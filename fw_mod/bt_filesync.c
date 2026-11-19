@@ -164,8 +164,8 @@ typedef struct __attribute__((packed)) {
 #define DIR_ALLOC_SIZE     0x100u
 #define FIL_ALLOC_SIZE     0x300u
 #define FILINFO_ALLOC_SIZE 0x160u
-#define MAX_CHUNK_LEN      496u
-#define MAX_BURST_FRAMES   4u
+#define MAX_CHUNK_LEN      640u /* 12 B XREC hdr + 640 B = 652 B <= 660 B turbo RFCOMM MTU */
+#define MAX_BURST_FRAMES   6u   /* <= 6 frames per burst (safe within K=7 RFCOMM credits) */
 #define MAX_BURST_LEN      (MAX_CHUNK_LEN * MAX_BURST_FRAMES)
 #define FA_READ            0x01u
 
@@ -662,7 +662,7 @@ static void handle_put(void *hf, const uint8_t *args, uint16_t args_len)
     while (colon < end && *colon != ':') {
         colon++;
     }
-    if (colon >= end || (uint32_t)(end - (colon + 1)) < data_len || data_len == 0 || data_len > 460u) {
+    if (colon >= end || (uint32_t)(end - (colon + 1)) < data_len || data_len == 0 || data_len > 600u) {
         send_str(hf, "+XREC:ERR,PUTLEN\r\n");
         return;
     }

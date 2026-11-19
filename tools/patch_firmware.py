@@ -172,6 +172,56 @@ PATCHES: dict[str, BinaryPatch] = {
             ),
         ),
     ),
+    "bt-rfcomm-turbo": BinaryPatch(
+        name="bt-rfcomm-turbo",
+        description=(
+            "Raise RFCOMM negotiated DLCI MTU from 512 B to 660 B (0x294, safely inside "
+            "672 B L2CAP MTU) and shorten RFCOMM RX credit-refill delay timer from 100 ms "
+            "to 5 ms (threshold <=16, batch 32 credits) for faster +XREC downloads and OTA."
+        ),
+        hunks=(
+            PatchHunk(
+                flash_offset=0x1641B8,  # Outgoing DLCI MTU: mov.w r3, #0x200 -> movw r3, #0x294 (660)
+                original=bytes.fromhex("4f f4 00 73"),
+                replacement=bytes.fromhex("40 f2 94 23"),
+            ),
+            PatchHunk(
+                flash_offset=0x16429A,  # Server DLCI MTU: mov.w r3, #0x200 -> movw r3, #0x294 (660)
+                original=bytes.fromhex("4f f4 00 73"),
+                replacement=bytes.fromhex("40 f2 94 23"),
+            ),
+            PatchHunk(
+                flash_offset=0x163DDA,  # Credit refill delay timer: 100 ms -> 5 ms
+                original=bytes.fromhex("64 20"),
+                replacement=bytes.fromhex("05 20"),
+            ),
+            PatchHunk(
+                flash_offset=0x163F72,  # Credit refill delay timer: 100 ms -> 5 ms
+                original=bytes.fromhex("64 20"),
+                replacement=bytes.fromhex("05 20"),
+            ),
+            PatchHunk(
+                flash_offset=0x163DB2,  # Credit refill threshold: <= 7 -> <= 16
+                original=bytes.fromhex("07 2b"),
+                replacement=bytes.fromhex("10 2b"),
+            ),
+            PatchHunk(
+                flash_offset=0x163F4A,  # Credit refill threshold: <= 7 -> <= 16
+                original=bytes.fromhex("07 2b"),
+                replacement=bytes.fromhex("10 2b"),
+            ),
+            PatchHunk(
+                flash_offset=0x163DBA,  # Credit refill batch: 16 -> 32
+                original=bytes.fromhex("10 22"),
+                replacement=bytes.fromhex("20 22"),
+            ),
+            PatchHunk(
+                flash_offset=0x163F52,  # Credit refill batch: 16 -> 32
+                original=bytes.fromhex("10 22"),
+                replacement=bytes.fromhex("20 22"),
+            ),
+        ),
+    ),
 }
 
 

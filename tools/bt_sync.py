@@ -351,7 +351,14 @@ class XRecRFCOMMClient:
                 break  # EOF
         return bytes(out)
 
-    def download_file(self, filename: str, total_size: int, dst_path: Path, burst_size: int = DEFAULT_BURST_SIZE) -> str:
+    def download_file(
+        self,
+        filename: str,
+        total_size: int,
+        dst_path: Path,
+        burst_size: int = DEFAULT_BURST_SIZE,
+        chunk_size: int = CHUNK_SIZE,
+    ) -> str:
         tmp_path = dst_path.with_suffix(dst_path.suffix + ".part")
         h = hashlib.sha256()
         offset = 0
@@ -359,13 +366,13 @@ class XRecRFCOMMClient:
 
         with open(tmp_path, "wb") as f:
             while offset < total_size:
-                use_burst = burst_size > CHUNK_SIZE
-                req = min(burst_size if use_burst else CHUNK_SIZE, total_size - offset)
+                use_burst = burst_size > chunk_size
+                req = min(burst_size if use_burst else chunk_size, total_size - offset)
                 chunk = None
                 for attempt in range(3):
                     try:
                         if use_burst:
-                            chunk = self.get_burst(filename, offset, req, CHUNK_SIZE)
+                            chunk = self.get_burst(filename, offset, req, chunk_size)
                         else:
                             chunk = self.get_chunk(filename, offset, req)
                         break
@@ -426,6 +433,18 @@ def main() -> None:
         type=int,
         default=DEFAULT_BURST_SIZE,
         help=f"Multi-packet +XREC:GETS burst size in bytes (0 to use single-chunk +XREC:GET; default {DEFAULT_BURST_SIZE})",
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=CHUNK_SIZE,
+        help=f"Per-frame +XREC:GET/GETS payload size in bytes (default {CHUNK_SIZE}; up to 640 with bt-rfcomm-turbo)",
+    )
+    parser.add_argument(
+        "--ota-chunk-size",
+        type=int,
+        default=440,
+        help="Per-packet +XREC:PUT payload size in bytes (default 440; up to 600 with bt-rfcomm-turbo)",
     )
     args = parser.parse_args()
 
@@ -496,7 +515,7 @@ def main() -> None:
             print("Device rebooting...")
             return
         if args.ota:
-            client.ota_upload_and_flash(args.ota)
+            client.ota_upload_and_flash(args.ota, chunk_size=args.ota_chunk_size)
             return
 
         files = client.list_files()
@@ -513,7 +532,7 @@ def main() -> None:
             if dst.is_file() and dst.stat().st_size == sz:
                 print(f"Skipping already synced: {name} ({sz:,} bytes)")
                 continue
-            digest = client.download_file(name, sz, dst, burst_size=args.burst_size)
+            digest = client.download_file(name, sz, dst, burst_size=args.burst_size, chunk_size=args.chunk_size)
             print(f"  -> Saved {dst} (SHA-256: {digest[:16]}...)")
             synced += 1
         print(f"Bluetooth sync complete ({synced} new file(s) downloaded to {args.dest}).")
