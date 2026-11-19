@@ -27,8 +27,8 @@ from typing import Dict, List, Optional, Tuple
 
 
 DEFAULT_NAME_PREFIX = "HW_"
-CHUNK_SIZE = 256  # <= 256 bytes per RFCOMM packet (tested reliable on SL6801)
-DEFAULT_BURST_SIZE = 2048  # 8 x 256 B chunks per +XREC:GETS burst (~52 KB/s, stays inside RFCOMM credit window)
+CHUNK_SIZE = 480  # 12 B header + 480 B = 492 B <= 512 B negotiated RFCOMM MTU (0x200)
+DEFAULT_BURST_SIZE = 1920  # 4 x 480 B frames per +XREC:GETS burst (safe within K=7 RFCOMM credit window)
 
 
 def crc16_ccitt_false(data: bytes, init: int = 0xFFFF) -> int:
@@ -175,6 +175,29 @@ class XRecRFCOMMClient:
         if line != "+XREC:OK,RTC":
             raise RuntimeError(f"Failed to set RTC: {line}")
 
+    def rec_start(self, filename: Optional[str] = None) -> str:
+        cmd = f"+XREC:RECSTART,{filename}" if filename else "+XREC:RECSTART"
+        self._send_cmd(cmd)
+        line = self._read_line()
+        if not line.startswith("+XREC:OK,RECSTART,"):
+            raise RuntimeError(f"Failed to start recording: {line}")
+        return line[len("+XREC:OK,RECSTART,") :]
+
+    def rec_stop(self) -> None:
+        self._send_cmd("+XREC:RECSTOP")
+        line = self._read_line()
+        if line != "+XREC:OK,RECSTOP":
+            raise RuntimeError(f"Failed to stop recording: {line}")
+
+    def get_stat(self) -> Dict[str, int]:
+        self._send_cmd("+XREC:STAT")
+        line = self._read_line()
+        if not line.startswith("+XREC:STAT,"):
+            raise RuntimeError(f"Failed to query status: {line}")
+        parts = [int(x) for x in line[len("+XREC:STAT,") :].split(",")]
+        keys = ("battery_pct", "voltage_mv", "charge_status", "vbus", "media_status", "rec_sec", "free_mb", "total_mb")
+        return dict(zip(keys, parts))
+
     def _read_xrec_frame(self, expected_offset: int, filename: str) -> bytes:
         # Wait for either 12-byte binary header "XREC" or text error "+XREC:ERR,"
         while len(self.rx_buf) < 4:
@@ -287,6 +310,9 @@ def main() -> None:
     parser.add_argument("--rtc-read", action="store_true", help="Read hardware RTC over Bluetooth")
     parser.add_argument("--rtc-sync", action="store_true", help="Sync device hardware RTC to host local clock over Bluetooth")
     parser.add_argument("--rtc-set", metavar="YYYY-MM-DD HH:MM:SS", help="Set device hardware RTC to explicit local timestamp")
+    parser.add_argument("--stat", action="store_true", help="Query battery %, voltage, charge state, recording state & SD free space")
+    parser.add_argument("--rec-start", nargs="?", const="", metavar="FILENAME", help="Start a local stereo WAV recording (optional custom filename)")
+    parser.add_argument("--rec-stop", action="store_true", help="Stop an active local stereo WAV recording")
     parser.add_argument(
         "--burst-size",
         type=int,
@@ -319,6 +345,24 @@ def main() -> None:
         if args.delete:
             client.delete_file(args.delete)
             print(f"Deleted 0:\\record\\{args.delete}")
+            return
+        if args.stat:
+            st = client.get_stat()
+            chg_names = {0: "discharging", 1: "charging", 2: "full"}
+            chg = chg_names.get(st.get("charge_status", -1), str(st.get("charge_status")))
+            print(
+                f"Battery: {st['battery_pct']}% ({st['voltage_mv']} mV, {chg}, vbus={st['vbus']}) | "
+                f"Media: 0x{st['media_status']:02X} (rec={st['rec_sec']}s) | "
+                f"SD: {st['free_mb']:,} / {st['total_mb']:,} MB free"
+            )
+            return
+        if args.rec_start is not None:
+            fn = client.rec_start(args.rec_start or None)
+            print(f"Started local stereo recording: 0:\\record\\{fn}")
+            return
+        if args.rec_stop:
+            client.rec_stop()
+            print("Stopped local stereo recording.")
             return
 
         files = client.list_files()

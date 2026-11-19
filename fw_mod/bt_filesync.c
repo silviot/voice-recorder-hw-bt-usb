@@ -36,6 +36,15 @@
  *         -> Reads hardware RTC via HAL_rtc_get -> "+XREC:RTC,YYYY-MM-DD HH:MM:SS,W\r\n"
  *       +XREC:RTC,<YYYY>,<MM>,<DD>,<hh>,<mm>,<ss>,<wd>\r
  *         -> Sets hardware RTC via HAL_rtc_set -> "+XREC:OK,RTC\r\n"
+ *       +XREC:RECSTART[,<filename>]\r
+ *         -> Starts a local stereo WAV recording (default name from RTC) while keeping
+ *            BT HFP connected -> "+XREC:OK,RECSTART,<filename>\r\n"
+ *       +XREC:RECSTOP\r
+ *         -> Stops active local stereo recording cleanly -> "+XREC:OK,RECSTOP\r\n"
+ *       +XREC:STAT\r
+ *         -> Returns live battery %, voltage_mv, charge_status, vbus, media_status,
+ *            rec_sec, free_mb, total_mb:
+ *            "+XREC:STAT,<bat%>,<mv>,<chg>,<vbus>,<mstat>,<rec_s>,<free_mb>,<tot_mb>\r\n"
  *     and returns 0 (cleanly exits _hfp_hf_slc_open_status via jump table[0] -> 0xD624E8).
  *
  * Rules:
@@ -69,6 +78,17 @@
 #define f_read                FW_FN(0x00D4B308, int,      (void *fp, void *buff, uint32_t btr, uint32_t *br))
 #define f_close               FW_FN(0x00D4C750, int,      (void *fp))
 #define f_unlink              FW_FN(0x00D4BDDA, int,      (const char *path))
+#define f_getfree             FW_FN(0x00D4BCBC, int,      (const char *path, uint32_t *nclst, void **fatfs))
+
+/* Media / Local Stereo Recorder (thread-safe xQueueSend to Media Task ID 8) */
+#define media_get_status          FW_FN(0x00D1AB1C, uint8_t,  (void))
+#define pstr_audio_get_rec_time   FW_FN(0x00CF04DC, uint32_t, (void))
+#define pstr_audio_start_record   FW_FN(0x00CF07B0, void,     (const char *basename))
+#define media_stop_record_if_act  FW_FN(0x00D1AAD4, void,     (void))
+
+/* Lock-free live PMU battery/charging state in SRAM (0x00821222) */
+#define PMU_STATE_ADDR            ((const volatile uint8_t *)0x00821222u)
+#define PMU_VOLTAGE_MV_ADDR       ((const volatile uint16_t *)0x0082122Au)
 
 /* Hardware RTC HAL (lock-free MMIO) */
 typedef struct __attribute__((packed)) {
@@ -95,12 +115,20 @@ typedef struct __attribute__((packed)) {
  *   DIR     <= 0x80 bytes (firmware stack uses 0x58)
  *   FIL     <= 0x300 bytes (contains 512-byte sector buf at +0x54)
  *   FILINFO <= 0x160 bytes (fsize u64 @ +0x00, fattrib u8 @ +0x0C, fname[256] @ +0x1A)
+ *
+ * RFCOMM MTU & Credit Limits (verified in 0xD636E0 / 0xD63962 / 0xD6429A):
+ *   - Negotiated dlci->mtu = 512 B (0x200); L2CAP MTU = 672 B; HCI ACL cap = 674 B.
+ *     12-byte XREC header + 496 B payload = 508 B <= 512 B (safe per hfp_rfcomm_send).
+ *   - RFCOMM uses credit-based flow control (K=7 initial credits) with NO TX queueing:
+ *     packets sent when remote_credits == 0 are silently dropped! Because this hook runs
+ *     inside the BT task, cap each +XREC:GETS burst to <= 4 frames so credits never run dry.
  */
 #define DIR_ALLOC_SIZE     0x100u
 #define FIL_ALLOC_SIZE     0x300u
 #define FILINFO_ALLOC_SIZE 0x160u
-#define MAX_CHUNK_LEN      256u
-#define MAX_BURST_LEN      16384u
+#define MAX_CHUNK_LEN      496u
+#define MAX_BURST_FRAMES   4u
+#define MAX_BURST_LEN      (MAX_CHUNK_LEN * MAX_BURST_FRAMES)
 #define FA_READ            0x01u
 
 static uint16_t crc16_ccitt_false(const uint8_t *buf, uint32_t len)
@@ -322,7 +350,9 @@ static void handle_get_stream(void *hf, const uint8_t *args, uint16_t args_len, 
     }
 
     uint32_t sent = 0;
-    while (sent < total_len) {
+    uint32_t frames = 0;
+    uint32_t max_frames = is_stream ? MAX_BURST_FRAMES : 1u;
+    while (sent < total_len && frames < max_frames) {
         uint32_t want = total_len - sent;
         if (want > chunk_len) {
             want = chunk_len;
@@ -336,6 +366,7 @@ static void handle_get_stream(void *hf, const uint8_t *args, uint16_t args_len, 
         }
         send_xrec_frame(hf, pkt, offset + sent, br);
         sent += br;
+        frames++;
         if (br < want) {
             break; /* EOF reached */
         }
@@ -448,6 +479,117 @@ static void handle_rtc(void *hf, const uint8_t *args, uint16_t args_len)
     oal_free(resp);
 }
 
+static void handle_recstart(void *hf, const uint8_t *args, uint16_t args_len)
+{
+    uint8_t st = media_get_status();
+    if (st == 0x21u || st == 0x22u) {
+        send_str(hf, "+XREC:ERR,RECACTIVE\r\n");
+        return;
+    }
+    if (st != 0x10u && st != 0x00u && st != 0x20u) {
+        send_str(hf, "+XREC:ERR,BUSY\r\n");
+        return;
+    }
+
+    char *fname = (char *)oal_malloc(128);
+    char *resp = (char *)oal_malloc(160);
+    if (!fname || !resp) {
+        if (fname) oal_free(fname);
+        if (resp) oal_free(resp);
+        send_str(hf, "+XREC:ERR,ENOMEM\r\n");
+        return;
+    }
+
+    if (args_len > 1 && args[0] == ',') {
+        const uint8_t *p = args + 1;
+        const uint8_t *end = args + args_len;
+        uint32_t n = 0;
+        while (p < end && *p != '\r' && *p != '\n' && *p != '\0' && n < 120u) {
+            if (*p == '/' || *p == '\\') {
+                n = 0;
+                break;
+            }
+            fname[n++] = (char)*p++;
+        }
+        fname[n] = '\0';
+        if (n == 0) {
+            send_str(hf, "+XREC:ERR,NAME\r\n");
+            oal_free(resp);
+            oal_free(fname);
+            return;
+        }
+    } else {
+        rtc_time_t t;
+        rom_memset(&t, 0, sizeof(t));
+        HAL_rtc_get(&t);
+        fw_sprintf(
+            fname,
+            "20%02u%02u%02u-%02u%02u%02u.wav",
+            (unsigned)t.year,
+            (unsigned)t.month,
+            (unsigned)t.day,
+            (unsigned)t.hour,
+            (unsigned)t.minute,
+            (unsigned)t.second
+        );
+    }
+
+    pstr_audio_start_record(fname);
+    fw_sprintf(resp, "+XREC:OK,RECSTART,%s\r\n", fname);
+    send_str(hf, resp);
+
+    oal_free(resp);
+    oal_free(fname);
+}
+
+static void handle_recstop(void *hf)
+{
+    uint8_t st = media_get_status();
+    if (st != 0x21u && st != 0x22u) {
+        send_str(hf, "+XREC:ERR,NOTREC\r\n");
+        return;
+    }
+    media_stop_record_if_act();
+    send_str(hf, "+XREC:OK,RECSTOP\r\n");
+}
+
+static void handle_stat(void *hf)
+{
+    char *resp = (char *)oal_malloc(128);
+    if (!resp) {
+        send_str(hf, "+XREC:ERR,ENOMEM\r\n");
+        return;
+    }
+
+    uint32_t bat_pct = PMU_STATE_ADDR[3];
+    uint32_t chg_st  = PMU_STATE_ADDR[1];
+    uint32_t vbus    = PMU_STATE_ADDR[2];
+    uint32_t mv      = *PMU_VOLTAGE_MV_ADDR;
+    uint32_t mstat   = media_get_status();
+    uint32_t rec_s   = (mstat == 0x21u || mstat == 0x22u) ? pstr_audio_get_rec_time() : 0u;
+
+    uint32_t free_mb = 0;
+    uint32_t total_mb = 0;
+    uint32_t free_clst = 0;
+    void *fs = NULL;
+    if (f_getfree("0:", &free_clst, &fs) == 0 && fs != NULL) {
+        uint32_t csize = *(const uint16_t *)((const uint8_t *)fs + 0x0A);
+        uint32_t n_fatent = *(const uint32_t *)((const uint8_t *)fs + 0x20);
+        uint32_t total_clst = (n_fatent > 2u) ? (n_fatent - 2u) : 0u;
+        /* 512 B/sector -> (clst * csize) / 2048 == MB; split shift to avoid 64-bit helper */
+        free_mb  = ((free_clst >> 11) * csize) + (((free_clst & 0x7FFu) * csize) >> 11);
+        total_mb = ((total_clst >> 11) * csize) + (((total_clst & 0x7FFu) * csize) >> 11);
+    }
+
+    fw_sprintf(
+        resp,
+        "+XREC:STAT,%u,%u,%u,%u,%u,%u,%u,%u\r\n",
+        bat_pct, mv, chg_st, vbus, mstat, rec_s, free_mb, total_mb
+    );
+    send_str(hf, resp);
+    oal_free(resp);
+}
+
 /*
  * Entry point placed at exact VMA 0x00D74000 via section ".text.entry".
  */
@@ -481,6 +623,12 @@ uint32_t bt_filesync_hook(void *hf, const uint8_t *data, uint16_t len)
         handle_del(hf, p + 4, (uint16_t)(rem - 4));
     } else if (starts_with(p, rem, "RTC")) {
         handle_rtc(hf, p + 3, (uint16_t)(rem - 3));
+    } else if (starts_with(p, rem, "RECSTART")) {
+        handle_recstart(hf, p + 8, (uint16_t)(rem - 8));
+    } else if (starts_with(p, rem, "RECSTOP")) {
+        handle_recstop(hf);
+    } else if (starts_with(p, rem, "STAT")) {
+        handle_stat(hf);
     } else {
         send_str(hf, "+XREC:ERR,CMD\r\n");
     }

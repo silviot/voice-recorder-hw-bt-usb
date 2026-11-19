@@ -452,3 +452,26 @@ Verified against `dumps/sdcard_backup/DBROOT/{db_wave.db,db_content.db}` and `FI
 ### 11.3 Architectural Finding: `btc` Runs on CPU0
 * Across the entire 384 KB Mask ROM, the CPU1 mailbox (`0x30000600`) appears **only once** (in lower-ROM `Reset_Handler` at `0x0000A8`). There is no CPU1 firmware image in ROM.
 * The entire 154 KB Bluetooth BR/EDR Controller (`0x020000..0x0467FF`) runs directly on **CPU0** under FreeRTOS (`task btc` / `bt_isr_bh` in `FIRM 0xD55312..0xD585D8`). CPU1 is booted exclusively from `FIRM` XIP (`0x00CE73A8` → `0x00CE7371`).
+
+---
+
+## 12. Bluetooth Boot Persistence, RFCOMM MTU/Credits & Remote Control APIs
+
+### 12.1 Bluetooth Boot Persistence (`bt_info` vs `profile`) & Charging Behavior
+* **`bt_info` (PSMP key `12`, 1 B, SRAM `0x0081BA04`):** Stores BT power/connection state (`0` = Off, `1` = On/Disconnected, `2` = Connected), **not** music/phone mode. Both power-off (`0x00CEEB08`) and USB `Charge & Transfer` (`0x00CFB7FC`) call `bt_close_stack()` (`0x00D66E3C`), whose `stack_close` callback (`0x00CF5F60`) writes `bt_info = 0` — causing `pstr_bt_nv_read` (`0x00CF0EA0`) to skip `bt_open_stack()` on the next boot.
+* **`profile` (PSMP key `9`, 4 B, SRAM `0x0081B80C`):** Stores **`music mode` (`0x0200`) vs `phone mode` (`0x0400`)**, loaded at boot by `bt_subsystem_init` (`0x00CEA0F8`, defaults to `0x400` `phone mode` and persists across reboots).
+* **USB Charging (`Charge & Play`):** VBUS plug-in does **not** close Bluetooth; selecting `Charge & Play` (`pstr_select_usb_mode(2)` at `0x00CFB7C8`) or letting the USB prompt time out keeps Bluetooth 100% active while charging.
+* **Verified Boot Patches (in [tools/patch_firmware.py](tools/patch_firmware.py)):**
+  * **`--patch bt-autoboot`** (`0x00CF0EC6` / flash `0x0F0EC6`, 2 B): `0b b1` (`cbz r3, 0xcf0ecc`) → `00 bf` (`nop`) — calls `bt_open_stack()` unconditionally at boot.
+  * **`--patch bt-force-phone`** (`0x00CEA132` / flash `0x0EA132`, 2 B): `28 bb` (`cbnz r0, 0xcea180`) → `25 e0` (`b 0xcea180`) — forces `phone mode` (`0x400`) on every boot.
+
+### 12.2 RFCOMM MTU & Credit-Based Flow Control (`0x00D620E6..0x00D645C4`)
+* **TX Ceilings:** `dlci->mtu` is negotiated to **`512` bytes** (`0x200` at `0x00D6429A`), RFCOMM UIH stack buffer (`0x00D633A8`) is `1024` B, L2CAP MTU (`0x00D5EB80`) is `672` B (`0x2A0`), and HCI ACL non-segmenting cap (`0x00D553DE`) is `674` B (`0x2A2`). Up to **`496` bytes** of payload + 12 B `+XREC` header (`508 <= 512` B) is safe per `hfp_rfcomm_send` call.
+* **Credit Window (`0x00D63962`):** RFCOMM uses credit-based flow control (`K = 7` initial credits, `dlci->remote_credits` at `[dlci+0x0F]`) with **no TX queue or blocking** — sending when `remote_credits == 0` silently drops the packet. Tight-loop bursts inside the BT task must therefore be capped to **≤ 4 frames** per host ACK (`MAX_BURST_FRAMES = 4`, `4 × 480 = 1,920` B/burst).
+
+### 12.3 Thread-Safe Remote Recording & Status APIs (`+XREC:RECSTART` / `RECSTOP` / `STAT`)
+* **Local Stereo Recording Start (`0x00CF07B0`):** `pstr_audio_start_record(const char *basename)` builds `"0:\\record\\<basename>"` and posts `cmd=0x0C` via `xQueueSend` to Media Task ID 8. Handled natively in `BTREADY` (`0x10`) state — records stereo 16/48 kHz WAV while keeping BT HFP connected.
+* **Local Stereo Recording Stop (`0x00D1AAD4`):** `media_stop_record_if_active()` posts `cmd=0x0D` directly to Media Task ID 8 (without touching LVGL timers), flushes/closes the WAV, and returns to `BTREADY` (`0x10`).
+* **Media Status & Timer:** `media_get_status()` (`0x00D1AB1C`, atomic `ldrb` from `0x0081C718`: `0x10`=`BTREADY`, `0x21`=`RECORDPLAY`, `0x22`=`RECORDPAUSE`); `pstr_audio_get_rec_time()` (`0x00CF04DC`).
+* **Live Battery / PMU State (`0x00821222`, lock-free SRAM):** `+0x01` `charge_status` (`0`=discharging, `1`=charging, `2`=full), `+0x02` `vbus_status`, `+0x03` `percent` (`0..100`, getter `0x00D1BA2C`), `+0x08` (`0x0082122A`) `u16 voltage_mv`.
+* **SD Free Space:** `f_getfree("0:", &free_clst, &fs)` (`0x00D4BCBC`); `FATFS` has `u16 csize` at `+0x0A` and `u32 n_fatent` at `+0x20`.

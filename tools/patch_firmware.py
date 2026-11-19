@@ -1,22 +1,24 @@
 #!/usr/bin/env python3
 """
-Firmware verifier, binary patcher, and 0:\\update.up packager for
-Smartlink SL6801 (HW_76 / pen133_2.0.65).
+Firmware verifier, binary patcher, XIP payload injector, and 0:\\update.up
+packager for Smartlink SL6801 (HW_76 / pen133_2.0.65).
 
 Examples:
   # Verify all four CRC-16/CCITT-FALSE checksums in a 2 MB flash dump:
   python3 tools/patch_firmware.py dumps/firmware_2M.bin --verify
 
-  # Apply the WAV nBlockAlign=4 fix and write a patched 2 MB image + update.up:
+  # Apply SDIO + WAV fixes + Bluetooth +XREC XIP payload and emit both raw bin & update.up:
   python3 tools/patch_firmware.py dumps/firmware_2M.bin \\
-      --patch wav-blockalign \\
-      --out-bin /tmp/firmware_2M_patched.bin \\
-      --out-update-up /tmp/update.up
+      --patch sdio-end-of-disk --patch wav-blockalign \\
+      --xip-payload /tmp/bt_filesync.bin \\
+      --out-bin dumps/firmware_2M_patched.bin \\
+      --out-update-up dumps/update.up
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import pathlib
 import struct
 import sys
@@ -27,6 +29,14 @@ FLASH_SIZE = 0x200000  # 2 MiB
 PART_TABLE_OFF = 0x00D000
 FIRM_OFF = 0x00E000
 PSMP_OFF = 0x1FC000
+
+# XIP Bluetooth RFCOMM (+XREC) extension hook parameters (pen133_2.0.65)
+XIP_HOOK_VMA = 0x00D625E2
+XIP_HOOK_FLASH_OFF = XIP_HOOK_VMA - 0x00C00000  # 0x1625E2
+XIP_ORIG_TARGET_VMA = 0x00D62180
+XIP_PAYLOAD_VMA = 0x00D74000
+XIP_PAYLOAD_OFF = XIP_PAYLOAD_VMA - 0x00C00000  # 0x174000
+XIP_MAX_PAYLOAD_SIZE = 0x4000  # 16 KiB
 
 
 def crc16_ccitt_false(data: bytes | bytearray | memoryview) -> int:
@@ -99,6 +109,34 @@ PATCHES: dict[str, BinaryPatch] = {
             ),
         ),
     ),
+    "bt-autoboot": BinaryPatch(
+        name="bt-autoboot",
+        description=(
+            "Auto-enable Bluetooth stack on every boot (pstr_bt_nv_read @ 0x00CF0EC6 / flash 0x0F0EC6): "
+            "NOP the cbz around bt_open_stack() so BT starts automatically after power-off or Charge & Transfer."
+        ),
+        hunks=(
+            PatchHunk(
+                flash_offset=0x0F0EC6,  # VMA 0x00CF0EC6: cbz r3, 0xcf0ecc -> nop
+                original=bytes.fromhex("0b b1"),
+                replacement=bytes.fromhex("00 bf"),
+            ),
+        ),
+    ),
+    "bt-force-phone": BinaryPatch(
+        name="bt-force-phone",
+        description=(
+            "Force Bluetooth HFP phone mode (profile=0x400) on every boot "
+            "(bt_subsystem_init @ 0x00CEA132 / flash 0x0EA132): always take the 0x400 HFP branch."
+        ),
+        hunks=(
+            PatchHunk(
+                flash_offset=0x0EA132,  # VMA 0x00CEA132: cbnz r0, 0xcea180 -> b 0xcea180
+                original=bytes.fromhex("28 bb"),
+                replacement=bytes.fromhex("25 e0"),
+            ),
+        ),
+    ),
 }
 
 
@@ -143,12 +181,70 @@ def update_firm_checksums(buf: bytearray) -> None:
     struct.pack_into("<I", buf, PART_TABLE_OFF + 0x1C, part_crc)
 
 
-def build_update_up(buf: bytes | bytearray) -> bytes:
-    """Wrap the flash image up to the end of FIRM (aligned to 4 KiB, < PSMP) in 0:\\update.up format."""
+def encode_thumb2_bl(pc: int, target: int) -> bytes:
+    """Encode a 32-bit Thumb-2 BL instruction from `pc` to `target`."""
+    offset = target - (pc + 4)
+    if offset < -(1 << 24) or offset >= (1 << 24) or (offset & 1):
+        raise ValueError(f"BL target 0x{target:08X} out of range from 0x{pc:08X}")
+    s = (offset >> 24) & 1
+    i1 = (offset >> 23) & 1
+    i2 = (offset >> 22) & 1
+    j1 = (~(i1 ^ s)) & 1
+    j2 = (~(i2 ^ s)) & 1
+    imm10 = (offset >> 12) & 0x3FF
+    imm11 = (offset >> 1) & 0x7FF
+    hw1 = 0xF000 | (s << 10) | imm10
+    hw2 = 0xD000 | (j1 << 13) | (1 << 12) | (j2 << 11) | imm11
+    return struct.pack("<HH", hw1, hw2)
+
+
+def inject_xip_payload(buf: bytearray, payload: bytes) -> int:
+    """Inject compiled XIP payload at 0x174000 and patch BL at 0x1625E2 -> 0x00D74000.
+
+    Returns the end flash offset (XIP_PAYLOAD_OFF + len(payload)).
+    """
+    if not (1 <= len(payload) <= XIP_MAX_PAYLOAD_SIZE):
+        raise ValueError(f"XIP payload size {len(payload)} out of range (1..{XIP_MAX_PAYLOAD_SIZE})")
+
     firm_off, firm_size, _ = read_firm_layout(buf)
-    end_off = (firm_off + firm_size + 0xFFF) & ~0xFFF
+    if not (firm_off <= XIP_HOOK_FLASH_OFF < firm_off + firm_size):
+        raise ValueError("XIP hook offset falls outside FIRM partition")
+    if XIP_PAYLOAD_OFF < firm_off + firm_size:
+        raise ValueError("XIP payload overlaps FIRM partition")
+
+    expected_orig_bl = encode_thumb2_bl(XIP_HOOK_VMA, XIP_ORIG_TARGET_VMA)
+    new_bl = encode_thumb2_bl(XIP_HOOK_VMA, XIP_PAYLOAD_VMA)
+    actual_bl = bytes(buf[XIP_HOOK_FLASH_OFF : XIP_HOOK_FLASH_OFF + 4])
+    if actual_bl not in (expected_orig_bl, new_bl):
+        raise ValueError(
+            f"Unexpected instruction at 0x{XIP_HOOK_VMA:06X}: got {actual_bl.hex()}, "
+            f"expected {expected_orig_bl.hex()} (is this pen133_2.0.65?)"
+        )
+
+    if actual_bl == expected_orig_bl:
+        target_slice = buf[XIP_PAYLOAD_OFF : XIP_PAYLOAD_OFF + len(payload)]
+        if any(b != 0xFF for b in target_slice):
+            raise ValueError(f"Target XIP region 0x{XIP_PAYLOAD_OFF:06X} is not erased 0xFF!")
+
+    buf[XIP_HOOK_FLASH_OFF : XIP_HOOK_FLASH_OFF + 4] = new_bl
+    buf[XIP_PAYLOAD_OFF : XIP_PAYLOAD_OFF + len(payload)] = payload
+    print(
+        f"  [XIP] Hook @ 0x{XIP_HOOK_VMA:06X} (flash 0x{XIP_HOOK_FLASH_OFF:06X}): "
+        f"{actual_bl.hex()} -> {new_bl.hex()} (bl 0x{XIP_PAYLOAD_VMA:06X})"
+    )
+    print(
+        f"  [XIP] Payload @ 0x{XIP_PAYLOAD_VMA:06X} (flash 0x{XIP_PAYLOAD_OFF:06X}): "
+        f"{len(payload)} bytes"
+    )
+    return XIP_PAYLOAD_OFF + len(payload)
+
+
+def build_update_up(buf: bytes | bytearray, min_end_off: int = 0) -> bytes:
+    """Wrap the flash image up to max(FIRM end, min_end_off) (4 KiB aligned, < PSMP) in 0:\\update.up format."""
+    firm_off, firm_size, _ = read_firm_layout(buf)
+    end_off = (max(firm_off + firm_size, min_end_off) + 0xFFF) & ~0xFFF
     if end_off > PSMP_OFF:
-        raise ValueError(f"FIRM end 0x{end_off:X} overlaps PSMP at 0x{PSMP_OFF:X}")
+        raise ValueError(f"Image end 0x{end_off:X} overlaps PSMP at 0x{PSMP_OFF:X}")
 
     header = bytearray(0x200)
     header[0x00:0x06] = b"CONFIG"
@@ -163,6 +259,7 @@ def main() -> int:
     ap.add_argument("--verify", action="store_true", help="Verify all CRC-16/CCITT-FALSE checksums")
     ap.add_argument("--list-patches", action="store_true", help="List available binary patches")
     ap.add_argument("--patch", action="append", default=[], choices=sorted(PATCHES), help="Apply a named binary patch")
+    ap.add_argument("--xip-payload", type=pathlib.Path, help="Inject compiled XIP payload (e.g. bt_filesync.bin) at 0x174000 and hook 0x1625E2")
     ap.add_argument("--bump-timestamp", action="store_true", help="Increment FIRM+0x04 build timestamp by 1")
     ap.add_argument("--out-bin", type=pathlib.Path, help="Write patched 2 MB raw flash image")
     ap.add_argument("--out-update-up", type=pathlib.Path, help="Write SD-card 0:\\update.up package")
@@ -175,13 +272,14 @@ def main() -> int:
             print(f"  {p.name:18s} @ {offs} ({total_b} B): {p.description}")
         return 0
 
-    raw = bytearray(args.input.read_bytes())
+    orig_raw = args.input.read_bytes()
+    raw = bytearray(orig_raw)
     if len(raw) != FLASH_SIZE:
         print(f"Error: expected {FLASH_SIZE} bytes, got {len(raw)}", file=sys.stderr)
         return 1
 
     print(f"Loaded {args.input} ({len(raw)} bytes)")
-    if args.verify or not (args.patch or args.out_bin or args.out_update_up):
+    if args.verify or not (args.patch or args.xip_payload or args.out_bin or args.out_update_up):
         ok = verify_checksums(raw)
         if not ok:
             return 1
@@ -209,25 +307,36 @@ def main() -> int:
         total_b = sum(len(h.replacement) for h in p.hunks)
         print(f"  [APPLIED] {name} ({len(p.hunks)} hunk(s), {total_b} bytes)")
 
+    xip_end_off = 0
+    if args.xip_payload:
+        xip_end_off = inject_xip_payload(raw, args.xip_payload.read_bytes())
+
     if args.bump_timestamp:
         firm_off, _, _ = read_firm_layout(raw)
         old_ts = struct.unpack_from("<I", raw, firm_off + 0x04)[0]
         struct.pack_into("<I", raw, firm_off + 0x04, (old_ts + 1) & 0xFFFFFFFF)
         print(f"  [BUMPED] FIRM timestamp: 0x{old_ts:08X} -> 0x{(old_ts + 1) & 0xFFFFFFFF:08X}")
 
-    if args.patch or args.bump_timestamp:
+    if args.patch or args.xip_payload or args.bump_timestamp:
         update_firm_checksums(raw)
         print("Recomputed FIRM checksums:")
         assert verify_checksums(raw)
 
+    changed_sectors = [
+        sec for sec in range(0, len(raw), 0x1000)
+        if raw[sec : sec + 0x1000] != orig_raw[sec : sec + 0x1000]
+    ]
+    if changed_sectors:
+        print(f"  Changed 4 KiB flash sectors ({len(changed_sectors)}): {[hex(s) for s in changed_sectors]}")
+
     if args.out_bin:
         args.out_bin.write_bytes(raw)
-        print(f"Wrote patched 2 MB flash image: {args.out_bin}")
+        print(f"Wrote patched 2 MB flash image: {args.out_bin} (SHA-256: {hashlib.sha256(raw).hexdigest()})")
 
     if args.out_update_up:
-        pkg = build_update_up(raw)
+        pkg = build_update_up(raw, min_end_off=xip_end_off)
         args.out_update_up.write_bytes(pkg)
-        print(f"Wrote SD update package: {args.out_update_up} ({len(pkg)} bytes, stops before PSMP 0x1FC000)")
+        print(f"Wrote SD update package: {args.out_update_up} ({len(pkg)} bytes, covers up to 0x{len(pkg) - 0x200:06X}, < PSMP 0x1FC000)")
 
     return 0
 
