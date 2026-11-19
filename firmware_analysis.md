@@ -89,7 +89,7 @@ The 16 KB `PSMP` partition (`0x1FC000..0x200000`, 4 × 4 KB sectors) is a wear-l
 | `3` | `freq_drift` | 2 | `0x0049` (`73`) — RF crystal calibration trim |
 | `4` | `profile` | 4 | `00 02 00 00` — System UI/backlight/power settings |
 | `5` | `pass` | 4 | `00 00 63 63` — Power-on password disabled (`00 00`) |
-| `6` | `record` | 28 | Voice recorder settings: bitrate mode `3`, segment **`120 min`**, scheduled start `08:30` / end `09:30`, VAD/monitor/denoise flags |
+| `6` | `record` | 28 | Voice recorder settings: `kbps_mode = 0` (**512 kbps**, 16 kHz 16-bit stereo), `segment_mode = 3` (**120 min**), scheduled start `08:30` / end `09:30`, monitor/denoise/VAD flags (see §9.2) |
 | `7` | `music` | 20 | Last played track (`#1`, pos `45s`, play mode `4`) |
 | `8` | `audio_volume` | 16 | Four `u32` gains: speaker/headphone volume `10`, `100`, `90`, `90` |
 | `9` | `voltage` | 4 | `0x0104` (`260`), `100%` battery state |
@@ -165,7 +165,14 @@ All vendor commands use standard 31-byte USB MSC CBW (`USBC`, `0x43425355`) with
 2. **Direct Vendor `0xC0` USB Tooling (`libusb` / Python `pyusb`):**
    * Detaching `usb-storage` via `libusb` lets a host script read `PSMP` NVRAM (`read_flash 0x1FC000 16K`) in <50 ms (e.g., to inspect battery voltage, paired BT link keys, or recording settings) or invoke firmware functions in `FIRM` (such as reading/setting `/dev/rtc` via `0xD15070` so recordings always have accurate timestamps!).
 3. **Custom XIP App / USB Command Extension:**
-   * There is **544 KB of unused `0xFF` XIP flash** at `0x173E8C..0x1FC000` (`0xD73E8C..0xDFC000`). And `FIRM`'s `ops + 0x18` (`0x812A80`) is currently a stub (`movs r0, #0; bx lr`), meaning custom firmware extensions can cleanly add new `0xC0` subcommands (`CDB[1] = 0x40..0x7F`) for live RPC over USB!
+   * There is **544 KB of unused `0xFF` XIP flash** at `0x173E8C..0x1FC000` (`0xD73E8C..0xDFC000`).
+   * In Boot ROM's `0xC0` dispatcher (`0x621E..0x6234`), **any unknown `CDB[1]` subcommand** (i.e. anything other than `0x00, 0x02..0x0A, 0x81, 0x82, 0x86, 0x87`) automatically calls `FIRM`'s `ops + 0x18` (`0x812A80`, currently a stub `movs r0, #0; bx lr`):
+     ```c
+     int ret = ops->user_c0_cmd((uint8_t *)0x00800FFF /* CDB pointer */);
+     if (ret > 0) { *(uint16_t *)0x00800DEE = 0; return 0; } // success, no IN data
+     return (ret == 0) ? 0 : -1;                             // 0 = send tx_len bytes from 0x800DF0; <0 = STALL/fail
+     ```
+   * Custom firmware extensions can therefore cleanly add new `0xC0` subcommands (`CDB[1] = 0x40..0x7F`) for live RPC over USB!
 
 ---
 
@@ -257,3 +264,165 @@ In **`music mode`**, `HW_76` scans for and connects to a Bluetooth audio sink �
   * `0x4B` **`FORWARD` (Next File)**, `0x4C` **`BACKWARD` (Previous File)**
   * Plus `GetPlayStatus` (`PDU 0x30` at `0xD61834` — returns total track length & current playback position in ms!) and `RegisterNotification` (`PDU 0x31` at `0xD61844`).
   * On Linux, once `HW_76` connects in `music mode`, you can control it directly via **`playerctl`** or D-Bus (`org.bluez.MediaPlayer1` / `MediaControl1`: `Play`, `Pause`, `Stop`, `Next`, `Previous`)!
+
+---
+
+## 5. Bootloader Integrity, `0:\update.up` Protocol & Binary Patching
+
+Disassembling the Stage-1 Bootloader (`0x000060..0x00C950`, loaded to SRAM `0x0081FBC0`, entry `0x00820001`) reveals **no cryptographic signature verification anywhere in the boot or update path**. All integrity fields use plain **`CRC-16/CCITT-FALSE`** (`poly=0x1021`, `init=0xFFFF`, `xorout=0x0000`), verified against `dumps/firmware_2M.bin`:
+
+| Structure | Flash Range | Checksum Field | Stored & Computed CRC-16 |
+| :--- | :--- | :--- | :--- |
+| **`HLKJ` Boot Header** | `0x000000..0x00005B` | `0x00005C` (`u16`) | `0xC1E7` (exact match) |
+| **Stage-1 Bootloader** | `0x000060..0x00C94F` (`0xC8F0` B) | `0x000014` (`u16`) | `0x3244` (exact match) |
+| **`FIRM` Initial RAM Block** | `0x00E030..0x00F02F` (`0x1000` B) | `0x00E01C` (`u16`) | `0x4724` (exact match) |
+| **Entire `FIRM` Partition** | `0x00E000..0x173E8B` (`0x165E8C` B) | `0x00D01C` (`u16`, partition table) | `0xBDA3` (exact match) |
+
+### 5.1 Normal Boot (`0x820470..0x8204D6`)
+* The bootloader reads `FIRM` header fields (`loadToRam = 0x804C00`, `runFromRam = 0x804C01`, `loadLength = 0x1000`), copies `0x1000` bytes from flash `0x00E030` to SRAM `0x804C00` via `0x820A64`, logs `boot--->firmware_header_len ...`, and immediately executes **`blx r6`** (`0x8204D0`) without re-checking `loadCrc` at boot.
+
+### 5.2 SD-Card Update Format (`0:\update.up`, `sdupdate` at `0x827854..0x827BD4`)
+Triggered when `HAL_pmu_sd_update_flag_set` is active and `0:\update.up` exists on the SD card:
+1. Reads the first `0x200` bytes and validates two ASCII magic fields:
+   * `+0x00`: `"CONFI"` (5 bytes checked; fails with `0xFE`)
+   * `+0x06`: `codeOffsetInByte` (`u32_le`, byte offset in `update.up` where the raw flash image starts)
+   * `+0x16`: `"SL6801"` (6 bytes checked; fails with `0xFA`)
+2. Reads `partition_start` from the current flash's `HLKJ` header at `0x000020` (`0x0000D000`; defaults to `0x3000` if zero).
+3. Erases 4 KB sectors starting at `partition_start` (`0xD000`) — **never touching the Stage-1 Bootloader (`0x0000..0xCFFF`) or `PSMP` NVRAM (`0x1FC000..0x200000`)** as long as the image ends below `0x1FC000`.
+4. Programs 512-byte chunks (as two 256-byte SPI NOR pages via `0x821FFC`) while accumulating a running 16-bit CRC (`0x821F84`, init `0xFFFF`), then reads back all written sectors and compares the read-back CRC (`crc cmp %x %x`).
+
+---
+
+## 6. WAV/ADPCM Recording Pipeline & Exact Binary Patches
+
+Disassembling `WriteWav` (`0xCED1F4`) and `CloseWav` (`0xCED32C`, flash `0x0ED32C`) shows that the recorder supports both **uncompressed PCM (`wFormatTag = 0x0001`, 44-byte header)** and **IMA-ADPCM (`wFormatTag = 0x0011`, 60-byte header with `fact` chunk when codec == `"adpc"`)**.
+
+### 6.1 Exact Instruction-Level Root Cause & In-Place Patch for WAV `blockAlign = 2`
+In the PCM WAV header builder (`0xCED45C..0xCED478`, flash `0x0ED45C..0x0ED478`, where `sp + 0x0C` is the start of the 44-byte RIFF header):
+```armasm
+ced464: 7bd2         ldrb   r2, [r2, #0xf]   @ r2 = bytesPerSample (2)
+ced466: 4350         muls   r0, r2, r0       @ r0 = bytesPerSample * sampleRate
+ced468: b292         uxth   r2, r2           @ redundant zero-extend
+ced46a: 4343         muls   r3, r0, r3       @ r3 = nAvgBytesPerSec (64000)
+ced46c: f8ad 202c    strh.w r2, [sp, #0x2c]  @ BUG: stores bytesPerSample (2) as nBlockAlign!
+ced470: 00d2         lsls   r2, r2, #0x3     @ r2 = wBitsPerSample (16)
+ced472: 930a         str    r3, [sp, #0x28]  @ nAvgBytesPerSec
+ced474: f8ad 202e    strh.w r2, [sp, #0x2e]  @ wBitsPerSample
+```
+Because `nAvgBytesPerSec == nBlockAlign * nSamplesPerSec`, this can be fixed cleanly in-place (exact same 20 bytes at flash `0x0ED464..0x0ED477`, followed by recomputing partition CRC-16 at `0x00D01C` — automated by [tools/patch_firmware.py](tools/patch_firmware.py) `--patch wav-blockalign`):
+```armasm
+ced464: 7bd2         ldrb   r2, [r2, #0xf]   @ r2 = bytesPerSample
+ced466: 4353         muls   r3, r2, r3       @ r3 = bytesPerSample * nChannels (nBlockAlign = 4!)
+ced468: 4358         muls   r0, r3, r0       @ r0 = nBlockAlign * sampleRate (nAvgBytesPerSec)
+ced46a: f8ad 302c    strh.w r3, [sp, #0x2c]  @ nBlockAlign = 4
+ced46e: 00d2         lsls   r2, r2, #0x3     @ r2 = wBitsPerSample (16)
+ced470: 900a         str    r0, [sp, #0x28]  @ nAvgBytesPerSec
+ced472: f8ad 202e    strh.w r2, [sp, #0x2e]  @ wBitsPerSample
+ced476: bf00         nop                     @ 2-byte pad
+```
+
+---
+
+## 7. Hardware Peripherals, `/dev/rtc` Struct & USB Clock Sync
+
+`FIRM` registers a POSIX-like `/dev/*` table including `/dev/audio0`, `/dev/audio1`, `/dev/lcd`, `/dev/tp`, `/dev/rtc`, `/dev/timer`, `/dev/pmu`, `/dev/wdog`, `/dev/sd`, `/dev/usbd`, `/dev/uart0..2`, `/dev/kadc_ch0..5`, `/dev/key_onoff`, `/dev/key_io`, `/dev/exti`, and `/dev/pwm_ch0..5`.
+
+### `/dev/rtc` Binary Layout & Direct HAL Entry Points (`0xD3B40C` / `0xD3B488`)
+Both `/dev/rtc` (`read`/`write` require `len >= 10`) and FatFs `get_fattime` (`0xD15084`) use a packed **10-byte `rtc_time_t`** struct:
+
+| Offset | Type | Field | Notes |
+| :--- | :--- | :--- | :--- |
+| `+0x00` | `u16` | `year` | Years since **2000** (e.g., `26` for `2026`; `rtc_write` adds `2000` for Zeller's congruence, `get_fattime` adds `20` for FAT 1980 epoch) |
+| `+0x02` | `u8` | `month` | `1..12` |
+| `+0x03` | `u8` | `day` | `1..31` |
+| `+0x04` | `u16` | `weekday` | `0..6` (auto-computed by `/dev/rtc` write at `0xD3B424..0xD3B474`) |
+| `+0x06` | `u8` | `hour` | `0..23` |
+| `+0x07` | `u8` | `minute` | `0..59` |
+| `+0x08` | `u8` | `second` | `0..59` |
+| `+0x09` | `u8` | `pad` | `0` |
+
+* **`HAL_rtc_get(rtc_time_t *out)`:** `0x0080D4E4` (in `.ramtext`, pure lock-free MMIO read via `*(uint32_t *)0x81A430`)
+* **`HAL_rtc_set(const rtc_time_t *in)`:** `0x00CE88D4` → `0x00CE898C` (pure lock-free MMIO write; automatically computes leap-year bit 24)
+* **Cached RAM copy:** `0x00821216` (refreshed every 1000 ms by `sync_rtc` timer `0xD15030`)
+* **Zero-flash USB RTC Sync ([tools/usb_rtc_sync.py](tools/usb_rtc_sync.py)):** In normal `301a:2801` Card Reader mode, `usb_rtc_sync.py` writes a 20–28 byte Thumb-2 stub into the unused upper half of Boot ROM's 512-byte USB MSC data buffer (`0x00800E80`) via `0xC0` `WRITERAM` (`0x09`) and executes it via `RUNRAM` (`0x0A`), setting `*(uint16_t *)0x00800DEE = 10` on reads to return the live `rtc_time_t` from `0x00800DF0` without modifying flash.
+
+---
+
+## 8. CPU1 Co-Processor Boot & Mailbox (`0xCE7370..0xCE73CC`)
+
+`FIRM` boots CPU1 (`0xCE73A8`) through three 32-bit mailbox words in CPU1 SRAM (`0x30000600`):
+1. `*(uint32_t *)0x30000600 = 0x00CE7371` — CPU1 trampoline address (read by Boot ROM when `CPU_ID != 0`).
+2. `*(uint32_t *)0x30000604 = cfg->stack` — initial `SP` for CPU1.
+3. `*(uint32_t *)0x30000608 = cfg->entry` — CPU1 payload entry point.
+4. Calls Boot ROM reset/wake helpers `0x2570(0)` and `0x2564(0)`.
+
+On wake, CPU1 executes the trampoline at `0x00CE7370`, sets `SP` from `0x30000604`, enables the **Cortex-M4F FPU** (`CPACR` `0xE000ED88 |= 0x00F00000`, confirming CPU1 is also a Cortex-M4F with FPU), writes `0x8` to `0x40000060`, and branches to `*(uint32_t *)0x30000608`.
+
+---
+
+## 9. Audio Capture, DSP & `PHONERECORD` Pipeline
+
+### 9.1 `/dev/audio0` (DAC) & `/dev/audio1` (ADC) Unified Driver (`0x00D3A6E8..0x00D3ABFC`)
+Both `/dev/audio0` (`0x00CB9A3C`, `arg=0`) and `/dev/audio1` (`0x00CB9A48`, `arg=1`) share a single factory function `audio_dev_init(uint32_t dev_id)` at **`0x00D3A984`** (flash `0x13A984`), which allocates a `0x7C`-byte handle and configures the codec via `HAL_audio_ioctl(1, cmd, val)` (`0x00D3C186`) and `HAL_audio_open(1, dir, cfg)` (`0x00D3C1B2`):
+
+| Device | `dev_id` | Vtable (`open`, `close`, `read`/`write`, `ioctl`) | Key Hardware Behavior |
+| :--- | :--- | :--- | :--- |
+| **`/dev/audio0`** (Playback / DAC) | `0` | `open=0xD3AAC1`, `close=0xD3A941`, `write=0xD3A911`, `ioctl=0xD3A6E9` | Defaults `AMIC1_GAIN=28` (`0x1C`), `AMIC2_GAIN=84` (`0x54`). On `open`: if `sample_rate <= 16000`, instantiates an upsampler (`0xD3BE44`) to **48,000 Hz**; if `channels == 1`, enables `mono_to_stereo` (`+0x74 = 1`) with a stereo-duplication buffer (`+0x78`). Opens DAC via `HAL_audio_open(1, 1, cfg)`. |
+| **`/dev/audio1`** (Capture / ADC) | `1` | `open=0xD3A7A9`, `close=0xD3A78D`, `read=0xD3A6ED` (`b.w 0x813604`), `ioctl=0xD3A6E9` | On `open` (2 ch): uses default `AMIC1_GAIN=28` / `AMIC2_GAIN=84` if `[handle+0x3C]==0`, or scales `AMIC1_GAIN = gain * 1.5` and `AMIC2_GAIN = gain * 2.0`. Enables ADC bias (`0x60=1`, `0x5F=1`), routes mic input via `mic_sel` (`0xD3A6F2`), and opens ADC via `HAL_audio_open(1, 2, cfg)`. |
+
+* Higher-level `audio_crab` plugins (`reader.pcm` / `recopcm` at `0x00D3DD70`, `writer.pcm` / `spkr` at `0x00D3DE40`) wrap `/dev/audio1` and `/dev/audio0`; `writer.pcm` also opens `/dev/exti` (`0x00D3DEDC`) for headphone-jack presence detection (`earphoone_exist`).
+
+### 9.2 `PSMP` `record` Struct (28 Bytes) & Bitrate / Sample-Rate Table (`0x00CEFD08`)
+The recording config builder **`0x00CEFD08`** (flash `0x0EFD08`, reading cached `PSMP` `record` from RAM `0x0081B9C8`) decodes the exact 28-byte `record` struct:
+
+| Offset | Type | Field | Dump Value | Meaning |
+| :--- | :--- | :--- | :--- | :--- |
+| `+0x00` | `u8` | `kbps_mode` | `0x00` | `0` = **512 kbps**, `1` = **1536 kbps**, `2` = **3072 kbps** |
+| `+0x01` | `u8` | `monitor` | `0x00` | `1` = Enable headphone monitoring (`flags |= 0x0C` vs `0x04`) |
+| `+0x02` | `u8` | `denoise` | `0x00` | Noise-reduction / ENC level (`0` = off; presets `2`, `3`, `4` in `0xD16CF0`) |
+| `+0x03` | `u8` | `segment_mode` | `0x03` | File split duration index (`3` = **120 min**, producing `*-120min.wav`) |
+| `+0x04` | `u8` | `vad_enable` | `0x00` | `1` = Enable VAD (`flags |= 0x10`; **only honored when `kbps_mode == 0`**) |
+| `+0x08` | `u16[2]` | `sched_start` | `8, 30` | Scheduled recording start (`08:30`) |
+| `+0x0C` | `u16[2]` | `sched_end` | `9, 30` | Scheduled recording end (`09:30`) |
+| `+0x14` | `u8` | `extra_flag` | `0x01` | `1` = Sets `flags |= 0x40` (**only honored when `kbps_mode == 0`**) |
+| `+0x18` | `u32` | `param_18` | `0` | Copied to `[cfg + 0x0C]` |
+
+| `kbps_mode` | UI Label | Packed Format (`[cfg+0x1C]`) | Sample Rate | Ch | Bit Depth | Bitrate | Mic Gain | VAD Allowed |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **`0`** | `512kbps` | `0x02023E80` | `16,000 Hz` | 2 | 16-bit | **512 kbps** | `0x22` (`34`) | Yes |
+| **`1`** | `1536kbps` | `0x0202BB80` | `48,000 Hz` | 2 | 16-bit | **1536 kbps** | `0x24` (`36`) | No |
+| **`2`** | `3072kbps` | `0x0402BB80` | `48,000 Hz` | 2 | 32-bit | **3072 kbps** | `0x24` (`36`) | No |
+
+### 9.3 DSP: VAD (`enc.vad`), Denoise (ENC/AENC), TX AGC & TX EQ
+* **VAD (`enc.vad`, `0x00CECC64..0x00CECE28`):** Allocates a `0x6460`-byte context with a **24-frame × 512-byte (12 KB) pre-roll ring buffer** at `+0x60`. Opens the XIP VAD engine (`0x00D6BB94`, `frame_samples=128`) with `-40` / `-20` dBFS thresholds (`0x00D6C154`, cmd `0x1002`), downmixes stereo to mono (`0x000012D4`), and tracks speech via a **30-bit sliding hangover bitmask** at `[ctx+0x58]`.
+* **Denoise (ENC/AENC) + TX AGC + 4-Band TX EQ (`0x00D16CF0..0x00D17200`):** Configures the DSP via `0x00D6CFE8` / `0x00D6CF42` with ioctls `0xA800` (AENC/ENC noise suppression, `-15`/`-20` dB, `+6`/`+9` dB), `0xA801` (TX AGC), and `0xA802` (4-band TX EQ at `350 / 1500 / 2200 / 3500 Hz`). Recording ENC is initialized at `0x00D16CF0`; HFP Phone AENC at `0x00D16F48(sample_rate)` branches on `8000 Hz` (CVSD) vs `16000 Hz` (mSBC).
+* **Dynamic Fast-RAM DSP Overlay (`0x00D40B08..0x00D40B88`):** Loads active DSP kernels from flash (`0x00E030 + offset`) into SRAM **`0x00805C40`** on demand, invoked per frame by the AENC plugin (`0xD3C6CC`).
+
+### 9.4 `PHONERECORD` Bluetooth HFP/SCO Mixing & Recording Path
+* During an active HFP SCO call (`PHONEPLAY`, state `0x31`), `0x00D14DC4` sends `audio_crab_control(crab, 0x108, 1, 0, filepath)` to transition into **`PHONERECORD` (state `0x32`)**.
+* The HFP plugin (`0x00D3C5CC..0x00D3C710`) processes 768-byte 3-channel 16-bit frames (`ch0` = far-end SCO RX reference, `ch1..2` = dual-mic near-end TX), runs the SRAM AENC/AEC/AGC/EQ kernel (`0x00805C40`), interleaves processed `[RX, TX]` into a 512-byte stereo frame, and pushes it to `call_save_push` (`0x00D40A08`).
+* FreeRTOS task **`"call save process"`** (`0x00D40958..0x00D40A04`) performs **Q15 saturating mono summation** of `RX + TX` (`(rx << 15) + (tx << 15)`, clamped to `[-0x40000000, +0x7FFFFFFE]`), duplicates the mixed sample to both L/R channels (dual-mono stereo), and writes it via `writer.wav` (`WriteWav` at `0x00CED1F4`).
+
+---
+
+## 10. Media Database (`0:\DBROOT\db_wave.db` & `db_content.db`)
+
+Verified against `dumps/sdcard_backup/DBROOT/{db_wave.db,db_content.db}` and `FIRM`'s database routines (`0x00D42A1C..0x00D42AC6`, `0x00D47C70..0x00D48258`):
+
+### 10.1 `0:\DBROOT\db_wave.db` — Headerless `N × 510`-Byte Record Array
+* **No file header:** Flat array of **`N × 510` (`0x1FE`) bytes** (`N = db_content.wave_count`, hard-capped at **5,000 records** at `0x00D47FAA`).
+* **510-Byte Record Layout** (`db_wave_append_record` at `0x00D47C70`):
+  * `+0x000` (`char[255]`): NUL-terminated, zero-padded FatFs path (e.g. `"0:\record\20250907-234610-120min.wav"`).
+  * `+0x0FF` (`char[255]`): NUL-terminated, zero-padded basename (e.g. `"20250907-234610-120min.wav"`).
+* Sorting (`0x00D47E3C`) and deletion (`0x00D4819C`) rewrite via temporary `0:\DBROOT\db_sort.db` followed by `f_unlink` + `f_rename`.
+
+### 10.2 `0:\DBROOT\db_content.db` — Serialized `db_content_t` Master Index (`696` Bytes)
+* **Save (`0x00D42A1C`)** writes the entire `0x2B8`-byte (696 B) in-memory `db_content_t` struct verbatim to disk (leaking live XIP/SRAM pointers at `+0x54..+0x5F` and the 600-byte FatFs `FIL` struct at `+0x60..+0x2B7`). **Load (`0x00D42A98`)** safely reads back only the first **`0x4C` (76) bytes**:
+
+| Offset | Size | Field | Value in Dump | Meaning |
+| :--- | :--- | :--- | :--- | :--- |
+| `+0x00` | `4` | `header_ver` | `0e 02 00 01` | Database header / version bytes |
+| `+0x04` | `4` | `dirty_flags` | `0x00000200` | Dirty bitmask (bit 6 `0x40` = `db_wave.db` dirty) |
+| `+0x10` | `4` | `free_clst` | `0x000746AB` (`476,843`) | Snapshot of FAT free clusters (compared on boot to detect external USB/SD edits) |
+| `+0x2C` | `4` | `wave_count` | `4` | Number of 510-byte records in `db_wave.db` (max `5,000`) |
+| `+0x54..+0x5F` | `12` | `callbacks[2], mutex` | `0xD15535`, `0xD1BB29`, `0x8358D0` | Leaked runtime XIP/SRAM pointers (not loaded back) |

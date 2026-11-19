@@ -33,6 +33,7 @@ Run from the **repo root**, e.g. `python3 tools/fw_analysis/analyze_fw.py`.
 | `disasm_sdp_sdio_psmp.py` | `PSMP nv_set` routine, SDP service records (Handsfree `0x111E`, AudioSource `0x110A`, …) |
 | `disasm_usb_bt.py` | Bootloader `boot--->firmware_header_len` loader path, BootROM USB SCSI + `0xC0` handler |
 | `disasm_usb_ops_and_bt.py` | FIRM USB MSC ops callbacks in `.ramtext`, SD read/write registered callbacks |
+| `disasm_update_wav_rtc_cpu1.py` | CRC-16/CCITT-FALSE verification (`HLKJ`/bootloader/`FIRM`), bootloader `sdupdate` (`0:\update.up`), WAV `blockAlign` bug, `/dev/rtc`, and CPU1 boot trampoline |
 | `final_checks.py` | `HAL_sd_disk_read`, raw SDP records + query patterns |
 | `find_bt_xrefs.py` | Cross-references into the BT host stack |
 | `inspect_details.py` | All strings in the BT host stack (`0x0D6700..0x0DD400`) and CLI strings |
