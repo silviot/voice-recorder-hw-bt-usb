@@ -189,6 +189,48 @@ class XRecRFCOMMClient:
         if line != "+XREC:OK,RECSTOP":
             raise RuntimeError(f"Failed to stop recording: {line}")
 
+    def reboot(self) -> None:
+        self._send_cmd("+XREC:REBOOT")
+        line = self._read_line()
+        if line != "+XREC:OK,REBOOT":
+            raise RuntimeError(f"Failed to reboot: {line}")
+
+    def ota_upload_and_flash(self, update_up_path: Path, chunk_size: int = 440) -> None:
+        """Upload 0:\\update.up over Bluetooth (+XREC:PUT) and trigger zero-button OTA (+XREC:OTA)."""
+        data = update_up_path.read_bytes()
+        total = len(data)
+        t0 = time.monotonic()
+        offset = 0
+        assert self.sock is not None
+
+        while offset < total:
+            chunk = data[offset : offset + chunk_size]
+            crc = crc16_ccitt_false(chunk)
+            header = f"+XREC:PUT,{offset},{len(chunk)},{crc},OTA:".encode("ascii")
+            for attempt in range(3):
+                self.sock.sendall(header + chunk)
+                resp = self._read_line()
+                if resp == f"+XREC:OK,PUT,{offset},{len(chunk)}":
+                    break
+                if attempt == 2:
+                    raise RuntimeError(f"OTA PUT failed at offset {offset}: {resp}")
+                print(f"\n  Retry {attempt + 1} at offset {offset}: {resp}")
+            offset += len(chunk)
+            elapsed = max(time.monotonic() - t0, 0.001)
+            rate = (offset / 1024.0) / elapsed
+            pct = offset * 100.0 / total
+            print(
+                f"\r  OTA upload: {offset:,}/{total:,} B ({pct:5.1f}%) @ {rate:5.1f} KB/s",
+                end="",
+                flush=True,
+            )
+        print("\nUpload complete! Triggering bootloader SD-OTA (+XREC:OTA)...")
+        self._send_cmd("+XREC:OTA")
+        resp = self._read_line()
+        if resp != "+XREC:OK,OTA":
+            raise RuntimeError(f"OTA trigger failed: {resp}")
+        print("Device acknowledged +XREC:OTA — rebooting to flash 0:\\update.up and auto-boot new firmware!")
+
     def get_stat(self) -> Dict[str, int]:
         self._send_cmd("+XREC:STAT")
         line = self._read_line()
@@ -313,6 +355,8 @@ def main() -> None:
     parser.add_argument("--stat", action="store_true", help="Query battery %%, voltage, charge state, recording state & SD free space")
     parser.add_argument("--rec-start", nargs="?", const="", metavar="FILENAME", help="Start a local stereo WAV recording (optional custom filename)")
     parser.add_argument("--rec-stop", action="store_true", help="Stop an active local stereo WAV recording")
+    parser.add_argument("--reboot", action="store_true", help="Cleanly reboot the device over Bluetooth (+XREC:REBOOT)")
+    parser.add_argument("--ota", type=Path, metavar="UPDATE_UP", help="Upload 0:\\update.up over Bluetooth (+XREC:PUT) and auto-flash (+XREC:OTA)")
     parser.add_argument(
         "--burst-size",
         type=int,
@@ -363,6 +407,13 @@ def main() -> None:
         if args.rec_stop:
             client.rec_stop()
             print("Stopped local stereo recording.")
+            return
+        if args.reboot:
+            client.reboot()
+            print("Device rebooting...")
+            return
+        if args.ota:
+            client.ota_upload_and_flash(args.ota)
             return
 
         files = client.list_files()

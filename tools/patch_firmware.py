@@ -112,14 +112,16 @@ PATCHES: dict[str, BinaryPatch] = {
     "bt-autoboot": BinaryPatch(
         name="bt-autoboot",
         description=(
-            "Auto-enable Bluetooth stack on every boot (pstr_bt_nv_read @ 0x00CF0EC6 / flash 0x0F0EC6): "
-            "NOP the cbz around bt_open_stack() so BT starts automatically after power-off or Charge & Transfer."
+            "Auto-enable Bluetooth stack on every boot strictly AFTER the 'welcome' splash screen "
+            "is dismissed (watch_presenter_entry @ 0x00CFBD8A / flash 0x0FBD8A): redirect "
+            "bl soft_timer_reset('pstr') (0x00D1BCD4) to XIP bt_autoboot_post_welcome (0x00D74010). "
+            "Requires --xip-payload compiled from fw_mod/bt_filesync.c."
         ),
         hunks=(
             PatchHunk(
-                flash_offset=0x0F0EC6,  # VMA 0x00CF0EC6: cbz r3, 0xcf0ecc -> nop
-                original=bytes.fromhex("0b b1"),
-                replacement=bytes.fromhex("00 bf"),
+                flash_offset=0x0FBD8A,  # VMA 0x00CFBD8A: bl 0x00D1BCD4 -> bl 0x00D74010
+                original=bytes.fromhex("1f f0 a3 ff"),
+                replacement=bytes.fromhex("78 f0 41 f9"),
             ),
         ),
     ),

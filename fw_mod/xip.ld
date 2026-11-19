@@ -10,6 +10,9 @@ SECTIONS
 {
     .text 0x00D74000 : {
         KEEP(*(.text.entry))
+        . = ALIGN(4);
+        . = 0x00D74010;
+        KEEP(*(.text.autoboot))
         *(.text .text.*)
         *(.rodata .rodata.*)
         . = ALIGN(4);

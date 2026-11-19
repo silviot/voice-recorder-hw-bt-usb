@@ -76,9 +76,22 @@
 #define f_open                FW_FN(0x00D4C280, int,      (void *fp, const char *path, uint8_t mode))
 #define f_lseek               FW_FN(0x00D4B6BE, int,      (void *fp, uint64_t ofs))
 #define f_read                FW_FN(0x00D4B308, int,      (void *fp, void *buff, uint32_t btr, uint32_t *br))
+#define f_write               FW_FN(0x00D4B4C6, int,      (void *fp, const void *buff, uint32_t btw, uint32_t *bw))
 #define f_close               FW_FN(0x00D4C750, int,      (void *fp))
 #define f_unlink              FW_FN(0x00D4BDDA, int,      (const char *path))
 #define f_getfree             FW_FN(0x00D4BCBC, int,      (const char *path, uint32_t *nclst, void **fatfs))
+
+/* Timer, PMU, Reboot & Post-Welcome BT Autoboot (from 01_autoboot_ota_idle.md) */
+#define fw_timer_reset        FW_FN(0x00D1BCD4, int,      (const char *name))
+#define bt_open_stack         FW_FN(0x00D66E14, void,     (void))
+#define HAL_pmu_sd_upd_set    FW_FN(0x00CE84B0, void,     (int en))
+#define do_reboot_mode        FW_FN(0x00CEE05C, void,     (void))
+#define STR_IDLESHUT          ((const char *)0x00C4B944u) /* "idleshut" */
+#define STR_SCREEN            ((const char *)0x00CB0EFCu) /* "screen"   */
+
+#define FA_WRITE              0x02u
+#define FA_CREATE_ALWAYS      0x08u
+#define FA_OPEN_ALWAYS        0x10u
 
 /* Media / Local Stereo Recorder (thread-safe xQueueSend to Media Task ID 8) */
 #define media_get_status          FW_FN(0x00D1AB1C, uint8_t,  (void))
@@ -590,11 +603,105 @@ static void handle_stat(void *hf)
     oal_free(resp);
 }
 
-/*
- * Entry point placed at exact VMA 0x00D74000 via section ".text.entry".
- */
-__attribute__((section(".text.entry"), used))
-uint32_t bt_filesync_hook(void *hf, const uint8_t *data, uint16_t len)
+static void handle_put(void *hf, const uint8_t *args, uint16_t args_len)
+{
+    /* Binary upload frame for 0:\update.up (OTA) or 0:\record\<file>:
+     *   +XREC:PUT,<offset_dec>,<len_dec>,<crc16_dec>,<dest_tag>:<raw_bytes>
+     *   dest_tag: "OTA" -> "0:\update.up"
+     */
+    const uint8_t *p = args;
+    const uint8_t *end = args + args_len;
+
+    uint32_t offset = parse_u32(p, end, &p);
+    if (p >= end || *p != ',') {
+        send_str(hf, "+XREC:ERR,PUTARG1\r\n");
+        return;
+    }
+    p++;
+
+    uint32_t data_len = parse_u32(p, end, &p);
+    if (p >= end || *p != ',') {
+        send_str(hf, "+XREC:ERR,PUTARG2\r\n");
+        return;
+    }
+    p++;
+
+    uint32_t exp_crc = parse_u32(p, end, &p);
+    if (p >= end || *p != ',') {
+        send_str(hf, "+XREC:ERR,PUTARG3\r\n");
+        return;
+    }
+    p++;
+
+    const uint8_t *colon = p;
+    while (colon < end && *colon != ':') {
+        colon++;
+    }
+    if (colon >= end || (uint32_t)(end - (colon + 1)) < data_len || data_len == 0 || data_len > 460u) {
+        send_str(hf, "+XREC:ERR,PUTLEN\r\n");
+        return;
+    }
+
+    const uint8_t *payload = colon + 1;
+    uint16_t calc_crc = crc16_ccitt_false(payload, data_len);
+    if (calc_crc != (uint16_t)exp_crc) {
+        send_str(hf, "+XREC:ERR,PUTCRC\r\n");
+        return;
+    }
+
+    if (!starts_with(p, (uint16_t)(colon - p), "OTA")) {
+        send_str(hf, "+XREC:ERR,PUTDST\r\n");
+        return;
+    }
+
+    uint8_t *fp = (uint8_t *)oal_malloc(FIL_ALLOC_SIZE);
+    char *resp = (char *)oal_malloc(64);
+    if (!fp || !resp) {
+        if (fp) oal_free(fp);
+        if (resp) oal_free(resp);
+        send_str(hf, "+XREC:ERR,ENOMEM\r\n");
+        return;
+    }
+
+    rom_memset(fp, 0, FIL_ALLOC_SIZE);
+    uint8_t mode = (offset == 0) ? (uint8_t)(FA_WRITE | FA_CREATE_ALWAYS) : (uint8_t)(FA_WRITE | FA_OPEN_ALWAYS);
+    int rc = f_open(fp, "0:\\update.up", mode);
+    if (rc != 0) {
+        fw_sprintf(resp, "+XREC:ERR,PUTOPEN,%d\r\n", rc);
+        send_str(hf, resp);
+        goto cleanup;
+    }
+
+    if (offset > 0) {
+        rc = f_lseek(fp, (uint64_t)offset);
+        if (rc != 0) {
+            f_close(fp);
+            fw_sprintf(resp, "+XREC:ERR,PUTSEEK,%d\r\n", rc);
+            send_str(hf, resp);
+            goto cleanup;
+        }
+    }
+
+    uint32_t bw = 0;
+    rc = f_write(fp, payload, data_len, &bw);
+    f_close(fp);
+
+    if (rc != 0 || bw != data_len) {
+        fw_sprintf(resp, "+XREC:ERR,PUTWR,%d,%u\r\n", rc, bw);
+        send_str(hf, resp);
+        goto cleanup;
+    }
+
+    fw_sprintf(resp, "+XREC:OK,PUT,%u,%u\r\n", offset, bw);
+    send_str(hf, resp);
+
+cleanup:
+    oal_free(resp);
+    oal_free(fp);
+}
+
+__attribute__((used))
+uint32_t bt_filesync_dispatch(void *hf, const uint8_t *data, uint16_t len)
 {
     /* Fast path: skip leading CR/LF/spaces */
     const uint8_t *p = data;
@@ -607,6 +714,10 @@ uint32_t bt_filesync_hook(void *hf, const uint8_t *data, uint16_t len)
     if (!starts_with(p, rem, "+XREC:")) {
         return orig_hfp_parse_at_cmd(hf, data, len);
     }
+
+    /* Reset idle auto-power-off and screen-off timers on every +XREC packet */
+    fw_timer_reset(STR_IDLESHUT);
+    fw_timer_reset(STR_SCREEN);
 
     p += 6;
     rem -= 6;
@@ -629,10 +740,38 @@ uint32_t bt_filesync_hook(void *hf, const uint8_t *data, uint16_t len)
         handle_recstop(hf);
     } else if (starts_with(p, rem, "STAT")) {
         handle_stat(hf);
+    } else if (starts_with(p, rem, "PUT,")) {
+        handle_put(hf, p + 4, (uint16_t)(rem - 4));
+    } else if (starts_with(p, rem, "OTA")) {
+        send_str(hf, "+XREC:OK,OTA\r\n");
+        HAL_pmu_sd_upd_set(1);
+        do_reboot_mode();
+    } else if (starts_with(p, rem, "REBOOT")) {
+        send_str(hf, "+XREC:OK,REBOOT\r\n");
+        do_reboot_mode();
     } else {
         send_str(hf, "+XREC:ERR,CMD\r\n");
     }
 
     /* Return 0 -> _hfp_hf_slc_open_status jump table[0] exits cleanly to 0xD624E8 */
     return 0;
+}
+
+/*
+ * Fixed-address entry trampolines:
+ *   0x00D74000: bt_filesync_hook        (hooked from 0x00D625E2)
+ *   0x00D74010: bt_autoboot_post_welcome (hooked from 0x00CFBD8A, strictly after "welcome" is dismissed)
+ */
+__attribute__((section(".text.entry"), used, naked))
+void bt_filesync_hook(void)
+{
+    __asm__ volatile ("b.w bt_filesync_dispatch");
+}
+
+__attribute__((section(".text.autoboot"), used))
+int bt_autoboot_post_welcome(const char *timer_name)
+{
+    int rc = fw_timer_reset(timer_name);
+    bt_open_stack();
+    return rc;
 }
