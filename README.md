@@ -154,7 +154,7 @@ There are three key open-source projects targeting the **Smartlink SL6801 / SL68
 
 ## 6. Firmware & Boot ROM Analysis (`HW_76` / `pen133_2.0.65`)
 
-Using `smtlink_dump --id 301a:2801` in Card Reader mode, the **2 MB SPI NOR flash** (`dumps/firmware_2M.bin`) and **64 KB internal Boot ROM** (`dumps/bootrom_64K.bin`) can be dumped locally and inspected with [`tools/inspect_fw.py`](tools/inspect_fw.py). The full Thumb-2 disassembly walkthrough and protocol reference derived from these dumps lives in **[firmware_analysis.md](firmware_analysis.md)**.
+Using `smtlink_dump --id 301a:2801` in Card Reader mode, the **2 MB SPI NOR flash** (`dumps/firmware_2M.bin`) and **64 KB internal Boot ROM** (`dumps/bootrom_64K.bin`) can be dumped locally and inspected with [`tools/inspect_fw.py`](tools/inspect_fw.py). The full Thumb-2 disassembly walkthrough and protocol reference derived from these dumps lives in **[firmware_analysis.md](firmware_analysis.md)**, and the exploratory one-off scripts that produced it are preserved in [`tools/fw_analysis/`](tools/fw_analysis/).
 
 ### 1. Flash Image Structure & Checksums (`inspect_fw.py`)
 ```text

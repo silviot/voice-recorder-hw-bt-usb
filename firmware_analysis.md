@@ -5,6 +5,8 @@ This document synthesizes a clean-room binary and Thumb-2 disassembly analysis o
 > [!NOTE]
 > Device-specific identifiers (the unit's Bluetooth MAC, factory serial string, and paired-device MAC addresses) are redacted in this public repository (`XX:XX:XX:XX:XX:xx`). Read the live values from your own dump's `PSMP` partition (see §2) or via `bluetoothctl`.
 
+> The exploratory one-off scripts that produced this analysis (PSMP parser, `llvm-objdump` ELF-wrapper disassemblers, string/xref scanners) are preserved in [`tools/fw_analysis/`](tools/fw_analysis/).
+
 ---
 
 ## 1. Dual-Core SoC, Boot ROM & Complete Memory Map
