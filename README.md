@@ -254,6 +254,52 @@ python3 tools/bt_companion.py --mode record-stream --duration 30 --dest ~/Record
 
 ---
 
+## 9. Custom XIP Extension: Bluetooth File Transfer, Casual-User Security & Wireless OTA
+
+Using the unused SPI NOR XIP flash region at `0x00D74000` (flash `0x174000`), [`fw_mod/bt_filesync.c`](fw_mod/bt_filesync.c) + [`tools/patch_firmware.py`](tools/patch_firmware.py) + [`tools/bt_sync.py`](tools/bt_sync.py) add a complete, authenticated `+XREC:` protocol over Classic Bluetooth RFCOMM Channel 1 (alongside standard HFP):
+
+### Firmware Patches (`tools/patch_firmware.py`)
+| Patch | Hook / Address | What It Does |
+| :--- | :--- | :--- |
+| `sdio-end-of-disk` | `0x042452`, `0x042A20` | Fixes the root-cause SDIO `CMD18`/`CMD12` end-of-disk read bug in `FIRM`. |
+| `wav-blockalign` | `0x0ED44C` | Fixes stereo WAV header `nBlockAlign` (`2` → `4`). |
+| `bt-autoboot` | `0x0FBD8A` → `0xD74010` | Auto-enables Bluetooth strictly *after* the `"welcome"` splash dismisses. |
+| `bt-invisible-boot` | `0x15D47A` | Boots connectable-only (`Page Scan` ON, `Inquiry Scan` OFF) so paired phones reconnect instantly while nearby scans cannot discover `HW_76`. |
+| `bt-pair-menu` | `0x0FFA56` → `0xD74020` | Opening the recorder's **Bluetooth** menu opens a 60-second physical-presence pairing window, temporarily enables discoverability, and renders a yellow **`PIN: XXXXXX`** banner on the LCD via LVGL. |
+| `--xip-payload` | `0x1625E2` → `0xD74000` | Installs [`fw_mod/bt_filesync.c`](fw_mod/bt_filesync.c) (`+XREC:` handler: `PING`, `CHAL`, `PAIR`, `AUTH`, `LS`, `GET`, `GETS`, `DEL`, `RTC`, `RECSTART`, `RECSTOP`, `STAT`, `PUT`, `OTA`, `REBOOT`) + idle/screen timer keep-alive. |
+
+### Casual-User Security Model (v5)
+* **Same generic firmware for every device** — no per-user compiled secrets or config files.
+* **Locked by default:** Every privileged command (`LS`, `GET`, `DEL`, `RTC`, `RECSTART`, `STAT`, `PUT`, `OTA`, `REBOOT`) returns `+XREC:ERR,LOCKED` until the client completes a per-connection **HMAC-SHA256** challenge-response (`+XREC:CHAL` → `+XREC:AUTH`).
+* **Physical-Presence 6-Digit PIN Binding:** Opening the **Bluetooth** menu on the recorder displays a random 6-digit PIN on the LCD for 60 seconds (max 5 attempts) and enables Bluetooth discoverability. The app sends `+XREC:PAIR,<PIN>,<64-hex-key>`; the recorder verifies the PIN in constant time, persists the 256-bit key in `PSMP` NVRAM (`"xrec_key"`, survives reboots and future wireless OTAs), closes the pairing window, and turns discoverability back OFF.
+
+### Build, Pair, Sync & Wireless OTA
+```bash
+# 1. Compile the Thumb-2 XIP extension (zero .data/.bss)
+clang --target=thumbv7em-none-eabi -mcpu=cortex-m4 -mfloat-abi=soft -mthumb -Os \
+  -ffreestanding -fno-builtin -fno-stack-protector -c fw_mod/bt_filesync.c -o /tmp/bt_filesync.o
+ld.lld -T fw_mod/xip.ld /tmp/bt_filesync.o -o /tmp/bt_filesync.elf
+llvm-objcopy -O binary /tmp/bt_filesync.elf /tmp/bt_filesync.bin
+
+# 2. Patch your local dump and generate both a 2 MB flash image and a 0:\update.up OTA package
+python3 tools/patch_firmware.py dumps/firmware_2M.bin \
+  --out-bin dumps/firmware_2M_v5.bin --out-update-up dumps/update_v5.up \
+  --patch sdio-end-of-disk --patch wav-blockalign \
+  --patch bt-autoboot --patch bt-invisible-boot --patch bt-pair-menu \
+  --xip-payload /tmp/bt_filesync.bin --bump-timestamp --verify
+
+# 3. One-time pairing (open Bluetooth menu on recorder to see the 6-digit LCD PIN)
+python3 tools/bt_sync.py --mac XX:XX:XX:XX:XX:76 --pair 123456
+
+# 4. Everyday automatic sync, telemetry, RTC sync, remote recording, or wireless OTA
+python3 tools/bt_sync.py --mac XX:XX:XX:XX:XX:76 --stat
+python3 tools/bt_sync.py --mac XX:XX:XX:XX:XX:76 --rtc-sync
+python3 tools/bt_sync.py --mac XX:XX:XX:XX:XX:76 --dest ~/Recordings/HW_76
+python3 tools/bt_sync.py --mac XX:XX:XX:XX:XX:76 --ota dumps/update_v5.up
+```
+
+---
+
 ## License
 
 Code and documentation in this repository are released under the [MIT License](LICENSE). No proprietary firmware or Boot ROM binaries are distributed in this repository (users must extract any dumps locally from their own hardware).

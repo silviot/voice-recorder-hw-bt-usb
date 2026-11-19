@@ -14,7 +14,9 @@ SPDX-License-Identifier: MIT
 """
 import argparse
 import hashlib
+import hmac
 import json
+import os
 import re
 import socket
 import struct
@@ -27,8 +29,37 @@ from typing import Dict, List, Optional, Tuple
 
 
 DEFAULT_NAME_PREFIX = "HW_"
+DEFAULT_KEY_FILE = Path.home() / ".config" / "hw76-sync" / "keys.json"
 CHUNK_SIZE = 480  # 12 B header + 480 B = 492 B <= 512 B negotiated RFCOMM MTU (0x200)
 DEFAULT_BURST_SIZE = 1920  # 4 x 480 B frames per +XREC:GETS burst (safe within K=7 RFCOMM credit window)
+
+
+def load_device_key(key_file: Path, mac: str) -> Optional[bytes]:
+    if not key_file.is_file():
+        return None
+    try:
+        data = json.loads(key_file.read_text(encoding="utf-8"))
+        hex_key = data.get(mac.upper())
+        if isinstance(hex_key, str) and len(hex_key) == 64:
+            return bytes.fromhex(hex_key)
+    except Exception:
+        return None
+    return None
+
+
+def save_device_key(key_file: Path, mac: str, key: bytes) -> None:
+    key_file.parent.mkdir(parents=True, exist_ok=True)
+    data: Dict[str, str] = {}
+    if key_file.is_file():
+        try:
+            loaded = json.loads(key_file.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data = loaded
+        except Exception:
+            pass
+    data[mac.upper()] = key.hex()
+    key_file.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    os.chmod(key_file, 0o600)
 
 
 def crc16_ccitt_false(data: bytes, init: int = 0xFFFF) -> int:
@@ -140,6 +171,28 @@ class XRecRFCOMMClient:
         self._send_cmd("+XREC:PING")
         return self._read_line()
 
+    def pair(self, pin: str, key: bytes) -> None:
+        if len(pin) != 6 or not pin.isdigit():
+            raise ValueError("PIN must be exactly 6 digits")
+        if len(key) != 32:
+            raise ValueError("Key must be 32 bytes")
+        self._send_cmd(f"+XREC:PAIR,{pin},{key.hex()}")
+        resp = self._read_line()
+        if resp != "+XREC:OK,PAIR":
+            raise RuntimeError(f"Pairing failed: {resp}")
+
+    def authenticate(self, key: bytes) -> None:
+        self._send_cmd("+XREC:CHAL")
+        line = self._read_line()
+        if not line.startswith("+XREC:CHAL,"):
+            raise RuntimeError(f"Challenge failed: {line}")
+        nonce = bytes.fromhex(line[len("+XREC:CHAL,") :].strip())
+        mac_hex = hmac.new(key, nonce, hashlib.sha256).hexdigest()
+        self._send_cmd(f"+XREC:AUTH,{mac_hex}")
+        resp = self._read_line()
+        if resp != "+XREC:OK,AUTH":
+            raise RuntimeError(f"Authentication failed: {resp}")
+
     def list_files(self) -> List[Tuple[str, int]]:
         self._send_cmd("+XREC:LS")
         files: List[Tuple[str, int]] = []
@@ -191,9 +244,13 @@ class XRecRFCOMMClient:
 
     def reboot(self) -> None:
         self._send_cmd("+XREC:REBOOT")
-        line = self._read_line()
-        if line != "+XREC:OK,REBOOT":
-            raise RuntimeError(f"Failed to reboot: {line}")
+        try:
+            line = self._read_line()
+            if line != "+XREC:OK,REBOOT":
+                raise RuntimeError(f"Failed to reboot: {line}")
+        except (TimeoutError, ConnectionError, OSError):
+            # Device may reset the PMU/BT link immediately before the ACK flushes.
+            pass
 
     def ota_upload_and_flash(self, update_up_path: Path, chunk_size: int = 440) -> None:
         """Upload 0:\\update.up over Bluetooth (+XREC:PUT) and trigger zero-button OTA (+XREC:OTA)."""
@@ -357,6 +414,13 @@ def main() -> None:
     parser.add_argument("--rec-stop", action="store_true", help="Stop an active local stereo WAV recording")
     parser.add_argument("--reboot", action="store_true", help="Cleanly reboot the device over Bluetooth (+XREC:REBOOT)")
     parser.add_argument("--ota", type=Path, metavar="UPDATE_UP", help="Upload 0:\\update.up over Bluetooth (+XREC:PUT) and auto-flash (+XREC:OTA)")
+    parser.add_argument("--pair", metavar="PIN", help="Bind to recorder using the 6-digit PIN shown on its Bluetooth menu LCD (v5)")
+    parser.add_argument(
+        "--key-file",
+        type=Path,
+        default=DEFAULT_KEY_FILE,
+        help=f"Local JSON keystore for v5 device secrets (default: {DEFAULT_KEY_FILE})",
+    )
     parser.add_argument(
         "--burst-size",
         type=int,
@@ -377,6 +441,25 @@ def main() -> None:
         print(f"Ping response: {pong}")
         if args.ping:
             return
+
+        if args.pair:
+            new_key = os.urandom(32)
+            client.pair(args.pair.strip(), new_key)
+            save_device_key(args.key_file, mac, new_key)
+            print(f"Paired & bound {mac} successfully! Secret saved to {args.key_file} (0600).")
+            return
+
+        if ",v5," in pong:
+            key = load_device_key(args.key_file, mac)
+            if not key:
+                print(
+                    f"Recorder is locked (v5) and no key is stored for {mac} in {args.key_file}.\n"
+                    "Open the Bluetooth menu on the recorder to display the 6-digit PIN, then run:\n"
+                    f"  python3 tools/bt_sync.py --mac {mac} --pair <6-digit-PIN>"
+                )
+                sys.exit(2)
+            client.authenticate(key)
+            print("Authenticated (HMAC-SHA256 challenge-response OK).")
 
         if args.rtc_read:
             print(f"Device RTC: {client.read_rtc()}")

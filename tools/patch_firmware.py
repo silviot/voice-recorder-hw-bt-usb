@@ -128,14 +128,47 @@ PATCHES: dict[str, BinaryPatch] = {
     "bt-force-phone": BinaryPatch(
         name="bt-force-phone",
         description=(
-            "Force Bluetooth HFP phone mode (profile=0x400) on every boot "
-            "(bt_subsystem_init @ 0x00CEA132 / flash 0x0EA132): always take the 0x400 HFP branch."
+            "Force Bluetooth profile=0x400 branch in bt_subsystem_init @ 0x00CEA132 / flash 0x0EA132 "
+            "(Note: on pen133_2.0.65, 0x400 selects Music/A2DP mode; leave disabled to preserve "
+            "Phone/HFP mode saved in PSMP)."
         ),
         hunks=(
             PatchHunk(
                 flash_offset=0x0EA132,  # VMA 0x00CEA132: cbnz r0, 0xcea180 -> b 0xcea180
                 original=bytes.fromhex("28 bb"),
                 replacement=bytes.fromhex("25 e0"),
+            ),
+        ),
+    ),
+    "bt-invisible-boot": BinaryPatch(
+        name="bt-invisible-boot",
+        description=(
+            "Boot Bluetooth in connectable-only mode (Page Scan ON, Inquiry Scan OFF; "
+            "bt_host_init @ 0x00D5D47A / flash 0x15D47A): already-paired devices reconnect "
+            "instantly while nearby Bluetooth scans cannot discover HW_76. Combine with "
+            "bt-pair-menu so opening the Bluetooth menu temporarily enables discoverability."
+        ),
+        hunks=(
+            PatchHunk(
+                flash_offset=0x15D47A,  # VMA 0x00D5D47A: movw r3, #0x0101 -> movw r3, #0x0001
+                original=bytes.fromhex("40 f2 01 13"),
+                replacement=bytes.fromhex("40 f2 01 03"),
+            ),
+        ),
+    ),
+    "bt-pair-menu": BinaryPatch(
+        name="bt-pair-menu",
+        description=(
+            "Hook ViewTask page_bt_menu_create (@ 0x00CFFA56 / flash 0x0FFA56 -> 0x00D74020) "
+            "so opening the recorder's Bluetooth menu opens a 60-second physical-presence "
+            "pairing window, enables BT discoverability, and renders a 6-digit PIN banner "
+            "on the LCD via LVGL. Requires --xip-payload compiled from fw_mod/bt_filesync.c v5+."
+        ),
+        hunks=(
+            PatchHunk(
+                flash_offset=0x0FFA56,  # VMA 0x00CFFA56: bl 0x00D02D64 -> bl 0x00D74020
+                original=bytes.fromhex("03 f0 85 f9"),
+                replacement=bytes.fromhex("74 f0 e3 fa"),
             ),
         ),
     ),

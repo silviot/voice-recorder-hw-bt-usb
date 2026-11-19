@@ -13,6 +13,9 @@ SECTIONS
         . = ALIGN(4);
         . = 0x00D74010;
         KEEP(*(.text.autoboot))
+        . = ALIGN(4);
+        . = 0x00D74020;
+        KEEP(*(.text.pairmenu))
         *(.text .text.*)
         *(.rodata .rodata.*)
         . = ALIGN(4);
