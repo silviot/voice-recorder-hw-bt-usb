@@ -24,7 +24,7 @@ HOST_CFLAGS := -O2 -Wall -Wextra -Werror -Iinclude
 SRCS      := src/startup.c src/wdt_timer.c src/rtc.c src/uart.c src/pmu.c \
              src/keys.c src/lcd_st7735s.c src/sdio.c src/audio_dma.c \
              src/usb_scsi.c src/usb_musb.c src/bt_rf.c src/bt_spp.c \
-             src/xrec_proto.c src/recorder.c \
+             src/xrec_proto.c src/bt_hci.c src/recorder.c \
              src/crypto.c src/wav.c src/exfat.c src/main.c
 OBJS      := $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(SRCS))
 

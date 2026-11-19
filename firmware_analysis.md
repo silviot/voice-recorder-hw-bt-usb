@@ -657,3 +657,16 @@ Implemented and host-verified in [open_fw](open_fw/):
 * **Classic BR/EDR L2CAP + SDP + RFCOMM (`bt_spp.c`, `openfw_bt_spp.h`):** Allocation-free server with ACL L2CAP reassembly, signaling (`CID 0x0001`), strict SDP `ServiceSearchPattern` matching advertising SPP (`UUID 0x1101`) on RFCOMM Channel 1 (`"Cassini"`, `80`-byte attribute record), RFCOMM MUX (`DLCI 0`/`2`) with credit-based flow negotiation, direct TX queueing, and disconnect notifications to drop authentication state on link teardown.
 * **`+XREC v5` State Machine (`xrec_proto.c`, `openfw_xrec.h`):** Implements `PING`, `PAIR`, `CHAL`/`AUTH` (HMAC-SHA256 + constant-time comparison), `STAT`, `RTC` (read/write with range validation), coalesced `LS` (`/record`), `DEL`, `RECSTART`/`RECSTOP`, `REBOOT`, and streaming `GET`/`GETS` `"XREC"` binary frames (with CRC-16/CCITT-FALSE, 0-byte EOF framing, and credit-stall resume via `xrec_poll()`).
 * **Verification (`open_fw`):** `make -C open_fw test-host` (`6/6` host test suites + `exfat-img` + `fsck.exfat`) and `make -C open_fw` (`0` warnings; `.ram_boot` `1,508 B` / `4,096 B`, XIP `47,604 B`, FIRM `52,772 B`), plus `update-up` `4/4` CRC-16s `[OK]`.
+
+---
+
+## 23. OpenFW Layer 5d: Clean-Room `RW-BT` HCI Controller, IRQ 26 ISR & On-Device Classic BT `+XREC` Mode
+
+Implemented and verified in [open_fw](open_fw/):
+
+* **`TASK_HCI` (`0x3C`), `RWBT` IRQ 26 & Active-Link Hooks (`bt_hci.c`, `startup.c`, `sl6801_rom.h`):**
+  * `.ramtext` `RWBT_IRQHandler` at vector slot `42` (NVIC IRQ `26`) acknowledges `RWBT_INTSTAT` (`0x40020010` / `0x40020018`) and accumulates flags into a bottom-half `bt_irq_bh_poll()` dispatching BootROM `rwbt_cscnt_isr` (`0x0002F3A5`), `rwbt_rx_isr` (`0x0002F389`), and `ke_event_set(1)` (`0x00030DC1`).
+  * Implements the complete clean-room `RW-BT` environment using Mask ROM entry points plus verified hook tables: nested `PRIMASK` lock (`0x00803C1C`/`0x00803C20`), static 8 KiB block allocator (`0x008041CC`/`0x008041D0`), xorshift PRNG (`0x00803C24`), `ke_event` scheduler (`0x00804200`/`0x00804204`), `rwip_rf` vtable (`0x00803BDC`), active-link EM/CS hooks (`0x00802BB0[2..6]`, `0x00802904+0x00`, `0x008021BC`), event mask filter (`0x00803BBC[7]`), TX power/RSSI tables (`0x00802CF4`..`0x00802E94`), and `TASK_HCI` (`0x3C`) byte-repacking handler (`0xE47D` ACL RX, Command Complete/Status credit refill, and SSP/Classic events).
+* **On-Device Classic BT + SSP + `+XREC v5` Mode (`bt_hci.c`, `main.c`):**
+  * Press `KEY_RIGHT` while idle to calibrate BT RF (`bt_rf_init_calibrated`), bring up the BR/EDR controller with an eFuse-derived locally-administered `BD_ADDR` (`"Cassini_XX"`), handle Legacy/SSP Just-Works pairing (`0x040B..0x040E`, `0x042B`, `0x042C`) with a 4-slot RAM link-key cache, bridge ACL PDUs into `bt_spp` (`UUID 0x1101`, RFCOMM Ch 1), and serve `+XREC v5` with `KEY_ENTER` 60-second PIN pairing (`"PIN: XXXXXX"`) and `0:/cassini.key` (`"CSK5"` + 32 B key) persistence on SD root.
+* **Verification (`open_fw`):** `make -C open_fw clean && make -C open_fw test-host && make -C open_fw` (`0` warnings, `llvm-nm -u` zero undefined symbols; `.ram_boot` `1,536 B` / `4,096 B`, XIP `57,588 B`, FIRM `62,756 B`), `make -C open_fw update-up` (`123,392 B`), and `patch_firmware.py --verify` `4/4` CRC-16s `[OK]` (`0xC1E7`, `0x3244`, `0xC6FC`, `0xEDBE`).

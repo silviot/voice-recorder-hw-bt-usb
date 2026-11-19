@@ -140,4 +140,26 @@ void     bt_rf_init(uint32_t freq_drift, uint32_t vco_cal_10a4);
 void     bt_modem_init(uint32_t clk6_hz);
 uint32_t bt_rf_init_calibrated(uint32_t freq_drift, uint32_t clk6_hz);
 
+/* Classic BR/EDR Bluetooth Controller + SPP + +XREC v5 Service (bt_hci.c) */
+typedef struct {
+    uint8_t  active;
+    uint8_t  hci_ready;
+    uint8_t  acl_connected;
+    uint8_t  spp_open;
+    uint8_t  xrec_bound;
+    uint8_t  xrec_auth;
+    uint8_t  pair_active;
+    char     pair_pin[8];
+    uint32_t rx_acl_pkts;
+    uint32_t tx_acl_pkts;
+    uint8_t  bd_addr[6];
+    char     dev_name[16];
+} bt_status_t;
+
+int  bt_xrec_start(exfat_vol_t *vol, int sd_mounted);
+void bt_xrec_poll(void);
+void bt_xrec_stop(void);
+void bt_xrec_open_pairing(uint32_t duration_ms);
+void bt_xrec_get_status(bt_status_t *out);
+
 #endif /* OPENFW_H */

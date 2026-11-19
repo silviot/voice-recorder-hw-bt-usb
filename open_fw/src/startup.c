@@ -23,6 +23,7 @@ void _start(void);
 void reset_c_entry(void);
 void Default_Handler(void);
 void SysTick_Handler(void);
+void RWBT_IRQHandler(void) __attribute__((weak, alias("Default_Handler")));
 void DMAC_CH1_IRQHandler(void) __attribute__((weak, alias("Default_Handler")));
 
 __attribute__((section(".isr_vector"), used, aligned(512)))
@@ -40,7 +41,9 @@ const uint32_t g_isr_vector[96] = {
     0,
     (uint32_t)(uintptr_t)Default_Handler,  /* 14: PendSV */
     (uint32_t)(uintptr_t)SysTick_Handler,  /* 15: SysTick */
-    [16 ... 76] = (uint32_t)(uintptr_t)Default_Handler,
+    [16 ... 41] = (uint32_t)(uintptr_t)Default_Handler,
+    [42]        = (uint32_t)(uintptr_t)RWBT_IRQHandler,     /* IRQ 26: RW-BT Baseband */
+    [43 ... 76] = (uint32_t)(uintptr_t)Default_Handler,
     [77]        = (uint32_t)(uintptr_t)DMAC_CH1_IRQHandler, /* IRQ 61: DMAC CH1 */
     [78 ... 95] = (uint32_t)(uintptr_t)Default_Handler,
 };

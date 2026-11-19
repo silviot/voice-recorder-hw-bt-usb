@@ -247,6 +247,114 @@ static int run_usb_msc_mode(uint16_t col_bg, uint16_t col_cyan, uint16_t col_tex
     return manual_exit;
 }
 
+static void run_bt_xrec_mode(uint16_t col_bg, uint16_t col_cyan, uint16_t col_text,
+                             uint16_t col_green, uint16_t col_yellow, uint16_t col_dim)
+{
+    draw_line_padded(45u, "BT RF CAL...", col_yellow, col_bg);
+    draw_line_padded(57u, "", col_bg, col_bg);
+    draw_line_padded(69u, "", col_bg, col_bg);
+    draw_line_padded(81u, "", col_bg, col_bg);
+    draw_line_padded(93u, "", col_bg, col_bg);
+    draw_line_padded(105u, "", col_bg, col_bg);
+    draw_line_padded(118u, "", col_bg, col_bg);
+    draw_line_padded(131u, "", col_bg, col_bg);
+    draw_line_padded(147u, "WAIT...", col_dim, col_bg);
+
+    wdt_feed();
+    (void)bt_rf_init_calibrated(0x53u, 32000000u);
+    (void)bt_xrec_start(&g_exfat_vol, g_sd_mounted);
+
+    draw_line_padded(45u, "BT SPP +XREC", col_cyan, col_bg);
+    draw_line_padded(147u, "BACK=EXIT BT", col_yellow, col_bg);
+
+    uint32_t last_ui     = 0u;
+    int      exit_armed  = 0;
+    key_id_t prev_bt_key = KEY_NONE;
+
+    while (1) {
+        wdt_feed();
+        bt_xrec_poll();
+
+        uint32_t now = millis();
+        if ((uint32_t)(now - last_ui) >= 150u || last_ui == 0u) {
+            last_ui = now;
+
+            key_id_t k = keys_decode(keys_read_adc());
+            if (k == KEY_NONE) {
+                exit_armed = 1;
+            } else if (exit_armed && k == KEY_BACK) {
+                break;
+            } else if (exit_armed && k == KEY_ENTER && prev_bt_key != KEY_ENTER) {
+                bt_xrec_open_pairing(60000u);
+            }
+            prev_bt_key = k;
+
+            bt_status_t st;
+            bt_xrec_get_status(&st);
+
+            draw_line_padded(57u, st.dev_name, col_text, col_bg);
+
+            const char *link_str = "HCI INIT";
+            uint16_t    link_col = col_dim;
+            if (st.xrec_auth) {
+                link_str = "AUTH OK";
+                link_col = col_green;
+            } else if (st.spp_open) {
+                link_str = "SPP OPEN";
+                link_col = col_cyan;
+            } else if (st.acl_connected) {
+                link_str = "ACL CONN";
+                link_col = col_yellow;
+            } else if (st.hci_ready) {
+                link_str = "WAIT CONN";
+                link_col = col_dim;
+            }
+            draw_line_padded(69u, link_str, link_col, col_bg);
+
+            char line[24];
+            int pos = 0;
+            rtc_datetime_t dt;
+            rtc_get(&dt);
+            append_str(line, &pos, (int)sizeof(line), "CLK ");
+            append_2d(line, &pos, (int)sizeof(line), dt.hour);
+            append_str(line, &pos, (int)sizeof(line), ":");
+            append_2d(line, &pos, (int)sizeof(line), dt.minute);
+            append_str(line, &pos, (int)sizeof(line), ":");
+            append_2d(line, &pos, (int)sizeof(line), dt.second);
+            line[pos] = '\0';
+            draw_line_padded(81u, line, col_text, col_bg);
+
+            if (st.pair_active) {
+                pos = 0;
+                append_str(line, &pos, (int)sizeof(line), "PIN: ");
+                append_str(line, &pos, (int)sizeof(line), st.pair_pin);
+                line[pos] = '\0';
+                draw_line_padded(93u, line, col_yellow, col_bg);
+            } else {
+                draw_line_padded(93u, "ENT=PAIR 60s", col_yellow, col_bg);
+            }
+
+            pos = 0;
+            append_str(line, &pos, (int)sizeof(line), "RX: ");
+            append_u32(line, &pos, (int)sizeof(line), st.rx_acl_pkts);
+            line[pos] = '\0';
+            draw_line_padded(118u, line, col_text, col_bg);
+
+            pos = 0;
+            append_str(line, &pos, (int)sizeof(line), "TX: ");
+            append_u32(line, &pos, (int)sizeof(line), st.tx_acl_pkts);
+            line[pos] = '\0';
+            draw_line_padded(131u, line, col_text, col_bg);
+        }
+    }
+
+    bt_xrec_stop();
+    while (keys_decode(keys_read_adc()) == KEY_BACK) {
+        wdt_feed();
+        mdelay(20u);
+    }
+}
+
 int openfw_main(void)
 {
     const uint16_t col_bg     = rgb565(0u, 0u, 0u);
@@ -265,7 +373,7 @@ int openfw_main(void)
 
     /* Emit early UART0 banner before keys_init() switches PD0 to SARADC */
     uart0_init_115200();
-    uart0_puts("\n=== Cassini OpenFW (SL6801 Layer 5a: RTC + exFAT + WAV + Auto-USB) ===\n");
+    uart0_puts("\n=== Cassini OpenFW (SL6801 Layer 5d: RTC + exFAT + WAV + USB MSC + Classic BT +XREC) ===\n");
     uart0_puts("CPU=96MHz XIP=0x00C0F430 CPU_ID=");
     uart0_put_u32(SYSCTL_CPU_ID);
     uart0_puts(" VBAT_MV=");
@@ -366,6 +474,17 @@ int openfw_main(void)
                 last_slow_ui    = 0u;
                 continue;
             }
+            if (key == KEY_RIGHT && prev_key != KEY_RIGHT) {
+                run_bt_xrec_mode(col_bg, col_cyan, col_text, col_green, col_yellow, col_dim);
+                draw_line_padded(45u, "OpenFW 96M", col_hdr, col_bg);
+                format_sd_status(sd_line, (int)sizeof(sd_line), &sd_col, col_green, col_yellow, col_alert);
+                draw_line_padded(57u, sd_line, sd_col, col_bg);
+                draw_line_padded(147u, "HOLD BACK=USB", col_dim, col_bg);
+                prev_key        = KEY_NONE;
+                back_hold_ticks = 0u;
+                last_slow_ui    = 0u;
+                continue;
+            }
         }
         prev_key = key;
 
@@ -421,13 +540,13 @@ int openfw_main(void)
                 draw_line_padded(81u, line, col_text, col_bg);
             }
 
-            /* Row 4 (y=93): Record switch, charger state, or USB MSC prompt */
+            /* Row 4 (y=93): Record switch, charger state, or USB/BT prompt */
             if (rec_sw) {
                 draw_line_padded(93u, recorder_is_saving() ? "SAVING WAV" : "SW: REC ON", col_alert, col_bg);
             } else if (usb_charger_only) {
                 draw_line_padded(93u, "USB: CHG", col_yellow, col_bg);
             } else {
-                draw_line_padded(93u, g_sd_card.initialized ? "ENT=USB MSC" : "SW: SAVE", col_cyan, col_bg);
+                draw_line_padded(93u, g_sd_card.initialized ? "ENT=USB R=BT" : "R=BT SW=REC", col_cyan, col_bg);
             }
 
             /* Row 6 (y=118): Microphone peak % and ring overruns */
