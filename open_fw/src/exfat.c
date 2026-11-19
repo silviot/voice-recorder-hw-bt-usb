@@ -277,8 +277,15 @@ void exfat_set_timestamp(exfat_vol_t *vol, uint32_t dos_timestamp)
     }
 }
 
-typedef int (*exfat_dir_loc_cb_t)(const exfat_entry_t *entry, uint32_t entry_lba,
-                                  uint8_t entry_slot, void *user);
+typedef struct {
+    uint32_t cls;
+    uint32_t s;
+    uint32_t lba;
+    uint8_t  slot;
+    uint8_t  sec_cnt;
+} exfat_dir_loc_t;
+
+typedef int (*exfat_dir_loc_cb_t)(const exfat_entry_t *entry, const exfat_dir_loc_t *loc, void *user);
 
 static int list_dir_with_loc(const exfat_vol_t *vol, uint32_t dir_cluster, uint8_t no_fat_chain,
                              exfat_dir_cb_t cb, exfat_dir_loc_cb_t loc_cb, void *user)
@@ -294,8 +301,8 @@ static int list_dir_with_loc(const exfat_vol_t *vol, uint32_t dir_cluster, uint8
     uint8_t have_stream  = 0u;
     uint8_t name_len     = 0u;
     uint8_t name_pos     = 0u;
-    uint32_t prim_lba    = 0u;
-    uint8_t  prim_slot   = 0u;
+    exfat_dir_loc_t prim_loc;
+    mem_zero(&prim_loc, sizeof(prim_loc));
 
     uint32_t cls = dir_cluster;
     uint8_t sec[512];
@@ -324,8 +331,11 @@ static int list_dir_with_loc(const exfat_vol_t *vol, uint32_t dir_cluster, uint8
                     have_stream = 0u;
                     name_len = 0u;
                     name_pos = 0u;
-                    prim_lba = lba;
-                    prim_slot = (uint8_t)idx;
+                    prim_loc.cls     = cls;
+                    prim_loc.s       = s;
+                    prim_loc.lba     = lba;
+                    prim_loc.slot    = (uint8_t)idx;
+                    prim_loc.sec_cnt = d[1];
                     cur_ent.file_attr = le16(d + 4u);
                     cur_ent.is_dir    = (uint8_t)((cur_ent.file_attr & EXFAT_ATTR_DIR) != 0u);
                     cur_ent.name[0]   = '\0';
@@ -357,7 +367,7 @@ static int list_dir_with_loc(const exfat_vol_t *vol, uint32_t dir_cluster, uint8
                 if (sec_seen >= sec_expected) {
                     in_set = 0u;
                     if (have_stream && cur_ent.name[0] != '\0') {
-                        int stop = loc_cb ? loc_cb(&cur_ent, prim_lba, prim_slot, user)
+                        int stop = loc_cb ? loc_cb(&cur_ent, &prim_loc, user)
                                           : cb(&cur_ent, user);
                         if (stop != 0) {
                             return 0;
@@ -383,22 +393,20 @@ int exfat_list_dir(const exfat_vol_t *vol, uint32_t dir_cluster, uint8_t no_fat_
 }
 
 typedef struct {
-    const char   *target;
-    uint32_t      target_len;
-    exfat_entry_t result;
-    uint32_t      entry_lba;
-    uint8_t       entry_slot;
-    int           found;
+    const char     *target;
+    uint32_t        target_len;
+    exfat_entry_t   result;
+    exfat_dir_loc_t loc;
+    int             found;
 } find_ctx_t;
 
-static int find_entry_loc_cb(const exfat_entry_t *entry, uint32_t lba, uint8_t slot, void *user)
+static int find_entry_loc_cb(const exfat_entry_t *entry, const exfat_dir_loc_t *loc, void *user)
 {
     find_ctx_t *ctx = (find_ctx_t *)user;
     if (str_eq_ci_n(entry->name, ctx->target, ctx->target_len)) {
-        ctx->result     = *entry;
-        ctx->entry_lba  = lba;
-        ctx->entry_slot = slot;
-        ctx->found      = 1;
+        ctx->result = *entry;
+        ctx->loc    = *loc;
+        ctx->found  = 1;
         return 1;
     }
     return 0;
@@ -453,8 +461,8 @@ static int find_path_with_loc(const exfat_vol_t *vol, const char *path, exfat_en
             return -1;
         }
         cur      = ctx.result;
-        cur_lba  = ctx.entry_lba;
-        cur_slot = ctx.entry_slot;
+        cur_lba  = ctx.loc.lba;
+        cur_slot = ctx.loc.slot;
 
         p += seg_len;
         while (*p == '/' || *p == '\\') {
@@ -555,6 +563,25 @@ int exfat_read_file(const exfat_vol_t *vol, const exfat_entry_t *file,
 /* ============================================================================
  * Write Support: Allocation Bitmap, FAT Chain, Checksums, Directory & File I/O
  * ============================================================================ */
+
+static int fat_get_entry(const exfat_vol_t *vol, uint32_t cluster, uint32_t *out_val)
+{
+    if (cluster < 2u || (cluster - 2u) >= vol->cluster_count) {
+        return -1;
+    }
+    uint32_t fat_sec_off = (cluster * 4u) >> 9;
+    uint32_t fat_in_sec  = (cluster * 4u) & 511u;
+    if (fat_sec_off >= vol->fat_sectors) {
+        return -1;
+    }
+
+    uint8_t sec[512];
+    if (vol->dev->read_sectors(vol->dev->ctx, vol->fat_lba + fat_sec_off, 1u, sec) != 0) {
+        return -1;
+    }
+    *out_val = le32(sec + fat_in_sec);
+    return 0;
+}
 
 static int fat_set_entry(const exfat_vol_t *vol, uint32_t cluster, uint32_t value)
 {
@@ -673,6 +700,50 @@ static int alloc_cluster(exfat_vol_t *vol, uint32_t prev_cluster, uint32_t *out_
         return -1;
     }
     return (scan_bitmap_range(vol, 0u, hint_byte + 1u, prev_cluster, out_cluster) == 0) ? 0 : -1;
+}
+
+static int free_cluster_bit(exfat_vol_t *vol, uint32_t cluster)
+{
+    if (!vol || !vol->dev->write_sectors || vol->bitmap_cluster < 2u ||
+        cluster < 2u || (cluster - 2u) >= vol->cluster_count) {
+        return -1;
+    }
+
+    uint32_t idx      = cluster - 2u;
+    uint32_t byte_off = idx >> 3;
+    uint32_t bit      = idx & 7u;
+    if (byte_off >= vol->bitmap_bytes) {
+        return -1;
+    }
+
+    uint32_t cls_shift   = 9u + (uint32_t)vol->spc_shift;
+    uint32_t target_cidx = byte_off >> cls_shift;
+    uint32_t sec_in_cls  = (byte_off & (vol->cluster_size - 1u)) >> 9;
+    uint32_t in_sec      = byte_off & 511u;
+
+    uint32_t bmp_cls = vol->bitmap_cluster;
+    for (uint32_t c = 0u; c < target_cidx; c++) {
+        uint32_t nxt = 0u;
+        if (next_bitmap_cluster(vol, bmp_cls, &nxt) != 0 || nxt == 0u) {
+            return -1;
+        }
+        bmp_cls = nxt;
+    }
+
+    uint8_t sec[512];
+    uint32_t lba = cluster_to_lba(vol, bmp_cls) + sec_in_cls;
+    if (vol->dev->read_sectors(vol->dev->ctx, lba, 1u, sec) != 0) {
+        return -1;
+    }
+    sec[in_sec] &= (uint8_t)~(1u << bit);
+    if (vol->dev->write_sectors(vol->dev->ctx, lba, 1u, sec) != 0) {
+        return -1;
+    }
+
+    if (idx < vol->alloc_hint) {
+        vol->alloc_hint = idx;
+    }
+    return 0;
 }
 
 static int zero_cluster(const exfat_vol_t *vol, uint32_t cluster)
@@ -1084,5 +1155,171 @@ int exfat_close_file(exfat_writer_t *w)
     }
 
     w->active = 0u;
+    return 0;
+}
+
+int exfat_stat_fs(const exfat_vol_t *vol, uint32_t *free_mb, uint32_t *total_mb)
+{
+    if (!vol || !vol->dev || !vol->dev->read_sectors) {
+        return -1;
+    }
+    uint32_t spc = vol->sectors_per_cluster;
+    if (total_mb) {
+        uint32_t tc = vol->cluster_count;
+        *total_mb = ((tc >> 11) * spc) + (((tc & 0x7FFu) * spc) >> 11);
+    }
+    if (!free_mb) {
+        return 0;
+    }
+    if (vol->bitmap_cluster < 2u || vol->bitmap_bytes == 0u) {
+        *free_mb = 0u;
+        return -1;
+    }
+
+    uint32_t need_bytes = (vol->cluster_count + 7u) >> 3;
+    uint32_t limit      = (vol->bitmap_bytes < need_bytes) ? vol->bitmap_bytes : need_bytes;
+    uint32_t bmp_cls    = vol->bitmap_cluster;
+    uint32_t cur_byte   = 0u;
+    uint32_t free_cls   = 0u;
+    uint8_t  sec[512];
+
+    while (bmp_cls >= 2u && cur_byte < limit) {
+        uint32_t base_lba = cluster_to_lba(vol, bmp_cls);
+        for (uint32_t s = 0u; s < spc && cur_byte < limit; s++) {
+            if (vol->dev->read_sectors(vol->dev->ctx, base_lba + s, 1u, sec) != 0) {
+                return -1;
+            }
+            uint32_t b_end = ((limit - cur_byte) < 512u) ? (limit - cur_byte) : 512u;
+            for (uint32_t b = 0u; b < b_end; b++) {
+                uint32_t base_idx = (cur_byte + b) << 3;
+                uint32_t rem_bits = vol->cluster_count - base_idx;
+                uint32_t nbits    = (rem_bits < 8u) ? rem_bits : 8u;
+                uint8_t  v        = sec[b];
+                if (nbits == 8u && v == 0x00u) {
+                    free_cls += 8u;
+                } else if (nbits == 8u && v == 0xFFu) {
+                    continue;
+                } else {
+                    for (uint32_t bit = 0u; bit < nbits; bit++) {
+                        if ((v & (1u << bit)) == 0u) {
+                            free_cls++;
+                        }
+                    }
+                }
+            }
+            cur_byte += b_end;
+        }
+        if (cur_byte < limit) {
+            uint32_t nxt = 0u;
+            if (next_bitmap_cluster(vol, bmp_cls, &nxt) != 0) {
+                return -1;
+            }
+            bmp_cls = nxt;
+        }
+    }
+
+    *free_mb = ((free_cls >> 11) * spc) + (((free_cls & 0x7FFu) * spc) >> 11);
+    return 0;
+}
+
+int exfat_delete_file(exfat_vol_t *vol, const char *dir_path, const char *filename)
+{
+    if (!vol || !vol->dev || !vol->dev->read_sectors || !vol->dev->write_sectors ||
+        !dir_path || !filename) {
+        return -1;
+    }
+    uint32_t name_len = ascii_len_checked(filename, EXFAT_MAX_NAME - 1u);
+    if (name_len == 0u) {
+        return -1;
+    }
+    for (uint32_t i = 0u; i < name_len; i++) {
+        if (filename[i] == '/' || filename[i] == '\\') {
+            return -1;
+        }
+    }
+
+    exfat_entry_t dir_ent;
+    if (find_path_with_loc(vol, dir_path, &dir_ent, 0, 0) != 0 || !dir_ent.is_dir) {
+        return -1;
+    }
+
+    find_ctx_t fc;
+    fc.target     = filename;
+    fc.target_len = name_len;
+    fc.found      = 0;
+    if (list_dir_with_loc(vol, dir_ent.first_cluster, dir_ent.no_fat_chain,
+                          0, find_entry_loc_cb, &fc) != 0 ||
+        !fc.found || fc.result.is_dir) {
+        return -1;
+    }
+
+    /* Clear bit 7 across all directory entries in the set across sector/cluster boundaries */
+    uint8_t  sec[512];
+    uint32_t rem = 1u + (uint32_t)fc.loc.sec_cnt;
+    uint32_t c   = fc.loc.cls;
+    uint32_t s   = fc.loc.s;
+    uint32_t sl  = fc.loc.slot;
+    while (rem > 0u) {
+        if (c < 2u || (c - 2u) >= vol->cluster_count) {
+            return -1;
+        }
+        uint32_t lba = cluster_to_lba(vol, c) + s;
+        if (vol->dev->read_sectors(vol->dev->ctx, lba, 1u, sec) != 0) {
+            return -1;
+        }
+        while (sl < 16u && rem > 0u) {
+            sec[sl * 32u] &= 0x7Fu;
+            sl++;
+            rem--;
+        }
+        if (vol->dev->write_sectors(vol->dev->ctx, lba, 1u, sec) != 0) {
+            return -1;
+        }
+        sl = 0u;
+        s++;
+        if (s >= vol->sectors_per_cluster && rem > 0u) {
+            s = 0u;
+            uint32_t nxt = 0u;
+            if (next_cluster(vol, c, dir_ent.no_fat_chain, &nxt) != 0 || nxt == 0u) {
+                return -1;
+            }
+            c = nxt;
+        }
+    }
+
+    /* Return data clusters to the Allocation Bitmap (and clear FAT chain if used) */
+    if (fc.result.first_cluster >= 2u && fc.result.size > 0u) {
+        if (fc.result.no_fat_chain) {
+            uint32_t cls_shift = 9u + (uint32_t)vol->spc_shift;
+            uint64_t n_cls64   = (fc.result.size + ((uint64_t)vol->cluster_size - 1u)) >> cls_shift;
+            uint32_t n_cls     = (n_cls64 > vol->cluster_count) ? vol->cluster_count : (uint32_t)n_cls64;
+            for (uint32_t i = 0u; i < n_cls; i++) {
+                if (free_cluster_bit(vol, fc.result.first_cluster + i) != 0) {
+                    return -1;
+                }
+            }
+        } else {
+            uint32_t cur   = fc.result.first_cluster;
+            uint32_t steps = 0u;
+            while (cur >= 2u && (cur - 2u) < vol->cluster_count && steps < vol->cluster_count) {
+                uint32_t nxt = 0u;
+                if (fat_get_entry(vol, cur, &nxt) != 0) {
+                    return -1;
+                }
+                if (free_cluster_bit(vol, cur) != 0) {
+                    return -1;
+                }
+                if (fat_set_entry(vol, cur, 0u) != 0) {
+                    return -1;
+                }
+                steps++;
+                if (nxt >= 0xFFFFFFF8u || nxt < 2u || (nxt - 2u) >= vol->cluster_count) {
+                    break;
+                }
+                cur = nxt;
+            }
+        }
+    }
+
     return 0;
 }

@@ -646,3 +646,14 @@ Verified via Thumb-2 disassembly (`FIRM` and BootROM `0x000000..0x05FFFF`) for L
 ### 21.3 Pure BootROM `RW-BT` Init Sequence & H4 HCI (`0x00803C28`)
 * **`BD_ADDR` & Baseband Init:** `ld_bd_addr_set` (`0x0003BA30`) stores the 6-byte `BD_ADDR` at `0x00802C14..0x00802C19` and computes the 5-byte BCH at `0x00802BEB..0x00802BEF` before `ld_util_cs_init` (`0x0003A42C`) populates EM `CS[0..9]` (`0x400302B0 + idx*0x5C`). Task types `0x3B` (`0x00800608`), `0x39` (`0x008005F8`), `0x38` (`0x00800660`), and `0x3C` (`TASK_HCI`) are registered via `ke_task_create` (`0x0003089C`).
 * **H4 Transport (`hci_tl_env` @ `0x00803C28`):** Classic 3-arg `rwip_eif_api` (`read`/`write`/`flow_on`/`flow_off`); `em_buf_tx_alloc` (`0x000305B8`) returns a direct CPU-accessible EM pointer. `HCI_Reset` (`0x0C03`) emits `0xE07A` via ROM `0x00032E40`; other HCI commands map directly to `TASK_LM` (`0x38`) / `TASK_LC` (`0x39`) `ke_msg` IDs, and ACL TX uses `0xE426` to `TASK_LC`.
+
+---
+
+## 22. OpenFW Layer 5c: Clean-Room Classic BT L2CAP/SDP/RFCOMM, `+XREC v5`, and exFAT Delete/Stat
+
+Implemented and host-verified in [open_fw](open_fw/):
+
+* **exFAT Maintenance (`exfat.c`, `openfw_fs.h`):** Added `exfat_stat_fs()` (reading the `0x81` Allocation Bitmap without 64-bit division helpers) and `exfat_delete_file()` (clearing directory entry sets `0x85`/`0xC0`/`0xC1` across sector/cluster boundaries, clearing the bitmap bits, and unlinking FAT chains). Validated against `/usr/sbin/fsck.exfat -n` (`clean. directories 2, files 1`).
+* **Classic BR/EDR L2CAP + SDP + RFCOMM (`bt_spp.c`, `openfw_bt_spp.h`):** Allocation-free server with ACL L2CAP reassembly, signaling (`CID 0x0001`), strict SDP `ServiceSearchPattern` matching advertising SPP (`UUID 0x1101`) on RFCOMM Channel 1 (`"Cassini"`, `80`-byte attribute record), RFCOMM MUX (`DLCI 0`/`2`) with credit-based flow negotiation, direct TX queueing, and disconnect notifications to drop authentication state on link teardown.
+* **`+XREC v5` State Machine (`xrec_proto.c`, `openfw_xrec.h`):** Implements `PING`, `PAIR`, `CHAL`/`AUTH` (HMAC-SHA256 + constant-time comparison), `STAT`, `RTC` (read/write with range validation), coalesced `LS` (`/record`), `DEL`, `RECSTART`/`RECSTOP`, `REBOOT`, and streaming `GET`/`GETS` `"XREC"` binary frames (with CRC-16/CCITT-FALSE, 0-byte EOF framing, and credit-stall resume via `xrec_poll()`).
+* **Verification (`open_fw`):** `make -C open_fw test-host` (`6/6` host test suites + `exfat-img` + `fsck.exfat`) and `make -C open_fw` (`0` warnings; `.ram_boot` `1,508 B` / `4,096 B`, XIP `47,604 B`, FIRM `52,772 B`), plus `update-up` `4/4` CRC-16s `[OK]`.

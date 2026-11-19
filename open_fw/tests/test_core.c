@@ -10,10 +10,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "openfw_bt_spp.h"
 #include "openfw_crypto.h"
 #include "openfw_fs.h"
 #include "openfw_usb_msc.h"
 #include "openfw_wav.h"
+#include "openfw_xrec.h"
 
 static void put_le16(uint8_t *p, uint16_t v)
 {
@@ -338,6 +340,24 @@ static void test_exfat_write(void)
         assert(exfat_close_file(&w) == 0);
     }
 
+    uint32_t free_mb = 99u, total_mb = 99u;
+    assert(exfat_stat_fs(&vol, &free_mb, &total_mb) == 0);
+    assert(free_mb <= total_mb);
+
+    /* Delete safety: reject directories/missing files, delete multi-cluster file & reuse slot/clusters */
+    assert(exfat_delete_file(&vol, "/", "record") != 0);
+    assert(exfat_delete_file(&vol, "/record", "NOPE.wav") != 0);
+    assert(exfat_create_file(&vol, "/record", "REC_TEMP.wav", &w) == 0);
+    assert(exfat_write(&w, pcm, 1024u) == 0);
+    assert(exfat_close_file(&w) == 0);
+    exfat_entry_t tmp_ent;
+    assert(exfat_find_path(&vol, "/record/REC_TEMP.wav", &tmp_ent) == 0);
+    assert(exfat_delete_file(&vol, "/record", "REC_TEMP.wav") == 0);
+    assert(exfat_find_path(&vol, "/record/REC_TEMP.wav", &tmp_ent) != 0);
+    assert(exfat_create_file(&vol, "/record", "REC_REUSE.wav", &w) == 0);
+    assert(exfat_write(&w, "OK", 2u) == 0);
+    assert(exfat_close_file(&w) == 0);
+
     exfat_vol_t vol2;
     assert(exfat_mount(&vol2, &dev) == 0);
 
@@ -541,6 +561,10 @@ static void run_exfat_img_test(const char *path)
     assert(exfat_mkdir(&vol, "record") == 0);
     exfat_set_timestamp(&vol, 0x5D738420u); /* 2026-11-19 16:33:00 */
 
+    uint32_t free_before = 0u, free_mid = 0u, free_after = 0u, total_mb = 0u;
+    assert(exfat_stat_fs(&vol, &free_before, &total_mb) == 0);
+    assert(total_mb >= 1u);
+
     exfat_writer_t w;
     assert(exfat_create_file(&vol, "/record", "REC_0001.wav", &w) == 0);
 
@@ -557,6 +581,19 @@ static void run_exfat_img_test(const char *path)
     assert(wav_build_header(hdr, 16000u, 1u, 16u, sizeof(pcm)) == 0);
     assert(exfat_patch_header(&w, hdr, 44u) == 0);
     assert(exfat_close_file(&w) == 0);
+
+    /* Create & delete a 2-cluster temp file so fsck.exfat verifies deleted slots + freed bitmap/FAT */
+    exfat_writer_t wt;
+    assert(exfat_create_file(&vol, "/record", "REC_TEMP.wav", &wt) == 0);
+    assert(exfat_write(&wt, pcm, 8192u) == 0);
+    assert(exfat_close_file(&wt) == 0);
+    assert(exfat_stat_fs(&vol, &free_mid, NULL) == 0);
+    assert(free_mid <= free_before);
+    assert(exfat_delete_file(&vol, "/record", "REC_TEMP.wav") == 0);
+    exfat_entry_t deleted_ent;
+    assert(exfat_find_path(&vol, "/record/REC_TEMP.wav", &deleted_ent) != 0);
+    assert(exfat_stat_fs(&vol, &free_after, NULL) == 0);
+    assert(free_after >= free_mid);
 
     exfat_vol_t vol2;
     assert(exfat_mount(&vol2, &dev) == 0);
@@ -579,6 +616,453 @@ static void run_exfat_img_test(const char *path)
     printf("  [PASS] exfat-img (%s: 16,428 B multi-cluster WAV written & verified)\n", path);
 }
 
+static uint8_t test_rfcomm_fcs(const uint8_t *data, uint32_t len)
+{
+    uint8_t crc = 0xFFu;
+    for (uint32_t i = 0u; i < len; i++) {
+        crc ^= data[i];
+        for (int b = 0; b < 8; b++) {
+            crc = (crc & 1u) ? (uint8_t)((crc >> 1) ^ 0xE0u) : (uint8_t)(crc >> 1);
+        }
+    }
+    return (uint8_t)(crc ^ 0xFFu);
+}
+
+static void send_l2cap_client(bt_spp_t *spp, uint16_t dcid, const uint8_t *sdu, uint16_t len)
+{
+    uint8_t pdu[700];
+    put_le16(&pdu[0], len);
+    put_le16(&pdu[2], dcid);
+    memcpy(&pdu[4], sdu, len);
+    bt_spp_on_acl_rx(spp, 0x0080u, 0x02u, pdu, (uint16_t)(4u + len));
+}
+
+static void send_rfcomm_client_ctrl(bt_spp_t *spp, uint16_t rfcomm_dcid, uint8_t dlci, uint8_t ctrl)
+{
+    uint8_t f[4];
+    f[0] = (uint8_t)((dlci << 2) | 0x03u); /* Initiator CR=1, EA=1 */
+    f[1] = ctrl;
+    f[2] = 0x01u;
+    f[3] = test_rfcomm_fcs(f, 3u);
+    send_l2cap_client(spp, rfcomm_dcid, f, 4u);
+}
+
+static void send_rfcomm_client_uih(bt_spp_t *spp, uint16_t rfcomm_dcid, uint8_t dlci,
+                                   const uint8_t *info, uint16_t len)
+{
+    uint8_t f[700];
+    uint16_t h = 0u;
+    f[h++] = (uint8_t)((dlci << 2) | 0x03u);
+    f[h++] = 0xEFu;
+    if (len <= 127u) {
+        f[h++] = (uint8_t)((len << 1) | 0x01u);
+    } else {
+        f[h++] = (uint8_t)((len & 0x7Fu) << 1);
+        f[h++] = (uint8_t)(len >> 7);
+    }
+    memcpy(&f[h], info, len);
+    f[h + len] = test_rfcomm_fcs(f, 2u);
+    send_l2cap_client(spp, rfcomm_dcid, f, (uint16_t)(h + len + 1u));
+}
+
+static void send_rfcomm_client_credits(bt_spp_t *spp, uint16_t rfcomm_dcid, uint8_t dlci, uint8_t credits)
+{
+    uint8_t f[5];
+    f[0] = (uint8_t)((dlci << 2) | 0x03u);
+    f[1] = 0xFFu;
+    f[2] = 0x01u; /* len=0, EA=1 */
+    f[3] = credits;
+    f[4] = test_rfcomm_fcs(f, 2u);
+    send_l2cap_client(spp, rfcomm_dcid, f, 5u);
+}
+
+typedef struct {
+    bt_spp_t   *spp;
+    xrec_rtc_t  rtc;
+    uint8_t     bound_key[32];
+    int         bound_called;
+    uint8_t     rx_stream[4096];
+    uint32_t    rx_len;
+    uint32_t    rx_acl_pkts;
+} sim_phone_t;
+
+static void mock_spp_data_cb(void *user, const uint8_t *data, uint16_t len)
+{
+    xrec_ctx_t *xrec = (xrec_ctx_t *)user;
+    xrec_on_rx(xrec, data, len);
+}
+
+static void mock_spp_disc_cb(void *user)
+{
+    xrec_ctx_t *xrec = (xrec_ctx_t *)user;
+    xrec_on_disconnect(xrec);
+}
+
+static int mock_xrec_send(void *user, const uint8_t *data, uint16_t len)
+{
+    sim_phone_t *sp = (sim_phone_t *)user;
+    return bt_spp_send(sp->spp, data, len);
+}
+
+static void mock_xrec_get_stat(void *user, xrec_stat_t *out)
+{
+    (void)user;
+    out->bat_pct       = 87u;
+    out->voltage_mv    = 4095u;
+    out->charge_status = 1u;
+    out->vbus          = 1u;
+    out->media_status  = 0x10u;
+    out->rec_sec       = 0u;
+    out->free_mb       = 30100u;
+    out->total_mb      = 30500u;
+}
+
+static void mock_xrec_get_rtc(void *user, xrec_rtc_t *out)
+{
+    sim_phone_t *sp = (sim_phone_t *)user;
+    *out = sp->rtc;
+}
+
+static int mock_xrec_set_rtc(void *user, const xrec_rtc_t *dt)
+{
+    sim_phone_t *sp = (sim_phone_t *)user;
+    sp->rtc = *dt;
+    return 0;
+}
+
+static void mock_xrec_entropy(void *user, uint8_t out[16])
+{
+    (void)user;
+    for (uint32_t i = 0u; i < 16u; i++) {
+        out[i] = (uint8_t)(0xA0u + i);
+    }
+}
+
+static void mock_xrec_bound(void *user, const uint8_t key[32])
+{
+    sim_phone_t *sp = (sim_phone_t *)user;
+    memcpy(sp->bound_key, key, 32u);
+    sp->bound_called = 1;
+}
+
+static void drain_acl_to_phone(bt_spp_t *spp, sim_phone_t *sp)
+{
+    uint16_t hdl = 0u;
+    uint8_t  pdu[700];
+    uint16_t plen;
+    while ((plen = bt_spp_pop_acl_tx(spp, &hdl, pdu, sizeof(pdu))) > 0u) {
+        assert(hdl == 0x0080u && plen >= 4u);
+        sp->rx_acl_pkts++;
+        uint16_t l2cid = (uint16_t)pdu[2] | ((uint16_t)pdu[3] << 8);
+        if (l2cid == 0x0102u && plen > 8u) {
+            /* RFCOMM frame from server -> extract UIH DLCI 2 user data */
+            const uint8_t *rf = &pdu[4];
+            uint16_t rf_len   = (uint16_t)(plen - 4u);
+            uint8_t  dlci     = (uint8_t)(rf[0] >> 2);
+            uint8_t  ctrl     = rf[1];
+            if (dlci == 2u && (ctrl & 0xEFu) == 0xEFu) {
+                uint16_t hdr  = 3u;
+                uint16_t ulen;
+                if (rf[2] & 0x01u) {
+                    ulen = (uint16_t)(rf[2] >> 1);
+                } else {
+                    ulen = (uint16_t)((rf[2] >> 1) | ((uint16_t)rf[3] << 7));
+                    hdr  = 4u;
+                }
+                if (ctrl & 0x10u) {
+                    hdr++;
+                }
+                assert(hdr + ulen + 1u == rf_len);
+                if (ulen > 0u) {
+                    assert(sp->rx_len + ulen <= sizeof(sp->rx_stream));
+                    memcpy(&sp->rx_stream[sp->rx_len], &rf[hdr], ulen);
+                    sp->rx_len += ulen;
+                }
+            }
+        }
+    }
+}
+
+static void test_bt_spp_and_xrec(void)
+{
+    /* Prepare clean exFAT volume in g_disk with /record/REC_0001.wav + EXACT960.wav + 8 extra files */
+    memset(g_disk, 0, sizeof(g_disk));
+    g_disk[510] = 0x55u;
+    g_disk[511] = 0xAAu;
+    g_disk[0x1BEu + 4u] = 0x07u;
+    put_le32(&g_disk[0x1BEu + 8u], 4u);
+    put_le32(&g_disk[0x1BEu + 12u], MEM_DISK_SECTORS - 4u);
+
+    uint8_t *vbr = &g_disk[4u * 512u];
+    memcpy(&vbr[3], "EXFAT   ", 8u);
+    put_le64(&vbr[0x40], 4u);
+    put_le64(&vbr[0x48], MEM_DISK_SECTORS - 4u);
+    put_le32(&vbr[0x50], 12u);
+    put_le32(&vbr[0x54], 4u);
+    put_le32(&vbr[0x58], 16u);
+    put_le32(&vbr[0x5C], 64u);
+    put_le32(&vbr[0x60], 2u);
+    vbr[0x6C] = 9u;
+    vbr[0x6D] = 0u;
+    vbr[510]  = 0x55u;
+    vbr[511]  = 0xAAu;
+
+    uint8_t *fat = &g_disk[16u * 512u];
+    put_le32(fat + 0u * 4u, 0xFFFFFFF8u);
+    put_le32(fat + 1u * 4u, 0xFFFFFFFFu);
+    put_le32(fat + 2u * 4u, 0xFFFFFFFFu);
+    put_le32(fat + 3u * 4u, 0xFFFFFFFFu);
+    uint8_t *bmp_ent = &g_disk[20u * 512u];
+    bmp_ent[0] = 0x81u;
+    put_le32(bmp_ent + 20u, 3u);
+    put_le64(bmp_ent + 24u, 8u);
+    g_disk[21u * 512u] = 0x03u;
+
+    blkdev_t dev = { mem_read_sectors, mem_write_sectors, MEM_DISK_SECTORS, NULL };
+    exfat_vol_t vol;
+    assert(exfat_mount(&vol, &dev) == 0);
+    assert(exfat_mkdir(&vol, "record") == 0);
+
+    uint8_t wav_file[1024];
+    assert(wav_build_header(wav_file, 16000u, 1u, 16u, sizeof(wav_file) - 44u) == 0);
+    for (uint32_t i = 44u; i < sizeof(wav_file); i++) {
+        wav_file[i] = (uint8_t)((i * 41u + 3u) & 0xFFu);
+    }
+    exfat_writer_t w;
+    assert(exfat_create_file(&vol, "/record", "REC_0001.wav", &w) == 0);
+    assert(exfat_write(&w, wav_file, sizeof(wav_file)) == 0);
+    assert(exfat_close_file(&w) == 0);
+
+    uint8_t exact960[960];
+    assert(wav_build_header(exact960, 16000u, 1u, 16u, sizeof(exact960) - 44u) == 0);
+    for (uint32_t i = 44u; i < sizeof(exact960); i++) {
+        exact960[i] = (uint8_t)((i * 59u + 13u) & 0xFFu);
+    }
+    assert(exfat_create_file(&vol, "/record", "EXACT960.wav", &w) == 0);
+    assert(exfat_write(&w, exact960, sizeof(exact960)) == 0);
+    assert(exfat_close_file(&w) == 0);
+
+    for (int idx = 2; idx <= 9; idx++) {
+        char fname[20];
+        snprintf(fname, sizeof(fname), "REC_%04d.wav", idx);
+        assert(exfat_create_file(&vol, "/record", fname, &w) == 0);
+        assert(exfat_write(&w, wav_file, 64u) == 0);
+        assert(exfat_close_file(&w) == 0);
+    }
+
+    bt_spp_t    spp;
+    sim_phone_t sp;
+    xrec_ctx_t  xrec;
+    memset(&sp, 0, sizeof(sp));
+    sp.spp       = &spp;
+    sp.rtc.year  = 2026u;
+    sp.rtc.month = 11u;
+    sp.rtc.day   = 19u;
+
+    xrec_ops_t ops = {
+        mock_xrec_send, mock_xrec_get_stat, mock_xrec_get_rtc,
+        mock_xrec_set_rtc, mock_xrec_entropy, mock_xrec_bound, NULL,
+        NULL, NULL,
+    };
+    xrec_init(&xrec, &vol, &ops, &sp);
+    bt_spp_init(&spp, mock_spp_data_cb, &xrec);
+    bt_spp_set_disconnect_cb(&spp, mock_spp_disc_cb, &xrec);
+
+    /* 1. L2CAP Info + SDP connect + HFP negative match + SPP positive match */
+    uint8_t info_req[6] = { 0x0Au, 1u, 2u, 0u, 2u, 0u };
+    send_l2cap_client(&spp, 0x0001u, info_req, 6u);
+    uint8_t conn_sdp[8] = { 0x02u, 2u, 4u, 0u, 0x01u, 0x00u, 0x01u, 0x01u };
+    send_l2cap_client(&spp, 0x0001u, conn_sdp, 8u);
+    uint8_t cfg_sdp[8]  = { 0x04u, 3u, 4u, 0u, 0x40u, 0x00u, 0u, 0u };
+    send_l2cap_client(&spp, 0x0001u, cfg_sdp, 8u);
+    drain_acl_to_phone(&spp, &sp);
+
+    /* HFP (0x111E) + L2CAP (0x0100) must NOT match our SPP record */
+    uint8_t sdp_hfp[18] = {
+        0x06u, 0x00u, 0x01u, 0x00u, 13u,
+        0x35u, 0x06u, 0x19u, 0x11u, 0x1Eu, 0x19u, 0x01u, 0x00u,
+        0x00u, 0xFFu, 0x35u, 0x01u, 0x00u
+    };
+    send_l2cap_client(&spp, 0x0040u, sdp_hfp, sizeof(sdp_hfp));
+    uint16_t hdl = 0u;
+    uint8_t sdp_out[256];
+    uint16_t sdp_len = bt_spp_pop_acl_tx(&spp, &hdl, sdp_out, sizeof(sdp_out));
+    assert(sdp_len == 14u && sdp_out[4] == 0x07u && sdp_out[11] == 0x35u && sdp_out[12] == 0x00u);
+
+    uint8_t sdp_req[15] = { 0x06u, 0x00u, 0x02u, 0x00u, 10u, 0x35u, 0x03u, 0x19u, 0x11u, 0x01u, 0x00u, 0xFFu, 0x35u, 0x05u, 0x0Au };
+    send_l2cap_client(&spp, 0x0040u, sdp_req, sizeof(sdp_req));
+    sdp_len = bt_spp_pop_acl_tx(&spp, &hdl, sdp_out, sizeof(sdp_out));
+    assert(sdp_len > 20u && sdp_out[4] == 0x07u);
+    int found_name = 0;
+    for (uint16_t i = 0u; i + 7u <= sdp_len; i++) {
+        if (memcmp(&sdp_out[i], "Cassini", 7u) == 0) {
+            found_name = 1;
+            break;
+        }
+    }
+    assert(found_name == 1);
+
+    /* 2. L2CAP RFCOMM connect + Config with Android-style MTU=1691 -> RFCOMM PN -> SABM */
+    uint8_t conn_rf[8] = { 0x02u, 4u, 4u, 0u, 0x03u, 0x00u, 0x02u, 0x01u };
+    send_l2cap_client(&spp, 0x0001u, conn_rf, 8u);
+    uint8_t cfg_rf[12] = { 0x04u, 5u, 8u, 0u, 0x41u, 0x00u, 0x00u, 0x00u, 0x01u, 0x02u, 0x9Bu, 0x06u };
+    send_l2cap_client(&spp, 0x0001u, cfg_rf, 12u);
+
+    int saw_echo_1691 = 0;
+    uint16_t plen;
+    while ((plen = bt_spp_pop_acl_tx(&spp, &hdl, sdp_out, sizeof(sdp_out))) > 0u) {
+        if (plen >= 18u && sdp_out[2] == 0x01u && sdp_out[4] == 0x05u && sdp_out[14] == 0x01u) {
+            uint16_t echoed = (uint16_t)sdp_out[16] | ((uint16_t)sdp_out[17] << 8);
+            if (echoed == 1691u) {
+                saw_echo_1691 = 1;
+            }
+        }
+    }
+    assert(saw_echo_1691 == 1);
+
+    send_rfcomm_client_ctrl(&spp, 0x0041u, 0u, 0x3Fu); /* SABM DLCI 0 */
+    uint8_t pn_cmd[10] = { 0x83u, 0x11u, 0x02u, 0xF0u, 0x00u, 0x00u, 0x94u, 0x02u, 0x00u, 0x07u }; /* MTU 660, k=7 */
+    send_rfcomm_client_uih(&spp, 0x0041u, 0u, pn_cmd, sizeof(pn_cmd));
+    send_rfcomm_client_ctrl(&spp, 0x0041u, 2u, 0x3Fu); /* SABM DLCI 2 */
+    drain_acl_to_phone(&spp, &sp);
+    assert(bt_spp_is_open(&spp) == 1);
+
+    /* 3. +XREC:PING, +XREC:STAT (locked), +XREC:PAIR, +XREC:CHAL -> +XREC:AUTH */
+    const char *c_ping = "+XREC:PING\r";
+    send_rfcomm_client_uih(&spp, 0x0041u, 2u, (const uint8_t *)c_ping, (uint16_t)strlen(c_ping));
+    const char *c_lock = "+XREC:STAT\r";
+    send_rfcomm_client_uih(&spp, 0x0041u, 2u, (const uint8_t *)c_lock, (uint16_t)strlen(c_lock));
+    drain_acl_to_phone(&spp, &sp);
+    sp.rx_stream[sp.rx_len] = '\0';
+    assert(strstr((const char *)sp.rx_stream, "+XREC:PONG,openfw_v5,v5,bound=0,auth=0,pair=0") != NULL);
+    assert(strstr((const char *)sp.rx_stream, "+XREC:ERR,LOCKED") != NULL);
+
+    sp.rx_len = 0u;
+    xrec_open_pairing(&xrec, "482910");
+    const char *c_pair = "+XREC:PAIR,482910,000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\r";
+    send_rfcomm_client_uih(&spp, 0x0041u, 2u, (const uint8_t *)c_pair, (uint16_t)strlen(c_pair));
+    drain_acl_to_phone(&spp, &sp);
+    sp.rx_stream[sp.rx_len] = '\0';
+    assert(sp.bound_called == 1 && strstr((const char *)sp.rx_stream, "+XREC:OK,PAIR") != NULL);
+
+    /* Disconnect callback check: RFCOMM DISC DLCI 2 must drop auth */
+    send_rfcomm_client_ctrl(&spp, 0x0041u, 2u, 0x53u); /* DISC */
+    drain_acl_to_phone(&spp, &sp);
+    assert(bt_spp_is_open(&spp) == 0);
+
+    uint8_t pn_k7[10] = { 0x83u, 0x11u, 0x02u, 0xF0u, 0x00u, 0x00u, 0x94u, 0x02u, 0x00u, 0x07u };
+    send_rfcomm_client_uih(&spp, 0x0041u, 0u, pn_k7, sizeof(pn_k7));
+    send_rfcomm_client_ctrl(&spp, 0x0041u, 2u, 0x3Fu); /* re-SABM DLCI 2 */
+    drain_acl_to_phone(&spp, &sp);
+    assert(bt_spp_is_open(&spp) == 1);
+
+    sp.rx_len = 0u;
+    send_rfcomm_client_uih(&spp, 0x0041u, 2u, (const uint8_t *)c_lock, (uint16_t)strlen(c_lock));
+    drain_acl_to_phone(&spp, &sp);
+    sp.rx_stream[sp.rx_len] = '\0';
+    assert(strstr((const char *)sp.rx_stream, "+XREC:ERR,LOCKED") != NULL);
+
+    /* Authenticate using docs/XREC_PROTOCOL.md §5 HMAC vector */
+    sp.rx_len = 0u;
+    const char *c_chal = "+XREC:CHAL\r";
+    send_rfcomm_client_uih(&spp, 0x0041u, 2u, (const uint8_t *)c_chal, (uint16_t)strlen(c_chal));
+    drain_acl_to_phone(&spp, &sp);
+    sp.rx_stream[sp.rx_len] = '\0';
+    assert(strstr((const char *)sp.rx_stream, "+XREC:CHAL,a0a1a2a3a4a5a6a7a8a9aaabacadaeaf") != NULL);
+
+    sp.rx_len = 0u;
+    const char *c_auth = "+XREC:AUTH,b1489727b2602a0e047cb237580a4c795aaf9023c5bc6b0b865c7fa17e0a2367\r";
+    send_rfcomm_client_uih(&spp, 0x0041u, 2u, (const uint8_t *)c_auth, (uint16_t)strlen(c_auth));
+    const char *c_rtc_bad = "+XREC:RTC,2026,13,19,17,05,30,3\r";
+    send_rfcomm_client_uih(&spp, 0x0041u, 2u, (const uint8_t *)c_rtc_bad, (uint16_t)strlen(c_rtc_bad));
+    const char *c_rtc  = "+XREC:RTC,2026,11,19,17,05,30,3\r+XREC:RTC\r+XREC:STAT\r";
+    send_rfcomm_client_uih(&spp, 0x0041u, 2u, (const uint8_t *)c_rtc, (uint16_t)strlen(c_rtc));
+    drain_acl_to_phone(&spp, &sp);
+    sp.rx_stream[sp.rx_len] = '\0';
+    assert(strstr((const char *)sp.rx_stream, "+XREC:OK,AUTH") != NULL);
+    assert(strstr((const char *)sp.rx_stream, "+XREC:ERR,RTCRNG") != NULL);
+    assert(strstr((const char *)sp.rx_stream, "+XREC:OK,RTC") != NULL);
+    assert(strstr((const char *)sp.rx_stream, "+XREC:RTC,2026-11-19 17:05:30,3") != NULL);
+    assert(strstr((const char *)sp.rx_stream, "+XREC:STAT,87,4095,1,1,16,0,30100,30500") != NULL);
+
+    /* Replenish credits & test coalesced 10-file +XREC:LS + +XREC:DEL + path traversal block */
+    send_rfcomm_client_credits(&spp, 0x0041u, 2u, 10u);
+    sp.rx_len      = 0u;
+    sp.rx_acl_pkts = 0u;
+    const char *c_ls = "+XREC:LS\r";
+    send_rfcomm_client_uih(&spp, 0x0041u, 2u, (const uint8_t *)c_ls, (uint16_t)strlen(c_ls));
+    drain_acl_to_phone(&spp, &sp);
+    sp.rx_stream[sp.rx_len] = '\0';
+    assert(sp.rx_acl_pkts <= 2u);
+    assert(strstr((const char *)sp.rx_stream, "+XREC:F,1024,REC_0001.wav") != NULL);
+    assert(strstr((const char *)sp.rx_stream, "+XREC:F,960,EXACT960.wav") != NULL);
+    assert(strstr((const char *)sp.rx_stream, "+XREC:F,64,REC_0009.wav") != NULL);
+    assert(strstr((const char *)sp.rx_stream, "+XREC:END") != NULL);
+
+    sp.rx_len = 0u;
+    const char *c_del_trav = "+XREC:DEL,../evil.wav\r+XREC:GETS,0,16,16,../evil.wav\r+XREC:DEL,REC_0009.wav\r+XREC:LS\r";
+    send_rfcomm_client_uih(&spp, 0x0041u, 2u, (const uint8_t *)c_del_trav, (uint16_t)strlen(c_del_trav));
+    drain_acl_to_phone(&spp, &sp);
+    sp.rx_stream[sp.rx_len] = '\0';
+    assert(strstr((const char *)sp.rx_stream, "+XREC:ERR,NAME") != NULL);
+    assert(strstr((const char *)sp.rx_stream, "+XREC:OK,DEL") != NULL);
+    assert(strstr((const char *)sp.rx_stream, "REC_0009.wav") == NULL);
+
+    /* 4. Single-frame +XREC:GET */
+    send_rfcomm_client_credits(&spp, 0x0041u, 2u, 6u);
+    sp.rx_len = 0u;
+    const char *c_get = "+XREC:GET,0,300,REC_0001.wav\r";
+    send_rfcomm_client_uih(&spp, 0x0041u, 2u, (const uint8_t *)c_get, (uint16_t)strlen(c_get));
+    drain_acl_to_phone(&spp, &sp);
+    assert(sp.rx_len == 12u + 300u && memcmp(sp.rx_stream, "XREC", 4u) == 0);
+    assert(memcmp(sp.rx_stream + 12u, wav_file, 300u) == 0);
+
+    /* 5. +XREC:GETS exact-multiple EOF (0-byte XREC frame) + credit stall + xrec_poll resume */
+    while (spp.peer_credits > 1u) {
+        send_rfcomm_client_uih(&spp, 0x0041u, 2u, (const uint8_t *)c_ping, (uint16_t)strlen(c_ping));
+        drain_acl_to_phone(&spp, &sp);
+    }
+    assert(spp.peer_credits == 1u);
+
+    sp.rx_len = 0u;
+    const char *c_gets = "+XREC:GETS,0,1920,480,EXACT960.wav\r";
+    send_rfcomm_client_uih(&spp, 0x0041u, 2u, (const uint8_t *)c_gets, (uint16_t)strlen(c_gets));
+    drain_acl_to_phone(&spp, &sp);
+    assert(sp.rx_len == 12u + 480u); /* Stalled cleanly after 1st frame because peer_credits hit 0 */
+    assert(xrec.gets_active == 1u);
+
+    send_rfcomm_client_credits(&spp, 0x0041u, 2u, 4u);
+    xrec_poll(&xrec);
+    drain_acl_to_phone(&spp, &sp);
+    assert(xrec.gets_active == 0u);
+
+    uint8_t downloaded[1024];
+    uint32_t dpos = 0u, ppos = 0u, frames_seen = 0u;
+    int saw_eof_zero_frame = 0;
+    while (ppos + 12u <= sp.rx_len) {
+        assert(memcmp(&sp.rx_stream[ppos], "XREC", 4u) == 0);
+        uint32_t foff = get_le32(&sp.rx_stream[ppos + 4u]);
+        uint16_t flen = (uint16_t)sp.rx_stream[ppos + 8u] | ((uint16_t)sp.rx_stream[ppos + 9u] << 8);
+        uint16_t fcrc = (uint16_t)sp.rx_stream[ppos + 10u] | ((uint16_t)sp.rx_stream[ppos + 11u] << 8);
+        assert(foff == dpos);
+        assert(ppos + 12u + flen <= sp.rx_len);
+        assert(openfw_crc16_ccitt_false(&sp.rx_stream[ppos + 12u], flen) == fcrc);
+        if (flen > 0u) {
+            memcpy(&downloaded[dpos], &sp.rx_stream[ppos + 12u], flen);
+            dpos += flen;
+        } else {
+            saw_eof_zero_frame = 1;
+            assert(fcrc == 0xFFFFu);
+        }
+        frames_seen++;
+        ppos += 12u + flen;
+    }
+    assert(ppos == sp.rx_len && frames_seen == 3u && saw_eof_zero_frame == 1);
+    assert(dpos == sizeof(exact960) && memcmp(downloaded, exact960, sizeof(exact960)) == 0);
+
+    printf("  [PASS] bt_spp + xrec (L2CAP, SDP, RFCOMM credits/DISC, +XREC auth/LS/DEL/GET/GETS+EOF)\n");
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 3 && strcmp(argv[1], "--exfat-img") == 0) {
@@ -592,6 +1076,7 @@ int main(int argc, char **argv)
     test_exfat();
     test_exfat_write();
     test_usb_msc();
+    test_bt_spp_and_xrec();
     printf("All open_fw host unit tests PASSED!\n");
     return 0;
 }

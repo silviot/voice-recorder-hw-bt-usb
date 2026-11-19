@@ -71,12 +71,14 @@ int exfat_find_path(const exfat_vol_t *vol, const char *path, exfat_entry_t *out
 int exfat_read_file(const exfat_vol_t *vol, const exfat_entry_t *file,
                     uint64_t offset, void *dst, uint32_t len, uint32_t *bytes_read);
 
-/* Write operations (requires dev->write_sectors != NULL and 0x81 Allocation Bitmap) */
+/* Write & maintenance operations (requires dev->write_sectors != NULL and 0x81 Allocation Bitmap) */
 void exfat_set_timestamp(exfat_vol_t *vol, uint32_t dos_timestamp);
+int  exfat_stat_fs(const exfat_vol_t *vol, uint32_t *free_mb, uint32_t *total_mb);
 int  exfat_mkdir(exfat_vol_t *vol, const char *name);
-int exfat_create_file(exfat_vol_t *vol, const char *dir_path, const char *filename, exfat_writer_t *out);
-int exfat_write(exfat_writer_t *w, const void *data, uint32_t len);
-int exfat_patch_header(exfat_writer_t *w, const void *hdr, uint32_t len);
-int exfat_close_file(exfat_writer_t *w);
+int  exfat_create_file(exfat_vol_t *vol, const char *dir_path, const char *filename, exfat_writer_t *out);
+int  exfat_write(exfat_writer_t *w, const void *data, uint32_t len);
+int  exfat_patch_header(exfat_writer_t *w, const void *hdr, uint32_t len);
+int  exfat_close_file(exfat_writer_t *w);
+int  exfat_delete_file(exfat_vol_t *vol, const char *dir_path, const char *filename);
 
 #endif /* OPENFW_FS_H */
