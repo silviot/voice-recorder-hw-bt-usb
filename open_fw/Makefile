@@ -77,6 +77,14 @@ test-host: tests/test_core.c src/crypto.c src/wav.c src/exfat.c src/usb_scsi.c s
 		src/sdio.c src/lcd_st7735s.c src/usb_musb.c src/usb_scsi.c src/exfat.c \
 		-o $(BUILD_DIR)/test_drivers_mmio
 	$(BUILD_DIR)/test_drivers_mmio $(BUILD_DIR)/test_exfat.img
+	$(HOST_CC) $(HOST_CFLAGS) -DOPENFW_HOST_MMIO tests/test_audio_bt_mmio.c \
+		src/audio_dma.c src/recorder.c src/bt_rf.c \
+		src/wav.c src/exfat.c src/rtc.c src/wdt_timer.c \
+		-o $(BUILD_DIR)/test_audio_bt_mmio
+	dd if=/dev/zero of=$(BUILD_DIR)/test_rec_exfat.img bs=512 count=4096 status=none
+	/usr/sbin/mkfs.exfat -q -b 4096 -c 4096 $(BUILD_DIR)/test_rec_exfat.img
+	$(BUILD_DIR)/test_audio_bt_mmio $(BUILD_DIR)/test_rec_exfat.img
+	/usr/sbin/fsck.exfat -n $(BUILD_DIR)/test_rec_exfat.img
 
 update-up: $(BUILD_DIR)/ram_boot.bin $(BUILD_DIR)/xip.bin tools/pack_firm.py
 	@test -f "$(STOCK_DUMP)" || (echo "Error: $(STOCK_DUMP) not found" >&2; exit 1)
