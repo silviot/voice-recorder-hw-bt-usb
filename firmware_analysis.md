@@ -497,18 +497,18 @@ Scanning all literal-pool loads and `MOVT` instructions across `bootrom_384K.bin
 | `0x40027000` | **BT Controller / HCI / Sync Ctrl** | Serviced by `task btc` (p9) & `bt_isr_bh` (p19) |
 | `0x40030000`–`0x40038000` | **BT Exchange Memory & BB Tables** | `0x40030000`, `0x40031000`, `0x40033000`, `0x40036000`, `0x40038000` |
 | `0x40040000` | **USB 2.0 OTG Controller (MUSB)** | Mentor MUSB (`bootrom 0x4CD8+`, `.ramtext`, XIP) |
-| `0x40070000` | **IPC Mailbox & PMU RTWI Bus** | `+0x24`/`+0x2C` Master/Slave IRQ status (W1C), `+0x40 + ch*0x20` 2-word FIFOs |
+| `0x40070000` | **Hardware IPC Mailbox** | `+0x24`/`+0x2C` Master/Slave IRQ status (W1C), `+0x40 + ch*0x20` 2-word FIFOs |
 | `0x40080000` | **CRU (Clock, PLL & Reset Unit)** | `HAL_rst_release` (`0x2564`), `HAL_clk_enable` (`0x27A0`/`0x8051EC`) |
 | `0x40081000` | **GPIO & Pinmux Controller** | Ports A/B/C/D at `0x40081000 / 0x40081040 / 0x40081080 / 0x400810C0` |
 | `0x40082100` | **64-bit System Counter (`us_timer`)** | BootROM `0xB6D8` (`+0x04` lo / `+0x08` hi), used by `udelay`/`mdelay` |
 | `0x40083000` | **Watchdog Timer (WDT)** | BootROM `0xB7A4..0xB80E`: feed key `0x28000001` @ `+0x10`, timeout `+0x14`, ctrl `+0x18/+0x1C` |
-| `0x40084000` | **PWM Controller (6 channels)** | `0xD514A6`: `/dev/pwm_ch0..5` (`+0x20 + ch*0x20`) |
-| `0x40085000` | **AON / RTC Controller** | Date `+0x04`, Time `+0x08`, Alarm0 `+0x10/+0x18`, Alarm1 `+0x20/+0x24`, AON wake/poweroff `+0x60/+0xA4/+0xAC/+0xD8` |
-| `0x40090000` | **UART0 (Debug Console)** | IRQ `16`, 24 MHz clk, 115200 bps, TX = `PD0` (`rom_printf @ 0x2B0`) |
+| `0x40084000` | **PWM Controller (6 channels)** | `0xD514A6`: `/dev/pwm_ch0..5` (`+0x20 + ch*0x20`; `pwm_ch3` @ `+0x80` on `PB17`) |
+| `0x40085000` | **AON / RTC Controller & PMU RTWI** | RTC Date `+0x04`, Time `+0x08`, Alarm0/1 `+0x10..+0x24`, AON `+0x60..+0xD8`; **PMU RTWI Master @ `0x40085100..0x40085110`** (slave `0x30` on `PC0`/`PC1`) |
+| `0x40090000` | **UART0 (Debug Console)** | Custom SoC UART (`DATA +0x00`, `CTRL +0x04`, `STAT +0x08`), IRQ `16`, 24 MHz clk, 115200 bps, TX = `PD0` (`rom_printf @ 0x2B0`) |
 | `0x40091000` | **UART1** | IRQ `17` (`PD6`/`PD5`) |
 | `0x40092000` | **UART2 (CLI Shell)** | IRQ `18` (`PB22`/`PB23`), 115200 bps (`cli` task `0xD3FAFD`) |
-| `0x40095000` | **SPI Controller (LCD SPI)** | `0xD5114E` (rst `0x5C`, clk `0x3F`): drives `/dev/lcd` via DMAC `0x40001000` |
-| `0x40096000` | **SPI / QSPI / Peripheral Ctrl** | BootROM `0x33E0..0x33F6`, `0x3742` |
+| `0x40095000` | **LCDC (8080 8-Bit Parallel)** | `0xD5114E` (rst `0x5C`, clk `0x3F`): MCU 8080 parallel bus + crossbar (`+0x40/+0x44`) driving `/dev/lcd` via DMAC `0x40001000` |
+| `0x40096000` | **SARADC (12-Bit Key/ADC)** | `/dev/kadc_ch0..5` (`ch1` result @ `+0x34` on `PD0` analog `mux=15`; CRU bank 2 bit 20) |
 | `0x40099000` | **eFuse / OTP Controller** | `0xCE8C68`: words at `+0x20 + 4*idx` (PMU trim reg `0x11`) |
 | `0x4009B000` | **General-Purpose Timers** | `0xD518D8`: `/dev/timer` |
 | `0x400A0010` | **Hardware Spinlock (IPC Mutex)** | `0x805996`/`0x8059AC`: 16-byte stride (`0x400A0010 + id*16`; poll until `0`, write `0` to unlock) |
@@ -536,9 +536,10 @@ Scanning all literal-pool loads and `MOVT` instructions across `bootrom_384K.bin
 * **Sole CPU1 workload:** **`ViewTask`** (`0x00CE9A09`, `core_id=1`, `task_id=3`) running **LVGL v8.3**, its two 6.4 KB RGB565 LCD strip buffers (`0x0081E00E`, `0x0081F90E`), and `/dev/pwm_ch3` backlight control. All Bluetooth, Audio/Media, FatFs, and System tasks run on **CPU0** under FreeRTOS, communicating with CPU1 via the 8-byte hardware mailbox (`0x40070000`) + hardware spinlock (`0x400A0010`).
 
 ### 15.2 Physical Buttons, Hardware Boot Strap, LCD & Debug UART
-* **Buttons:** 6 buttons on SARADC 12-bit resistor ladder `/dev/kadc_ch1` (`0x20` Prev `256..336`, `0x22` Next `656..848`, `0x24` Vol+ `1280..1424`, `0x23` Vol- `2176`, `0x36` Back/Menu `2560`, `0x48` Enter/Play `2704..2960`), dedicated **Record slide switch** on GPIO **`PB6`** (`/dev/key_io`: `0`=`0x34` Rec ON, `1`=`0x49` Rec OFF/Save), and Power on `/dev/key_onoff` (`0x37`).
+* **Stage-1 → `FIRM` Handoff (`0x00820470`):** Stage-1 loads `loadLength` bytes from flash **`0x00E430`** (`FIRM + 0x430`, skipping a 1 KiB block at `0x00E030..0x00E42F`) into `loadToRam` (`0x00804C00`) and executes `blx runFromRam` (`0x00804C01`) on **24 MHz HOSC** with IRQs disabled (`cpsid i`), without setting `SCB->VTOR` or `MSP`.
+* **Buttons:** 6 buttons on SARADC 12-bit resistor ladder `/dev/kadc_ch1` (`0x40096000`, `PD0` analog `mux=15` — **note: shares `PD0` with `UART0 TX`**: `0x20` Prev `256..336`, `0x22` Next `656..848`, `0x24` Vol+ `1280..1424`, `0x23` Vol- `2176`, `0x36` Back/Menu `2560`, `0x48` Enter/Play `2704..2960`), dedicated **Record slide switch** on GPIO **`PB6`** (`/dev/key_io`: `0`=`0x34` Rec ON, `1`=`0x49` Rec OFF/Save), and Power on `/dev/key_onoff` (`0x37`).
 * **USB ISP Boot Key (`301a:2800`):** Stage-0 BootROM (`0x4C95E`, `0x4C18C`) checks **`PD0 == 0`** and **`PB23 == 0`** for 500 consecutive polls before entering USB MSC ISP (`0x4D2B6`).
-* **Display (`/dev/lcd`):** `FIRM` drives **`ST7735S`** (`0xD39D80`, **`80 × 160`** active window inside `128 × 160` controller RAM, `MADCTL=0xC8`, RGB565, `INVON`, reset **`PB10`**, SPI `0x40095000` + DMAC `0x40001000`). Backlight is `/dev/pwm_ch3` (`0x00D16561(0..100)`).
+* **Display (`/dev/lcd`):** `FIRM` drives **`ST7735S`** over **8080 8-bit parallel LCDC (`0x40095000`)** on `PB0..PB5, PB18, PD1..PD3, PD10` (`mux=12`, crossbar `0x40095040/0x40095044`, pad enable `0x40081404`), **`80 × 160`** active window (`x_off=26, y_off=0`, `MADCTL=0xC8`, RGB565, `INVON`, reset **`PB10`**). Backlight is `/dev/pwm_ch3` (`0x40084080` on **`PB17`** `mux=5`, `0x00D16561(0..100)`).
 * **Debug UART & CLI:** `rom_printf` (`0x2B0`) outputs on **`UART0` (`0x40090000`, `PD0` TX, 115200 bps)**; interactive CLI shell runs on **`UART2` (`0x40092000`, `PB22`/`PB23`, 115200 bps)**.
 * **PMU Wake & Dual Hardware RTC Alarms:** `/dev/pmu` `ioctl` `5`=Soft Power-Off, `6`=Reboot, `7`=Deep Sleep (`WFI`). Wake sources: ONOFF key, USB VBUS, Record switch (`PB6`), and **AON RTC `Alarm0` / `Alarm1`** (`HAL_rtc_set_alarm @ 0x00CE88E1`, `0x40085000+0x10..+0x24`).
 

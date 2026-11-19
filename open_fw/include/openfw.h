@@ -1,0 +1,82 @@
+/*
+ * Cassini OpenFW Internal Driver Interfaces (Layer 1b)
+ *
+ * SPDX-License-Identifier: MIT
+ */
+#ifndef OPENFW_H
+#define OPENFW_H
+
+#include <stdint.h>
+
+/* Watchdog, Timers & System Reset (wdt_timer.c) */
+void     wdt_feed(void);
+void     system_reboot(void);
+uint64_t us_timer_now(void);
+void     udelay(uint32_t us);
+void     mdelay(uint32_t ms);
+void     systick_init(uint32_t cpu_hz);
+uint32_t millis(void);
+
+/* AON Hardware RTC (rtc.c) */
+void     rtc_read_raw(uint32_t *date_reg, uint32_t *time_reg);
+void     rtc_set_alarm0_seconds(uint32_t seconds);
+
+/* UART0 Debug Console (uart.c) — NOTE: PD0 is shared with SARADC kadc_ch1 */
+void     uart0_init_115200(void);
+void     uart0_putc(char c);
+void     uart0_puts(const char *s);
+void     uart0_put_u32(uint32_t v);
+void     uart0_put_hex(uint32_t v);
+
+/* PMU RTWI (pmu.c) */
+typedef enum {
+    PMU_CHG_DISCHARGING = 0,
+    PMU_CHG_CHARGING    = 1,
+    PMU_CHG_FULL        = 2,
+} pmu_chg_state_t;
+
+int             pmu_write_reg(uint8_t reg, uint8_t val);
+uint8_t         pmu_read_reg(uint8_t reg);
+uint32_t        pmu_read_vbat_mv(void);
+pmu_chg_state_t pmu_get_charge_state(void);
+void            pmu_reboot_to_usb_bootloader(void) __attribute__((noreturn));
+void            pmu_reboot_to_sd_ota(void) __attribute__((noreturn));
+
+/* SARADC Keypad & Record Switch (keys.c) */
+typedef enum {
+    KEY_NONE = 0,
+    KEY_LEFT,
+    KEY_RIGHT,
+    KEY_VOL_UP,
+    KEY_VOL_DOWN,
+    KEY_BACK,
+    KEY_ENTER,
+    KEY_UNKNOWN,
+} key_id_t;
+
+void        keys_init(void);
+uint16_t    keys_read_adc(void);
+int         keys_read_rec_switch(void);
+key_id_t    keys_decode(uint16_t adc);
+const char *keys_name(key_id_t key);
+
+/* ST7735S 80x160 8080 Parallel LCD + PWM3 Backlight (lcd_st7735s.c) */
+#define LCD_WIDTH   80u
+#define LCD_HEIGHT  160u
+
+static inline uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b)
+{
+    return (uint16_t)(((uint16_t)(r >> 3) << 11) | ((uint16_t)(g >> 2) << 5) | (uint16_t)(b >> 3));
+}
+
+void lcd_backlight_set(uint8_t percent);
+void lcd_init(void);
+void lcd_set_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1);
+void lcd_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t color);
+void lcd_blit_rgb565(uint16_t x, uint16_t y, uint16_t w, uint16_t h, const uint16_t *pixels);
+void lcd_draw_char(uint16_t x, uint16_t y, char c, uint16_t fg, uint16_t bg);
+void lcd_draw_str(uint16_t x, uint16_t y, const char *s, uint16_t fg, uint16_t bg);
+void lcd_draw_u32(uint16_t x, uint16_t y, uint32_t v, uint16_t fg, uint16_t bg);
+void lcd_draw_hex(uint16_t x, uint16_t y, uint32_t v, uint8_t digits, uint16_t fg, uint16_t bg);
+
+#endif /* OPENFW_H */

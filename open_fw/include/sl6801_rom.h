@@ -17,15 +17,23 @@
 /* Debug UART0 printf (115200 bps, PD0 TX) */
 #define rom_printf          ROM_FN(0x000002B0, int,      (const char *fmt, ...))
 
+/* GPIO helpers (pin_cfg = (port<<16)|(pin<<11)|(mux<<7)|(init<<6)|(drv<<4)|pull_idx) */
+#define rom_gpio_config     ROM_FN(0x000007AC, void,     (uint32_t cfg))
+#define rom_gpio_read       ROM_FN(0x000007EC, int,      (uint32_t cfg))
+#define rom_gpio_write      ROM_FN(0x0000080E, void,     (uint32_t cfg, int val))
+
 /* Standard libc primitives */
 #define rom_strlen          ROM_FN(0x00000AA2, size_t,   (const char *s))
 #define rom_memcpy          ROM_FN(0x00000B2A, void *,   (void *dst, const void *src, size_t n))
 #define rom_memset          ROM_FN(0x00000BAA, void *,   (void *dst, int val, size_t n))
 
 /* CRU Clock & Reset helpers */
+#define rom_rst_is_released ROM_FN(0x00002518, int,      (uint32_t rst_id))
 #define rom_rst_release     ROM_FN(0x00002564, void,     (uint32_t rst_id))
 #define rom_rst_hold        ROM_FN(0x00002570, void,     (uint32_t rst_id))
 #define rom_clk_enable      ROM_FN(0x000027A0, void,     (uint32_t clk_id))
+#define rom_clk_div         ROM_FN(0x00002D58, void,     (uint32_t clk_id, uint32_t div))
+#define rom_clk_set_src     ROM_FN(0x00003118, void,     (uint32_t clk_id, uint32_t src))
 
 /* 64-bit System Microsecond Timer & WDT */
 #define rom_us_timer_get    ROM_FN(0x0000B6D8, uint64_t, (void))

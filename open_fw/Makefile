@@ -1,8 +1,9 @@
 # Build system for Cassini OpenFW (standalone clean-room SL6801 firmware)
 #
 # Usage:
-#   make -C open_fw        # Compile & pack standalone open_fw FIRM partition
-#   make -C open_fw clean  # Remove build artifacts
+#   make -C open_fw            # Compile & pack standalone open_fw FIRM partition
+#   make -C open_fw update-up  # Also build 2 MB flash image + 0:\update.up (requires ../dumps/firmware_2M.bin)
+#   make -C open_fw clean      # Remove build artifacts
 #
 # SPDX-License-Identifier: MIT
 
@@ -10,36 +11,56 @@ CLANG    ?= clang
 LLD      ?= $(shell which ld.lld 2>/dev/null || find /usr/lib "$${ANDROID_HOME:-$$HOME/Android/Sdk}/ndk" -maxdepth 8 \( -type f -o -type l \) -executable -name ld.lld 2>/dev/null | head -n 1)
 OBJCOPY  ?= $(shell which llvm-objcopy 2>/dev/null || find /usr/lib "$${ANDROID_HOME:-$$HOME/Android/Sdk}/ndk" -maxdepth 8 \( -type f -o -type l \) -executable -name llvm-objcopy 2>/dev/null | head -n 1)
 
+BUILD_DIR ?= /tmp/sl6801_openfw
+
 CFLAGS   := --target=thumbv7em-none-eabi -mcpu=cortex-m4 -mfloat-abi=soft -mthumb \
             -Os -Wall -Wextra -ffreestanding -fno-builtin -fno-stack-protector \
-            -Iinclude
+            -Iinclude -I$(BUILD_DIR)
 
-BUILD_DIR ?= /tmp/sl6801_openfw
-SRCS      := src/startup.c src/wdt_timer.c src/rtc.c src/main.c
+SRCS      := src/startup.c src/wdt_timer.c src/rtc.c src/uart.c src/pmu.c src/keys.c src/lcd_st7735s.c src/main.c
 OBJS      := $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(SRCS))
 
-.PHONY: all clean
+SPLASH_PNG  := ../assets/cassini_welcome_80x40.png
+SPLASH_HDR  := $(BUILD_DIR)/cassini_splash.h
+STOCK_DUMP  := ../dumps/firmware_2M.bin
+OUT_BIN     := ../dumps/firmware_2M_openfw.bin
+OUT_UP      := ../dumps/update_openfw.up
+
+.PHONY: all update-up clean
 
 all: $(BUILD_DIR)/open_fw_firm.bin
 
 $(BUILD_DIR):
 	@mkdir -p $(BUILD_DIR)
 
-$(BUILD_DIR)/%.o: src/%.c include/sl6801_regs.h include/sl6801_rom.h | $(BUILD_DIR)
+$(SPLASH_HDR): $(SPLASH_PNG) tools/png_to_rgb565_h.py | $(BUILD_DIR)
+	python3 tools/png_to_rgb565_h.py $(SPLASH_PNG) --out $@
+
+$(BUILD_DIR)/main.o: src/main.c $(SPLASH_HDR) include/sl6801_regs.h include/openfw.h | $(BUILD_DIR)
+	$(CLANG) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/%.o: src/%.c include/sl6801_regs.h include/sl6801_rom.h include/openfw.h | $(BUILD_DIR)
 	$(CLANG) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/open_fw.elf: $(OBJS) sl6801_firm.ld
 	@test -n "$(LLD)" || (echo "Error: ld.lld not found (set LLD=/path/to/ld.lld)" >&2; exit 1)
 	$(LLD) -T sl6801_firm.ld $(OBJS) -o $@
 
-$(BUILD_DIR)/ram_boot.bin: $(BUILD_DIR)/open_fw.elf
-	$(OBJCOPY) -O binary -j .ram_boot $< $@
+$(BUILD_DIR)/open_fw_ram.bin: $(BUILD_DIR)/open_fw.elf
+	@test -n "$(OBJCOPY)" || (echo "Error: llvm-objcopy not found (set OBJCOPY=/path/to/llvm-objcopy)" >&2; exit 1)
+	$(OBJCOPY) -O binary $< $@
 
-$(BUILD_DIR)/xip.bin: $(BUILD_DIR)/open_fw.elf
-	$(OBJCOPY) -O binary -j .text -j .data $< $@
+$(BUILD_DIR)/open_fw_firm.bin: $(BUILD_DIR)/open_fw_ram.bin tools/pack_firm.py
+	python3 tools/pack_firm.py --ram-img $< --out-firm $@
 
-$(BUILD_DIR)/open_fw_firm.bin: $(BUILD_DIR)/ram_boot.bin $(BUILD_DIR)/xip.bin tools/pack_firm.py
-	python3 tools/pack_firm.py --ram-boot $(BUILD_DIR)/ram_boot.bin --xip $(BUILD_DIR)/xip.bin --out-firm $@
+update-up: $(BUILD_DIR)/open_fw_ram.bin tools/pack_firm.py
+	@test -f "$(STOCK_DUMP)" || (echo "Error: $(STOCK_DUMP) not found" >&2; exit 1)
+	python3 tools/pack_firm.py --ram-img $(BUILD_DIR)/open_fw_ram.bin \
+		--out-firm $(BUILD_DIR)/open_fw_firm.bin \
+		--base-hlkj $(STOCK_DUMP) \
+		--out-bin $(OUT_BIN) \
+		--out-update-up $(OUT_UP)
+	python3 ../tools/inspect_fw.py $(OUT_BIN)
 
 clean:
 	rm -rf $(BUILD_DIR)
