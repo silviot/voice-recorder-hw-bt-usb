@@ -116,21 +116,18 @@ When VBUS is detected during normal operation (`pstr_usb_option_process`):
 * Selecting **`Charge & Transfer`** closes Bluetooth (`USB reader, close bt`), disables local recording, calls `usbd_msc_cardreader_init` (`0xD3A580`), registers `FIRM`'s `ops` table (`0x812A00..0x812AD9`) into Boot ROM's USB MSC state via `usb_set_userfn` (`0x5914` -> `*(0x801068)`), and enumerates as **`301a:2801`** (`SMTLINK CARDREADER 1.00`).
 * Selecting **Settings → Update Options → `PC Upgrade`** sets a PMU flag (`HAL_pmu_pc_update_flag_set`) and reboots into the Bootloader's USB update mode (**`301a:2800`**, no hardware boot-key press needed).
 
-### 3.2 Exact Instruction-Level Root Cause of the 15s Linux Disconnect Loop
-Disassembling `FIRM`'s SCSI CDB interceptor (`0x812AD8`) and SDIO reader (`HAL_sd_disk_read` at SRAM **`0x8160C8`**, flash `0x0428F8`) pinpoints the exact firmware bug described in [README.md](README.md):
+### 3.2 Exact Instruction-Level Root Cause & Firmware Fix for the 15s Linux Disconnect Loop
+Disassembling `FIRM`'s SCSI CDB interceptor (`0x812AD8`), `HAL_sd_disk_read` (`0x8160C8`, flash `0x0428F8`), and `sd_read_blocks` (`0x815BF0`, flash `0x042420`) pinpoints **two interlocking bugs** when Linux probes the final 4 KiB (`LBA 122,101,752..122,101,759`) in 1-sector (`count = 1`) USB MSC reads:
 
-1. `FIRM` intercepts SCSI `0x28` (`READ(10)`), `0x2A` (`WRITE(10)`), and `0x1B` (`START STOP UNIT`) at `0x812AD8`, bypassing Boot ROM's bounds-checked `READ(10)` (`0x5CBC`). (Incidentally, at `0x812BD2`, whenever `LBA == 0` is read over USB, `FIRM` zeroes MBR partition entries 2–4 in RAM before sending sector 0 to the host.)
-2. Inside `HAL_sd_disk_read` (`0x8160C8`), the driver prefetches 8 sectors at a time using open-ended SD **`CMD18` (`READ_MULTIPLE_BLOCK`, `0x815BF0`)** followed by **`CMD12` (`STOP_TRANSMISSION`, at `0x8162CC`)**.
-3. However, at **`0x8161FA`**, the author wrote an inverted boundary check against **`total_sectors - 3`** (`122,101,760 - 3 = 122,101,757 = 0x07471FFD` — the *exact* failing LBA in `dmesg`!):
-   ```armasm
-   8161f6: ldr.w  r3, [r11, r3]   @ r3 = total_sectors (122,101,760)
-   8161fa: subs   r3, #0x3        @ r3 = total_sectors - 3 (122,101,757 = 0x07471FFD)
-   8161fc: cmp    r3, r5          @ compare 122,101,757 vs requested LBA (r5)
-   8161fe: bhi    0x8162cc        @ ONLY sends CMD12 + copies sector to caller if LBA < 122,101,757!
-   @ When LBA >= 122,101,757: unlocks mutex (0x80db6e) and returns early at 0x81621A
-   @ WITHOUT sending CMD12 STOP_TRANSMISSION and WITHOUT copying data to the USB buffer!
-   ```
-4. Because `CMD18` is left unterminated on the SDIO bus, the SD card stays wedged in `DATA` state and hangs the USB/SD worker thread until Linux's 15-second `usb-storage` timeout resets the port. Your existing [50-smartlink-sl6801.rules](50-smartlink-sl6801.rules) + `-1 cluster` shrink in [fix_exfat_boundary.py](tools/fix_exfat_boundary.py) keeps `udevd` and `fwupd` below `total_sectors - 256`, completely avoiding `LBA >= total_sectors - 3`.
+1. `FIRM` intercepts SCSI `0x28` (`READ(10)`), `0x2A` (`WRITE(10)`), and `0x1B` (`START STOP UNIT`) at `0x812AD8` (splitting every `READ(10)` into 1-sector calls to `HAL_sd_disk_read`, and zeroing MBR entries 2–4 in RAM whenever `LBA == 0` is read at `0x812BD2`).
+2. `HAL_sd_disk_read` uses a matched entry (`0x816128`) / exit (`0x8161F0`) pair comparing against `total_sectors - 3` (`122,101,757 = 0x07471FFD`) to temporarily switch from `read_mode = 1` (open-ended streaming `CMD18`) to `read_mode = 2` (finite `CMD18` + hardware `AUTO_CMD12`, clamped to `min(8, total_sectors - r5)` sectors) on the last 3 sectors.
+3. **Bug #1 — Off-by-one on post-incremented `r5` (`0x8161FA`):** When reading `LBA = 122,101,756` (`total_sectors - 4`, `count = 1`), entry keeps `read_mode = 1` (open-ended `CMD18`, card stays in `DATA` streaming state), then `0x816244` increments `r5` to `122,101,757`. At exit (`0x8161FA`), `cmp (total_sectors - 3), r5` is equal, so `bhi 0x8162cc` is NOT taken and `0x81620E` **erroneously sets `skip_cmd12` (`[r4+0xd0] = 1`)** while the card is still actively streaming!
+4. **Bug #2 — Illegal `CMD18` in `DATA` state (`0x815C22`):** On the immediately following read at **`LBA = 122,101,757`** (`total_sectors - 3`), entry switches `read_mode = 2` and calls `sd_read_blocks(r4, cache_buf, 122101757, 3)`. Because `122,101,757 == next_expected_lba` (`[r4+0x98]`), `0x815C1E` skips the `CMD12` stop check and falls directly into `0x815B38`, **issuing a new `CMD18` (`AUTO_CMD12`) to an SD card still in `DATA` state without sending `CMD12` first** — wedging the SDIO bus until Linux's 15-second `usb-storage` timeout resets the port.
+5. **Two Ways to Fix It:**
+   * **Host-side (no flashing):** [50-smartlink-sl6801.rules](50-smartlink-sl6801.rules) + `-1 cluster` shrink in [fix_exfat_boundary.py](tools/fix_exfat_boundary.py) keeps `udevd` and `fwupd` below `total_sectors - 256`.
+   * **Direct Firmware Patch (`--patch sdio-end-of-disk` in [tools/patch_firmware.py](tools/patch_firmware.py)):** Two `llvm-objdump`-verified hunks (34 bytes total in `.ramtext`):
+     * **Hunk 1 (`0x815C22`, flash `0x042452`, 6 B):** On sequential reads, only continue streaming if `read_mode == 1`; otherwise branch to `0x815C4C` so `CMD12` is sent before issuing finite `CMD18`.
+     * **Hunk 2 (`0x8161F0`, flash `0x042A20`, 28 B):** Check `[r4+0x38] == 2` (actual mode switch) instead of post-incremented `r5 >= total_sectors - 3`, and verify `[r4+0x98] >= r5` before setting `skip_cmd12 = 1` (preventing cache-hit corruption too). Fixes Linux USB on **any** SD card without shrinking partitions!
 
 ### 3.3 Full USB SCSI & Vendor `0xC0` Command Table
 Because `FIRM`'s `ops + 0x20` (`0x812AD8`) only intercepts `0x1B`, `0x28`, and `0x2A`, and returns `0` for everything else, **Boot ROM's entire `0xC0` vendor SCSI command engine (`0x61DE`) remains live in normal `301a:2801` Card Reader mode** as well as `301a:2800` Bootloader mode!
@@ -426,3 +423,32 @@ Verified against `dumps/sdcard_backup/DBROOT/{db_wave.db,db_content.db}` and `FI
 | `+0x10` | `4` | `free_clst` | `0x000746AB` (`476,843`) | Snapshot of FAT free clusters (compared on boot to detect external USB/SD edits) |
 | `+0x2C` | `4` | `wave_count` | `4` | Number of 510-byte records in `db_wave.db` (max `5,000`) |
 | `+0x54..+0x5F` | `12` | `callbacks[2], mutex` | `0xD15535`, `0xD1BB29`, `0x8358D0` | Leaked runtime XIP/SRAM pointers (not loaded back) |
+
+---
+
+## 11. Full 384 KB Internal Mask ROM Architecture (`dumps/bootrom_384K.bin`)
+
+### 11.1 Complete ROM Section Map (`0x000000..0x05FFFF`, 393,216 B)
+
+`bootrom_384K.bin[0x000000..0x00FFFF]` is byte-for-byte identical to `bootrom_64K.bin`. The full 384 KB ROM is partitioned into **8 zero-padded sections**:
+
+| Section | ROM Range | Active Size | VFP/FPU | Subsystem & Contents |
+| :--- | :--- | :--- | :---: | :--- |
+| **S0** | `0x000000..0x00FFFF` | `65,109 B` | `0xB800+` | **Lower Boot ROM:** Vectors, `Reset_Handler` (`0x41`), libc, USB Device/Host MSC + `0xC0` ISP (`0x4E00..0x8500`), SPI NOR, FreeRTOS (`SVC`/`SysTick`), lower DSP helpers |
+| **S1** | `0x010000..0x01FFFF` | `65,136 B` | Heavy | **ROM Audio DSP, Decoders & Parsers:** Radix-2 float FFT (`0x0100F0`), hookable `audio_malloc`/`calloc`/`free` (`0x01100C..0x0110C0`), fast `log2f`/`exp2f` (`0x0128D8`), ROM audio decoders (`0x013000..0x01BFFF`), MP4/M4A/ALAC/MP3 (`Xing`) container parsers (`0x01BED0..0x01FE70`) |
+| **S2+S3a** | `0x020000..0x0467FF` | `157,696 B` | None | **Bluetooth BR/EDR Controller (`btc`):** Pure integer RivieraWaves-style (`ke_msg`/`ke_mem`) HCI/LMP/LC/Baseband/Sleep controller. Accesses BT MMIO at `0x40020000` (70 refs), `0x40030000` (80 refs), `0x40036000` (51 refs), `0x40031000`, `0x40027000`. |
+| **S3b** | `0x046800..0x047FFF` | `5,085 B` | Heavy | **Audio/Speech DSP Tail:** Float DSP routines (`0x0468DA` called from `FIRM 0xD67508`), calling S6 FPU dot-product helpers |
+| **S4** | `0x048000..0x04BFFF` | `15,539 B` | Heavy | **FPU Math & Speech/Audio DSP:** Fast `log2f` (`0x048228`), `exp2f` (`0x048268`), RAM-hookable `codec_calloc`/`codec_free` (`0x04B29C`/`0x04B2AC`), 4-wide `vmla.f32` FIR filter (`0x04B896`) |
+| **S5** | `0x04C000..0x04FFFF` | `15,334 B` | Tables | **Stage-0 Boot ROM Loader & LUTs:** `rom_delay_loop` (`0x04C014`), default exception/IRQ handlers (`0x04C2C5..0x04C2CD`), Boot ROM `main()` (`0x04C9C8`), `HLKJ` SPI NOR loader (`0x04CC6C`), `log2f`/trig LUTs (`0x04D600..0x04FBE6`) |
+| **S6** | `0x050000..0x05B7FF` | `46,787 B` | `0x596C0+` | **Audio Codec Tables & FPU DSP Tail:** MP3 Huffman (`0x0567BE..0x058CCC`) & IMDCT/polyphase tables (`0x0501A4..0x0567BD`), format FourCCs (`WAVE`, `OggS`, `fLaC`, `ftyp`, `MAC ` at `0x059680..0x0596BC`), 8-wide `vmla.f32` dot product (`0x05B24C`) |
+| **S7** | `0x05B800..0x05BEB4` | `1,716 B` | Data | **Boot ROM `.data` Load Image (`-> SRAM 0x00800000..0x008006B4`):** 64-entry RAM vector table, USB MSC callback tables (`0x05BCC8..0x05BDC0`), audio parser vtable, SCSI Inquiry `"SMTLINK DEVICE          2.00"` (`0x05BD90`) |
+
+### 11.2 `FIRM` → Upper ROM Cross-Reference Summary
+`FIRM` makes **694 calls to 153 distinct upper-ROM targets** (`0x010000..0x05FFFF`), plus a 10-entry `btc` dispatch table in `.ramtext` (`0x00816D20..0x00816D70`):
+* **BT Controller (`0x020000..0x0467FF`):** 96 targets / 301 calls (key RAM-patchable thunks: `ke_msg_alloc` `0x0309EC`, `ke_msg_send` `0x030A30`, `ke_msg_free` `0x030A9E`, `btc_int_disable`/`restore` `0x03DE80`/`0x03DE8C`, `ke_malloc`/`free` `0x03DEA4`/`0x03DEB0`).
+* **FPU Math & DSP (`0x048000..0x04BCB3`):** 25 targets / 239 calls (`codec_calloc` `0x04B29C`, `codec_free` `0x04B2AC`, `exp2f` `0x048268`, 4-wide FIR `0x04B896`).
+* **Audio Allocator, FFT & Parsers (`0x010000..0x01FFFF`):** 30 targets / 151 calls (`audio_malloc`/`calloc`/`free` `0x01100C`/`0x011044`/`0x0110C0`, Radix-2 FFT `0x0100F0`, parser init/free `0x01D634`/`0x01D664`).
+
+### 11.3 Architectural Finding: `btc` Runs on CPU0
+* Across the entire 384 KB Mask ROM, the CPU1 mailbox (`0x30000600`) appears **only once** (in lower-ROM `Reset_Handler` at `0x0000A8`). There is no CPU1 firmware image in ROM.
+* The entire 154 KB Bluetooth BR/EDR Controller (`0x020000..0x0467FF`) runs directly on **CPU0** under FreeRTOS (`task btc` / `bt_isr_bh` in `FIRM 0xD55312..0xD585D8`). CPU1 is booted exclusively from `FIRM` XIP (`0x00CE73A8` → `0x00CE7371`).

@@ -43,12 +43,17 @@ def crc16_ccitt_false(data: bytes | bytearray | memoryview) -> int:
 
 
 @dataclass(frozen=True)
-class BinaryPatch:
-    name: str
-    description: str
+class PatchHunk:
     flash_offset: int
     original: bytes
     replacement: bytes
+
+
+@dataclass(frozen=True)
+class BinaryPatch:
+    name: str
+    description: str
+    hunks: tuple[PatchHunk, ...]
 
 
 PATCHES: dict[str, BinaryPatch] = {
@@ -58,12 +63,40 @@ PATCHES: dict[str, BinaryPatch] = {
             "Fix PCM WAV header nBlockAlign at CloseWav (VMA 0xCED464 / flash 0x0ED464): "
             "store bytesPerSample * nChannels (4) instead of bytesPerSample (2)."
         ),
-        flash_offset=0x0ED464,
-        original=bytes.fromhex(
-            "d2 7b 50 43 92 b2 43 43 ad f8 2c 20 d2 00 0a 93 ad f8 2e 20"
+        hunks=(
+            PatchHunk(
+                flash_offset=0x0ED464,
+                original=bytes.fromhex(
+                    "d2 7b 50 43 92 b2 43 43 ad f8 2c 20 d2 00 0a 93 ad f8 2e 20"
+                ),
+                replacement=bytes.fromhex(
+                    "d2 7b 53 43 58 43 ad f8 2c 30 d2 00 0a 90 ad f8 2e 20 00 bf"
+                ),
+            ),
         ),
-        replacement=bytes.fromhex(
-            "d2 7b 53 43 58 43 ad f8 2c 30 d2 00 0a 90 ad f8 2e 20 00 bf"
+    ),
+    "sdio-end-of-disk": BinaryPatch(
+        name="sdio-end-of-disk",
+        description=(
+            "Fix 15-second Linux USB disconnect on end-of-card reads (LBA >= total_sectors - 3) "
+            "in sd_read_blocks (0x815C22) + HAL_sd_disk_read (0x8161F0): send CMD12 before "
+            "switching from open-ended to finite AUTO_CMD12 reads and fix post-increment skip_cmd12 flag."
+        ),
+        hunks=(
+            PatchHunk(
+                flash_offset=0x042452,  # SRAM 0x815C22 (sd_read_blocks)
+                original=bytes.fromhex("33 f0 02 03 04 d1"),
+                replacement=bytes.fromhex("01 2b 05 d0 11 e0"),
+            ),
+            PatchHunk(
+                flash_offset=0x042A20,  # SRAM 0x8161F0 (HAL_sd_disk_read exit)
+                original=bytes.fromhex(
+                    "98 f8 00 30 1b 01 5b f8 03 30 03 3b ab 42 65 d8 d4 f8 cc 30 01 2b 61 d1 c4 e9 0e 33"
+                ),
+                replacement=bytes.fromhex(
+                    "a3 6b 02 2b 6a d1 d4 f8 cc 30 01 2b 66 d1 c4 e9 0e 33 d4 f8 98 20 aa 42 60 d3 00 bf"
+                ),
+            ),
         ),
     ),
 }
@@ -137,7 +170,9 @@ def main() -> int:
 
     if args.list_patches:
         for p in PATCHES.values():
-            print(f"  {p.name:18s} @ 0x{p.flash_offset:06X} ({len(p.original)} B): {p.description}")
+            total_b = sum(len(h.original) for h in p.hunks)
+            offs = ", ".join(f"0x{h.flash_offset:06X}" for h in p.hunks)
+            print(f"  {p.name:18s} @ {offs} ({total_b} B): {p.description}")
         return 0
 
     raw = bytearray(args.input.read_bytes())
@@ -153,15 +188,26 @@ def main() -> int:
 
     for name in args.patch:
         p = PATCHES[name]
-        cur = bytes(raw[p.flash_offset : p.flash_offset + len(p.original)])
-        if cur == p.replacement:
-            print(f"  [SKIP] Patch '{name}' already applied at 0x{p.flash_offset:06X}")
+        # Pre-validate all hunks before modifying anything
+        already = all(
+            bytes(raw[h.flash_offset : h.flash_offset + len(h.original)]) == h.replacement
+            for h in p.hunks
+        )
+        if already:
+            print(f"  [SKIP] Patch '{name}' already applied")
             continue
-        if cur != p.original:
-            print(f"Error: bytes at 0x{p.flash_offset:06X} do not match expected original for '{name}'", file=sys.stderr)
-            return 1
-        raw[p.flash_offset : p.flash_offset + len(p.replacement)] = p.replacement
-        print(f"  [APPLIED] {name} @ 0x{p.flash_offset:06X} ({len(p.replacement)} bytes)")
+        for h in p.hunks:
+            cur = bytes(raw[h.flash_offset : h.flash_offset + len(h.original)])
+            if cur != h.original:
+                print(
+                    f"Error: bytes at 0x{h.flash_offset:06X} do not match expected original for '{name}'",
+                    file=sys.stderr,
+                )
+                return 1
+        for h in p.hunks:
+            raw[h.flash_offset : h.flash_offset + len(h.replacement)] = h.replacement
+        total_b = sum(len(h.replacement) for h in p.hunks)
+        print(f"  [APPLIED] {name} ({len(p.hunks)} hunk(s), {total_b} bytes)")
 
     if args.bump_timestamp:
         firm_off, _, _ = read_firm_layout(raw)
