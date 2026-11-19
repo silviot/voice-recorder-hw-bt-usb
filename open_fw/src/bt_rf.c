@@ -114,7 +114,7 @@ static uint32_t int_log2_q8(uint64_t v)
 static void rf_delay(uint32_t n)
 {
     for (volatile uint32_t i = n * 200u; i != 0u; i--) {
-        __asm__ volatile ("nop");
+        OPENFW_NOP();
     }
 }
 
@@ -122,29 +122,29 @@ uint32_t bt_rf_efuse_trim(void)
 {
     rom_rst_release(EFUSE_RST_ID);
     rom_clk_enable(EFUSE_CLK_ID);
-    if ((EFUSE_WORD(3u) >> 31) == 0u) {
+    if ((openfw_mmio_rd32(EFUSE_WORD_ADDR(3u)) >> 31) == 0u) {
         return 4u;
     }
-    return (EFUSE_WORD(1u) >> 14) & 0xFu;
+    return (openfw_mmio_rd32(EFUSE_WORD_ADDR(1u)) >> 14) & 0xFu;
 }
 
 static uint32_t rf_lut_read_raw(uint32_t addr)
 {
-    RF_LUT_CTRL = (RF_LUT_CTRL & ~0x1FFu) | (addr & 0x1FFu);
-    RF_LUT_CTRL &= ~(1u << 11);
-    RF_LUT_CTRL |=  (1u << 16);
-    while (RF_LUT_CTRL & (1u << 16)) {
+    openfw_mmio_rmw32(RF_LUT_CTRL_ADDR, 0x1FFu, addr & 0x1FFu);
+    openfw_mmio_clr32(RF_LUT_CTRL_ADDR, (1u << 11));
+    openfw_mmio_set32(RF_LUT_CTRL_ADDR, (1u << 16));
+    while (openfw_mmio_rd32(RF_LUT_CTRL_ADDR) & (1u << 16)) {
     }
-    return RF_LUT_DATA;
+    return openfw_mmio_rd32(RF_LUT_DATA_ADDR);
 }
 
 static void rf_lut_write_raw(uint32_t addr, uint32_t val)
 {
-    RF_LUT_DATA = val;
-    RF_LUT_CTRL = (RF_LUT_CTRL & ~0x1FFu) | (addr & 0x1FFu);
-    RF_LUT_CTRL |= (1u << 11);
-    RF_LUT_CTRL |= (1u << 16);
-    while (RF_LUT_CTRL & (1u << 16)) {
+    openfw_mmio_wr32(RF_LUT_DATA_ADDR, val);
+    openfw_mmio_rmw32(RF_LUT_CTRL_ADDR, 0x1FFu, addr & 0x1FFu);
+    openfw_mmio_set32(RF_LUT_CTRL_ADDR, (1u << 11));
+    openfw_mmio_set32(RF_LUT_CTRL_ADDR, (1u << 16));
+    while (openfw_mmio_rd32(RF_LUT_CTRL_ADDR) & (1u << 16)) {
     }
 }
 
@@ -230,56 +230,56 @@ static void rf_lut_populate(const uint8_t tx_band[86], const uint8_t tx_cap[86],
 
 static void rf_cru_reset(void)
 {
-    CRU_BT_RF_WRAP   &= ~(1u << 0);
-    CRU_RST_STAT1    &= ~(1u << 2);
-    CRU_RST_SET1     &= ~(1u << 2);
-    CRU_CLK_SRC_GATE |=  (1u << 4);
-    CRU_RST_SET1     |=  (1u << 2);
-    CRU_RST_STAT1    |=  (1u << 2);
-    CRU_BT_RF_WRAP   |=  (1u << 0);
+    openfw_mmio_clr32(CRU_BT_RF_WRAP_ADDR, (1u << 0));
+    openfw_mmio_clr32(CRU_RST_STAT1_ADDR, (1u << 2));
+    openfw_mmio_clr32(CRU_RST_SET1_ADDR, (1u << 2));
+    openfw_mmio_set32(CRU_CLK_SRC_GATE_ADDR, (1u << 4));
+    openfw_mmio_set32(CRU_RST_SET1_ADDR, (1u << 2));
+    openfw_mmio_set32(CRU_RST_STAT1_ADDR, (1u << 2));
+    openfw_mmio_set32(CRU_BT_RF_WRAP_ADDR, (1u << 0));
     rf_delay(1u);
 }
 
 static void bt_rf_cal_mode_reset(void)
 {
     rf_cru_reset();
-    RF_BB_CTRL |= (1u << 26);
-    REG32(RF_ANA_BASE + 0x20u) &= ~0x1u;
-    REG32(RF_ANA_BASE + 0x2Cu) |=  0x4u;
-    REG32(RF_ANA_BASE + 0x40u) |=  0x20u;
-    REG32(RF_ANA_BASE + 0x64u) |=  (1u << 19) | (1u << 18) | (1u << 20);
-    REG32(RF_ANA_BASE + 0x80u) |=  (1u << 17);
-    REG32(RF_ANA_BASE + 0x84u) |=  (1u << 18) | (1u << 19);
-    REG32(RF_ANA_BASE + 0xA0u) |=  (1u << 31) | (1u << 27);
-    REG32(RF_ANA_BASE + 0xACu) |=  (1u << 9)  | (1u << 16);
-    REG32(RF_ANA_BASE + 0xB0u) |=  (1u << 24);
-    REG32(RF_ANA_BASE + 0xB8u) |=  (1u << 28);
-    REG32(RF_ANA_BASE + 0xC0u) |=  (1u << 9);
-    RF_LUT_CTRL                &= ~0xFFF00000u;
-    REG32(RF_BB_BASE + 0x200u) &= ~0x420u;
-    AON_CLK_CFG = (AON_CLK_CFG & ~0xFF0u) | 0x4C0u;
+    openfw_mmio_set32(RF_BB_CTRL_ADDR, (1u << 26));
+    openfw_mmio_clr32(RF_ANA_BASE + 0x20u, 0x1u);
+    openfw_mmio_set32(RF_ANA_BASE + 0x2Cu, 0x4u);
+    openfw_mmio_set32(RF_ANA_BASE + 0x40u, 0x20u);
+    openfw_mmio_set32(RF_ANA_BASE + 0x64u, (1u << 19) | (1u << 18) | (1u << 20));
+    openfw_mmio_set32(RF_ANA_BASE + 0x80u, (1u << 17));
+    openfw_mmio_set32(RF_ANA_BASE + 0x84u, (1u << 18) | (1u << 19));
+    openfw_mmio_set32(RF_ANA_BASE + 0xA0u, (1u << 31) | (1u << 27));
+    openfw_mmio_set32(RF_ANA_BASE + 0xACu, (1u << 9) | (1u << 16));
+    openfw_mmio_set32(RF_ANA_BASE + 0xB0u, (1u << 24));
+    openfw_mmio_set32(RF_ANA_BASE + 0xB8u, (1u << 28));
+    openfw_mmio_set32(RF_ANA_BASE + 0xC0u, (1u << 9));
+    openfw_mmio_clr32(RF_LUT_CTRL_ADDR, 0xFFF00000u);
+    openfw_mmio_clr32(RF_BB_BASE + 0x200u, 0x420u);
+    openfw_mmio_rmw32(AON_CLK_CFG_ADDR, 0xFF0u, 0x4C0u);
 }
 
 static void rf_pll_ldo_en(uint32_t trim)
 {
-    REG32(RF_ANA_BASE + 0x40u) &= ~0x4u;
-    REG32(RF_ANA_BASE + 0x40u) = (REG32(RF_ANA_BASE + 0x40u) & ~0xF0000u) | ((trim & 0xFu) << 16);
-    REG32(RF_ANA_BASE + 0x40u) |= 0x20u;
+    openfw_mmio_clr32(RF_ANA_BASE + 0x40u, 0x4u);
+    openfw_mmio_rmw32(RF_ANA_BASE + 0x40u, 0xF0000u, (trim & 0xFu) << 16);
+    openfw_mmio_set32(RF_ANA_BASE + 0x40u, 0x20u);
     rf_delay(1u);
 }
 
 static void rf_xtal_en(void)
 {
-    REG32(RF_ANA_BASE + 0x2Cu) |= 0x5u;
+    openfw_mmio_set32(RF_ANA_BASE + 0x2Cu, 0x5u);
     rf_delay(1u);
 }
 
 static void rf_synth_en(void)
 {
-    REG32(RF_ANA_BASE + 0xB0u) |= (1u << 24);
-    REG32(RF_ANA_BASE + 0xB8u) |= (1u << 28);
+    openfw_mmio_set32(RF_ANA_BASE + 0xB0u, (1u << 24));
+    openfw_mmio_set32(RF_ANA_BASE + 0xB8u, (1u << 28));
     for (int b = 15; b >= 1; b--) {
-        REG32(RF_ANA_BASE + 0xB4u) |= (1u << (uint32_t)b);
+        openfw_mmio_set32(RF_ANA_BASE + 0xB4u, (1u << (uint32_t)b));
     }
     rf_delay(10u);
 }
@@ -288,16 +288,16 @@ static void rf_vco_cal_step(int16_t n_int, uint32_t n_frac)
 {
     rf_lut_write_field(25u, 0u, n_frac);
     rf_lut_write_field(24u, 0u, (uint32_t)n_int);
-    REG32(RF_ANA_BASE + 0xC0u) |=  (1u << 9);
-    REG32(RF_ANA_BASE + 0xC0u) &= ~0x7Fu;
-    REG32(RF_ANA_BASE + 0xC0u) |=  (1u << 8);
-    while (REG32(RF_ANA_BASE + 0xC0u) & (1u << 8)) {
+    openfw_mmio_set32(RF_ANA_BASE + 0xC0u, (1u << 9));
+    openfw_mmio_clr32(RF_ANA_BASE + 0xC0u, 0x7Fu);
+    openfw_mmio_set32(RF_ANA_BASE + 0xC0u, (1u << 8));
+    while (openfw_mmio_rd32(RF_ANA_BASE + 0xC0u) & (1u << 8)) {
     }
-    REG32(RF_ANA_BASE + 0xB4u) |=  0x1u;
+    openfw_mmio_set32(RF_ANA_BASE + 0xB4u, 0x1u);
     rf_delay(1u);
-    REG32(RF_ANA_BASE + 0xB4u) &= ~0x1u;
+    openfw_mmio_clr32(RF_ANA_BASE + 0xB4u, 0x1u);
     rf_delay(1u);
-    REG32(RF_ANA_BASE + 0xBCu) = 0x1E1D1303u;
+    openfw_mmio_wr32(RF_ANA_BASE + 0xBCu, 0x1E1D1303u);
     rf_delay(50u);
 }
 
@@ -312,86 +312,84 @@ static void bt_rf_vco_cal(uint32_t trim, uint8_t tx_band[86], uint8_t tx_cap[86]
         int16_t  ni = (int16_t)(200u + (ch / 12u));
         uint32_t nf = ((ch % 12u) << 21) / 12u;
         rf_vco_cal_step(ni, nf);
-        tx_cap[ch]  = (uint8_t)(REG32(RF_ANA_BASE + 0xC4u) & 0x7Fu);
-        tx_band[ch] = (uint8_t)(REG32(RF_ANA_BASE + 0xCCu) >> 12);
+        tx_cap[ch]  = (uint8_t)(openfw_mmio_rd32(RF_ANA_BASE + 0xC4u) & 0x7Fu);
+        tx_band[ch] = (uint8_t)(openfw_mmio_rd32(RF_ANA_BASE + 0xCCu) >> 12);
     }
     for (uint32_t ch = 0u; ch < 86u; ch++) {
         int16_t  ni = (int16_t)(200u + (ch / 12u) + 7u);
         uint32_t nf = ((ch % 12u) << 21) / 12u;
         rf_vco_cal_step(ni, nf);
-        rx_cap[ch]  = (uint8_t)(REG32(RF_ANA_BASE + 0xC4u) & 0x7Fu);
-        rx_band[ch] = (uint8_t)(REG32(RF_ANA_BASE + 0xCCu) >> 12);
+        rx_cap[ch]  = (uint8_t)(openfw_mmio_rd32(RF_ANA_BASE + 0xC4u) & 0x7Fu);
+        rx_band[ch] = (uint8_t)(openfw_mmio_rd32(RF_ANA_BASE + 0xCCu) >> 12);
     }
 }
 
 static void rf_synth_tune_mhz(uint32_t freq_mhz)
 {
-    REG32(RF_ANA_BASE + 0xC0u) |= (1u << 9);
-    REG32(RF_ANA_BASE + 0xC0u)  = (REG32(RF_ANA_BASE + 0xC0u) & ~0x7Fu) | ((freq_mhz - 0x960u) & 0x7Fu);
-    REG32(RF_ANA_BASE + 0xC0u) |= (1u << 8);
-    while (REG32(RF_ANA_BASE + 0xC0u) & (1u << 8)) {
+    openfw_mmio_set32(RF_ANA_BASE + 0xC0u, (1u << 9));
+    openfw_mmio_rmw32(RF_ANA_BASE + 0xC0u, 0x7Fu, (freq_mhz - 0x960u) & 0x7Fu);
+    openfw_mmio_set32(RF_ANA_BASE + 0xC0u, (1u << 8));
+    while (openfw_mmio_rd32(RF_ANA_BASE + 0xC0u) & (1u << 8)) {
     }
-    REG32(RF_ANA_BASE + 0xB4u) |=  0x1u;
+    openfw_mmio_set32(RF_ANA_BASE + 0xB4u, 0x1u);
     rf_delay(1u);
-    REG32(RF_ANA_BASE + 0xB4u) &= ~0x1u;
+    openfw_mmio_clr32(RF_ANA_BASE + 0xB4u, 0x1u);
     rf_delay(50u);
 }
 
 static void rf_tx_tone_start(uint32_t step, uint32_t em_off)
 {
-    REG32(RF_ANA_BASE + 0x0Cu) &= ~(1u << 31);
-    REG32(RF_ANA_BASE + 0xA0u) |=  (1u << 20);
-    volatile uint16_t *em = (volatile uint16_t *)(uintptr_t)(RWBT_EM_BASE + em_off);
+    openfw_mmio_clr32(RF_ANA_BASE + 0x0Cu, (1u << 31));
+    openfw_mmio_set32(RF_ANA_BASE + 0xA0u, (1u << 20));
     uint32_t phase = 0u;
     for (uint32_t i = 0u; i < 1024u; i++) {
-        em[2u * i]      = (uint16_t)trig_cos1024(phase);
-        em[2u * i + 1u] = (uint16_t)trig_sin1024(phase);
+        openfw_mmio_wr16(RWBT_EM_BASE + em_off + 4u * i,      (uint16_t)trig_cos1024(phase));
+        openfw_mmio_wr16(RWBT_EM_BASE + em_off + 4u * i + 2u, (uint16_t)trig_sin1024(phase));
         phase += (step + 1u);
     }
-    REG32(RF_ANA_BASE + 0x00u) |= (1u << 14);
+    openfw_mmio_set32(RF_ANA_BASE + 0x00u, (1u << 14));
     rf_lut_write_field(6u, 0u, (uint32_t)(-32));
-    REG32(RF_ANA_BASE + 0xACu) |= 0x100u;
-    while (REG32(RF_ANA_BASE + 0xACu) & 0x100u) {
+    openfw_mmio_set32(RF_ANA_BASE + 0xACu, 0x100u);
+    while (openfw_mmio_rd32(RF_ANA_BASE + 0xACu) & 0x100u) {
     }
     rf_lut_write_field(3u, 0u, 1u);
-    REG32(RF_ANA_BASE + 0xACu) |= 0x100u;
-    while (REG32(RF_ANA_BASE + 0xACu) & 0x100u) {
+    openfw_mmio_set32(RF_ANA_BASE + 0xACu, 0x100u);
+    while (openfw_mmio_rd32(RF_ANA_BASE + 0xACu) & 0x100u) {
     }
-    REG32(RF_ANA_BASE + 0x0Cu)  = (REG32(RF_ANA_BASE + 0x0Cu) & ~0x7FFF0000u)
-                                | ((em_off << 16) & 0x7FFF0000u);
-    REG32(RF_ANA_BASE + 0x0Cu)  = (REG32(RF_ANA_BASE + 0x0Cu) & ~0xFFFFu) | 0x0FFCu;
-    REG32(RF_ANA_BASE + 0x0Cu) |= (1u << 31);
-    REG32(RF_ANA_BASE + 0xA0u) &= ~(1u << 20);
+    openfw_mmio_rmw32(RF_ANA_BASE + 0x0Cu, 0x7FFF0000u, (em_off << 16) & 0x7FFF0000u);
+    openfw_mmio_rmw32(RF_ANA_BASE + 0x0Cu, 0xFFFFu, 0x0FFCu);
+    openfw_mmio_set32(RF_ANA_BASE + 0x0Cu, (1u << 31));
+    openfw_mmio_clr32(RF_ANA_BASE + 0xA0u, (1u << 20));
     rf_delay(101u);
 }
 
 static void rf_tx_cal_cfg(void)
 {
-    REG32(RF_ANA_BASE + 0xA0u) = (REG32(RF_ANA_BASE + 0xA0u) & ~0x70000000u) | 0x30000000u;
-    REG32(RF_ANA_BASE + 0xA4u) = (REG32(RF_ANA_BASE + 0xA4u) & ~0xFF000370u) | 0xED000340u;
-    REG32(RF_ANA_BASE + 0xA8u) = (REG32(RF_ANA_BASE + 0xA8u) & ~0xFF3u)      | (3u << 4) | (1u << 6);
-    REG32(RF_BB_BASE + 0x120u) = (REG32(RF_BB_BASE + 0x120u) & ~0xE1FFFu)    | (3u << 17);
+    openfw_mmio_rmw32(RF_ANA_BASE + 0xA0u, 0x70000000u, 0x30000000u);
+    openfw_mmio_rmw32(RF_ANA_BASE + 0xA4u, 0xFF000370u, 0xED000340u);
+    openfw_mmio_rmw32(RF_ANA_BASE + 0xA8u, 0xFF3u, (3u << 4) | (1u << 6));
+    openfw_mmio_rmw32(RF_BB_BASE + 0x120u, 0xE1FFFu, (3u << 17));
     rf_lut_write_field(2u, 0u, 1u);
     rf_lut_write_field(1u, 0u, 1u);
     rf_lut_write_field(5u, 0u, 1u);
     rf_lut_write_field(4u, 0u, 1u);
-    REG32(RF_ANA_BASE + 0xACu) |= 0x100u;
-    while (REG32(RF_ANA_BASE + 0xACu) & 0x100u) {
+    openfw_mmio_set32(RF_ANA_BASE + 0xACu, 0x100u);
+    while (openfw_mmio_rd32(RF_ANA_BASE + 0xACu) & 0x100u) {
     }
     rf_lut_write_field(9u, 0u, 1u);
     rf_lut_write_field(8u, 0u, 1u);
     rf_lut_write_field(11u, 0u, 1u);
     rf_lut_write_field(10u, 0u, 1u);
-    REG32(RF_ANA_BASE + 0xACu) |= 0x100u;
-    while (REG32(RF_ANA_BASE + 0xACu) & 0x100u) {
+    openfw_mmio_set32(RF_ANA_BASE + 0xACu, 0x100u);
+    while (openfw_mmio_rd32(RF_ANA_BASE + 0xACu) & 0x100u) {
     }
     rf_lut_write_field(6u, 0u, 0x20u);
-    REG32(RF_ANA_BASE + 0xACu) |= 0x100u;
+    openfw_mmio_set32(RF_ANA_BASE + 0xACu, 0x100u);
     rf_lut_write_field(0u, 0u, 0x73u);
-    REG32(RF_ANA_BASE + 0xACu) |= 0x100u;
+    openfw_mmio_set32(RF_ANA_BASE + 0xACu, 0x100u);
     rf_lut_write_field(3u, 0u, 7u);
-    REG32(RF_ANA_BASE + 0xACu) |= 0x100u;
-    while (REG32(RF_ANA_BASE + 0xACu) & 0x100u) {
+    openfw_mmio_set32(RF_ANA_BASE + 0xACu, 0x100u);
+    while (openfw_mmio_rd32(RF_ANA_BASE + 0xACu) & 0x100u) {
     }
 }
 
@@ -413,17 +411,16 @@ static uint32_t dft_bin_mag_sq(uint32_t bin, const int16_t x[128])
 static uint32_t measure_rx_tone_log2_q8(uint32_t bin)
 {
     int16_t ibuf[128], qbuf[128];
-    REG32(RF_ANA_BASE + 0x10u) &= ~0x7FFF0000u;
-    REG32(RF_ANA_BASE + 0x10u)  = (REG32(RF_ANA_BASE + 0x10u) & ~0x7FFFu) | 0x1FCu;
-    REG32(RF_ANA_BASE + 0x10u) |= 0x80008000u;
-    while (REG32(RF_ANA_BASE + 0x10u) & (1u << 31)) {
+    openfw_mmio_clr32(RF_ANA_BASE + 0x10u, 0x7FFF0000u);
+    openfw_mmio_rmw32(RF_ANA_BASE + 0x10u, 0x7FFFu, 0x1FCu);
+    openfw_mmio_set32(RF_ANA_BASE + 0x10u, 0x80008000u);
+    while (openfw_mmio_rd32(RF_ANA_BASE + 0x10u) & (1u << 31)) {
     }
     rf_delay(1u);
 
-    volatile uint16_t *em = (volatile uint16_t *)(uintptr_t)RWBT_EM_BASE;
     for (uint32_t n = 0u; n < 128u; n++) {
-        int16_t iv = (int16_t)em[2u * n];
-        int16_t qv = (int16_t)em[2u * n + 1u];
+        int16_t iv = (int16_t)openfw_mmio_rd16(RWBT_EM_BASE + 4u * n);
+        int16_t qv = (int16_t)openfw_mmio_rd16(RWBT_EM_BASE + 4u * n + 2u);
         if (iv & 0x800) {
             iv |= (int16_t)0xF000;
         }
@@ -453,20 +450,21 @@ static uint32_t bt_rf_cal_10a4(uint32_t trim)
     rf_synth_en();
     rf_synth_tune_mhz(0x98Au);
 
-    REG32(RF_ANA_BASE + 0xA0u) = (REG32(RF_ANA_BASE + 0xA0u) | (1u << 31) | (1u << 20))
-                               & ~((1u << 22) | (1u << 21) | (1u << 19) | (1u << 17) | (1u << 16));
-    REG32(RF_ANA_BASE + 0x64u) &= ~0x80u;
+    openfw_mmio_rmw32(RF_ANA_BASE + 0xA0u,
+                      (1u << 22) | (1u << 21) | (1u << 19) | (1u << 17) | (1u << 16),
+                      (1u << 31) | (1u << 20));
+    openfw_mmio_clr32(RF_ANA_BASE + 0x64u, 0x80u);
     rf_delay(1u);
-    REG32(RF_ANA_BASE + 0xA0u)  = (REG32(RF_ANA_BASE + 0xA0u) | (1u << 21)) & ~((1u << 18) | (1u << 24));
+    openfw_mmio_rmw32(RF_ANA_BASE + 0xA0u, (1u << 18) | (1u << 24), (1u << 21));
     rf_delay(1u);
-    REG32(RF_ANA_BASE + 0xA0u) |= (1u << 22);
+    openfw_mmio_set32(RF_ANA_BASE + 0xA0u, (1u << 22));
     if (rf_lut_read_field(0u, 0u) & 0xF0u) {
-        REG32(RF_ANA_BASE + 0x64u) |= 0x80u;
+        openfw_mmio_set32(RF_ANA_BASE + 0x64u, 0x80u);
     }
     rf_delay(1u);
-    REG32(RF_ANA_BASE + 0xA0u) &= ~(1u << 20);
+    openfw_mmio_clr32(RF_ANA_BASE + 0xA0u, (1u << 20));
     rf_delay(1u);
-    REG32(RF_ANA_BASE + 0xA0u) |= (1u << 19) | (1u << 17) | (1u << 16);
+    openfw_mmio_set32(RF_ANA_BASE + 0xA0u, (1u << 19) | (1u << 17) | (1u << 16));
     rf_tx_cal_cfg();
 
     rf_pll_ldo_en(trim);
@@ -474,38 +472,38 @@ static uint32_t bt_rf_cal_10a4(uint32_t trim)
     rf_synth_en();
     rf_synth_tune_mhz(0x98Au);
 
-    REG32(RF_ANA_BASE + 0x64u) |= (1u << 19) | (1u << 16) | 0x60u;
+    openfw_mmio_set32(RF_ANA_BASE + 0x64u, (1u << 19) | (1u << 16) | 0x60u);
     rf_delay(1u);
-    REG32(RF_ANA_BASE + 0x64u) |= (1u << 19) | 0x1Fu;
+    openfw_mmio_set32(RF_ANA_BASE + 0x64u, (1u << 19) | 0x1Fu);
     rf_delay(1u);
-    REG32(RF_ANA_BASE + 0x84u)  = (REG32(RF_ANA_BASE + 0x84u) | (1u << 18) | 0x2Cu) & ~0x192u;
+    openfw_mmio_rmw32(RF_ANA_BASE + 0x84u, 0x192u, (1u << 18) | 0x2Cu);
     rf_delay(4u);
-    REG32(RF_ANA_BASE + 0x84u) |= 0x180u;
+    openfw_mmio_set32(RF_ANA_BASE + 0x84u, 0x180u);
     rf_delay(1u);
-    REG32(RF_ANA_BASE + 0x84u)  = (REG32(RF_ANA_BASE + 0x84u) | 0x10u) & ~0xCu;
+    openfw_mmio_rmw32(RF_ANA_BASE + 0x84u, 0xCu, 0x10u);
     rf_delay(1u);
     rf_synth_tune_mhz(0x9B4u);
 
-    REG32(RF_ANA_BASE + 0x80u) = (REG32(RF_ANA_BASE + 0x80u) & ~0x7u) | 4u;
-    REG32(RF_ANA_BASE + 0x60u) = (REG32(RF_ANA_BASE + 0x60u) & ~0x7C007C00u) | 0x30003000u;
+    openfw_mmio_rmw32(RF_ANA_BASE + 0x80u, 0x7u, 4u);
+    openfw_mmio_rmw32(RF_ANA_BASE + 0x60u, 0x7C007C00u, 0x30003000u);
     rf_lut_write_field(14u, 0u, 0u);
     rf_lut_write_field(15u, 0u, 0u);
-    REG32(RF_ANA_BASE + 0x80u) |= 0x10000u;
-    while (REG32(RF_ANA_BASE + 0x80u) & 0x10000u) {
+    openfw_mmio_set32(RF_ANA_BASE + 0x80u, 0x10000u);
+    while (openfw_mmio_rd32(RF_ANA_BASE + 0x80u) & 0x10000u) {
     }
     rf_lut_write_field(23u, 0u, 0u);
     rf_lut_write_field(22u, 0u, 0u);
-    REG32(RF_ANA_BASE + 0x80u) |= 0x10000u;
-    while (REG32(RF_ANA_BASE + 0x80u) & 0x10000u) {
+    openfw_mmio_set32(RF_ANA_BASE + 0x80u, 0x10000u);
+    while (openfw_mmio_rd32(RF_ANA_BASE + 0x80u) & 0x10000u) {
     }
     rf_lut_write_field(12u, 0u, 0u);
     rf_lut_write_field(13u, 0u, 6u);
     rf_lut_write_field(16u, 0u, 0u);
-    REG32(RF_ANA_BASE + 0x80u) |= 0x10000u;
-    while (REG32(RF_ANA_BASE + 0x80u) & 0x10000u) {
+    openfw_mmio_set32(RF_ANA_BASE + 0x80u, 0x10000u);
+    while (openfw_mmio_rd32(RF_ANA_BASE + 0x80u) & 0x10000u) {
     }
-    REG32(RF_ANA_BASE + 0x88u) = (REG32(RF_ANA_BASE + 0x88u) & ~0xF0003F00u) | 0x60002D00u;
-    REG32(RF_ANA_BASE + 0x84u) = (REG32(RF_ANA_BASE + 0x84u) & ~0xF0000000u) | 0x60000000u;
+    openfw_mmio_rmw32(RF_ANA_BASE + 0x88u, 0xF0003F00u, 0x60002D00u);
+    openfw_mmio_rmw32(RF_ANA_BASE + 0x84u, 0xF0000000u, 0x60000000u);
     rf_delay(1u);
 
     uint32_t l2_low = measure_rx_tone_log2_q8(2u);
@@ -516,7 +514,7 @@ static uint32_t bt_rf_cal_10a4(uint32_t trim)
     uint32_t best_k   = 0x0Du;
     uint32_t best_err = 0xFFFFFFFFu;
     for (uint32_t k = 0u; k < 32u; k++) {
-        REG32(RF_ANA_BASE + 0xA4u) = (REG32(RF_ANA_BASE + 0xA4u) & ~0x1F000000u) | (k << 24);
+        openfw_mmio_rmw32(RF_ANA_BASE + 0xA4u, 0x1F000000u, k << 24);
         uint32_t l2_hi = measure_rx_tone_log2_q8(12u);
         int32_t  drop  = (int32_t)l2_low - (int32_t)l2_hi;
         int32_t  diff  = drop - 510;
@@ -536,58 +534,59 @@ static void bt_rf_init_internal(uint32_t freq_drift, uint32_t vco_cal_10a4,
     uint32_t trim = bt_rf_efuse_trim();
     rf_cru_reset();
 
-    RF_BB_CTRL |= (1u << 26);
-    REG32(RF_ANA_BASE + 0x20u) &= ~(1u << 0);
-    REG32(RF_ANA_BASE + 0x84u) |=  (1u << 19);
-    REG32(RF_ANA_BASE + 0x40u) |=  (1u << 5) | ((trim & 0xFu) << 16);
-    REG32(RF_ANA_BASE + 0xACu) |=  (1u << 16);
-    RF_LUT_CTRL = (RF_LUT_CTRL & ~0xFFF00000u) | 0x04000000u;
+    openfw_mmio_set32(RF_BB_CTRL_ADDR, (1u << 26));
+    openfw_mmio_clr32(RF_ANA_BASE + 0x20u, (1u << 0));
+    openfw_mmio_set32(RF_ANA_BASE + 0x84u, (1u << 19));
+    openfw_mmio_set32(RF_ANA_BASE + 0x40u, (1u << 5) | ((trim & 0xFu) << 16));
+    openfw_mmio_set32(RF_ANA_BASE + 0xACu, (1u << 16));
+    openfw_mmio_rmw32(RF_LUT_CTRL_ADDR, 0xFFF00000u, 0x04000000u);
 
     rf_lut_populate(tx_band, tx_cap, rx_band, rx_cap);
 
-    REG32(RF_ANA_BASE + 0xA0u) = (REG32(RF_ANA_BASE + 0xA0u) & ~0x71040000u) | 0x30000000u;
-    REG32(RF_ANA_BASE + 0xA4u) = (REG32(RF_ANA_BASE + 0xA4u) & ~0xFF03F370u)
-                               | 0xE0000B40u | ((vco_cal_10a4 & 0x1Fu) << 24);
-    REG32(RF_ANA_BASE + 0xA8u) = (REG32(RF_ANA_BASE + 0xA8u) & ~0x00000FF0u) | 0x00000450u
-                               | ((REG32(RF_BB_BASE + 0x120u) & 0x1FFFu) ? 0x100u : 0u);
+    openfw_mmio_rmw32(RF_ANA_BASE + 0xA0u, 0x71040000u, 0x30000000u);
+    openfw_mmio_rmw32(RF_ANA_BASE + 0xA4u, 0xFF03F370u,
+                      0xE0000B40u | ((vco_cal_10a4 & 0x1Fu) << 24));
+    openfw_mmio_rmw32(RF_ANA_BASE + 0xA8u, 0x00000FF0u,
+                      0x00000450u | ((openfw_mmio_rd32(RF_BB_BASE + 0x120u) & 0x1FFFu) ? 0x100u : 0u));
 
-    REG32(RF_ANA_BASE + 0x60u) = (REG32(RF_ANA_BASE + 0x60u) & ~0x7F037C07u) | 0x35023407u;
-    REG32(RF_ANA_BASE + 0x80u) = (REG32(RF_ANA_BASE + 0x80u) & ~0x00000007u) | 0x00000004u;
+    openfw_mmio_rmw32(RF_ANA_BASE + 0x60u, 0x7F037C07u, 0x35023407u);
+    openfw_mmio_rmw32(RF_ANA_BASE + 0x80u, 0x00000007u, 0x00000004u);
 
-    REG32(RF_ANA_BASE + 0x88u) = (REG32(RF_ANA_BASE + 0x88u) & ~0xF0003F00u) | 0x60002D00u;
-    REG32(RF_ANA_BASE + 0x84u) = (REG32(RF_ANA_BASE + 0x84u) & ~0xF0000000u) | 0x60000000u;
-    REG32(RF_ANA_BASE + 0x20u) &= ~(1u << 21);
-    REG32(RF_ANA_BASE + 0x20u) |=  (1u << 21);
-    REG32(RF_ANA_BASE + 0x24u) &= ~0xF0000000u;
+    openfw_mmio_rmw32(RF_ANA_BASE + 0x88u, 0xF0003F00u, 0x60002D00u);
+    openfw_mmio_rmw32(RF_ANA_BASE + 0x84u, 0xF0000000u, 0x60000000u);
+    openfw_mmio_clr32(RF_ANA_BASE + 0x20u, (1u << 21));
+    openfw_mmio_set32(RF_ANA_BASE + 0x20u, (1u << 21));
+    openfw_mmio_clr32(RF_ANA_BASE + 0x24u, 0xF0000000u);
 
-    REG32(RF_ANA_BASE + 0xC0u) = (REG32(RF_ANA_BASE + 0xC0u) & ~0x7Fu) | 0x00000229u;
-    REG32(RF_ANA_BASE + 0xC0u) |= (1u << 8);
-    while (REG32(RF_ANA_BASE + 0xC0u) & (1u << 8)) {
+    openfw_mmio_rmw32(RF_ANA_BASE + 0xC0u, 0x7Fu, 0x00000229u);
+    openfw_mmio_set32(RF_ANA_BASE + 0xC0u, (1u << 8));
+    while (openfw_mmio_rd32(RF_ANA_BASE + 0xC0u) & (1u << 8)) {
     }
-    REG32(RF_ANA_BASE + 0xC0u) &= ~(1u << 9);
-    REG32(RF_ANA_BASE + 0xE4u) = (REG32(RF_ANA_BASE + 0xE4u) & ~0x3FE00000u) | 0x00E00000u;
-    AON_CLK_CFG = (AON_CLK_CFG & ~0x00000FF0u) | (((freq_drift > 0xFFu) ? 0x4Cu : freq_drift) << 4);
-    REG32(RF_ANA_BASE + 0xB8u) &= ~0x60000000u;
-    REG32(RF_ANA_BASE + 0xBCu) = 0x1E1D0303u;
+    openfw_mmio_clr32(RF_ANA_BASE + 0xC0u, (1u << 9));
+    openfw_mmio_rmw32(RF_ANA_BASE + 0xE4u, 0x3FE00000u, 0x00E00000u);
+    openfw_mmio_rmw32(AON_CLK_CFG_ADDR, 0x00000FF0u,
+                      (((freq_drift > 0xFFu) ? 0x4Cu : freq_drift) << 4));
+    openfw_mmio_clr32(RF_ANA_BASE + 0xB8u, 0x60000000u);
+    openfw_mmio_wr32(RF_ANA_BASE + 0xBCu, 0x1E1D0303u);
 
-    REG32(RF_ANA_BASE + 0x80u) = (REG32(RF_ANA_BASE + 0x80u) & ~0x7F00u) | 0x00021A00u;
-    REG32(RF_ANA_BASE + 0x80u) |= (1u << 16);
-    while (REG32(RF_ANA_BASE + 0x80u) & (1u << 16)) {
+    openfw_mmio_rmw32(RF_ANA_BASE + 0x80u, 0x7F00u, 0x00021A00u);
+    openfw_mmio_set32(RF_ANA_BASE + 0x80u, (1u << 16));
+    while (openfw_mmio_rd32(RF_ANA_BASE + 0x80u) & (1u << 16)) {
     }
-    REG32(RF_ANA_BASE + 0x80u) &= ~(1u << 17);
-    REG32(RF_ANA_BASE + 0xACu) = (REG32(RF_ANA_BASE + 0xACu) & ~0x1Fu) | 0x00000212u;
-    REG32(RF_ANA_BASE + 0xACu) |= (1u << 8);
-    while (REG32(RF_ANA_BASE + 0xACu) & (1u << 8)) {
+    openfw_mmio_clr32(RF_ANA_BASE + 0x80u, (1u << 17));
+    openfw_mmio_rmw32(RF_ANA_BASE + 0xACu, 0x1Fu, 0x00000212u);
+    openfw_mmio_set32(RF_ANA_BASE + 0xACu, (1u << 8));
+    while (openfw_mmio_rd32(RF_ANA_BASE + 0xACu) & (1u << 8)) {
     }
-    REG32(RF_ANA_BASE + 0xACu) &= ~(1u << 9);
+    openfw_mmio_clr32(RF_ANA_BASE + 0xACu, (1u << 9));
 
-    REG32(RF_ANA_BASE + 0x40u) &= ~0x00007F00u;
-    REG32(RF_ANA_BASE + 0x80u) = (REG32(RF_ANA_BASE + 0x80u) & ~0x7FF00000u) | 0x36000000u;
-    REG32(RF_ANA_BASE + 0xA0u) = (REG32(RF_ANA_BASE + 0xA0u) & ~0x0000FF07u) | 0x00006000u;
-    REG32(RF_ANA_BASE + 0xACu) = (REG32(RF_ANA_BASE + 0xACu) & ~0xFFFC0000u) | 0x0A140000u;
-    REG32(RF_ANA_BASE + 0xB0u) = (REG32(RF_ANA_BASE + 0xB0u) & ~0x7E7F7F7Fu) | 0x3A033100u;
+    openfw_mmio_clr32(RF_ANA_BASE + 0x40u, 0x00007F00u);
+    openfw_mmio_rmw32(RF_ANA_BASE + 0x80u, 0x7FF00000u, 0x36000000u);
+    openfw_mmio_rmw32(RF_ANA_BASE + 0xA0u, 0x0000FF07u, 0x00006000u);
+    openfw_mmio_rmw32(RF_ANA_BASE + 0xACu, 0xFFFC0000u, 0x0A140000u);
+    openfw_mmio_rmw32(RF_ANA_BASE + 0xB0u, 0x7E7F7F7Fu, 0x3A033100u);
 
-    RF_BB_CTRL &= ~(1u << 26);
+    openfw_mmio_clr32(RF_BB_CTRL_ADDR, (1u << 26));
     rf_delay(100u);
 }
 
@@ -600,37 +599,37 @@ void bt_modem_init(uint32_t clk6_hz)
 {
     uint32_t div = (clk6_hz <= 16000000u) ? 1u : 2u;
     uint32_t mhz = (clk6_hz / 1000000u) / div;
-    RF_BB_CTRL = (RF_BB_CTRL & ~0x073F0000u) | ((div - 1u) << 24) | (mhz << 16);
+    openfw_mmio_rmw32(RF_BB_CTRL_ADDR, 0x073F0000u, ((div - 1u) << 24) | (mhz << 16));
 
-    REG32(RF_BB_BASE + 0x298u) = 0x2D2B2927u;
-    REG32(RF_BB_BASE + 0x29Cu) = 0x3533312Fu;
-    REG32(RF_BB_BASE + 0x2A0u) = 0x3D3B3937u;
-    REG32(RF_BB_BASE + 0x2A4u) = 0x4543413Fu;
-    REG32(RF_BB_BASE + 0x2A8u) = 0x4D4B4947u;
-    REG32(RF_BB_BASE + 0x2ACu) = 0x5553514Fu;
-    REG32(RF_BB_BASE + 0x2B0u) = 0x00005957u;
+    openfw_mmio_wr32(RF_BB_BASE + 0x298u, 0x2D2B2927u);
+    openfw_mmio_wr32(RF_BB_BASE + 0x29Cu, 0x3533312Fu);
+    openfw_mmio_wr32(RF_BB_BASE + 0x2A0u, 0x3D3B3937u);
+    openfw_mmio_wr32(RF_BB_BASE + 0x2A4u, 0x4543413Fu);
+    openfw_mmio_wr32(RF_BB_BASE + 0x2A8u, 0x4D4B4947u);
+    openfw_mmio_wr32(RF_BB_BASE + 0x2ACu, 0x5553514Fu);
+    openfw_mmio_wr32(RF_BB_BASE + 0x2B0u, 0x00005957u);
 
-    REG32(RF_BB_BASE + 0x01Cu) = 0x00000001u;
-    REG32(RF_BB_BASE + 0x100u) = 0x00000080u;
-    REG32(RF_BB_BASE + 0x120u) = 0x800703E8u;
-    REG32(RF_BB_BASE + 0x2F0u) = 0x0022C3E8u;
-    REG32(RF_BB_BASE + 0x270u) = 0x9A805E1Bu;
-    REG32(RF_BB_BASE + 0x274u) = 0x00F00341u;
-    REG32(RF_BB_BASE + 0x280u) = 0x0EEDE000u;
-    REG32(RF_BB_BASE + 0x20Cu) = 0x18601111u;
-    REG32(RF_BB_BASE + 0x290u) = (REG32(RF_BB_BASE + 0x290u) & ~0x003F3F00u) | 0x00393F00u;
-    REG32(RF_BB_BASE + 0x21Cu) = 0x000CB88Au;
-    REG32(RF_BB_BASE + 0x2C0u) = 0x600C6020u;
-    REG32(RF_BB_BASE + 0x2C4u) = 0x01303779u;
-    REG32(RF_BB_BASE + 0x108u) = 0x14360422u;
-    REG32(RF_BB_BASE + 0x2C8u) = 0x031CC1F4u;
-    REG32(RF_BB_BASE + 0x2B8u) = 0x001350C0u;
-    REG32(RF_BB_BASE + 0x2F8u) = 0x00013765u;
-    REG32(RF_BB_BASE + 0x228u) = (REG32(RF_BB_BASE + 0x228u) & ~0x00003F00u) | 0x00001C00u;
-    REG32(RF_BB_BASE + 0x2F4u) = (REG32(RF_BB_BASE + 0x2F4u) & ~0x00003F00u) | 0x00002200u;
-    REG32(RF_BB_BASE + 0x2FCu) = (REG32(RF_BB_BASE + 0x2FCu) & ~0x0003F000u) | 0x0002C000u;
-    REG32(RF_BB_BASE + 0x200u) = (REG32(RF_BB_BASE + 0x200u) & ~0x00008000u) | 0x00002000u;
-    REG32(RF_BB_BASE + 0x30Cu) = 0x00353B73u;
+    openfw_mmio_wr32(RF_BB_BASE + 0x01Cu, 0x00000001u);
+    openfw_mmio_wr32(RF_BB_BASE + 0x100u, 0x00000080u);
+    openfw_mmio_wr32(RF_BB_BASE + 0x120u, 0x800703E8u);
+    openfw_mmio_wr32(RF_BB_BASE + 0x2F0u, 0x0022C3E8u);
+    openfw_mmio_wr32(RF_BB_BASE + 0x270u, 0x9A805E1Bu);
+    openfw_mmio_wr32(RF_BB_BASE + 0x274u, 0x00F00341u);
+    openfw_mmio_wr32(RF_BB_BASE + 0x280u, 0x0EEDE000u);
+    openfw_mmio_wr32(RF_BB_BASE + 0x20Cu, 0x18601111u);
+    openfw_mmio_rmw32(RF_BB_BASE + 0x290u, 0x003F3F00u, 0x00393F00u);
+    openfw_mmio_wr32(RF_BB_BASE + 0x21Cu, 0x000CB88Au);
+    openfw_mmio_wr32(RF_BB_BASE + 0x2C0u, 0x600C6020u);
+    openfw_mmio_wr32(RF_BB_BASE + 0x2C4u, 0x01303779u);
+    openfw_mmio_wr32(RF_BB_BASE + 0x108u, 0x14360422u);
+    openfw_mmio_wr32(RF_BB_BASE + 0x2C8u, 0x031CC1F4u);
+    openfw_mmio_wr32(RF_BB_BASE + 0x2B8u, 0x001350C0u);
+    openfw_mmio_wr32(RF_BB_BASE + 0x2F8u, 0x00013765u);
+    openfw_mmio_rmw32(RF_BB_BASE + 0x228u, 0x00003F00u, 0x00001C00u);
+    openfw_mmio_rmw32(RF_BB_BASE + 0x2F4u, 0x00003F00u, 0x00002200u);
+    openfw_mmio_rmw32(RF_BB_BASE + 0x2FCu, 0x0003F000u, 0x0002C000u);
+    openfw_mmio_rmw32(RF_BB_BASE + 0x200u, 0x00008000u, 0x00002000u);
+    openfw_mmio_wr32(RF_BB_BASE + 0x30Cu, 0x00353B73u);
 }
 
 uint32_t bt_rf_init_calibrated(uint32_t freq_drift, uint32_t clk6_hz)

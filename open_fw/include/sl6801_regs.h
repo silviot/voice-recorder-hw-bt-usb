@@ -21,10 +21,14 @@ void     openfw_mmio_wr8(uint32_t addr, uint8_t val);
 void     openfw_mmio_nop(void);
 void     openfw_mmio_dsb(void);
 void     openfw_mmio_wfi(void);
+void     openfw_host_dmac_register_ptr(uint32_t ch, void *buf, uint32_t len);
 
 #define OPENFW_NOP() openfw_mmio_nop()
 #define OPENFW_DSB() openfw_mmio_dsb()
 #define OPENFW_WFI() openfw_mmio_wfi()
+#define OPENFW_IRQ_SAVE(pm)                do { (pm) = 0u; } while (0)
+#define OPENFW_IRQ_RESTORE(pm)             do { (void)(pm); } while (0)
+#define OPENFW_HOST_DMAC_BUF(ch, ptr, len) do { openfw_host_dmac_register_ptr((ch), (ptr), (len)); } while (0)
 #else
 #define REG32(addr) (*(volatile uint32_t *)(uintptr_t)(addr))
 #define REG16(addr) (*(volatile uint16_t *)(uintptr_t)(addr))
@@ -40,6 +44,16 @@ static inline void     openfw_mmio_wr8(uint32_t addr, uint8_t v)    { REG8(addr)
 #define OPENFW_NOP() __asm__ volatile ("nop")
 #define OPENFW_DSB() __asm__ volatile ("dsb" ::: "memory")
 #define OPENFW_WFI() __asm__ volatile ("wfi")
+#define OPENFW_IRQ_SAVE(pm) do { \
+    __asm__ volatile ("mrs %0, primask" : "=r"(pm)); \
+    __asm__ volatile ("cpsid i" ::: "memory"); \
+} while (0)
+#define OPENFW_IRQ_RESTORE(pm) do { \
+    if (((pm) & 1u) == 0u) { \
+        __asm__ volatile ("cpsie i" ::: "memory"); \
+    } \
+} while (0)
+#define OPENFW_HOST_DMAC_BUF(ch, ptr, len) do { } while (0)
 #endif
 
 static inline void openfw_mmio_set32(uint32_t addr, uint32_t bits)
@@ -450,37 +464,66 @@ static inline int gpio_read(uint32_t port, uint32_t pin)
 /* ============================================================================
  * Audio Codec (0x40009000) & DMAC (0x40001000)
  * ============================================================================ */
-#define CODEC_MICBIAS       REG32(AUDIO_CODEC_BASE + 0x000u) /* bits [25:24] */
-#define CODEC_ANA_CTRL0     REG32(AUDIO_CODEC_BASE + 0x000u)
-#define CODEC_AMIC1_CTRL    REG32(AUDIO_CODEC_BASE + 0x008u) /* PGA gain bits [28:24] (0..31) */
-#define CODEC_AMIC01_PGA    REG32(AUDIO_CODEC_BASE + 0x008u)
-#define CODEC_AMIC2_CTRL    REG32(AUDIO_CODEC_BASE + 0x00Cu) /* PGA gain bits [14:8] (0..127) */
-#define CODEC_ADC_MUX       REG32(AUDIO_CODEC_BASE + 0x020u) /* bits [11:8] & [19:16] */
-#define CODEC_ADC_CH_MUX    REG32(AUDIO_CODEC_BASE + 0x020u)
-#define CODEC_ANA_MISC      REG32(AUDIO_CODEC_BASE + 0x0FCu)
-#define CODEC_GLB           REG32(AUDIO_CODEC_BASE + 0x100u)
-#define CODEC_DAC0_MUTE     REG32(AUDIO_CODEC_BASE + 0x134u)
-#define CODEC_DAC0_VOL      REG32(AUDIO_CODEC_BASE + 0x138u)
-#define CODEC_DAC1_MUTE     REG32(AUDIO_CODEC_BASE + 0x154u)
-#define CODEC_DAC1_VOL      REG32(AUDIO_CODEC_BASE + 0x158u)
-#define CODEC_DAC2_MUTE     REG32(AUDIO_CODEC_BASE + 0x174u)
-#define CODEC_DAC2_VOL      REG32(AUDIO_CODEC_BASE + 0x178u)
-#define CODEC_ADC_DIG_CTRL  REG32(AUDIO_CODEC_BASE + 0x200u)
-#define CODEC_ADC_FIFO_CTRL REG32(AUDIO_CODEC_BASE + 0x208u)
-#define CODEC_ADC_RX_FIFO_ADDR (AUDIO_CODEC_BASE + 0x20Cu)
-#define CODEC_ADC_RX_FIFO   REG32(CODEC_ADC_RX_FIFO_ADDR)
-#define CODEC_ADC_CH_CTRL(ch) REG32(AUDIO_CODEC_BASE + 0x220u + (uint32_t)(ch) * 0x30u)
-#define CODEC_ADC_CH_GAIN(ch) REG32(AUDIO_CODEC_BASE + 0x228u + (uint32_t)(ch) * 0x30u)
-#define CODEC_SRAM_START    (AUDIO_CODEC_BASE + 0x400u)
-#define CODEC_SRAM_END      (AUDIO_CODEC_BASE + 0x600u)
+#define CODEC_ANA_CTRL0_ADDR     (AUDIO_CODEC_BASE + 0x000u)
+#define CODEC_MICBIAS_ADDR       CODEC_ANA_CTRL0_ADDR /* bits [25:24] */
+#define CODEC_AMIC01_PGA_ADDR    (AUDIO_CODEC_BASE + 0x008u) /* PGA gain bits [28:24] (0..31) */
+#define CODEC_AMIC1_CTRL_ADDR    CODEC_AMIC01_PGA_ADDR
+#define CODEC_AMIC2_CTRL_ADDR    (AUDIO_CODEC_BASE + 0x00Cu) /* PGA gain bits [14:8] (0..127) */
+#define CODEC_ADC_CH_MUX_ADDR    (AUDIO_CODEC_BASE + 0x020u) /* bits [11:8] & [19:16] */
+#define CODEC_ADC_MUX_ADDR       CODEC_ADC_CH_MUX_ADDR
+#define CODEC_ANA_MISC_ADDR      (AUDIO_CODEC_BASE + 0x0FCu)
+#define CODEC_GLB_ADDR           (AUDIO_CODEC_BASE + 0x100u)
+#define CODEC_DAC0_MUTE_ADDR     (AUDIO_CODEC_BASE + 0x134u)
+#define CODEC_DAC0_VOL_ADDR      (AUDIO_CODEC_BASE + 0x138u)
+#define CODEC_DAC1_MUTE_ADDR     (AUDIO_CODEC_BASE + 0x154u)
+#define CODEC_DAC1_VOL_ADDR      (AUDIO_CODEC_BASE + 0x158u)
+#define CODEC_DAC2_MUTE_ADDR     (AUDIO_CODEC_BASE + 0x174u)
+#define CODEC_DAC2_VOL_ADDR      (AUDIO_CODEC_BASE + 0x178u)
+#define CODEC_ADC_DIG_CTRL_ADDR  (AUDIO_CODEC_BASE + 0x200u)
+#define CODEC_ADC_FIFO_CTRL_ADDR (AUDIO_CODEC_BASE + 0x208u)
+#define CODEC_ADC_RX_FIFO_ADDR   (AUDIO_CODEC_BASE + 0x20Cu)
+#define CODEC_ADC_CH_CTRL_ADDR(ch) (AUDIO_CODEC_BASE + 0x220u + (uint32_t)(ch) * 0x30u)
+#define CODEC_ADC_CH_GAIN_ADDR(ch) (AUDIO_CODEC_BASE + 0x228u + (uint32_t)(ch) * 0x30u)
+#define CODEC_SRAM_START         (AUDIO_CODEC_BASE + 0x400u)
+#define CODEC_SRAM_END           (AUDIO_CODEC_BASE + 0x600u)
 
-#define DMAC_CH_BASE(ch)     (DMAC_BASE + ((uint32_t)(ch) * 0x40u))
-#define DMAC_CH_CTL(ch)      REG32(DMAC_CH_BASE(ch) + 0x00u)
-#define DMAC_CH_SRC(ch)      REG32(DMAC_CH_BASE(ch) + 0x04u)
-#define DMAC_CH_DST(ch)      REG32(DMAC_CH_BASE(ch) + 0x08u)
-#define DMAC_CH_XFER_CNT(ch) REG32(DMAC_CH_BASE(ch) + 0x0Cu)
-#define DMAC_CH_IRQ_EN(ch)   REG32(DMAC_CH_BASE(ch) + 0x20u)
-#define DMAC_CH_IRQ_STAT(ch) REG32(DMAC_CH_BASE(ch) + 0x24u)
+#define DMAC_CH_BASE(ch)          (DMAC_BASE + ((uint32_t)(ch) * 0x40u))
+#define DMAC_CH_CTL_ADDR(ch)      (DMAC_CH_BASE(ch) + 0x00u)
+#define DMAC_CH_SRC_ADDR(ch)      (DMAC_CH_BASE(ch) + 0x04u)
+#define DMAC_CH_DST_ADDR(ch)      (DMAC_CH_BASE(ch) + 0x08u)
+#define DMAC_CH_XFER_CNT_ADDR(ch) (DMAC_CH_BASE(ch) + 0x0Cu)
+#define DMAC_CH_IRQ_EN_ADDR(ch)   (DMAC_CH_BASE(ch) + 0x20u)
+#define DMAC_CH_IRQ_STAT_ADDR(ch) (DMAC_CH_BASE(ch) + 0x24u)
+
+#ifndef OPENFW_HOST_MMIO
+#define CODEC_MICBIAS         REG32(CODEC_MICBIAS_ADDR)
+#define CODEC_ANA_CTRL0       REG32(CODEC_ANA_CTRL0_ADDR)
+#define CODEC_AMIC1_CTRL      REG32(CODEC_AMIC1_CTRL_ADDR)
+#define CODEC_AMIC01_PGA      REG32(CODEC_AMIC01_PGA_ADDR)
+#define CODEC_AMIC2_CTRL      REG32(CODEC_AMIC2_CTRL_ADDR)
+#define CODEC_ADC_MUX         REG32(CODEC_ADC_MUX_ADDR)
+#define CODEC_ADC_CH_MUX      REG32(CODEC_ADC_CH_MUX_ADDR)
+#define CODEC_ANA_MISC        REG32(CODEC_ANA_MISC_ADDR)
+#define CODEC_GLB             REG32(CODEC_GLB_ADDR)
+#define CODEC_DAC0_MUTE       REG32(CODEC_DAC0_MUTE_ADDR)
+#define CODEC_DAC0_VOL        REG32(CODEC_DAC0_VOL_ADDR)
+#define CODEC_DAC1_MUTE       REG32(CODEC_DAC1_MUTE_ADDR)
+#define CODEC_DAC1_VOL        REG32(CODEC_DAC1_VOL_ADDR)
+#define CODEC_DAC2_MUTE       REG32(CODEC_DAC2_MUTE_ADDR)
+#define CODEC_DAC2_VOL        REG32(CODEC_DAC2_VOL_ADDR)
+#define CODEC_ADC_DIG_CTRL    REG32(CODEC_ADC_DIG_CTRL_ADDR)
+#define CODEC_ADC_FIFO_CTRL   REG32(CODEC_ADC_FIFO_CTRL_ADDR)
+#define CODEC_ADC_RX_FIFO     REG32(CODEC_ADC_RX_FIFO_ADDR)
+#define CODEC_ADC_CH_CTRL(ch) REG32(CODEC_ADC_CH_CTRL_ADDR(ch))
+#define CODEC_ADC_CH_GAIN(ch) REG32(CODEC_ADC_CH_GAIN_ADDR(ch))
+
+#define DMAC_CH_CTL(ch)       REG32(DMAC_CH_CTL_ADDR(ch))
+#define DMAC_CH_SRC(ch)       REG32(DMAC_CH_SRC_ADDR(ch))
+#define DMAC_CH_DST(ch)       REG32(DMAC_CH_DST_ADDR(ch))
+#define DMAC_CH_XFER_CNT(ch)  REG32(DMAC_CH_XFER_CNT_ADDR(ch))
+#define DMAC_CH_IRQ_EN(ch)    REG32(DMAC_CH_IRQ_EN_ADDR(ch))
+#define DMAC_CH_IRQ_STAT(ch)  REG32(DMAC_CH_IRQ_STAT_ADDR(ch))
+#endif
 
 #define DMAC_REQ_AUDIO_ADC_RX 1u
 #define DMAC_CTL_ADC_RX_BASE  0x002A0281u /* SRC=ADC_RX(1) fixed 32b b4 -> DST=MEM inc 32b b4 */
@@ -545,10 +588,17 @@ static inline int gpio_read(uint32_t port, uint32_t pin)
 /* ============================================================================
  * eFuse / OTP (0x40099000) & BT RF / Modem (0x40010000 / 0x40011000)
  * ============================================================================ */
-#define EFUSE_WORD(n)       REG32(EFUSE_BASE + 0x20u + 4u * (uint32_t)(n))
-#define RF_BB_CTRL          REG32(RF_BB_BASE + 0x000u) /* bit 26 = RF config mode */
-#define RF_LUT_CTRL         REG32(RF_ANA_BASE + 0x004u)
-#define RF_LUT_DATA         REG32(RF_ANA_BASE + 0x008u)
+#define EFUSE_WORD_ADDR(n)  (EFUSE_BASE + 0x20u + 4u * (uint32_t)(n))
+#define RF_BB_CTRL_ADDR     (RF_BB_BASE + 0x000u) /* bit 26 = RF config mode */
+#define RF_LUT_CTRL_ADDR    (RF_ANA_BASE + 0x004u)
+#define RF_LUT_DATA_ADDR    (RF_ANA_BASE + 0x008u)
+
+#ifndef OPENFW_HOST_MMIO
+#define EFUSE_WORD(n)       REG32(EFUSE_WORD_ADDR(n))
+#define RF_BB_CTRL          REG32(RF_BB_CTRL_ADDR)
+#define RF_LUT_CTRL         REG32(RF_LUT_CTRL_ADDR)
+#define RF_LUT_DATA         REG32(RF_LUT_DATA_ADDR)
+#endif
 
 /* ============================================================================
  * RivieraWaves RW-BT Baseband Controller (0x40020000)
