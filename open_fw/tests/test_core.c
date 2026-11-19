@@ -309,6 +309,7 @@ static void test_exfat_write(void)
     assert(exfat_mkdir(&vol, "record") == 0);
     assert(exfat_mkdir(&vol, "record") == 0); /* Idempotent when already present */
 
+    exfat_set_timestamp(&vol, 0x5D738420u); /* 2026-11-19 16:33:00 */
     exfat_writer_t w;
     assert(exfat_create_file(&vol, "/record", "REC_0001.wav", &w) == 0);
 
@@ -360,7 +361,15 @@ static void test_exfat_write(void)
     assert(exfat_read_file(&vol2, &seventh, 0u, buf7, 10u, &nread) == 0);
     assert(nread == 10u && memcmp(buf7, "FILE_0007!", 10u) == 0);
 
-    printf("  [PASS] exfat write (mkdir, multi-cluster write, header patch, sector wrap & dir expand)\n");
+    exfat_entry_t rec_dir;
+    assert(exfat_find_path(&vol2, "/record", &rec_dir) == 0);
+    uint8_t dir_sec[512];
+    assert(mem_read_sectors(NULL, vol2.heap_lba + (rec_dir.first_cluster - 2u), 1u, dir_sec) == 0);
+    assert(dir_sec[0] == 0x85u);
+    assert(get_le32(&dir_sec[0x08]) == 0x5D738420u);
+    assert(get_le32(&dir_sec[0x0C]) == 0x5D738420u);
+
+    printf("  [PASS] exfat write (mkdir, multi-cluster write, header patch, timestamp, sector wrap)\n");
 }
 
 static void build_cbw(uint8_t cbw[31], uint32_t tag, uint32_t data_len,
@@ -530,6 +539,7 @@ static void run_exfat_img_test(const char *path)
     assert(vol.bitmap_cluster >= 2u);
 
     assert(exfat_mkdir(&vol, "record") == 0);
+    exfat_set_timestamp(&vol, 0x5D738420u); /* 2026-11-19 16:33:00 */
 
     exfat_writer_t w;
     assert(exfat_create_file(&vol, "/record", "REC_0001.wav", &w) == 0);

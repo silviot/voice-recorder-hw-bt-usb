@@ -607,3 +607,25 @@ Verified via Thumb-2 disassembly (`FIRM` and BootROM `0x000000..0x05FFFF`) for L
 * **Clocks & Baseband RAM:** Uses CRU reset/clk ID `0x22` (`0x40080064`/`0x74` bit 2), `0x40080030` bit 4, and `0x400800E8` bit 0; zeroes all **32 KiB Exchange Memory** at `0x40030000..0x40038000` before `RWBT_CNTL` (`0x40020000 |= 0x20000000`) soft reset. Zero PMU RTWI accesses are required by BT/RF bring-up.
 * **BootROM Reserved SRAM Region:** The `RW-BT` Mask ROM (`0x020000..0x0467FF`) directly accesses BootROM `.data`/`.bss` patch/hook tables across **`0x00800000..0x00804BFF`** (`0x00802904`, `0x00802BB0`, `0x00803BBC`, `0x00803C1C..0x008041E0`, `ke_event_env` `0x008041E4`). Keeping `open_fw` `.ram_boot` at `0x00804C00..0x00805BFF` and SRAM `.data`/`.bss` at `0x0081A380+` preserves this entire region untouched.
 * **Single Interrupt & HCI Transport:** Driven solely by **NVIC IRQ `26`** (`0x1A`, `RWBT_INTSTAT +0x10`, `RWBT_INTACK +0x18`) calling Mask ROM `rwbt_cscnt_isr` (`0x0002F3A4`), `rwbt_rx_isr` (`0x0002F388`), `ke_event_set(1)` (`0x00030DC0`), and main loop scheduler `ke_event_schedule` (`0x00030DB4`). Host transport uses `btc_register_hci_rx_cb` (`0x00D550C1`), `btc_hci_send_cmd` (`0x00817317`), and `btc_hci_send_acl` (`0x00D553C9`).
+
+---
+
+## 20. Verified BT RF LUTs, Mask ROM Hook Tables, USB VBUS/PHY Detect & Binary `AON_RTC`
+
+Verified via Thumb-2 disassembly (`FIRM` and BootROM `0x000000..0x05FFFF`) for Layer 5 in [open_fw](open_fw/):
+
+### 20.1 BT RF/Modem Calibration, eFuse Trim & Mask ROM Hook Tables
+* **BT Modem Table (`0x00C48844`):** 27-byte progression `0x2D + 2*i` (`i = 0..26`); runtime init (`0x00D54D38`) subtracts `6` from each byte (`0x27 + 2*i`) and packs bytes `0..25` into `0x40010298..0x400102B0`.
+* **RF LUT Bus (`0x40011004` / `0x40011008`):** 330 words (`0x000..0x149`) across 30 field descriptors (`0x00CD667F`/`9D`/`BC`): `0x00..0x9D` TX/gain/filter tables, `0x9E..0xF3` 86-ch synth int/frac `(2400 + ch) / 12` and `(((2400 + ch) % 12) << 21) / 12`, and `0xF4..0x149` VCO band/cap calibration slots.
+* **eFuse Trim & `freq_drift`:** After releasing eFuse reset `0x58` / clock `0x1B`, word 3 bit 31 (`0x4009902C`) validates BT trim nibble `(REG32(0x40099024) >> 14) & 0xF` (fallback `4`) -> `0x40011040[19:16]`. `freq_drift` (default `0x53`) trims AON XTAL cap `0x40085090[11:4]`.
+* **Mask ROM `RW-BT` Hook Tables:** BootROM contains no built-in initializer for its `RW-BT` SRAM patch tables; external firmware populates **`0x00802904`** (24-slot LD table), **`0x00802BB0`** (8-slot link driver table), **`0x008030CC`** (3-slot SCO/audio table), **`0x00803BBC`** (8-slot HCI filter/mask table), and **`0x00803C1C..0x00804204`** (kernel IRQ lock/alloc/timer/event hooks, using pure BootROM `ev 0 = 0x000307D5` and `ev 1 = 0x00030B8D`).
+
+### 20.2 Two-Stage USB VBUS vs. Data Host Detection & Frame Watchdog
+* **VBUS Presence:** PMU RTWI reg `0x2A` bit 2 (`0x04`) reports live 5V `VBUS_IN`; PMU reg `0x30` latches W1C VBUS edge events.
+* **USB Host Attach vs. Charger-Only:** Once `VBUS_IN` rises, arm `USB_PHY_CTRL` (`0x40040300 = (.. & ~0xF0) | 0x11F`) + `USB_PHY_INTE |= 0x3` and poll `USB_PHY_INT_STATUS` (`0x40040308`) bit `0` (W1C). If bit `0` asserts, a USB data host attached (disarm `0x40040308 = st | 0x7`, `0x40040304 &= ~0x3`, `0x40040300 &= ~0x103`, enter MUSB MSC); if VBUS remains steady without bit `0`, it is a charger-only 5V adapter. While MUSB runs, polling `MUSB_FRAME` (`0x4004000C`) detects host detach once a non-zero frame count freezes for `~600–750 ms`.
+
+### 20.3 `AON_RTC` Pure-Binary Date/Time Format (`0x40085000..0x400851BC`)
+* **Unsigned Binary (Not BCD):**
+  * `RTC_DATE` (`0x40085004`): `[4:0]=day (1..31)`, `[11:8]=month (1..12)`, `[22:16]=year - 2000 (0..127)`, `[24]=LEAP_YEAR`.
+  * `RTC_TIME` (`0x40085008`): `[5:0]=second`, `[13:8]=minute`, `[20:16]=hour (0..23)`, `[26:24]=weekday (0=Mon..6=Sun)`.
+* **One-Time Clock Enable:** Wait `(int32_t)0x40085090 >= 0`, set `0x40085090[16:12] = 0x18`, dummy read `0x40085094`, `0x400850A8 |= (1<<2)`, `0x400850A0 &= ~(1<<28)`, `0x40085000 &= ~0x110` (`mode=0, HALT=0`). No unlock key or shadow latch is required to read or write `RTC_DATE`/`RTC_TIME`.

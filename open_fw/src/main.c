@@ -155,8 +155,8 @@ static void probe_microsd_status(char *sd_line, int cap, uint16_t *sd_col,
     uart0_puts("\n");
 }
 
-static void run_usb_msc_mode(uint16_t col_bg, uint16_t col_cyan, uint16_t col_text,
-                             uint16_t col_green, uint16_t col_yellow)
+static int run_usb_msc_mode(uint16_t col_bg, uint16_t col_cyan, uint16_t col_text,
+                            uint16_t col_green, uint16_t col_yellow, int auto_mode)
 {
     draw_line_padded(45u, "USB MSC MODE", col_cyan, col_bg);
     draw_line_padded(57u, "DISK: EXPOSED", col_green, col_bg);
@@ -169,11 +169,15 @@ static void run_usb_msc_mode(uint16_t col_bg, uint16_t col_cyan, uint16_t col_te
     draw_line_padded(147u, "BACK=EXIT USB", col_yellow, col_bg);
 
     if (usb_msc_start(&g_sd_blkdev) != 0) {
-        return;
+        return 0;
     }
 
-    uint32_t last_ui    = millis();
-    int      exit_armed = 0;
+    uint32_t last_ui         = millis();
+    uint16_t last_frame      = 0u;
+    uint32_t stale_ticks     = 0u;
+    int      seen_sof        = 0;
+    int      exit_armed      = 0;
+    int      manual_exit     = 0;
 
     while (1) {
         wdt_feed();
@@ -187,7 +191,27 @@ static void run_usb_msc_mode(uint16_t col_bg, uint16_t col_cyan, uint16_t col_te
             if (k == KEY_NONE) {
                 exit_armed = 1;
             } else if (exit_armed && k == KEY_BACK) {
+                manual_exit = 1;
                 break;
+            }
+
+            if (auto_mode) {
+                if (!pmu_is_vbus_present()) {
+                    break;
+                }
+                uint16_t frame = usb_musb_frame();
+                if (frame != 0u) {
+                    if (seen_sof && frame == last_frame) {
+                        stale_ticks++;
+                        if (stale_ticks >= 5u) { /* >= 750 ms without SOF */
+                            break;
+                        }
+                    } else {
+                        seen_sof    = 1;
+                        last_frame  = frame;
+                        stale_ticks = 0u;
+                    }
+                }
             }
 
             uint32_t rxp = 0u, txp = 0u;
@@ -220,6 +244,7 @@ static void run_usb_msc_mode(uint16_t col_bg, uint16_t col_cyan, uint16_t col_te
     if (g_sd_card.initialized) {
         g_sd_mounted = (exfat_mount(&g_exfat_vol, &g_sd_blkdev) == 0) ? 1 : 0;
     }
+    return manual_exit;
 }
 
 int openfw_main(void)
@@ -236,10 +261,11 @@ int openfw_main(void)
 
     wdt_feed();
     systick_init(96000000u); /* Boosted in .ram_boot: PLL0 192 MHz / 2 */
+    rtc_ensure_running();
 
     /* Emit early UART0 banner before keys_init() switches PD0 to SARADC */
     uart0_init_115200();
-    uart0_puts("\n=== Cassini OpenFW (SL6801 Layer 4: exFAT + WAV + USB MSC) ===\n");
+    uart0_puts("\n=== Cassini OpenFW (SL6801 Layer 5a: RTC + exFAT + WAV + Auto-USB) ===\n");
     uart0_puts("CPU=96MHz XIP=0x00C0F430 CPU_ID=");
     uart0_put_u32(SYSCTL_CPU_ID);
     uart0_puts(" VBAT_MV=");
@@ -263,12 +289,17 @@ int openfw_main(void)
     uart0_puts("Switching PD0 to SARADC key ladder & entering main loop...\n");
     keys_init();
 
-    int      rec_active      = 0;
-    key_id_t prev_key        = KEY_NONE;
-    uint32_t back_hold_ticks = 0u;
-    uint32_t last_slow_ui    = 0u;
-    uint32_t mv              = pmu_read_vbat_mv();
-    pmu_chg_state_t chg      = pmu_get_charge_state();
+    int      rec_active              = 0;
+    int      prev_vbus               = 0;
+    int      usb_probing             = 0;
+    int      usb_charger_only        = 0;
+    int      usb_suppress_until_unpl = 0;
+    uint32_t usb_probe_deadline      = 0u;
+    key_id_t prev_key                = KEY_NONE;
+    uint32_t back_hold_ticks         = 0u;
+    uint32_t last_slow_ui            = 0u;
+    uint32_t mv                      = pmu_read_vbat_mv();
+    pmu_chg_state_t chg              = pmu_get_charge_state();
 
     while (1) {
         wdt_feed();
@@ -290,16 +321,51 @@ int openfw_main(void)
 
         if (rec_active) {
             recorder_poll();
-        } else if (key == KEY_ENTER && prev_key != KEY_ENTER && g_sd_card.initialized) {
-            run_usb_msc_mode(col_bg, col_cyan, col_text, col_green, col_yellow);
-            draw_line_padded(45u, "OpenFW 96M", col_hdr, col_bg);
-            format_sd_status(sd_line, (int)sizeof(sd_line), &sd_col, col_green, col_yellow, col_alert);
-            draw_line_padded(57u, sd_line, sd_col, col_bg);
-            draw_line_padded(147u, "HOLD BACK=USB", col_dim, col_bg);
-            prev_key        = KEY_NONE;
-            back_hold_ticks = 0u;
-            last_slow_ui    = 0u;
-            continue;
+            prev_vbus   = pmu_is_vbus_present();
+            usb_probing = 0;
+        } else {
+            uint32_t now_tick = millis();
+            int vbus_now = pmu_is_vbus_present();
+            int enter_usb_auto = 0;
+
+            if (!vbus_now) {
+                prev_vbus               = 0;
+                usb_probing             = 0;
+                usb_charger_only        = 0;
+                usb_suppress_until_unpl = 0;
+            } else if (g_sd_card.initialized && !usb_suppress_until_unpl) {
+                if (!prev_vbus) {
+                    prev_vbus          = 1;
+                    usb_charger_only   = 0;
+                    usb_probing        = 1;
+                    usb_probe_deadline = now_tick + 1500u;
+                    usb_phy_det_arm();
+                } else if (usb_probing) {
+                    if (usb_phy_det_poll_host()) {
+                        usb_probing    = 0;
+                        enter_usb_auto = 1;
+                    } else if ((int32_t)(now_tick - usb_probe_deadline) >= 0) {
+                        usb_probing      = 0;
+                        usb_charger_only = 1;
+                    }
+                }
+            }
+
+            if (enter_usb_auto || (key == KEY_ENTER && prev_key != KEY_ENTER && g_sd_card.initialized)) {
+                int manual = run_usb_msc_mode(col_bg, col_cyan, col_text, col_green, col_yellow, enter_usb_auto);
+                if (manual || enter_usb_auto) {
+                    /* Keep manual exit suppressed until VBUS drops; if host disconnected cleanly, re-arm only on replug */
+                    usb_suppress_until_unpl = pmu_is_vbus_present();
+                }
+                draw_line_padded(45u, "OpenFW 96M", col_hdr, col_bg);
+                format_sd_status(sd_line, (int)sizeof(sd_line), &sd_col, col_green, col_yellow, col_alert);
+                draw_line_padded(57u, sd_line, sd_col, col_bg);
+                draw_line_padded(147u, "HOLD BACK=USB", col_dim, col_bg);
+                prev_key        = KEY_NONE;
+                back_hold_ticks = 0u;
+                last_slow_ui    = 0u;
+                continue;
+            }
         }
         prev_key = key;
 
@@ -332,7 +398,7 @@ int openfw_main(void)
                 draw_line_padded(69u, line, (chg == PMU_CHG_CHARGING) ? col_yellow : col_green, col_bg);
             }
 
-            /* Row 3 (y=81): Recording MM:SS when recording, else Uptime */
+            /* Row 3 (y=81): Recording MM:SS when recording, else live AON RTC clock */
             pos = 0;
             if (rec_active) {
                 uint32_t rsec = recorder_get_seconds();
@@ -343,16 +409,23 @@ int openfw_main(void)
                 line[pos] = '\0';
                 draw_line_padded(81u, line, col_alert, col_bg);
             } else {
-                append_str(line, &pos, (int)sizeof(line), "UP ");
-                append_u32(line, &pos, (int)sizeof(line), now_ms / 1000u);
-                append_str(line, &pos, (int)sizeof(line), "s");
+                rtc_datetime_t dt;
+                rtc_get(&dt);
+                append_str(line, &pos, (int)sizeof(line), "CLK ");
+                append_2d(line, &pos, (int)sizeof(line), dt.hour);
+                append_str(line, &pos, (int)sizeof(line), ":");
+                append_2d(line, &pos, (int)sizeof(line), dt.minute);
+                append_str(line, &pos, (int)sizeof(line), ":");
+                append_2d(line, &pos, (int)sizeof(line), dt.second);
                 line[pos] = '\0';
                 draw_line_padded(81u, line, col_text, col_bg);
             }
 
-            /* Row 4 (y=93): Record switch or USB MSC prompt */
+            /* Row 4 (y=93): Record switch, charger state, or USB MSC prompt */
             if (rec_sw) {
                 draw_line_padded(93u, recorder_is_saving() ? "SAVING WAV" : "SW: REC ON", col_alert, col_bg);
+            } else if (usb_charger_only) {
+                draw_line_padded(93u, "USB: CHG", col_yellow, col_bg);
             } else {
                 draw_line_padded(93u, g_sd_card.initialized ? "ENT=USB MSC" : "SW: SAVE", col_cyan, col_bg);
             }

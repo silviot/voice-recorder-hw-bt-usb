@@ -97,6 +97,10 @@ int recorder_start(exfat_vol_t *vol, int sd_mounted)
     g_filename[0] = '\0';
 
     if (sd_mounted && vol && exfat_mkdir(vol, "record") == 0) {
+        rtc_datetime_t now;
+        rtc_get(&now);
+        exfat_set_timestamp(vol, rtc_to_dos_timestamp(&now));
+
         exfat_entry_t rec_dir;
         if (exfat_find_path(vol, "/record", &rec_dir) == 0 && rec_dir.is_dir) {
             uint32_t max_idx = 0u;
@@ -172,6 +176,11 @@ int recorder_stop(void)
     recorder_poll();
 
     if (g_rec_saving) {
+        if (g_writer.vol) {
+            rtc_datetime_t now;
+            rtc_get(&now);
+            exfat_set_timestamp(g_writer.vol, rtc_to_dos_timestamp(&now));
+        }
         uint8_t hdr[44];
         (void)wav_build_header(hdr, 16000u, 1u, 16u, g_pcm_bytes);
         (void)exfat_patch_header(&g_writer, hdr, 44u);

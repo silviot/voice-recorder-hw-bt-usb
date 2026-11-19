@@ -47,6 +47,11 @@ pmu_chg_state_t pmu_get_charge_state(void)
     return PMU_CHG_DISCHARGING;
 }
 
+int pmu_is_vbus_present(void)
+{
+    return (pmu_read_reg(0x2Au) & 0x04u) ? 1 : 0;
+}
+
 void pmu_reboot_to_usb_bootloader(void)
 {
     uint8_t r23 = pmu_read_reg(0x23u);

@@ -264,9 +264,17 @@ int exfat_mount(exfat_vol_t *vol, const blkdev_t *dev)
     vol->bitmap_cluster      = 0u;
     vol->bitmap_bytes        = 0u;
     vol->alloc_hint          = 0u;
+    vol->default_timestamp   = EXFAT_DOS_TIMESTAMP_DEFAULT;
 
     (void)scan_root_bitmap(vol);
     return 0;
+}
+
+void exfat_set_timestamp(exfat_vol_t *vol, uint32_t dos_timestamp)
+{
+    if (vol && dos_timestamp != 0u) {
+        vol->default_timestamp = dos_timestamp;
+    }
 }
 
 typedef int (*exfat_dir_loc_cb_t)(const exfat_entry_t *entry, uint32_t entry_lba,
@@ -708,18 +716,22 @@ static uint16_t exfat_entry_set_checksum(const uint8_t *entries, uint32_t total_
 }
 
 static void build_entry_set(uint8_t *dst, uint32_t total_ents, const char *name, uint32_t name_len,
-                            uint16_t file_attr, uint32_t first_cluster, uint64_t data_len)
+                            uint16_t file_attr, uint32_t first_cluster, uint64_t data_len,
+                            uint32_t dos_timestamp)
 {
     mem_zero(dst, total_ents * 32u);
+    if (dos_timestamp == 0u) {
+        dos_timestamp = EXFAT_DOS_TIMESTAMP_DEFAULT;
+    }
 
     /* 0x85 Primary File Directory Entry */
     uint8_t *f = dst;
     f[0] = 0x85u;
     f[1] = (uint8_t)(total_ents - 1u);
     put_le16(f + 4u, file_attr);
-    put_le32(f + 8u, EXFAT_DOS_TIMESTAMP_DEFAULT);
-    put_le32(f + 12u, EXFAT_DOS_TIMESTAMP_DEFAULT);
-    put_le32(f + 16u, EXFAT_DOS_TIMESTAMP_DEFAULT);
+    put_le32(f + 8u, dos_timestamp);
+    put_le32(f + 12u, dos_timestamp);
+    put_le32(f + 16u, dos_timestamp);
     f[22] = 0x80u; /* UTC offset valid (+00:00) */
     f[23] = 0x80u;
     f[24] = 0x80u;
@@ -882,7 +894,7 @@ int exfat_mkdir(exfat_vol_t *vol, const char *name)
         return -1;
     }
     build_entry_set(&sec[(uint32_t)slot_idx * 32u], total_ents, name, name_len,
-                    EXFAT_ATTR_DIR, dir_cls, vol->cluster_size);
+                    EXFAT_ATTR_DIR, dir_cls, vol->cluster_size, vol->default_timestamp);
     return vol->dev->write_sectors(vol->dev->ctx, slot_lba, 1u, sec);
 }
 
@@ -933,7 +945,7 @@ int exfat_create_file(exfat_vol_t *vol, const char *dir_path, const char *filena
         return -1;
     }
     build_entry_set(&sec[(uint32_t)slot_idx * 32u], total_ents, filename, name_len,
-                    EXFAT_ATTR_ARCHIVE, 0u, 0u);
+                    EXFAT_ATTR_ARCHIVE, 0u, 0u, vol->default_timestamp);
     if (vol->dev->write_sectors(vol->dev->ctx, slot_lba, 1u, sec) != 0) {
         return -1;
     }
@@ -1057,6 +1069,10 @@ int exfat_close_file(exfat_writer_t *w)
         return -1;
     }
 
+    if (w->vol->default_timestamp != 0u) {
+        put_le32(f + 12u, w->vol->default_timestamp);
+        put_le32(f + 16u, w->vol->default_timestamp);
+    }
     s[1] = 0x01u; /* AllocationPossible=1, NoFatChain=0 */
     put_le64(s + 8u, w->bytes_written);
     put_le32(s + 20u, w->first_cluster);

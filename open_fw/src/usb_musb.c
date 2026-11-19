@@ -314,21 +314,8 @@ static void ep0_service(void)
     }
 }
 
-int usb_msc_start(blkdev_t *dev)
+static void usb_phy_power_on(void)
 {
-    if (!dev || g_usb_active) {
-        return g_usb_active ? 0 : -1;
-    }
-
-    usb_msc_init_state(&g_msc, dev);
-    g_rx_pkts       = 0u;
-    g_tx_pkts       = 0u;
-    g_ep0_state     = EP0_IDLE;
-    g_ep0_tx_rem    = 0u;
-    g_set_addr_pend = 0u;
-    g_pending_addr  = 0u;
-    g_usb_cfg       = 0u;
-
     /* 1. PLL0 runs at 192 MHz; enable 48 MHz USB tap (clk 0x09) */
     CRU_CLK_SRC_GATE |= (1u << 6);
 
@@ -346,6 +333,49 @@ int usb_msc_start(blkdev_t *dev)
     /* 4. PB22 & PB23 = Analog (mux 15) for DP/DM */
     gpio_set_mux(GPIO_PORT_B, 22u, 15u);
     gpio_set_mux(GPIO_PORT_B, 23u, 15u);
+}
+
+void usb_phy_det_arm(void)
+{
+    usb_phy_power_on();
+    USB_PHY_INT_STATUS = 0x7u; /* W1C */
+    USB_PHY_CTRL       = (USB_PHY_CTRL & ~0x000000F0u) | 0x0000011Fu;
+    USB_PHY_INTE      |= 0x3u;
+}
+
+int usb_phy_det_poll_host(void)
+{
+    uint32_t st = USB_PHY_INT_STATUS;
+    if (st & 0x1u) {
+        USB_PHY_INT_STATUS = st | 0x7u;
+        USB_PHY_INTE      &= ~0x3u;
+        USB_PHY_CTRL      &= ~0x103u;
+        return 1;
+    }
+    return 0;
+}
+
+uint16_t usb_musb_frame(void)
+{
+    return MUSB_FRAME;
+}
+
+int usb_msc_start(blkdev_t *dev)
+{
+    if (!dev || g_usb_active) {
+        return g_usb_active ? 0 : -1;
+    }
+
+    usb_msc_init_state(&g_msc, dev);
+    g_rx_pkts       = 0u;
+    g_tx_pkts       = 0u;
+    g_ep0_state     = EP0_IDLE;
+    g_ep0_tx_rem    = 0u;
+    g_set_addr_pend = 0u;
+    g_pending_addr  = 0u;
+    g_usb_cfg       = 0u;
+
+    usb_phy_power_on();
 
     /* 5. PHY wrapper: disable plug-detect IRQ, Device mode (bit 12) + 50 ms */
     USB_PHY_INTE &= ~0x03u;

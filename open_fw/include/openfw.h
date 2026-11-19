@@ -19,7 +19,21 @@ void     systick_init(uint32_t cpu_hz);
 uint32_t millis(void);
 
 /* AON Hardware RTC (rtc.c) */
+typedef struct {
+    uint16_t year;    /* Full year e.g. 2026 (2000..2127) */
+    uint8_t  month;   /* 1..12 */
+    uint8_t  day;     /* 1..31 */
+    uint8_t  weekday; /* 0 = Mon .. 6 = Sun */
+    uint8_t  hour;    /* 0..23 */
+    uint8_t  minute;  /* 0..59 */
+    uint8_t  second;  /* 0..59 */
+} rtc_datetime_t;
+
 void     rtc_read_raw(uint32_t *date_reg, uint32_t *time_reg);
+void     rtc_ensure_running(void);
+void     rtc_get(rtc_datetime_t *dt);
+void     rtc_set(const rtc_datetime_t *dt);
+uint32_t rtc_to_dos_timestamp(const rtc_datetime_t *dt);
 void     rtc_set_alarm0_seconds(uint32_t seconds);
 
 /* UART0 Debug Console (uart.c) — NOTE: PD0 is shared with SARADC kadc_ch1 */
@@ -40,6 +54,7 @@ int             pmu_write_reg(uint8_t reg, uint8_t val);
 uint8_t         pmu_read_reg(uint8_t reg);
 uint32_t        pmu_read_vbat_mv(void);
 pmu_chg_state_t pmu_get_charge_state(void);
+int             pmu_is_vbus_present(void);
 void            pmu_reboot_to_usb_bootloader(void) __attribute__((noreturn));
 void            pmu_reboot_to_sd_ota(void) __attribute__((noreturn));
 
@@ -109,11 +124,19 @@ int         recorder_is_saving(void);
 uint32_t    recorder_get_seconds(void);
 const char *recorder_get_filename(void);
 
-/* USB Mass Storage Full-Speed MUSB Driver (usb_musb.c) */
+/* USB Mass Storage Full-Speed MUSB & PHY Plug Detect (usb_musb.c) */
+void usb_phy_det_arm(void);
+int  usb_phy_det_poll_host(void);
+uint16_t usb_musb_frame(void);
 int  usb_msc_start(blkdev_t *dev);
 void usb_msc_stop(void);
 void usb_msc_poll(void);
 int  usb_msc_is_active(void);
 void usb_msc_get_stats(uint32_t *rx_pkts, uint32_t *tx_pkts);
+
+/* BT RF & Modem Hardware Bring-Up (bt_rf.c) */
+uint32_t bt_rf_efuse_trim(void);
+void     bt_rf_init(uint32_t freq_drift, uint32_t vco_cal_10a4);
+void     bt_modem_init(uint32_t clk6_hz);
 
 #endif /* OPENFW_H */

@@ -55,6 +55,7 @@ static inline void nvic_clear_pending(uint32_t irq)
 #define IRQ_USB_DMA         42u
 #define IRQ_USB_PHY         43u
 #define IRQ_SDIO            44u
+#define IRQ_RTC             47u
 #define DMAC_IRQ_BASE       60u /* CH0..CH7 = NVIC IRQ 60..67 */
 
 /* ============================================================================
@@ -228,14 +229,20 @@ static inline int gpio_read(uint32_t port, uint32_t pin)
 /* ============================================================================
  * AON Hardware RTC (0x40085000) & PMU RTWI Bus (0x40085100)
  * ============================================================================ */
-#define RTC_DATE            REG32(AON_RTC_BASE + 0x04u)
-#define RTC_TIME            REG32(AON_RTC_BASE + 0x08u)
+#define AON_RTC_CTRL        REG32(AON_RTC_BASE + 0x00u) /* bit 4=mode, bit 8=HALT */
+#define RTC_DATE            REG32(AON_RTC_BASE + 0x04u) /* binary: [24]leap [22:16]yr-2000 [11:8]mon [4:0]day */
+#define RTC_TIME            REG32(AON_RTC_BASE + 0x08u) /* binary: [26:24]wday [20:16]hr [13:8]min [5:0]sec */
 #define RTC_ALARM0_VAL      REG32(AON_RTC_BASE + 0x10u)
 #define RTC_ALARM0_CTRL     REG32(AON_RTC_BASE + 0x18u)
 #define RTC_ALARM1_TIME     REG32(AON_RTC_BASE + 0x20u)
 #define RTC_ALARM1_CTRL     REG32(AON_RTC_BASE + 0x24u)
 #define AON_PWR_CTRL0       REG32(AON_RTC_BASE + 0x60u)
+#define AON_CLK_CFG         REG32(AON_RTC_BASE + 0x90u) /* [11:4]=XTAL cap, [16:12]=RTC clk, [31]=busy */
+#define AON_CLK_STAT        REG32(AON_RTC_BASE + 0x94u)
+#define AON_PWR_CTL0        REG32(AON_RTC_BASE + 0xA0u) /* bit 28 = RTC pwr gate (0=on) */
+#define AON_CLK_EN          REG32(AON_RTC_BASE + 0xA8u) /* bit 2 = RTC clk enable */
 #define AON_PLL_CTRL        REG32(AON_RTC_BASE + 0xD8u) /* bit 2 = PLL0 LDO/power */
+#define AON_BACKUP(n)       REG32(AON_RTC_BASE + 0x180u + 4u * (uint32_t)(n))
 
 #define RTWI_CTRL           REG32(RTWI_BASE + 0x00u)
 #define RTWI_CMD            REG32(RTWI_BASE + 0x04u) /* bit31=BUSY, bit30=1, [15:8]=reg, [7:0]=0x60/0x61 */
@@ -352,6 +359,15 @@ static inline int gpio_read(uint32_t port, uint32_t pin)
 
 #define USB_PHY_CTRL        REG32(MUSB_BASE + 0x300u) /* bit 12 = Device mode */
 #define USB_PHY_INTE        REG32(MUSB_BASE + 0x304u) /* bits [1:0] = VBUS/plug IRQ EN */
+#define USB_PHY_INT_STATUS  REG32(MUSB_BASE + 0x308u) /* bit 0 = USB host attach (W1C) */
+
+/* ============================================================================
+ * eFuse / OTP (0x40099000) & BT RF / Modem (0x40010000 / 0x40011000)
+ * ============================================================================ */
+#define EFUSE_WORD(n)       REG32(EFUSE_BASE + 0x20u + 4u * (uint32_t)(n))
+#define RF_BB_CTRL          REG32(RF_BB_BASE + 0x000u) /* bit 26 = RF config mode */
+#define RF_LUT_CTRL         REG32(RF_ANA_BASE + 0x004u)
+#define RF_LUT_DATA         REG32(RF_ANA_BASE + 0x008u)
 
 /* ============================================================================
  * RivieraWaves RW-BT Baseband Controller (0x40020000)

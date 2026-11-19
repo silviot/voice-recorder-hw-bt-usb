@@ -32,6 +32,7 @@ typedef struct {
     uint32_t bitmap_cluster;
     uint32_t bitmap_bytes;
     uint32_t alloc_hint;
+    uint32_t default_timestamp;
 } exfat_vol_t;
 
 #define EXFAT_MAX_NAME 64u
@@ -71,7 +72,8 @@ int exfat_read_file(const exfat_vol_t *vol, const exfat_entry_t *file,
                     uint64_t offset, void *dst, uint32_t len, uint32_t *bytes_read);
 
 /* Write operations (requires dev->write_sectors != NULL and 0x81 Allocation Bitmap) */
-int exfat_mkdir(exfat_vol_t *vol, const char *name);
+void exfat_set_timestamp(exfat_vol_t *vol, uint32_t dos_timestamp);
+int  exfat_mkdir(exfat_vol_t *vol, const char *name);
 int exfat_create_file(exfat_vol_t *vol, const char *dir_path, const char *filename, exfat_writer_t *out);
 int exfat_write(exfat_writer_t *w, const void *data, uint32_t len);
 int exfat_patch_header(exfat_writer_t *w, const void *hdr, uint32_t len);
