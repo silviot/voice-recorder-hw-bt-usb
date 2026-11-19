@@ -142,10 +142,12 @@ static void handle_cbw(usb_msc_state_t *st, const uint8_t *pkt, uint8_t len)
     uint8_t  cb_len   = pkt[14] & 0x1Fu;
     const uint8_t *cb = pkt + 15u;
 
-    st->csw_tag     = tag;
-    st->csw_residue = data_len;
-    st->csw_status  = 0u;
-    st->send_zlp    = 0u;
+    st->csw_tag       = tag;
+    st->csw_residue   = data_len;
+    st->csw_status    = 0u;
+    st->send_zlp      = 0u;
+    st->is_blk_xfer   = 0u;
+    st->is_vendor_out = 0u;
 
     if (lun != 0u || cb_len == 0u || cb_len > 16u) {
         fail_cmd(st, data_len, flags, 1u, 0x05u, 0x24u, 0x00u);
@@ -342,6 +344,38 @@ static void handle_cbw(usb_msc_state_t *st, const uint8_t *pkt, uint8_t len)
         break;
     }
 
+    case 0xE0u: /* OpenFW Vendor Diagnostic / Control Command */ {
+        if (!st->vendor_cb) {
+            fail_cmd(st, data_len, flags, 1u, 0x05u, 0x20u, 0x00u);
+            break;
+        }
+        if ((flags & 0x80u) != 0u || data_len == 0u) {
+            uint16_t resp_len = (uint16_t)(data_len < 64u ? data_len : 64u);
+            mem_zero(st->inline_buf, 64u);
+            if (st->vendor_cb(st->vendor_user, cb, st->inline_buf, &resp_len, 0) != 0) {
+                fail_cmd(st, data_len, flags, 1u, 0x05u, 0x24u, 0x00u);
+            } else {
+                if (resp_len > 64u) {
+                    resp_len = 64u;
+                }
+                start_inline_in(st, data_len, resp_len);
+            }
+        } else {
+            if (data_len > 64u) {
+                fail_cmd(st, data_len, flags, 1u, 0x05u, 0x24u, 0x00u);
+                break;
+            }
+            mem_copy(st->vendor_cdb, cb, 16u);
+            st->inline_pos    = 0u;
+            st->inline_len    = (uint16_t)data_len;
+            st->is_vendor_out = 1u;
+            st->is_blk_xfer   = 0u;
+            st->data_rem      = data_len;
+            st->phase         = MSC_PHASE_DATA_OUT;
+        }
+        break;
+    }
+
     default:
         fail_cmd(st, data_len, flags, 1u, 0x05u, 0x20u, 0x00u); /* Invalid command op */
         break;
@@ -358,15 +392,28 @@ void usb_msc_init_state(usb_msc_state_t *st, blkdev_t *dev)
     st->phase = MSC_PHASE_IDLE;
 }
 
+void usb_msc_set_vendor_cb(usb_msc_state_t *st, usb_msc_vendor_cb_t cb, void *user)
+{
+    if (!st) {
+        return;
+    }
+    st->vendor_cb   = cb;
+    st->vendor_user = user;
+}
+
 void usb_msc_reset(usb_msc_state_t *st)
 {
     if (!st) {
         return;
     }
-    blkdev_t *dev = st->dev;
+    blkdev_t           *dev         = st->dev;
+    usb_msc_vendor_cb_t vendor_cb   = st->vendor_cb;
+    void               *vendor_user = st->vendor_user;
     mem_zero(st, sizeof(*st));
-    st->dev   = dev;
-    st->phase = MSC_PHASE_IDLE;
+    st->dev         = dev;
+    st->vendor_cb   = vendor_cb;
+    st->vendor_user = vendor_user;
+    st->phase       = MSC_PHASE_IDLE;
 }
 
 void usb_msc_on_rx_packet(usb_msc_state_t *st, const uint8_t *pkt, uint8_t len)
@@ -386,6 +433,22 @@ void usb_msc_on_rx_packet(usb_msc_state_t *st, const uint8_t *pkt, uint8_t len)
 
     uint32_t pos = 0u;
     while (pos < len && st->data_rem > 0u) {
+        if (st->is_vendor_out) {
+            uint32_t space = (uint32_t)st->inline_len - (uint32_t)st->inline_pos;
+            uint32_t take  = len - pos;
+            if (take > space) {
+                take = space;
+            }
+            if (take > st->data_rem) {
+                take = st->data_rem;
+            }
+            mem_copy(&st->inline_buf[st->inline_pos], pkt + pos, take);
+            st->inline_pos = (uint16_t)(st->inline_pos + take);
+            pos           += take;
+            st->data_rem  -= take;
+            continue;
+        }
+
         if (!st->is_blk_xfer) {
             /* Drain unwanted OUT payload on a failed command */
             uint32_t drop = len - pos;
@@ -425,8 +488,21 @@ void usb_msc_on_rx_packet(usb_msc_state_t *st, const uint8_t *pkt, uint8_t len)
     }
 
     if (st->data_rem == 0u) {
-        st->is_blk_xfer = 0u;
-        st->phase       = MSC_PHASE_CSW;
+        if (st->is_vendor_out) {
+            uint16_t io_len = st->inline_len;
+            st->is_vendor_out = 0u;
+            if (!st->vendor_cb ||
+                st->vendor_cb(st->vendor_user, st->vendor_cdb, st->inline_buf, &io_len, 1) != 0) {
+                fail_cmd(st, 0u, 0u, 1u, 0x05u, 0x24u, 0x00u);
+            } else {
+                st->csw_status  = 0u;
+                st->csw_residue = 0u;
+                st->phase       = MSC_PHASE_CSW;
+            }
+        } else {
+            st->is_blk_xfer = 0u;
+            st->phase       = MSC_PHASE_CSW;
+        }
     }
 }
 

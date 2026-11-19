@@ -20,31 +20,41 @@ typedef enum {
     MSC_PHASE_CSW,
 } usb_msc_phase_t;
 
+typedef int (*usb_msc_vendor_cb_t)(void *user, const uint8_t cdb[16],
+                                   uint8_t *io_buf, uint16_t *io_len, int is_out);
+
 typedef struct {
-    blkdev_t       *dev;
-    usb_msc_phase_t phase;
-    uint32_t        csw_tag;
-    uint32_t        csw_residue;
-    uint8_t         csw_status;
-    uint8_t         medium_ejected;
-    uint8_t         send_zlp;
-    uint8_t         sense_key;
-    uint8_t         sense_asc;
-    uint8_t         sense_ascq;
+    blkdev_t           *dev;
+    usb_msc_phase_t     phase;
+    uint32_t            csw_tag;
+    uint32_t            csw_residue;
+    uint8_t             csw_status;
+    uint8_t             medium_ejected;
+    uint8_t             send_zlp;
+    uint8_t             sense_key;
+    uint8_t             sense_asc;
+    uint8_t             sense_ascq;
+
+    /* Optional vendor SCSI 0xE0 callback (preserved across usb_msc_reset) */
+    usb_msc_vendor_cb_t vendor_cb;
+    void               *vendor_user;
+    uint8_t             is_vendor_out;
+    uint8_t             vendor_cdb[16];
 
     /* Streaming / inline transfer state */
-    uint8_t         is_blk_xfer;
-    uint32_t        cur_lba;
-    uint32_t        blocks_rem;
-    uint32_t        data_rem;
-    uint16_t        sec_off;
-    uint16_t        inline_pos;
-    uint16_t        inline_len;
-    uint8_t         inline_buf[64];
-    uint8_t         sec_buf[512];
+    uint8_t             is_blk_xfer;
+    uint32_t            cur_lba;
+    uint32_t            blocks_rem;
+    uint32_t            data_rem;
+    uint16_t            sec_off;
+    uint16_t            inline_pos;
+    uint16_t            inline_len;
+    uint8_t             inline_buf[64];
+    uint8_t             sec_buf[512];
 } usb_msc_state_t;
 
 void    usb_msc_init_state(usb_msc_state_t *st, blkdev_t *dev);
+void    usb_msc_set_vendor_cb(usb_msc_state_t *st, usb_msc_vendor_cb_t cb, void *user);
 void    usb_msc_reset(usb_msc_state_t *st);
 void    usb_msc_on_rx_packet(usb_msc_state_t *st, const uint8_t *pkt, uint8_t len);
 int     usb_msc_need_tx(const usb_msc_state_t *st);

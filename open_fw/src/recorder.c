@@ -13,6 +13,7 @@
 
 static int            g_rec_active = 0;
 static int            g_rec_saving = 0;
+static uint8_t        g_mic_gain   = 24u;
 static exfat_writer_t g_writer;
 static uint32_t       g_pcm_bytes  = 0u;
 static char           g_filename[16];
@@ -82,12 +83,22 @@ static void format_rec_filename(uint32_t idx, char out[16])
     out[12] = '\0';
 }
 
+void recorder_set_gain(uint8_t gain_0_31)
+{
+    g_mic_gain = (gain_0_31 > 31u) ? 31u : gain_0_31;
+}
+
+uint8_t recorder_get_gain(void)
+{
+    return g_mic_gain;
+}
+
 int recorder_start(exfat_vol_t *vol, int sd_mounted)
 {
     if (g_rec_active) {
         return 0;
     }
-    if (audio_capture_start(24u) != 0) {
+    if (audio_capture_start(g_mic_gain) != 0) {
         return -1;
     }
 

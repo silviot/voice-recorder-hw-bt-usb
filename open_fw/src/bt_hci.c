@@ -1263,6 +1263,69 @@ static const bt_link_key_slot_t *find_link_key(const uint8_t bd[6])
     return 0;
 }
 
+static void save_link_keys_to_sd(void)
+{
+    if (!g_sd_mounted || !g_vol) {
+        return;
+    }
+    exfat_entry_t existing;
+    if (exfat_find_path(g_vol, "/bt_keys.bin", &existing) == 0 && !existing.is_dir) {
+        (void)exfat_delete_file(g_vol, "/", "bt_keys.bin");
+    }
+    rtc_datetime_t dt;
+    rtc_get(&dt);
+    exfat_set_timestamp(g_vol, rtc_to_dos_timestamp(&dt));
+
+    exfat_writer_t w;
+    if (exfat_create_file(g_vol, "/", "bt_keys.bin", &w) == 0) {
+        uint8_t blob[96];
+        blob[0] = 'B';
+        blob[1] = 'L';
+        blob[2] = 'K';
+        blob[3] = '1';
+        for (uint32_t i = 0u; i < 4u; i++) {
+            uint32_t off = 4u + i * 23u;
+            blob[off] = g_key_cache[i].valid ? 1u : 0u;
+            bt_memcpy(&blob[off + 1u], g_key_cache[i].bd, 6u);
+            bt_memcpy(&blob[off + 7u], g_key_cache[i].key, 16u);
+        }
+        (void)exfat_write(&w, blob, (uint32_t)sizeof(blob));
+        (void)exfat_close_file(&w);
+    }
+}
+
+static void load_link_keys_from_sd(void)
+{
+    bt_memzero(g_key_cache, sizeof(g_key_cache));
+    g_key_next = 0u;
+
+    if (!g_sd_mounted || !g_vol) {
+        return;
+    }
+    exfat_entry_t ent;
+    if (exfat_find_path(g_vol, "/bt_keys.bin", &ent) != 0 || ent.is_dir || ent.size != 96u) {
+        return;
+    }
+    uint8_t blob[96];
+    uint32_t nread = 0u;
+    if (exfat_read_file(g_vol, &ent, 0u, blob, (uint32_t)sizeof(blob), &nread) != 0 ||
+        nread != 96u ||
+        blob[0] != 'B' || blob[1] != 'L' || blob[2] != 'K' || blob[3] != '1') {
+        return;
+    }
+    int found_empty = 0;
+    for (uint32_t i = 0u; i < 4u; i++) {
+        uint32_t off = 4u + i * 23u;
+        g_key_cache[i].valid = (blob[off] != 0u) ? 1u : 0u;
+        bt_memcpy(g_key_cache[i].bd, &blob[off + 1u], 6u);
+        bt_memcpy(g_key_cache[i].key, &blob[off + 7u], 16u);
+        if (!found_empty && !g_key_cache[i].valid) {
+            g_key_next  = (uint8_t)i;
+            found_empty = 1;
+        }
+    }
+}
+
 static void store_link_key(const uint8_t bd[6], const uint8_t key[16])
 {
     int slot = -1;
@@ -1279,6 +1342,7 @@ static void store_link_key(const uint8_t bd[6], const uint8_t key[16])
     g_key_cache[slot].valid = 1u;
     bt_memcpy(g_key_cache[slot].bd, bd, 6u);
     bt_memcpy(g_key_cache[slot].key, key, 16u);
+    save_link_keys_to_sd();
 }
 
 static void hci_send_scan_enable(uint8_t mode)
@@ -1558,6 +1622,40 @@ static void xrec_cb_on_reboot(void *user)
     system_reboot();
 }
 
+static int xrec_cb_rec_start(void *user, const char *opt_name, char *out_name, uint32_t out_max)
+{
+    (void)user;
+    (void)opt_name;
+    if (!out_name || out_max == 0u) {
+        return -1;
+    }
+    out_name[0] = '\0';
+    int was_saving = recorder_is_saving();
+    if (recorder_start(g_vol, g_sd_mounted) != 0) {
+        return -1;
+    }
+    if (recorder_is_saving()) {
+        const char *fname = recorder_get_filename();
+        uint32_t i = 0u;
+        while (fname[i] != '\0' && (i + 1u) < out_max) {
+            out_name[i] = fname[i];
+            i++;
+        }
+        out_name[i] = '\0';
+        return (i > 0u) ? 0 : -1;
+    }
+    if (!was_saving && !keys_read_rec_switch()) {
+        (void)recorder_stop();
+    }
+    return -1;
+}
+
+static int xrec_cb_rec_stop(void *user)
+{
+    (void)user;
+    return recorder_stop();
+}
+
 static void load_bound_key_from_sd(void)
 {
     if (!g_sd_mounted || !g_vol) {
@@ -1615,8 +1713,8 @@ int bt_xrec_start(exfat_vol_t *vol, int sd_mounted)
         xrec_cb_entropy,
         xrec_cb_on_bound_key,
         xrec_cb_on_reboot,
-        0,
-        0,
+        xrec_cb_rec_start,
+        xrec_cb_rec_stop,
     };
 
     g_vol              = vol;
@@ -1633,6 +1731,7 @@ int bt_xrec_start(exfat_vol_t *vol, int sd_mounted)
 
     xrec_init(&g_xrec, g_sd_mounted ? g_vol : 0, &ops, 0);
     load_bound_key_from_sd();
+    load_link_keys_from_sd();
 
     bt_spp_init(&g_spp, spp_rx_cb, &g_xrec);
     bt_spp_set_disconnect_cb(&g_spp, spp_disc_cb, &g_xrec);

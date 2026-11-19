@@ -21,6 +21,9 @@ static usb_msc_state_t g_msc;
 static int             g_usb_active = 0;
 static uint32_t        g_rx_pkts    = 0u;
 static uint32_t        g_tx_pkts    = 0u;
+static uint8_t         g_diag_sd_mounted = 0u;
+static uint8_t         g_diag_rec_active = 0u;
+static uint8_t         g_diag_mic_gain   = 24u;
 
 static ep0_state_t     g_ep0_state      = EP0_IDLE;
 static const uint8_t  *g_ep0_tx_ptr     = 0;
@@ -361,6 +364,153 @@ uint16_t usb_musb_frame(void)
     return openfw_mmio_rd16(MUSB_FRAME_ADDR);
 }
 
+static inline uint32_t musb_get_le32(const uint8_t *p)
+{
+    return (uint32_t)p[0]
+         | ((uint32_t)p[1] << 8)
+         | ((uint32_t)p[2] << 16)
+         | ((uint32_t)p[3] << 24);
+}
+
+static inline void musb_put_le16(uint8_t *p, uint16_t v)
+{
+    p[0] = (uint8_t)(v & 0xFFu);
+    p[1] = (uint8_t)((v >> 8) & 0xFFu);
+}
+
+static inline void musb_put_le32(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)(v & 0xFFu);
+    p[1] = (uint8_t)((v >> 8) & 0xFFu);
+    p[2] = (uint8_t)((v >> 16) & 0xFFu);
+    p[3] = (uint8_t)((v >> 24) & 0xFFu);
+}
+
+static int musb_vendor_scsi_cb(void *user, const uint8_t cdb[16],
+                               uint8_t *io_buf, uint16_t *io_len, int is_out)
+{
+    (void)user;
+    if (!cdb || !io_buf || !io_len) {
+        return -1;
+    }
+
+    switch (cdb[1]) {
+    case 0x01u: /* GET_INFO (IN 32 B) */ {
+        if (is_out) {
+            return -1;
+        }
+        uint8_t info[32];
+        info[0] = 'O';
+        info[1] = 'F';
+        info[2] = 'W';
+        info[3] = '1';
+        musb_put_le32(&info[4],  millis());
+        musb_put_le32(&info[8],  pmu_read_vbat_mv());
+        info[12] = (uint8_t)pmu_get_charge_state();
+        info[13] = g_diag_sd_mounted;
+        info[14] = g_diag_rec_active;
+        info[15] = g_diag_mic_gain;
+        musb_put_le32(&info[16], g_openfw_log.write_idx);
+        musb_put_le32(&info[20], g_openfw_log.dropped_bytes);
+        musb_put_le32(&info[24], OPENFW_LOG_SIZE);
+        musb_put_le32(&info[28], 0u);
+
+        uint16_t n = (*io_len < 32u) ? *io_len : 32u;
+        for (uint16_t i = 0u; i < n; i++) {
+            io_buf[i] = info[i];
+        }
+        *io_len = n;
+        return 0;
+    }
+
+    case 0x02u: /* READ_LOG (IN 1..64 B) */ {
+        if (is_out) {
+            return -1;
+        }
+        uint32_t offset = musb_get_le32(&cdb[2]);
+        uint32_t req    = musb_get_le32(&cdb[6]);
+        if (req < 1u) {
+            req = 1u;
+        }
+        if (req > 64u) {
+            req = 64u;
+        }
+        if (req > *io_len) {
+            req = *io_len;
+        }
+        for (uint32_t i = 0u; i < req; i++) {
+            io_buf[i] = (uint8_t)g_openfw_log.buf[(offset + i) & (OPENFW_LOG_SIZE - 1u)];
+        }
+        *io_len = (uint16_t)req;
+        return 0;
+    }
+
+    case 0x03u: /* GET_RTC (IN 8 B) */ {
+        if (is_out) {
+            return -1;
+        }
+        rtc_datetime_t dt;
+        rtc_get(&dt);
+        uint8_t raw[8];
+        musb_put_le16(&raw[0], dt.year);
+        raw[2] = dt.month;
+        raw[3] = dt.day;
+        raw[4] = dt.hour;
+        raw[5] = dt.minute;
+        raw[6] = dt.second;
+        raw[7] = dt.weekday;
+
+        uint16_t n = (*io_len < 8u) ? *io_len : 8u;
+        for (uint16_t i = 0u; i < n; i++) {
+            io_buf[i] = raw[i];
+        }
+        *io_len = n;
+        return 0;
+    }
+
+    case 0x04u: /* SET_RTC (OUT 8 B) */ {
+        if (!is_out || *io_len != 8u) {
+            return -1;
+        }
+        uint16_t year    = (uint16_t)io_buf[0] | ((uint16_t)io_buf[1] << 8);
+        uint8_t  month   = io_buf[2];
+        uint8_t  day     = io_buf[3];
+        uint8_t  hour    = io_buf[4];
+        uint8_t  minute  = io_buf[5];
+        uint8_t  second  = io_buf[6];
+        uint8_t  weekday = io_buf[7];
+
+        if (year < 2000u || year > 2099u ||
+            month < 1u || month > 12u ||
+            day < 1u || day > 31u ||
+            hour > 23u || minute > 59u || second > 59u) {
+            return -1;
+        }
+
+        rtc_datetime_t dt;
+        dt.year    = year;
+        dt.month   = month;
+        dt.day     = day;
+        dt.weekday = weekday;
+        dt.hour    = hour;
+        dt.minute  = minute;
+        dt.second  = second;
+        rtc_set(&dt);
+        return 0;
+    }
+
+    default:
+        return -1;
+    }
+}
+
+void usb_msc_set_diag_info(uint8_t sd_mounted, uint8_t rec_active, uint8_t mic_gain)
+{
+    g_diag_sd_mounted = sd_mounted;
+    g_diag_rec_active = rec_active;
+    g_diag_mic_gain   = mic_gain;
+}
+
 int usb_msc_start(blkdev_t *dev)
 {
     if (!dev || g_usb_active) {
@@ -368,6 +518,7 @@ int usb_msc_start(blkdev_t *dev)
     }
 
     usb_msc_init_state(&g_msc, dev);
+    usb_msc_set_vendor_cb(&g_msc, musb_vendor_scsi_cb, 0);
     g_rx_pkts       = 0u;
     g_tx_pkts       = 0u;
     g_ep0_state     = EP0_IDLE;

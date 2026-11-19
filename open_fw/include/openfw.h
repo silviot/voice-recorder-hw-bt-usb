@@ -132,6 +132,8 @@ const int16_t *audio_pop_frame(uint32_t *out_bytes);
 uint32_t       audio_get_overruns(void);
 
 /* Real-Time WAV Recorder (recorder.c) */
+void        recorder_set_gain(uint8_t gain_0_31);
+uint8_t     recorder_get_gain(void);
 int         recorder_start(exfat_vol_t *vol, int sd_mounted);
 void        recorder_poll(void);
 int         recorder_stop(void);
@@ -143,6 +145,7 @@ const char *recorder_get_filename(void);
 void usb_phy_det_arm(void);
 int  usb_phy_det_poll_host(void);
 uint16_t usb_musb_frame(void);
+void usb_msc_set_diag_info(uint8_t sd_mounted, uint8_t rec_active, uint8_t mic_gain);
 int  usb_msc_start(blkdev_t *dev);
 void usb_msc_stop(void);
 void usb_msc_poll(void);

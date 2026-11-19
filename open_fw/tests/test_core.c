@@ -524,6 +524,144 @@ static void test_usb_msc(void)
     printf("  [PASS] usb_msc (SCSI INQUIRY, TUR, READCAP, WRITE10, READ10, SENSE)\n");
 }
 
+typedef struct {
+    int      calls;
+    int      fail_next;
+    int      last_is_out;
+    uint16_t resp_len;
+    uint16_t last_io_len;
+    uint8_t  last_cdb[16];
+    uint8_t  last_out[64];
+} test_vendor_ctx_t;
+
+static int test_vendor_cb(void *user, const uint8_t cdb[16],
+                          uint8_t *io_buf, uint16_t *io_len, int is_out)
+{
+    test_vendor_ctx_t *ctx = (test_vendor_ctx_t *)user;
+    ctx->calls++;
+    ctx->last_is_out = is_out;
+    ctx->last_io_len = *io_len;
+    memcpy(ctx->last_cdb, cdb, 16u);
+    if (ctx->fail_next) {
+        ctx->fail_next = 0;
+        return -1;
+    }
+    if (is_out) {
+        if (*io_len > 0u) {
+            memcpy(ctx->last_out, io_buf, *io_len);
+        }
+        return 0;
+    }
+    uint16_t n = (ctx->resp_len < *io_len) ? ctx->resp_len : *io_len;
+    for (uint16_t i = 0u; i < n; i++) {
+        io_buf[i] = (uint8_t)((cdb[1] * 17u + i) & 0xFFu);
+    }
+    *io_len = n;
+    return 0;
+}
+
+static void test_usb_msc_vendor_e0(void)
+{
+    memset(g_disk, 0, sizeof(g_disk));
+    blkdev_t dev = { mem_read_sectors, mem_write_sectors, MEM_DISK_SECTORS, NULL };
+    usb_msc_state_t st;
+    usb_msc_init_state(&st, &dev);
+
+    uint8_t  status = 0u;
+    uint32_t res = 0u, got = 0u;
+    uint8_t  buf[128];
+    uint8_t  req_cdb[6] = { 0x03u, 0u, 0u, 0u, 18u, 0u };
+
+    /* 1. Unregistered 0xE0 -> Illegal Request 0x05/0x20/0x00 */
+    uint8_t v_in_cdb[16] = { 0xE0u, 0x01u, 0x11u, 0x22u };
+    scsi_xfer(&st, 100u, 0x80u, v_in_cdb, 16u, NULL, buf, 8u, &status, &res, &got);
+    assert(status == 1u && res == 8u && got == 0u);
+    scsi_xfer(&st, 101u, 0x80u, req_cdb, 6u, NULL, buf, 18u, &status, &res, &got);
+    assert(status == 0u && buf[2] == 0x05u && buf[12] == 0x20u && buf[13] == 0x00u);
+
+    /* 2. Register callback -> IN exact (32 B) & short (20/64 B) & zero-len */
+    test_vendor_ctx_t vctx;
+    memset(&vctx, 0, sizeof(vctx));
+    usb_msc_set_vendor_cb(&st, test_vendor_cb, &vctx);
+
+    vctx.resp_len = 32u;
+    scsi_xfer(&st, 102u, 0x80u, v_in_cdb, 16u, NULL, buf, 32u, &status, &res, &got);
+    assert(status == 0u && res == 0u && got == 32u && vctx.calls == 1 && vctx.last_is_out == 0);
+    for (uint32_t i = 0u; i < 32u; i++) {
+        assert(buf[i] == (uint8_t)((0x01u * 17u + i) & 0xFFu));
+    }
+
+    vctx.resp_len = 20u;
+    scsi_xfer(&st, 103u, 0x80u, v_in_cdb, 16u, NULL, buf, 64u, &status, &res, &got);
+    assert(status == 0u && res == 44u && got == 20u);
+
+    uint8_t v_zero_cdb[16] = { 0xE0u, 0x05u };
+    scsi_xfer(&st, 104u, 0x00u, v_zero_cdb, 16u, NULL, NULL, 0u, &status, &res, NULL);
+    assert(status == 0u && res == 0u && vctx.last_is_out == 0 && vctx.last_io_len == 0u);
+
+    /* 3. OUT single-packet (8 B) and multi-chunk (24 + 24 = 48 B) */
+    uint8_t v_out_cdb[16] = { 0xE0u, 0x04u, 0xAAu, 0xBBu };
+    uint8_t out8[8] = { 0xEAu, 0x07u, 11u, 15u, 10u, 20u, 30u, 4u };
+    scsi_xfer(&st, 105u, 0x00u, v_out_cdb, 16u, out8, NULL, 8u, &status, &res, NULL);
+    assert(status == 0u && res == 0u && vctx.last_is_out == 1 && vctx.last_io_len == 8u);
+    assert(memcmp(vctx.last_out, out8, 8u) == 0);
+    assert(memcmp(vctx.last_cdb, v_out_cdb, 16u) == 0);
+
+    uint8_t out48[48];
+    for (uint32_t i = 0u; i < sizeof(out48); i++) {
+        out48[i] = (uint8_t)(0xC0u ^ i);
+    }
+    uint8_t cbw[31];
+    build_cbw(cbw, 106u, 48u, 0x00u, v_out_cdb, 16u);
+    usb_msc_on_rx_packet(&st, cbw, 31u);
+    int calls_before = vctx.calls;
+    usb_msc_on_rx_packet(&st, out48, 24u);
+    assert(vctx.calls == calls_before);
+    usb_msc_on_rx_packet(&st, out48 + 24u, 24u);
+    assert(vctx.calls == calls_before + 1 && vctx.last_io_len == 48u);
+    assert(memcmp(vctx.last_out, out48, 48u) == 0);
+    uint8_t csw_pkt[64];
+    assert(usb_msc_need_tx(&st) == 1);
+    assert(usb_msc_get_tx_packet(&st, csw_pkt) == 13u && csw_pkt[12] == 0u && get_le32(&csw_pkt[8]) == 0u);
+    assert(usb_msc_need_tx(&st) == 0);
+
+    /* 4. Failure sense 0x05/0x24/0x00 on IN, OUT callback fail, and OUT > 64 B */
+    vctx.fail_next = 1;
+    scsi_xfer(&st, 107u, 0x80u, v_in_cdb, 16u, NULL, buf, 32u, &status, &res, &got);
+    assert(status == 1u && res == 32u && got == 0u);
+    scsi_xfer(&st, 108u, 0x80u, req_cdb, 6u, NULL, buf, 18u, &status, &res, &got);
+    assert(status == 0u && buf[2] == 0x05u && buf[12] == 0x24u && buf[13] == 0x00u);
+
+    vctx.fail_next = 1;
+    scsi_xfer(&st, 109u, 0x00u, v_out_cdb, 16u, out8, NULL, 8u, &status, &res, NULL);
+    assert(status == 1u && res == 0u);
+    scsi_xfer(&st, 110u, 0x80u, req_cdb, 6u, NULL, buf, 18u, &status, &res, &got);
+    assert(status == 0u && buf[2] == 0x05u && buf[12] == 0x24u && buf[13] == 0x00u);
+
+    uint8_t out65[65];
+    memset(out65, 0x5Au, sizeof(out65));
+    calls_before = vctx.calls;
+    scsi_xfer(&st, 111u, 0x00u, v_out_cdb, 16u, out65, NULL, 65u, &status, &res, NULL);
+    assert(vctx.calls == calls_before && status == 1u && res == 65u);
+    scsi_xfer(&st, 112u, 0x80u, req_cdb, 6u, NULL, buf, 18u, &status, &res, &got);
+    assert(status == 0u && buf[2] == 0x05u && buf[12] == 0x24u && buf[13] == 0x00u);
+
+    /* 5. Callback & user pointer preserved across usb_msc_reset() */
+    usb_msc_reset(&st);
+    assert(st.vendor_cb == test_vendor_cb && st.vendor_user == &vctx);
+    vctx.resp_len = 16u;
+    v_in_cdb[1] = 0x02u;
+    scsi_xfer(&st, 113u, 0x80u, v_in_cdb, 16u, NULL, buf, 16u, &status, &res, &got);
+    assert(status == 0u && res == 0u && got == 16u);
+    for (uint32_t i = 0u; i < 16u; i++) {
+        assert(buf[i] == (uint8_t)((0x02u * 17u + i) & 0xFFu));
+    }
+    scsi_xfer(&st, 114u, 0x00u, v_out_cdb, 16u, out8, NULL, 8u, &status, &res, NULL);
+    assert(status == 0u && res == 0u && memcmp(vctx.last_out, out8, 8u) == 0);
+
+    printf("  [PASS] usb_msc vendor 0xE0 (IN, OUT, multi-pkt, fail sense, reset preserve)\n");
+}
+
 static int file_read_sectors(void *ctx, uint32_t lba, uint32_t count, void *buf)
 {
     FILE *fp = (FILE *)ctx;
@@ -1076,6 +1214,7 @@ int main(int argc, char **argv)
     test_exfat();
     test_exfat_write();
     test_usb_msc();
+    test_usb_msc_vendor_e0();
     test_bt_spp_and_xrec();
     printf("All open_fw host unit tests PASSED!\n");
     return 0;
