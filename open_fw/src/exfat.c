@@ -1,9 +1,18 @@
 /*
- * Smartlink SL6801 OpenFW Standalone MBR + exFAT Reader
+ * Smartlink SL6801 OpenFW Standalone MBR + exFAT Reader & Writer
+ *
+ * Allocation-free Microsoft exFAT reader/writer for microSD:
+ *   - Supports reading contiguous (NoFatChain=1) and FAT-chained files/dirs
+ *   - Supports creating single-level root dirs, creating/appending FAT-chained
+ *     files, patching sector-0 headers (e.g. final RIFF/WAV sizes), updating
+ *     the primary Allocation Bitmap (0x81), NameHash, and 16-bit SetChecksum.
  *
  * SPDX-License-Identifier: MIT
  */
 #include "openfw_fs.h"
+
+#define EXFAT_DOS_TIMESTAMP_DEFAULT 0x5C210000u /* 2026-01-01 00:00:00 */
+#define EXFAT_ATTR_ARCHIVE          0x0020u
 
 static inline uint16_t le16(const uint8_t *p)
 {
@@ -23,6 +32,43 @@ static inline uint64_t le64(const uint8_t *p)
     return (uint64_t)le32(p) | ((uint64_t)le32(p + 4) << 32);
 }
 
+static inline void put_le16(uint8_t *p, uint16_t v)
+{
+    p[0] = (uint8_t)(v & 0xFFu);
+    p[1] = (uint8_t)((v >> 8) & 0xFFu);
+}
+
+static inline void put_le32(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)(v & 0xFFu);
+    p[1] = (uint8_t)((v >> 8) & 0xFFu);
+    p[2] = (uint8_t)((v >> 16) & 0xFFu);
+    p[3] = (uint8_t)((v >> 24) & 0xFFu);
+}
+
+static inline void put_le64(uint8_t *p, uint64_t v)
+{
+    put_le32(p, (uint32_t)(v & 0xFFFFFFFFu));
+    put_le32(p + 4, (uint32_t)(v >> 32));
+}
+
+static void mem_zero(void *dst, uint32_t n)
+{
+    uint8_t *d = (uint8_t *)dst;
+    for (uint32_t i = 0u; i < n; i++) {
+        d[i] = 0u;
+    }
+}
+
+static void mem_copy(void *dst, const void *src, uint32_t n)
+{
+    uint8_t *d = (uint8_t *)dst;
+    const uint8_t *s = (const uint8_t *)src;
+    for (uint32_t i = 0u; i < n; i++) {
+        d[i] = s[i];
+    }
+}
+
 static char ascii_lower(char c)
 {
     if (c >= 'A' && c <= 'Z') {
@@ -39,6 +85,21 @@ static int str_eq_ci_n(const char *a, const char *b, uint32_t b_len)
         }
     }
     return a[b_len] == '\0';
+}
+
+static uint32_t ascii_len_checked(const char *s, uint32_t max_len)
+{
+    if (!s) {
+        return 0u;
+    }
+    uint32_t n = 0u;
+    while (s[n] != '\0') {
+        if ((uint8_t)s[n] >= 0x80u || n >= max_len) {
+            return 0u;
+        }
+        n++;
+    }
+    return n;
 }
 
 static int is_exfat_vbr(const uint8_t sec[512])
@@ -87,6 +148,61 @@ static int next_cluster(const exfat_vol_t *vol, uint32_t cur, uint8_t no_fat_cha
         return 0;
     }
     *out_next = val;
+    return 0;
+}
+
+static int next_bitmap_cluster(const exfat_vol_t *vol, uint32_t cur, uint32_t *out_next)
+{
+    uint32_t nxt = 0u;
+    if (next_cluster(vol, cur, 0u, &nxt) != 0) {
+        return -1;
+    }
+    if (nxt >= 2u && (nxt - 2u) < vol->cluster_count) {
+        *out_next = nxt;
+        return 0;
+    }
+    uint32_t contig = cur + 1u;
+    if ((contig - 2u) < vol->cluster_count) {
+        *out_next = contig;
+        return 0;
+    }
+    *out_next = 0u;
+    return 0;
+}
+
+static int scan_root_bitmap(exfat_vol_t *vol)
+{
+    uint32_t cls = vol->root_dir_cluster;
+    uint8_t sec[512];
+
+    while (cls >= 2u && (cls - 2u) < vol->cluster_count) {
+        uint32_t base_lba = cluster_to_lba(vol, cls);
+        for (uint32_t s = 0u; s < vol->sectors_per_cluster; s++) {
+            if (vol->dev->read_sectors(vol->dev->ctx, base_lba + s, 1u, sec) != 0) {
+                return -1;
+            }
+            for (uint32_t idx = 0u; idx < 16u; idx++) {
+                const uint8_t *d = &sec[idx * 32u];
+                if (d[0] == 0x00u) {
+                    return 0;
+                }
+                if (d[0] == 0x81u && (d[1] & 1u) == 0u) {
+                    uint32_t bmp_cls = le32(d + 20u);
+                    uint64_t bmp_len = le64(d + 24u);
+                    if (bmp_cls >= 2u && (bmp_cls - 2u) < vol->cluster_count) {
+                        vol->bitmap_cluster = bmp_cls;
+                        vol->bitmap_bytes   = (bmp_len > 0xFFFFFFFFu) ? 0xFFFFFFFFu : (uint32_t)bmp_len;
+                        return 0;
+                    }
+                }
+            }
+        }
+        uint32_t nxt = 0u;
+        if (next_cluster(vol, cls, 0u, &nxt) != 0) {
+            return -1;
+        }
+        cls = nxt;
+    }
     return 0;
 }
 
@@ -145,13 +261,21 @@ int exfat_mount(exfat_vol_t *vol, const blkdev_t *dev)
     vol->spc_shift           = spc_shift;
     vol->sectors_per_cluster = 1u << spc_shift;
     vol->cluster_size        = 512u << spc_shift;
+    vol->bitmap_cluster      = 0u;
+    vol->bitmap_bytes        = 0u;
+    vol->alloc_hint          = 0u;
+
+    (void)scan_root_bitmap(vol);
     return 0;
 }
 
-int exfat_list_dir(const exfat_vol_t *vol, uint32_t dir_cluster, uint8_t no_fat_chain,
-                   exfat_dir_cb_t cb, void *user)
+typedef int (*exfat_dir_loc_cb_t)(const exfat_entry_t *entry, uint32_t entry_lba,
+                                  uint8_t entry_slot, void *user);
+
+static int list_dir_with_loc(const exfat_vol_t *vol, uint32_t dir_cluster, uint8_t no_fat_chain,
+                             exfat_dir_cb_t cb, exfat_dir_loc_cb_t loc_cb, void *user)
 {
-    if (!vol || !cb || dir_cluster < 2u) {
+    if (!vol || (!cb && !loc_cb) || dir_cluster < 2u) {
         return -1;
     }
 
@@ -162,6 +286,8 @@ int exfat_list_dir(const exfat_vol_t *vol, uint32_t dir_cluster, uint8_t no_fat_
     uint8_t have_stream  = 0u;
     uint8_t name_len     = 0u;
     uint8_t name_pos     = 0u;
+    uint32_t prim_lba    = 0u;
+    uint8_t  prim_slot   = 0u;
 
     uint32_t cls = dir_cluster;
     uint8_t sec[512];
@@ -169,7 +295,8 @@ int exfat_list_dir(const exfat_vol_t *vol, uint32_t dir_cluster, uint8_t no_fat_
     while (cls >= 2u && (cls - 2u) < vol->cluster_count) {
         uint32_t base_lba = cluster_to_lba(vol, cls);
         for (uint32_t s = 0u; s < vol->sectors_per_cluster; s++) {
-            if (vol->dev->read_sectors(vol->dev->ctx, base_lba + s, 1u, sec) != 0) {
+            uint32_t lba = base_lba + s;
+            if (vol->dev->read_sectors(vol->dev->ctx, lba, 1u, sec) != 0) {
                 return -1;
             }
             for (uint32_t idx = 0u; idx < 16u; idx++) {
@@ -183,13 +310,14 @@ int exfat_list_dir(const exfat_vol_t *vol, uint32_t dir_cluster, uint8_t no_fat_
                     continue;
                 }
                 if (etype == 0x85u) {
-                    /* File Directory Entry */
                     in_set = (d[1] >= 2u) ? 1u : 0u;
                     sec_expected = d[1];
                     sec_seen = 0u;
                     have_stream = 0u;
                     name_len = 0u;
                     name_pos = 0u;
+                    prim_lba = lba;
+                    prim_slot = (uint8_t)idx;
                     cur_ent.file_attr = le16(d + 4u);
                     cur_ent.is_dir    = (uint8_t)((cur_ent.file_attr & EXFAT_ATTR_DIR) != 0u);
                     cur_ent.name[0]   = '\0';
@@ -201,14 +329,12 @@ int exfat_list_dir(const exfat_vol_t *vol, uint32_t dir_cluster, uint8_t no_fat_
 
                 sec_seen++;
                 if (etype == 0xC0u) {
-                    /* Stream Extension Entry */
                     cur_ent.no_fat_chain  = (uint8_t)((d[1] >> 1) & 1u);
                     name_len              = d[3];
                     cur_ent.first_cluster = le32(d + 20u);
                     cur_ent.size          = le64(d + 24u);
                     have_stream           = 1u;
                 } else if (etype == 0xC1u) {
-                    /* File Name Entry (up to 15 UTF-16LE units) */
                     for (uint32_t k = 0u; k < 15u && name_pos < name_len; k++) {
                         uint16_t ch = le16(d + 2u + k * 2u);
                         if (name_pos < (EXFAT_MAX_NAME - 1u)) {
@@ -223,7 +349,8 @@ int exfat_list_dir(const exfat_vol_t *vol, uint32_t dir_cluster, uint8_t no_fat_
                 if (sec_seen >= sec_expected) {
                     in_set = 0u;
                     if (have_stream && cur_ent.name[0] != '\0') {
-                        int stop = cb(&cur_ent, user);
+                        int stop = loc_cb ? loc_cb(&cur_ent, prim_lba, prim_slot, user)
+                                          : cb(&cur_ent, user);
                         if (stop != 0) {
                             return 0;
                         }
@@ -241,25 +368,36 @@ int exfat_list_dir(const exfat_vol_t *vol, uint32_t dir_cluster, uint8_t no_fat_
     return 0;
 }
 
+int exfat_list_dir(const exfat_vol_t *vol, uint32_t dir_cluster, uint8_t no_fat_chain,
+                   exfat_dir_cb_t cb, void *user)
+{
+    return list_dir_with_loc(vol, dir_cluster, no_fat_chain, cb, 0, user);
+}
+
 typedef struct {
     const char   *target;
     uint32_t      target_len;
     exfat_entry_t result;
+    uint32_t      entry_lba;
+    uint8_t       entry_slot;
     int           found;
 } find_ctx_t;
 
-static int find_entry_cb(const exfat_entry_t *entry, void *user)
+static int find_entry_loc_cb(const exfat_entry_t *entry, uint32_t lba, uint8_t slot, void *user)
 {
     find_ctx_t *ctx = (find_ctx_t *)user;
     if (str_eq_ci_n(entry->name, ctx->target, ctx->target_len)) {
-        ctx->result = *entry;
-        ctx->found  = 1;
-        return 1; /* stop iteration */
+        ctx->result     = *entry;
+        ctx->entry_lba  = lba;
+        ctx->entry_slot = slot;
+        ctx->found      = 1;
+        return 1;
     }
     return 0;
 }
 
-int exfat_find_path(const exfat_vol_t *vol, const char *path, exfat_entry_t *out)
+static int find_path_with_loc(const exfat_vol_t *vol, const char *path, exfat_entry_t *out,
+                              uint32_t *out_lba, uint8_t *out_slot)
 {
     if (!vol || !path || !out) {
         return -1;
@@ -274,12 +412,17 @@ int exfat_find_path(const exfat_vol_t *vol, const char *path, exfat_entry_t *out
     cur.no_fat_chain  = 0u;
     cur.is_dir        = 1u;
 
+    uint32_t cur_lba  = 0u;
+    uint8_t  cur_slot = 0u;
+
     const char *p = path;
     while (*p == '/' || *p == '\\') {
         p++;
     }
     if (*p == '\0') {
         *out = cur;
+        if (out_lba)  *out_lba  = 0u;
+        if (out_slot) *out_slot = 0u;
         return 0;
     }
 
@@ -297,11 +440,13 @@ int exfat_find_path(const exfat_vol_t *vol, const char *path, exfat_entry_t *out
         ctx.target     = seg;
         ctx.target_len = seg_len;
         ctx.found      = 0;
-        if (exfat_list_dir(vol, cur.first_cluster, cur.no_fat_chain, find_entry_cb, &ctx) != 0 ||
-            !ctx.found) {
+        if (list_dir_with_loc(vol, cur.first_cluster, cur.no_fat_chain,
+                              0, find_entry_loc_cb, &ctx) != 0 || !ctx.found) {
             return -1;
         }
-        cur = ctx.result;
+        cur      = ctx.result;
+        cur_lba  = ctx.entry_lba;
+        cur_slot = ctx.entry_slot;
 
         p += seg_len;
         while (*p == '/' || *p == '\\') {
@@ -310,7 +455,14 @@ int exfat_find_path(const exfat_vol_t *vol, const char *path, exfat_entry_t *out
     }
 
     *out = cur;
+    if (out_lba)  *out_lba  = cur_lba;
+    if (out_slot) *out_slot = cur_slot;
     return 0;
+}
+
+int exfat_find_path(const exfat_vol_t *vol, const char *path, exfat_entry_t *out)
+{
+    return find_path_with_loc(vol, path, out, 0, 0);
 }
 
 int exfat_read_file(const exfat_vol_t *vol, const exfat_entry_t *file,
@@ -330,7 +482,6 @@ int exfat_read_file(const exfat_vol_t *vol, const exfat_entry_t *file,
     uint32_t want  = (avail < (uint64_t)len) ? (uint32_t)avail : len;
     uint32_t cls   = file->first_cluster;
 
-    /* Walk clusters to reach `offset` (cluster_size is always 512 << spc_shift) */
     uint32_t cls_shift     = 9u + (uint32_t)vol->spc_shift;
     uint64_t skip_clusters = offset >> cls_shift;
     uint32_t in_cls_off    = (uint32_t)(offset & ((uint64_t)vol->cluster_size - 1u));
@@ -371,9 +522,7 @@ int exfat_read_file(const exfat_vol_t *vol, const exfat_entry_t *file,
                 if (vol->dev->read_sectors(vol->dev->ctx, base_lba + s_idx, 1u, sec) != 0) {
                     return -1;
                 }
-                for (uint32_t i = 0u; i < take; i++) {
-                    out[done + i] = sec[s_off + i];
-                }
+                mem_copy(out + done, sec + s_off, take);
             }
             done += take;
             s_idx++;
@@ -392,5 +541,532 @@ int exfat_read_file(const exfat_vol_t *vol, const exfat_entry_t *file,
     if (bytes_read) {
         *bytes_read = done;
     }
+    return 0;
+}
+
+/* ============================================================================
+ * Write Support: Allocation Bitmap, FAT Chain, Checksums, Directory & File I/O
+ * ============================================================================ */
+
+static int fat_set_entry(const exfat_vol_t *vol, uint32_t cluster, uint32_t value)
+{
+    if (cluster < 2u || (cluster - 2u) >= vol->cluster_count) {
+        return -1;
+    }
+    uint32_t fat_sec_off = (cluster * 4u) >> 9;
+    uint32_t fat_in_sec  = (cluster * 4u) & 511u;
+    if (fat_sec_off >= vol->fat_sectors) {
+        return -1;
+    }
+
+    uint8_t sec[512];
+    uint32_t lba = vol->fat_lba + fat_sec_off;
+    if (vol->dev->read_sectors(vol->dev->ctx, lba, 1u, sec) != 0) {
+        return -1;
+    }
+    put_le32(sec + fat_in_sec, value);
+    return vol->dev->write_sectors(vol->dev->ctx, lba, 1u, sec);
+}
+
+static int scan_bitmap_range(exfat_vol_t *vol, uint32_t start_byte, uint32_t end_byte,
+                             uint32_t prev_cluster, uint32_t *out_cluster)
+{
+    uint32_t cls_shift   = 9u + (uint32_t)vol->spc_shift;
+    uint32_t cls_mask    = vol->cluster_size - 1u;
+    uint32_t target_cidx = start_byte >> cls_shift;
+
+    uint32_t bmp_cls = vol->bitmap_cluster;
+    for (uint32_t c = 0u; c < target_cidx; c++) {
+        uint32_t nxt = 0u;
+        if (next_bitmap_cluster(vol, bmp_cls, &nxt) != 0 || nxt == 0u) {
+            return 1; /* Not found / end */
+        }
+        bmp_cls = nxt;
+    }
+
+    uint32_t cur_byte = target_cidx << cls_shift;
+    uint32_t s_start  = (start_byte & cls_mask) >> 9;
+    uint8_t  sec[512];
+
+    while (bmp_cls >= 2u && cur_byte < end_byte) {
+        uint32_t base_lba = cluster_to_lba(vol, bmp_cls);
+        for (uint32_t s = s_start; s < vol->sectors_per_cluster && cur_byte < end_byte; s++) {
+            uint32_t sec_base = cur_byte + (s << 9);
+            if (sec_base >= end_byte) {
+                return 1;
+            }
+            if (vol->dev->read_sectors(vol->dev->ctx, base_lba + s, 1u, sec) != 0) {
+                return -1;
+            }
+            uint32_t b_start = (start_byte > sec_base) ? (start_byte - sec_base) : 0u;
+            uint32_t b_end   = (end_byte - sec_base < 512u) ? (end_byte - sec_base) : 512u;
+            for (uint32_t b = b_start; b < b_end; b++) {
+                if (sec[b] == 0xFFu) {
+                    continue;
+                }
+                for (uint32_t bit = 0u; bit < 8u; bit++) {
+                    if (sec[b] & (1u << bit)) {
+                        continue;
+                    }
+                    uint32_t idx = ((sec_base + b) << 3) + bit;
+                    if (idx >= vol->cluster_count) {
+                        return 1;
+                    }
+                    uint32_t new_c = idx + 2u;
+                    sec[b] |= (uint8_t)(1u << bit);
+                    if (vol->dev->write_sectors(vol->dev->ctx, base_lba + s, 1u, sec) != 0) {
+                        return -1;
+                    }
+                    if (fat_set_entry(vol, new_c, 0xFFFFFFFFu) != 0) {
+                        return -1;
+                    }
+                    if (prev_cluster >= 2u && fat_set_entry(vol, prev_cluster, new_c) != 0) {
+                        return -1;
+                    }
+                    vol->alloc_hint = idx + 1u;
+                    *out_cluster    = new_c;
+                    return 0;
+                }
+            }
+        }
+        s_start  = 0u;
+        cur_byte += vol->cluster_size;
+        uint32_t nxt = 0u;
+        if (next_bitmap_cluster(vol, bmp_cls, &nxt) != 0) {
+            return -1;
+        }
+        bmp_cls = nxt;
+    }
+
+    return 1;
+}
+
+static int alloc_cluster(exfat_vol_t *vol, uint32_t prev_cluster, uint32_t *out_cluster)
+{
+    if (!vol || !vol->dev->write_sectors || vol->bitmap_cluster < 2u || vol->bitmap_bytes == 0u) {
+        return -1;
+    }
+
+    uint32_t limit = (vol->cluster_count + 7u) >> 3;
+    if (vol->bitmap_bytes < limit) {
+        limit = vol->bitmap_bytes;
+    }
+
+    uint32_t hint_byte = vol->alloc_hint >> 3;
+    if (hint_byte >= limit) {
+        hint_byte = 0u;
+    }
+
+    int rc = scan_bitmap_range(vol, hint_byte, limit, prev_cluster, out_cluster);
+    if (rc == 0) {
+        return 0;
+    }
+    if (rc < 0 || hint_byte == 0u) {
+        return -1;
+    }
+    return (scan_bitmap_range(vol, 0u, hint_byte + 1u, prev_cluster, out_cluster) == 0) ? 0 : -1;
+}
+
+static int zero_cluster(const exfat_vol_t *vol, uint32_t cluster)
+{
+    uint8_t zero[512];
+    mem_zero(zero, sizeof(zero));
+    uint32_t base_lba = cluster_to_lba(vol, cluster);
+    for (uint32_t s = 0u; s < vol->sectors_per_cluster; s++) {
+        if (vol->dev->write_sectors(vol->dev->ctx, base_lba + s, 1u, zero) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static uint16_t exfat_name_hash_ascii(const char *name, uint32_t len)
+{
+    uint16_t hash = 0u;
+    for (uint32_t i = 0u; i < len; i++) {
+        uint8_t c = (uint8_t)name[i];
+        if (c >= 'a' && c <= 'z') {
+            c = (uint8_t)(c - ('a' - 'A'));
+        }
+        hash = (uint16_t)(((hash & 1u) ? 0x8000u : 0u) + (hash >> 1) + c);
+        hash = (uint16_t)(((hash & 1u) ? 0x8000u : 0u) + (hash >> 1));
+    }
+    return hash;
+}
+
+static uint16_t exfat_entry_set_checksum(const uint8_t *entries, uint32_t total_ents)
+{
+    uint32_t bytes = total_ents * 32u;
+    uint16_t sum = 0u;
+    for (uint32_t i = 0u; i < bytes; i++) {
+        if (i == 2u || i == 3u) {
+            continue;
+        }
+        sum = (uint16_t)(((sum & 1u) ? 0x8000u : 0u) + (sum >> 1) + entries[i]);
+    }
+    return sum;
+}
+
+static void build_entry_set(uint8_t *dst, uint32_t total_ents, const char *name, uint32_t name_len,
+                            uint16_t file_attr, uint32_t first_cluster, uint64_t data_len)
+{
+    mem_zero(dst, total_ents * 32u);
+
+    /* 0x85 Primary File Directory Entry */
+    uint8_t *f = dst;
+    f[0] = 0x85u;
+    f[1] = (uint8_t)(total_ents - 1u);
+    put_le16(f + 4u, file_attr);
+    put_le32(f + 8u, EXFAT_DOS_TIMESTAMP_DEFAULT);
+    put_le32(f + 12u, EXFAT_DOS_TIMESTAMP_DEFAULT);
+    put_le32(f + 16u, EXFAT_DOS_TIMESTAMP_DEFAULT);
+    f[22] = 0x80u; /* UTC offset valid (+00:00) */
+    f[23] = 0x80u;
+    f[24] = 0x80u;
+
+    /* 0xC0 Stream Extension */
+    uint8_t *s = dst + 32u;
+    s[0] = 0xC0u;
+    s[1] = 0x01u; /* AllocationPossible=1, NoFatChain=0 (FAT-chained) */
+    s[3] = (uint8_t)name_len;
+    put_le16(s + 4u, exfat_name_hash_ascii(name, name_len));
+    put_le64(s + 8u, data_len);
+    put_le32(s + 20u, first_cluster);
+    put_le64(s + 24u, data_len);
+
+    /* 0xC1 File Name entries (15 UTF-16LE chars per slot) */
+    uint32_t pos = 0u;
+    for (uint32_t e = 2u; e < total_ents; e++) {
+        uint8_t *fn = dst + e * 32u;
+        fn[0] = 0xC1u;
+        for (uint32_t k = 0u; k < 15u && pos < name_len; k++, pos++) {
+            put_le16(fn + 2u + k * 2u, (uint8_t)name[pos]);
+        }
+    }
+
+    put_le16(f + 2u, exfat_entry_set_checksum(dst, total_ents));
+}
+
+static int grow_dir_size_in_parent(const exfat_vol_t *vol, uint32_t parent_lba, uint8_t parent_slot)
+{
+    if (parent_lba == 0u || parent_slot >= 15u) {
+        return 0; /* Root dir has no parent entry */
+    }
+    uint8_t sec[512];
+    if (vol->dev->read_sectors(vol->dev->ctx, parent_lba, 1u, sec) != 0) {
+        return -1;
+    }
+    uint8_t *f = &sec[(uint32_t)parent_slot * 32u];
+    uint8_t *s = &sec[((uint32_t)parent_slot + 1u) * 32u];
+    if (f[0] != 0x85u || s[0] != 0xC0u) {
+        return -1;
+    }
+    uint32_t total_ents = (uint32_t)f[1] + 1u;
+    if ((uint32_t)parent_slot + total_ents > 16u) {
+        return -1;
+    }
+    uint64_t new_len = le64(s + 24u) + vol->cluster_size;
+    put_le64(s + 8u, new_len);
+    put_le64(s + 24u, new_len);
+    put_le16(f + 2u, exfat_entry_set_checksum(f, total_ents));
+    return vol->dev->write_sectors(vol->dev->ctx, parent_lba, 1u, sec);
+}
+
+static int dir_alloc_slots(exfat_vol_t *vol, uint32_t dir_cluster, uint8_t dir_no_fat_chain,
+                           uint32_t parent_lba, uint8_t parent_slot, uint8_t total_ents,
+                           uint32_t *out_lba, uint8_t *out_slot)
+{
+    uint32_t cls = dir_cluster;
+    uint8_t  sec[512];
+
+    while (cls >= 2u && (cls - 2u) < vol->cluster_count) {
+        uint32_t base_lba = cluster_to_lba(vol, cls);
+        for (uint32_t s = 0u; s < vol->sectors_per_cluster; s++) {
+            uint32_t lba = base_lba + s;
+            if (vol->dev->read_sectors(vol->dev->ctx, lba, 1u, sec) != 0) {
+                return -1;
+            }
+            uint32_t free_run   = 0u;
+            uint32_t run_start  = 0u;
+            for (uint32_t idx = 0u; idx < 16u; idx++) {
+                uint8_t etype = sec[idx * 32u];
+                if (etype == 0x00u) {
+                    if ((16u - idx) >= total_ents) {
+                        *out_lba  = lba;
+                        *out_slot = (uint8_t)idx;
+                        return 0;
+                    }
+                    /* Pad tail of sector with deleted File markers so scanner continues cleanly */
+                    for (uint32_t k = idx; k < 16u; k++) {
+                        sec[k * 32u] = 0x05u;
+                    }
+                    if (vol->dev->write_sectors(vol->dev->ctx, lba, 1u, sec) != 0) {
+                        return -1;
+                    }
+                    break;
+                }
+                if ((etype & 0x80u) == 0u) {
+                    if (free_run == 0u) {
+                        run_start = idx;
+                    }
+                    free_run++;
+                    if (free_run >= total_ents) {
+                        *out_lba  = lba;
+                        *out_slot = (uint8_t)run_start;
+                        return 0;
+                    }
+                } else {
+                    free_run = 0u;
+                }
+            }
+        }
+
+        uint32_t nxt = 0u;
+        if (next_cluster(vol, cls, dir_no_fat_chain, &nxt) != 0) {
+            return -1;
+        }
+        if (nxt == 0u) {
+            if (dir_no_fat_chain) {
+                return -1; /* Avoid mutating NoFatChain flag on foreign multi-cluster dir */
+            }
+            if (alloc_cluster(vol, cls, &nxt) != 0 || zero_cluster(vol, nxt) != 0) {
+                return -1;
+            }
+            if (grow_dir_size_in_parent(vol, parent_lba, parent_slot) != 0) {
+                return -1;
+            }
+        }
+        cls = nxt;
+    }
+    return -1;
+}
+
+int exfat_mkdir(exfat_vol_t *vol, const char *name)
+{
+    if (!vol || !vol->dev->write_sectors || !name) {
+        return -1;
+    }
+    while (*name == '/' || *name == '\\') {
+        name++;
+    }
+    uint32_t name_len = ascii_len_checked(name, 30u);
+    if (name_len == 0u) {
+        return -1;
+    }
+    for (uint32_t i = 0u; i < name_len; i++) {
+        if (name[i] == '/' || name[i] == '\\') {
+            return -1;
+        }
+    }
+
+    exfat_entry_t existing;
+    if (find_path_with_loc(vol, name, &existing, 0, 0) == 0) {
+        return existing.is_dir ? 0 : -1;
+    }
+
+    uint32_t dir_cls = 0u;
+    if (alloc_cluster(vol, 0u, &dir_cls) != 0 || zero_cluster(vol, dir_cls) != 0) {
+        return -1;
+    }
+
+    uint8_t total_ents = (name_len <= 15u) ? 3u : 4u;
+    uint32_t slot_lba  = 0u;
+    uint8_t  slot_idx  = 0u;
+    if (dir_alloc_slots(vol, vol->root_dir_cluster, 0u, 0u, 0u, total_ents,
+                        &slot_lba, &slot_idx) != 0) {
+        return -1;
+    }
+
+    uint8_t sec[512];
+    if (vol->dev->read_sectors(vol->dev->ctx, slot_lba, 1u, sec) != 0) {
+        return -1;
+    }
+    build_entry_set(&sec[(uint32_t)slot_idx * 32u], total_ents, name, name_len,
+                    EXFAT_ATTR_DIR, dir_cls, vol->cluster_size);
+    return vol->dev->write_sectors(vol->dev->ctx, slot_lba, 1u, sec);
+}
+
+int exfat_create_file(exfat_vol_t *vol, const char *dir_path, const char *filename, exfat_writer_t *out)
+{
+    if (!vol || !vol->dev->write_sectors || !dir_path || !filename || !out) {
+        return -1;
+    }
+    mem_zero(out, sizeof(*out));
+
+    uint32_t name_len = ascii_len_checked(filename, 30u);
+    if (name_len == 0u) {
+        return -1;
+    }
+    for (uint32_t i = 0u; i < name_len; i++) {
+        if (filename[i] == '/' || filename[i] == '\\') {
+            return -1;
+        }
+    }
+
+    exfat_entry_t dir_ent;
+    uint32_t parent_lba  = 0u;
+    uint8_t  parent_slot = 0u;
+    if (find_path_with_loc(vol, dir_path, &dir_ent, &parent_lba, &parent_slot) != 0 || !dir_ent.is_dir) {
+        return -1;
+    }
+
+    /* Fail cleanly if file already exists in target directory */
+    find_ctx_t dup;
+    dup.target     = filename;
+    dup.target_len = name_len;
+    dup.found      = 0;
+    if (list_dir_with_loc(vol, dir_ent.first_cluster, dir_ent.no_fat_chain,
+                          0, find_entry_loc_cb, &dup) != 0 || dup.found) {
+        return -1;
+    }
+
+    uint8_t total_ents = (name_len <= 15u) ? 3u : 4u;
+    uint32_t slot_lba  = 0u;
+    uint8_t  slot_idx  = 0u;
+    if (dir_alloc_slots(vol, dir_ent.first_cluster, dir_ent.no_fat_chain,
+                        parent_lba, parent_slot, total_ents, &slot_lba, &slot_idx) != 0) {
+        return -1;
+    }
+
+    uint8_t sec[512];
+    if (vol->dev->read_sectors(vol->dev->ctx, slot_lba, 1u, sec) != 0) {
+        return -1;
+    }
+    build_entry_set(&sec[(uint32_t)slot_idx * 32u], total_ents, filename, name_len,
+                    EXFAT_ATTR_ARCHIVE, 0u, 0u);
+    if (vol->dev->write_sectors(vol->dev->ctx, slot_lba, 1u, sec) != 0) {
+        return -1;
+    }
+
+    out->vol        = vol;
+    out->dir_lba    = slot_lba;
+    out->dir_slot   = slot_idx;
+    out->total_ents = total_ents;
+    out->active     = 1u;
+    return 0;
+}
+
+static int writer_write_sector(exfat_writer_t *w, const uint8_t *sec_data)
+{
+    if (w->cur_cluster == 0u || w->sec_in_cluster >= w->vol->sectors_per_cluster) {
+        uint32_t new_c = 0u;
+        if (alloc_cluster(w->vol, w->cur_cluster, &new_c) != 0) {
+            return -1;
+        }
+        if (w->first_cluster == 0u) {
+            w->first_cluster = new_c;
+        }
+        w->cur_cluster    = new_c;
+        w->sec_in_cluster = 0u;
+    }
+
+    uint32_t lba = cluster_to_lba(w->vol, w->cur_cluster) + w->sec_in_cluster;
+    if (w->vol->dev->write_sectors(w->vol->dev->ctx, lba, 1u, sec_data) != 0) {
+        return -1;
+    }
+    w->sec_in_cluster++;
+    return 0;
+}
+
+int exfat_write(exfat_writer_t *w, const void *data, uint32_t len)
+{
+    if (!w || !w->active || (!data && len > 0u)) {
+        return -1;
+    }
+    if (len == 0u) {
+        return 0;
+    }
+
+    const uint8_t *src = (const uint8_t *)data;
+    uint32_t rem = len;
+
+    while (rem > 0u) {
+        if (w->sec_buf_used == 0u && rem >= 512u) {
+            if (writer_write_sector(w, src) != 0) {
+                return -1;
+            }
+            src += 512u;
+            rem -= 512u;
+            w->bytes_written += 512u;
+            continue;
+        }
+
+        uint32_t space = 512u - w->sec_buf_used;
+        uint32_t take  = (rem < space) ? rem : space;
+        mem_copy(w->sec_buf + w->sec_buf_used, src, take);
+        w->sec_buf_used  += take;
+        w->bytes_written += take;
+        src              += take;
+        rem              -= take;
+
+        if (w->sec_buf_used == 512u) {
+            if (writer_write_sector(w, w->sec_buf) != 0) {
+                return -1;
+            }
+            w->sec_buf_used = 0u;
+        }
+    }
+    return 0;
+}
+
+int exfat_patch_header(exfat_writer_t *w, const void *hdr, uint32_t len)
+{
+    if (!w || !w->active || !hdr || len > 512u || (uint64_t)len > w->bytes_written) {
+        return -1;
+    }
+    if (len == 0u) {
+        return 0;
+    }
+
+    if (w->first_cluster == 0u) {
+        mem_copy(w->sec_buf, hdr, len);
+        return 0;
+    }
+
+    uint8_t sec[512];
+    uint32_t lba = cluster_to_lba(w->vol, w->first_cluster);
+    if (w->vol->dev->read_sectors(w->vol->dev->ctx, lba, 1u, sec) != 0) {
+        return -1;
+    }
+    mem_copy(sec, hdr, len);
+    return w->vol->dev->write_sectors(w->vol->dev->ctx, lba, 1u, sec);
+}
+
+int exfat_close_file(exfat_writer_t *w)
+{
+    if (!w || !w->active) {
+        return -1;
+    }
+
+    if (w->sec_buf_used > 0u) {
+        mem_zero(w->sec_buf + w->sec_buf_used, 512u - w->sec_buf_used);
+        if (writer_write_sector(w, w->sec_buf) != 0) {
+            return -1;
+        }
+        w->sec_buf_used = 0u;
+    }
+
+    uint8_t sec[512];
+    if (w->vol->dev->read_sectors(w->vol->dev->ctx, w->dir_lba, 1u, sec) != 0) {
+        return -1;
+    }
+
+    uint8_t *f = &sec[(uint32_t)w->dir_slot * 32u];
+    uint8_t *s = &sec[((uint32_t)w->dir_slot + 1u) * 32u];
+    if (f[0] != 0x85u || s[0] != 0xC0u) {
+        return -1;
+    }
+
+    s[1] = 0x01u; /* AllocationPossible=1, NoFatChain=0 */
+    put_le64(s + 8u, w->bytes_written);
+    put_le32(s + 20u, w->first_cluster);
+    put_le64(s + 24u, w->bytes_written);
+    put_le16(f + 2u, exfat_entry_set_checksum(f, w->total_ents));
+
+    if (w->vol->dev->write_sectors(w->vol->dev->ctx, w->dir_lba, 1u, sec) != 0) {
+        return -1;
+    }
+
+    w->active = 0u;
     return 0;
 }

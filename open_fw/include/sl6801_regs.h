@@ -50,6 +50,10 @@ static inline void nvic_clear_pending(uint32_t irq)
     NVIC_ICPR(irq >> 5) = (1u << (irq & 31u));
 }
 
+#define IRQ_BT              26u
+#define IRQ_USB_MC          41u
+#define IRQ_USB_DMA         42u
+#define IRQ_USB_PHY         43u
 #define IRQ_SDIO            44u
 #define DMAC_IRQ_BASE       60u /* CH0..CH7 = NVIC IRQ 60..67 */
 
@@ -89,6 +93,7 @@ static inline void nvic_clear_pending(uint32_t irq)
 /* ============================================================================
  * SYSCTL, SPI NOR XIP (0x30000000), US_TIMER, WDT, CRU
  * ============================================================================ */
+#define SYSCTL_USB_CTRL     REG32(SYSCTL_BASE + 0x00u) /* bit 0 = PHY PWR, bit 6 = USB EN */
 #define SYSCTL_SRAM_WS0     REG32(SYSCTL_BASE + 0x04u)
 #define SYSCTL_SRAM_WS1     REG32(SYSCTL_BASE + 0x08u)
 #define SYSCTL_CPU_ID       REG32(SYSCTL_BASE + 0x0Cu) /* 0 = CPU0, !=0 = CPU1 */
@@ -121,9 +126,12 @@ static inline void nvic_clear_pending(uint32_t irq)
 #define CRU_APLL_CTRL       REG32(CRU_BASE + 0x10u)
 #define CRU_APLL_FRAC       REG32(CRU_BASE + 0x14u)
 #define CRU_PLL0_POSTDIV    REG32(CRU_BASE + 0x30u)
+#define CRU_CLK_SRC_GATE    REG32(CRU_BASE + 0x30u)  /* bit 4 = BT/RF clk, bit 6 = USB 48M tap */
 #define CRU_RST_STAT1       REG32(CRU_BASE + 0x64u)  /* bank 1 reset status/release */
 #define CRU_RST_SET1        REG32(CRU_BASE + 0x74u)  /* bank 1 reset control */
+#define CRU_CLK_EN_USB      REG32(CRU_BASE + 0x84u)  /* bit 0 = USB controller clk 0x12 */
 #define CRU_CLK_EN_AUDIO    REG32(CRU_BASE + 0x88u)  /* bit 0 = audio codec clk 0x13 */
+#define CRU_BT_RF_WRAP      REG32(CRU_BASE + 0xE8u)  /* bit 0 = BT RF wrapper release */
 #define CRU_SARADC_CLK      REG32(CRU_BASE + 0x68u)
 #define CRU_SARADC_RST      REG32(CRU_BASE + 0x78u)
 
@@ -135,7 +143,9 @@ static inline void nvic_clear_pending(uint32_t irq)
 #define CRU_CLK_HCLK        0x04u
 #define CRU_CLK_PCLK        0x05u
 #define CRU_CLK_BUS6        0x06u
+#define CRU_CLK_USB_48M     0x09u
 #define CRU_CLK_SDIO        0x11u
+#define CRU_CLK_USB         0x12u
 #define CRU_CLK_AUDIO       0x13u
 #define CRU_CLK_PWM         0x27u
 #define CRU_CLK_NOR         0x2Bu
@@ -144,6 +154,8 @@ static inline void nvic_clear_pending(uint32_t irq)
 #define CRU_RST_NOR         0x01u
 #define CRU_RST_CODEC_SRAM  0x20u
 #define CRU_RST_DMAC        0x21u
+#define CRU_RST_BT          0x22u
+#define CRU_RST_USB         0x23u
 #define CRU_RST_SDIO        0x24u
 #define CRU_RST_AUDIO       0x25u
 #define CRU_RST_PWM         0x44u
@@ -313,6 +325,41 @@ static inline int gpio_read(uint32_t port, uint32_t pin)
 #define DMAC_CTL_RELOAD       (1u << 29)
 #define DMAC_IRQ_TC           (1u << 0)
 #define DMAC_IRQ_HT           (1u << 1)
+
+/* ============================================================================
+ * Mentor MUSB USB 2.0 OTG Controller (0x40040000) & USB PHY Wrapper
+ * ============================================================================ */
+#define MUSB_FADDR          REG8(MUSB_BASE + 0x00u)
+#define MUSB_POWER          REG8(MUSB_BASE + 0x01u)
+#define MUSB_INTRTX         REG16(MUSB_BASE + 0x02u) /* read-to-clear */
+#define MUSB_INTRRX         REG16(MUSB_BASE + 0x04u) /* read-to-clear */
+#define MUSB_INTRTXE        REG16(MUSB_BASE + 0x06u)
+#define MUSB_INTRRXE        REG16(MUSB_BASE + 0x08u)
+#define MUSB_INTRUSB        REG8(MUSB_BASE + 0x0Au)  /* read-to-clear */
+#define MUSB_INTRUSBE       REG8(MUSB_BASE + 0x0Bu)
+#define MUSB_FRAME          REG16(MUSB_BASE + 0x0Cu)
+#define MUSB_INDEX          REG8(MUSB_BASE + 0x0Eu)
+#define MUSB_TESTMODE       REG8(MUSB_BASE + 0x0Fu)
+#define MUSB_TXMAXP         REG16(MUSB_BASE + 0x10u)
+#define MUSB_CSR0           REG16(MUSB_BASE + 0x12u)
+#define MUSB_TXCSR          REG16(MUSB_BASE + 0x12u)
+#define MUSB_RXMAXP         REG16(MUSB_BASE + 0x14u)
+#define MUSB_RXCSR          REG16(MUSB_BASE + 0x16u)
+#define MUSB_COUNT0         REG16(MUSB_BASE + 0x18u)
+#define MUSB_RXCOUNT        REG16(MUSB_BASE + 0x18u)
+#define MUSB_DEVCTL         REG8(MUSB_BASE + 0x60u)
+#define MUSB_FIFO_ADDR(ep)  (MUSB_BASE + 0x20u + 4u * (uint32_t)(ep))
+
+#define USB_PHY_CTRL        REG32(MUSB_BASE + 0x300u) /* bit 12 = Device mode */
+#define USB_PHY_INTE        REG32(MUSB_BASE + 0x304u) /* bits [1:0] = VBUS/plug IRQ EN */
+
+/* ============================================================================
+ * RivieraWaves RW-BT Baseband Controller (0x40020000)
+ * ============================================================================ */
+#define RWBT_CNTL           REG32(RWBT_BB_BASE + 0x00u)
+#define RWBT_INTSTAT        REG32(RWBT_BB_BASE + 0x10u)
+#define RWBT_INTACK         REG32(RWBT_BB_BASE + 0x18u)
+#define RWBT_TIMING         REG32(RWBT_BB_BASE + 0x80u)
 
 /* ============================================================================
  * IPC Mailbox, Spinlocks & CPU1 Boot Mailbox

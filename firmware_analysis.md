@@ -590,3 +590,20 @@ Verified via Thumb-2 disassembly (`FIRM` and BootROM `0x000000..0x05FFFF`) for c
 * **Audio PLL (`CRU+0x10`/`0x14`):** `CRU_APLL_CTRL = (.. & 0xFC1F0000) | 0x3060` (`int=3`), `CRU_APLL_FRAC = (.. & 0x3800) | 0x80000400 | (0x3126 << 14)`, enable `|= 0xC0000000`, poll bit `28` lock -> **`24.576 MHz`** for the 8/16/32/48 kHz rate family (codec reset `0x25`, clock `0x13`, codec SRAM reset `0x20` + `0x40009400..0x400095FF` zeroing via `0x40000020` bit 2).
 * **16 kHz Mono `AMIC1` Capture:** `PB12`/`PB13` mux=`15`, `CODEC_ANA_CTRL0` core powerup (`0xC0000022`) + `MICBIAS0/1` (`0x03000000`), `CODEC+0x08` differential `AMIC1` (`0x20430000`, gain `[28:24]` `0..31`), `CODEC+0x20` mux `AMIC1` (`0xD` in `[11:8]`), `CODEC+0x200` rate=`3` (`16 kHz`) + run bit 1, `CODEC+0x208` `0x84` (16-bit + RX FIFO DMA request), RX FIFO data port at **`0x4000920C`**.
 * **DMAC (`0x40001000 + ch*0x40`, NVIC IRQ `60 + ch`):** Release CRU reset `0x21`, program `CTL = 0x002A0281` (`SRC_REQ=1` Audio ADC RX fixed 32-bit burst-4 -> `DST_REQ=0` SRAM incrementing 32-bit burst-4), `SRC=0x4000920C`, `XFER_CNT = 0xFF000000 | bytes`, `IRQ_EN = 0x00080001` (`TC_IE`), set `CTL |= (1<<30)` (`CH_EN`), and re-arm the alternate ping-pong buffer in `DMAC_CH1_IRQHandler` (IRQ `61`, vector slot `77`).
+
+---
+
+## 19. Verified Mentor MUSB USB (`0x40040000`) & Mask ROM `RW-BT` HCI (`0x020000..0x0467FF`)
+
+Verified via Thumb-2 disassembly (`FIRM` and BootROM `0x000000..0x05FFFF`) for Layer 4/5 in [open_fw](open_fw/):
+
+### 19.1 Mentor MUSB USB 2.0 OTG Controller (`0x40040000`) & PHY Wrapper (`+0x300`)
+* **Clocks, Reset & Pads:** Uses `PLL0`/`PLL2` `192 MHz` 48 MHz tap (`CRU+0x30 |= (1<<6)`, clk ID `0x09`), CRU reset ID `0x23` (`CRU+0x74`/`0x64` bit 3 + 2 ms delay), USB clk ID `0x12` (`CRU+0x84 |= 1`), `SYSCTL+0x00 |= (1<<0) | (1<<6)`, and `PB22`/`PB23` configured to `mux=15` (Analog DP/DM).
+* **USB PHY Wrapper:** `0x40040304` (`USB_PHY_INTE`) bits `[1:0]` control VBUS/plug IRQ; `0x40040300` (`USB_PHY_CTRL`) bit `12` (`0x1000`) selects Device mode (set + clear `[8, 1:0]` followed by 50 ms delay before connecting).
+* **Controller & Fixed FIFOs:** Standard packed Mentor MUSB HDRC register map (`FADDR` `+0x00`, `POWER` `+0x01` bit `6` = `SOFTCONN`, `INTRTX` `+0x02`, `INTRRX` `+0x04`, `INTRUSB` `+0x0A`, `INDEX` `+0x0E`, `TESTMODE` `+0x0F` bit `5` = `Force_FS`, indexed `TXMAXP`/`CSR0`/`TXCSR`/`RXMAXP`/`RXCSR`/`COUNT` at `+0x10..+0x18`, 32-bit/8-bit FIFOs at `+0x20 + 4*ep`). Endpoint FIFOs are hardwired in silicon (`TXFIFOSZ`/`RXFIFOSZ` are never programmed); EP1 IN (`0x81`) and EP1 OUT (`0x01`) use `MaxPacketSize = 64` for Full-Speed SCSI BOT (`TXCSR=0x0048`, `RXCSR=0x0090`).
+* **NVIC IRQs:** IRQ `41` (`0x29`, vector slot `57`) = USB MC; IRQ `42` (`0x2A`, vector slot `58`) = USB DMA (`+0x200`); IRQ `43` (`0x2B`, vector slot `59`) = USB PHY plug detect.
+
+### 19.2 Mask ROM `RW-BT` Baseband (`0x40020000`) & HCI Interface (`0x020000..0x0467FF`)
+* **Clocks & Baseband RAM:** Uses CRU reset/clk ID `0x22` (`0x40080064`/`0x74` bit 2), `0x40080030` bit 4, and `0x400800E8` bit 0; zeroes all **32 KiB Exchange Memory** at `0x40030000..0x40038000` before `RWBT_CNTL` (`0x40020000 |= 0x20000000`) soft reset. Zero PMU RTWI accesses are required by BT/RF bring-up.
+* **BootROM Reserved SRAM Region:** The `RW-BT` Mask ROM (`0x020000..0x0467FF`) directly accesses BootROM `.data`/`.bss` patch/hook tables across **`0x00800000..0x00804BFF`** (`0x00802904`, `0x00802BB0`, `0x00803BBC`, `0x00803C1C..0x008041E0`, `ke_event_env` `0x008041E4`). Keeping `open_fw` `.ram_boot` at `0x00804C00..0x00805BFF` and SRAM `.data`/`.bss` at `0x0081A380+` preserves this entire region untouched.
+* **Single Interrupt & HCI Transport:** Driven solely by **NVIC IRQ `26`** (`0x1A`, `RWBT_INTSTAT +0x10`, `RWBT_INTACK +0x18`) calling Mask ROM `rwbt_cscnt_isr` (`0x0002F3A4`), `rwbt_rx_isr` (`0x0002F388`), `ke_event_set(1)` (`0x00030DC0`), and main loop scheduler `ke_event_schedule` (`0x00030DB4`). Host transport uses `btc_register_hci_rx_cb` (`0x00D550C1`), `btc_hci_send_cmd` (`0x00817317`), and `btc_hci_send_acl` (`0x00D553C9`).

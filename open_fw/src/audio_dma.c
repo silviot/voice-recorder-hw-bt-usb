@@ -2,8 +2,8 @@
  * Smartlink SL6801 Bare-Metal Audio ADC (AMIC1, 16 kHz / 16-bit) + DMAC CH1 Driver
  *
  * Configures Audio PLL (24.576 MHz), AMIC1 differential PGA on PB12/PB13,
- * 16 kHz mono 16-bit ADC capture, and DMAC Channel 1 (NVIC IRQ 61) ping-pong
- * single-shot transfers for real-time audio telemetry and recording.
+ * 16 kHz mono 16-bit ADC capture, and DMAC Channel 1 (NVIC IRQ 61) into a
+ * 4-slot (512 ms) lock-free ring buffer for glitch-free WAV streaming + VU meter.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -12,14 +12,18 @@
 #include "openfw.h"
 
 #define AUDIO_DMA_CH        1u
+#define AUDIO_RING_SLOTS    4u
 #define AUDIO_FRAME_SAMPLES 2048u /* 128 ms @ 16 kHz mono 16-bit */
 #define AUDIO_FRAME_BYTES   (AUDIO_FRAME_SAMPLES * sizeof(int16_t))
 
-static int16_t g_pcm_buf[2][AUDIO_FRAME_SAMPLES] __attribute__((aligned(4)));
-static volatile uint8_t  g_active_buf = 0u;
-static volatile uint8_t  g_running    = 0u;
-static volatile uint8_t  g_peak_pct   = 0u;
-static volatile uint32_t g_frames     = 0u;
+static int16_t g_pcm_buf[AUDIO_RING_SLOTS][AUDIO_FRAME_SAMPLES] __attribute__((aligned(4)));
+static volatile uint8_t  g_dma_slot = 0u;
+static volatile uint8_t  g_running  = 0u;
+static volatile uint8_t  g_peak_pct = 0u;
+static volatile uint32_t g_frames   = 0u;
+static volatile uint32_t g_wr_idx   = 0u;
+static volatile uint32_t g_rd_idx   = 0u;
+static volatile uint32_t g_overruns = 0u;
 
 static inline void dmac_arm_rx(void *dst_buf, uint32_t len_bytes)
 {
@@ -59,12 +63,21 @@ void DMAC_CH1_IRQHandler(void)
     }
 
     if (st & DMAC_IRQ_TC) {
-        uint8_t done_idx = g_active_buf;
-        uint8_t next_idx = (uint8_t)(done_idx ^ 1u);
-        g_active_buf = next_idx;
-        dmac_arm_rx(g_pcm_buf[next_idx], AUDIO_FRAME_BYTES);
+        uint8_t done_slot = g_dma_slot;
+        uint8_t next_slot = (uint8_t)((done_slot + 1u) & (AUDIO_RING_SLOTS - 1u));
+        g_dma_slot = next_slot;
 
-        g_peak_pct = compute_ac_peak_pct(g_pcm_buf[done_idx], AUDIO_FRAME_SAMPLES);
+        /* Reserve next_slot exclusively for DMAC: keep at most SLOTS-1 queued */
+        if ((g_wr_idx - g_rd_idx) >= (AUDIO_RING_SLOTS - 1u)) {
+            g_rd_idx++;
+            g_overruns++;
+        }
+
+        dmac_arm_rx(g_pcm_buf[next_slot], AUDIO_FRAME_BYTES);
+        __asm__ volatile ("dsb" ::: "memory");
+
+        g_wr_idx++;
+        g_peak_pct = compute_ac_peak_pct(g_pcm_buf[done_slot], AUDIO_FRAME_SAMPLES);
         g_frames++;
     }
 }
@@ -168,9 +181,12 @@ int audio_capture_start(uint8_t gain_0_31)
         return 0;
     }
 
-    g_active_buf = 0u;
-    g_peak_pct   = 0u;
-    g_frames     = 0u;
+    g_dma_slot = 0u;
+    g_peak_pct = 0u;
+    g_frames   = 0u;
+    g_wr_idx   = 0u;
+    g_rd_idx   = 0u;
+    g_overruns = 0u;
 
     audio_amic1_16k_init(gain_0_31);
     dmac_audio_rx_init();
@@ -200,6 +216,33 @@ void audio_capture_stop(void)
     CODEC_ANA_CTRL0       &= ~0x03000000u;
 }
 
+const int16_t *audio_pop_frame(uint32_t *out_bytes)
+{
+    uint32_t primask;
+    __asm__ volatile ("mrs %0, primask" : "=r"(primask));
+    __asm__ volatile ("cpsid i" ::: "memory");
+
+    if (g_rd_idx == g_wr_idx) {
+        if ((primask & 1u) == 0u) {
+            __asm__ volatile ("cpsie i" ::: "memory");
+        }
+        return 0;
+    }
+
+    uint32_t slot = g_rd_idx & (AUDIO_RING_SLOTS - 1u);
+    g_rd_idx++;
+
+    if ((primask & 1u) == 0u) {
+        __asm__ volatile ("cpsie i" ::: "memory");
+    }
+    __asm__ volatile ("dsb" ::: "memory");
+
+    if (out_bytes) {
+        *out_bytes = (uint32_t)AUDIO_FRAME_BYTES;
+    }
+    return g_pcm_buf[slot];
+}
+
 uint8_t audio_get_peak_pct(void)
 {
     return g_peak_pct;
@@ -208,4 +251,9 @@ uint8_t audio_get_peak_pct(void)
 uint32_t audio_get_frames(void)
 {
     return g_frames;
+}
+
+uint32_t audio_get_overruns(void)
+{
+    return g_overruns;
 }

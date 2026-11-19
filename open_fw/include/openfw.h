@@ -93,10 +93,27 @@ int      sd_read_blocks(sd_card_t *card, uint32_t lba, uint32_t count, void *buf
 int      sd_write_blocks(sd_card_t *card, uint32_t lba, uint32_t count, const void *buf);
 blkdev_t sd_as_blkdev(sd_card_t *card);
 
-/* Audio ADC AMIC1 + DMAC CH1 Ping-Pong Capture (audio_dma.c) */
-int      audio_capture_start(uint8_t gain_0_31);
-void     audio_capture_stop(void);
-uint8_t  audio_get_peak_pct(void);
-uint32_t audio_get_frames(void);
+/* Audio ADC AMIC1 + DMAC CH1 4-Frame Ring Capture (audio_dma.c) */
+int            audio_capture_start(uint8_t gain_0_31);
+void           audio_capture_stop(void);
+uint8_t        audio_get_peak_pct(void);
+uint32_t       audio_get_frames(void);
+const int16_t *audio_pop_frame(uint32_t *out_bytes);
+uint32_t       audio_get_overruns(void);
+
+/* Real-Time WAV Recorder (recorder.c) */
+int         recorder_start(exfat_vol_t *vol, int sd_mounted);
+void        recorder_poll(void);
+int         recorder_stop(void);
+int         recorder_is_saving(void);
+uint32_t    recorder_get_seconds(void);
+const char *recorder_get_filename(void);
+
+/* USB Mass Storage Full-Speed MUSB Driver (usb_musb.c) */
+int  usb_msc_start(blkdev_t *dev);
+void usb_msc_stop(void);
+void usb_msc_poll(void);
+int  usb_msc_is_active(void);
+void usb_msc_get_stats(uint32_t *rx_pkts, uint32_t *tx_pkts);
 
 #endif /* OPENFW_H */
