@@ -265,13 +265,18 @@ class XRecRFCOMMClient:
             crc = crc16_ccitt_false(chunk)
             header = f"+XREC:PUT,{offset},{len(chunk)},{crc},OTA:".encode("ascii")
             for attempt in range(3):
-                self.sock.sendall(header + chunk)
-                resp = self._read_line()
-                if resp == f"+XREC:OK,PUT,{offset},{len(chunk)}":
-                    break
+                try:
+                    self.sock.sendall(header + chunk)
+                    resp = self._read_line()
+                    if resp == f"+XREC:OK,PUT,{offset},{len(chunk)}":
+                        break
+                    err_msg = resp
+                except TimeoutError as exc:
+                    err_msg = str(exc)
+                    self.rx_buf.clear()
                 if attempt == 2:
-                    raise RuntimeError(f"OTA PUT failed at offset {offset}: {resp}")
-                print(f"\n  Retry {attempt + 1} at offset {offset}: {resp}")
+                    raise RuntimeError(f"OTA PUT failed at offset {offset}: {err_msg}")
+                print(f"\n  Retry {attempt + 1} at offset {offset}: {err_msg}")
             offset += len(chunk)
             elapsed = max(time.monotonic() - t0, 0.001)
             rate = (offset / 1024.0) / elapsed
