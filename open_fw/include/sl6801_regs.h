@@ -372,10 +372,12 @@ static inline int gpio_read(uint32_t port, uint32_t pin)
 /* ============================================================================
  * RivieraWaves RW-BT Baseband Controller (0x40020000)
  * ============================================================================ */
-#define RWBT_CNTL           REG32(RWBT_BB_BASE + 0x00u)
-#define RWBT_INTSTAT        REG32(RWBT_BB_BASE + 0x10u)
-#define RWBT_INTACK         REG32(RWBT_BB_BASE + 0x18u)
-#define RWBT_TIMING         REG32(RWBT_BB_BASE + 0x80u)
+#define RWBT_REG(off)       REG32(RWBT_BB_BASE + (uint32_t)(off))
+#define RWBT_CNTL           REG32(RWBT_BB_BASE + 0x000u)
+#define RWBT_INTCNTL        REG32(RWBT_BB_BASE + 0x00Cu)
+#define RWBT_INTSTAT        REG32(RWBT_BB_BASE + 0x010u)
+#define RWBT_INTACK         REG32(RWBT_BB_BASE + 0x018u)
+#define RWBT_TIMING         REG32(RWBT_BB_BASE + 0x080u)
 
 /* ============================================================================
  * IPC Mailbox, Spinlocks & CPU1 Boot Mailbox

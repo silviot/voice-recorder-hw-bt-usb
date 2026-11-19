@@ -629,3 +629,20 @@ Verified via Thumb-2 disassembly (`FIRM` and BootROM `0x000000..0x05FFFF`) for L
   * `RTC_DATE` (`0x40085004`): `[4:0]=day (1..31)`, `[11:8]=month (1..12)`, `[22:16]=year - 2000 (0..127)`, `[24]=LEAP_YEAR`.
   * `RTC_TIME` (`0x40085008`): `[5:0]=second`, `[13:8]=minute`, `[20:16]=hour (0..23)`, `[26:24]=weekday (0=Mon..6=Sun)`.
 * **One-Time Clock Enable:** Wait `(int32_t)0x40085090 >= 0`, set `0x40085090[16:12] = 0x18`, dummy read `0x40085094`, `0x400850A8 |= (1<<2)`, `0x400850A0 &= ~(1<<28)`, `0x40085000 &= ~0x110` (`mode=0, HALT=0`). No unlock key or shadow latch is required to read or write `RTC_DATE`/`RTC_TIME`.
+
+---
+
+## 21. Verified RF Calibration Algorithms, Clean-Room `RW-BT` ROM Init & H4 HCI Internals
+
+Verified via Thumb-2 disassembly (`FIRM` and BootROM `0x000000..0x05FFFF`) for Layer 5b in [open_fw](open_fw/):
+
+### 21.1 BR/EDR-Only Silicon Confirmation
+* **No BLE Hardware / Controller:** SL6801 Mask ROM (`0x020000..0x0467FF`) and baseband MMIO (`0x40020000..0x40020190`) implement **Classic Bluetooth BR/EDR (`RW-BT`) only** — no `LE` (`OGF=0x08`, `LLM`, `LLC`) exists in ROM or silicon.
+
+### 21.2 Silicon RF VCO & BPF/LPF Corner Calibration (`0x00D532C0`, `0x00D528A0`, `0x00D53B00`)
+* **86-Channel VCO Band/Cap Cal (`0x00D528A0`):** After `bt_rf_cal_mode_reset()` (`0x00D532C0`), iterates `ch = 0..85` writing synth dividers `n_int = 200 + ch/12` (TX) / `+ 7` (RX) and `n_frac = ((ch % 12) << 21) / 12` to LUT `id 24/25`, triggers AFC (`0x400110BC = 0x1E1D1303`), and latches `cap = REG32(0x400110C4) & 0x7F` (`id 27/29`) and `band = REG32(0x400110CC) >> 12` (`id 26/28`).
+* **3 dB RX BPF/LPF Roll-Off Cal (`0x00D53B00`):** Uses EM TX loopback (`0x40033000` via `0x4001100C`) and 128-sample EM RX capture (`0x40030000` via `0x40011010`), comparing DFT bin 2 (`step=0x0F`) vs bin 12 (`step=0x5F`) across `k = 0..31` on `0x400110A4[28:24]` (`vco_cal_10a4`).
+
+### 21.3 Pure BootROM `RW-BT` Init Sequence & H4 HCI (`0x00803C28`)
+* **`BD_ADDR` & Baseband Init:** `ld_bd_addr_set` (`0x0003BA30`) stores the 6-byte `BD_ADDR` at `0x00802C14..0x00802C19` and computes the 5-byte BCH at `0x00802BEB..0x00802BEF` before `ld_util_cs_init` (`0x0003A42C`) populates EM `CS[0..9]` (`0x400302B0 + idx*0x5C`). Task types `0x3B` (`0x00800608`), `0x39` (`0x008005F8`), `0x38` (`0x00800660`), and `0x3C` (`TASK_HCI`) are registered via `ke_task_create` (`0x0003089C`).
+* **H4 Transport (`hci_tl_env` @ `0x00803C28`):** Classic 3-arg `rwip_eif_api` (`read`/`write`/`flow_on`/`flow_off`); `em_buf_tx_alloc` (`0x000305B8`) returns a direct CPU-accessible EM pointer. `HCI_Reset` (`0x0C03`) emits `0xE07A` via ROM `0x00032E40`; other HCI commands map directly to `TASK_LM` (`0x38`) / `TASK_LC` (`0x39`) `ke_msg` IDs, and ACL TX uses `0xE426` to `TASK_LC`.

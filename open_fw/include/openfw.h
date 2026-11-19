@@ -138,5 +138,6 @@ void usb_msc_get_stats(uint32_t *rx_pkts, uint32_t *tx_pkts);
 uint32_t bt_rf_efuse_trim(void);
 void     bt_rf_init(uint32_t freq_drift, uint32_t vco_cal_10a4);
 void     bt_modem_init(uint32_t clk6_hz);
+uint32_t bt_rf_init_calibrated(uint32_t freq_drift, uint32_t clk6_hz);
 
 #endif /* OPENFW_H */
