@@ -30,8 +30,8 @@ from typing import Dict, List, Optional, Tuple
 
 DEFAULT_NAME_PREFIX = "HW_"
 DEFAULT_KEY_FILE = Path.home() / ".config" / "hw76-sync" / "keys.json"
-CHUNK_SIZE = 480  # 12 B header + 480 B = 492 B <= 512 B negotiated RFCOMM MTU (0x200)
-DEFAULT_BURST_SIZE = 1920  # 4 x 480 B frames per +XREC:GETS burst (safe within K=7 RFCOMM credit window)
+CHUNK_SIZE = 640  # 12 B header + 640 B = 652 B <= 660 B RFCOMM MTU (with bt-rfcomm-turbo; use 480 on stock MTU)
+DEFAULT_BURST_SIZE = 3840  # 6 x 640 B frames per +XREC:GETS burst (~92-96 KB/s, safe within K=7 credits)
 
 
 def load_device_key(key_file: Path, mac: str) -> Optional[bytes]:
@@ -448,8 +448,8 @@ def main() -> None:
     parser.add_argument(
         "--ota-chunk-size",
         type=int,
-        default=440,
-        help="Per-packet +XREC:PUT payload size in bytes (default 440; up to 600 with bt-rfcomm-turbo)",
+        default=560,
+        help="Per-packet +XREC:PUT payload size in bytes (default 560 with bt-rfcomm-turbo; use 440 on stock MTU)",
     )
     args = parser.parse_args()
 

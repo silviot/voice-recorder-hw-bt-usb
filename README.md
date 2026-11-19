@@ -254,9 +254,9 @@ python3 tools/bt_companion.py --mode record-stream --duration 30 --dest ~/Record
 
 ---
 
-## 9. Custom XIP Extension: Bluetooth File Transfer, Casual-User Security & Wireless OTA
+## 9. Custom XIP Extension: Bluetooth File Transfer, Security, Custom Art & Wireless OTA
 
-Using the unused SPI NOR XIP flash region at `0x00D74000` (flash `0x174000`), [`fw_mod/bt_filesync.c`](fw_mod/bt_filesync.c) + [`tools/patch_firmware.py`](tools/patch_firmware.py) + [`tools/bt_sync.py`](tools/bt_sync.py) add a complete, authenticated `+XREC:` protocol over Classic Bluetooth RFCOMM Channel 1 (alongside standard HFP):
+Using the unused SPI NOR XIP flash region at `0x00D74000` (flash `0x174000`), [`fw_mod/bt_filesync.c`](fw_mod/bt_filesync.c) + [`tools/patch_firmware.py`](tools/patch_firmware.py) + [`tools/bt_sync.py`](tools/bt_sync.py) add a complete, authenticated `+XREC:` protocol over Classic Bluetooth RFCOMM Channel 1. The full wire specification and test vectors for mobile clients (e.g. Android) are in **[docs/XREC_PROTOCOL.md](docs/XREC_PROTOCOL.md)**.
 
 ### Firmware Patches (`tools/patch_firmware.py`)
 | Patch | Hook / Address | What It Does |
@@ -266,36 +266,32 @@ Using the unused SPI NOR XIP flash region at `0x00D74000` (flash `0x174000`), [`
 | `bt-autoboot` | `0x0FBD8A` → `0xD74010` | Auto-enables Bluetooth strictly *after* the `"welcome"` splash dismisses. |
 | `bt-invisible-boot` | `0x15D47A` | Boots connectable-only (`Page Scan` ON, `Inquiry Scan` OFF) so paired phones reconnect instantly while nearby scans cannot discover `HW_76`. |
 | `bt-pair-menu` | `0x0FFA56` → `0xD74020` | Opening the recorder's **Bluetooth** menu opens a 60-second physical-presence pairing window, temporarily enables discoverability, and renders a yellow **`PIN: XXXXXX`** banner on the LCD via LVGL. |
-| `--xip-payload` | `0x1625E2` → `0xD74000` | Installs [`fw_mod/bt_filesync.c`](fw_mod/bt_filesync.c) (`+XREC:` handler: `PING`, `CHAL`, `PAIR`, `AUTH`, `LS`, `GET`, `GETS`, `DEL`, `RTC`, `RECSTART`, `RECSTOP`, `STAT`, `PUT`, `OTA`, `REBOOT`) + idle/screen timer keep-alive. |
+| `bt-rfcomm-turbo` | `0x1641B8`, `0x16429A`, `0x163DB2..0x163F72` | Raises RFCOMM DLCI MTU from `512 B` → **`660 B`** and shortens credit-refill delay `100 ms` → **`5 ms`** (verified **92–96 KB/s** downloads, **28–31 KB/s** wireless OTA). |
+| `bt-spp-uuid` | `0x0DAE11`, `0x0DAE33` | Advertises **Serial Port Profile (`0x1101` v1.2)** instead of Handsfree (`0x111E`) on RFCOMM Ch 1 so Android `HeadsetService` and Linux PipeWire never hijack phone calls or contend for Ch 1. |
+| `--xip-payload` | `0x1625E2` → `0xD74000` | Installs [`fw_mod/bt_filesync.c`](fw_mod/bt_filesync.c) (`+XREC:` handler: `PING`, `CHAL`, `PAIR`, `AUTH`, `LS`, `GET`, `GETS`, `DEL`, `RTC`, `RECSTART`, `RECSTOP`, `STAT`, `PUT`, `OTA`, `REBOOT`) with silent background polling. |
 
 ### Casual-User Security Model (v5)
 * **Same generic firmware for every device** — no per-user compiled secrets or config files.
 * **Locked by default:** Every privileged command (`LS`, `GET`, `DEL`, `RTC`, `RECSTART`, `STAT`, `PUT`, `OTA`, `REBOOT`) returns `+XREC:ERR,LOCKED` until the client completes a per-connection **HMAC-SHA256** challenge-response (`+XREC:CHAL` → `+XREC:AUTH`).
 * **Physical-Presence 6-Digit PIN Binding:** Opening the **Bluetooth** menu on the recorder displays a random 6-digit PIN on the LCD for 60 seconds (max 5 attempts) and enables Bluetooth discoverability. The app sends `+XREC:PAIR,<PIN>,<64-hex-key>`; the recorder verifies the PIN in constant time, persists the 256-bit key in `PSMP` NVRAM (`"xrec_key"`, survives reboots and future wireless OTAs), closes the pairing window, and turns discoverability back OFF.
 
+### Custom Artwork (`tools/assets.py`) & Clean-Room C SDK (`fw_mod/sl6801_sdk.h`)
+* [`tools/assets.py`](tools/assets.py) extracts all 20 embedded LVGL v8.3 images (`WELCOME` `0x00C55CB8`, `Bluetooth`, `Files`, `Music`, `Record`, `Settings`, equalizer frames) to PNG + a labeled contact sheet, and replaces any image in-place from a PNG (e.g. [`assets/cassini_welcome_80x40.png`](assets/cassini_welcome_80x40.png)).
+* [`fw_mod/sl6801_sdk.h`](fw_mod/sl6801_sdk.h) + [`fw_mod/custom_ui.c`](fw_mod/custom_ui.c) provide a clean-room Thumb-2 C SDK for writing custom LVGL v8.3 screens and XIP extensions.
+
 ### Build, Pair, Sync & Wireless OTA
 ```bash
-# 1. Compile the Thumb-2 XIP extension (zero .data/.bss)
-clang --target=thumbv7em-none-eabi -mcpu=cortex-m4 -mfloat-abi=soft -mthumb -Os \
-  -ffreestanding -fno-builtin -fno-stack-protector -c fw_mod/bt_filesync.c -o /tmp/bt_filesync.o
-ld.lld -T fw_mod/xip.ld /tmp/bt_filesync.o -o /tmp/bt_filesync.elf
-llvm-objcopy -O binary /tmp/bt_filesync.elf /tmp/bt_filesync.bin
+# 1. One-command build (compiles XIP payload, applies custom splash + all 7 patches, verifies CRCs)
+make -C fw_mod all firmware
 
-# 2. Patch your local dump and generate both a 2 MB flash image and a 0:\update.up OTA package
-python3 tools/patch_firmware.py dumps/firmware_2M.bin \
-  --out-bin dumps/firmware_2M_v5.bin --out-update-up dumps/update_v5.up \
-  --patch sdio-end-of-disk --patch wav-blockalign \
-  --patch bt-autoboot --patch bt-invisible-boot --patch bt-pair-menu \
-  --xip-payload /tmp/bt_filesync.bin --bump-timestamp --verify
-
-# 3. One-time pairing (open Bluetooth menu on recorder to see the 6-digit LCD PIN)
+# 2. One-time pairing (open Bluetooth menu on recorder to see the 6-digit LCD PIN)
 python3 tools/bt_sync.py --mac XX:XX:XX:XX:XX:76 --pair 123456
 
-# 4. Everyday automatic sync, telemetry, RTC sync, remote recording, or wireless OTA
+# 3. Everyday automatic sync (~92-96 KB/s), telemetry, RTC sync, or wireless OTA (~30 KB/s)
 python3 tools/bt_sync.py --mac XX:XX:XX:XX:XX:76 --stat
 python3 tools/bt_sync.py --mac XX:XX:XX:XX:XX:76 --rtc-sync
 python3 tools/bt_sync.py --mac XX:XX:XX:XX:XX:76 --dest ~/Recordings/HW_76
-python3 tools/bt_sync.py --mac XX:XX:XX:XX:XX:76 --ota dumps/update_v5.up
+python3 tools/bt_sync.py --mac XX:XX:XX:XX:XX:76 --ota dumps/update_custom.up
 ```
 
 ---
