@@ -461,9 +461,10 @@ Verified against `dumps/sdcard_backup/DBROOT/{db_wave.db,db_content.db}` and `FI
 * **`bt_info` (PSMP key `12`, 1 B, SRAM `0x0081BA04`):** Stores BT power/connection state (`0` = Off, `1` = On/Disconnected, `2` = Connected), **not** music/phone mode. Both power-off (`0x00CEEB08`) and USB `Charge & Transfer` (`0x00CFB7FC`) call `bt_close_stack()` (`0x00D66E3C`), whose `stack_close` callback (`0x00CF5F60`) writes `bt_info = 0` — causing `pstr_bt_nv_read` (`0x00CF0EA0`) to skip `bt_open_stack()` on the next boot.
 * **`profile` (PSMP key `9`, 4 B, SRAM `0x0081B80C`):** Stores **`music mode` (`0x0200`) vs `phone mode` (`0x0400`)**, loaded at boot by `bt_subsystem_init` (`0x00CEA0F8`, defaults to `0x400` `phone mode` and persists across reboots).
 * **USB Charging (`Charge & Play`):** VBUS plug-in does **not** close Bluetooth; selecting `Charge & Play` (`pstr_select_usb_mode(2)` at `0x00CFB7C8`) or letting the USB prompt time out keeps Bluetooth 100% active while charging.
-* **Verified Boot Patches (in [tools/patch_firmware.py](tools/patch_firmware.py)):**
-  * **`--patch bt-autoboot`** (`0x00CF0EC6` / flash `0x0F0EC6`, 2 B): `0b b1` (`cbz r3, 0xcf0ecc`) → `00 bf` (`nop`) — calls `bt_open_stack()` unconditionally at boot.
-  * **`--patch bt-force-phone`** (`0x00CEA132` / flash `0x0EA132`, 2 B): `28 bb` (`cbnz r0, 0xcea180`) → `25 e0` (`b 0xcea180`) — forces `phone mode` (`0x400`) on every boot.
+* **Verified Boot & Security Patches (in [tools/patch_firmware.py](tools/patch_firmware.py)):**
+  * **`--patch bt-autoboot`** (`0x00CFBD8A` / flash `0x0FBD8A`, 4 B): `1f f0 a3 ff` (`bl soft_timer_reset("pstr")`) → `78 f0 41 f9` (`bl 0x00D74010` `bt_autoboot_post_welcome`) — calls `bt_open_stack()` strictly *after* `ViewTask` dismisses the `"welcome"` splash screen. *(Note: patching `0x00CF0EC6` fires before `pstr_start_view()` and hangs on `"welcome"`, and `0x400` in `0x00CEA132` forces Music/A2DP mode rather than Phone/HFP mode.)*
+  * **`--patch bt-invisible-boot`** (`0x00D5D47A` / flash `0x15D47A`, 4 B): `40 f2 01 13` → `40 f2 01 03` (`page_en=1, inq_en=0`) — boots connectable-only so paired phones reconnect immediately while nearby scans cannot discover `HW_76`.
+  * **`--patch bt-pair-menu`** (`0x00CFFA56` / flash `0x0FFA56`, 4 B): `03 f0 85 f9` (`bl page_bt_menu_create`) → `74 f0 e3 fa` (`bl 0x00D74020` `bt_pair_menu_hook`) — opens a 60-second physical-presence pairing window, enables discoverability via `USER_EVT_SET_DISCOVERABLE (0x8004)`, and renders a yellow `PIN: XXXXXX` LVGL banner on the Bluetooth menu LCD.
 
 ### 12.2 RFCOMM MTU & Credit-Based Flow Control (`0x00D620E6..0x00D645C4`)
 * **TX Ceilings:** `dlci->mtu` is negotiated to **`512` bytes** (`0x200` at `0x00D6429A`), RFCOMM UIH stack buffer (`0x00D633A8`) is `1024` B, L2CAP MTU (`0x00D5EB80`) is `672` B (`0x2A0`), and HCI ACL non-segmenting cap (`0x00D553DE`) is `674` B (`0x2A2`). Up to **`496` bytes** of payload + 12 B `+XREC` header (`508 <= 512` B) is safe per `hfp_rfcomm_send` call.
@@ -475,3 +476,96 @@ Verified against `dumps/sdcard_backup/DBROOT/{db_wave.db,db_content.db}` and `FI
 * **Media Status & Timer:** `media_get_status()` (`0x00D1AB1C`, atomic `ldrb` from `0x0081C718`: `0x10`=`BTREADY`, `0x21`=`RECORDPLAY`, `0x22`=`RECORDPAUSE`); `pstr_audio_get_rec_time()` (`0x00CF04DC`).
 * **Live Battery / PMU State (`0x00821222`, lock-free SRAM):** `+0x01` `charge_status` (`0`=discharging, `1`=charging, `2`=full), `+0x02` `vbus_status`, `+0x03` `percent` (`0..100`, getter `0x00D1BA2C`), `+0x08` (`0x0082122A`) `u16 voltage_mv`.
 * **SD Free Space:** `f_getfree("0:", &free_clst, &fs)` (`0x00D4BCBC`); `FATFS` has `u16 csize` at `+0x0A` and `u32 n_fatent` at `+0x20`.
+
+
+---
+
+## 13. Complete SoC Peripheral MMIO Map (`0x40000000..0x400FFFFF`)
+
+Scanning all literal-pool loads and `MOVT` instructions across `bootrom_384K.bin`, Stage-1 Bootloader, and `FIRM` reveals **32 distinct 4 KB MMIO blocks** (and zero peripherals in `0x40100000..0x5FFFFFFF`):
+
+| Base Address | Peripheral Block | Key Registers & Notes |
+| :--- | :--- | :--- |
+| `0x40000000` | **SYSCTL / Core ID & Remap** | `+0x0C` = `CPU_ID` (`0`=CPU0, `!=0`=CPU1); `+0x60` = CPU1 ready flag (`0x8`) |
+| `0x40001000` | **DMA Controller (DMAC)** | `0xD509AE` (rst `0x21`): multi-channel DMAC, `0x40`-byte channel stride |
+| `0x40003000` | **SDIO / SDMMC Controller** | `0x4CEFC` (ROM), `0x8225BC` (Stage-1), `HAL_sd_disk_init` |
+| `0x40009000` | **Audio Codec (ADC/DAC/ANC/PGA)** | `+0x00` MICBIAS `[25:24]`, `+0x08` AMIC1 PGA `[28:24]`, `+0x0C` AMIC2 PGA `[14:8]`, `+0x20` ADC mux |
+| `0x4000A000` | **BootROM Debug/Download Slave I/F** | BootROM `0x4C9D0..0x4CB80`, `0x4D358..0x4D414`: ROM RAM-load/checksum/jump loop |
+| `0x40010000` | **RF Baseband / Modem Ctrl** | `0x4336C` (ROM), `0xD52714` (`RF DRIVER VERSION V0_9`) |
+| `0x40011000` | **RF Analog / PHY Registers** | `0xD52736+` (`RF DRIVER VERSION V0_9`) |
+| `0x40020000` | **BT Baseband / Link Controller** | RivieraWaves `RW-BT` BR/EDR-only LC/BB |
+| `0x40027000` | **BT Controller / HCI / Sync Ctrl** | Serviced by `task btc` (p9) & `bt_isr_bh` (p19) |
+| `0x40030000`–`0x40038000` | **BT Exchange Memory & BB Tables** | `0x40030000`, `0x40031000`, `0x40033000`, `0x40036000`, `0x40038000` |
+| `0x40040000` | **USB 2.0 OTG Controller (MUSB)** | Mentor MUSB (`bootrom 0x4CD8+`, `.ramtext`, XIP) |
+| `0x40070000` | **IPC Mailbox & PMU RTWI Bus** | `+0x24`/`+0x2C` Master/Slave IRQ status (W1C), `+0x40 + ch*0x20` 2-word FIFOs |
+| `0x40080000` | **CRU (Clock, PLL & Reset Unit)** | `HAL_rst_release` (`0x2564`), `HAL_clk_enable` (`0x27A0`/`0x8051EC`) |
+| `0x40081000` | **GPIO & Pinmux Controller** | Ports A/B/C/D at `0x40081000 / 0x40081040 / 0x40081080 / 0x400810C0` |
+| `0x40082100` | **64-bit System Counter (`us_timer`)** | BootROM `0xB6D8` (`+0x04` lo / `+0x08` hi), used by `udelay`/`mdelay` |
+| `0x40083000` | **Watchdog Timer (WDT)** | BootROM `0xB7A4..0xB80E`: feed key `0x28000001` @ `+0x10`, timeout `+0x14`, ctrl `+0x18/+0x1C` |
+| `0x40084000` | **PWM Controller (6 channels)** | `0xD514A6`: `/dev/pwm_ch0..5` (`+0x20 + ch*0x20`) |
+| `0x40085000` | **AON / RTC Controller** | Date `+0x04`, Time `+0x08`, Alarm0 `+0x10/+0x18`, Alarm1 `+0x20/+0x24`, AON wake/poweroff `+0x60/+0xA4/+0xAC/+0xD8` |
+| `0x40090000` | **UART0 (Debug Console)** | IRQ `16`, 24 MHz clk, 115200 bps, TX = `PD0` (`rom_printf @ 0x2B0`) |
+| `0x40091000` | **UART1** | IRQ `17` (`PD6`/`PD5`) |
+| `0x40092000` | **UART2 (CLI Shell)** | IRQ `18` (`PB22`/`PB23`), 115200 bps (`cli` task `0xD3FAFD`) |
+| `0x40095000` | **SPI Controller (LCD SPI)** | `0xD5114E` (rst `0x5C`, clk `0x3F`): drives `/dev/lcd` via DMAC `0x40001000` |
+| `0x40096000` | **SPI / QSPI / Peripheral Ctrl** | BootROM `0x33E0..0x33F6`, `0x3742` |
+| `0x40099000` | **eFuse / OTP Controller** | `0xCE8C68`: words at `+0x20 + 4*idx` (PMU trim reg `0x11`) |
+| `0x4009B000` | **General-Purpose Timers** | `0xD518D8`: `/dev/timer` |
+| `0x400A0010` | **Hardware Spinlock (IPC Mutex)** | `0x805996`/`0x8059AC`: 16-byte stride (`0x400A0010 + id*16`; poll until `0`, write `0` to unlock) |
+| `0x400D0000` | **ASRC (Audio Sample Rate Conv)** | `0x814004`, `0xD4CD68` |
+| `0x400D1000` | **Audio DSP / Hardware Filter** | `0x814784` (`+0x10/+0x14/+0x18`) |
+
+* **Hardware Crypto / TRNG:** None — no hardware TRNG, AES, or SHA peripheral exists in `0x40000000..0x5FFFFFFF`. All crypto in BootROM is software-only (AES S-box `0x04D4C0`, SHA-256 IV/K `0x00DD98..0x00DDB8`).
+
+---
+
+## 14. Bluetooth Radio Silicon (`RW-BT` BR/EDR-Only), SPP & RFCOMM Tuning
+
+* **No BLE in Silicon or Mask ROM:** The SL6801 Bluetooth controller is **strictly BR/EDR-only** (`RW-BT`, BT 4.0, `HCI_Version = 0x06`, ACL max `1021` B 3-DH5 × 9 buffers). The HCI command table (`0x00C44422..0x00C445EE`) has **0 opcodes in `OGF=0x08` (LE Controller)**, `HCI_Read_Local_Supported_Commands` (`0x1002`) zeroes octets 25–28, ROM `ke_msg_handler` has only BR/EDR tasks (`TASK_LM/LC/HCI`), and there is no `RW-BLE` register block. *(Quirk: LMP page 0 features at `0x00802C04` leave bits 38/49 set from the RivieraWaves template despite no BLE hardware.)*
+* **No Compiled SPP (`0x1101`) Profile:** Only HFP (`0x111E`) registers an RFCOMM server (`0x00D6320C`). Although CLI `"spp"` wrappers (`0x00CEBF00`, `bt_serial_port_send_data` `0x00D67070`) exist, the BT host layer jump table (`0x00D66BE0`) routes Layer `5` (SPP) to `unknown layer` (`0x00D66C24`).
+* **RFCOMM Throughput Tuning Patch Sites:**
+  * **Negotiated DLCI MTU:** `0x00D641B8` (outgoing) and `0x00D6429A` (server): `4f f4 00 73` (`512` B) → `40 f2 94 23` (**`660` B**, safely inside `672` B L2CAP MTU and `1036` B RFCOMM stack buffer).
+  * **Credit Refill Timer (RX/OTA bottleneck):** `0x00D63DDA` & `0x00D63F72`: `64 20` (**100 ms**) → `05 20` (**5 ms**); threshold `0x00D63DB2`/`0x00D63F4A` `07 2b` (`<=7`) → `10 2b` (`<=16`); batch `0x00D63DBA`/`0x00D63F52` `10 22` (`16`) → `20 22` (`32`). *(Do **not** patch PN `K=7` at `0x00D63744`/`0x00D63762` — RFCOMM PN `K` is a 3-bit field.)*
+
+---
+
+## 15. CPU1 Architecture (`ViewTask` / LVGL), Physical Inputs, LCD & PMU Wake
+
+### 15.1 What Actually Runs on CPU1
+* **No separate binary is loaded into `0x30000000`:** `0x00CE73A8` writes `{ 0x00CE7371 (trampoline), 0x0081B7B4 (4 KB stack), 0x0080DA4F (worker loop) }` into `0x30000600..0x30000608` and releases CPU1 reset.
+* **Sole CPU1 workload:** **`ViewTask`** (`0x00CE9A09`, `core_id=1`, `task_id=3`) running **LVGL v8.3**, its two 6.4 KB RGB565 LCD strip buffers (`0x0081E00E`, `0x0081F90E`), and `/dev/pwm_ch3` backlight control. All Bluetooth, Audio/Media, FatFs, and System tasks run on **CPU0** under FreeRTOS, communicating with CPU1 via the 8-byte hardware mailbox (`0x40070000`) + hardware spinlock (`0x400A0010`).
+
+### 15.2 Physical Buttons, Hardware Boot Strap, LCD & Debug UART
+* **Buttons:** 6 buttons on SARADC 12-bit resistor ladder `/dev/kadc_ch1` (`0x20` Prev `256..336`, `0x22` Next `656..848`, `0x24` Vol+ `1280..1424`, `0x23` Vol- `2176`, `0x36` Back/Menu `2560`, `0x48` Enter/Play `2704..2960`), dedicated **Record slide switch** on GPIO **`PB6`** (`/dev/key_io`: `0`=`0x34` Rec ON, `1`=`0x49` Rec OFF/Save), and Power on `/dev/key_onoff` (`0x37`).
+* **USB ISP Boot Key (`301a:2800`):** Stage-0 BootROM (`0x4C95E`, `0x4C18C`) checks **`PD0 == 0`** and **`PB23 == 0`** for 500 consecutive polls before entering USB MSC ISP (`0x4D2B6`).
+* **Display (`/dev/lcd`):** `FIRM` drives **`ST7735S`** (`0xD39D80`, **`80 × 160`** active window inside `128 × 160` controller RAM, `MADCTL=0xC8`, RGB565, `INVON`, reset **`PB10`**, SPI `0x40095000` + DMAC `0x40001000`). Backlight is `/dev/pwm_ch3` (`0x00D16561(0..100)`).
+* **Debug UART & CLI:** `rom_printf` (`0x2B0`) outputs on **`UART0` (`0x40090000`, `PD0` TX, 115200 bps)**; interactive CLI shell runs on **`UART2` (`0x40092000`, `PB22`/`PB23`, 115200 bps)**.
+* **PMU Wake & Dual Hardware RTC Alarms:** `/dev/pmu` `ioctl` `5`=Soft Power-Off, `6`=Reboot, `7`=Deep Sleep (`WFI`). Wake sources: ONOFF key, USB VBUS, Record switch (`PB6`), and **AON RTC `Alarm0` / `Alarm1`** (`HAL_rtc_set_alarm @ 0x00CE88E1`, `0x40085000+0x10..+0x24`).
+
+---
+
+## 16. Audio Front-End (`AMIC1`/`AMIC2`), Codecs & Dynamic `+XREC` Control
+
+* **Dual-Mic Analog Front-End (`0x40009000`):** `/dev/audio1` enables both differential **`AMIC1`** (PGA `0x40009008[28:24]`, `0..31`, ioctl `0x31`) and **`AMIC2`** (PGA `0x4000900C[14:8]`, `0..127`, ioctl `0x32`). Live PGA gain can be changed mid-recording via `HAL_audio_ioctl(1, 0x31/0x32, gain)` (`0x00D3C187`).
+* **Empirical WAV Observation:** Real recorded `.wav` files have bit-identical Left & Right channels (`max|L-R| == 0`) because the DSP/denoise pipeline (`codec.admomini` / `aenc`) outputs a single mono stream duplicated into stereo PCM.
+* **Encoders vs Decoders (`0x00D14AE0..0x00D14CF8`):** File recording is **uncompressed PCM WAV only** (`writer.wav @ 0xCECF9D`, captured at 16 kHz / 16-bit and resampled for `1536`/`3072` kbps; no MP3/Opus/IMA-ADPCM encoder is compiled in, while `mp3/wav/aac/m4a/wma/ape/ogg/flac` are decoders). Runtime recording settings live in RAM at **`0x0081B9C8`** (`+0x00` `kbps_mode`, `+0x01` `vad_en`, `+0x02` `vad_level`, `+0x03` `seg_time`, `+0x04` `monitor_en`, `+0x14` `denoise_en`), persistable via `pstr_audio_record_nv_write()` (`0x00CF0965`).
+
+---
+
+## 17. Complete 512 KB SRAM Map (`0x00800000..0x0087FFFF`) & FreeRTOS Task Table
+
+| Address Range | Size | Owner / Contents |
+| :--- | :---: | :--- |
+| `0x00800000..0x008006B3` | 1.7 KB | BootROM `.data` (from ROM `0x0005B800`) |
+| `0x00800800..0x008047FF` | 16 KB | BootROM `.bss` (`heap_4` metadata, USB MSC state `0x800DE8..0x801068`) |
+| `0x00804800..0x0080CC3F` | 33.1 KB | `FIRM` Vectors & Early Fast RAM Code (`Reset_Handler` `0x804C41`, `main` `0x805200`) |
+| `0x0080CC40..0x0081A37F` | 53.8 KB | `FIRM` `.ramtext` + `.data` (mailbox, CPU1 loop, USB MSC, SDIO, `bt_isr_bh`) |
+| `0x0081A380..0x00821C07` | 30.1 KB | `FIRM` `.bss` (CPU1 stack `0x81A7B4..0x81B7B4`, LCD strip bufs `0x81E00E`/`0x81F90E`) |
+| `0x00821C08..0x0086A807` | **291 KB** | FreeRTOS `heap_4` Heap (`pvPortMalloc` `0x00CE901C`) |
+| `0x0086A808..0x0086AC07` | 1 KB | CPU0 Initial MSP Stack (`SP = 0x0086AC08`) |
+| `0x0086AC08..0x0086FFFF` | **~21 KB** | **Unused SRAM Gap** (zero refs in ROM/FIRM; `+XREC` v5 runtime state uses `0x0086B000`) |
+| `0x00870000..0x00875FFF` | **24 KB** | OAL / `libc` Secondary Heap (`oal_malloc` `0x00D3BBC8`, ctrl `0x0081CCB0`) |
+| `0x00876000..0x0087FFFF` | **40 KB** | LVGL v8.3 TLSF Heap (`lv_mem_init` `0x00D2DD98`, pool `0x0081CB34`) |
+
+* **19 Active Tasks:** 9 OAL tasks (`MainTask` p1, `TransmitTask` p4, `ViewTask` **[CPU1]** p0, `bt_host_task` p3, `Master_CPU_Recv_Task` p4, `MediaTask` p3, `MgrTask` p3, `DbsTask` p1, `PreTask` p3) + 10 direct FreeRTOS tasks on CPU0 (`_dev_service_task_` p3, `pmu_isr_bh` p3, `crab_monitor` p3, dynamic audio engine, `cli` p3 on `/dev/uart2`, `call save process` p1, `bt_isr_bh` **p19**, `task btc` **p9**, `_tf_write` p3, `build index` p1).
+* **15 POSIX `/dev/*` Nodes Registered at Boot (`0x00D39040`):** `/dev/uart2`, `/dev/pmu`, `/dev/timer`, `/dev/audio0`, `/dev/audio1`, `/dev/sd`, `/dev/lcd`, `/dev/usbd`, `/dev/rtc`, `/dev/wdog`, `/dev/pwm_ch3`, `/dev/exti`, `/dev/kadc_ch1`, `/dev/key_onoff`, `/dev/key_io`.
