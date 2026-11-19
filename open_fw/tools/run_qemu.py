@@ -6,10 +6,12 @@ Boots open_fw inside anton-veretenenko/smartlink-sl6801-emulator, lets Cortex-M4
 run past startup + LCD + SDIO/exFAT init into the main loop, connects over a
 pure-Python GDB RSP client (no arm-none-eabi-gdb required), and verifies:
   1. CPU PC is executing inside open_fw (not stuck in Default_Handler/fault).
-  2. g_systick_ms > 0 (SysTick 1 kHz IRQ firing on NVIC).
+  2. g_systick_ms > 0 and continues advancing across a 0.4s resume window.
   3. g_openfw_log SRAM ring contains valid 'OFLG' magic & Cassini OpenFW banner.
   4. g_sd_card / g_sd_mounted status over SL6801 SDIO (0x40003000) + exFAT.
   5. ST7735S RGB565 framebuffer (0x50000000, x=26..105) is non-blank & saved to PNG.
+  6. Unless --skip-keys is set, boots a second short QEMU pass with kadc-raw-ch1=2850
+     (KEY_ENTER) + sd-image and verifies transition into USB MSC mode (g_usb_active == 1).
 
 SPDX-License-Identifier: MIT
 """
@@ -23,9 +25,11 @@ import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 import zlib
 from pathlib import Path
+from typing import Callable, TypeVar
 
 
 DEFAULT_QEMU = "/tmp/sl6801-emu/work/build/qemu-system-arm"
@@ -37,6 +41,8 @@ LCD_W = 80
 LCD_H = 160
 FB_ADDR = 0x50000000
 LOG_MAGIC = 0x474C464F  # 'OFLG' LE
+
+T = TypeVar("T")
 
 
 def read_elf32_symbols(elf_path: Path) -> dict[str, tuple[int, int]]:
@@ -92,6 +98,7 @@ def write_png_rgb(path: Path, width: int, height: int, rgb_bytes: bytes) -> None
         + chunk(b"IDAT", zlib.compress(bytes(raw_rows), 6))
         + chunk(b"IEND", b"")
     )
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(png)
 
 
@@ -168,10 +175,15 @@ class GdbRspClient:
             cur += chunk_len
         return bytes(out)
 
+    def read_u32(self, addr: int) -> int:
+        return struct.unpack("<I", self.read_mem(addr, 4))[0]
+
+    def read_i32(self, addr: int) -> int:
+        return struct.unpack("<i", self.read_mem(addr, 4))[0]
+
     def continue_for(self, seconds: float) -> str:
         csum = sum(b"c") & 0xFF
         self.sock.sendall(f"$c#{csum:02x}".encode("ascii"))
-        # Consume initial '+' ack if it arrives promptly, then run for `seconds`.
         time.sleep(seconds)
         return self.send_interrupt()
 
@@ -191,6 +203,86 @@ def prepare_sd_image(img_path: Path, size_mb: int = 8) -> None:
     subprocess.run([mkfs, "-q", "-b", "4096", "-c", "4096", str(img_path)], check=True)
 
 
+def build_machine_arg(
+    qemu_rom: Path, stub: Path, flash: Path, sd_img: Path, kadc_ch1: int
+) -> str:
+    return (
+        f"smartlink-sl6801,"
+        f"rom={qemu_rom},"
+        f"rom-stub={stub},"
+        f"flash={flash},"
+        f"sd-image={sd_img},"
+        f"viewtask-local=off,"
+        f"high-rom-hle=off,"
+        f"boot-decision=6,"
+        f"kadc-raw-ch1={kadc_ch1},"
+        f"pmu-battery-code=90"
+    )
+
+
+def run_qemu_session(
+    qemu_bin: Path, machine: str, fn: Callable[[GdbRspClient], T]
+) -> tuple[T, str]:
+    """Launch QEMU headless with GDB stub, run `fn(client)`, and return `(result, stderr)`."""
+    port = free_tcp_port()
+    cmd = [
+        str(qemu_bin),
+        "-M", machine,
+        "-display", "none",
+        "-serial", "none",
+        "-gdb", f"tcp:127.0.0.1:{port}",
+        "-S",
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        client: GdbRspClient | None = None
+        deadline = time.monotonic() + 8.0
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                err = proc.stderr.read().decode("utf-8", "replace") if proc.stderr else ""
+                raise RuntimeError(f"QEMU exited early (rc={proc.returncode}):\n{err}")
+            try:
+                client = GdbRspClient("127.0.0.1", port, timeout=10.0)
+                break
+            except OSError:
+                time.sleep(0.05)
+        if client is None:
+            raise TimeoutError("Timed out connecting to QEMU GDB stub")
+
+        try:
+            result = fn(client)
+        except (OSError, EOFError, RuntimeError) as exc:
+            err = ""
+            if proc.poll() is not None and proc.stderr:
+                err = proc.stderr.read().decode("utf-8", "replace")
+            else:
+                proc.terminate()
+                try:
+                    _, eb = proc.communicate(timeout=2.0)
+                    err = eb.decode("utf-8", "replace")
+                except Exception:
+                    pass
+            raise RuntimeError(f"GDB RSP communication failed: {exc}\nQEMU stderr:\n{err}") from exc
+        finally:
+            client.close()
+
+        proc.terminate()
+        try:
+            _, stderr_bytes = proc.communicate(timeout=3.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            _, stderr_bytes = proc.communicate(timeout=3.0)
+        return result, stderr_bytes.decode("utf-8", "replace")
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
+def is_in_fault(pc: int, default_handler: int) -> bool:
+    return abs(pc - default_handler) <= 8
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Boot & verify Cassini OpenFW in QEMU SL6801")
     ap.add_argument("--qemu", default=os.environ.get("QEMU_SL6801", DEFAULT_QEMU))
@@ -199,6 +291,8 @@ def main() -> int:
     ap.add_argument("--rom", type=Path, default=Path("../dumps/bootrom_384K.bin"))
     ap.add_argument("--flash", type=Path, default=Path("../dumps/firmware_2M_openfw.bin"))
     ap.add_argument("--boot-seconds", type=float, default=2.0)
+    ap.add_argument("--keys-seconds", type=float, default=1.2)
+    ap.add_argument("--skip-keys", action="store_true", help="Skip KEY_ENTER -> USB MSC check")
     ap.add_argument("--png-out", type=Path, default=BUILD_DIR / "qemu_lcd.png")
     args = ap.parse_args()
 
@@ -212,70 +306,34 @@ def main() -> int:
             return 1
 
     syms = read_elf32_symbols(args.elf)
-    for req_sym in ("g_systick_ms", "g_openfw_log", "g_sd_card", "g_sd_mounted", "Default_Handler"):
+    req_syms = ["g_systick_ms", "g_openfw_log", "g_sd_card", "g_sd_mounted", "Default_Handler"]
+    if not args.skip_keys:
+        req_syms.append("g_usb_active")
+    for req_sym in req_syms:
         if req_sym not in syms:
             print(f"ERROR: Symbol {req_sym} missing from {args.elf}", file=sys.stderr)
             return 1
 
-    # QEMU's smartlink_sl6801.c limits mask ROM load_image_targphys() to 0x5C000 bytes.
-    qemu_rom = BUILD_DIR / "qemu_rom_368k.bin"
-    qemu_rom.write_bytes(args.rom.read_bytes()[:SL6801_ROM_SIZE])
+    default_handler = syms["Default_Handler"][0]
+    systick_addr = syms["g_systick_ms"][0]
+    log_addr = syms["g_openfw_log"][0]
 
-    sd_img = BUILD_DIR / "qemu_sd.img"
-    prepare_sd_image(sd_img, size_mb=8)
+    with tempfile.TemporaryDirectory(prefix="sl6801_qemu_") as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        # QEMU's smartlink_sl6801.c limits mask ROM load_image_targphys() to 0x5C000 bytes.
+        qemu_rom = tmp_path / "qemu_rom_368k.bin"
+        qemu_rom.write_bytes(args.rom.read_bytes()[:SL6801_ROM_SIZE])
 
-    port = free_tcp_port()
-    machine = (
-        f"smartlink-sl6801,"
-        f"rom={qemu_rom},"
-        f"rom-stub={args.stub},"
-        f"flash={args.flash},"
-        f"sd-image={sd_img},"
-        f"viewtask-local=off,"
-        f"high-rom-hle=off,"
-        f"boot-decision=6,"
-        f"kadc-raw-ch1=4095,"
-        f"pmu-battery-code=90"
-    )
-    cmd = [
-        str(qemu_bin),
-        "-M", machine,
-        "-display", "none",
-        "-serial", "none",
-        "-gdb", f"tcp:127.0.0.1:{port}",
-        "-S",
-    ]
+        sd_img = tmp_path / "qemu_sd.img"
+        prepare_sd_image(sd_img, size_mb=8)
 
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    try:
-        # Wait briefly for GDB RSP server socket to start listening
-        client = None
-        deadline = time.monotonic() + 8.0
-        while time.monotonic() < deadline:
-            if proc.poll() is not None:
-                err = proc.stderr.read().decode("utf-8", "replace")
-                raise RuntimeError(f"QEMU exited early (rc={proc.returncode}):\n{err}")
-            try:
-                client = GdbRspClient("127.0.0.1", port, timeout=10.0)
-                break
-            except OSError:
-                time.sleep(0.05)
-        if client is None:
-            raise TimeoutError("Timed out connecting to QEMU GDB stub")
-
-        try:
+        def inspect_boot(client: GdbRspClient):
             _ = client.continue_for(args.boot_seconds)
+            systick_1 = client.read_u32(systick_addr)
+            _ = client.continue_for(0.4)
+            systick_2 = client.read_u32(systick_addr)
+
             regs = client.read_regs()
-            sp, lr, pc = regs[13], regs[14], regs[15]
-            xpsr = regs[16] if len(regs) > 16 else 0
-
-            default_handler = syms["Default_Handler"][0]
-            in_fault = abs(pc - default_handler) <= 8
-
-            systick_addr = syms["g_systick_ms"][0]
-            systick_ms = struct.unpack("<I", client.read_mem(systick_addr, 4))[0]
-
-            log_addr = syms["g_openfw_log"][0]
             log_hdr = client.read_mem(log_addr, 16)
             log_magic, log_size, log_widx, log_drop = struct.unpack("<4I", log_hdr)
             log_text = ""
@@ -287,94 +345,129 @@ def main() -> int:
             sd_card_raw = client.read_mem(syms["g_sd_card"][0], 16)
             sd_init_ok, sd_sdhc, sd_rca, sd_sectors = struct.unpack("<iiII", sd_card_raw)
             sd_rca &= 0xFFFF
-            sd_mounted = struct.unpack("<i", client.read_mem(syms["g_sd_mounted"][0], 4))[0]
-
+            sd_mounted = client.read_i32(syms["g_sd_mounted"][0])
             fb_raw = client.read_mem(FB_ADDR, LCD_STRIDE * LCD_H * 2)
-        except (OSError, EOFError, RuntimeError) as exc:
-            err = ""
-            if proc.poll() is not None and proc.stderr:
-                err = proc.stderr.read().decode("utf-8", "replace")
-            else:
-                proc.terminate()
-                try:
-                    _, eb = proc.communicate(timeout=2.0)
-                    err = eb.decode("utf-8", "replace")
-                except Exception:
-                    pass
-            print(f"ERROR: GDB RSP communication failed: {exc}\nQEMU stderr:\n{err}", file=sys.stderr)
-            return 1
-        finally:
-            client.close()
+            return (
+                regs, systick_1, systick_2,
+                log_magic, log_size, log_widx, log_drop, log_text,
+                sd_init_ok, sd_sdhc, sd_rca, sd_sectors, sd_mounted, fb_raw,
+            )
 
-        proc.terminate()
         try:
-            _, stderr_bytes = proc.communicate(timeout=3.0)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            _, stderr_bytes = proc.communicate(timeout=3.0)
-    finally:
-        if proc.poll() is None:
-            proc.kill()
-            proc.wait()
+            boot_machine = build_machine_arg(qemu_rom, args.stub, args.flash, sd_img, kadc_ch1=4095)
+            boot_res, uart_stderr = run_qemu_session(qemu_bin, boot_machine, inspect_boot)
+        except (RuntimeError, TimeoutError) as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
 
-    uart_stderr = stderr_bytes.decode("utf-8", "replace")
+        (
+            regs, systick_1, systick_2,
+            log_magic, log_size, log_widx, log_drop, log_text,
+            sd_init_ok, sd_sdhc, sd_rca, sd_sectors, sd_mounted, fb_raw,
+        ) = boot_res
+        sp, lr, pc = regs[13], regs[14], regs[15]
+        xpsr = regs[16] if len(regs) > 16 else 0
 
-    # Convert active 80x160 pane (x=26..105, y=0..159) to RGB24 PNG
-    rgb = bytearray(LCD_W * LCD_H * 3)
-    unique_colors: set[int] = set()
-    nonblack = 0
-    for y in range(LCD_H):
-        for x in range(LCD_W):
-            px, = struct.unpack_from("<H", fb_raw, (y * LCD_STRIDE + (LCD_X_OFF + x)) * 2)
-            unique_colors.add(px)
-            if px != 0:
-                nonblack += 1
-            r = ((px >> 11) & 0x1F) << 3
-            g = ((px >> 5) & 0x3F) << 2
-            b = (px & 0x1F) << 3
-            idx = (y * LCD_W + x) * 3
-            rgb[idx : idx + 3] = bytes((r, g, b))
-    write_png_rgb(args.png_out, LCD_W, LCD_H, bytes(rgb))
+        # Convert active 80x160 pane (x=26..105, y=0..159) to RGB24 PNG
+        rgb = bytearray(LCD_W * LCD_H * 3)
+        unique_colors: set[int] = set()
+        nonblack = 0
+        for y in range(LCD_H):
+            for x in range(LCD_W):
+                px, = struct.unpack_from("<H", fb_raw, (y * LCD_STRIDE + (LCD_X_OFF + x)) * 2)
+                unique_colors.add(px)
+                if px != 0:
+                    nonblack += 1
+                r = ((px >> 11) & 0x1F) << 3
+                g = ((px >> 5) & 0x3F) << 2
+                b = (px & 0x1F) << 3
+                idx = (y * LCD_W + x) * 3
+                rgb[idx : idx + 3] = bytes((r, g, b))
+        write_png_rgb(args.png_out, LCD_W, LCD_H, bytes(rgb))
 
-    print(f"CPU state: PC=0x{pc:08x} SP=0x{sp:08x} LR=0x{lr:08x} xPSR=0x{xpsr:08x}")
-    print(f"SysTick:   g_systick_ms={systick_ms}")
-    print(
-        f"Log ring:  magic=0x{log_magic:08x} size={log_size} "
-        f"write_idx={log_widx} dropped={log_drop}"
-    )
-    if log_text:
-        for line in log_text.strip().splitlines():
-            print(f"  [SRAM] {line}")
-    if "Cassini OpenFW" in uart_stderr:
-        for line in uart_stderr.strip().splitlines():
-            if "Cassini OpenFW" in line or "CPU=" in line or "SD:" in line or "Switching PD0" in line:
-                print(f"  [UART0] {line}")
-    print(
-        f"SDIO/FS:   sd_init={sd_init_ok} sdhc={sd_sdhc} rca=0x{sd_rca:04x} "
-        f"sectors={sd_sectors} mounted={sd_mounted}"
-    )
-    print(
-        f"LCD FB:    {LCD_W}x{LCD_H} @ 0x{FB_ADDR:08x}: nonblack={nonblack}/{LCD_W * LCD_H} "
-        f"unique_colors={len(unique_colors)} -> {args.png_out}"
-    )
-
-    failures = []
-    if in_fault:
-        failures.append(f"CPU trapped near Default_Handler (PC=0x{pc:08x})")
-    if pc < 0x00804C00:
-        failures.append(f"PC=0x{pc:08x} did not reach SRAM/XIP open_fw space")
-    if systick_ms == 0:
-        failures.append("g_systick_ms remained 0")
-    if log_magic != LOG_MAGIC or "Cassini OpenFW" not in log_text:
-        failures.append("g_openfw_log did not record Cassini OpenFW boot banner")
-    if "Switching PD0" not in log_text:
-        failures.append("open_fw did not reach main loop banner")
-    if sd_init_ok != 1 or sd_mounted != 1:
-        failures.append(f"SD/exFAT mount failed in QEMU (sd_init={sd_init_ok}, mounted={sd_mounted})")
-    if nonblack < 400 or len(unique_colors) < 6:
-        failures.append(
-            f"LCD framebuffer appears blank or corrupted (nonblack={nonblack}, colors={len(unique_colors)})"
+        print(f"CPU state: PC=0x{pc:08x} SP=0x{sp:08x} LR=0x{lr:08x} xPSR=0x{xpsr:08x}")
+        print(
+            f"SysTick:   g_systick_ms={systick_1} -> {systick_2} "
+            f"(+{systick_2 - systick_1} ms over 0.4s)"
         )
+        print(
+            f"Log ring:  magic=0x{log_magic:08x} size={log_size} "
+            f"write_idx={log_widx} dropped={log_drop}"
+        )
+        if log_text:
+            for line in log_text.strip().splitlines():
+                print(f"  [SRAM] {line}")
+        if "Cassini OpenFW" in uart_stderr:
+            for line in uart_stderr.strip().splitlines():
+                if "Cassini OpenFW" in line or "CPU=" in line or "SD:" in line or "Switching PD0" in line:
+                    print(f"  [UART0] {line}")
+        print(
+            f"SDIO/FS:   sd_init={sd_init_ok} sdhc={sd_sdhc} rca=0x{sd_rca:04x} "
+            f"sectors={sd_sectors} mounted={sd_mounted}"
+        )
+        print(
+            f"LCD FB:    {LCD_W}x{LCD_H} @ 0x{FB_ADDR:08x}: nonblack={nonblack}/{LCD_W * LCD_H} "
+            f"unique_colors={len(unique_colors)} -> {args.png_out}"
+        )
+
+        failures = []
+        if is_in_fault(pc, default_handler):
+            failures.append(f"CPU trapped near Default_Handler (PC=0x{pc:08x})")
+        if pc < 0x00804C00:
+            failures.append(f"PC=0x{pc:08x} did not reach SRAM/XIP open_fw space")
+        if systick_1 == 0:
+            failures.append("g_systick_ms remained 0")
+        if systick_2 <= systick_1:
+            failures.append(
+                f"g_systick_ms did not advance across 0.4s resume ({systick_1} -> {systick_2})"
+            )
+        if log_magic != LOG_MAGIC or "Cassini OpenFW" not in log_text:
+            failures.append("g_openfw_log did not record Cassini OpenFW boot banner")
+        if "Switching PD0" not in log_text:
+            failures.append("open_fw did not reach main loop banner")
+        if sd_init_ok != 1 or sd_mounted != 1:
+            failures.append(f"SD/exFAT mount failed in QEMU (sd_init={sd_init_ok}, mounted={sd_mounted})")
+        if nonblack < 400 or len(unique_colors) < 6:
+            failures.append(
+                f"LCD framebuffer appears blank or corrupted (nonblack={nonblack}, colors={len(unique_colors)})"
+            )
+
+        if not args.skip_keys:
+            usb_active_addr = syms["g_usb_active"][0]
+
+            def inspect_key_enter(client: GdbRspClient):
+                _ = client.continue_for(args.keys_seconds)
+                for _ in range(4):
+                    k_regs = client.read_regs()
+                    k_pc = k_regs[15]
+                    k_systick = client.read_u32(systick_addr)
+                    usb_active = client.read_i32(usb_active_addr)
+                    if is_in_fault(k_pc, default_handler) or usb_active == 1:
+                        return k_pc, k_systick, usb_active
+                    _ = client.continue_for(0.4)
+                k_regs = client.read_regs()
+                return k_regs[15], client.read_u32(systick_addr), client.read_i32(usb_active_addr)
+
+            try:
+                keys_machine = build_machine_arg(qemu_rom, args.stub, args.flash, sd_img, kadc_ch1=2850)
+                (k_pc, k_systick, usb_active), _ = run_qemu_session(qemu_bin, keys_machine, inspect_key_enter)
+            except (RuntimeError, TimeoutError) as exc:
+                failures.append(f"KEY_ENTER QEMU check failed: {exc}")
+            else:
+                print(
+                    f"Key check: PC=0x{k_pc:08x} g_systick_ms={k_systick} "
+                    f"g_usb_active={usb_active}"
+                )
+                if is_in_fault(k_pc, default_handler):
+                    failures.append(f"KEY_ENTER check trapped near Default_Handler (PC=0x{k_pc:08x})")
+                if k_pc < 0x00804C00:
+                    failures.append(f"KEY_ENTER check PC=0x{k_pc:08x} did not reach open_fw space")
+                if k_systick == 0:
+                    failures.append("KEY_ENTER check g_systick_ms remained 0")
+                if usb_active != 1:
+                    failures.append(f"KEY_ENTER did not activate USB MSC (g_usb_active={usb_active})")
+                else:
+                    print("[KEY_ENTER -> USB MSC ACTIVE]")
 
     if failures:
         for msg in failures:

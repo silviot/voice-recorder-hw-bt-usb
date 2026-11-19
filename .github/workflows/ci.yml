@@ -1,0 +1,30 @@
+name: Cassini OpenFW CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install toolchain and host test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang lld llvm exfatprogs python3 python3-pil
+
+      - name: Run OpenFW host unit and MMIO driver tests
+        run: make -C open_fw test-host
+
+      - name: Build Cassini OpenFW ARM firmware
+        run: make -C open_fw
+
+      - name: Run Python host tool self-tests
+        run: |
+          python3 tools/flash_ranges.py --self-test
+          python3 tools/openfw_usb.py --self-test
+          python3 tools/usb_rtc_sync.py --dry-run
