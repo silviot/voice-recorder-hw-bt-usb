@@ -5,8 +5,8 @@ USB Auto-Sync & Recording Importer for Smartlink SL6801 (HW_76) Voice Recorders.
 Automatically detects when the voice recorder's exFAT volume is mounted (or
 watches for udev block/mount events with `--watch`), copies any new `.wav` /
 `.mp3` recordings from `record/` into a local destination directory, verifies
-SHA-256 integrity, and maintains a local `.sync_manifest.json` so already-synced
-recordings are not re-copied.
+SHA-256 integrity, and skips files that already exist locally with the same
+filename and byte size (stateless, rsync-style).
 
 SPDX-License-Identifier: MIT
 """
@@ -91,14 +91,6 @@ def sync_recordings(
         return []
 
     dest_dir.mkdir(parents=True, exist_ok=True)
-    manifest_path = dest_dir / ".sync_manifest.json"
-    manifest: Dict[str, dict] = {}
-    if manifest_path.is_file():
-        try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except Exception:
-            manifest = {}
-
     synced_files: List[Path] = []
     audio_files = sorted(
         p for p in record_dir.iterdir()
@@ -107,11 +99,9 @@ def sync_recordings(
 
     for src in audio_files:
         stat = src.stat()
-        key = src.name
-        cached = manifest.get(key)
         dst = dest_dir / src.name
 
-        if cached and cached.get("size") == stat.st_size and dst.is_file():
+        if dst.is_file() and dst.stat().st_size == stat.st_size:
             continue
 
         print(f"Syncing {src.name} ({stat.st_size:,} bytes)...")
@@ -124,15 +114,6 @@ def sync_recordings(
             raise RuntimeError(f"Checksum mismatch while copying {src.name}")
 
         tmp_dst.replace(dst)
-        manifest[key] = {
-            "filename": src.name,
-            "size": stat.st_size,
-            "sha256": dst_hash,
-            "mtime": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
-            "synced_at": datetime.now(tz=timezone.utc).isoformat(),
-            "source_type": "phone_call_bt" if "-phone" in src.name.lower() else "mic_recorder",
-        }
-        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
         synced_files.append(dst)
         print(f"  -> Saved to {dst} (SHA-256: {dst_hash[:16]}...)")
 

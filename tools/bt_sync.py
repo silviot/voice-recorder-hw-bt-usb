@@ -7,8 +7,8 @@ Connects to `HW_76` on RFCOMM Channel 1, completes the SL6801 HFP Service Level
 Connection (`SLC_OPEN`), and then uses the custom `+XREC:` commands to:
   - Ping the extension (`+XREC:PING`)
   - List all recordings in `0:\record` with exact sizes (`+XREC:LS`)
-  - Download recordings as bit-exact binary chunks with CRC-16 verification (`+XREC:GET`)
-  - Track synced files in `.sync_manifest.json` so already-synced files are skipped.
+  - Download recordings as bit-exact binary chunks with CRC-16 verification (`+XREC:GET` / `+XREC:GETS`)
+  - Skip files that already exist locally with the same filename and byte size (stateless, rsync-style).
 
 SPDX-License-Identifier: MIT
 """
@@ -317,7 +317,7 @@ def main() -> None:
         "--burst-size",
         type=int,
         default=DEFAULT_BURST_SIZE,
-        help="Multi-packet +XREC:GETS burst size in bytes (0 to use single-chunk +XREC:GET; default 4096)",
+        help=f"Multi-packet +XREC:GETS burst size in bytes (0 to use single-chunk +XREC:GET; default {DEFAULT_BURST_SIZE})",
     )
     args = parser.parse_args()
 
@@ -373,30 +373,14 @@ def main() -> None:
             return
 
         args.dest.mkdir(parents=True, exist_ok=True)
-        manifest_path = args.dest / ".sync_manifest.json"
-        manifest: Dict[str, dict] = {}
-        if manifest_path.is_file():
-            try:
-                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            except Exception:
-                manifest = {}
-
         synced = 0
         for name, sz in files:
             dst = args.dest / name
-            cached = manifest.get(name)
-            if cached and cached.get("size") == sz and dst.is_file():
-                print(f"Skipping already synced: {name}")
+            if dst.is_file() and dst.stat().st_size == sz:
+                print(f"Skipping already synced: {name} ({sz:,} bytes)")
                 continue
             digest = client.download_file(name, sz, dst, burst_size=args.burst_size)
-            manifest[name] = {
-                "filename": name,
-                "size": sz,
-                "sha256": digest,
-                "synced_at": datetime.now(tz=timezone.utc).isoformat(),
-                "transport": "bluetooth_rfcomm_xrec",
-            }
-            manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+            print(f"  -> Saved {dst} (SHA-256: {digest[:16]}...)")
             synced += 1
         print(f"Bluetooth sync complete ({synced} new file(s) downloaded to {args.dest}).")
     finally:

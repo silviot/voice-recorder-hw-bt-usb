@@ -217,7 +217,7 @@ python3 tools/inspect_fw.py dumps/firmware_2M.bin
 ## 8. Integration Tools: USB Auto-Sync & Bluetooth Companion (`tools/`)
 
 ### 1. USB Auto-Sync (`tools/usb_sync.py`)
-Automatically detects when the `HW_76` (`301a:2801`) exFAT volume is connected (and auto-mounts it via `udisksctl` if not yet mounted), imports new `.wav` / `.mp3` recordings from `record/`, verifies SHA-256 checksums, classifies whether each recording is a microphone recording (`20YYMMDD-HHMMSS-120min.wav`) or a Bluetooth phone call recording (`20YYMMDD-HHMMSS-phone.wav`), and tracks synced files in `.sync_manifest.json`.
+Automatically detects when the `HW_76` (`301a:2801`) exFAT volume is connected (and auto-mounts it via `udisksctl` if not yet mounted), imports new `.wav` / `.mp3` recordings from `record/` with SHA-256 verification, and skips files already present locally with the same filename and size (stateless, `rsync`-style).
 
 ```bash
 # One-shot sync of all new recordings to ~/Recordings/HW_76
