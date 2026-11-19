@@ -28,6 +28,7 @@ from typing import Dict, List, Optional, Tuple
 
 DEFAULT_NAME_PREFIX = "HW_"
 CHUNK_SIZE = 240  # <= 256 bytes per RFCOMM packet for reliable flow control
+DEFAULT_BURST_SIZE = 4096  # multi-packet +XREC:GETS burst size (clamped to 16384 in firmware)
 
 
 def crc16_ccitt_false(data: bytes, init: int = 0xFFFF) -> int:
@@ -68,9 +69,10 @@ class XRecRFCOMMClient:
         self.sock.connect((self.mac, self.channel))
 
         def send_ag(lines: List[str]) -> None:
-            payload = ("\r\n" + "\r\n".join(lines) + "\r\n").encode("ascii")
             assert self.sock is not None
-            self.sock.sendall(payload)
+            for line in lines:
+                self.sock.sendall(f"\r\n{line}\r\n".encode("ascii"))
+                time.sleep(0.05)
 
         # Complete HFP Service Level Connection until SLC_OPEN (after AT+CMER)
         buf = ""
@@ -153,16 +155,34 @@ class XRecRFCOMMClient:
                     files.append((parts[2], int(parts[1])))
         return files
 
-    def get_chunk(self, filename: str, offset: int, length: int = CHUNK_SIZE) -> bytes:
-        self._send_cmd(f"+XREC:GET,{offset},{length},{filename}")
+    def delete_file(self, filename: str) -> None:
+        self._send_cmd(f"+XREC:DEL,{filename}")
+        line = self._read_line()
+        if line != "+XREC:OK,DEL":
+            raise RuntimeError(f"Failed to delete {filename}: {line}")
 
+    def read_rtc(self) -> str:
+        self._send_cmd("+XREC:RTC")
+        line = self._read_line()
+        if not line.startswith("+XREC:RTC,"):
+            raise RuntimeError(f"Failed to read RTC: {line}")
+        return line[len("+XREC:RTC,") :]
+
+    def set_rtc(self, dt: datetime) -> None:
+        cmd = f"+XREC:RTC,{dt.year},{dt.month},{dt.day},{dt.hour},{dt.minute},{dt.second},{dt.weekday()}"
+        self._send_cmd(cmd)
+        line = self._read_line()
+        if line != "+XREC:OK,RTC":
+            raise RuntimeError(f"Failed to set RTC: {line}")
+
+    def _read_xrec_frame(self, expected_offset: int, filename: str) -> bytes:
         # Wait for either 12-byte binary header "XREC" or text error "+XREC:ERR,"
         while len(self.rx_buf) < 4:
             self._recv_into_buf()
 
         if self.rx_buf.startswith(b"+XREC:ERR,"):
             err = self._read_line()
-            raise RuntimeError(f"Device error reading {filename}@{offset}: {err}")
+            raise RuntimeError(f"Device error reading {filename}@{expected_offset}: {err}")
 
         # Sync to "XREC" header (ignoring any stray HFP CR/LF)
         while True:
@@ -186,14 +206,30 @@ class XRecRFCOMMClient:
         payload = bytes(self.rx_buf[12 : 12 + rx_len])
         del self.rx_buf[: 12 + rx_len]
 
-        if rx_off != offset:
-            raise RuntimeError(f"Offset mismatch: expected {offset}, got {rx_off}")
+        if rx_off != expected_offset:
+            raise RuntimeError(f"Offset mismatch: expected {expected_offset}, got {rx_off}")
         calc_crc = crc16_ccitt_false(payload)
         if calc_crc != rx_crc:
-            raise RuntimeError(f"CRC-16 mismatch at offset {offset}: expected 0x{rx_crc:04X}, calc 0x{calc_crc:04X}")
+            raise RuntimeError(f"CRC-16 mismatch at offset {expected_offset}: expected 0x{rx_crc:04X}, calc 0x{calc_crc:04X}")
         return payload
 
-    def download_file(self, filename: str, total_size: int, dst_path: Path) -> str:
+    def get_chunk(self, filename: str, offset: int, length: int = CHUNK_SIZE) -> bytes:
+        self._send_cmd(f"+XREC:GET,{offset},{length},{filename}")
+        return self._read_xrec_frame(offset, filename)
+
+    def get_burst(self, filename: str, offset: int, total_len: int, chunk_size: int = CHUNK_SIZE) -> bytes:
+        self._send_cmd(f"+XREC:GETS,{offset},{total_len},{chunk_size},{filename}")
+        out = bytearray()
+        cur = offset
+        while len(out) < total_len:
+            frame = self._read_xrec_frame(cur, filename)
+            out.extend(frame)
+            cur += len(frame)
+            if len(frame) < min(chunk_size, total_len - (len(out) - len(frame))):
+                break  # EOF
+        return bytes(out)
+
+    def download_file(self, filename: str, total_size: int, dst_path: Path, burst_size: int = DEFAULT_BURST_SIZE) -> str:
         tmp_path = dst_path.with_suffix(dst_path.suffix + ".part")
         h = hashlib.sha256()
         offset = 0
@@ -201,11 +237,15 @@ class XRecRFCOMMClient:
 
         with open(tmp_path, "wb") as f:
             while offset < total_size:
-                req = min(CHUNK_SIZE, total_size - offset)
+                use_burst = burst_size > CHUNK_SIZE
+                req = min(burst_size if use_burst else CHUNK_SIZE, total_size - offset)
                 chunk = None
                 for attempt in range(3):
                     try:
-                        chunk = self.get_chunk(filename, offset, req)
+                        if use_burst:
+                            chunk = self.get_burst(filename, offset, req, CHUNK_SIZE)
+                        else:
+                            chunk = self.get_chunk(filename, offset, req)
                         break
                     except Exception as exc:
                         if attempt == 2:
@@ -243,6 +283,16 @@ def main() -> None:
     )
     parser.add_argument("--ping", action="store_true", help="Only ping the +XREC firmware extension")
     parser.add_argument("--list", action="store_true", help="Only list recordings on 0:\\record")
+    parser.add_argument("--delete", metavar="FILENAME", help="Delete a single recording from 0:\\record")
+    parser.add_argument("--rtc-read", action="store_true", help="Read hardware RTC over Bluetooth")
+    parser.add_argument("--rtc-sync", action="store_true", help="Sync device hardware RTC to host local clock over Bluetooth")
+    parser.add_argument("--rtc-set", metavar="YYYY-MM-DD HH:MM:SS", help="Set device hardware RTC to explicit local timestamp")
+    parser.add_argument(
+        "--burst-size",
+        type=int,
+        default=DEFAULT_BURST_SIZE,
+        help="Multi-packet +XREC:GETS burst size in bytes (0 to use single-chunk +XREC:GET; default 4096)",
+    )
     args = parser.parse_args()
 
     mac = discover_hw_mac(args.mac)
@@ -256,6 +306,19 @@ def main() -> None:
         pong = client.ping()
         print(f"Ping response: {pong}")
         if args.ping:
+            return
+
+        if args.rtc_read:
+            print(f"Device RTC: {client.read_rtc()}")
+            return
+        if args.rtc_sync or args.rtc_set:
+            target = datetime.now().replace(microsecond=0) if args.rtc_sync else datetime.strptime(args.rtc_set, "%Y-%m-%d %H:%M:%S")
+            client.set_rtc(target)
+            print(f"Device RTC updated: {client.read_rtc()}")
+            return
+        if args.delete:
+            client.delete_file(args.delete)
+            print(f"Deleted 0:\\record\\{args.delete}")
             return
 
         files = client.list_files()
@@ -281,7 +344,7 @@ def main() -> None:
             if cached and cached.get("size") == sz and dst.is_file():
                 print(f"Skipping already synced: {name}")
                 continue
-            digest = client.download_file(name, sz, dst)
+            digest = client.download_file(name, sz, dst, burst_size=args.burst_size)
             manifest[name] = {
                 "filename": name,
                 "size": sz,
