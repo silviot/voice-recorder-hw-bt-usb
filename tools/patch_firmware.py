@@ -222,6 +222,28 @@ PATCHES: dict[str, BinaryPatch] = {
             ),
         ),
     ),
+    "bt-spp-uuid": BinaryPatch(
+        name="bt-spp-uuid",
+        description=(
+            "Advertise Serial Port Profile (SPP 0x1101 v1.2) instead of Handsfree (0x111E v1.6) "
+            "on RFCOMM Channel 1 in the SDP record (0x00CDAE11 & 0x00CDAE33). Prevents Android "
+            "HeadsetService and Linux PipeWire from routing phone calls to HW_76 or contending for "
+            "RFCOMM Channel 1, and lets Android apps connect via standard SPP_UUID "
+            "(00001101-0000-1000-8000-00805F9B34FB)."
+        ),
+        hunks=(
+            PatchHunk(
+                flash_offset=0x0DAE11,  # ServiceClassIDList: 0x111E + 0x1203 -> 0x1101 (SPP)
+                original=bytes.fromhex("19 11 1e 19 12 03"),
+                replacement=bytes.fromhex("19 11 01 19 11 01"),
+            ),
+            PatchHunk(
+                flash_offset=0x0DAE33,  # BluetoothProfileDescriptorList: 0x111E v1.6 -> 0x1101 v1.2
+                original=bytes.fromhex("19 11 1e 09 01 06"),
+                replacement=bytes.fromhex("19 11 01 09 01 02"),
+            ),
+        ),
+    ),
 }
 
 

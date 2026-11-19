@@ -1173,10 +1173,6 @@ uint32_t bt_filesync_dispatch(void *hf, const uint8_t *data, uint16_t len)
         return orig_hfp_parse_at_cmd(hf, data, len);
     }
 
-    /* Reset idle auto-power-off and screen-off timers on every +XREC packet */
-    fw_timer_reset(STR_IDLESHUT);
-    fw_timer_reset(STR_SCREEN);
-
     xrec_rt_t *rt = xrec_rt();
     xrec_ensure_nv_loaded(rt);
     int pair_open = xrec_pair_window_open(rt);
@@ -1212,8 +1208,11 @@ uint32_t bt_filesync_dispatch(void *hf, const uint8_t *data, uint16_t len)
     if (starts_with(p, rem, "LS")) {
         handle_ls(hf);
     } else if (starts_with(p, rem, "GETS,")) {
+        /* Keep device awake during active bulk download (without waking LCD screen) */
+        fw_timer_reset(STR_IDLESHUT);
         handle_get_stream(hf, p + 5, (uint16_t)(rem - 5), 1);
     } else if (starts_with(p, rem, "GET,")) {
+        fw_timer_reset(STR_IDLESHUT);
         handle_get_stream(hf, p + 4, (uint16_t)(rem - 4), 0);
     } else if (starts_with(p, rem, "DEL,")) {
         handle_del(hf, p + 4, (uint16_t)(rem - 4));
@@ -1226,6 +1225,7 @@ uint32_t bt_filesync_dispatch(void *hf, const uint8_t *data, uint16_t len)
     } else if (starts_with(p, rem, "STAT")) {
         handle_stat(hf);
     } else if (starts_with(p, rem, "PUT,")) {
+        fw_timer_reset(STR_IDLESHUT);
         handle_put(hf, p + 4, (uint16_t)(rem - 4));
     } else if (starts_with(p, rem, "OTA")) {
         send_str(hf, "+XREC:OK,OTA\r\n");
