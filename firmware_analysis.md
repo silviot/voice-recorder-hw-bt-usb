@@ -687,3 +687,35 @@ Implemented and verified in [open_fw](open_fw/) and [tools/flash_ranges.py](tool
   * Observed full QEMU Cortex-M4F boot into `open_fw` XIP main loop: `PC=0x00c0f51c`, `g_systick_ms=499`, `g_openfw_log` (`magic=0x474c464f`, `write_idx=206`, `dropped=0`) + UART0 banner (`CPU=96MHz XIP=0x00C0F430 CPU_ID=0 VBAT_MV=4075`, `SD: OK 0f`), SDIO/exFAT mounted (`sd_init=1 sdhc=1 rca=0x0001 sectors=262144 mounted=1`), and active ST7735S `80x160 @ 0x50000000` framebuffer rendered (`nonblack=2465/12800`, `unique_colors=155`).
 * **Clean-Room Chunked Partial SPI NOR Flasher (`tools/flash_ranges.py`):**
   * Implemented [tools/flash_ranges.py](tools/flash_ranges.py) targeting BootROM USB DFU PID `0x301a:2800` only (`0x81 INIT`, `0x00 READID`, `0x03 ERASE4K`, `0x02 WRITEPAGE`, `0x07 READ`, `0x82 CRC`, `0x86 PING`) with `--diff` 4 KiB sector coalescing, `--range`, `--chunk`, `--retries`, hardware CRC-16 + byte readback `--verify`, default `--dry-run` safety guard, and `--self-test` (`PASSED`). Dry-run diff against stock `firmware_2M.bin` coalesced to `1` range (`0x00D000..0x174000`, `359` sectors, `1,470,464 B`).
+
+---
+
+## 25. Stage-0 BootROM / Audio DAC Hardware Findings & OpenFW Layer 5e (Two-Way OTA, `0xE0` USB, Power/UI & CI)
+
+Verified via BootROM/stock disassembly (`dumps/bootrom_384K.bin`, `dumps/firmware_2M.bin`) and implemented in [open_fw](open_fw/):
+
+### 25.1 Stage-0 BootROM `HLKJ` Loader & GPIO ID Decoder
+* **`HLKJ` Stage-1 SPI NOR Loader (`0x04CC74`, `0x04CCB8`):**
+  * `0x04CC74` attempts 3 retries reading the primary `HLKJ` image at flash offset `0x0000`, and if all 3 fail, falls back to backup flash offset `0x1000` with 3 retries (`str r5, [r4, #0x60]`).
+  * `0x04CCB8` streams the Stage-1 image to SRAM (`0x0081FBC0`) in `0x800`-byte chunks (plus trailing `< 0x800` remainder) through the BootROM hardware CRC-16 helpers (`0x00008510`, `0x000083B4`, `0x00008500`, `0x00008528`), comparing against the header CRC word `[r7, #0x14]`.
+* **Compact GPIO ID Decoder (`0x0000077A`, table `0x000009B4`):**
+  * `port = (id >> 16) & 0xF` indexes `{0x40081000, 0x40081040, 0x40081080, 0x400810C0}` (`GPIOA..GPIOD`), and `pin = (id >> 11) & 0x1F`.
+
+### 25.2 Audio DAC, DMAC Allocator & Headphone `/dev/exti`
+* **DAC Digital / Analog Codec Registers (`0x40009000`..`0x400092B8`):**
+  * 4 digital audio channel blocks at `0x40009220`, `0x40009250`, `0x40009280` (table `0x00CD61E8`), and `0x400092B0` (`0x00D4E7D4`), alongside shared control at `0x40009200` and DAC/analog registers at `+0x014`, `+0x018`, `+0x02C`, `+0x030`, `+0x04C`, `+0x050`, `+0x054`, and `+0x108`/`+0x114` (`0x00D4E4E0..0x00D507D8`).
+  * Unified Audio HAL DMAC channel allocator (`0x00D5095C`) uses DMAC `0x40001000` (`ch*0x40`) with NVIC IRQs `0x3C..0x43` (`60..67`, table `0x00C48804`).
+* **Headphone Detect (`/dev/exti`, `0x00D3ABFC`) & Audio GPIOs:**
+  * `/dev/exti` (`open=0x00D3AC55`, `read=0x00D3AC3D`) samples GPIO ID `0x15800` (`PB11`) and feeds `earphoone_exist` inside `writer.pcm` (`0x00D3DE40` / `0x00D3DEE6`). Audio codec init/control (`0x00D4D78C`, `0x00D4DB0C`) also configures `PB10` (`0x15000`), `PB11` (`0x15800`), `PB14` (`0x17000`), `PB15` (`0x17800`), `PB19` (`0x19800`), and `PB20` (`0x1A000`).
+
+### 25.3 OpenFW Layer 5e Additions (Core Features, MMIO Tests, Tooling & CI)
+* **Two-Way Wireless BT `+XREC v5` Remote Control & OTA ([xrec_proto.c](open_fw/src/xrec_proto.c), [bt_hci.c](open_fw/src/bt_hci.c), [openfw_xrec.h](open_fw/include/openfw_xrec.h)):**
+  * Wired `+XREC:RECSTART` / `+XREC:RECSTOP` to `recorder_start()` / `recorder_stop()` and added binary `+XREC:PUT,<off>,<len>,<crc>,OTA:<bytes>` streaming to `0:/update.up` (with CRC-16 verification + idempotent retry handling) plus `+XREC:OTA` triggering `pmu_reboot_to_sd_ota()` after ACL TX drains (`250 ms`), keeping OpenFW two-way compatible with [tools/bt_sync.py](tools/bt_sync.py) `--ota`.
+  * Persists Classic BT link keys across reboots in 96-byte `"BLK1"` `0:/bt_keys.bin` alongside `0:/cassini.key`.
+* **Power Management, Recording Safety & On-Device UI ([main.c](open_fw/src/main.c), [recorder.c](open_fw/src/recorder.c)):**
+  * Added `wfi_sleep_ms(25u)` SysTick `wfi` idle sleep, PWM3 backlight auto-dim (`15%` @ 15s, `0%` @ 30s with wake on key/switch/USB/BT), low-VBAT recording guard (`< 3450 mV` auto-stop & flush, `< 3550 mV` amber/red indicator), 2s silent SD hot-plug re-probe when idle, `PB6` switch support in BT mode, configurable `recorder_set_gain()`, and `KEY_LEFT` `FILES` / `SETTINGS` menu.
+* **Vendor SCSI `0xE0` Diagnostics & Host Tools ([usb_scsi.c](open_fw/src/usb_scsi.c), [usb_musb.c](open_fw/src/usb_musb.c), [tools/openfw_usb.py](tools/openfw_usb.py)):**
+  * Added `usb_msc_set_vendor_cb()` and SCSI `0xE0` subcommands (`0x01 GET_INFO`, `0x02 READ_LOG`, `0x03 GET_RTC`, `0x04 SET_RTC`), clean-room client [tools/openfw_usb.py](tools/openfw_usb.py) (with `--self-test`), `1209:0001` redirect in [tools/usb_rtc_sync.py](tools/usb_rtc_sync.py), and `Cassini_`/`HW_` auto-discovery in [tools/bt_sync.py](tools/bt_sync.py).
+* **Audio/Recorder/`bt_rf` MMIO Suite, Deterministic Packing, QEMU & CI:**
+  * Added `OPENFW_HOST_MMIO` + `OPENFW_IRQ_SAVE`/`RESTORE` + `OPENFW_HOST_DMAC_BUF` for [audio_dma.c](open_fw/src/audio_dma.c) and [bt_rf.c](open_fw/src/bt_rf.c) in [sl6801_regs.h](open_fw/include/sl6801_regs.h) and native [test_audio_bt_mmio.c](open_fw/tests/test_audio_bt_mmio.c) (checked with `fsck.exfat -n`), deterministic `pack_firm.py` (`--timestamp` / `SOURCE_DATE_EPOCH`, default `0`), [sl6801_qemu_openfw.patch](open_fw/tools/sl6801_qemu_openfw.patch) + [setup_qemu.sh](open_fw/tools/setup_qemu.sh), SysTick + `KEY_ENTER -> USB MSC` QEMU assertions in [run_qemu.py](open_fw/tools/run_qemu.py), and GitHub Actions workflow [.github/workflows/ci.yml](.github/workflows/ci.yml).
+

@@ -46,6 +46,7 @@ typedef struct {
     void (*on_reboot)(void *user);
     int  (*rec_start)(void *user, const char *opt_name, char *out_name, uint32_t out_max);
     int  (*rec_stop)(void *user);
+    void (*on_ota)(void *user);
 } xrec_ops_t;
 
 typedef struct {
@@ -72,6 +73,23 @@ typedef struct {
     uint32_t       gets_offset;
     uint32_t       gets_rem;
     uint16_t       gets_chunk_max;
+
+    /* Streaming +XREC:PUT -> /update.up OTA upload state */
+    uint8_t        put_active;
+    uint8_t        put_auth_ok;
+    uint32_t       put_offset;
+    uint16_t       put_len;
+    uint16_t       put_got;
+    uint16_t       put_crc;
+    uint8_t        put_buf[XREC_MAX_CHUNK];
+
+    uint8_t        ota_open;
+    uint8_t        ota_has_last;
+    exfat_writer_t ota_writer;
+    uint32_t       ota_written;
+    uint32_t       ota_last_off;
+    uint16_t       ota_last_len;
+    uint16_t       ota_last_crc;
 } xrec_ctx_t;
 
 void xrec_init(xrec_ctx_t *ctx, exfat_vol_t *vol, const xrec_ops_t *ops, void *user);

@@ -819,10 +819,22 @@ typedef struct {
     xrec_rtc_t  rtc;
     uint8_t     bound_key[32];
     int         bound_called;
+    int         ota_called;
     uint8_t     rx_stream[4096];
     uint32_t    rx_len;
     uint32_t    rx_acl_pkts;
 } sim_phone_t;
+
+static void send_xrec_put_chunk(bt_spp_t *spp, uint32_t offset, const uint8_t *chunk,
+                                uint16_t chunk_len, uint16_t crc)
+{
+    uint8_t pkt[64u + XREC_MAX_CHUNK];
+    int hlen = snprintf((char *)pkt, sizeof(pkt), "+XREC:PUT,%u,%u,%u,OTA:",
+                        (unsigned)offset, (unsigned)chunk_len, (unsigned)crc);
+    assert(hlen > 0 && hlen + chunk_len <= (int)sizeof(pkt));
+    memcpy(&pkt[hlen], chunk, chunk_len);
+    send_rfcomm_client_uih(spp, 0x0041u, 2u, pkt, (uint16_t)(hlen + chunk_len));
+}
 
 static void mock_spp_data_cb(void *user, const uint8_t *data, uint16_t len)
 {
@@ -881,6 +893,12 @@ static void mock_xrec_bound(void *user, const uint8_t key[32])
     sim_phone_t *sp = (sim_phone_t *)user;
     memcpy(sp->bound_key, key, 32u);
     sp->bound_called = 1;
+}
+
+static void mock_xrec_on_ota(void *user)
+{
+    sim_phone_t *sp = (sim_phone_t *)user;
+    sp->ota_called++;
 }
 
 static void drain_acl_to_phone(bt_spp_t *spp, sim_phone_t *sp)
@@ -1000,7 +1018,7 @@ static void test_bt_spp_and_xrec(void)
     xrec_ops_t ops = {
         mock_xrec_send, mock_xrec_get_stat, mock_xrec_get_rtc,
         mock_xrec_set_rtc, mock_xrec_entropy, mock_xrec_bound, NULL,
-        NULL, NULL,
+        NULL, NULL, mock_xrec_on_ota,
     };
     xrec_init(&xrec, &vol, &ops, &sp);
     bt_spp_init(&spp, mock_spp_data_cb, &xrec);
@@ -1096,9 +1114,18 @@ static void test_bt_spp_and_xrec(void)
 
     sp.rx_len = 0u;
     send_rfcomm_client_uih(&spp, 0x0041u, 2u, (const uint8_t *)c_lock, (uint16_t)strlen(c_lock));
+    const uint8_t unauth_bin[16] = {
+        '\r', '\n', ':', 0x00u, 'X', 0xFFu, 0x01u, '\r',
+        '\n', '+', 'X', 'R', 'E', 'C', ':', 0x00u
+    };
+    send_xrec_put_chunk(&spp, 0u, unauth_bin, 16u,
+                        openfw_crc16_ccitt_false(unauth_bin, 16u));
+    send_rfcomm_client_uih(&spp, 0x0041u, 2u, (const uint8_t *)c_ping, (uint16_t)strlen(c_ping));
     drain_acl_to_phone(&spp, &sp);
     sp.rx_stream[sp.rx_len] = '\0';
     assert(strstr((const char *)sp.rx_stream, "+XREC:ERR,LOCKED") != NULL);
+    assert(strstr((const char *)sp.rx_stream, "+XREC:PONG,openfw_v5") != NULL);
+    send_rfcomm_client_credits(&spp, 0x0041u, 2u, 2u);
 
     /* Authenticate using docs/XREC_PROTOCOL.md §5 HMAC vector */
     sp.rx_len = 0u;
@@ -1198,7 +1225,66 @@ static void test_bt_spp_and_xrec(void)
     assert(ppos == sp.rx_len && frames_seen == 3u && saw_eof_zero_frame == 1);
     assert(dpos == sizeof(exact960) && memcmp(downloaded, exact960, sizeof(exact960)) == 0);
 
-    printf("  [PASS] bt_spp + xrec (L2CAP, SDP, RFCOMM credits/DISC, +XREC auth/LS/DEL/GET/GETS+EOF)\n");
+    /* 6. +XREC:PUT (chunks 560+560+80 with bad CRC + idempotent retry) -> +XREC:OTA */
+    uint8_t ota_img[1200];
+    for (uint32_t i = 0u; i < (uint32_t)sizeof(ota_img); i++) {
+        ota_img[i] = (uint8_t)((i * 37u) ^ 0x5Au);
+    }
+    ota_img[0]   = '\r';
+    ota_img[1]   = '\n';
+    ota_img[2]   = '\0';
+    ota_img[3]   = ':';
+    ota_img[560] = '\r';
+    ota_img[561] = ':';
+
+    send_rfcomm_client_credits(&spp, 0x0041u, 2u, 10u);
+    sp.rx_len = 0u;
+    uint16_t crc0 = openfw_crc16_ccitt_false(&ota_img[0], 560u);
+    send_xrec_put_chunk(&spp, 0u, &ota_img[0], 560u, crc0);
+    drain_acl_to_phone(&spp, &sp);
+    sp.rx_stream[sp.rx_len] = '\0';
+    assert(strcmp((const char *)sp.rx_stream, "+XREC:OK,PUT,0,560\r\n") == 0);
+
+    /* Bad CRC at offset 560 -> +XREC:ERR,CRC, leaving file offset at 560 */
+    sp.rx_len = 0u;
+    uint16_t crc1 = openfw_crc16_ccitt_false(&ota_img[560], 560u);
+    send_xrec_put_chunk(&spp, 560u, &ota_img[560], 560u, (uint16_t)(crc1 ^ 0x0001u));
+    drain_acl_to_phone(&spp, &sp);
+    sp.rx_stream[sp.rx_len] = '\0';
+    assert(strcmp((const char *)sp.rx_stream, "+XREC:ERR,CRC\r\n") == 0);
+
+    /* Retry offset 560 with good CRC, then idempotent duplicate resend of offset 560 */
+    sp.rx_len = 0u;
+    send_xrec_put_chunk(&spp, 560u, &ota_img[560], 560u, crc1);
+    drain_acl_to_phone(&spp, &sp);
+    sp.rx_stream[sp.rx_len] = '\0';
+    assert(strcmp((const char *)sp.rx_stream, "+XREC:OK,PUT,560,560\r\n") == 0);
+
+    sp.rx_len = 0u;
+    send_xrec_put_chunk(&spp, 560u, &ota_img[560], 560u, crc1);
+    drain_acl_to_phone(&spp, &sp);
+    sp.rx_stream[sp.rx_len] = '\0';
+    assert(strcmp((const char *)sp.rx_stream, "+XREC:OK,PUT,560,560\r\n") == 0);
+
+    /* Final 80-byte chunk at offset 1120 + +XREC:OTA trigger */
+    sp.rx_len = 0u;
+    uint16_t crc2 = openfw_crc16_ccitt_false(&ota_img[1120], 80u);
+    send_xrec_put_chunk(&spp, 1120u, &ota_img[1120], 80u, crc2);
+    const char *c_ota = "+XREC:OTA\r";
+    send_rfcomm_client_uih(&spp, 0x0041u, 2u, (const uint8_t *)c_ota, (uint16_t)strlen(c_ota));
+    drain_acl_to_phone(&spp, &sp);
+    sp.rx_stream[sp.rx_len] = '\0';
+    assert(strcmp((const char *)sp.rx_stream, "+XREC:OK,PUT,1120,80\r\n+XREC:OK,OTA\r\n") == 0);
+    assert(sp.ota_called == 1);
+
+    exfat_entry_t ota_ent;
+    assert(exfat_find_path(&vol, "/update.up", &ota_ent) == 0 && ota_ent.size == sizeof(ota_img));
+    uint8_t ota_readback[1200];
+    uint32_t ota_nread = 0u;
+    assert(exfat_read_file(&vol, &ota_ent, 0u, ota_readback, sizeof(ota_readback), &ota_nread) == 0);
+    assert(ota_nread == sizeof(ota_img) && memcmp(ota_readback, ota_img, sizeof(ota_img)) == 0);
+
+    printf("  [PASS] bt_spp + xrec (L2CAP, SDP, RFCOMM credits/DISC, +XREC auth/LS/DEL/GET/GETS+EOF/PUT+OTA)\n");
 }
 
 int main(int argc, char **argv)

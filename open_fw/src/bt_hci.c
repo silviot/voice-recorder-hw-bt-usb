@@ -1233,6 +1233,8 @@ static char               g_dev_name[16];
 static uint16_t           g_conhdl = 0u;
 static uint8_t            g_acl_connected = 0u;
 static uint32_t           g_pair_deadline_ms = 0u;
+static uint8_t            g_pending_reboot_mode = 0u; /* 0=none, 1=reboot, 2=sd_ota */
+static uint32_t           g_reboot_deadline_ms = 0u;
 static uint32_t           g_rx_acl_pkts = 0u;
 static uint32_t           g_tx_acl_pkts = 0u;
 static bt_link_key_slot_t g_key_cache[4];
@@ -1618,8 +1620,15 @@ static void xrec_cb_on_bound_key(void *user, const uint8_t key[32])
 static void xrec_cb_on_reboot(void *user)
 {
     (void)user;
-    mdelay(50u);
-    system_reboot();
+    g_pending_reboot_mode = 1u;
+    g_reboot_deadline_ms  = millis() + 250u;
+}
+
+static void xrec_cb_on_ota(void *user)
+{
+    (void)user;
+    g_pending_reboot_mode = 2u;
+    g_reboot_deadline_ms  = millis() + 250u;
 }
 
 static int xrec_cb_rec_start(void *user, const char *opt_name, char *out_name, uint32_t out_max)
@@ -1715,6 +1724,7 @@ int bt_xrec_start(exfat_vol_t *vol, int sd_mounted)
         xrec_cb_on_reboot,
         xrec_cb_rec_start,
         xrec_cb_rec_stop,
+        xrec_cb_on_ota,
     };
 
     g_vol              = vol;
@@ -1722,6 +1732,8 @@ int bt_xrec_start(exfat_vol_t *vol, int sd_mounted)
     g_conhdl           = 0u;
     g_acl_connected    = 0u;
     g_pair_deadline_ms = 0u;
+    g_pending_reboot_mode = 0u;
+    g_reboot_deadline_ms  = 0u;
     g_rx_acl_pkts      = 0u;
     g_tx_acl_pkts      = 0u;
     g_pending_tx_len   = 0u;
@@ -1804,6 +1816,16 @@ void bt_xrec_poll(void)
         }
         g_tx_acl_pkts++;
     }
+
+    if (g_pending_reboot_mode != 0u && g_pending_tx_len == 0u &&
+        (int32_t)(millis() - g_reboot_deadline_ms) >= 0) {
+        uint8_t mode = g_pending_reboot_mode;
+        g_pending_reboot_mode = 0u;
+        if (mode == 2u) {
+            pmu_reboot_to_sd_ota();
+        }
+        system_reboot();
+    }
 }
 
 void bt_xrec_stop(void)
@@ -1817,13 +1839,15 @@ void bt_xrec_stop(void)
     }
     nvic_clear_pending(IRQ_BT);
 
-    g_bt_irq_pending   = 0u;
-    g_active           = 0u;
-    g_hci_stage        = HCI_ST_IDLE;
-    g_acl_connected    = 0u;
-    g_conhdl           = 0u;
-    g_pending_tx_len   = 0u;
-    g_pair_deadline_ms = 0u;
+    g_bt_irq_pending      = 0u;
+    g_active              = 0u;
+    g_hci_stage           = HCI_ST_IDLE;
+    g_acl_connected       = 0u;
+    g_conhdl              = 0u;
+    g_pending_tx_len      = 0u;
+    g_pair_deadline_ms    = 0u;
+    g_pending_reboot_mode = 0u;
+    g_reboot_deadline_ms  = 0u;
     xrec_close_pairing(&g_xrec);
     xrec_on_disconnect(&g_xrec);
     bt_spp_reset_link(&g_spp, 0u);
