@@ -310,7 +310,7 @@ def main() -> None:
     parser.add_argument("--rtc-read", action="store_true", help="Read hardware RTC over Bluetooth")
     parser.add_argument("--rtc-sync", action="store_true", help="Sync device hardware RTC to host local clock over Bluetooth")
     parser.add_argument("--rtc-set", metavar="YYYY-MM-DD HH:MM:SS", help="Set device hardware RTC to explicit local timestamp")
-    parser.add_argument("--stat", action="store_true", help="Query battery %, voltage, charge state, recording state & SD free space")
+    parser.add_argument("--stat", action="store_true", help="Query battery %%, voltage, charge state, recording state & SD free space")
     parser.add_argument("--rec-start", nargs="?", const="", metavar="FILENAME", help="Start a local stereo WAV recording (optional custom filename)")
     parser.add_argument("--rec-stop", action="store_true", help="Stop an active local stereo WAV recording")
     parser.add_argument(
