@@ -212,6 +212,46 @@ python3 tools/inspect_fw.py dumps/firmware_2M.bin
 
 ---
 
+## 8. Integration Tools: USB Auto-Sync & Bluetooth Companion (`tools/`)
+
+### 1. USB Auto-Sync (`tools/usb_sync.py`)
+Automatically detects when the `HW_76` (`301a:2801`) exFAT volume is connected (and auto-mounts it via `udisksctl` if not yet mounted), imports new `.wav` / `.mp3` recordings from `record/`, verifies SHA-256 checksums, classifies whether each recording is a microphone recording (`20YYMMDD-HHMMSS-120min.wav`) or a Bluetooth phone call recording (`20YYMMDD-HHMMSS-phone.wav`), and tracks synced files in `.sync_manifest.json`.
+
+```bash
+# One-shot sync of all new recordings to ~/Recordings/HW_76
+python3 tools/usb_sync.py --dest ~/Recordings/HW_76
+
+# Continuous daemon mode: watches for USB plug-in and auto-imports new recordings
+python3 tools/usb_sync.py --watch --dest ~/Recordings/HW_76
+```
+
+### 2. Bluetooth Companion & Audio Stream Capture (`tools/bt_companion.py`)
+Reverse-engineering of the firmware's internal `spark_bt` stack (`0xDA800..0xDC000` in `pen133_2.0.65`) revealed the exact profiles and state machines compiled into the device:
+* **`spark_bt_rfcomm_entry` / `_hfp_hf_slc_open_status` (HFP v1.6 Hands-Free Unit on RFCOMM Channel 1):**
+  * Expects the exact AT command Service Level Connection (SLC) sequence: `W4RFCOMM` -> `W4SF` (`AT+BRSF=`) -> `W4IND` (`AT+CIND=?`) -> `W4INDSTA` (`AT+CIND?`) -> `W4CMER` (`AT+CMER=3,0,0,1`) -> `SLC_OPEN`.
+  * Supports `+BCS` codec negotiation (`CVSD` / `mSBC`), `ATA` (answer), `AT+CHUP` (hang up), `+VGS` / `+VGM`, and `+CIEV` call indicators (`call_income`, `call_ring`, `call_online`, `call_end`).
+* **`spark_bt_a2dp_src_entry` / `spark_bt_avrcp_tg_entry` (A2DP Source + AVRCP Target):**
+  * Used in "Bluetooth Headphone" mode to stream playback of recordings stored on the device to a paired Bluetooth Audio Sink, accepting remote AVRCP pass-through commands (`Play`, `Pause`, `Stop`, `Forward`, `Backward`, `Fast-forward`, `Rewind`, `Vol up`, `Vol down`).
+* **No OBEX / SPP / BLE File Transfer in Stock Firmware:**
+  * Because stock firmware only implements Bluetooth audio profiles (HFP + A2DP/AVRCP), `tools/bt_companion.py` provides four Bluetooth integration modes:
+    1. `--mode pair`: Automated Classic Bluetooth (`bredr`) discovery, pairing, trusting, and connection via BlueZ.
+    2. `--mode rfcomm-slc`: Connects directly to RFCOMM Channel 1 as an HFP Audio Gateway (AG) and completes the SL6801 AT command handshake (`SLC_OPEN`).
+    3. `--mode simulate-call`: Triggers the `call_online` state on `HW_76` over RFCOMM (`+CIEV: 2,1`), causing `HW_76` to switch to its call-recording UI (`page_call_on_create`) and record incoming SCO audio to `0:\record\20YYMMDD-HHMMSS-phone.wav`.
+    4. `--mode record-stream`: Captures live audio arriving from `HW_76` over Bluetooth (either wireless HFP microphone audio or A2DP playback of stored recordings when the PC is paired as an A2DP Audio Sink) via PipeWire (`pw-record`) into timestamped `.wav` files.
+
+```bash
+# Pair and connect to HW_76 over Classic Bluetooth
+python3 tools/bt_companion.py --mode pair
+
+# Complete the direct RFCOMM Channel 1 HFP Service Level Connection handshake
+python3 tools/bt_companion.py --mode rfcomm-slc
+
+# Capture Bluetooth audio stream (HFP mic or A2DP playback) via PipeWire to .wav
+python3 tools/bt_companion.py --mode record-stream --duration 30 --dest ~/Recordings/HW_76
+```
+
+---
+
 ## License
 
 Code and documentation in this repository are released under the [MIT License](LICENSE). No proprietary firmware or Boot ROM binaries are distributed in this repository (users must extract any dumps locally from their own hardware).
