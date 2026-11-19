@@ -32,11 +32,14 @@
 #define rom_rst_release     ROM_FN(0x00002564, void,     (uint32_t rst_id))
 #define rom_rst_hold        ROM_FN(0x00002570, void,     (uint32_t rst_id))
 #define rom_clk_enable      ROM_FN(0x000027A0, void,     (uint32_t clk_id))
+#define rom_clk_disable     ROM_FN(0x00002A7C, void,     (uint32_t clk_id))
 #define rom_clk_div         ROM_FN(0x00002D58, void,     (uint32_t clk_id, uint32_t div))
 #define rom_clk_set_src     ROM_FN(0x00003118, void,     (uint32_t clk_id, uint32_t src))
+#define rom_clk_set_rate    ROM_FN(0x00003904, void,     (uint32_t clk_id, uint32_t hz))
 
-/* 64-bit System Microsecond Timer & WDT */
+/* 64-bit System Microsecond Timer, Delay & WDT */
 #define rom_us_timer_get    ROM_FN(0x0000B6D8, uint64_t, (void))
+#define rom_us_delay        ROM_FN(0x0000B730, void,     (uint32_t us))
 #define rom_wdt_reset       ROM_FN(0x0000B7B0, void,     (uint32_t timeout))
 
 #endif /* SL6801_ROM_H */

@@ -22,7 +22,8 @@ CFLAGS   := --target=thumbv7em-none-eabi -mcpu=cortex-m4 -mfloat-abi=soft -mthum
 HOST_CFLAGS := -O2 -Wall -Wextra -Werror -Iinclude
 
 SRCS      := src/startup.c src/wdt_timer.c src/rtc.c src/uart.c src/pmu.c \
-             src/keys.c src/lcd_st7735s.c src/crypto.c src/wav.c src/exfat.c src/main.c
+             src/keys.c src/lcd_st7735s.c src/sdio.c src/audio_dma.c \
+             src/crypto.c src/wav.c src/exfat.c src/main.c
 OBJS      := $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(SRCS))
 
 SPLASH_PNG  := ../assets/cassini_welcome_80x40.png
@@ -51,20 +52,24 @@ $(BUILD_DIR)/open_fw.elf: $(OBJS) sl6801_firm.ld
 	@test -n "$(LLD)" || (echo "Error: ld.lld not found (set LLD=/path/to/ld.lld)" >&2; exit 1)
 	$(LLD) -T sl6801_firm.ld $(OBJS) -o $@
 
-$(BUILD_DIR)/open_fw_ram.bin: $(BUILD_DIR)/open_fw.elf
+$(BUILD_DIR)/ram_boot.bin: $(BUILD_DIR)/open_fw.elf
 	@test -n "$(OBJCOPY)" || (echo "Error: llvm-objcopy not found (set OBJCOPY=/path/to/llvm-objcopy)" >&2; exit 1)
-	$(OBJCOPY) -O binary $< $@
+	$(OBJCOPY) -O binary -j .ram_boot $< $@
 
-$(BUILD_DIR)/open_fw_firm.bin: $(BUILD_DIR)/open_fw_ram.bin tools/pack_firm.py
-	python3 tools/pack_firm.py --ram-img $< --out-firm $@
+$(BUILD_DIR)/xip.bin: $(BUILD_DIR)/open_fw.elf
+	@test -n "$(OBJCOPY)" || (echo "Error: llvm-objcopy not found (set OBJCOPY=/path/to/llvm-objcopy)" >&2; exit 1)
+	$(OBJCOPY) -O binary -j .text -j .data $< $@
+
+$(BUILD_DIR)/open_fw_firm.bin: $(BUILD_DIR)/ram_boot.bin $(BUILD_DIR)/xip.bin tools/pack_firm.py
+	python3 tools/pack_firm.py --ram-boot $(BUILD_DIR)/ram_boot.bin --xip $(BUILD_DIR)/xip.bin --out-firm $@
 
 test-host: tests/test_core.c src/crypto.c src/wav.c src/exfat.c | $(BUILD_DIR)
 	$(HOST_CC) $(HOST_CFLAGS) $^ -o $(BUILD_DIR)/test_core
 	$(BUILD_DIR)/test_core
 
-update-up: $(BUILD_DIR)/open_fw_ram.bin tools/pack_firm.py
+update-up: $(BUILD_DIR)/ram_boot.bin $(BUILD_DIR)/xip.bin tools/pack_firm.py
 	@test -f "$(STOCK_DUMP)" || (echo "Error: $(STOCK_DUMP) not found" >&2; exit 1)
-	python3 tools/pack_firm.py --ram-img $(BUILD_DIR)/open_fw_ram.bin \
+	python3 tools/pack_firm.py --ram-boot $(BUILD_DIR)/ram_boot.bin --xip $(BUILD_DIR)/xip.bin \
 		--out-firm $(BUILD_DIR)/open_fw_firm.bin \
 		--base-hlkj $(STOCK_DUMP) \
 		--out-bin $(OUT_BIN) \

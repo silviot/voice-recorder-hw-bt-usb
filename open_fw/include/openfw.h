@@ -7,6 +7,7 @@
 #define OPENFW_H
 
 #include <stdint.h>
+#include "openfw_fs.h"
 
 /* Watchdog, Timers & System Reset (wdt_timer.c) */
 void     wdt_feed(void);
@@ -78,5 +79,24 @@ void lcd_draw_char(uint16_t x, uint16_t y, char c, uint16_t fg, uint16_t bg);
 void lcd_draw_str(uint16_t x, uint16_t y, const char *s, uint16_t fg, uint16_t bg);
 void lcd_draw_u32(uint16_t x, uint16_t y, uint32_t v, uint16_t fg, uint16_t bg);
 void lcd_draw_hex(uint16_t x, uint16_t y, uint32_t v, uint8_t digits, uint16_t fg, uint16_t bg);
+
+/* 1-Bit SDIO / microSD Block Driver (sdio.c) */
+typedef struct {
+    int      initialized;
+    int      is_sdhc;
+    uint16_t rca;
+    uint32_t sector_count;
+} sd_card_t;
+
+int      sd_init(sd_card_t *card);
+int      sd_read_blocks(sd_card_t *card, uint32_t lba, uint32_t count, void *buf);
+int      sd_write_blocks(sd_card_t *card, uint32_t lba, uint32_t count, const void *buf);
+blkdev_t sd_as_blkdev(sd_card_t *card);
+
+/* Audio ADC AMIC1 + DMAC CH1 Ping-Pong Capture (audio_dma.c) */
+int      audio_capture_start(uint8_t gain_0_31);
+void     audio_capture_stop(void);
+uint8_t  audio_get_peak_pct(void);
+uint32_t audio_get_frames(void);
 
 #endif /* OPENFW_H */

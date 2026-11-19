@@ -1,59 +1,61 @@
 /*
- * Smartlink SL6801 Standalone Open-Source FIRM Linker Script (Layer 1b: SRAM-Resident)
+ * Linker script for standalone open_fw Hybrid SRAM Bootstrap + SPI NOR XIP
  *
- * Stage-1 Bootloader copies `loadLength` bytes from flash 0x00E430 directly to
- * `loadToRam = 0x00804C00` and invokes `blx 0x00804C01` (without remapping XIP
- * or setting SCB->VTOR / MSP, while Stage-1's temporary SP is ~0x0083BE90).
+ * Flash layout (FIRM partition @ 0x00E000):
+ *   0x00E000..0x00E02F : 48 B FIRM header (loadToRam=0x00804C00, loadLength=0x1000)
+ *   0x00E030..0x00E42F : 1024 B Stage-1 pad
+ *   0x00E430..0x00F42F : 4096 B .ram_boot copied by Stage-1 to SRAM 0x00804C00
+ *   0x00F430+          : .text/.rodata + .data LMA, mapped by SPI NOR XIP to 0x00C0F430+
  *
- * Keeping the flat Layer 1b image inside 0x00804C00..0x0082CBFF (160 KB) guarantees
- * Stage-1 safely loads the entire image without overwriting its own stack, after
- * which `_start` switches MSP to `_estack = 0x0086AC08`.
- *
- * SPDX-License-Identifier: MIT
+ * SRAM 0x00800000..0x00804BFF (BootROM/RW-BT globals) and 0x00805C00..0x0081A37F
+ * remain completely untouched. Stack starts at 0x0086AC08 descending.
  */
 ENTRY(_start)
 
 MEMORY
 {
-    SRAM_IMG (rwx) : ORIGIN = 0x00804C00, LENGTH = 0x00028000
+    RAM_BOOT (rwx) : ORIGIN = 0x00804C00, LENGTH = 0x00001000
+    XIP      (rx)  : ORIGIN = 0x00C0F430, LENGTH = 0x001ECBD0
+    SRAM     (rwx) : ORIGIN = 0x0081A380, LENGTH = 0x00050480
 }
 
 _estack = 0x0086AC08;
 
 SECTIONS
 {
-    /* Naked Thumb entry trampoline MUST sit at exact 0x00804C00 (blx 0x00804C01) */
-    .text.entry 0x00804C00 : {
+    /* Stage-1 copies flash 0x00E430..0x00F42F (<= 4 KiB) to SRAM 0x00804C00 */
+    .ram_boot 0x00804C00 : {
         KEEP(*(.text.entry))
-    } > SRAM_IMG
-
-    /* 256-byte aligned Cortex-M4F vector table at 0x00804D00 */
-    .isr_vector ALIGN(256) : {
+        . = ALIGN(512);
         KEEP(*(.isr_vector))
-    } > SRAM_IMG
-
-    .text : {
         *(.ramtext .ramtext.*)
+        . = ALIGN(4);
+    } > RAM_BOOT
+
+    ASSERT(SIZEOF(.ram_boot) <= 0x1000, ".ram_boot exceeds 4 KiB Stage-1 load window")
+
+    /* Execute-in-Place code & read-only data mapped at 0x00C0F430 (flash 0x00F430) */
+    .text 0x00C0F430 : {
         *(.text .text.*)
         *(.rodata .rodata.*)
         . = ALIGN(4);
-    } > SRAM_IMG
+    } > XIP
 
     .data : ALIGN(4) {
         _sdata = .;
         *(.data .data.*)
         . = ALIGN(4);
         _edata = .;
-    } > SRAM_IMG
+    } > SRAM AT > XIP
 
-    ASSERT((_edata - 0x00804C00) <= 0x00028000, "SRAM image exceeds safe pre-stack limit")
+    _sidata = LOADADDR(.data);
 
     .bss (NOLOAD) : ALIGN(4) {
         _sbss = .;
         *(.bss .bss.* COMMON)
         . = ALIGN(4);
         _ebss = .;
-    } > SRAM_IMG
+    } > SRAM
 
     /DISCARD/ : {
         *(.ARM.exidx* .ARM.extab* .comment .note*)

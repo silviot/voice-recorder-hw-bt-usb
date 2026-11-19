@@ -31,6 +31,28 @@
 #define SCB_AIRCR_SYSRESET  (1u << 2)
 #define SCB_CPACR_FPU_FULL  (0xFu << 20)
 
+#define NVIC_ISER(n)        REG32(0xE000E100u + 4u * (uint32_t)(n))
+#define NVIC_ICER(n)        REG32(0xE000E180u + 4u * (uint32_t)(n))
+#define NVIC_ICPR(n)        REG32(0xE000E280u + 4u * (uint32_t)(n))
+
+static inline void nvic_enable_irq(uint32_t irq)
+{
+    NVIC_ISER(irq >> 5) = (1u << (irq & 31u));
+}
+
+static inline void nvic_disable_irq(uint32_t irq)
+{
+    NVIC_ICER(irq >> 5) = (1u << (irq & 31u));
+}
+
+static inline void nvic_clear_pending(uint32_t irq)
+{
+    NVIC_ICPR(irq >> 5) = (1u << (irq & 31u));
+}
+
+#define IRQ_SDIO            44u
+#define DMAC_IRQ_BASE       60u /* CH0..CH7 = NVIC IRQ 60..67 */
+
 /* ============================================================================
  * SL6801 SoC Peripheral Base Addresses
  * ============================================================================ */
@@ -65,10 +87,24 @@
 #define AUDIO_DSP_BASE      0x400D1000u /* Audio DSP / Hardware Filter */
 
 /* ============================================================================
- * SYSCTL, US_TIMER, WDT, CRU
+ * SYSCTL, SPI NOR XIP (0x30000000), US_TIMER, WDT, CRU
  * ============================================================================ */
+#define SYSCTL_SRAM_WS0     REG32(SYSCTL_BASE + 0x04u)
+#define SYSCTL_SRAM_WS1     REG32(SYSCTL_BASE + 0x08u)
 #define SYSCTL_CPU_ID       REG32(SYSCTL_BASE + 0x0Cu) /* 0 = CPU0, !=0 = CPU1 */
+#define SYSCTL_CODEC_SRAM   REG32(SYSCTL_BASE + 0x20u) /* bit 2 = CPU access to codec SRAM */
 #define SYSCTL_CPU1_READY   REG32(SYSCTL_BASE + 0x60u) /* write 0x8 from CPU1 */
+
+#define NOR_BASE            0x30000000u
+#define NOR_XIP_WINDOW      0x00C00000u
+#define NOR_CTRL            REG32(NOR_BASE + 0x00u)  /* 0x1 = enable polling controller */
+#define NOR_XIP_CFG         REG32(NOR_BASE + 0x20u)  /* bit 25 = XIP enable */
+#define NOR_XIP_OFFSET      REG32(NOR_BASE + 0x24u)  /* flash offset mapped to 0x00C00000 */
+#define XIP_BRIDGE_CTRL     REG32(NOR_BASE + 0x204u) /* bit 8 = map AHB XIP window */
+#define XIP_CACHE_CTRL0     REG32(NOR_BASE + 0x800u)
+#define XIP_CACHE_CTRL1     REG32(NOR_BASE + 0x804u)
+#define NOR_XIP_CFG_1WIRE   0x02A09503u              /* 1-wire 0x03 read */
+#define NOR_XIP_CFG_DUAL    0x02A8993Bu              /* Fast Read Dual Output 0x3B */
 
 #define US_TIMER_LO         REG32(US_TIMER_BASE + 0x04u)
 #define US_TIMER_HI         REG32(US_TIMER_BASE + 0x08u)
@@ -79,14 +115,40 @@
 #define WDT_CTRL1           REG32(WDT_BASE + 0x1Cu)
 #define WDT_FEED_KEY        0x28000001u
 
-/* CRU IDs & SARADC clock/reset bank 2 (ID 0x54 = bit 20) */
-#define CRU_CLK_SRC_HOSC24M 0x0Au
-#define CRU_RST_PWM         0x44u
-#define CRU_CLK_PWM         0x27u
-#define CRU_RST_LCDC        0x5Cu
-#define CRU_CLK_LCDC        0x3Fu
+/* CRU raw registers & clock/reset IDs */
+#define CRU_PLL0_CTRL       REG32(CRU_BASE + 0x00u)
+#define CRU_PLL1_CTRL       REG32(CRU_BASE + 0x08u)
+#define CRU_APLL_CTRL       REG32(CRU_BASE + 0x10u)
+#define CRU_APLL_FRAC       REG32(CRU_BASE + 0x14u)
+#define CRU_PLL0_POSTDIV    REG32(CRU_BASE + 0x30u)
+#define CRU_RST_STAT1       REG32(CRU_BASE + 0x64u)  /* bank 1 reset status/release */
+#define CRU_RST_SET1        REG32(CRU_BASE + 0x74u)  /* bank 1 reset control */
+#define CRU_CLK_EN_AUDIO    REG32(CRU_BASE + 0x88u)  /* bit 0 = audio codec clk 0x13 */
 #define CRU_SARADC_CLK      REG32(CRU_BASE + 0x68u)
 #define CRU_SARADC_RST      REG32(CRU_BASE + 0x78u)
+
+#define CRU_CLK_SRC_PLL0    0x02u
+#define CRU_CLK_SRC_HOSC24M 0x0Au
+#define CRU_CLK_APLL        0x00u
+#define CRU_CLK_PLL0        0x02u
+#define CRU_CLK_CPU         0x03u
+#define CRU_CLK_HCLK        0x04u
+#define CRU_CLK_PCLK        0x05u
+#define CRU_CLK_BUS6        0x06u
+#define CRU_CLK_SDIO        0x11u
+#define CRU_CLK_AUDIO       0x13u
+#define CRU_CLK_PWM         0x27u
+#define CRU_CLK_NOR         0x2Bu
+#define CRU_CLK_LCDC        0x3Fu
+
+#define CRU_RST_NOR         0x01u
+#define CRU_RST_CODEC_SRAM  0x20u
+#define CRU_RST_DMAC        0x21u
+#define CRU_RST_SDIO        0x24u
+#define CRU_RST_AUDIO       0x25u
+#define CRU_RST_PWM         0x44u
+#define CRU_RST_XIP_BUS     0x5Au
+#define CRU_RST_LCDC        0x5Cu
 
 /* ============================================================================
  * GPIO & Pinmux (0x40081000, Ports A..D @ +0x40 stride)
@@ -160,6 +222,8 @@ static inline int gpio_read(uint32_t port, uint32_t pin)
 #define RTC_ALARM0_CTRL     REG32(AON_RTC_BASE + 0x18u)
 #define RTC_ALARM1_TIME     REG32(AON_RTC_BASE + 0x20u)
 #define RTC_ALARM1_CTRL     REG32(AON_RTC_BASE + 0x24u)
+#define AON_PWR_CTRL0       REG32(AON_RTC_BASE + 0x60u)
+#define AON_PLL_CTRL        REG32(AON_RTC_BASE + 0xD8u) /* bit 2 = PLL0 LDO/power */
 
 #define RTWI_CTRL           REG32(RTWI_BASE + 0x00u)
 #define RTWI_CMD            REG32(RTWI_BASE + 0x04u) /* bit31=BUSY, bit30=1, [15:8]=reg, [7:0]=0x60/0x61 */
@@ -179,12 +243,80 @@ static inline int gpio_read(uint32_t port, uint32_t pin)
 #define SARADC_CH1_DATA     REG32(SARADC_BASE + 0x34u) /* bits [11:0] continuous scan */
 
 /* ============================================================================
- * Audio Codec, IPC Mailbox, Spinlocks & CPU1 Boot Mailbox
+ * 1-Bit SDIO / SDMMC Controller (0x40003000, PD5=CLK, PD4=CMD, PD6=D0)
  * ============================================================================ */
-#define CODEC_MICBIAS       REG32(AUDIO_CODEC_BASE + 0x00u) /* bits [25:24] */
-#define CODEC_AMIC1_CTRL    REG32(AUDIO_CODEC_BASE + 0x08u) /* PGA gain bits [28:24] (0..31) */
-#define CODEC_AMIC2_CTRL    REG32(AUDIO_CODEC_BASE + 0x0Cu) /* PGA gain bits [14:8]  (0..127) */
-#define CODEC_ADC_MUX       REG32(AUDIO_CODEC_BASE + 0x20u) /* bits [11:8] & [19:16] */
+#define SDIO_CTRL           REG32(SDIO_BASE + 0x000u)
+#define SDIO_CMD            REG32(SDIO_BASE + 0x004u)
+#define SDIO_ARG            REG32(SDIO_BASE + 0x008u)
+#define SDIO_BLKSIZ         REG32(SDIO_BASE + 0x00Cu)
+#define SDIO_BYTCNT         REG32(SDIO_BASE + 0x010u)
+#define SDIO_INTMASK        REG32(SDIO_BASE + 0x014u)
+#define SDIO_RINTSTS        REG32(SDIO_BASE + 0x034u)
+#define SDIO_RESP0          REG32(SDIO_BASE + 0x038u)
+#define SDIO_RESP1          REG32(SDIO_BASE + 0x03Cu)
+#define SDIO_RESP2          REG32(SDIO_BASE + 0x040u)
+#define SDIO_RESP3          REG32(SDIO_BASE + 0x044u)
+#define SDIO_STATUS         REG32(SDIO_BASE + 0x048u)
+#define SDIO_FIFOTH         REG32(SDIO_BASE + 0x04Cu)
+#define SDIO_TMOUT          REG32(SDIO_BASE + 0x064u)
+#define SDIO_BMOD           REG32(SDIO_BASE + 0x100u)
+#define SDIO_FIFO           REG32(SDIO_BASE + 0x200u)
+
+#define SDIO_INT_CMD_DONE   (1u << 2)
+#define SDIO_INT_DTO        (1u << 3)
+#define SDIO_INT_TXDR       (1u << 4)
+#define SDIO_INT_RXDR       (1u << 5)
+#define SDIO_INT_RCRC       (1u << 6)
+#define SDIO_INT_RTO        (1u << 8)
+#define SDIO_INT_DRTO       (1u << 9)
+#define SDIO_STAT_FIFO_EMP  (1u << 2)
+#define SDIO_STAT_FIFO_FULL (1u << 3)
+
+/* ============================================================================
+ * Audio Codec (0x40009000) & DMAC (0x40001000)
+ * ============================================================================ */
+#define CODEC_MICBIAS       REG32(AUDIO_CODEC_BASE + 0x000u) /* bits [25:24] */
+#define CODEC_ANA_CTRL0     REG32(AUDIO_CODEC_BASE + 0x000u)
+#define CODEC_AMIC1_CTRL    REG32(AUDIO_CODEC_BASE + 0x008u) /* PGA gain bits [28:24] (0..31) */
+#define CODEC_AMIC01_PGA    REG32(AUDIO_CODEC_BASE + 0x008u)
+#define CODEC_AMIC2_CTRL    REG32(AUDIO_CODEC_BASE + 0x00Cu) /* PGA gain bits [14:8] (0..127) */
+#define CODEC_ADC_MUX       REG32(AUDIO_CODEC_BASE + 0x020u) /* bits [11:8] & [19:16] */
+#define CODEC_ADC_CH_MUX    REG32(AUDIO_CODEC_BASE + 0x020u)
+#define CODEC_ANA_MISC      REG32(AUDIO_CODEC_BASE + 0x0FCu)
+#define CODEC_GLB           REG32(AUDIO_CODEC_BASE + 0x100u)
+#define CODEC_DAC0_MUTE     REG32(AUDIO_CODEC_BASE + 0x134u)
+#define CODEC_DAC0_VOL      REG32(AUDIO_CODEC_BASE + 0x138u)
+#define CODEC_DAC1_MUTE     REG32(AUDIO_CODEC_BASE + 0x154u)
+#define CODEC_DAC1_VOL      REG32(AUDIO_CODEC_BASE + 0x158u)
+#define CODEC_DAC2_MUTE     REG32(AUDIO_CODEC_BASE + 0x174u)
+#define CODEC_DAC2_VOL      REG32(AUDIO_CODEC_BASE + 0x178u)
+#define CODEC_ADC_DIG_CTRL  REG32(AUDIO_CODEC_BASE + 0x200u)
+#define CODEC_ADC_FIFO_CTRL REG32(AUDIO_CODEC_BASE + 0x208u)
+#define CODEC_ADC_RX_FIFO_ADDR (AUDIO_CODEC_BASE + 0x20Cu)
+#define CODEC_ADC_RX_FIFO   REG32(CODEC_ADC_RX_FIFO_ADDR)
+#define CODEC_ADC_CH_CTRL(ch) REG32(AUDIO_CODEC_BASE + 0x220u + (uint32_t)(ch) * 0x30u)
+#define CODEC_ADC_CH_GAIN(ch) REG32(AUDIO_CODEC_BASE + 0x228u + (uint32_t)(ch) * 0x30u)
+#define CODEC_SRAM_START    (AUDIO_CODEC_BASE + 0x400u)
+#define CODEC_SRAM_END      (AUDIO_CODEC_BASE + 0x600u)
+
+#define DMAC_CH_BASE(ch)     (DMAC_BASE + ((uint32_t)(ch) * 0x40u))
+#define DMAC_CH_CTL(ch)      REG32(DMAC_CH_BASE(ch) + 0x00u)
+#define DMAC_CH_SRC(ch)      REG32(DMAC_CH_BASE(ch) + 0x04u)
+#define DMAC_CH_DST(ch)      REG32(DMAC_CH_BASE(ch) + 0x08u)
+#define DMAC_CH_XFER_CNT(ch) REG32(DMAC_CH_BASE(ch) + 0x0Cu)
+#define DMAC_CH_IRQ_EN(ch)   REG32(DMAC_CH_BASE(ch) + 0x20u)
+#define DMAC_CH_IRQ_STAT(ch) REG32(DMAC_CH_BASE(ch) + 0x24u)
+
+#define DMAC_REQ_AUDIO_ADC_RX 1u
+#define DMAC_CTL_ADC_RX_BASE  0x002A0281u /* SRC=ADC_RX(1) fixed 32b b4 -> DST=MEM inc 32b b4 */
+#define DMAC_CTL_CH_EN        (1u << 30)
+#define DMAC_CTL_RELOAD       (1u << 29)
+#define DMAC_IRQ_TC           (1u << 0)
+#define DMAC_IRQ_HT           (1u << 1)
+
+/* ============================================================================
+ * IPC Mailbox, Spinlocks & CPU1 Boot Mailbox
+ * ============================================================================ */
 
 #define MBOX_CPU0_IRQ_STAT  REG32(IPC_MBOX_BASE + 0x24u)
 #define MBOX_CPU1_IRQ_STAT  REG32(IPC_MBOX_BASE + 0x2Cu)

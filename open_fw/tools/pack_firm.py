@@ -18,6 +18,7 @@ from pathlib import Path
 FIRM_HEADER_SIZE = 0x30
 FIRM_PAD_SIZE = 0x400
 FIRM_RAM_LOAD = 0x00804C00
+FIRM_BOOT_WINDOW = 0x1000
 FIRM_MAX_RAM = 0x00028000
 FIRM_FLASH_OFF = 0x00E000
 PART_TABLE_OFF = 0x00D000
@@ -34,21 +35,39 @@ def crc16_ccitt_false(data: bytes, init: int = 0xFFFF) -> int:
     return crc
 
 
-def build_firm_partition(ram_img: bytes, entry_addr: int, timestamp: int) -> bytes:
-    if len(ram_img) > FIRM_MAX_RAM:
-        raise ValueError(f"ram_img ({len(ram_img)} B) exceeds safe pre-stack limit ({FIRM_MAX_RAM} B)")
+def build_firm_partition(
+    ram_img: bytes,
+    entry_addr: int,
+    timestamp: int,
+    xip_img: bytes = b"",
+) -> bytes:
+    if xip_img:
+        if len(ram_img) > FIRM_BOOT_WINDOW:
+            raise ValueError(
+                f"ram_boot ({len(ram_img)} B) exceeds 4 KiB Stage-1 window ({FIRM_BOOT_WINDOW} B)"
+            )
+        ram_padded = ram_img + b"\x00" * (FIRM_BOOT_WINDOW - len(ram_img))
+        xip_aligned_len = (len(xip_img) + 3) & ~3
+        xip_padded = xip_img + b"\x00" * (xip_aligned_len - len(xip_img))
+        load_len = FIRM_BOOT_WINDOW
+        body_after_hdr = (b"\x00" * FIRM_PAD_SIZE) + ram_padded + xip_padded
+    else:
+        if len(ram_img) > FIRM_MAX_RAM:
+            raise ValueError(
+                f"ram_img ({len(ram_img)} B) exceeds safe pre-stack limit ({FIRM_MAX_RAM} B)"
+            )
+        load_len = (len(ram_img) + 3) & ~3
+        ram_padded = ram_img + b"\x00" * (load_len - len(ram_img))
+        body_after_hdr = (b"\x00" * FIRM_PAD_SIZE) + ram_padded
 
-    aligned_len = (len(ram_img) + 3) & ~3
-    ram_padded = ram_img + b"\x00" * (aligned_len - len(ram_img))
-    body_after_hdr = (b"\x00" * FIRM_PAD_SIZE) + ram_padded
-    ram_crc = crc16_ccitt_false(body_after_hdr[:aligned_len])
+    ram_crc = crc16_ccitt_false(body_after_hdr[:load_len])
 
     hdr = bytearray(FIRM_HEADER_SIZE)
     struct.pack_into("<I", hdr, 0x00, FIRM_HEADER_SIZE)
     struct.pack_into("<I", hdr, 0x04, timestamp & 0xFFFFFFFF)
     struct.pack_into("<I", hdr, 0x10, FIRM_RAM_LOAD)
     struct.pack_into("<I", hdr, 0x14, entry_addr | 1)
-    struct.pack_into("<I", hdr, 0x18, aligned_len)
+    struct.pack_into("<I", hdr, 0x18, load_len)
     struct.pack_into("<I", hdr, 0x1C, ram_crc)
 
     return bytes(hdr) + body_after_hdr
@@ -86,7 +105,10 @@ def build_full_image_and_up(
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Pack standalone SL6801 open_fw FIRM partition.")
-    p.add_argument("--ram-img", type=Path, required=True, help="Flat SRAM binary starting at 0x00804C00")
+    src = p.add_mutually_exclusive_group(required=True)
+    src.add_argument("--ram-boot", type=Path, help="<= 4 KiB SRAM bootstrap binary (0x00804C00)")
+    src.add_argument("--ram-img", type=Path, help="Legacy flat SRAM-only binary (0x00804C00)")
+    p.add_argument("--xip", type=Path, default=None, help="SPI NOR XIP payload mapped at 0x00C0F430")
     p.add_argument("--entry", type=lambda s: int(s, 0), default=0x00804C01, help="Thumb entry address")
     p.add_argument("--out-firm", type=Path, required=True, help="Output standalone FIRM partition binary")
     p.add_argument("--base-hlkj", type=Path, default=None, help="Optional 2 MB base dump for HLKJ + PSMP")
@@ -94,18 +116,33 @@ def main() -> None:
     p.add_argument("--out-update-up", type=Path, default=None, help="Output 0:\\update.up OTA package")
     args = p.parse_args()
 
-    ram_img = args.ram_img.read_bytes()
     ts = int(time.time()) & 0xFFFFFFFF
+    if args.ram_boot is not None:
+        if args.xip is None:
+            p.error("--ram-boot requires --xip")
+        ram_img = args.ram_boot.read_bytes()
+        xip_img = args.xip.read_bytes()
+    else:
+        ram_img = args.ram_img.read_bytes()
+        xip_img = b""
 
-    firm = build_firm_partition(ram_img, args.entry, ts)
+    firm = build_firm_partition(ram_img, args.entry, ts, xip_img=xip_img)
     firm_crc = crc16_ccitt_false(firm)
     args.out_firm.parent.mkdir(parents=True, exist_ok=True)
     args.out_firm.write_bytes(firm)
-    print(
-        f"Packed standalone FIRM: {args.out_firm} ({len(firm):,} B: "
-        f"48 B hdr + 1024 B pad + {len(ram_img):,} B SRAM image, "
-        f"entry=0x{args.entry | 1:08X}, FIRM CRC-16=0x{firm_crc:04X})"
-    )
+    if xip_img:
+        print(
+            f"Packed hybrid FIRM: {args.out_firm} ({len(firm):,} B: "
+            f"48 B hdr + 1024 B pad + {len(ram_img):,} B/4096 B ram_boot + "
+            f"{len(xip_img):,} B XIP @ 0x00C0F430, entry=0x{args.entry | 1:08X}, "
+            f"FIRM CRC-16=0x{firm_crc:04X})"
+        )
+    else:
+        print(
+            f"Packed standalone FIRM: {args.out_firm} ({len(firm):,} B: "
+            f"48 B hdr + 1024 B pad + {len(ram_img):,} B SRAM image, "
+            f"entry=0x{args.entry | 1:08X}, FIRM CRC-16=0x{firm_crc:04X})"
+        )
 
     if args.base_hlkj is not None:
         full_bin, up_bytes = build_full_image_and_up(args.base_hlkj.read_bytes(), firm)

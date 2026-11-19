@@ -570,3 +570,23 @@ Scanning all literal-pool loads and `MOVT` instructions across `bootrom_384K.bin
 
 * **19 Active Tasks:** 9 OAL tasks (`MainTask` p1, `TransmitTask` p4, `ViewTask` **[CPU1]** p0, `bt_host_task` p3, `Master_CPU_Recv_Task` p4, `MediaTask` p3, `MgrTask` p3, `DbsTask` p1, `PreTask` p3) + 10 direct FreeRTOS tasks on CPU0 (`_dev_service_task_` p3, `pmu_isr_bh` p3, `crab_monitor` p3, dynamic audio engine, `cli` p3 on `/dev/uart2`, `call save process` p1, `bt_isr_bh` **p19**, `task btc` **p9**, `_tf_write` p3, `build index` p1).
 * **15 POSIX `/dev/*` Nodes Registered at Boot (`0x00D39040`):** `/dev/uart2`, `/dev/pmu`, `/dev/timer`, `/dev/audio0`, `/dev/audio1`, `/dev/sd`, `/dev/lcd`, `/dev/usbd`, `/dev/rtc`, `/dev/wdog`, `/dev/pwm_ch3`, `/dev/exti`, `/dev/kadc_ch1`, `/dev/key_onoff`, `/dev/key_io`.
+
+---
+
+## 18. Verified CPU PLL, SPI NOR XIP, 1-Bit SDIO & Audio ADC + DMAC Architecture
+
+Verified via Thumb-2 disassembly (`FIRM` and BootROM `0x000000..0x05FFFF`) for clean-room bare-metal implementation in [open_fw](open_fw/):
+
+### 18.1 CPU PLL0 (`CRU = 0x40080000`) & SPI NOR XIP (`0x30000000..0x30000804`)
+* **PLL0 Frequency:** `f_PLL0 = 48 MHz * M / N` (`CRU+0x00`: `[3:0]=N`, `[15:8]=M`, `[28]=LOCK`, `[16]=OUT_EN`, `[31:30]=0x3`); `AON+0xD8` bit 2 supplies PLL0 analog power.
+* **Bus & CPU Bring-Up:** Park `clk 3` (`CPU`) and `clk 6` (`BUS6`) on `0x0A` (24 MHz HOSC), configure SRAM wait states (`SYSCTL+0x04` and `SYSCTL+0x08`), lock `PLL0` via BootROM `0x00003904(2, pll_hz)`, set dividers (`CPU /2`, `HCLK /1`, `PCLK /1`), then switch `clk 3` and `clk 6` to `0x02` (`PLL0`). `pll_hz = 192 MHz` yields a stable **96 MHz CPU** and `32 MHz` bus without bumping PMU core voltage.
+* **SPI NOR XIP Mapping (`0x00C00000`):** Release CRU resets `0x5A` (XIP bus) and `0x01` (SPI NOR), configure `PA0..PA3` (`mux=2`) + `PA4..PA5` high (1-wire `WP#`/`HOLD#`), set clock `0x2B` on `PLL0`, set `0x30000000 = 0x1` (`NOR_CTRL`), `0x30000020 = 0x02A09503` (1-wire `0x03` XIP; `0x02A8993B` for Dual `0x3B`), `0x30000204 |= (1<<8)` (`XIP_BRIDGE_CTRL`), `0x30000024 = 0`, and enable the 2048 KB XIP I-cache via `0x30000800`/`0x30000804`. Because Stage-1 loads `loadLength = 0x1000` (4 KiB) from `0x00E430` to SRAM `0x00804C00`, flash `0x00F430+` executes directly at `0x00C0F430+`.
+
+### 18.2 Bare-Metal 1-Bit SDIO (`0x40003000`, `PD4/PD5/PD6`)
+* **Pinmux:** The microSD socket is wired in **1-bit SDIO mode only** (`PD5` `CLK` `0x00032D90`, `PD4` `CMD` `0x0003259B`, `PD6` `D0` `0x0003359B`; `D1..D3` unconnected, never send `ACMD6` 4-bit). CRU reset ID is `0x24`, clock ID is `0x11` on `0x0A` (24 MHz HOSC), NVIC IRQ is `44` (`0x2C`).
+* **Why Raw Polling Avoids Two Bugs:** BootROM SDIO helpers (`0x0004CFBC`/`0x0004D01C`) use SRAM at `0x00804A04` (colliding with the vector table region below `0x00804C00`), and stock `FIRM` multi-block `CMD18`/`CMD12` suffers from end-of-disk stalls. Raw DesignWare `dw_mmc` polling at `0x40003000` (`SDIO_CTRL=0x40000000`, `SDIO_BMOD|=0x2`, FIFO at `+0x200`) with single-block `CMD17` (`0x2351`) and `CMD24` (`0x2758`) avoids both issues cleanly.
+
+### 18.3 Audio ADC (`AMIC1`, `0x40009000`) & DMAC (`0x40001000`, IRQ `60..67`)
+* **Audio PLL (`CRU+0x10`/`0x14`):** `CRU_APLL_CTRL = (.. & 0xFC1F0000) | 0x3060` (`int=3`), `CRU_APLL_FRAC = (.. & 0x3800) | 0x80000400 | (0x3126 << 14)`, enable `|= 0xC0000000`, poll bit `28` lock -> **`24.576 MHz`** for the 8/16/32/48 kHz rate family (codec reset `0x25`, clock `0x13`, codec SRAM reset `0x20` + `0x40009400..0x400095FF` zeroing via `0x40000020` bit 2).
+* **16 kHz Mono `AMIC1` Capture:** `PB12`/`PB13` mux=`15`, `CODEC_ANA_CTRL0` core powerup (`0xC0000022`) + `MICBIAS0/1` (`0x03000000`), `CODEC+0x08` differential `AMIC1` (`0x20430000`, gain `[28:24]` `0..31`), `CODEC+0x20` mux `AMIC1` (`0xD` in `[11:8]`), `CODEC+0x200` rate=`3` (`16 kHz`) + run bit 1, `CODEC+0x208` `0x84` (16-bit + RX FIFO DMA request), RX FIFO data port at **`0x4000920C`**.
+* **DMAC (`0x40001000 + ch*0x40`, NVIC IRQ `60 + ch`):** Release CRU reset `0x21`, program `CTL = 0x002A0281` (`SRC_REQ=1` Audio ADC RX fixed 32-bit burst-4 -> `DST_REQ=0` SRAM incrementing 32-bit burst-4), `SRC=0x4000920C`, `XFER_CNT = 0xFF000000 | bytes`, `IRQ_EN = 0x00080001` (`TC_IE`), set `CTL |= (1<<30)` (`CH_EN`), and re-arm the alternate ping-pong buffer in `DMAC_CH1_IRQHandler` (IRQ `61`, vector slot `77`).
