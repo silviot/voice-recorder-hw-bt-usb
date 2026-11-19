@@ -10,9 +10,11 @@ Matches Stage-1 Bootloader handoff (`0x00820470..0x008204E0`):
 
 SPDX-License-Identifier: MIT
 """
+from __future__ import annotations
+
 import argparse
+import os
 import struct
-import time
 from pathlib import Path
 
 FIRM_HEADER_SIZE = 0x30
@@ -103,6 +105,17 @@ def build_full_image_and_up(
     return bytes(raw), up_bytes
 
 
+def resolve_timestamp(cli_timestamp: int | None) -> int:
+    """Resolve deterministic FIRM header timestamp (--timestamp > SOURCE_DATE_EPOCH > 0)."""
+    if cli_timestamp is not None:
+        return cli_timestamp & 0xFFFFFFFF
+    env_ts = os.environ.get("SOURCE_DATE_EPOCH", "").strip()
+    if env_ts:
+        base = 0 if env_ts.lower().startswith(("0x", "0b", "0o")) else 10
+        return int(env_ts, base) & 0xFFFFFFFF
+    return 0
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="Pack standalone SL6801 open_fw FIRM partition.")
     src = p.add_mutually_exclusive_group(required=True)
@@ -110,13 +123,19 @@ def main() -> None:
     src.add_argument("--ram-img", type=Path, help="Legacy flat SRAM-only binary (0x00804C00)")
     p.add_argument("--xip", type=Path, default=None, help="SPI NOR XIP payload mapped at 0x00C0F430")
     p.add_argument("--entry", type=lambda s: int(s, 0), default=0x00804C01, help="Thumb entry address")
+    p.add_argument(
+        "--timestamp",
+        type=lambda s: int(s, 0),
+        default=None,
+        help="FIRM header timestamp (base-0 int; defaults to SOURCE_DATE_EPOCH or 0)",
+    )
     p.add_argument("--out-firm", type=Path, required=True, help="Output standalone FIRM partition binary")
     p.add_argument("--base-hlkj", type=Path, default=None, help="Optional 2 MB base dump for HLKJ + PSMP")
     p.add_argument("--out-bin", type=Path, default=None, help="Output complete 2 MB flash image")
     p.add_argument("--out-update-up", type=Path, default=None, help="Output 0:\\update.up OTA package")
     args = p.parse_args()
 
-    ts = int(time.time()) & 0xFFFFFFFF
+    ts = resolve_timestamp(args.timestamp)
     if args.ram_boot is not None:
         if args.xip is None:
             p.error("--ram-boot requires --xip")

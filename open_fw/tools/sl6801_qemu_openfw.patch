@@ -1,0 +1,119 @@
+diff --git a/emulator/qemu/smartlink_audio.c b/emulator/qemu/smartlink_audio.c
+index 8948261..0b93c6a 100644
+--- a/emulator/qemu/smartlink_audio.c
++++ b/emulator/qemu/smartlink_audio.c
+@@ -24,6 +24,7 @@
+ #include "hw/qdev-properties-system.h"
+ #include "chardev/char-fe.h"
+ #include "qapi/error.h"
++#include "qapi/visitor.h"
+ #include "qemu/module.h"
+ #include "qemu/timer.h"
+ #include "hw/sysbus.h"
+diff --git a/emulator/qemu/smartlink_sl6801.c b/emulator/qemu/smartlink_sl6801.c
+index 26e7552..b582e00 100644
+--- a/emulator/qemu/smartlink_sl6801.c
++++ b/emulator/qemu/smartlink_sl6801.c
+@@ -234,6 +234,8 @@ struct SL6801MachineState {
+     MemoryRegion io_lcd;
+     MemoryRegion io_dma;
+     MemoryRegion console;
++    MemoryRegion io_uart0;
++    uint32_t uart0_reg[16];
+     MemoryRegion io_cpld;
+     MemoryRegion io_rcc;
+     uint32_t rcc_dma_status;
+@@ -1118,6 +1120,32 @@ static void sl6801_console_write(void *opaque, hwaddr offset,
+     }
+ }
+ 
++static uint64_t sl6801_uart0_read(void *opaque, hwaddr offset, unsigned size)
++{
++    SL6801MachineState *s = opaque;
++
++    if (offset == 0x08) {
++        return 0x10; /* 16 TX FIFO slots free */
++    }
++    return s->uart0_reg[(offset >> 2) & 15];
++}
++
++static void sl6801_uart0_write(void *opaque, hwaddr offset,
++                               uint64_t value, unsigned size)
++{
++    SL6801MachineState *s = opaque;
++
++    if (offset == 0x00) {
++        char c = (char)(value & 0xff);
++        fputc(c, stderr);
++        if (c == '\n') {
++            fflush(stderr);
++        }
++        return;
++    }
++    s->uart0_reg[(offset >> 2) & 15] = (uint32_t)value;
++}
++
+ static bool sl6801_rtc_localtime(SL6801MachineState *s, struct tm *tmv)
+ {
+     time_t now;
+@@ -2209,14 +2237,27 @@ static void sl6801_lcd2_write(void *opaque, hwaddr offset, uint64_t value,
+     case 0x24:                      /* command byte */
+         sl6801_lcd2_set_command(s, value & 0xff);
+         break;
+-    case 0x30:                      /* value latch */
+-        s->dcs_value = value & 0xffff;
++    case 0x30:                      /* value latch (up to 4 bytes LSB-first) */
++        s->dcs_value = (uint32_t)value;
+         break;
+-    case 0x28:                      /* data kind: 0 = param, 1 = pixel */
++    case 0x28:                      /* data_len = byte_count - 1 */
+         if ((value & 0xff) == 0) {
+             sl6801_lcd2_param(s, s->dcs_value & 0xff);
+         } else if ((value & 0xff) == 1 && s->dcs_ramwr) {
+             sl6801_lcd2_put_pixel(s, s->dcs_value & 0xffff);
++        } else if ((value & 0xff) == 3) {
++            if (!s->dcs_ramwr) {
++                for (int i = 0; i < 4; i++) {
++                    sl6801_lcd2_param(s, (s->dcs_value >> (i * 8)) & 0xff);
++                }
++            } else {
++                uint8_t b0 = (uint8_t)(s->dcs_value);
++                uint8_t b1 = (uint8_t)(s->dcs_value >> 8);
++                uint8_t b2 = (uint8_t)(s->dcs_value >> 16);
++                uint8_t b3 = (uint8_t)(s->dcs_value >> 24);
++                sl6801_lcd2_put_pixel(s, (uint16_t)(((uint16_t)b0 << 8) | b1));
++                sl6801_lcd2_put_pixel(s, (uint16_t)(((uint16_t)b2 << 8) | b3));
++            }
+         }
+         break;
+     case 0x14:
+@@ -2534,6 +2575,16 @@ static const MemoryRegionOps sl6801_console_ops = {
+     .valid.max_access_size = 4,
+ };
+ 
++static const MemoryRegionOps sl6801_uart0_ops = {
++    .read = sl6801_uart0_read,
++    .write = sl6801_uart0_write,
++    .endianness = DEVICE_NATIVE_ENDIAN,
++    .impl.min_access_size = 1,
++    .impl.max_access_size = 4,
++    .valid.min_access_size = 1,
++    .valid.max_access_size = 4,
++};
++
+ static const MemoryRegionOps sl6801_ones_ops = {
+     .read = sl6801_ones_read,
+     .write = sl6801_ones_write,
+@@ -3396,6 +3447,12 @@ static void sl6801_init(MachineState *machine)
+     memory_region_add_subregion_overlap(system_memory, 0x4000F000,
+                                         &s->console, 3);
+ 
++    /* Hardware UART0 debug TX/STAT at 0x40090000. */
++    memory_region_init_io(&s->io_uart0, NULL, &sl6801_uart0_ops, s,
++                          "sl6801.io_uart0", 0x1000);
++    memory_region_add_subregion_overlap(system_memory, 0x40090000,
++                                        &s->io_uart0, 3);
++
+     memory_region_init_io(&s->io_cpld, NULL, &sl6801_cpld_ops, s,
+                           "sl6801.io_cpld", 0x1000);
+     memory_region_add_subregion_overlap(system_memory, 0x40085000,

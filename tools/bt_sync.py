@@ -29,6 +29,7 @@ from typing import Dict, List, Optional, Tuple
 
 
 DEFAULT_NAME_PREFIX = "HW_"
+DEFAULT_NAME_PREFIXES = ("Cassini_", "HW_")
 DEFAULT_KEY_FILE = Path.home() / ".config" / "hw76-sync" / "keys.json"
 CHUNK_SIZE = 640  # 12 B header + 640 B = 652 B <= 660 B RFCOMM MTU (with bt-rfcomm-turbo; use 480 on stock MTU)
 DEFAULT_BURST_SIZE = 3840  # 6 x 640 B frames per +XREC:GETS burst (~92-96 KB/s, safe within K=7 credits)
@@ -78,7 +79,7 @@ def discover_hw_mac(explicit_mac: Optional[str] = None) -> Optional[str]:
         out = subprocess.check_output(["bluetoothctl", "devices"], text=True)
         for line in out.splitlines():
             m = re.search(r"Device ([0-9A-F:]{17}) (.*)", line)
-            if m and m.group(2).strip().startswith(DEFAULT_NAME_PREFIX):
+            if m and m.group(2).strip().startswith(DEFAULT_NAME_PREFIXES):
                 return m.group(1)
     except Exception:
         pass
@@ -455,7 +456,7 @@ def main() -> None:
 
     mac = discover_hw_mac(args.mac)
     if not mac:
-        print("Could not find HW_76 in BlueZ paired devices. Pass --mac XX:XX:XX:XX:XX:XX.")
+        print("Could not find Cassini_* or HW_* in BlueZ paired devices. Pass --mac XX:XX:XX:XX:XX:XX.")
         sys.exit(1)
 
     client = XRecRFCOMMClient(mac)

@@ -25,6 +25,8 @@ import sys
 
 VID = 0x301A
 PID_CARDREADER = 0x2801
+OPENFW_VID = 0x1209
+OPENFW_PID = 0x0001
 
 # Boot ROM USB MSC buffer layout (0x00800DE8..0x00800FEF):
 #   0x00800DEE: uint16_t tx_len (Bulk-IN response length)
@@ -93,6 +95,12 @@ class SL6801Usb:
         self._usb_util = usb.util
         self.dev = usb.core.find(idVendor=vid, idProduct=pid)
         if self.dev is None:
+            openfw_dev = usb.core.find(idVendor=OPENFW_VID, idProduct=OPENFW_PID)
+            if openfw_dev is not None:
+                raise SystemExit(
+                    "Cassini OpenFW (1209:0001) detected instead of stock SL6801 Card Reader (301a:2801).\n"
+                    "Run `python3 tools/openfw_usb.py --rtc-sync` instead of stock BootROM stubs."
+                )
             raise SystemExit(f"Smartlink SL6801 ({vid:04x}:{pid:04x}) not found. Plug in and select 'Charge & Transfer'.")
 
         self._reattach = False
