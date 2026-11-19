@@ -2,12 +2,14 @@
 #
 # Usage:
 #   make -C open_fw            # Compile & pack standalone open_fw FIRM partition
+#   make -C open_fw test-host  # Compile & run host unit tests (crypto, wav, exfat)
 #   make -C open_fw update-up  # Also build 2 MB flash image + 0:\update.up (requires ../dumps/firmware_2M.bin)
 #   make -C open_fw clean      # Remove build artifacts
 #
 # SPDX-License-Identifier: MIT
 
 CLANG    ?= clang
+HOST_CC  ?= cc
 LLD      ?= $(shell which ld.lld 2>/dev/null || find /usr/lib "$${ANDROID_HOME:-$$HOME/Android/Sdk}/ndk" -maxdepth 8 \( -type f -o -type l \) -executable -name ld.lld 2>/dev/null | head -n 1)
 OBJCOPY  ?= $(shell which llvm-objcopy 2>/dev/null || find /usr/lib "$${ANDROID_HOME:-$$HOME/Android/Sdk}/ndk" -maxdepth 8 \( -type f -o -type l \) -executable -name llvm-objcopy 2>/dev/null | head -n 1)
 
@@ -17,7 +19,10 @@ CFLAGS   := --target=thumbv7em-none-eabi -mcpu=cortex-m4 -mfloat-abi=soft -mthum
             -Os -Wall -Wextra -ffreestanding -fno-builtin -fno-stack-protector \
             -Iinclude -I$(BUILD_DIR)
 
-SRCS      := src/startup.c src/wdt_timer.c src/rtc.c src/uart.c src/pmu.c src/keys.c src/lcd_st7735s.c src/main.c
+HOST_CFLAGS := -O2 -Wall -Wextra -Werror -Iinclude
+
+SRCS      := src/startup.c src/wdt_timer.c src/rtc.c src/uart.c src/pmu.c \
+             src/keys.c src/lcd_st7735s.c src/crypto.c src/wav.c src/exfat.c src/main.c
 OBJS      := $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(SRCS))
 
 SPLASH_PNG  := ../assets/cassini_welcome_80x40.png
@@ -26,7 +31,7 @@ STOCK_DUMP  := ../dumps/firmware_2M.bin
 OUT_BIN     := ../dumps/firmware_2M_openfw.bin
 OUT_UP      := ../dumps/update_openfw.up
 
-.PHONY: all update-up clean
+.PHONY: all test-host update-up clean
 
 all: $(BUILD_DIR)/open_fw_firm.bin
 
@@ -39,7 +44,7 @@ $(SPLASH_HDR): $(SPLASH_PNG) tools/png_to_rgb565_h.py | $(BUILD_DIR)
 $(BUILD_DIR)/main.o: src/main.c $(SPLASH_HDR) include/sl6801_regs.h include/openfw.h | $(BUILD_DIR)
 	$(CLANG) $(CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/%.o: src/%.c include/sl6801_regs.h include/sl6801_rom.h include/openfw.h | $(BUILD_DIR)
+$(BUILD_DIR)/%.o: src/%.c include/sl6801_regs.h include/sl6801_rom.h include/openfw.h include/openfw_crypto.h include/openfw_wav.h include/openfw_fs.h | $(BUILD_DIR)
 	$(CLANG) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/open_fw.elf: $(OBJS) sl6801_firm.ld
@@ -52,6 +57,10 @@ $(BUILD_DIR)/open_fw_ram.bin: $(BUILD_DIR)/open_fw.elf
 
 $(BUILD_DIR)/open_fw_firm.bin: $(BUILD_DIR)/open_fw_ram.bin tools/pack_firm.py
 	python3 tools/pack_firm.py --ram-img $< --out-firm $@
+
+test-host: tests/test_core.c src/crypto.c src/wav.c src/exfat.c | $(BUILD_DIR)
+	$(HOST_CC) $(HOST_CFLAGS) $^ -o $(BUILD_DIR)/test_core
+	$(BUILD_DIR)/test_core
 
 update-up: $(BUILD_DIR)/open_fw_ram.bin tools/pack_firm.py
 	@test -f "$(STOCK_DUMP)" || (echo "Error: $(STOCK_DUMP) not found" >&2; exit 1)

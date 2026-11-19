@@ -89,3 +89,57 @@ void reset_c_entry(void)
         __asm__ volatile ("wfi");
     }
 }
+
+/* Bare-metal ARM EABI memory helpers emitted by Clang for struct copies */
+void __aeabi_memcpy(void *dst, const void *src, uint32_t n)
+{
+    uint8_t *d = (uint8_t *)dst;
+    const uint8_t *s = (const uint8_t *)src;
+    while (n-- > 0u) {
+        *d++ = *s++;
+    }
+}
+
+void __aeabi_memcpy4(void *dst, const void *src, uint32_t n)
+{
+    __aeabi_memcpy(dst, src, n);
+}
+
+void __aeabi_memcpy8(void *dst, const void *src, uint32_t n)
+{
+    __aeabi_memcpy(dst, src, n);
+}
+
+void __aeabi_memset(void *dst, uint32_t n, int c)
+{
+    uint8_t *d = (uint8_t *)dst;
+    uint8_t v = (uint8_t)c;
+    while (n-- > 0u) {
+        *d++ = v;
+    }
+}
+
+void __aeabi_memset4(void *dst, uint32_t n, int c)
+{
+    __aeabi_memset(dst, n, c);
+}
+
+void __aeabi_memset8(void *dst, uint32_t n, int c)
+{
+    __aeabi_memset(dst, n, c);
+}
+
+void __aeabi_memclr(void *dst, uint32_t n)
+{
+    __aeabi_memset(dst, n, 0);
+}
+
+void __aeabi_memclr4(void *dst, uint32_t n)
+{
+    __aeabi_memset(dst, n, 0);
+}
+
+void __aeabi_memclr8(void *dst, uint32_t n)
+{
+    __aeabi_memset(dst, n, 0);
+}
