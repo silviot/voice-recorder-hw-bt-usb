@@ -34,7 +34,7 @@ STOCK_DUMP  := ../dumps/firmware_2M.bin
 OUT_BIN     := ../dumps/firmware_2M_openfw.bin
 OUT_UP      := ../dumps/update_openfw.up
 
-.PHONY: all test-host update-up clean
+.PHONY: all test-host test-qemu update-up clean
 
 all: $(BUILD_DIR)/open_fw_firm.bin
 
@@ -72,6 +72,11 @@ test-host: tests/test_core.c src/crypto.c src/wav.c src/exfat.c src/usb_scsi.c s
 	/usr/sbin/mkfs.exfat -q -b 4096 -c 4096 $(BUILD_DIR)/test_exfat.img
 	$(BUILD_DIR)/test_core --exfat-img $(BUILD_DIR)/test_exfat.img
 	/usr/sbin/fsck.exfat -n $(BUILD_DIR)/test_exfat.img
+	$(HOST_CC) $(HOST_CFLAGS) -DOPENFW_HOST_MMIO tests/test_drivers_mmio.c \
+		src/wdt_timer.c src/uart.c src/rtc.c src/pmu.c src/keys.c \
+		src/sdio.c src/lcd_st7735s.c src/usb_musb.c src/usb_scsi.c src/exfat.c \
+		-o $(BUILD_DIR)/test_drivers_mmio
+	$(BUILD_DIR)/test_drivers_mmio $(BUILD_DIR)/test_exfat.img
 
 update-up: $(BUILD_DIR)/ram_boot.bin $(BUILD_DIR)/xip.bin tools/pack_firm.py
 	@test -f "$(STOCK_DUMP)" || (echo "Error: $(STOCK_DUMP) not found" >&2; exit 1)
@@ -81,6 +86,16 @@ update-up: $(BUILD_DIR)/ram_boot.bin $(BUILD_DIR)/xip.bin tools/pack_firm.py
 		--out-bin $(OUT_BIN) \
 		--out-update-up $(OUT_UP)
 	python3 ../tools/inspect_fw.py $(OUT_BIN)
+
+$(BUILD_DIR)/qemu_boot_stub.bin: tools/qemu_boot_stub.S | $(BUILD_DIR)
+	@test -n "$(LLD)" || (echo "Error: ld.lld not found (set LLD=/path/to/ld.lld)" >&2; exit 1)
+	@test -n "$(OBJCOPY)" || (echo "Error: llvm-objcopy not found (set OBJCOPY=/path/to/llvm-objcopy)" >&2; exit 1)
+	$(CLANG) --target=thumbv7em-none-eabi -mcpu=cortex-m4 -mfloat-abi=soft -mthumb -c $< -o $(BUILD_DIR)/qemu_boot_stub.o
+	$(LLD) -Ttext=0x10000000 -e _qemu_stub_vectors $(BUILD_DIR)/qemu_boot_stub.o -o $(BUILD_DIR)/qemu_boot_stub.elf
+	$(OBJCOPY) -O binary $(BUILD_DIR)/qemu_boot_stub.elf $@
+
+test-qemu: all update-up $(BUILD_DIR)/qemu_boot_stub.bin
+	python3 tools/run_qemu.py --elf $(BUILD_DIR)/open_fw.elf --stub $(BUILD_DIR)/qemu_boot_stub.bin --flash $(OUT_BIN)
 
 clean:
 	rm -rf $(BUILD_DIR)

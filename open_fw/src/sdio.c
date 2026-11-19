@@ -35,7 +35,7 @@
 static int sdio_wait_cmd_accept(void)
 {
     uint64_t t0 = us_timer_now();
-    while (SDIO_CMD & SDIO_CMD_START) {
+    while (openfw_mmio_rd32(SDIO_CMD_ADDR) & SDIO_CMD_START) {
         if ((uint32_t)(us_timer_now() - t0) >= SDIO_CMD_TIMEOUT_US) {
             return -1;
         }
@@ -48,7 +48,7 @@ static int sdio_update_clk(void)
     if (sdio_wait_cmd_accept() != 0) {
         return -1;
     }
-    SDIO_CMD = SDIO_CMD_UPD_CLK;
+    openfw_mmio_wr32(SDIO_CMD_ADDR, SDIO_CMD_UPD_CLK);
     return sdio_wait_cmd_accept();
 }
 
@@ -66,20 +66,20 @@ static int sdio_send_cmd(uint32_t cmd_word, uint32_t arg, int ignore_rcrc)
         return -1;
     }
 
-    SDIO_RINTSTS = 0xFFFFFFFFu;
-    SDIO_ARG = arg;
-    SDIO_CMD = SDIO_CMD_START | (cmd_word & 0xFFFFu);
+    openfw_mmio_wr32(SDIO_RINTSTS_ADDR, 0xFFFFFFFFu);
+    openfw_mmio_wr32(SDIO_ARG_ADDR,     arg);
+    openfw_mmio_wr32(SDIO_CMD_ADDR,     SDIO_CMD_START | (cmd_word & 0xFFFFu));
 
     uint64_t t0 = us_timer_now();
-    while (!(SDIO_RINTSTS & SDIO_INT_CMD_DONE)) {
+    while (!(openfw_mmio_rd32(SDIO_RINTSTS_ADDR) & SDIO_INT_CMD_DONE)) {
         if ((uint32_t)(us_timer_now() - t0) >= SDIO_CMD_TIMEOUT_US) {
-            SDIO_RINTSTS = 0xFFFFFFFFu;
+            openfw_mmio_wr32(SDIO_RINTSTS_ADDR, 0xFFFFFFFFu);
             return -1;
         }
     }
 
-    uint32_t st = SDIO_RINTSTS;
-    SDIO_RINTSTS = 0x00000344u;
+    uint32_t st = openfw_mmio_rd32(SDIO_RINTSTS_ADDR);
+    openfw_mmio_wr32(SDIO_RINTSTS_ADDR, 0x00000344u);
 
     if (st & (SDIO_INT_RTO | SDIO_INT_DRTO)) {
         return -1;
@@ -101,9 +101,9 @@ static int sdio_send_acmd41(uint32_t arg)
 static uint32_t parse_csd_sectors(void)
 {
     /* Standard DesignWare dw_mmc R2 packing: RESP3=[127:96], RESP2=[95:64], RESP1=[63:32] */
-    uint32_t csd3 = SDIO_RESP3;
-    uint32_t csd2 = SDIO_RESP2;
-    uint32_t csd1 = SDIO_RESP1;
+    uint32_t csd3 = openfw_mmio_rd32(SDIO_RESP3_ADDR);
+    uint32_t csd2 = openfw_mmio_rd32(SDIO_RESP2_ADDR);
+    uint32_t csd1 = openfw_mmio_rd32(SDIO_RESP1_ADDR);
     uint32_t csd_ver = (csd3 >> 30) & 0x3u;
     if (csd_ver == 1u) {
         uint32_t c_size = ((csd2 & 0x3Fu) << 16) | ((csd1 >> 16) & 0xFFFFu);
@@ -136,25 +136,25 @@ int sd_init(sd_card_t *card)
     sdio_set_clk_div(64u);
 
     /* Soft reset controller + FIFO + DMA, then lock 1-bit polling mode */
-    SDIO_CTRL |= 0x7u;
+    openfw_mmio_set32(SDIO_CTRL_ADDR, 0x7u);
     {
         uint64_t t0 = us_timer_now();
-        while (SDIO_CTRL & 0x7u) {
+        while (openfw_mmio_rd32(SDIO_CTRL_ADDR) & 0x7u) {
             if ((uint32_t)(us_timer_now() - t0) >= SDIO_CMD_TIMEOUT_US) {
                 return -1;
             }
         }
     }
-    SDIO_CTRL = (SDIO_CTRL & ~0xC0000008u) | 0x40000000u;
+    openfw_mmio_rmw32(SDIO_CTRL_ADDR, 0xC0000008u, 0x40000000u);
     if (sdio_update_clk() != 0) {
         return -1;
     }
 
-    SDIO_RINTSTS = 0xFFFFFFFFu;
-    SDIO_FIFOTH  = 0x20070008u;
-    SDIO_TMOUT   = 0x00FFFFFFu;
-    SDIO_BMOD   |= 0x2u;
-    SDIO_INTMASK = 0xFFFFFF40u;
+    openfw_mmio_wr32(SDIO_RINTSTS_ADDR, 0xFFFFFFFFu);
+    openfw_mmio_wr32(SDIO_FIFOTH_ADDR,  0x20070008u);
+    openfw_mmio_wr32(SDIO_TMOUT_ADDR,   0x00FFFFFFu);
+    openfw_mmio_set32(SDIO_BMOD_ADDR,   0x2u);
+    openfw_mmio_wr32(SDIO_INTMASK_ADDR, 0xFFFFFF40u);
 
     /* Card identification: CMD0 -> CMD8 -> ACMD41 -> CMD2 -> CMD3 */
     if (sdio_send_cmd(SD_CMD0_GO_IDLE, 0u, 1) != 0) {
@@ -164,7 +164,7 @@ int sd_init(sd_card_t *card)
 
     uint32_t acmd41_arg = 0x00100000u;
     if (sdio_send_cmd(SD_CMD8_IF_COND, 0x000001AAu, 0) == 0 &&
-        (SDIO_RESP0 & 0xFFu) == 0xAAu) {
+        (openfw_mmio_rd32(SDIO_RESP0_ADDR) & 0xFFu) == 0xAAu) {
         acmd41_arg = 0x40100000u; /* SD v2.0 HCS=1 */
     }
 
@@ -173,7 +173,7 @@ int sd_init(sd_card_t *card)
     for (int tries = 0; tries < 250; tries++) {
         wdt_feed();
         if (sdio_send_acmd41(acmd41_arg) == 0) {
-            ocr = SDIO_RESP0;
+            ocr = openfw_mmio_rd32(SDIO_RESP0_ADDR);
             if (ocr & (1u << 31)) {
                 ready = 1;
                 break;
@@ -193,7 +193,7 @@ int sd_init(sd_card_t *card)
     if (sdio_send_cmd(SD_CMD3_REL_ADDR, 0x00010000u, 0) != 0) {
         return -1;
     }
-    uint16_t rca = (uint16_t)(SDIO_RESP0 >> 16);
+    uint16_t rca = (uint16_t)(openfw_mmio_rd32(SDIO_RESP0_ADDR) >> 16);
     if (rca == 0u) {
         return -1;
     }
@@ -229,9 +229,9 @@ static int sdio_read_one_sector(sd_card_t *card, uint32_t lba, uint8_t *dst)
 {
     uint32_t arg = card->is_sdhc ? lba : (lba << 9);
 
-    SDIO_BLKSIZ  = 512u;
-    SDIO_BYTCNT  = 512u;
-    SDIO_RINTSTS = 0xFFFFFFFFu;
+    openfw_mmio_wr32(SDIO_BLKSIZ_ADDR,  512u);
+    openfw_mmio_wr32(SDIO_BYTCNT_ADDR,  512u);
+    openfw_mmio_wr32(SDIO_RINTSTS_ADDR, 0xFFFFFFFFu);
 
     if (sdio_send_cmd(SD_CMD17_READ1, arg, 0) != 0) {
         return -1;
@@ -239,31 +239,31 @@ static int sdio_read_one_sector(sd_card_t *card, uint32_t lba, uint8_t *dst)
 
     uint64_t t0 = us_timer_now();
     for (uint32_t w = 0u; w < 128u; w++) {
-        while (SDIO_STATUS & SDIO_STAT_FIFO_EMP) {
-            if (SDIO_RINTSTS & (SDIO_INT_RTO | SDIO_INT_DRTO)) {
-                SDIO_RINTSTS = 0xFFFFFFFFu;
+        while (openfw_mmio_rd32(SDIO_STATUS_ADDR) & SDIO_STAT_FIFO_EMP) {
+            if (openfw_mmio_rd32(SDIO_RINTSTS_ADDR) & (SDIO_INT_RTO | SDIO_INT_DRTO)) {
+                openfw_mmio_wr32(SDIO_RINTSTS_ADDR, 0xFFFFFFFFu);
                 return -1;
             }
             if ((uint32_t)(us_timer_now() - t0) >= SDIO_DAT_TIMEOUT_US) {
-                SDIO_RINTSTS = 0xFFFFFFFFu;
+                openfw_mmio_wr32(SDIO_RINTSTS_ADDR, 0xFFFFFFFFu);
                 return -1;
             }
         }
-        uint32_t word = SDIO_FIFO;
+        uint32_t word = openfw_mmio_rd32(SDIO_FIFO_ADDR);
         dst[w * 4u + 0u] = (uint8_t)(word);
         dst[w * 4u + 1u] = (uint8_t)(word >> 8);
         dst[w * 4u + 2u] = (uint8_t)(word >> 16);
         dst[w * 4u + 3u] = (uint8_t)(word >> 24);
     }
 
-    while (!(SDIO_RINTSTS & SDIO_INT_DTO)) {
+    while (!(openfw_mmio_rd32(SDIO_RINTSTS_ADDR) & SDIO_INT_DTO)) {
         if ((uint32_t)(us_timer_now() - t0) >= SDIO_DAT_TIMEOUT_US) {
-            SDIO_RINTSTS = 0xFFFFFFFFu;
+            openfw_mmio_wr32(SDIO_RINTSTS_ADDR, 0xFFFFFFFFu);
             return -1;
         }
     }
-    uint32_t st = SDIO_RINTSTS;
-    SDIO_RINTSTS = 0xFFFFFFFFu;
+    uint32_t st = openfw_mmio_rd32(SDIO_RINTSTS_ADDR);
+    openfw_mmio_wr32(SDIO_RINTSTS_ADDR, 0xFFFFFFFFu);
     if (st & (SDIO_INT_RCRC | SDIO_INT_RTO | SDIO_INT_DRTO)) {
         return -1;
     }
@@ -274,9 +274,9 @@ static int sdio_write_one_sector(sd_card_t *card, uint32_t lba, const uint8_t *s
 {
     uint32_t arg = card->is_sdhc ? lba : (lba << 9);
 
-    SDIO_BLKSIZ  = 512u;
-    SDIO_BYTCNT  = 512u;
-    SDIO_RINTSTS = 0xFFFFFFFFu;
+    openfw_mmio_wr32(SDIO_BLKSIZ_ADDR,  512u);
+    openfw_mmio_wr32(SDIO_BYTCNT_ADDR,  512u);
+    openfw_mmio_wr32(SDIO_RINTSTS_ADDR, 0xFFFFFFFFu);
 
     if (sdio_send_cmd(SD_CMD24_WRITE1, arg, 0) != 0) {
         return -1;
@@ -284,13 +284,13 @@ static int sdio_write_one_sector(sd_card_t *card, uint32_t lba, const uint8_t *s
 
     uint64_t t0 = us_timer_now();
     for (uint32_t w = 0u; w < 128u; w++) {
-        while (SDIO_STATUS & SDIO_STAT_FIFO_FULL) {
-            if (SDIO_RINTSTS & (SDIO_INT_RTO | SDIO_INT_DRTO)) {
-                SDIO_RINTSTS = 0xFFFFFFFFu;
+        while (openfw_mmio_rd32(SDIO_STATUS_ADDR) & SDIO_STAT_FIFO_FULL) {
+            if (openfw_mmio_rd32(SDIO_RINTSTS_ADDR) & (SDIO_INT_RTO | SDIO_INT_DRTO)) {
+                openfw_mmio_wr32(SDIO_RINTSTS_ADDR, 0xFFFFFFFFu);
                 return -1;
             }
             if ((uint32_t)(us_timer_now() - t0) >= SDIO_DAT_TIMEOUT_US) {
-                SDIO_RINTSTS = 0xFFFFFFFFu;
+                openfw_mmio_wr32(SDIO_RINTSTS_ADDR, 0xFFFFFFFFu);
                 return -1;
             }
         }
@@ -298,22 +298,22 @@ static int sdio_write_one_sector(sd_card_t *card, uint32_t lba, const uint8_t *s
                       | ((uint32_t)src[w * 4u + 1u] << 8)
                       | ((uint32_t)src[w * 4u + 2u] << 16)
                       | ((uint32_t)src[w * 4u + 3u] << 24);
-        SDIO_FIFO = word;
+        openfw_mmio_wr32(SDIO_FIFO_ADDR, word);
     }
 
-    while (!(SDIO_RINTSTS & SDIO_INT_DTO)) {
+    while (!(openfw_mmio_rd32(SDIO_RINTSTS_ADDR) & SDIO_INT_DTO)) {
         if ((uint32_t)(us_timer_now() - t0) >= SDIO_DAT_TIMEOUT_US) {
-            SDIO_RINTSTS = 0xFFFFFFFFu;
+            openfw_mmio_wr32(SDIO_RINTSTS_ADDR, 0xFFFFFFFFu);
             return -1;
         }
     }
-    SDIO_RINTSTS = 0xFFFFFFFFu;
+    openfw_mmio_wr32(SDIO_RINTSTS_ADDR, 0xFFFFFFFFu);
 
     /* Wait for card programming completion (R1 bit 8 = READY_FOR_DATA) */
     uint64_t p0 = us_timer_now();
     while (1) {
         if (sdio_send_cmd(SD_CMD13_STATUS, (uint32_t)card->rca << 16, 0) == 0 &&
-            (SDIO_RESP0 & (1u << 8))) {
+            (openfw_mmio_rd32(SDIO_RESP0_ADDR) & (1u << 8))) {
             return 0;
         }
         if ((uint32_t)(us_timer_now() - p0) >= SDIO_DAT_TIMEOUT_US) {

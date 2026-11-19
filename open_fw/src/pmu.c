@@ -9,21 +9,23 @@
 
 int pmu_write_reg(uint8_t reg, uint8_t val)
 {
-    RTWI_WDATA = (uint32_t)val;
-    RTWI_CMD   = 0x40000060u | ((uint32_t)reg << 8);
-    RTWI_CMD  |= (1u << 31);
-    while ((int32_t)RTWI_CMD < 0) {
+    openfw_mmio_wr32(RTWI_WDATA_ADDR, (uint32_t)val);
+    uint32_t cmd = 0x40000060u | ((uint32_t)reg << 8);
+    openfw_mmio_wr32(RTWI_CMD_ADDR, cmd);
+    openfw_mmio_wr32(RTWI_CMD_ADDR, cmd | (1u << 31));
+    while ((int32_t)openfw_mmio_rd32(RTWI_CMD_ADDR) < 0) {
     }
-    return (RTWI_STATUS & 0xF000u) ? 1 : 0;
+    return (openfw_mmio_rd32(RTWI_STATUS_ADDR) & 0xF000u) ? 1 : 0;
 }
 
 uint8_t pmu_read_reg(uint8_t reg)
 {
-    RTWI_CMD  = 0x40000061u | ((uint32_t)reg << 8);
-    RTWI_CMD |= (1u << 31);
-    while ((int32_t)RTWI_CMD < 0) {
+    uint32_t cmd = 0x40000061u | ((uint32_t)reg << 8);
+    openfw_mmio_wr32(RTWI_CMD_ADDR, cmd);
+    openfw_mmio_wr32(RTWI_CMD_ADDR, cmd | (1u << 31));
+    while ((int32_t)openfw_mmio_rd32(RTWI_CMD_ADDR) < 0) {
     }
-    return (uint8_t)(RTWI_RDATA & 0xFFu);
+    return (uint8_t)(openfw_mmio_rd32(RTWI_RDATA_ADDR) & 0xFFu);
 }
 
 uint32_t pmu_read_vbat_mv(void)
@@ -60,7 +62,7 @@ void pmu_reboot_to_usb_bootloader(void)
     pmu_write_reg(0x00u, (uint8_t)(r00 | 0x01u));
     system_reboot();
     while (1) {
-        __asm__ volatile ("wfi");
+        OPENFW_WFI();
     }
 }
 
@@ -72,6 +74,6 @@ void pmu_reboot_to_sd_ota(void)
     pmu_write_reg(0x00u, (uint8_t)(r00 & ~0x01u));
     system_reboot();
     while (1) {
-        __asm__ volatile ("wfi");
+        OPENFW_WFI();
     }
 }

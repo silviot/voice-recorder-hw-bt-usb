@@ -15,9 +15,9 @@ void rtc_read_raw(uint32_t *date_reg, uint32_t *time_reg)
 {
     uint32_t d1, t, d2;
     do {
-        d1 = RTC_DATE;
-        t  = RTC_TIME;
-        d2 = RTC_DATE;
+        d1 = openfw_mmio_rd32(RTC_DATE_ADDR);
+        t  = openfw_mmio_rd32(RTC_TIME_ADDR);
+        d2 = openfw_mmio_rd32(RTC_DATE_ADDR);
     } while (d1 != d2);
     if (date_reg) {
         *date_reg = d1;
@@ -29,13 +29,13 @@ void rtc_read_raw(uint32_t *date_reg, uint32_t *time_reg)
 
 void rtc_ensure_running(void)
 {
-    while ((int32_t)AON_CLK_CFG < 0) {
+    while ((int32_t)openfw_mmio_rd32(AON_CLK_CFG_ADDR) < 0) {
     }
-    AON_CLK_CFG = (AON_CLK_CFG & ~0x0001F000u) | (0x18u << 12);
-    (void)AON_CLK_STAT;
-    AON_CLK_EN   |= (1u << 2);
-    AON_PWR_CTL0 &= ~(1u << 28);
-    AON_RTC_CTRL &= ~((1u << 4) | (1u << 8)); /* mode=0, HALT=0 */
+    openfw_mmio_rmw32(AON_CLK_CFG_ADDR, 0x0001F000u, (0x18u << 12));
+    (void)openfw_mmio_rd32(AON_CLK_STAT_ADDR);
+    openfw_mmio_set32(AON_CLK_EN_ADDR, 1u << 2);
+    openfw_mmio_clr32(AON_PWR_CTL0_ADDR, 1u << 28);
+    openfw_mmio_clr32(AON_RTC_CTRL_ADDR, (1u << 4) | (1u << 8)); /* mode=0, HALT=0 */
 }
 
 void rtc_get(rtc_datetime_t *dt)
@@ -75,14 +75,16 @@ void rtc_set(const rtc_datetime_t *dt)
     uint32_t wday = (dt->day + 2u * mw + (3u * (mw + 1u)) / 5u +
                      yw + yw / 4u - yw / 100u + yw / 400u) % 7u;
 
-    RTC_TIME = ((wday & 0x07u) << 24)
-             | (((uint32_t)dt->hour   & 0x1Fu) << 16)
-             | (((uint32_t)dt->minute & 0x3Fu) << 8)
-             | ((uint32_t)dt->second  & 0x3Fu);
-    RTC_DATE = (is_leap << 24)
-             | ((y_off & 0x7Fu) << 16)
-             | (((uint32_t)dt->month & 0x0Fu) << 8)
-             | ((uint32_t)dt->day    & 0x1Fu);
+    openfw_mmio_wr32(RTC_TIME_ADDR,
+                     ((wday & 0x07u) << 24)
+                   | (((uint32_t)dt->hour   & 0x1Fu) << 16)
+                   | (((uint32_t)dt->minute & 0x3Fu) << 8)
+                   | ((uint32_t)dt->second  & 0x3Fu));
+    openfw_mmio_wr32(RTC_DATE_ADDR,
+                     (is_leap << 24)
+                   | ((y_off & 0x7Fu) << 16)
+                   | (((uint32_t)dt->month & 0x0Fu) << 8)
+                   | ((uint32_t)dt->day    & 0x1Fu));
 }
 
 uint32_t rtc_to_dos_timestamp(const rtc_datetime_t *dt)
@@ -103,7 +105,7 @@ uint32_t rtc_to_dos_timestamp(const rtc_datetime_t *dt)
 
 void rtc_set_alarm0_seconds(uint32_t seconds)
 {
-    RTC_ALARM0_CTRL = 0u;
-    RTC_ALARM0_VAL  = (seconds > 0u) ? (seconds - 1u) : 0u;
-    RTC_ALARM0_CTRL = 1u;
+    openfw_mmio_wr32(RTC_ALARM0_CTRL_ADDR, 0u);
+    openfw_mmio_wr32(RTC_ALARM0_VAL_ADDR, (seconds > 0u) ? (seconds - 1u) : 0u);
+    openfw_mmio_wr32(RTC_ALARM0_CTRL_ADDR, 1u);
 }

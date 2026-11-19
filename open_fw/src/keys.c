@@ -10,32 +10,32 @@
 void keys_init(void)
 {
     /* PD0 = Analog mode (mux=15, floating) for kadc_ch1 resistor ladder */
-    REG32(GPIOD_BASE + 0x24u) &= ~0x3u;
+    openfw_mmio_clr32(GPIOD_BASE + 0x24u, 0x3u);
     gpio_set_mux(GPIO_PORT_D, 0u, 15u);
 
     /* PB6 = GPIO input for Record slide switch */
     gpio_set_mux(GPIO_PORT_B, 6u, 0u);
 
     /* Release SARADC reset & enable clock (CRU bank 2 bit 20 = ID 0x54) */
-    CRU_SARADC_RST |= (1u << 20);
-    CRU_SARADC_CLK |= (1u << 20);
-    while ((CRU_SARADC_CLK & (1u << 20)) == 0u) {
+    openfw_mmio_set32(CRU_SARADC_RST_ADDR, 1u << 20);
+    openfw_mmio_set32(CRU_SARADC_CLK_ADDR, 1u << 20);
+    while ((openfw_mmio_rd32(CRU_SARADC_CLK_ADDR) & (1u << 20)) == 0u) {
     }
 
     /* Configure continuous polling scan on ch1 (0x40096034) */
-    SARADC_CTRL    = 0x80180000u | (1u << 1);
-    SARADC_START   = 0u;
-    SARADC_IE      = 0u;
-    SARADC_REG10   = 0u;
-    SARADC_REG18   = 0u;
-    SARADC_CH1_THR = 0x0FFF0030u;
+    openfw_mmio_wr32(SARADC_CTRL_ADDR,    0x80180000u | (1u << 1));
+    openfw_mmio_wr32(SARADC_START_ADDR,   0u);
+    openfw_mmio_wr32(SARADC_IE_ADDR,      0u);
+    openfw_mmio_wr32(SARADC_REG10_ADDR,   0u);
+    openfw_mmio_wr32(SARADC_REG18_ADDR,   0u);
+    openfw_mmio_wr32(SARADC_CH1_THR_ADDR, 0x0FFF0030u);
     mdelay(5u);
-    SARADC_START   = 0x0000A800u;
+    openfw_mmio_wr32(SARADC_START_ADDR,   0x0000A800u);
 }
 
 uint16_t keys_read_adc(void)
 {
-    return (uint16_t)(SARADC_CH1_DATA & 0x0FFFu);
+    return (uint16_t)(openfw_mmio_rd32(SARADC_CH1_DATA_ADDR) & 0x0FFFu);
 }
 
 int keys_read_rec_switch(void)

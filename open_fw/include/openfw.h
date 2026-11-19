@@ -43,6 +43,21 @@ void     uart0_puts(const char *s);
 void     uart0_put_u32(uint32_t v);
 void     uart0_put_hex(uint32_t v);
 
+/* Zero-wire SRAM debug log ring (mirrored by uart0_putc in uart.c) */
+#define OPENFW_LOG_MAGIC 0x474C464Fu /* 'OFLG' little-endian */
+#define OPENFW_LOG_SIZE  4096u
+
+typedef struct {
+    uint32_t magic;
+    uint32_t size;
+    uint32_t write_idx;
+    uint32_t dropped_bytes;
+    char     buf[OPENFW_LOG_SIZE];
+} openfw_log_t;
+
+extern openfw_log_t g_openfw_log;
+void     openfw_log_reset(void);
+
 /* PMU RTWI (pmu.c) */
 typedef enum {
     PMU_CHG_DISCHARGING = 0,

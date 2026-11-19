@@ -12,6 +12,29 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#ifdef OPENFW_HOST_MMIO
+
+int      rom_printf(const char *fmt, ...);
+void     rom_gpio_config(uint32_t cfg);
+int      rom_gpio_read(uint32_t cfg);
+void     rom_gpio_write(uint32_t cfg, int val);
+size_t   rom_strlen(const char *s);
+void    *rom_memcpy(void *dst, const void *src, size_t n);
+void    *rom_memset(void *dst, int val, size_t n);
+int      rom_rst_is_released(uint32_t rst_id);
+void     rom_rst_release(uint32_t rst_id);
+void     rom_rst_hold(uint32_t rst_id);
+void     rom_clk_enable(uint32_t clk_id);
+void     rom_clk_disable(uint32_t clk_id);
+void     rom_clk_div(uint32_t clk_id, uint32_t div);
+void     rom_clk_set_src(uint32_t clk_id, uint32_t src);
+void     rom_clk_set_rate(uint32_t clk_id, uint32_t hz);
+uint64_t rom_us_timer_get(void);
+void     rom_us_delay(uint32_t us);
+void     rom_wdt_reset(uint32_t timeout);
+
+#else
+
 #define ROM_FN(addr, ret, args) ((ret (*) args)((uintptr_t)(addr) | 1u))
 
 /* Debug UART0 printf (115200 bps, PD0 TX) */
@@ -41,6 +64,8 @@
 #define rom_us_timer_get    ROM_FN(0x0000B6D8, uint64_t, (void))
 #define rom_us_delay        ROM_FN(0x0000B730, void,     (uint32_t us))
 #define rom_wdt_reset       ROM_FN(0x0000B7B0, void,     (uint32_t timeout))
+
+#endif
 
 /* RivieraWaves RW-BT Classic BR/EDR Mask ROM Controller (0x020000..0x0467FF) */
 #define rom_lc_con_cmp_evt       ROM_FN(0x00029F82, void,     (uint16_t dest_id, uint8_t status))

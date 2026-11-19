@@ -10,27 +10,62 @@
 #include "sl6801_regs.h"
 #include "openfw.h"
 
+#define UART0_TX_WAIT_MAX 50000u
+
+openfw_log_t g_openfw_log;
+
+void openfw_log_reset(void)
+{
+    g_openfw_log.magic         = OPENFW_LOG_MAGIC;
+    g_openfw_log.size          = OPENFW_LOG_SIZE;
+    g_openfw_log.write_idx     = 0u;
+    g_openfw_log.dropped_bytes = 0u;
+    for (uint32_t i = 0u; i < OPENFW_LOG_SIZE; i++) {
+        g_openfw_log.buf[i] = '\0';
+    }
+}
+
+static void log_ring_push(char c)
+{
+    if (g_openfw_log.magic != OPENFW_LOG_MAGIC || g_openfw_log.size != OPENFW_LOG_SIZE) {
+        openfw_log_reset();
+    }
+    g_openfw_log.buf[g_openfw_log.write_idx & (OPENFW_LOG_SIZE - 1u)] = c;
+    g_openfw_log.write_idx++;
+}
+
+static void uart0_tx_raw(uint8_t b)
+{
+    for (uint32_t i = 0u; i < UART0_TX_WAIT_MAX; i++) {
+        if ((openfw_mmio_rd32(UART0_STAT_ADDR) & 0x1Fu) != 0u) {
+            openfw_mmio_wr32(UART0_DATA_ADDR, (uint32_t)b);
+            return;
+        }
+    }
+    g_openfw_log.dropped_bytes++;
+}
+
 void uart0_init_115200(void)
 {
+    if (g_openfw_log.magic != OPENFW_LOG_MAGIC || g_openfw_log.size != OPENFW_LOG_SIZE) {
+        openfw_log_reset();
+    }
     gpio_set_mux(GPIO_PORT_D, 0u, 12u); /* PD0 = ALT12 (UART0 TX) */
-    UART0_IE = 0u;
-    UART0_REG18 &= ~3u;
-    UART0_REG1C = 0u;
-    UART0_REG20 = 0u;
+    openfw_mmio_wr32(UART0_IE_ADDR, 0u);
+    openfw_mmio_clr32(UART0_REG18_ADDR, 3u);
+    openfw_mmio_wr32(UART0_REG1C_ADDR, 0u);
+    openfw_mmio_wr32(UART0_REG20_ADDR, 0u);
     /* div = 24,000,000 / (115200 * 16) = 13 -> EN | TX | RX */
-    UART0_CTRL = (13u << 16) | (13u << 4) | 0x7u;
+    openfw_mmio_wr32(UART0_CTRL_ADDR, (13u << 16) | (13u << 4) | 0x7u);
 }
 
 void uart0_putc(char c)
 {
+    log_ring_push(c);
     if (c == '\n') {
-        while ((UART0_STAT & 0x1Fu) == 0u) {
-        }
-        UART0_DATA = (uint32_t)'\r';
+        uart0_tx_raw((uint8_t)'\r');
     }
-    while ((UART0_STAT & 0x1Fu) == 0u) {
-    }
-    UART0_DATA = (uint32_t)(uint8_t)c;
+    uart0_tx_raw((uint8_t)c);
 }
 
 void uart0_puts(const char *s)

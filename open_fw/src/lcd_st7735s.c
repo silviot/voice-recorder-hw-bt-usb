@@ -14,31 +14,31 @@
 
 static inline void lcdc_wait_idle(void)
 {
-    while ((LCDC_STATUS & 0x60000000u) != 0u) {
+    while ((openfw_mmio_rd32(LCDC_STATUS_ADDR) & 0x60000000u) != 0u) {
     }
 }
 
 static inline void lcdc_wait_done(void)
 {
-    while ((int32_t)LCDC_STATUS >= 0) {
+    while ((int32_t)openfw_mmio_rd32(LCDC_STATUS_ADDR) >= 0) {
     }
-    LCDC_STATUS = 0x80000000u; /* W1C DONE */
+    openfw_mmio_wr32(LCDC_STATUS_ADDR, 0x80000000u); /* W1C DONE */
 }
 
 static void st7735s_write_cmd(uint8_t cmd)
 {
-    LCDC_CMD_REG = (uint32_t)cmd;
+    openfw_mmio_wr32(LCDC_CMD_REG_ADDR, (uint32_t)cmd);
     lcdc_wait_idle();
-    LCDC_XFER_CTRL = (LCDC_XFER_CTRL & ~0x30Eu) | 0x07u;
+    openfw_mmio_rmw32(LCDC_XFER_CTRL_ADDR, 0x30Eu, 0x07u);
     lcdc_wait_done();
 }
 
 static void st7735s_write_data(uint32_t data, uint8_t len)
 {
-    LCDC_TX_DATA  = data;
-    LCDC_DATA_LEN = (uint32_t)(len - 1u);
+    openfw_mmio_wr32(LCDC_TX_DATA_ADDR,  data);
+    openfw_mmio_wr32(LCDC_DATA_LEN_ADDR, (uint32_t)(len - 1u));
     lcdc_wait_idle();
-    LCDC_XFER_CTRL = (LCDC_XFER_CTRL & ~0x0Eu) | 0x0Bu;
+    openfw_mmio_rmw32(LCDC_XFER_CTRL_ADDR, 0x0Eu, 0x0Bu);
     lcdc_wait_done();
 }
 
@@ -85,11 +85,11 @@ void lcd_backlight_set(uint8_t percent)
     /* PB17 = ALT5 (pwm_ch3) */
     gpio_set_mux(GPIO_PORT_B, 17u, 5u);
 
-    PWM3_CTRL = 0x40u;
-    PWM3_CTRL |= 0x3Fu;
-    while ((PWM3_CTRL & (1u << 28)) != 0u) {
+    openfw_mmio_wr32(PWM3_CTRL_ADDR, 0x40u);
+    openfw_mmio_set32(PWM3_CTRL_ADDR, 0x3Fu);
+    while ((openfw_mmio_rd32(PWM3_CTRL_ADDR) & (1u << 28)) != 0u) {
     }
-    PWM3_PERIOD_DUTY = (48000u << 16) | ((uint32_t)percent * 480u);
+    openfw_mmio_wr32(PWM3_PERIOD_DUTY_ADDR, (48000u << 16) | ((uint32_t)percent * 480u));
 }
 
 void lcd_init(void)
@@ -128,11 +128,11 @@ void lcd_init(void)
     gpio_set_mux(GPIO_PORT_D, 10u, 12u);
 
     /* Mandatory pad enable & LCDC crossbar routing (D0..D7, CS#, DC/RS, WR#) */
-    GPIO_LCD_PAD_EN |= 0x0000FFD0u;
-    LCDC_XBAR0       = 0xABF1FFFFu;
-    LCDC_XBAR1       = 0x58764029u;
-    LCDC_MCU_TIMING  = 0u;
-    LCDC_IF_CTRL    &= ~1u; /* 8080 8-bit parallel mode */
+    openfw_mmio_set32(GPIO_LCD_PAD_EN_ADDR, 0x0000FFD0u);
+    openfw_mmio_wr32(LCDC_XBAR0_ADDR,       0xABF1FFFFu);
+    openfw_mmio_wr32(LCDC_XBAR1_ADDR,       0x58764029u);
+    openfw_mmio_wr32(LCDC_MCU_TIMING_ADDR,  0u);
+    openfw_mmio_clr32(LCDC_IF_CTRL_ADDR,    1u); /* 8080 8-bit parallel mode */
 
     /* Hardware reset LCD via PB10 */
     gpio_set_mux(GPIO_PORT_B, 10u, 1u);

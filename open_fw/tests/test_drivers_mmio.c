@@ -1,0 +1,1041 @@
+/*
+ * MMIO-Hooked Host Unit Tests for Cassini OpenFW Bare-Metal Drivers
+ *
+ * Compiles the real ARM driver sources natively under -DOPENFW_HOST_MMIO and
+ * drives them against deterministic virtual SL6801 peripheral models
+ * (PPB/US_TIMER/WDT, UART0+g_openfw_log, AON RTC, PMU RTWI, SARADC Keypad,
+ * ST7735S LCDC+PWM3 framebuffer, 1-bit SDIO/microSD+exFAT, Mentor MUSB+SCSI).
+ *
+ * SPDX-License-Identifier: MIT
+ */
+#include <assert.h>
+#include <setjmp.h>
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "sl6801_regs.h"
+#include "sl6801_rom.h"
+#include "openfw.h"
+#include "openfw_fs.h"
+#include "openfw_usb_msc.h"
+
+/* ============================================================================
+ * Virtual SoC State & MMIO / ROM Hooks
+ * ============================================================================ */
+volatile uint32_t g_systick_ms = 0u;
+
+static jmp_buf      g_wfi_jmp;
+static volatile int g_wfi_armed = 0;
+
+static struct {
+    /* Core PPB & System */
+    uint32_t systick_csr;
+    uint32_t systick_rvr;
+    uint32_t systick_cvr;
+    uint32_t scb_aircr;
+    uint32_t dsb_count;
+    uint32_t wfi_count;
+    uint64_t us_time;
+    int      us_rollover_inject;
+    uint32_t wdt_feeds;
+    uint32_t last_wdt_key;
+
+    /* UART0 */
+    uint32_t uart0_ctrl;
+    uint32_t uart0_ie;
+    uint32_t uart0_reg18;
+    uint32_t uart0_stat;
+    char     uart0_tx[8192];
+    uint32_t uart0_tx_len;
+
+    /* AON RTC */
+    uint32_t aon_clk_cfg;
+    uint32_t aon_clk_en;
+    uint32_t aon_pwr_ctl0;
+    uint32_t aon_rtc_ctrl;
+    uint32_t rtc_date;
+    uint32_t rtc_time;
+    uint32_t rtc_alarm0_val;
+    uint32_t rtc_alarm0_ctrl;
+    int      rtc_rollover_inject;
+
+    /* PMU RTWI */
+    uint32_t rtwi_cmd;
+    uint32_t rtwi_wdata;
+    uint32_t rtwi_rdata;
+    uint32_t rtwi_status;
+    uint8_t  pmu_regs[256];
+
+    /* GPIO / SARADC / CRU */
+    uint32_t gpio_mux[4][4];
+    uint32_t gpio_out[4];
+    uint32_t gpio_in[4];
+    uint32_t gpio_pad_dir[4];
+    uint32_t gpio_lcd_pad_en;
+    uint32_t cru_saradc_clk;
+    uint32_t cru_saradc_rst;
+    uint32_t saradc_ctrl;
+    uint32_t saradc_start;
+    uint32_t saradc_ch1_thr;
+    uint32_t saradc_ch1_data;
+    uint32_t rom_rst_released_mask;
+
+    /* PWM3 + LCDC + Virtual ST7735S 80x160 RGB565 Panel */
+    uint32_t pwm3_ctrl;
+    uint32_t pwm3_period_duty;
+    uint32_t lcdc_xbar0;
+    uint32_t lcdc_xbar1;
+    uint32_t lcdc_if_ctrl;
+    uint32_t lcdc_status;
+    uint32_t lcdc_xfer_ctrl;
+    uint32_t lcdc_cmd_reg;
+    uint32_t lcdc_data_len;
+    uint32_t lcdc_tx_data;
+    uint8_t  st_cur_cmd;
+    uint8_t  st_param_idx;
+    uint16_t st_x0, st_x1, st_y0, st_y1;
+    uint16_t st_cx, st_cy;
+    uint8_t  st_madctl;
+    uint8_t  st_colmod;
+    uint8_t  st_invon;
+    uint8_t  st_disp_on;
+    uint8_t  st_ram_half;
+    uint8_t  st_hi_byte;
+    uint16_t st_fb[LCD_HEIGHT][LCD_WIDTH];
+
+    /* SDIO Controller + Virtual 8 MiB SDHC Card */
+    uint32_t sdio_ctrl;
+    uint32_t sdio_cmd;
+    uint32_t sdio_arg;
+    uint32_t sdio_blksiz;
+    uint32_t sdio_bytcnt;
+    uint32_t sdio_rintsts;
+    uint32_t sdio_resp[4];
+    uint32_t sdio_fifoth;
+    uint32_t sdio_tmout;
+    uint32_t sdio_bmod;
+    uint32_t sdio_intmask;
+    uint32_t sdio_fifo[128];
+    uint32_t sdio_fifo_pos;
+    uint32_t sdio_fifo_len;
+    uint32_t sdio_active_lba;
+    int      sdio_app_cmd;
+    int      sdio_acmd41_polls;
+    int      sdio_selected;
+    uint8_t  *sd_sectors;
+    uint32_t sd_num_sectors;
+
+    /* USB PHY + Mentor MUSB OTG Core */
+    uint32_t cru_clk_src_gate;
+    uint32_t cru_rst_set1;
+    uint32_t cru_rst_stat1;
+    uint32_t cru_clk_en_usb;
+    uint32_t sysctl_usb_ctrl;
+    uint32_t usb_phy_ctrl;
+    uint32_t usb_phy_inte;
+    uint32_t usb_phy_int_status;
+
+    uint8_t  musb_faddr;
+    uint8_t  musb_power;
+    uint16_t musb_intrtx;
+    uint16_t musb_intrrx;
+    uint16_t musb_intrtxe;
+    uint16_t musb_intrrxe;
+    uint8_t  musb_intrusb;
+    uint8_t  musb_intrusbe;
+    uint16_t musb_frame;
+    uint8_t  musb_index;
+    uint8_t  musb_testmode;
+    uint16_t musb_txmaxp[4];
+    uint16_t musb_rxmaxp[4];
+    uint16_t musb_txcsr[4]; /* ep0: CSR0 */
+    uint16_t musb_rxcsr[4];
+    uint16_t musb_rxcount[4]; /* ep0: COUNT0 */
+    uint8_t  musb_rx_fifo[4][512];
+    uint16_t musb_rx_pos[4];
+    uint16_t musb_rx_len[4];
+    uint8_t  musb_tx_fifo[4][512];
+    uint16_t musb_tx_len[4];
+} g_soc;
+
+static void soc_reset(void)
+{
+    uint8_t *saved_sd = g_soc.sd_sectors;
+    uint32_t saved_n  = g_soc.sd_num_sectors;
+    memset(&g_soc, 0, sizeof(g_soc));
+    g_soc.sd_sectors     = saved_sd;
+    g_soc.sd_num_sectors = saved_n;
+    g_soc.uart0_stat     = 16u;
+    g_soc.aon_pwr_ctl0   = (1u << 28);
+    g_soc.aon_rtc_ctrl   = (1u << 4) | (1u << 8);
+    g_soc.saradc_ch1_data = 4095u;
+    g_soc.gpio_in[1]     = (1u << 6); /* Rec switch released (active low) */
+    g_soc.st_x1          = LCD_WIDTH - 1u;
+    g_soc.st_y1          = LCD_HEIGHT - 1u;
+}
+
+static void st7735s_on_byte(int is_data, uint8_t b)
+{
+    if (!is_data) {
+        g_soc.st_cur_cmd   = b;
+        g_soc.st_param_idx = 0u;
+        if (b == 0x21u) g_soc.st_invon = 1u;
+        if (b == 0x29u) g_soc.st_disp_on = 1u;
+        if (b == 0x2Cu) {
+            g_soc.st_cx       = g_soc.st_x0;
+            g_soc.st_cy       = g_soc.st_y0;
+            g_soc.st_ram_half = 0u;
+        }
+        return;
+    }
+
+    switch (g_soc.st_cur_cmd) {
+    case 0x3Au:
+        g_soc.st_colmod = b;
+        break;
+    case 0x36u:
+        g_soc.st_madctl = b;
+        break;
+    case 0x2Au:
+        if (g_soc.st_param_idx == 1u) g_soc.st_x0 = (uint16_t)(b - 26u);
+        if (g_soc.st_param_idx == 3u) g_soc.st_x1 = (uint16_t)(b - 26u);
+        g_soc.st_param_idx++;
+        break;
+    case 0x2Bu:
+        if (g_soc.st_param_idx == 1u) g_soc.st_y0 = b;
+        if (g_soc.st_param_idx == 3u) g_soc.st_y1 = b;
+        g_soc.st_param_idx++;
+        break;
+    case 0x2Cu:
+        if (g_soc.st_ram_half == 0u) {
+            g_soc.st_hi_byte  = b;
+            g_soc.st_ram_half = 1u;
+        } else {
+            uint16_t px = ((uint16_t)g_soc.st_hi_byte << 8) | b;
+            if (g_soc.st_cx < LCD_WIDTH && g_soc.st_cy < LCD_HEIGHT) {
+                g_soc.st_fb[g_soc.st_cy][g_soc.st_cx] = px;
+            }
+            if (g_soc.st_cx < g_soc.st_x1) {
+                g_soc.st_cx++;
+            } else {
+                g_soc.st_cx = g_soc.st_x0;
+                if (g_soc.st_cy < g_soc.st_y1) {
+                    g_soc.st_cy++;
+                } else {
+                    g_soc.st_cy = g_soc.st_y0;
+                }
+            }
+            g_soc.st_ram_half = 0u;
+        }
+        break;
+    default:
+        g_soc.st_param_idx++;
+        break;
+    }
+}
+
+static void sdio_exec_cmd(uint32_t val)
+{
+    uint32_t cmd = val & 0x3Fu;
+    g_soc.sdio_cmd = val & ~0x80000000u; /* controller clears START */
+    if (val & 0x00200000u) {
+        return; /* update clock only */
+    }
+    g_soc.sdio_rintsts |= SDIO_INT_CMD_DONE;
+
+    switch (cmd) {
+    case 0u: /* CMD0 GO_IDLE */
+        g_soc.sdio_selected     = 0;
+        g_soc.sdio_app_cmd      = 0;
+        g_soc.sdio_acmd41_polls = 0;
+        break;
+    case 8u: /* CMD8 IF_COND */
+        g_soc.sdio_resp[0] = g_soc.sdio_arg;
+        break;
+    case 55u: /* CMD55 APP_CMD */
+        g_soc.sdio_app_cmd = 1;
+        g_soc.sdio_resp[0] = 0x00000120u;
+        break;
+    case 41u: /* ACMD41 */
+        g_soc.sdio_app_cmd = 0;
+        g_soc.sdio_acmd41_polls++;
+        g_soc.sdio_resp[0] = (g_soc.sdio_acmd41_polls >= 2) ? 0xC0FF8000u : 0x00FF8000u;
+        break;
+    case 2u: /* CMD2 ALL_SEND_CID */
+        g_soc.sdio_resp[0] = 0x11223344u;
+        g_soc.sdio_resp[1] = 0x55667788u;
+        g_soc.sdio_resp[2] = 0x99AABBCBu;
+        g_soc.sdio_resp[3] = 0x00534400u;
+        break;
+    case 3u: /* CMD3 SEND_REL_ADDR */
+        g_soc.sdio_resp[0] = 0x12340000u;
+        break;
+    case 9u: /* CMD9 SEND_CSD (SDv2: c_size = sectors/1024 - 1) */
+    {
+        uint32_t c_size = (g_soc.sd_num_sectors / 1024u) - 1u;
+        g_soc.sdio_resp[3] = (1u << 30);
+        g_soc.sdio_resp[2] = (c_size >> 16) & 0x3Fu;
+        g_soc.sdio_resp[1] = (c_size & 0xFFFFu) << 16;
+        g_soc.sdio_resp[0] = 0u;
+        break;
+    }
+    case 7u: /* CMD7 SELECT_CARD */
+        g_soc.sdio_selected = 1;
+        g_soc.sdio_resp[0] = 0x00000700u;
+        break;
+    case 13u: /* CMD13 SEND_STATUS */
+        g_soc.sdio_resp[0] = 0x00000900u; /* READY_FOR_DATA | TRAN */
+        break;
+    case 17u: /* CMD17 READ_SINGLE_BLOCK */
+    {
+        uint32_t lba = g_soc.sdio_arg;
+        assert(g_soc.sdio_selected);
+        assert(lba < g_soc.sd_num_sectors);
+        const uint8_t *src = &g_soc.sd_sectors[lba * 512u];
+        for (uint32_t w = 0u; w < 128u; w++) {
+            g_soc.sdio_fifo[w] = (uint32_t)src[w * 4u + 0u]
+                               | ((uint32_t)src[w * 4u + 1u] << 8)
+                               | ((uint32_t)src[w * 4u + 2u] << 16)
+                               | ((uint32_t)src[w * 4u + 3u] << 24);
+        }
+        g_soc.sdio_fifo_pos  = 0u;
+        g_soc.sdio_fifo_len  = 128u;
+        g_soc.sdio_rintsts  |= SDIO_INT_DTO;
+        break;
+    }
+    case 24u: /* CMD24 WRITE_BLOCK */
+        assert(g_soc.sdio_selected);
+        assert(g_soc.sdio_arg < g_soc.sd_num_sectors);
+        g_soc.sdio_active_lba = g_soc.sdio_arg;
+        g_soc.sdio_fifo_pos   = 0u;
+        g_soc.sdio_fifo_len   = 128u;
+        break;
+    default:
+        break;
+    }
+}
+
+uint32_t openfw_mmio_rd32(uint32_t addr)
+{
+    if (addr == SYSTICK_CSR_ADDR) return g_soc.systick_csr;
+    if (addr == SYSTICK_RVR_ADDR) return g_soc.systick_rvr;
+    if (addr == SYSTICK_CVR_ADDR) return g_soc.systick_cvr;
+
+    if (addr == US_TIMER_HI_ADDR) {
+        if (g_soc.us_rollover_inject == 1) {
+            g_soc.us_rollover_inject = 2;
+            return (uint32_t)(g_soc.us_time >> 32);
+        }
+        if (g_soc.us_rollover_inject == 2) {
+            g_soc.us_rollover_inject = 0;
+            g_soc.us_time += 0x100000000ULL;
+            g_soc.us_time &= 0xFFFFFFFF00000000ULL;
+        }
+        return (uint32_t)(g_soc.us_time >> 32);
+    }
+    if (addr == US_TIMER_LO_ADDR) {
+        return (uint32_t)(g_soc.us_time & 0xFFFFFFFFu);
+    }
+
+    if (addr == UART0_CTRL_ADDR) return g_soc.uart0_ctrl;
+    if (addr == UART0_IE_ADDR)   return g_soc.uart0_ie;
+    if (addr == UART0_REG18_ADDR) return g_soc.uart0_reg18;
+    if (addr == UART0_STAT_ADDR) return g_soc.uart0_stat;
+
+    if (addr == AON_CLK_CFG_ADDR)  return g_soc.aon_clk_cfg;
+    if (addr == AON_CLK_STAT_ADDR) return 0u;
+    if (addr == AON_CLK_EN_ADDR)   return g_soc.aon_clk_en;
+    if (addr == AON_PWR_CTL0_ADDR) return g_soc.aon_pwr_ctl0;
+    if (addr == AON_RTC_CTRL_ADDR) return g_soc.aon_rtc_ctrl;
+    if (addr == RTC_DATE_ADDR) {
+        if (g_soc.rtc_rollover_inject == 1) {
+            g_soc.rtc_rollover_inject = 2;
+            return g_soc.rtc_date;
+        }
+        if (g_soc.rtc_rollover_inject == 2) {
+            g_soc.rtc_rollover_inject = 0;
+            g_soc.rtc_date++;
+            g_soc.rtc_time = 0u;
+        }
+        return g_soc.rtc_date;
+    }
+    if (addr == RTC_TIME_ADDR) return g_soc.rtc_time;
+
+    if (addr == RTWI_CMD_ADDR)    return g_soc.rtwi_cmd;
+    if (addr == RTWI_RDATA_ADDR)  return g_soc.rtwi_rdata;
+    if (addr == RTWI_STATUS_ADDR) return g_soc.rtwi_status;
+
+    if (addr >= GPIO_BASE && addr < GPIO_BASE + 0x100u) {
+        uint32_t port = (addr - GPIO_BASE) >> 6;
+        uint32_t off  = (addr - GPIO_BASE) & 0x3Fu;
+        if (off < 0x10u)  return g_soc.gpio_mux[port][off >> 2];
+        if (off == 0x10u) return g_soc.gpio_in[port];
+        if (off == 0x24u) return g_soc.gpio_pad_dir[port];
+    }
+    if (addr == GPIO_LCD_PAD_EN_ADDR) return g_soc.gpio_lcd_pad_en;
+
+    if (addr == CRU_SARADC_CLK_ADDR)  return g_soc.cru_saradc_clk;
+    if (addr == CRU_SARADC_RST_ADDR)  return g_soc.cru_saradc_rst;
+    if (addr == SARADC_CH1_DATA_ADDR) return g_soc.saradc_ch1_data;
+
+    if (addr == PWM3_CTRL_ADDR)       return g_soc.pwm3_ctrl;
+    if (addr == PWM3_PERIOD_DUTY_ADDR) return g_soc.pwm3_period_duty;
+    if (addr == LCDC_STATUS_ADDR)     return g_soc.lcdc_status;
+    if (addr == LCDC_XFER_CTRL_ADDR)  return g_soc.lcdc_xfer_ctrl;
+    if (addr == LCDC_IF_CTRL_ADDR)    return g_soc.lcdc_if_ctrl;
+
+    if (addr == SDIO_CTRL_ADDR)    return g_soc.sdio_ctrl;
+    if (addr == SDIO_CMD_ADDR)     return g_soc.sdio_cmd;
+    if (addr == SDIO_RINTSTS_ADDR) return g_soc.sdio_rintsts;
+    if (addr == SDIO_RESP0_ADDR)   return g_soc.sdio_resp[0];
+    if (addr == SDIO_RESP1_ADDR)   return g_soc.sdio_resp[1];
+    if (addr == SDIO_RESP2_ADDR)   return g_soc.sdio_resp[2];
+    if (addr == SDIO_RESP3_ADDR)   return g_soc.sdio_resp[3];
+    if (addr == SDIO_BMOD_ADDR)    return g_soc.sdio_bmod;
+    if (addr == SDIO_STATUS_ADDR) {
+        return (g_soc.sdio_fifo_pos >= g_soc.sdio_fifo_len) ? SDIO_STAT_FIFO_EMP : 0u;
+    }
+    if (addr == SDIO_FIFO_ADDR) {
+        assert(g_soc.sdio_fifo_pos < g_soc.sdio_fifo_len);
+        return g_soc.sdio_fifo[g_soc.sdio_fifo_pos++];
+    }
+
+    if (addr == CRU_CLK_SRC_GATE_ADDR) return g_soc.cru_clk_src_gate;
+    if (addr == CRU_RST_SET1_ADDR)     return g_soc.cru_rst_set1;
+    if (addr == CRU_RST_STAT1_ADDR)    return g_soc.cru_rst_stat1;
+    if (addr == CRU_CLK_EN_USB_ADDR)   return g_soc.cru_clk_en_usb;
+    if (addr == SYSCTL_USB_CTRL_ADDR)  return g_soc.sysctl_usb_ctrl;
+    if (addr == USB_PHY_CTRL_ADDR)     return g_soc.usb_phy_ctrl;
+    if (addr == USB_PHY_INTE_ADDR)     return g_soc.usb_phy_inte;
+    if (addr == USB_PHY_INT_STATUS_ADDR) return g_soc.usb_phy_int_status;
+
+    if (addr >= MUSB_FIFO_ADDR(0) && addr <= MUSB_FIFO_ADDR(3)) {
+        uint8_t ep = (uint8_t)((addr - MUSB_FIFO_ADDR(0)) >> 2);
+        uint32_t w = 0u;
+        for (uint32_t i = 0u; i < 4u; i++) {
+            uint8_t b = (g_soc.musb_rx_pos[ep] < g_soc.musb_rx_len[ep])
+                      ? g_soc.musb_rx_fifo[ep][g_soc.musb_rx_pos[ep]++] : 0u;
+            w |= ((uint32_t)b << (i * 8u));
+        }
+        return w;
+    }
+    return 0u;
+}
+
+void openfw_mmio_wr32(uint32_t addr, uint32_t val)
+{
+    if (addr == SYSTICK_CSR_ADDR) { g_soc.systick_csr = val; return; }
+    if (addr == SYSTICK_RVR_ADDR) { g_soc.systick_rvr = val; return; }
+    if (addr == SYSTICK_CVR_ADDR) { g_soc.systick_cvr = val; return; }
+    if (addr == SCB_AIRCR_ADDR)   { g_soc.scb_aircr = val; return; }
+    if (addr == WDT_FEED_ADDR)    { g_soc.wdt_feeds++; g_soc.last_wdt_key = val; return; }
+
+    if (addr == UART0_CTRL_ADDR)  { g_soc.uart0_ctrl = val; return; }
+    if (addr == UART0_IE_ADDR)    { g_soc.uart0_ie = val; return; }
+    if (addr == UART0_REG18_ADDR) { g_soc.uart0_reg18 = val; return; }
+    if (addr == UART0_DATA_ADDR) {
+        if (g_soc.uart0_tx_len + 1u < sizeof(g_soc.uart0_tx)) {
+            g_soc.uart0_tx[g_soc.uart0_tx_len++] = (char)(val & 0xFFu);
+            g_soc.uart0_tx[g_soc.uart0_tx_len] = '\0';
+        }
+        return;
+    }
+
+    if (addr == AON_CLK_CFG_ADDR)     { g_soc.aon_clk_cfg = val & 0x7FFFFFFFu; return; }
+    if (addr == AON_CLK_EN_ADDR)      { g_soc.aon_clk_en = val; return; }
+    if (addr == AON_PWR_CTL0_ADDR)    { g_soc.aon_pwr_ctl0 = val; return; }
+    if (addr == AON_RTC_CTRL_ADDR)    { g_soc.aon_rtc_ctrl = val; return; }
+    if (addr == RTC_DATE_ADDR)        { g_soc.rtc_date = val; return; }
+    if (addr == RTC_TIME_ADDR)        { g_soc.rtc_time = val; return; }
+    if (addr == RTC_ALARM0_VAL_ADDR)  { g_soc.rtc_alarm0_val = val; return; }
+    if (addr == RTC_ALARM0_CTRL_ADDR) { g_soc.rtc_alarm0_ctrl = val; return; }
+
+    if (addr == RTWI_WDATA_ADDR) { g_soc.rtwi_wdata = val; return; }
+    if (addr == RTWI_CMD_ADDR) {
+        g_soc.rtwi_cmd = val;
+        if (val & (1u << 31)) {
+            uint8_t reg = (uint8_t)((val >> 8) & 0xFFu);
+            uint8_t op  = (uint8_t)(val & 0xFFu);
+            if (op == 0x60u) {
+                g_soc.pmu_regs[reg] = (uint8_t)(g_soc.rtwi_wdata & 0xFFu);
+            } else if (op == 0x61u) {
+                g_soc.rtwi_rdata = (uint32_t)g_soc.pmu_regs[reg];
+            }
+            g_soc.rtwi_cmd &= ~(1u << 31);
+        }
+        return;
+    }
+
+    if (addr >= GPIO_BASE && addr < GPIO_BASE + 0x100u) {
+        uint32_t port = (addr - GPIO_BASE) >> 6;
+        uint32_t off  = (addr - GPIO_BASE) & 0x3Fu;
+        if (off < 0x10u)  { g_soc.gpio_mux[port][off >> 2] = val; return; }
+        if (off == 0x24u) { g_soc.gpio_pad_dir[port] = val; return; }
+        if (off == 0x34u) { g_soc.gpio_out[port] |= val; return; }
+        if (off == 0x38u) { g_soc.gpio_out[port] &= ~val; return; }
+    }
+    if (addr == GPIO_LCD_PAD_EN_ADDR) { g_soc.gpio_lcd_pad_en = val; return; }
+
+    if (addr == CRU_SARADC_CLK_ADDR)  { g_soc.cru_saradc_clk = val; return; }
+    if (addr == CRU_SARADC_RST_ADDR)  { g_soc.cru_saradc_rst = val; return; }
+    if (addr == SARADC_CTRL_ADDR)     { g_soc.saradc_ctrl = val; return; }
+    if (addr == SARADC_START_ADDR)    { g_soc.saradc_start = val; return; }
+    if (addr == SARADC_CH1_THR_ADDR)  { g_soc.saradc_ch1_thr = val; return; }
+
+    if (addr == PWM3_CTRL_ADDR)       { g_soc.pwm3_ctrl = val & ~(1u << 28); return; }
+    if (addr == PWM3_PERIOD_DUTY_ADDR) { g_soc.pwm3_period_duty = val; return; }
+    if (addr == LCDC_XBAR0_ADDR)      { g_soc.lcdc_xbar0 = val; return; }
+    if (addr == LCDC_XBAR1_ADDR)      { g_soc.lcdc_xbar1 = val; return; }
+    if (addr == LCDC_IF_CTRL_ADDR)    { g_soc.lcdc_if_ctrl = val; return; }
+    if (addr == LCDC_CMD_REG_ADDR)    { g_soc.lcdc_cmd_reg = val; return; }
+    if (addr == LCDC_DATA_LEN_ADDR)   { g_soc.lcdc_data_len = val; return; }
+    if (addr == LCDC_TX_DATA_ADDR)    { g_soc.lcdc_tx_data = val; return; }
+    if (addr == LCDC_STATUS_ADDR)     { g_soc.lcdc_status &= ~val; return; }
+    if (addr == LCDC_XFER_CTRL_ADDR) {
+        g_soc.lcdc_xfer_ctrl = val;
+        if ((val & 0x0Fu) == 0x07u) {
+            st7735s_on_byte(0, (uint8_t)g_soc.lcdc_cmd_reg);
+            g_soc.lcdc_status |= 0x80000000u;
+        } else if ((val & 0x0Fu) == 0x0Bu) {
+            uint32_t n = (g_soc.lcdc_data_len & 0x3u) + 1u;
+            for (uint32_t i = 0u; i < n; i++) {
+                st7735s_on_byte(1, (uint8_t)(g_soc.lcdc_tx_data >> (i * 8u)));
+            }
+            g_soc.lcdc_status |= 0x80000000u;
+        }
+        return;
+    }
+
+    if (addr == SDIO_CTRL_ADDR)    { g_soc.sdio_ctrl = val & ~0x7u; return; }
+    if (addr == SDIO_ARG_ADDR)     { g_soc.sdio_arg = val; return; }
+    if (addr == SDIO_BLKSIZ_ADDR)  { g_soc.sdio_blksiz = val; return; }
+    if (addr == SDIO_BYTCNT_ADDR)  { g_soc.sdio_bytcnt = val; return; }
+    if (addr == SDIO_INTMASK_ADDR) { g_soc.sdio_intmask = val; return; }
+    if (addr == SDIO_FIFOTH_ADDR)  { g_soc.sdio_fifoth = val; return; }
+    if (addr == SDIO_TMOUT_ADDR)   { g_soc.sdio_tmout = val; return; }
+    if (addr == SDIO_BMOD_ADDR)    { g_soc.sdio_bmod = val; return; }
+    if (addr == SDIO_RINTSTS_ADDR) { g_soc.sdio_rintsts &= ~val; return; }
+    if (addr == SDIO_CMD_ADDR)     { if (val & 0x80000000u) sdio_exec_cmd(val); return; }
+    if (addr == SDIO_FIFO_ADDR) {
+        assert(g_soc.sdio_fifo_pos < 128u);
+        g_soc.sdio_fifo[g_soc.sdio_fifo_pos++] = val;
+        if (g_soc.sdio_fifo_pos == 128u) {
+            uint8_t *dst = &g_soc.sd_sectors[g_soc.sdio_active_lba * 512u];
+            for (uint32_t w = 0u; w < 128u; w++) {
+                uint32_t word = g_soc.sdio_fifo[w];
+                dst[w * 4u + 0u] = (uint8_t)(word);
+                dst[w * 4u + 1u] = (uint8_t)(word >> 8);
+                dst[w * 4u + 2u] = (uint8_t)(word >> 16);
+                dst[w * 4u + 3u] = (uint8_t)(word >> 24);
+            }
+            g_soc.sdio_rintsts |= SDIO_INT_DTO;
+        }
+        return;
+    }
+
+    if (addr == CRU_CLK_SRC_GATE_ADDR) { g_soc.cru_clk_src_gate = val; return; }
+    if (addr == CRU_RST_SET1_ADDR)     { g_soc.cru_rst_set1 = val; return; }
+    if (addr == CRU_RST_STAT1_ADDR)    { g_soc.cru_rst_stat1 = val; return; }
+    if (addr == CRU_CLK_EN_USB_ADDR)   { g_soc.cru_clk_en_usb = val; return; }
+    if (addr == SYSCTL_USB_CTRL_ADDR)  { g_soc.sysctl_usb_ctrl = val; return; }
+    if (addr == USB_PHY_CTRL_ADDR)     { g_soc.usb_phy_ctrl = val; return; }
+    if (addr == USB_PHY_INTE_ADDR)     { g_soc.usb_phy_inte = val; return; }
+    if (addr == USB_PHY_INT_STATUS_ADDR) { g_soc.usb_phy_int_status &= ~val; return; }
+
+    if (addr >= MUSB_FIFO_ADDR(0) && addr <= MUSB_FIFO_ADDR(3)) {
+        uint8_t ep = (uint8_t)((addr - MUSB_FIFO_ADDR(0)) >> 2);
+        for (uint32_t i = 0u; i < 4u; i++) {
+            assert(g_soc.musb_tx_len[ep] < sizeof(g_soc.musb_tx_fifo[ep]));
+            g_soc.musb_tx_fifo[ep][g_soc.musb_tx_len[ep]++] = (uint8_t)(val >> (i * 8u));
+        }
+    }
+}
+
+uint16_t openfw_mmio_rd16(uint32_t addr)
+{
+    if (addr == MUSB_INTRTX_ADDR)  { uint16_t v = g_soc.musb_intrtx; g_soc.musb_intrtx = 0u; return v; }
+    if (addr == MUSB_INTRRX_ADDR)  { uint16_t v = g_soc.musb_intrrx; g_soc.musb_intrrx = 0u; return v; }
+    if (addr == MUSB_FRAME_ADDR)   return g_soc.musb_frame;
+    if (addr == MUSB_CSR0_ADDR)    return g_soc.musb_txcsr[g_soc.musb_index];
+    if (addr == MUSB_RXCSR_ADDR)   return g_soc.musb_rxcsr[g_soc.musb_index];
+    if (addr == MUSB_COUNT0_ADDR)  return g_soc.musb_rxcount[g_soc.musb_index];
+    return 0u;
+}
+
+void openfw_mmio_wr16(uint32_t addr, uint16_t val)
+{
+    uint8_t ep = g_soc.musb_index & 3u;
+    if (addr == MUSB_INTRTXE_ADDR) { g_soc.musb_intrtxe = val; return; }
+    if (addr == MUSB_INTRRXE_ADDR) { g_soc.musb_intrrxe = val; return; }
+    if (addr == MUSB_TXMAXP_ADDR)  { g_soc.musb_txmaxp[ep] = val; return; }
+    if (addr == MUSB_RXMAXP_ADDR)  { g_soc.musb_rxmaxp[ep] = val; return; }
+    if (addr == MUSB_CSR0_ADDR) {
+        if (ep == 0u) {
+            if (val & 0x0040u) {
+                g_soc.musb_txcsr[0] &= ~0x0001u;
+                g_soc.musb_rx_pos[0] = 0u;
+                g_soc.musb_rx_len[0] = 0u;
+            }
+            if (val & 0x0002u) {
+                g_soc.musb_txcsr[0] &= ~0x0002u; /* host instantly consumes EP0 IN packet */
+            }
+            if (val & 0x0100u) {
+                g_soc.musb_tx_len[0] = 0u;
+                g_soc.musb_rx_len[0] = 0u;
+            }
+        } else {
+            g_soc.musb_txcsr[ep] = (uint16_t)(val & ~0x0048u);
+            if (val & 0x0008u) g_soc.musb_tx_len[ep] = 0u;
+        }
+        return;
+    }
+    if (addr == MUSB_RXCSR_ADDR) {
+        g_soc.musb_rxcsr[ep] = (uint16_t)(val & ~0x0090u);
+        if (val & 0x0010u) {
+            g_soc.musb_rx_pos[ep] = 0u;
+            g_soc.musb_rx_len[ep] = 0u;
+        }
+    }
+}
+
+uint8_t openfw_mmio_rd8(uint32_t addr)
+{
+    if (addr == MUSB_POWER_ADDR)    return g_soc.musb_power;
+    if (addr == MUSB_TESTMODE_ADDR) return g_soc.musb_testmode;
+    if (addr == MUSB_INTRUSB_ADDR)  { uint8_t v = g_soc.musb_intrusb; g_soc.musb_intrusb = 0u; return v; }
+    if (addr >= MUSB_FIFO_ADDR(0) && addr <= MUSB_FIFO_ADDR(3)) {
+        uint8_t ep = (uint8_t)((addr - MUSB_FIFO_ADDR(0)) >> 2);
+        return (g_soc.musb_rx_pos[ep] < g_soc.musb_rx_len[ep])
+             ? g_soc.musb_rx_fifo[ep][g_soc.musb_rx_pos[ep]++] : 0u;
+    }
+    return 0u;
+}
+
+void openfw_mmio_wr8(uint32_t addr, uint8_t val)
+{
+    if (addr == MUSB_FADDR_ADDR)    { g_soc.musb_faddr = val; return; }
+    if (addr == MUSB_POWER_ADDR)    { g_soc.musb_power = val; return; }
+    if (addr == MUSB_INTRUSBE_ADDR) { g_soc.musb_intrusbe = val; return; }
+    if (addr == MUSB_INDEX_ADDR)    { g_soc.musb_index = val & 0x0Fu; return; }
+    if (addr == MUSB_TESTMODE_ADDR) { g_soc.musb_testmode = val; return; }
+    if (addr >= MUSB_FIFO_ADDR(0) && addr <= MUSB_FIFO_ADDR(3)) {
+        uint8_t ep = (uint8_t)((addr - MUSB_FIFO_ADDR(0)) >> 2);
+        assert(g_soc.musb_tx_len[ep] < sizeof(g_soc.musb_tx_fifo[ep]));
+        g_soc.musb_tx_fifo[ep][g_soc.musb_tx_len[ep]++] = val;
+    }
+}
+
+void openfw_mmio_nop(void) { g_soc.us_time += 10u; }
+void openfw_mmio_dsb(void) { g_soc.dsb_count++; }
+void openfw_mmio_wfi(void)
+{
+    g_soc.wfi_count++;
+    if (g_wfi_armed) {
+        g_wfi_armed = 0;
+        longjmp(g_wfi_jmp, 1);
+    }
+}
+
+/* BootROM hooks required by drivers under test */
+int      rom_printf(const char *fmt, ...) { (void)fmt; return 0; }
+void     rom_gpio_config(uint32_t cfg) { (void)cfg; }
+int      rom_gpio_read(uint32_t cfg) { (void)cfg; return 0; }
+void     rom_gpio_write(uint32_t cfg, int val) { (void)cfg; (void)val; }
+size_t   rom_strlen(const char *s) { return strlen(s); }
+void    *rom_memcpy(void *dst, const void *src, size_t n) { return memcpy(dst, src, n); }
+void    *rom_memset(void *dst, int val, size_t n) { return memset(dst, val, n); }
+int      rom_rst_is_released(uint32_t rst_id) { return (g_soc.rom_rst_released_mask >> (rst_id & 31u)) & 1u; }
+void     rom_rst_release(uint32_t rst_id) { g_soc.rom_rst_released_mask |= (1u << (rst_id & 31u)); }
+void     rom_rst_hold(uint32_t rst_id) { g_soc.rom_rst_released_mask &= ~(1u << (rst_id & 31u)); }
+void     rom_clk_enable(uint32_t clk_id) { (void)clk_id; }
+void     rom_clk_disable(uint32_t clk_id) { (void)clk_id; }
+void     rom_clk_div(uint32_t clk_id, uint32_t div) { (void)clk_id; (void)div; }
+void     rom_clk_set_src(uint32_t clk_id, uint32_t src) { (void)clk_id; (void)src; }
+void     rom_clk_set_rate(uint32_t clk_id, uint32_t hz) { (void)clk_id; (void)hz; }
+uint64_t rom_us_timer_get(void) { return g_soc.us_time; }
+void     rom_us_delay(uint32_t us) { g_soc.us_time += us; }
+void     rom_wdt_reset(uint32_t timeout) { (void)timeout; }
+
+/* ============================================================================
+ * Per-Driver Test Cases
+ * ============================================================================ */
+static void test_wdt_timer(void)
+{
+    soc_reset();
+    wdt_feed();
+    assert(g_soc.wdt_feeds == 1u && g_soc.last_wdt_key == WDT_FEED_KEY);
+
+    systick_init(192000000u);
+    assert(g_soc.systick_rvr == 191999u);
+    assert(g_soc.systick_csr == 0x7u);
+    g_systick_ms = 4242u;
+    assert(millis() == 4242u);
+
+    g_soc.us_time = 0x00000001FFFFFFFAULL;
+    g_soc.us_rollover_inject = 1; /* hi1=1, lo=0xFFFFFFFA, then hi2=2 -> retries cleanly */
+    assert(us_timer_now() == 0x0000000200000000ULL);
+
+    uint64_t before = g_soc.us_time;
+    mdelay(2u);
+    assert(g_soc.us_time - before >= 2000u);
+
+    g_wfi_armed = 1;
+    if (setjmp(g_wfi_jmp) == 0) {
+        system_reboot();
+    }
+    assert(g_soc.dsb_count >= 1u);
+    assert(g_soc.scb_aircr == (SCB_AIRCR_VECTKEY | SCB_AIRCR_SYSRESET));
+    assert(g_soc.wfi_count == 1u);
+    printf("[OK] wdt_timer MMIO\n");
+}
+
+static void test_uart_and_log_ring(void)
+{
+    soc_reset();
+    openfw_log_reset();
+    uart0_init_115200();
+    assert((g_soc.gpio_mux[3][0] & 0xFu) == 12u); /* PD0 mux=12 */
+    assert(g_soc.uart0_ctrl == ((13u << 16) | (13u << 4) | 0x7u));
+
+    uart0_puts("BOOT\n");
+    uart0_put_u32(2026u);
+    uart0_putc(' ');
+    uart0_put_hex(0x00804C01u);
+    assert(strcmp(g_soc.uart0_tx, "BOOT\r\n2026 0x00804C01") == 0);
+    assert(g_openfw_log.magic == OPENFW_LOG_MAGIC);
+    assert(g_openfw_log.size == OPENFW_LOG_SIZE);
+    assert(g_openfw_log.write_idx == 20u);
+    assert(g_openfw_log.dropped_bytes == 0u);
+    assert(strncmp(g_openfw_log.buf, "BOOT\n2026 0x00804C01", 20) == 0);
+
+    /* TX FIFO stall must bound-out after 50,000 polls and still preserve SRAM log */
+    g_soc.uart0_stat = 0u;
+    uart0_puts("STALL");
+    assert(g_openfw_log.dropped_bytes == 5u);
+    assert(g_openfw_log.write_idx == 25u);
+    assert(strncmp(&g_openfw_log.buf[20], "STALL", 5) == 0);
+    printf("[OK] uart + g_openfw_log MMIO\n");
+}
+
+static void test_rtc_driver(void)
+{
+    soc_reset();
+    rtc_ensure_running();
+    assert((g_soc.aon_clk_en & (1u << 2)) != 0u);
+    assert((g_soc.aon_pwr_ctl0 & (1u << 28)) == 0u);
+    assert((g_soc.aon_rtc_ctrl & ((1u << 4) | (1u << 8))) == 0u);
+
+    /* 2024-02-29 is leap day (bit 24 = 1), Thursday (wday=3) */
+    rtc_datetime_t set_leap = { 2024u, 2u, 29u, 0u, 23u, 59u, 58u };
+    rtc_set(&set_leap);
+    assert((g_soc.rtc_date & (1u << 24)) != 0u);
+    rtc_datetime_t got = {0};
+    rtc_get(&got);
+    assert(got.year == 2024u && got.month == 2u && got.day == 29u);
+    assert(got.weekday == 3u && got.hour == 23u && got.minute == 59u && got.second == 58u);
+
+    /* Midnight rollover retry: first RTC_DATE read returns old day, second returns new day */
+    g_soc.rtc_rollover_inject = 1;
+    rtc_get(&got);
+    assert(got.day == 30u && got.hour == 0u && got.minute == 0u && got.second == 0u);
+
+    /* Non-leap 2026-11-19 Thursday (wday=3) + DOS timestamp + Alarm0 */
+    rtc_datetime_t set_2026 = { 2026u, 11u, 19u, 0u, 14u, 30u, 44u };
+    rtc_set(&set_2026);
+    assert((g_soc.rtc_date & (1u << 24)) == 0u);
+    rtc_get(&got);
+    assert(got.weekday == 3u);
+    uint32_t dos = rtc_to_dos_timestamp(&got);
+    assert(((dos >> 25) + 1980u) == 2026u && ((dos >> 21) & 0xFu) == 11u && ((dos >> 16) & 0x1Fu) == 19u);
+
+    rtc_set_alarm0_seconds(10u);
+    assert(g_soc.rtc_alarm0_val == 9u && g_soc.rtc_alarm0_ctrl == 1u);
+    printf("[OK] rtc MMIO\n");
+}
+
+static void test_pmu_driver(void)
+{
+    soc_reset();
+    g_soc.pmu_regs[0x2Eu] = 90u;  /* ~4.075 V */
+    g_soc.pmu_regs[0x2Au] = 0x04u; /* VBUS / charging */
+    assert(pmu_read_vbat_mv() == 4075u);
+    assert(pmu_get_charge_state() == PMU_CHG_CHARGING);
+    assert(pmu_is_vbus_present() == 1);
+
+    g_soc.pmu_regs[0x2Au] = 0x40u;
+    assert(pmu_get_charge_state() == PMU_CHG_FULL);
+    assert(pmu_is_vbus_present() == 0);
+
+    g_wfi_armed = 1;
+    if (setjmp(g_wfi_jmp) == 0) {
+        pmu_reboot_to_usb_bootloader();
+    }
+    assert((g_soc.pmu_regs[0x23u] & 0xC0u) == 0xC0u);
+    assert((g_soc.pmu_regs[0x00u] & 0x01u) == 0x01u);
+
+    g_wfi_armed = 1;
+    if (setjmp(g_wfi_jmp) == 0) {
+        pmu_reboot_to_sd_ota();
+    }
+    assert((g_soc.pmu_regs[0x00u] & 0x01u) == 0x00u);
+    printf("[OK] pmu RTWI MMIO\n");
+}
+
+static void test_keys_driver(void)
+{
+    soc_reset();
+    keys_init();
+    assert((g_soc.gpio_mux[3][0] & 0xFu) == 15u); /* PD0 analog */
+    assert((g_soc.cru_saradc_clk & (1u << 20)) != 0u);
+    assert(g_soc.saradc_start == 0x0000A800u);
+
+    g_soc.saradc_ch1_data = 300u;
+    assert(keys_decode(keys_read_adc()) == KEY_LEFT);
+    g_soc.saradc_ch1_data = 750u;
+    assert(keys_decode(keys_read_adc()) == KEY_RIGHT);
+    g_soc.saradc_ch1_data = 1350u;
+    assert(keys_decode(keys_read_adc()) == KEY_VOL_UP);
+    g_soc.saradc_ch1_data = 2150u;
+    assert(keys_decode(keys_read_adc()) == KEY_VOL_DOWN);
+    g_soc.saradc_ch1_data = 2550u;
+    assert(keys_decode(keys_read_adc()) == KEY_BACK);
+    g_soc.saradc_ch1_data = 2850u;
+    assert(keys_decode(keys_read_adc()) == KEY_ENTER);
+    g_soc.saradc_ch1_data = 4095u;
+    assert(keys_decode(keys_read_adc()) == KEY_NONE);
+
+    assert(keys_read_rec_switch() == 0);
+    g_soc.gpio_in[1] &= ~(1u << 6); /* PB6 low = Rec ON */
+    assert(keys_read_rec_switch() == 1);
+    printf("[OK] keys SARADC MMIO\n");
+}
+
+static void test_lcd_driver(void)
+{
+    soc_reset();
+    lcd_backlight_set(75u);
+    assert(g_soc.pwm3_period_duty == ((48000u << 16) | (75u * 480u)));
+
+    lcd_init();
+    assert((g_soc.gpio_lcd_pad_en & 0x0000FFD0u) == 0x0000FFD0u);
+    assert(g_soc.st_invon == 1u && g_soc.st_disp_on == 1u);
+    assert(g_soc.st_colmod == 0x05u && g_soc.st_madctl == 0xC8u);
+
+    uint16_t navy = rgb565(0u, 0u, 128u);
+    uint16_t gold = rgb565(255u, 220u, 0u);
+    lcd_fill_rect(0u, 0u, LCD_WIDTH, LCD_HEIGHT, navy);
+    assert(g_soc.st_fb[0][0] == navy && g_soc.st_fb[159][79] == navy);
+
+    lcd_draw_str(8u, 16u, "OK", gold, navy);
+    uint32_t fg_pixels = 0u;
+    for (uint16_t y = 16u; y < 23u; y++) {
+        for (uint16_t x = 8u; x < 20u; x++) {
+            if (g_soc.st_fb[y][x] == gold) {
+                fg_pixels++;
+            }
+        }
+    }
+    assert(fg_pixels > 10u);
+
+    uint16_t patch[4] = { 0x1111u, 0x2222u, 0x3333u, 0x4444u };
+    lcd_blit_rgb565(4u, 4u, 2u, 2u, patch);
+    assert(g_soc.st_fb[4][4] == 0x1111u && g_soc.st_fb[5][5] == 0x4444u);
+    printf("[OK] lcd_st7735s + PWM3 MMIO (%u fg px)\n", fg_pixels);
+}
+
+static void host_feed_ep0_setup(const uint8_t setup[8])
+{
+    memcpy(g_soc.musb_rx_fifo[0], setup, 8u);
+    g_soc.musb_rx_pos[0]   = 0u;
+    g_soc.musb_rx_len[0]   = 8u;
+    g_soc.musb_rxcount[0]  = 8u;
+    g_soc.musb_txcsr[0]   |= 0x0001u; /* RxPktRdy */
+    g_soc.musb_intrtx     |= 0x0001u;
+    g_soc.musb_tx_len[0]   = 0u;
+    usb_msc_poll();
+}
+
+static void host_feed_ep1_out(const uint8_t *data, uint16_t len)
+{
+    assert(len <= sizeof(g_soc.musb_rx_fifo[1]));
+    memcpy(g_soc.musb_rx_fifo[1], data, len);
+    g_soc.musb_rx_pos[1]  = 0u;
+    g_soc.musb_rx_len[1]  = len;
+    g_soc.musb_rxcount[1] = len;
+    g_soc.musb_rxcsr[1]  |= 0x0001u; /* RxPktRdy */
+    g_soc.musb_intrrx    |= 0x0002u;
+    usb_msc_poll();
+}
+
+static uint16_t host_drain_ep1_in(uint8_t *out, uint16_t max_len)
+{
+    uint16_t total = 0u;
+    for (int iter = 0; iter < 64; iter++) {
+        if (g_soc.musb_tx_len[1] > 0u) {
+            assert(total + g_soc.musb_tx_len[1] <= max_len);
+            memcpy(out + total, g_soc.musb_tx_fifo[1], g_soc.musb_tx_len[1]);
+            total = (uint16_t)(total + g_soc.musb_tx_len[1]);
+            g_soc.musb_tx_len[1] = 0u;
+            g_soc.musb_txcsr[1] &= ~0x0001u;
+        }
+        usb_msc_poll();
+        if (g_soc.musb_tx_len[1] == 0u) {
+            break;
+        }
+    }
+    return total;
+}
+
+static void test_sdio_exfat_and_usb_msc(const char *exfat_img_path)
+{
+    soc_reset();
+    g_soc.sd_num_sectors = 16384u; /* 8 MiB SDHC */
+    g_soc.sd_sectors = (uint8_t *)calloc(g_soc.sd_num_sectors, 512u);
+    assert(g_soc.sd_sectors != NULL);
+
+    FILE *f = fopen(exfat_img_path, "rb");
+    assert(f != NULL);
+    size_t got_bytes = fread(g_soc.sd_sectors, 512u, 4096u, f);
+    fclose(f);
+    assert(got_bytes == 4096u);
+
+    sd_card_t card;
+    assert(sd_init(&card) == 0);
+    assert(card.initialized == 1 && card.is_sdhc == 1);
+    assert(card.rca == 0x1234u && card.sector_count == 16384u);
+
+    blkdev_t blk = sd_as_blkdev(&card);
+    exfat_vol_t vol;
+    assert(exfat_mount(&vol, &blk) == 0);
+    exfat_set_timestamp(&vol, 0x5C210000u);
+
+    exfat_writer_t wf;
+    assert(exfat_mkdir(&vol, "MMIO") == 0);
+    assert(exfat_create_file(&vol, "MMIO", "MMIO_TEST.TXT", &wf) == 0);
+    static const char msg[] = "Hello via SL6801 SDIO!";
+    assert(exfat_write(&wf, msg, sizeof(msg) - 1u) == 0);
+    assert(exfat_close_file(&wf) == 0);
+
+    exfat_entry_t ent;
+    char rb[64];
+    uint32_t got_n = 0u;
+    assert(exfat_find_path(&vol, "MMIO/MMIO_TEST.TXT", &ent) == 0);
+    assert(ent.size == sizeof(msg) - 1u);
+    assert(exfat_read_file(&vol, &ent, 0u, rb, sizeof(rb), &got_n) == 0);
+    assert(got_n == sizeof(msg) - 1u && memcmp(rb, msg, got_n) == 0);
+
+    uint8_t sector_buf[512];
+    assert(sd_read_blocks(&card, 0u, 1u, sector_buf) == 0);
+    assert(memcmp(sector_buf + 3, "EXFAT   ", 8) == 0);
+
+    /* Now exercise full USB PHY + MUSB enumeration + SCSI BOT R/W over SDIO */
+    usb_phy_det_arm();
+    assert(usb_phy_det_poll_host() == 0);
+    g_soc.usb_phy_int_status = 0x1u;
+    assert(usb_phy_det_poll_host() == 1);
+
+    assert(usb_msc_start(&blk) == 0);
+    assert((g_soc.musb_power & 0x40u) != 0u);
+    assert((g_soc.musb_testmode & 0x20u) != 0u);
+
+    /* Bus Reset -> GET_DESCRIPTOR(DEVICE) -> SET_ADDRESS(5) -> SET_CONFIGURATION(1) -> GET_MAX_LUN */
+    g_soc.musb_intrusb = 0x04u;
+    usb_msc_poll();
+
+    static const uint8_t get_dev[8] = { 0x80u, 0x06u, 0x00u, 0x01u, 0x00u, 0x00u, 18u, 0x00u };
+    host_feed_ep0_setup(get_dev);
+    assert(g_soc.musb_tx_len[0] == 18u);
+    assert(g_soc.musb_tx_fifo[0][8] == 0x09u && g_soc.musb_tx_fifo[0][9] == 0x12u);
+
+    static const uint8_t set_addr[8] = { 0x00u, 0x05u, 5u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u };
+    host_feed_ep0_setup(set_addr);
+    usb_msc_poll(); /* applies deferred address on next ep0_service pass if triggered, or next SETUP */
+    static const uint8_t get_cfg[8] = { 0x80u, 0x08u, 0x00u, 0x00u, 0x00u, 0x00u, 1u, 0x00u };
+    host_feed_ep0_setup(get_cfg);
+    assert(g_soc.musb_faddr == 5u);
+    assert(g_soc.musb_tx_fifo[0][0] == 0u);
+
+    static const uint8_t set_cfg[8] = { 0x00u, 0x09u, 1u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u };
+    host_feed_ep0_setup(set_cfg);
+    static const uint8_t get_lun[8] = { 0xA1u, 0xFEu, 0x00u, 0x00u, 0x00u, 0x00u, 1u, 0x00u };
+    host_feed_ep0_setup(get_lun);
+    assert(g_soc.musb_tx_len[0] == 1u && g_soc.musb_tx_fifo[0][0] == 0u);
+
+    /* SCSI INQUIRY CBW */
+    uint8_t cbw[31] = {
+        0x55, 0x53, 0x42, 0x43,  0x01, 0x00, 0x00, 0x00,
+        36u, 0u, 0u, 0u,         0x80u, 0u, 6u,
+        0x12u, 0u, 0u, 0u, 36u, 0u,
+    };
+    host_feed_ep1_out(cbw, 31u);
+    uint8_t in_buf[600];
+    uint16_t n_in = host_drain_ep1_in(in_buf, sizeof(in_buf));
+    assert(n_in == 36u + 13u);
+    assert(memcmp(in_buf + 8, "Cassini ", 8) == 0);
+    assert(in_buf[36 + 12] == 0u);
+
+    /* SCSI READ(10) LBA 0 (1 sector = 512 B + 13 B CSW) */
+    memset(cbw, 0, sizeof(cbw));
+    memcpy(cbw, "USBC\x02\x00\x00\x00", 8);
+    cbw[8]  = 0x00u; cbw[9] = 0x02u; /* 512 B */
+    cbw[12] = 0x80u; cbw[14] = 10u;
+    cbw[15] = 0x28u; cbw[23] = 1u;   /* LBA 0, 1 blk */
+    host_feed_ep1_out(cbw, 31u);
+    n_in = host_drain_ep1_in(in_buf, sizeof(in_buf));
+    assert(n_in == 512u + 13u);
+    assert(memcmp(in_buf, sector_buf, 512u) == 0);
+    assert(in_buf[512 + 12] == 0u);
+
+    /* SCSI WRITE(10) LBA 5000 (safely past exFAT mkfs) -> verifies real SD write */
+    uint8_t wbuf[512];
+    for (uint32_t i = 0u; i < 512u; i++) {
+        wbuf[i] = (uint8_t)(0xA5u ^ i);
+    }
+    memset(cbw, 0, sizeof(cbw));
+    memcpy(cbw, "USBC\x03\x00\x00\x00", 8);
+    cbw[8]  = 0x00u; cbw[9] = 0x02u;
+    cbw[12] = 0x00u; cbw[14] = 10u;
+    cbw[15] = 0x2Au;
+    cbw[17] = (uint8_t)(5000u >> 24);
+    cbw[18] = (uint8_t)(5000u >> 16);
+    cbw[19] = (uint8_t)(5000u >> 8);
+    cbw[20] = (uint8_t)(5000u);
+    cbw[23] = 1u;
+    host_feed_ep1_out(cbw, 31u);
+    for (uint32_t off = 0u; off < 512u; off += 64u) {
+        host_feed_ep1_out(wbuf + off, 64u);
+    }
+    n_in = host_drain_ep1_in(in_buf, sizeof(in_buf));
+    assert(n_in == 13u && in_buf[12] == 0u);
+    assert(memcmp(&g_soc.sd_sectors[5000u * 512u], wbuf, 512u) == 0);
+
+    uint32_t rx_p = 0u, tx_p = 0u;
+    usb_msc_get_stats(&rx_p, &tx_p);
+    assert(rx_p > 0u && tx_p > 0u);
+    usb_msc_stop();
+    assert(usb_msc_is_active() == 0);
+
+    free(g_soc.sd_sectors);
+    g_soc.sd_sectors = NULL;
+    printf("[OK] sdio + exfat + usb_musb + usb_scsi E2E MMIO (rx=%u tx=%u)\n", rx_p, tx_p);
+}
+
+int main(int argc, char **argv)
+{
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s <test_exfat.img>\n", argv[0]);
+        return 2;
+    }
+    test_wdt_timer();
+    test_uart_and_log_ring();
+    test_rtc_driver();
+    test_pmu_driver();
+    test_keys_driver();
+    test_lcd_driver();
+    test_sdio_exfat_and_usb_msc(argv[1]);
+    printf("ALL 7 MMIO DRIVER SUITES PASSED\n");
+    return 0;
+}
