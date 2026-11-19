@@ -27,8 +27,8 @@ from typing import Dict, List, Optional, Tuple
 
 
 DEFAULT_NAME_PREFIX = "HW_"
-CHUNK_SIZE = 240  # <= 256 bytes per RFCOMM packet for reliable flow control
-DEFAULT_BURST_SIZE = 4096  # multi-packet +XREC:GETS burst size (clamped to 16384 in firmware)
+CHUNK_SIZE = 256  # <= 256 bytes per RFCOMM packet (tested reliable on SL6801)
+DEFAULT_BURST_SIZE = 2048  # 8 x 256 B chunks per +XREC:GETS burst (~52 KB/s, stays inside RFCOMM credit window)
 
 
 def crc16_ccitt_false(data: bytes, init: int = 0xFFFF) -> int:
