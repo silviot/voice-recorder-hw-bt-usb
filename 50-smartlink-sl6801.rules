@@ -1,0 +1,23 @@
+# Smartlink SL6801 / SL6806 Voice Recorder & MP3 Player (HW_76) udev rules
+# Install to: /etc/udev/rules.d/50-smartlink-sl6801.rules
+# Reload with: sudo udevadm control --reload-rules && sudo udevadm trigger
+
+# 1. Grant non-root user access (libusb / smtlink_dump) for Bootloader (2800) and Card Reader (2801) modes
+SUBSYSTEM=="usb", ATTR{idVendor}=="301a", ATTR{idProduct}=="2800", MODE="0666", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="301a", ATTR{idProduct}=="2801", MODE="0666", TAG+="uaccess"
+
+# 2. Prevent the SL6801 15-second USB disconnect / crash loop on Linux:
+#    - Clamp max_sectors_kb to 32 KiB (64 sectors) on the block device
+#    - Disable udev's built-in blkid probe on both the whole-disk (sd[a-z]) and partition (sd[a-z][0-9]*),
+#      because blkid reads the final 4 KiB sectors of the disk/partition (LBA 122101752..122101759)
+#      looking for GPT backup headers / RAID superblocks, which hangs the SL6801 USB firmware!
+#    - Explicitly populate ID_FS_TYPE="exfat" and ID_FS_USAGE="filesystem" on the partition node
+#      so udisks2 and desktop file managers still recognize and mount the partition normally!
+SUBSYSTEM=="block", KERNEL=="sd[a-z]", ATTRS{idVendor}=="301a", ATTRS{idProduct}=="2801", \
+  ATTR{queue/max_sectors_kb}="32", \
+  ENV{UDEV_DISABLE_PERSISTENT_STORAGE_BLKID_FLAG}="1"
+
+SUBSYSTEM=="block", KERNEL=="sd[a-z][0-9]*", ATTRS{idVendor}=="301a", ATTRS{idProduct}=="2801", \
+  ENV{UDEV_DISABLE_PERSISTENT_STORAGE_BLKID_FLAG}="1", \
+  ENV{ID_FS_USAGE}="filesystem", \
+  ENV{ID_FS_TYPE}="exfat"

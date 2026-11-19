@@ -1,0 +1,16 @@
+# Never commit proprietary firmware dumps, boot ROM dumps, or audio recordings
+dumps/
+*.bin
+*.up
+*.fw
+*.rom
+*.wav
+*.mp3
+
+# Compiled binaries and build artifacts
+tools/smtlink_dump
+tools/fwhelper
+*.o
+*.elf
+__pycache__/
+.venv/
