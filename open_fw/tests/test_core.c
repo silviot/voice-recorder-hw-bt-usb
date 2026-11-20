@@ -364,7 +364,7 @@ static int test_list_cb(const exfat_entry_t *e, void *user)
 {
     list_ctx_t *lc = (list_ctx_t *)user;
     if (lc->count == 0) {
-        strncpy(lc->first_name, e->name, sizeof(lc->first_name) - 1u);
+        snprintf(lc->first_name, sizeof(lc->first_name), "%s", e->name);
         lc->first_name[sizeof(lc->first_name) - 1u] = '\0';
     }
     lc->count++;

@@ -8,6 +8,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PATCH_FILE="${PATCH_FILE:-$SCRIPT_DIR/sl6801_qemu_openfw.patch}"
 EMU_REPO_URL="${EMU_REPO_URL:-https://github.com/anton-veretenenko/smartlink-sl6801-emulator}"
+EMU_COMMIT="${EMU_COMMIT:-a4136d678c6fc98c85e3459fc29f90173db5eeab}"
 QEMU_VERSION="${QEMU_VERSION:-8.2.2}"
 
 if [ ! -f "$PATCH_FILE" ]; then
@@ -29,8 +30,9 @@ WORK_DIR="$EMU_DIR/work"
 mkdir -p "$WORK_DIR"
 
 if [ ! -d "$REPO_DIR/.git" ]; then
-    echo "Cloning $EMU_REPO_URL -> $REPO_DIR..."
-    git clone --depth 1 "$EMU_REPO_URL" "$REPO_DIR"
+    echo "Cloning $EMU_REPO_URL (commit $EMU_COMMIT) -> $REPO_DIR..."
+    git clone "$EMU_REPO_URL" "$REPO_DIR"
+    git -C "$REPO_DIR" checkout --detach "$EMU_COMMIT"
 fi
 
 if git -C "$REPO_DIR" apply --check "$PATCH_FILE" >/dev/null 2>&1; then

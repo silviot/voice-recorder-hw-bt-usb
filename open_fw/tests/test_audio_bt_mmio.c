@@ -468,9 +468,17 @@ static int mem_read_sectors(void *ctx, uint32_t lba, uint32_t count, void *buf)
     return 0;
 }
 
+static int g_sd_fail_after = -1;
+
 static int mem_write_sectors(void *ctx, uint32_t lba, uint32_t count, const void *buf)
 {
     (void)ctx;
+    if (g_sd_fail_after >= 0) {
+        if (g_sd_fail_after == 0) {
+            return -1;
+        }
+        g_sd_fail_after--;
+    }
     if (lba > g_soc.sd_sectors || count > (g_soc.sd_sectors - lba)) {
         return -1;
     }
@@ -685,6 +693,62 @@ static void test_recorder(const char *exfat_img_path)
     assert(info3.sample_rate == 16000u && info3.channels == 2u && info3.block_align == 4u);
     assert(info3.byte_rate == 64000u && info3.data_bytes == 8192u);
 
+    /* Recording #4: Power-loss checkpoint recovery (remount WITHOUT calling recorder_stop) */
+    recorder_set_gain(20u);
+    recorder_set_dsp_profile(AUDIO_DSP_BYPASS);
+    recorder_set_channels(1u);
+    g_sd_fail_after = -1;
+    assert(recorder_start(&vol, 1) == 0);
+    assert(strcmp(recorder_get_filename(), "REC_0004.wav") == 0);
+    for (uint32_t f = 0u; f < 4u; f++) {
+        sim_dma_deliver_frame(200, 9000, NULL);
+        recorder_poll();
+    }
+    /* Remount fresh volume before stop -> checkpointed prefix must be playable */
+    exfat_vol_t vol_ckpt;
+    assert(exfat_mount(&vol_ckpt, &dev) == 0);
+    exfat_entry_t ent4;
+    assert(exfat_find_path(&vol_ckpt, "/record/REC_0004.wav", &ent4) == 0);
+    assert(ent4.first_cluster >= 2u && ent4.size >= 4096u);
+    uint8_t hdr4[44];
+    uint32_t got4 = 0u;
+    assert(exfat_read_file(&vol_ckpt, &ent4, 0u, hdr4, 44u, &got4) == 0 && got4 == 44u);
+    wav_info_t info4;
+    assert(wav_parse_header(hdr4, &info4) == 0 && info4.data_bytes == (uint32_t)(ent4.size - 44u));
+    assert(recorder_stop() == 0);
+
+    /* Snapshot clean SD image before fault-injection tests #5 & #6 */
+    uint8_t *sd_clean = (uint8_t *)malloc((size_t)sz);
+    assert(sd_clean != NULL);
+    memcpy(sd_clean, g_soc.sd_buf, (size_t)sz);
+
+    /* Recording #5: Mid-recording write failure -> recorder_has_error() && recorder_stop() == -1 */
+    assert(recorder_start(&vol, 1) == 0);
+    g_sd_fail_after = 2;
+    for (uint32_t f = 0u; f < 4u; f++) {
+        sim_dma_deliver_frame(300, 8000, NULL);
+        recorder_poll();
+    }
+    assert(recorder_has_error() == 1);
+    assert(recorder_is_saving() == 0);
+    assert(recorder_stop() == -1);
+    g_sd_fail_after = -1;
+
+    /* Recording #6: Failed final header patch / close -> recorder_stop() == -1 */
+    memcpy(g_soc.sd_buf, sd_clean, (size_t)sz);
+    assert(exfat_mount(&vol, &dev) == 0);
+    assert(recorder_start(&vol, 1) == 0);
+    sim_dma_deliver_frame(400, 7000, NULL);
+    recorder_poll();
+    g_sd_fail_after = 0; /* Fail writes during recorder_stop() */
+    assert(recorder_stop() == -1);
+    assert(recorder_has_error() == 1);
+    g_sd_fail_after = -1;
+
+    /* Restore clean snapshot for fsck.exfat validation */
+    memcpy(g_soc.sd_buf, sd_clean, (size_t)sz);
+    free(sd_clean);
+
     /* Restore default recorder config */
     recorder_set_gain(20u);
     recorder_set_dsp_profile(AUDIO_DSP_ASR_RAW);
@@ -700,7 +764,7 @@ static void test_recorder(const char *exfat_img_path)
     free(g_soc.sd_buf);
     g_soc.sd_buf     = NULL;
     g_soc.sd_sectors = 0u;
-    printf("[OK] recorder -> exFAT (REC_0001.wav=raw, REC_0002.wav=ASR_RAW, REC_0003.wav=2ch stereo)\n");
+    printf("[OK] recorder -> exFAT (REC_0001..0004 + checkpoint recovery + write/close fault injection)\n");
 }
 
 /* ============================================================================

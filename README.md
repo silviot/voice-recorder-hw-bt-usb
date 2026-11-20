@@ -51,7 +51,18 @@ The standalone open-source firmware already boots and runs natively on the real 
 - **Crisp Anti-Aliased Display:** Custom 4-bit (16-level) anti-aliased fonts and rounded UI primitives that render in under 4 ms on the `0.96"` screen, plus a 2-second boot animation.
 - **Reliable USB-C Drive Mode:** Plug it into Linux, macOS, or Windows and copy recordings without the factory firmware's 15-second disconnect bug.
 - **Desktop Emulator & Safe Testing:** Prototype UI changes in a desktop QEMU emulator or test code directly in device RAM without wearing out flash memory.
-- **Stock Firmware Tools (Optional):** If you prefer to keep the factory software, this repo also includes a safe, zero-data-loss Linux USB fix and a custom Bluetooth file-transfer patch (`fw_mod/`).
+- **Stock Firmware Tools (Optional):** If you prefer to keep the factory software, this repo also includes a Linux USB tail-boundary repair script (`tools/fix_exfat_boundary.py`) and a custom Bluetooth file-transfer patch (`fw_mod/`).
+
+### Verification Status (`HW_76` / `pen133_2.0.65`)
+
+| Area | Host / ASan+UBSan | QEMU Emulator | Physical `HW_76` Device |
+| :--- | :---: | :---: | :---: |
+| **exFAT read/write, crash checkpointing, atomic replace & `fsck.exfat`** | Verified (CI) | Verified | Verified (live SDIO mount + recording) |
+| **Recording DSP (`Raw` / `Voice` / `Bypass`), VOR & fault-injected write/close** | Verified (CI) | — | Live stereo AMIC1+AMIC2 verified |
+| **DAC playback, `PB30` speaker PA & `PB11` headphone detect** | Verified (MMIO CI) | — | Live DAC verified (`PB30` PA ready to test) |
+| **160×80 AA UI, off-screen framebuffer & 6-screen navigation** | Verified (CI) | Verified (6 screens) | Live flicker-free UI verified |
+| **USB MSC drive mode, RTC sync & `usb_sync.py` collision safety** | Verified (CI) | Verified | Live USB MSC + RTC sync verified |
+| **Classic BT SPP + `+XREC` v5 (resumable `LS`, staged `PUT`)** | Verified (CI) | — | RF/modem bring-up verified; full soak pending |
 
 ---
 
@@ -70,14 +81,15 @@ The standalone open-source firmware already boots and runs natively on the real 
 ## Quick Start
 
 ### 1. Just want to fix the Linux USB disconnect bug on the original firmware?
-The factory software freezes every 15 seconds on Linux because Linux checks the very last sectors of the 64 GB drive, triggering a bug in the recorder. You can fix it permanently with zero data loss:
+The factory software freezes every 15 seconds on Linux because Linux checks the very last sectors of the 64 GB drive, triggering a bug in the recorder. You can shrink the partition boundary by 1 cluster (128 KiB) so Linux stays clear of those sectors (`fix_exfat_boundary.py` verifies the tail cluster is unallocated in the exFAT bitmap and is idempotent — always run `--dry-run` first and back up important recordings):
 
 ```bash
 # Install the udev rule
 sudo cp 50-smartlink-sl6801.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules
 
-# Shrink the partition metadata by 128 KB so Linux stays clear of the buggy end-of-disk sectors
+# Dry-run first, then shrink the partition metadata by 128 KB if the tail cluster is free
+sudo python3 tools/fix_exfat_boundary.py --dry-run /dev/sdX
 sudo python3 tools/fix_exfat_boundary.py /dev/sdX
 ```
 

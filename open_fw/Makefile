@@ -39,7 +39,7 @@ STOCK_DUMP  := ../dumps/firmware_2M.bin
 OUT_BIN     := ../dumps/firmware_2M_openfw.bin
 OUT_UP      := ../dumps/update_openfw.up
 
-.PHONY: all test-host test-qemu qemu-stub update-up clean
+.PHONY: all test-host test-host-san test-qemu qemu-stub update-up clean
 
 all: $(BUILD_DIR)/open_fw_firm.bin
 
@@ -97,6 +97,9 @@ test-host: tests/test_core.c src/crypto.c src/wav.c src/cwx.c src/exfat.c src/pe
 	/usr/sbin/mkfs.exfat -q -b 4096 -c 4096 $(BUILD_DIR)/test_rec_exfat.img
 	$(BUILD_DIR)/test_audio_bt_mmio $(BUILD_DIR)/test_rec_exfat.img
 	/usr/sbin/fsck.exfat -n $(BUILD_DIR)/test_rec_exfat.img
+
+test-host-san:
+	$(MAKE) test-host HOST_CFLAGS="$(HOST_CFLAGS) -fsanitize=undefined,address -fno-omit-frame-pointer" BUILD_DIR="$(BUILD_DIR)_san"
 
 update-up: $(BUILD_DIR)/ram_boot.bin $(BUILD_DIR)/xip.bin tools/pack_firm.py
 	@test -f "$(STOCK_DUMP)" || (echo "Error: $(STOCK_DUMP) not found" >&2; exit 1)

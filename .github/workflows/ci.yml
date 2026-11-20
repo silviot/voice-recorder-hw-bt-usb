@@ -20,11 +20,18 @@ jobs:
       - name: Run OpenFW host unit and MMIO driver tests
         run: make -C open_fw test-host
 
+      - name: Run OpenFW host tests under ASan + UBSan
+        run: make -C open_fw test-host-san
+
       - name: Build Cassini OpenFW ARM firmware
         run: make -C open_fw
 
-      - name: Run Python host tool self-tests
+      - name: Run Python host tool self-tests and safety regressions
         run: |
           python3 tools/flash_ranges.py --self-test
           python3 tools/openfw_usb.py --self-test
           python3 tools/usb_rtc_sync.py --dry-run
+          python3 tools/dev_cycle.py --self-test
+          python3 tools/asr_prep.py --self-test
+          python3 tools/cassini_to_device.py --self-test
+          python3 tools/test_tools.py
