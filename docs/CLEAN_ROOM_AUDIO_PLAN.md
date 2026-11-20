@@ -114,23 +114,42 @@ void audio_dsp_process_i16(audio_dsp_t *dsp, int16_t *pcm, size_t num_frames);
 
 ---
 
-## 5. CPU & Memory Budget on SL6801
+## 5. Hardware Constraints, CPU & Memory Budget on SL6801
 
-- **Frame size:** `2048` samples @ 16 kHz = `128 ms` per DMAC interrupt.
+- **Hardware FPU confirmed in silicon (`fpv4-sp-d16`):** Both BootROM and stock firmware execute single-precision VFPv4-SP instructions natively. Firmware built with `-mfpu=fpv4-sp-d16 -mfloat-abi=hard` **must** enable `SCB->CPACR (0xE000ED88) |= (0xFu << 20); __DSB(); __ISB();` in `Reset_Handler` before running any hard-float C code.
+- **DMAC Transfer-Complete IRQ bit (`0x00080002u`):** On SL6801 DMAC (`0x40001000`), `DMAC_CH_IRQ_EN`/`IRQ_STAT` **bit 0 (`0x01`) is an early remaining-bytes watermark IRQ** (`[31:14] = 0x20` → 32 bytes remaining), while **bit 1 (`0x02`) is Transfer Complete (`TC`)**. Both `audio_dma.c` and `audio_dac.c` **must** enable **`0x00080002u`** and rearm on **bit 1 (`DMAC_IRQ_TC = 1u << 1`)** — arming bit 0 aborts every 128 ms DMA buffer 16 bytes (4 stereo frames = 1 burst) early, leaving a periodic 0.25 ms zero gap / filter ramp.
+- **ADC channel FIFO enable (`ADC_CHx_CTRL = 0x09`):** Channel control registers have stride `0x30` (`CH1 = 0x40009250` for `AMIC1`, `CH2 = 0x40009280` for `AMIC2`). Each active channel must set **bit 3 (`ADC_CHx_FIFO_EN`) | bit 0 (`ADC_CHx_EN`) = `0x09`**.
+- **Frame size:** `2048` frames @ 16 kHz = `128 ms` per DMAC interrupt (`8192` bytes stereo).
 - **Compute cost (`ASR_RAW`, Cortex-M4F w/ FPU @ 96 MHz):**
   - 1 biquad DF-II-T = ~12 cycles/sample; limiter = ~15 cycles/sample.
   - Mono: `2048 × ~30 cycles ≈ 61k cycles` = **0.64 ms per 128 ms frame (~0.5% CPU)**.
   - Stereo: **~1.0% CPU**.
   - `VOICE_CLARITY`: **~1.5–2.0% CPU** (even with 2 biquads + compressor + limiter).
 - **RAM footprint:** `sizeof(audio_dsp_t) ≈ 128 bytes` (static BSS, zero malloc).
-- **Profiling:** Benchmark on silicon using the 1 MHz 64-bit hardware timer (`0x40082104` / `0x40082108`), **not** `DWT->CYCCNT` (unverified/unused in stock BootROM and `FIRM`).
+- **Profiling:** Benchmark on silicon using the 1 MHz 64-bit hardware timer (`0x40082104` / `0x40082108`), **not** `DWT->CYCCNT` (unused in stock BootROM/firmware and frozen on sibling SL6806 silicon).
 
 ---
 
-## 6. Phased Implementation Roadmap
+## 6. Playback Volume & Built-In Speaker PA (`open_fw/src/audio_dac.c`)
+
+- **Logarithmic dB Volume Curve:** Hardware `CODEC_DAC01_ANA_VOL` (`0x40009030`, `0..31`) has limited audible range on its own; stock firmware keeps `CODEC_DAC0/1_VOL` (`0x40009138`/`0x40009158`) at `0x1FF` (0 dB) and scales PCM in software using a logarithmic dB curve (`10^(dB/20)`). Use a **32-entry logarithmic dB Q15 lookup table** (`0` = mute, `-48 dB` at level 1 up to `0 dB` at level 31, `~1.6 dB/step`) instead of linear or quadratic scaling so every volume-button step produces a uniform perceptual change.
+- **Pop-Free Speaker PA (`PB30`):** The built-in front speaker shares `DAC0 + DAC1` (`DAC2` is unused) through an external PA enabled on **`PB30`** (`GPIOB_BASE = 0x40081040`, `mux = 0` Hi-Z: internal pull-up ON `0x40081068[29:28] = 2` enables PA; no-pull disables PA via external pull-down). Keep `PB30` OFF whenever headphones are detected (`PB11 == 0`) and during DAC analog power-up/down depop ramps.
+
+---
+
+## 7. Stock Firmware Baseline (For Phase 4 VOR & A/B Benchmarks)
+
+- **No hardware AGC:** Analog mic PGAs (`AMIC1`/`AMIC2`) and ADC digital gain (`0 dB`) are static during recording.
+- **Stock software AGC (`codec.admomini`, active by default at `512 kbps`):** `2:1` compressor, `-24 dBFS` upper / `-60 dBFS` lower threshold, `1 ms` attack / `20–50 ms` release, `+8 dB` makeup gain (plus 350 Hz HPF, 2.2 kHz `+9 dB` high-shelf, and `-15 dB` 512-pt dual-mic STFT noise suppression).
+- **Stock VOR (`enc.vad`, opt-in):** `20–1000 Hz` spectral VAD on 128-sample mono-downmixed frames (`-40 / -20 dBFS` thresholds), 30-frame (`240 ms` @ 16 kHz) hangover bitmask, and 25-slot (`~200 ms`) circular pre-roll ring.
+
+---
+
+## 8. Phased Implementation Roadmap
 
 ### Phase 1 — Core Clean-Room DSP Module + Host Unit Tests *(Immediate)*
 - [ ] Add `open_fw/include/audio_dsp.h` and `open_fw/src/audio_dsp.c` implementing `ASR_RAW`, `VOICE_CLARITY`, and `BYPASS`.
+- [ ] Fix `DMAC_IRQ_TC` to bit 1 (`0x00080002u`) in `sl6801_regs.h`, `audio_dma.c`, and `audio_dac.c` to eliminate the 16-byte/4-frame tail gap on every 128 ms buffer.
 - [ ] Add `open_fw/tests/test_audio_dsp.c` and hook into `open_fw/Makefile` host test target:
   - Test 1: DC step input → settles to `0` under `ASR_RAW` and `VOICE_CLARITY`.
   - Test 2: Sine frequency sweep (`30 Hz`, `75 Hz`, `350 Hz`, `1 kHz`, `2.2 kHz`, `5 kHz`) → verify gain within `±0.5 dB` of analytical Butterworth / RBJ shelf curves.
@@ -139,10 +158,9 @@ void audio_dsp_process_i16(audio_dsp_t *dsp, int16_t *pcm, size_t num_frames);
 - [ ] Wire `audio_dsp_init()` in `recorder_start()` and `audio_dsp_process_i16()` in `recorder_poll()` (`open_fw/src/recorder.c`), defaulting to `AUDIO_DSP_ASR_RAW`.
 
 ### Phase 2 — True Dual-Mic Stereo Capture (`AMIC1 + AMIC2`) in `audio_dma.c`
-- [ ] Verify `AMIC2` analog GPIO mux pins and `CODEC_AMIC2` PGA register bits in `dumps/firmware_2M.bin` (we already confirmed `CODEC_ADC_CH_MUX = 0x000D0D00` for `ADC_CH1 + ADC_CH2`).
-- [ ] Add stereo mode to `audio_dma.c`:
-  - Interleaved 16 kHz / 16-bit / 2-ch (`4096` samples = `8192` bytes per 128 ms slot, `32 KiB` total ring buffer).
-  - Update `wav_build_header(hdr, 16000u, channels, 16u, ...)` in `recorder.c`.
+- [x] Verify `AMIC2` analog GPIO mux pins (`PB14/PB15`), `CODEC_ADC_CH_MUX = 0x000D0D00`, and `ADC_CH1/2_CTRL = 0x09` (`0x40009250`/`0x40009280`) — **live-verified on silicon**.
+- [ ] Keep stereo mode in `audio_dma.c` (`4096` samples = `8192` bytes per 128 ms slot, `32 KiB` total ring buffer) with `DMAC_CH_IRQ_EN = 0x00080002u` verified gap-free in `BYPASS` mode.
+- [ ] Update `audio_dac.c` volume control to the 32-entry logarithmic dB Q15 curve.
 - [ ] Optional: add 24-bit-in-32-bit capture mode if extra dynamic range is needed (avoids PGA tuning altogether).
 
 ### Phase 3 — Runtime Control & Host ASR Pipeline
