@@ -33,6 +33,29 @@ static int str_starts_with(const char *s, const char *pfx)
     return 1;
 }
 
+static int str_eq(const char *a, const char *b)
+{
+    while (*a != '\0' && *b != '\0') {
+        if (*a++ != *b++) {
+            return 0;
+        }
+    }
+    return (*a == *b) ? 1 : 0;
+}
+
+static void copy_cstr(char *dst, uint32_t cap, const char *src)
+{
+    uint32_t i = 0u;
+    if (cap == 0u) {
+        return;
+    }
+    while (src && src[i] != '\0' && (i + 1u) < cap) {
+        dst[i] = src[i];
+        i++;
+    }
+    dst[i] = '\0';
+}
+
 static int parse_u32_step(const char **pp, uint32_t *out)
 {
     const char *p = *pp;
@@ -552,10 +575,6 @@ static void handle_put_complete(xrec_ctx_t *ctx)
         send_err(ctx, "LOCKED");
         return;
     }
-    if (!ctx->vol) {
-        send_err(ctx, "NOSD");
-        return;
-    }
 
     uint16_t crc = openfw_crc16_ccitt_false(ctx->put_buf, ctx->put_len);
     if (crc != ctx->put_crc) {
@@ -563,46 +582,121 @@ static void handle_put_complete(xrec_ctx_t *ctx)
         return;
     }
 
-    if (ctx->ota_open && ctx->ota_has_last &&
-        ctx->put_offset == ctx->ota_last_off &&
-        ctx->put_len == ctx->ota_last_len &&
-        ctx->put_crc == ctx->ota_last_crc) {
+    if (ctx->put_target == XREC_PUT_EXP) {
+        if (!ctx->ops.exp_write) {
+            send_err(ctx, "UNSUP");
+            return;
+        }
+        if (ctx->ops.exp_write(ctx->user, ctx->put_offset, ctx->put_buf, ctx->put_len) != 0) {
+            send_err(ctx, "ARG");
+            return;
+        }
+        send_put_ok(ctx, ctx->put_offset, ctx->put_len);
+        return;
+    }
+
+    if (!ctx->vol) {
+        send_err(ctx, "NOSD");
+        return;
+    }
+
+    if (ctx->put_stream_mode == ctx->put_target && ctx->put_has_last &&
+        ctx->put_last_mode == ctx->put_target &&
+        ctx->put_offset == ctx->put_last_off &&
+        ctx->put_len == ctx->put_last_len &&
+        ctx->put_crc == ctx->put_last_crc &&
+        (ctx->put_target != XREC_PUT_CAS || str_eq(ctx->put_cas_name, ctx->put_stream_name))) {
         send_put_ok(ctx, ctx->put_offset, ctx->put_len);
         return;
     }
 
     if (ctx->put_offset == 0u) {
-        if (ctx->ota_open) {
-            (void)exfat_close_file(&ctx->ota_writer);
-            ctx->ota_open = 0u;
+        if (ctx->put_stream_mode != XREC_PUT_NONE) {
+            (void)exfat_close_file(&ctx->put_writer);
+            ctx->put_stream_mode = XREC_PUT_NONE;
         }
+
+        const char *dir   = "/";
+        const char *fname = "update.up";
+        char full_path[64];
+        int p = 0;
+
+        if (ctx->put_target == XREC_PUT_CAS) {
+            if (exfat_mkdir(ctx->vol, "cassini") != 0) {
+                send_err(ctx, "SDIO");
+                return;
+            }
+            dir   = "/cassini";
+            fname = ctx->put_cas_name;
+            append_str(full_path, &p, (int)sizeof(full_path), "/cassini/");
+            append_str(full_path, &p, (int)sizeof(full_path), fname);
+            full_path[p] = '\0';
+        } else {
+            append_str(full_path, &p, (int)sizeof(full_path), "/update.up");
+            full_path[p] = '\0';
+        }
+
         exfat_entry_t existing;
-        if (exfat_find_path(ctx->vol, "/update.up", &existing) == 0 && !existing.is_dir) {
-            (void)exfat_delete_file(ctx->vol, "/", "update.up");
+        if (exfat_find_path(ctx->vol, full_path, &existing) == 0 && !existing.is_dir) {
+            (void)exfat_delete_file(ctx->vol, dir, fname);
         }
-        if (exfat_create_file(ctx->vol, "/", "update.up", &ctx->ota_writer) != 0) {
+        if (exfat_create_file(ctx->vol, dir, fname, &ctx->put_writer) != 0) {
             send_err(ctx, "SDIO");
             return;
         }
-        ctx->ota_open     = 1u;
-        ctx->ota_written  = 0u;
-        ctx->ota_has_last = 0u;
-    } else if (!ctx->ota_open || ctx->put_offset != ctx->ota_written) {
+        ctx->put_stream_mode = ctx->put_target;
+        copy_cstr(ctx->put_stream_name, (uint32_t)sizeof(ctx->put_stream_name), fname);
+        ctx->put_written  = 0u;
+        ctx->put_has_last = 0u;
+    } else if (ctx->put_stream_mode != ctx->put_target ||
+               ctx->put_offset != ctx->put_written ||
+               (ctx->put_target == XREC_PUT_CAS && !str_eq(ctx->put_cas_name, ctx->put_stream_name))) {
         send_err(ctx, "OFF");
         return;
     }
 
-    if (exfat_write(&ctx->ota_writer, ctx->put_buf, ctx->put_len) != 0) {
+    if (exfat_write(&ctx->put_writer, ctx->put_buf, ctx->put_len) != 0) {
         send_err(ctx, "SDIO");
         return;
     }
 
-    ctx->ota_written  += ctx->put_len;
-    ctx->ota_last_off  = ctx->put_offset;
-    ctx->ota_last_len  = ctx->put_len;
-    ctx->ota_last_crc  = ctx->put_crc;
-    ctx->ota_has_last  = 1u;
+    ctx->put_written   += ctx->put_len;
+    ctx->put_last_off   = ctx->put_offset;
+    ctx->put_last_len   = ctx->put_len;
+    ctx->put_last_crc   = ctx->put_crc;
+    ctx->put_last_mode  = ctx->put_target;
+    ctx->put_has_last   = 1u;
     send_put_ok(ctx, ctx->put_offset, ctx->put_len);
+}
+
+static void handle_putend(xrec_ctx_t *ctx)
+{
+    if (!ctx->vol) {
+        send_err(ctx, "NOSD");
+        return;
+    }
+    if (ctx->put_stream_mode != XREC_PUT_CAS) {
+        send_err(ctx, "NOPUT");
+        return;
+    }
+
+    uint32_t total = ctx->put_written;
+    int rc = exfat_close_file(&ctx->put_writer);
+    ctx->put_stream_mode    = XREC_PUT_NONE;
+    ctx->put_has_last       = 0u;
+    ctx->put_written        = 0u;
+    ctx->put_stream_name[0] = '\0';
+    if (rc != 0) {
+        send_err(ctx, "SDIO");
+        return;
+    }
+
+    char resp[64];
+    int pos = 0;
+    append_str(resp, &pos, (int)sizeof(resp), "+XREC:OK,PUTEND,");
+    append_u32(resp, &pos, (int)sizeof(resp), total);
+    append_str(resp, &pos, (int)sizeof(resp), "\r\n");
+    send_text(ctx, resp, pos);
 }
 
 static void handle_ota(xrec_ctx_t *ctx)
@@ -611,14 +705,16 @@ static void handle_ota(xrec_ctx_t *ctx)
         send_err(ctx, "NOSD");
         return;
     }
-    if (!ctx->ota_open || ctx->ota_written < 64u) {
+    if (ctx->put_stream_mode != XREC_PUT_OTA || ctx->put_written < 64u) {
         send_err(ctx, "NOOTA");
         return;
     }
 
-    int rc = exfat_close_file(&ctx->ota_writer);
-    ctx->ota_open     = 0u;
-    ctx->ota_has_last = 0u;
+    int rc = exfat_close_file(&ctx->put_writer);
+    ctx->put_stream_mode    = XREC_PUT_NONE;
+    ctx->put_has_last       = 0u;
+    ctx->put_written        = 0u;
+    ctx->put_stream_name[0] = '\0';
     if (rc != 0) {
         send_err(ctx, "SDIO");
         return;
@@ -628,6 +724,172 @@ static void handle_ota(xrec_ctx_t *ctx)
     send_text(ctx, ok, (int)(sizeof(ok) - 1u));
     if (ctx->ops.on_ota) {
         ctx->ops.on_ota(ctx->user);
+    }
+}
+
+static void handle_run(xrec_ctx_t *ctx, const char *args)
+{
+    if (!ctx->ops.exp_run) {
+        send_err(ctx, "UNSUP");
+        return;
+    }
+    uint32_t entry_off = 0u;
+    uint32_t arg       = 0u;
+    if (*args == ',') {
+        const char *p = args + 1;
+        if (parse_u32_step(&p, &entry_off) != 0) {
+            send_err(ctx, "ARGS");
+            return;
+        }
+        if (*p == ',') {
+            p++;
+            if (parse_u32_step(&p, &arg) != 0 || *p != '\0') {
+                send_err(ctx, "ARGS");
+                return;
+            }
+        } else if (*p != '\0') {
+            send_err(ctx, "ARGS");
+            return;
+        }
+    } else if (*args != '\0') {
+        send_err(ctx, "ARGS");
+        return;
+    }
+
+    uint32_t rc = 0u, elapsed_ms = 0u, out_len = 0u, log_widx = 0u;
+    if (ctx->ops.exp_run(ctx->user, entry_off, arg, &rc, &elapsed_ms, &out_len, &log_widx) != 0) {
+        send_err(ctx, "RUN");
+        return;
+    }
+
+    char resp[96];
+    int pos = 0;
+    append_str(resp, &pos, (int)sizeof(resp), "+XREC:OK,RUN,");
+    append_u32(resp, &pos, (int)sizeof(resp), rc);
+    append_str(resp, &pos, (int)sizeof(resp), ",");
+    append_u32(resp, &pos, (int)sizeof(resp), elapsed_ms);
+    append_str(resp, &pos, (int)sizeof(resp), ",");
+    append_u32(resp, &pos, (int)sizeof(resp), out_len);
+    append_str(resp, &pos, (int)sizeof(resp), ",");
+    append_u32(resp, &pos, (int)sizeof(resp), log_widx);
+    append_str(resp, &pos, (int)sizeof(resp), "\r\n");
+    send_text(ctx, resp, pos);
+}
+
+static void handle_audio_cfg_cmd(xrec_ctx_t *ctx, const char *tag,
+                                 const char *rest, uint32_t field_idx,
+                                 uint32_t min_v, uint32_t max_v)
+{
+    if (!ctx->ops.audio_cfg) {
+        send_err(ctx, "UNSUP");
+        return;
+    }
+
+    uint8_t cfg[4] = { 0u, 20u, 1u, 0u };
+    if (ctx->ops.audio_cfg(ctx->user, 0, &cfg[0], &cfg[1], &cfg[2], &cfg[3]) != 0) {
+        send_err(ctx, "FAIL");
+        return;
+    }
+
+    if (*rest != '\0') {
+        if (*rest != '=' && *rest != ',') {
+            send_err(ctx, "ARGS");
+            return;
+        }
+        const char *p = rest + 1;
+        uint32_t val  = 0u;
+        if (parse_u32_step(&p, &val) != 0 || *p != '\0' || val < min_v || val > max_v) {
+            send_err(ctx, "ARGS");
+            return;
+        }
+        cfg[field_idx] = (uint8_t)val;
+        if (ctx->ops.audio_cfg(ctx->user, 1, &cfg[0], &cfg[1], &cfg[2], &cfg[3]) != 0) {
+            send_err(ctx, "ARGS");
+            return;
+        }
+    }
+
+    char resp[48];
+    int pos = 0;
+    append_str(resp, &pos, (int)sizeof(resp), "+XREC:OK,");
+    append_str(resp, &pos, (int)sizeof(resp), tag);
+    append_str(resp, &pos, (int)sizeof(resp), ",");
+    append_u32(resp, &pos, (int)sizeof(resp), cfg[field_idx]);
+    append_str(resp, &pos, (int)sizeof(resp), "\r\n");
+    send_text(ctx, resp, pos);
+}
+
+static void handle_log_cmd(xrec_ctx_t *ctx, const char *args)
+{
+    if (str_eq(args, ",CLEAR")) {
+        if (!ctx->ops.reset_log) {
+            send_err(ctx, "UNSUP");
+            return;
+        }
+        ctx->ops.reset_log(ctx->user);
+        static const char ok[] = "+XREC:OK,LOG,CLEAR\r\n";
+        send_text(ctx, ok, (int)(sizeof(ok) - 1u));
+        return;
+    }
+
+    if (!ctx->ops.read_log) {
+        send_err(ctx, "UNSUP");
+        return;
+    }
+
+    uint32_t off = 0u;
+    uint32_t req = 512u;
+    if (*args == ',') {
+        const char *p = args + 1;
+        if (parse_u32_step(&p, &off) != 0) {
+            send_err(ctx, "ARGS");
+            return;
+        }
+        if (*p == ',') {
+            p++;
+            if (parse_u32_step(&p, &req) != 0 || *p != '\0') {
+                send_err(ctx, "ARGS");
+                return;
+            }
+        } else if (*p != '\0') {
+            send_err(ctx, "ARGS");
+            return;
+        }
+    } else if (*args != '\0') {
+        send_err(ctx, "ARGS");
+        return;
+    }
+
+    if (req == 0u) {
+        send_err(ctx, "ARGS");
+        return;
+    }
+    if (req > 512u) {
+        req = 512u;
+    }
+
+    uint8_t frame[576];
+    uint8_t tmp[512];
+    uint32_t widx   = 0u;
+    uint32_t actual = ctx->ops.read_log(ctx->user, off, tmp, req, &widx);
+    if (actual > 512u) {
+        actual = 512u;
+    }
+
+    int pos = 0;
+    append_str((char *)frame, &pos, (int)sizeof(frame), "+XREC:LOG,");
+    append_u32((char *)frame, &pos, (int)sizeof(frame), off);
+    append_str((char *)frame, &pos, (int)sizeof(frame), ",");
+    append_u32((char *)frame, &pos, (int)sizeof(frame), actual);
+    append_str((char *)frame, &pos, (int)sizeof(frame), ",");
+    append_u32((char *)frame, &pos, (int)sizeof(frame), widx);
+    append_str((char *)frame, &pos, (int)sizeof(frame), ":");
+    if (actual > 0u && (uint32_t)pos + actual <= sizeof(frame)) {
+        mem_copy(&frame[pos], tmp, actual);
+        pos += (int)actual;
+    }
+    if (ctx->ops.send) {
+        (void)ctx->ops.send(ctx->user, frame, (uint16_t)pos);
     }
 }
 
@@ -648,14 +910,36 @@ static void try_start_put_header(xrec_ctx_t *ctx)
         return;
     }
     p++;
-    if (parse_u32_step(&p, &crc) != 0) {
+    if (parse_u32_step(&p, &crc) != 0 || *p != ',') {
         send_err(ctx, "ARG");
         return;
     }
-    if (p[0] != ',' || p[1] != 'O' || p[2] != 'T' || p[3] != 'A' || p[4] != '\0') {
+    p++;
+
+    uint8_t target = XREC_PUT_NONE;
+    char cas_name[32];
+    cas_name[0] = '\0';
+    if (str_eq(p, "OTA")) {
+        target = XREC_PUT_OTA;
+    } else if (str_eq(p, "EXP")) {
+        target = XREC_PUT_EXP;
+    } else if (str_starts_with(p, "CAS,")) {
+        const char *fname = p + 4;
+        uint32_t flen = 0u;
+        while (fname[flen] != '\0') {
+            flen++;
+        }
+        if (!is_safe_filename(fname) || flen > 30u) {
+            send_err(ctx, "NAME");
+            return;
+        }
+        target = XREC_PUT_CAS;
+        copy_cstr(cas_name, (uint32_t)sizeof(cas_name), fname);
+    } else {
         send_err(ctx, "ARG");
         return;
     }
+
     if (chunk_len == 0u || chunk_len > XREC_MAX_CHUNK || crc > 0xFFFFu) {
         send_err(ctx, "ARG");
         return;
@@ -663,6 +947,8 @@ static void try_start_put_header(xrec_ctx_t *ctx)
 
     ctx->put_active  = 1u;
     ctx->put_auth_ok = ctx->auth;
+    ctx->put_target  = target;
+    copy_cstr(ctx->put_cas_name, (uint32_t)sizeof(ctx->put_cas_name), cas_name);
     ctx->put_offset  = off;
     ctx->put_len     = (uint16_t)chunk_len;
     ctx->put_crc     = (uint16_t)crc;
@@ -720,8 +1006,28 @@ static void process_line(xrec_ctx_t *ctx, const char *line)
         if (ctx->ops.on_reboot) {
             ctx->ops.on_reboot(ctx->user);
         }
+    } else if (str_starts_with(cmd, "DFU") && cmd[3] == '\0') {
+        static const char ok[] = "+XREC:OK,DFU\r\n";
+        send_text(ctx, ok, (int)(sizeof(ok) - 1u));
+        if (ctx->ops.on_dfu) {
+            ctx->ops.on_dfu(ctx->user);
+        }
     } else if (str_starts_with(cmd, "OTA") && cmd[3] == '\0') {
         handle_ota(ctx);
+    } else if (str_starts_with(cmd, "PUTEND") && cmd[6] == '\0') {
+        handle_putend(ctx);
+    } else if (str_starts_with(cmd, "RUN") && (cmd[3] == '\0' || cmd[3] == ',')) {
+        handle_run(ctx, cmd + 3);
+    } else if (str_starts_with(cmd, "LOG") && (cmd[3] == '\0' || cmd[3] == ',')) {
+        handle_log_cmd(ctx, cmd + 3);
+    } else if (str_starts_with(cmd, "DSP") && (cmd[3] == '\0' || cmd[3] == '=' || cmd[3] == ',')) {
+        handle_audio_cfg_cmd(ctx, "DSP", cmd + 3, 0u, 0u, 2u);
+    } else if (str_starts_with(cmd, "GAIN") && (cmd[4] == '\0' || cmd[4] == '=' || cmd[4] == ',')) {
+        handle_audio_cfg_cmd(ctx, "GAIN", cmd + 4, 1u, 0u, 31u);
+    } else if (str_starts_with(cmd, "CH") && (cmd[2] == '\0' || cmd[2] == '=' || cmd[2] == ',')) {
+        handle_audio_cfg_cmd(ctx, "CH", cmd + 2, 2u, 1u, 2u);
+    } else if (str_starts_with(cmd, "VOR") && (cmd[3] == '\0' || cmd[3] == '=' || cmd[3] == ',')) {
+        handle_audio_cfg_cmd(ctx, "VOR", cmd + 3, 3u, 0u, 1u);
     } else {
         send_err(ctx, "CMD");
     }
@@ -772,18 +1078,22 @@ void xrec_on_disconnect(xrec_ctx_t *ctx)
     if (!ctx) {
         return;
     }
-    if (ctx->ota_open) {
-        (void)exfat_close_file(&ctx->ota_writer);
+    if (ctx->put_stream_mode != XREC_PUT_NONE) {
+        (void)exfat_close_file(&ctx->put_writer);
     }
-    ctx->auth         = 0u;
-    ctx->chal_active  = 0u;
-    ctx->rx_len       = 0u;
-    ctx->gets_active  = 0u;
-    ctx->put_active   = 0u;
-    ctx->put_got      = 0u;
-    ctx->ota_open     = 0u;
-    ctx->ota_has_last = 0u;
-    ctx->ota_written  = 0u;
+    ctx->auth               = 0u;
+    ctx->chal_active        = 0u;
+    ctx->rx_len             = 0u;
+    ctx->gets_active        = 0u;
+    ctx->put_active         = 0u;
+    ctx->put_target         = XREC_PUT_NONE;
+    ctx->put_cas_name[0]    = '\0';
+    ctx->put_got            = 0u;
+    ctx->put_stream_mode    = XREC_PUT_NONE;
+    ctx->put_has_last       = 0u;
+    ctx->put_last_mode      = XREC_PUT_NONE;
+    ctx->put_stream_name[0] = '\0';
+    ctx->put_written        = 0u;
 }
 
 void xrec_on_rx(xrec_ctx_t *ctx, const uint8_t *data, uint16_t len)

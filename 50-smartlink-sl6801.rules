@@ -2,9 +2,11 @@
 # Install to: /etc/udev/rules.d/50-smartlink-sl6801.rules
 # Reload with: sudo udevadm control --reload-rules && sudo udevadm trigger
 
-# 1. Grant non-root user access (libusb / smtlink_dump) for Bootloader (2800) and Card Reader (2801) modes
-SUBSYSTEM=="usb", ATTR{idVendor}=="301a", ATTR{idProduct}=="2800", MODE="0666", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTR{idVendor}=="301a", ATTR{idProduct}=="2801", MODE="0666", TAG+="uaccess"
+# 1. Grant non-root user access & disable USB autosuspend for Bootloader (2800), Card Reader (2801), and OpenFW (1209:0001)
+SUBSYSTEM=="usb", ATTR{idVendor}=="301a", ATTR{idProduct}=="2800", MODE="0666", TAG+="uaccess", TEST=="power/control", ATTR{power/control}="on"
+SUBSYSTEM=="usb", ATTR{idVendor}=="301a", ATTR{idProduct}=="2801", MODE="0666", TAG+="uaccess", TEST=="power/control", ATTR{power/control}="on"
+SUBSYSTEM=="usb", ATTR{idVendor}=="1209", ATTR{idProduct}=="0001", MODE="0666", TAG+="uaccess", TEST=="power/control", ATTR{power/control}="on"
+SUBSYSTEM=="scsi_generic", ATTRS{idVendor}=="1209", ATTRS{idProduct}=="0001", MODE="0666", TAG+="uaccess"
 
 # 2. Prevent the SL6801 15-second USB disconnect / crash loop on Linux:
 #    - Clamp max_sectors_kb to 32 KiB (64 sectors) on the block device

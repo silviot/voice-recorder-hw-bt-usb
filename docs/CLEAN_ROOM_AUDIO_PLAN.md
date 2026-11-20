@@ -1,0 +1,157 @@
+# Clean-Room Audio Processing Plan (`open_fw`)
+
+**Target Hardware:** Smartlink SL6801 (`HW_76`, Cortex-M4F @ 96–192 MHz, 512 KiB SRAM, dual differential analog mics `AMIC1 + AMIC2` at `18 mm` spacing, 16-bit / 24-bit ADC up to 48 kHz).  
+**Primary Downstream Consumers:**
+1. **NVIDIA Parakeet-TDT-0.6B (`v2` / `v3`)** — 16 kHz mono FastConformer-TDT, high native noise robustness, degraded by aggressive spectral subtraction or steep formant-distorting EQ.
+2. **Cactus Whistle (55M / 16.9 MB)** — 16 kHz mono edge ASR (≤30 s chunks, 80-bin log-mel, built-in Aho-Corasick keyword biasing), benefits from clean host-side VAD + `150–7000 Hz` bandpass.
+3. **Human Playback ("Voice Clarity" Mode)** — Optional clean-room replica of the stock firmware's "human voice focus" sound signature (without reverse-engineered binary blobs).
+
+---
+
+## 1. Design Principles
+
+1. **Preserve raw acoustic truth on the recorder by default.**  
+   On-device DSP should prevent hardware/acoustic failure modes (DC offset, handling rumble, ADC clipping) while leaving spectral detail and dual-mic phase intact for Parakeet, Whistle, and host-side beamforming.
+2. **Zero proprietary blobs, zero heap allocations.**  
+   Pure C99 (`float32_t` using Cortex-M4F hardware FPU, or Q31 fallback), static per-channel state structs, deterministic execution inside `recorder_poll()` (never inside `DMAC_CH1_IRQHandler`).
+3. **Zero-overhead drop-in to `open_fw`.**  
+   Plugs directly between `audio_pop_frame()` in `open_fw/src/audio_dma.c` and `exfat_write()` in `open_fw/src/recorder.c`, reusing the existing 4-slot (`4 × 128 ms`) lock-free DMAC ring buffer.
+4. **Host-testable first.**  
+   Every DSP block compiles and passes automated unit tests on Linux (`open_fw/tests/test_audio_dsp.c`) before touching hardware.
+
+---
+
+## 2. Architecture & File Layout
+
+```text
+open_fw/
+├── include/
+│   └── audio_dsp.h          # Public API, profile enum, config & state structs
+├── src/
+│   ├── audio_dsp.c          # Clean-room biquads, soft limiter, compressor, stats
+│   ├── audio_dma.c          # (Phase 2) Extend AMIC1 mono -> selectable AMIC1+AMIC2 stereo / 24-bit
+│   ├── recorder.c           # Wire audio_dsp_process_i16() between audio_pop_frame() & exfat_write()
+│   └── xrec_proto.c         # (Phase 3) Expose DSP profile & PGA gain over +XREC
+└── tests/
+    └── test_audio_dsp.c     # Host unit tests (frequency response, DC, limiter ceiling, clipping)
+```
+
+---
+
+## 3. On-Device DSP Profiles (`audio_dsp_profile_t`)
+
+### Profile A: `AUDIO_DSP_ASR_RAW` *(Default — Optimal for Parakeet & Whistle)*
+Minimal, phase-safe, non-destructive capture conditioning:
+
+1. **Stage 1 — 75 Hz 2nd-Order Butterworth High-Pass Filter (per channel)**
+   - **Topology:** Direct Form II Transposed biquad (`float32_t`, per-channel state `z1, z2`).
+   - **Purpose:** Strips ADC DC offset, pocket/chassis handling thumps, and wind rumble without attenuating male voice fundamentals (`85–180 Hz`) or distorting vowel formants.
+   - **Standard RBJ coefficients (`fs = 16000 Hz, fc = 75 Hz, Q = 0.70710678`):**
+     - `b0 =  0.979388f`, `b1 = -1.958776f`, `b2 =  0.979388f`
+     - `a1 = -1.958351f`, `a2 =  0.959202f`
+2. **Stage 2 — Transparent Safety Peak Limiter (No Upward AGC)**
+   - **Purpose:** Prevents harsh digital clipping on sudden loud speech/plosives while keeping background noise floor completely flat (no AGC "breathing/pumping" that confuses VAD and ASR).
+   - **Parameters:**
+     - Analog PGA gain set conservatively (`18..22` out of `31`, leaving ~12–18 dB headroom).
+     - Soft-knee ceiling starting at `-3.0 dBFS` (`0.707`), hard asymptote at `-0.5 dBFS` (`0.944`) via smooth `tanh`-like rational saturator or envelope-follower gain reduction (`attack = 1 ms`, `release = 80 ms`).
+   - **Stereo linking (Phase 2):** Compute peak envelope as `max(|L|, |R|)` and apply identical gain to both channels to preserve inter-channel level/phase cues for host beamforming.
+
+### Profile B: `AUDIO_DSP_VOICE_CLARITY` *(Optional — Clean-Room Human-Voice Focus)*
+Replicates the intelligible "broadcast voice" signature of stock `codec.admomini` using standard textbook DSP:
+
+1. **Stage 1 — 350 Hz 2nd-Order Butterworth HPF (`fs = 16000 Hz, Q = 0.7071`)**
+   - Cuts room boom, HVAC hum, and low-frequency proximity mud.
+   - RBJ coefficients: `b0 = 0.907363f`, `b1 = -1.814726f`, `b2 = 0.907363f`, `a1 = -1.806200f`, `a2 = 0.823251f`.
+2. **Stage 2 — 2200 Hz High-Shelf `+9 dB` (`fs = 16000 Hz, Q = 0.7071`)**
+   - Boosts consonant clarity and sibilant presence (`2.2–6 kHz`).
+3. **Stage 3 — Gentle 2:1 Voice Compressor + Makeup + Limiter**
+   - Threshold: `-24 dBFS`, Ratio: `2:1`, Attack: `5 ms`, Release: `120 ms`, Makeup: `+6 dB`, followed by the `-0.5 dBFS` safety limiter.
+4. **Stage 4 *(Optional Phase 4)* — Light Dual-Mic / STFT Noise Suppressor**
+   - Either simple `18 mm` broadside delay-and-sum (`(L + R) * 0.5`) or a lightweight 256-pt (16 ms) real FFT Wiener/MMSE-LSA floor capped at `-12 dB` attenuation (avoids musical noise). Strictly disabled in `ASR_RAW`.
+
+### Profile C: `AUDIO_DSP_BYPASS` *(Calibration & Diagnostics)*
+- Passes raw ADC samples unmodified to WAV for measuring analog noise floor, DC offset, and verifying dual-mic channel match.
+
+---
+
+## 4. Public C API (`open_fw/include/audio_dsp.h`)
+
+```c
+#pragma once
+#include <stddef.h>
+#include <stdint.h>
+
+typedef enum {
+    AUDIO_DSP_ASR_RAW       = 0, /* 75 Hz HPF + safety limiter (default for Parakeet/Whistle) */
+    AUDIO_DSP_VOICE_CLARITY = 1, /* 350 Hz HPF + 2.2 kHz +9 dB shelf + 2:1 comp + limiter     */
+    AUDIO_DSP_BYPASS        = 2, /* Raw ADC samples, no processing                            */
+} audio_dsp_profile_t;
+
+typedef struct {
+    float b0, b1, b2, a1, a2;
+    float z1, z2;
+} audio_biquad_t;
+
+typedef struct {
+    audio_dsp_profile_t profile;
+    uint32_t sample_rate;
+    uint8_t  channels;          /* 1 (mono) or 2 (interleaved stereo) */
+    audio_biquad_t hpf[2];
+    audio_biquad_t shelf[2];
+    float comp_env;             /* Linear RMS/peak envelope for compressor */
+    float lim_env;              /* Linear peak envelope for safety limiter */
+    uint32_t clip_events;       /* Counter of samples engaging safety limiter */
+    float    rms_dbfs;          /* Last-frame RMS level (for VU / telemetry) */
+} audio_dsp_t;
+
+void audio_dsp_init(audio_dsp_t *dsp, audio_dsp_profile_t profile,
+                    uint32_t sample_rate, uint8_t channels);
+void audio_dsp_reset(audio_dsp_t *dsp);
+
+/* In-place processing of interleaved int16 PCM (num_frames = samples per channel). */
+void audio_dsp_process_i16(audio_dsp_t *dsp, int16_t *pcm, size_t num_frames);
+```
+
+---
+
+## 5. CPU & Memory Budget on SL6801
+
+- **Frame size:** `2048` samples @ 16 kHz = `128 ms` per DMAC interrupt.
+- **Compute cost (`ASR_RAW`, Cortex-M4F w/ FPU @ 96 MHz):**
+  - 1 biquad DF-II-T = ~12 cycles/sample; limiter = ~15 cycles/sample.
+  - Mono: `2048 × ~30 cycles ≈ 61k cycles` = **0.64 ms per 128 ms frame (~0.5% CPU)**.
+  - Stereo: **~1.0% CPU**.
+  - `VOICE_CLARITY`: **~1.5–2.0% CPU** (even with 2 biquads + compressor + limiter).
+- **RAM footprint:** `sizeof(audio_dsp_t) ≈ 128 bytes` (static BSS, zero malloc).
+- **Profiling:** Benchmark on silicon using the 1 MHz 64-bit hardware timer (`0x40082104` / `0x40082108`), **not** `DWT->CYCCNT` (unverified/unused in stock BootROM and `FIRM`).
+
+---
+
+## 6. Phased Implementation Roadmap
+
+### Phase 1 — Core Clean-Room DSP Module + Host Unit Tests *(Immediate)*
+- [ ] Add `open_fw/include/audio_dsp.h` and `open_fw/src/audio_dsp.c` implementing `ASR_RAW`, `VOICE_CLARITY`, and `BYPASS`.
+- [ ] Add `open_fw/tests/test_audio_dsp.c` and hook into `open_fw/Makefile` host test target:
+  - Test 1: DC step input → settles to `0` under `ASR_RAW` and `VOICE_CLARITY`.
+  - Test 2: Sine frequency sweep (`30 Hz`, `75 Hz`, `350 Hz`, `1 kHz`, `2.2 kHz`, `5 kHz`) → verify gain within `±0.5 dB` of analytical Butterworth / RBJ shelf curves.
+  - Test 3: Overdriven `+6 dB` burst → verify limiter holds peak `<= 32767` with zero wrap-around and smooth release.
+  - Test 4: Stereo phase-link test → verify identical gain reduction on L and R channels.
+- [ ] Wire `audio_dsp_init()` in `recorder_start()` and `audio_dsp_process_i16()` in `recorder_poll()` (`open_fw/src/recorder.c`), defaulting to `AUDIO_DSP_ASR_RAW`.
+
+### Phase 2 — True Dual-Mic Stereo Capture (`AMIC1 + AMIC2`) in `audio_dma.c`
+- [ ] Verify `AMIC2` analog GPIO mux pins and `CODEC_AMIC2` PGA register bits in `dumps/firmware_2M.bin` (we already confirmed `CODEC_ADC_CH_MUX = 0x000D0D00` for `ADC_CH1 + ADC_CH2`).
+- [ ] Add stereo mode to `audio_dma.c`:
+  - Interleaved 16 kHz / 16-bit / 2-ch (`4096` samples = `8192` bytes per 128 ms slot, `32 KiB` total ring buffer).
+  - Update `wav_build_header(hdr, 16000u, channels, 16u, ...)` in `recorder.c`.
+- [ ] Optional: add 24-bit-in-32-bit capture mode if extra dynamic range is needed (avoids PGA tuning altogether).
+
+### Phase 3 — Runtime Control & Host ASR Pipeline
+- [ ] Expose `+XREC:DSP=<0|1|2>` and `+XREC:GAIN=<0..31>` in `open_fw/src/xrec_proto.c` (persisted in `PSMP` or config).
+- [ ] Add host helper script (`tools/asr_prep.py` or pipeline doc) implementing the two downstream recipes:
+  - **Parakeet (`parakeet-tdt-0.6b-v2`/`v3`):** stereo-to-mono sum (or MVDR if SNR < 0 dB) → Silero VAD → 16 kHz mono WAV → Parakeet.
+  - **Whistle (Cactus 55M):** stereo-to-mono sum/beamform → `150–7000 Hz` bandpass → Silero VAD (pause-aligned chunks `≤ 30 s`) → Whistle + keyword biasing list.
+
+### Phase 4 — Optional Advanced Features
+- [ ] **Clean-room VOR (Voice-Operated Recording):** 200 ms pre-roll ring + energy/ZCR hysteresis gate with `500 ms` hangover (opt-in only).
+- [ ] **Optional `VOICE_CLARITY` light noise suppression:** 256-pt real FFT Wiener suppressor (`-12 dB` floor) or simple `18 mm` broadside beamformer.
+- [ ] **Hardware A/B WER Benchmark:** Record the same noisy & quiet speech passages on SL6801 under `BYPASS`, `ASR_RAW`, `VOICE_CLARITY`, and stock firmware, and compare WER directly on Parakeet and Whistle.

@@ -19,6 +19,7 @@
 #include "sl6801_regs.h"
 #include "sl6801_rom.h"
 #include "openfw.h"
+#include "openfw_exp.h"
 #include "openfw_fs.h"
 #include "openfw_usb_msc.h"
 
@@ -42,6 +43,14 @@ static struct {
     int      us_rollover_inject;
     uint32_t wdt_feeds;
     uint32_t last_wdt_key;
+    uint32_t wdt_en;
+    uint32_t wdt_mode;
+    uint32_t wdt_cfg;
+    uint32_t wdt_ctrl1;
+    uint32_t aon_wdt_trim0;
+    uint32_t aon_wdt_trim1;
+    uint32_t aon_wdt_pmu_rst_cmd;
+    uint32_t aon_pll_ctrl;
 
     /* UART0 */
     uint32_t uart0_ctrl;
@@ -61,6 +70,7 @@ static struct {
     uint32_t rtc_alarm0_val;
     uint32_t rtc_alarm0_ctrl;
     int      rtc_rollover_inject;
+    uint32_t aon_backup[16];
 
     /* PMU RTWI */
     uint32_t rtwi_cmd;
@@ -104,7 +114,7 @@ static struct {
     uint8_t  st_disp_on;
     uint8_t  st_ram_half;
     uint8_t  st_hi_byte;
-    uint16_t st_fb[LCD_HEIGHT][LCD_WIDTH];
+    uint16_t st_fb[160][160];
 
     /* SDIO Controller + Virtual 8 MiB SDHC Card */
     uint32_t sdio_ctrl;
@@ -172,7 +182,7 @@ static void soc_reset(void)
     g_soc.aon_pwr_ctl0   = (1u << 28);
     g_soc.aon_rtc_ctrl   = (1u << 4) | (1u << 8);
     g_soc.saradc_ch1_data = 4095u;
-    g_soc.gpio_in[1]     = (1u << 6); /* Rec switch released (active low) */
+    g_soc.gpio_in[1]     = (1u << 6) | (1u << 11); /* Rec switch & PB11 HP jack inactive */
     g_soc.st_x1          = LCD_WIDTH - 1u;
     g_soc.st_y1          = LCD_HEIGHT - 1u;
 }
@@ -200,22 +210,28 @@ static void st7735s_on_byte(int is_data, uint8_t b)
         g_soc.st_madctl = b;
         break;
     case 0x2Au:
-        if (g_soc.st_param_idx == 1u) g_soc.st_x0 = (uint16_t)(b - 26u);
-        if (g_soc.st_param_idx == 3u) g_soc.st_x1 = (uint16_t)(b - 26u);
+    {
+        uint16_t x_off = (g_soc.st_madctl & 0x20u) ? 1u : 26u;
+        if (g_soc.st_param_idx == 1u) g_soc.st_x0 = (uint16_t)(b - x_off);
+        if (g_soc.st_param_idx == 3u) g_soc.st_x1 = (uint16_t)(b - x_off);
         g_soc.st_param_idx++;
         break;
+    }
     case 0x2Bu:
-        if (g_soc.st_param_idx == 1u) g_soc.st_y0 = b;
-        if (g_soc.st_param_idx == 3u) g_soc.st_y1 = b;
+    {
+        uint16_t y_off = (g_soc.st_madctl & 0x20u) ? 26u : 1u;
+        if (g_soc.st_param_idx == 1u) g_soc.st_y0 = (uint16_t)(b - y_off);
+        if (g_soc.st_param_idx == 3u) g_soc.st_y1 = (uint16_t)(b - y_off);
         g_soc.st_param_idx++;
         break;
+    }
     case 0x2Cu:
         if (g_soc.st_ram_half == 0u) {
             g_soc.st_hi_byte  = b;
             g_soc.st_ram_half = 1u;
         } else {
             uint16_t px = ((uint16_t)g_soc.st_hi_byte << 8) | b;
-            if (g_soc.st_cx < LCD_WIDTH && g_soc.st_cy < LCD_HEIGHT) {
+            if (g_soc.st_cx < 160u && g_soc.st_cy < 160u) {
                 g_soc.st_fb[g_soc.st_cy][g_soc.st_cx] = px;
             }
             if (g_soc.st_cx < g_soc.st_x1) {
@@ -345,11 +361,23 @@ uint32_t openfw_mmio_rd32(uint32_t addr)
     if (addr == UART0_REG18_ADDR) return g_soc.uart0_reg18;
     if (addr == UART0_STAT_ADDR) return g_soc.uart0_stat;
 
+    if (addr == WDT_EN_ADDR)       return g_soc.wdt_en;
+    if (addr == WDT_MODE_ADDR)     return g_soc.wdt_mode;
+    if (addr == WDT_CFG_ADDR)      return g_soc.wdt_cfg;
+    if (addr == WDT_CTRL1_ADDR)    return g_soc.wdt_ctrl1;
+    if (addr == AON_WDT_TRIM0_ADDR) return g_soc.aon_wdt_trim0;
+    if (addr == AON_WDT_TRIM1_ADDR) return g_soc.aon_wdt_trim1;
+    if (addr == AON_WDT_PMU_RST_CMD_ADDR) return g_soc.aon_wdt_pmu_rst_cmd;
+    if (addr == AON_PLL_CTRL_ADDR) return g_soc.aon_pll_ctrl;
+
     if (addr == AON_CLK_CFG_ADDR)  return g_soc.aon_clk_cfg;
     if (addr == AON_CLK_STAT_ADDR) return 0u;
     if (addr == AON_CLK_EN_ADDR)   return g_soc.aon_clk_en;
     if (addr == AON_PWR_CTL0_ADDR) return g_soc.aon_pwr_ctl0;
     if (addr == AON_RTC_CTRL_ADDR) return g_soc.aon_rtc_ctrl;
+    if (addr >= AON_BACKUP_ADDR(0u) && addr <= AON_BACKUP_ADDR(15u)) {
+        return g_soc.aon_backup[(addr - AON_BACKUP_ADDR(0u)) >> 2];
+    }
     if (addr == RTC_DATE_ADDR) {
         if (g_soc.rtc_rollover_inject == 1) {
             g_soc.rtc_rollover_inject = 2;
@@ -431,7 +459,13 @@ void openfw_mmio_wr32(uint32_t addr, uint32_t val)
     if (addr == SYSTICK_RVR_ADDR) { g_soc.systick_rvr = val; return; }
     if (addr == SYSTICK_CVR_ADDR) { g_soc.systick_cvr = val; return; }
     if (addr == SCB_AIRCR_ADDR)   { g_soc.scb_aircr = val; return; }
+    if (addr == WDT_EN_ADDR)      { g_soc.wdt_en = val; return; }
     if (addr == WDT_FEED_ADDR)    { g_soc.wdt_feeds++; g_soc.last_wdt_key = val; return; }
+    if (addr == WDT_MODE_ADDR)    { g_soc.wdt_mode = val; return; }
+    if (addr == WDT_CFG_ADDR)     { g_soc.wdt_cfg = val; return; }
+    if (addr == WDT_CTRL1_ADDR)   { g_soc.wdt_ctrl1 = val; return; }
+    if (addr == AON_WDT_PMU_RST_CMD_ADDR) { g_soc.aon_wdt_pmu_rst_cmd = val; return; }
+    if (addr == AON_PLL_CTRL_ADDR) { g_soc.aon_pll_ctrl = val; return; }
 
     if (addr == UART0_CTRL_ADDR)  { g_soc.uart0_ctrl = val; return; }
     if (addr == UART0_IE_ADDR)    { g_soc.uart0_ie = val; return; }
@@ -452,6 +486,10 @@ void openfw_mmio_wr32(uint32_t addr, uint32_t val)
     if (addr == RTC_TIME_ADDR)        { g_soc.rtc_time = val; return; }
     if (addr == RTC_ALARM0_VAL_ADDR)  { g_soc.rtc_alarm0_val = val; return; }
     if (addr == RTC_ALARM0_CTRL_ADDR) { g_soc.rtc_alarm0_ctrl = val; return; }
+    if (addr >= AON_BACKUP_ADDR(0u) && addr <= AON_BACKUP_ADDR(15u)) {
+        g_soc.aon_backup[(addr - AON_BACKUP_ADDR(0u)) >> 2] = val;
+        return;
+    }
 
     if (addr == RTWI_WDATA_ADDR) { g_soc.rtwi_wdata = val; return; }
     if (addr == RTWI_CMD_ADDR) {
@@ -460,7 +498,11 @@ void openfw_mmio_wr32(uint32_t addr, uint32_t val)
             uint8_t reg = (uint8_t)((val >> 8) & 0xFFu);
             uint8_t op  = (uint8_t)(val & 0xFFu);
             if (op == 0x60u) {
-                g_soc.pmu_regs[reg] = (uint8_t)(g_soc.rtwi_wdata & 0xFFu);
+                if (reg == 0x30u || reg == 0x31u || reg == 0x4Au) {
+                    g_soc.pmu_regs[reg] &= (uint8_t)~(g_soc.rtwi_wdata & 0xFFu); /* W1C IRQ regs */
+                } else {
+                    g_soc.pmu_regs[reg] = (uint8_t)(g_soc.rtwi_wdata & 0xFFu);
+                }
             } else if (op == 0x61u) {
                 g_soc.rtwi_rdata = (uint32_t)g_soc.pmu_regs[reg];
             }
@@ -668,6 +710,13 @@ static void test_wdt_timer(void)
     wdt_feed();
     assert(g_soc.wdt_feeds == 1u && g_soc.last_wdt_key == WDT_FEED_KEY);
 
+    g_systick_ms = 500u;
+    g_exp_running = 1u;
+    g_exp_deadline_ms = 1000u;
+    wdt_feed();
+    assert(g_exp_deadline_ms == 500u + OPENFW_EXP_TIMEOUT_MS);
+    g_exp_running = 0u;
+
     systick_init(192000000u);
     assert(g_soc.systick_rvr == 191999u);
     assert(g_soc.systick_csr == 0x7u);
@@ -682,14 +731,36 @@ static void test_wdt_timer(void)
     mdelay(2u);
     assert(g_soc.us_time - before >= 2000u);
 
+    g_soc.aon_wdt_trim0 = 0x00001234u;
+    g_soc.aon_wdt_trim1 = 0x0000005Au;
+    g_soc.aon_wdt_pmu_rst_cmd = 0xAF20u;
+    wdt_start_reset(16u, 0x2Fu);
+    assert(g_soc.aon_wdt_pmu_rst_cmd == 0u);
+    assert(g_soc.wdt_en == 1u);
+    assert(g_soc.wdt_mode == 0x2001u);
+    assert(g_soc.wdt_cfg == 0x71u);
+    assert(g_soc.wdt_ctrl1 == (((0x1234u << 8) & 0x01FFFF00u) | 0x5Au));
+    wdt_stop();
+    assert(g_soc.wdt_cfg == 0u);
+
+    g_soc.aon_wdt_pmu_rst_cmd = 0xAF20u;
+    g_soc.aon_pll_ctrl = 0x0Fu;
+    g_soc.wdt_en = 0u;
+    g_soc.wdt_mode = 0u;
+    g_soc.wdt_cfg = 0xF1u;
     g_wfi_armed = 1;
     if (setjmp(g_wfi_jmp) == 0) {
         system_reboot();
     }
     assert(g_soc.dsb_count >= 1u);
+    assert(g_soc.aon_wdt_pmu_rst_cmd == 0u);
+    assert((g_soc.aon_pll_ctrl & 0x02u) == 0u);
+    assert(g_soc.wdt_en == 1u);
+    assert(g_soc.wdt_mode == 0x2001u);
+    assert(g_soc.wdt_cfg == 0x01u);
     assert(g_soc.scb_aircr == (SCB_AIRCR_VECTKEY | SCB_AIRCR_SYSRESET));
     assert(g_soc.wfi_count == 1u);
-    printf("[OK] wdt_timer MMIO\n");
+    printf("[OK] wdt_timer + PMU reset MMIO\n");
 }
 
 static void test_uart_and_log_ring(void)
@@ -717,6 +788,15 @@ static void test_uart_and_log_ring(void)
     assert(g_openfw_log.dropped_bytes == 5u);
     assert(g_openfw_log.write_idx == 25u);
     assert(strncmp(&g_openfw_log.buf[20], "STALL", 5) == 0);
+
+    /* PD0-safe openfw_log_puts appends to SRAM ring without touching UART0 MMIO */
+    uint32_t tx_before   = g_soc.uart0_tx_len;
+    uint32_t drop_before = g_openfw_log.dropped_bytes;
+    openfw_log_puts("SRAM_ONLY");
+    assert(g_soc.uart0_tx_len == tx_before);
+    assert(g_openfw_log.dropped_bytes == drop_before);
+    assert(g_openfw_log.write_idx == 34u);
+    assert(strncmp(&g_openfw_log.buf[25], "SRAM_ONLY", 9) == 0);
     printf("[OK] uart + g_openfw_log MMIO\n");
 }
 
@@ -767,6 +847,10 @@ static void test_pmu_driver(void)
 
     g_soc.pmu_regs[0x2Au] = 0x40u;
     assert(pmu_get_charge_state() == PMU_CHG_FULL);
+    assert(pmu_is_vbus_present() == 1);
+
+    g_soc.pmu_regs[0x2Au] = 0x00u;
+    assert(pmu_get_charge_state() == PMU_CHG_DISCHARGING);
     assert(pmu_is_vbus_present() == 0);
 
     g_wfi_armed = 1;
@@ -781,6 +865,45 @@ static void test_pmu_driver(void)
         pmu_reboot_to_sd_ota();
     }
     assert((g_soc.pmu_regs[0x00u] & 0x01u) == 0x00u);
+
+    /* KEY_ONOFF (PMU reg 0x31 W1C + reg 0x1A unmask) */
+    g_soc.pmu_regs[0x1Au] = 0xFFu;
+    g_soc.pmu_regs[0x31u] = 0x70u;
+    key_onoff_init();
+    assert((g_soc.pmu_regs[0x1Au] & 0x70u) == 0x00u);
+    assert(g_soc.pmu_regs[0x31u] == 0x00u);
+
+    int lp = -1;
+    g_soc.pmu_regs[0x31u] = 0x40u; /* Press */
+    assert(key_onoff_pressed(&lp) == 1 && lp == 0 && g_soc.pmu_regs[0x31u] == 0x00u);
+    g_soc.pmu_regs[0x31u] = 0x20u; /* Long press while down */
+    assert(key_onoff_pressed(&lp) == 1 && lp == 1 && g_soc.pmu_regs[0x31u] == 0x00u);
+    g_soc.pmu_regs[0x31u] = 0x10u; /* Release */
+    assert(key_onoff_pressed(&lp) == 0 && lp == 0 && g_soc.pmu_regs[0x31u] == 0x00u);
+
+    /* Unattended always-on PMU init + charge management */
+    g_soc.pmu_regs[0x00u] = 0xCFu;
+    g_soc.pmu_regs[0x17u] = 0x01u;
+    g_soc.pmu_regs[0x20u] = 0x80u;
+    g_soc.pmu_regs[0x22u] = 0x55u;
+    g_soc.pmu_regs[0x23u] = 0xC3u;
+    g_soc.pmu_regs[0x2Au] = 0x04u; /* VBUS present */
+    g_soc.pmu_regs[0x30u] = 0xAAu;
+    pmu_unattended_init();
+    assert(g_soc.pmu_regs[0x00u] == 0xC9u); /* [2:1] cleared, bit 3 (0x08), [7:6] & [0] preserved */
+    assert(g_soc.pmu_regs[0x20u] == 0x2Fu);
+    assert(g_soc.pmu_regs[0x22u] == 0x00u);
+    assert(g_soc.pmu_regs[0x23u] == 0x03u);
+    assert(g_soc.pmu_regs[0x30u] == 0x00u);
+    assert((g_soc.pmu_regs[0x17u] & 0x05u) == 0x04u);
+
+    g_soc.pmu_regs[0x17u] = 0x00u;
+    pmu_poll_charge_manage();
+    assert((g_soc.pmu_regs[0x17u] & 0x04u) == 0x04u); /* VBUS attach enables charge */
+    g_soc.pmu_regs[0x30u] = 0x02u; /* PMU_CHG_FULL IRQ */
+    pmu_poll_charge_manage();
+    assert(g_soc.pmu_regs[0x30u] == 0x00u);
+    assert((g_soc.pmu_regs[0x17u] & 0x04u) == 0x00u); /* Full stops charging without dropping VBUS */
     printf("[OK] pmu RTWI MMIO\n");
 }
 
@@ -792,12 +915,18 @@ static void test_keys_driver(void)
     assert((g_soc.cru_saradc_clk & (1u << 20)) != 0u);
     assert(g_soc.saradc_start == 0x0000A800u);
 
+    g_soc.saradc_ch1_data = 50u;
+    assert(keys_decode(keys_read_adc()) == KEY_LEFT);
     g_soc.saradc_ch1_data = 300u;
     assert(keys_decode(keys_read_adc()) == KEY_LEFT);
+    g_soc.saradc_ch1_data = 500u;
+    assert(keys_decode(keys_read_adc()) == KEY_RIGHT);
     g_soc.saradc_ch1_data = 750u;
     assert(keys_decode(keys_read_adc()) == KEY_RIGHT);
     g_soc.saradc_ch1_data = 1350u;
     assert(keys_decode(keys_read_adc()) == KEY_VOL_UP);
+    g_soc.saradc_ch1_data = 1600u;
+    assert(keys_decode(keys_read_adc()) == KEY_NONE);
     g_soc.saradc_ch1_data = 2150u;
     assert(keys_decode(keys_read_adc()) == KEY_VOL_DOWN);
     g_soc.saradc_ch1_data = 2550u;
@@ -810,7 +939,11 @@ static void test_keys_driver(void)
     assert(keys_read_rec_switch() == 0);
     g_soc.gpio_in[1] &= ~(1u << 6); /* PB6 low = Rec ON */
     assert(keys_read_rec_switch() == 1);
-    printf("[OK] keys SARADC MMIO\n");
+
+    assert(keys_read_hp_detect() == 0);
+    g_soc.gpio_in[1] &= ~(1u << 11); /* PB11 low = Earphones inserted */
+    assert(keys_read_hp_detect() == 1);
+    printf("[OK] keys SARADC + PB6/PB11 MMIO\n");
 }
 
 static void test_lcd_driver(void)
@@ -843,7 +976,15 @@ static void test_lcd_driver(void)
     uint16_t patch[4] = { 0x1111u, 0x2222u, 0x3333u, 0x4444u };
     lcd_blit_rgb565(4u, 4u, 2u, 2u, patch);
     assert(g_soc.st_fb[4][4] == 0x1111u && g_soc.st_fb[5][5] == 0x4444u);
-    printf("[OK] lcd_st7735s + PWM3 MMIO (%u fg px)\n", fg_pixels);
+
+    /* Landscape 160x80 rotation check & restore portrait */
+    lcd_set_rotation(1);
+    assert(g_soc.st_madctl == 0xA8u && lcd_get_width() == 160u && lcd_get_height() == 80u);
+    lcd_fill_rect(120u, 10u, 4u, 4u, gold);
+    assert(g_soc.st_fb[10][120] == gold && g_soc.st_fb[13][123] == gold);
+    lcd_set_rotation(0);
+    assert(g_soc.st_madctl == 0xC8u && lcd_get_width() == 80u && lcd_get_height() == 160u);
+    printf("[OK] lcd_st7735s + PWM3 + rotation MMIO (%u fg px)\n", fg_pixels);
 }
 
 static void host_feed_ep0_setup(const uint8_t setup[8])
@@ -887,6 +1028,84 @@ static uint16_t host_drain_ep1_in(uint8_t *out, uint16_t max_len)
         }
     }
     return total;
+}
+
+static void host_put_le32(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)(v & 0xFFu);
+    p[1] = (uint8_t)((v >> 8) & 0xFFu);
+    p[2] = (uint8_t)((v >> 16) & 0xFFu);
+    p[3] = (uint8_t)((v >> 24) & 0xFFu);
+}
+
+static uint32_t host_get_le32(const uint8_t *p)
+{
+    return (uint32_t)p[0]
+         | ((uint32_t)p[1] << 8)
+         | ((uint32_t)p[2] << 16)
+         | ((uint32_t)p[3] << 24);
+}
+
+static uint8_t host_vendor_e0(uint32_t tag, uint8_t subcmd, uint32_t arg1, uint32_t arg2,
+                              int is_in, const uint8_t *out_data, uint8_t *in_data, uint16_t len)
+{
+    uint8_t cbw[31];
+    memset(cbw, 0, sizeof(cbw));
+    memcpy(cbw, "USBC", 4u);
+    host_put_le32(&cbw[4], tag);
+    host_put_le32(&cbw[8], len);
+    cbw[12] = is_in ? 0x80u : 0x00u;
+    cbw[14] = 16u;
+    cbw[15] = 0xE0u;
+    cbw[16] = subcmd;
+    host_put_le32(&cbw[17], arg1);
+    host_put_le32(&cbw[21], arg2);
+    host_feed_ep1_out(cbw, 31u);
+    if (!is_in && len > 0u && out_data) {
+        host_feed_ep1_out(out_data, len);
+    }
+    uint8_t rx[128];
+    uint16_t got = host_drain_ep1_in(rx, sizeof(rx));
+    uint16_t exp_data = (is_in && len > 0u) ? len : 0u;
+    assert(got == (uint16_t)(exp_data + 13u));
+    if (exp_data > 0u && in_data) {
+        memcpy(in_data, rx, exp_data);
+    }
+    assert(memcmp(&rx[exp_data], "USBS", 4u) == 0);
+    return rx[exp_data + 12u];
+}
+
+static uint8_t  g_mock_audio_cfg[4] = { 0u, 20u, 1u, 0u };
+static int16_t  g_mock_rms_x10      = -185;
+static uint16_t g_mock_clips        = 3u;
+
+static int mock_usb_audio_cfg_cb(int set, uint8_t cfg[4], int16_t *rms_x10, uint16_t *clips)
+{
+    if (set) {
+        for (int i = 0; i < 4; i++) {
+            if (cfg[i] != 0xFFu) {
+                g_mock_audio_cfg[i] = cfg[i];
+            }
+        }
+    }
+    for (int i = 0; i < 4; i++) {
+        cfg[i] = g_mock_audio_cfg[i];
+    }
+    if (rms_x10) *rms_x10 = g_mock_rms_x10;
+    if (clips)   *clips   = g_mock_clips;
+    return 0;
+}
+
+static uint32_t host_mock_exp_fn(const openfw_exp_api_t *api, uint32_t entry_off, uint32_t arg)
+{
+    assert(api->magic == OPENFW_EXP_ABI_MAGIC);
+    api->log_puts("HOST_EXP_OK\n");
+    api->out_buf[0] = 0x11u;
+    api->out_buf[1] = 0x22u;
+    api->out_buf[2] = 0x33u;
+    api->out_buf[3] = 0x44u;
+    *api->out_len_ptr = 4u;
+    return arg + entry_off + 100u;
 }
 
 static void test_sdio_exfat_and_usb_msc(const char *exfat_img_path)
@@ -1015,12 +1234,84 @@ static void test_sdio_exfat_and_usb_msc(const char *exfat_img_path)
     uint32_t rx_p = 0u, tx_p = 0u;
     usb_msc_get_stats(&rx_p, &tx_p);
     assert(rx_p > 0u && tx_p > 0u);
-    usb_msc_stop();
+
+    /* OpenFW 0xE0 experiment & memory commands (0x0A, 0x05, 0x07, 0x06, 0x09, 0x02, 0x08) */
+    assert(host_vendor_e0(10u, 0x0Au, 0u, 0u, 0, NULL, NULL, 0u) == 0u); /* LOG_RESET */
+    assert(g_openfw_log.write_idx == 0u);
+
+    uint8_t exp_bin[32];
+    for (uint32_t i = 0u; i < 32u; i++) {
+        exp_bin[i] = (uint8_t)(0x30u + i);
+    }
+    assert(host_vendor_e0(11u, 0x05u, 0u, 32u, 0, exp_bin, NULL, 32u) == 0u); /* EXP_WRITE */
+
+    uint8_t rb_arena[32];
+    assert(host_vendor_e0(12u, 0x07u, OPENFW_EXP_ARENA_ADDR, 32u, 1, NULL, rb_arena, 32u) == 0u); /* MEM_READ */
+    assert(memcmp(rb_arena, exp_bin, 32u) == 0);
+
+    openfw_exp_set_host_runner(host_mock_exp_fn);
+    openfw_exp_init_api(NULL);
+    uint8_t exp_res[32];
+    assert(host_vendor_e0(13u, 0x06u, 0u, 77u, 1, NULL, exp_res, 32u) == 0u); /* EXP_RUN */
+    assert(host_get_le32(&exp_res[0]) == OPENFW_EXP_RES_MAGIC);
+    assert(host_get_le32(&exp_res[4]) == 177u);
+    assert(host_get_le32(&exp_res[12]) == 4u);
+    assert(host_get_le32(&exp_res[16]) == 12u);
+    assert(host_get_le32(&exp_res[20]) == 1u);
+
+    uint8_t rb_stat[32];
+    assert(host_vendor_e0(14u, 0x09u, 0u, 0u, 1, NULL, rb_stat, 32u) == 0u); /* EXP_STATUS */
+    assert(memcmp(rb_stat, exp_res, 32u) == 0);
+
+    uint8_t rb_out[4];
+    assert(host_vendor_e0(15u, 0x07u, OPENFW_EXP_OUT_ADDR, 4u, 1, NULL, rb_out, 4u) == 0u); /* MEM_READ */
+    assert(rb_out[0] == 0x11u && rb_out[1] == 0x22u && rb_out[2] == 0x33u && rb_out[3] == 0x44u);
+
+    uint8_t rb_log[12];
+    assert(host_vendor_e0(16u, 0x02u, 0u, 12u, 1, NULL, rb_log, 12u) == 0u); /* READ_LOG */
+    assert(memcmp(rb_log, "HOST_EXP_OK\n", 12u) == 0);
+
+    /* Verify GET_INFO[28..31] exposes g_prev_fault_code and 0xE0 REBOOT mode=3 is refused in unattended mode */
+    g_prev_fault_code = 0xFA017006u;
+    uint8_t info_buf[32];
+    assert(host_vendor_e0(165u, 0x01u, 0u, 0u, 1, NULL, info_buf, 32u) == 0u);
+    assert(host_get_le32(&info_buf[28]) == 0xFA017006u);
+    g_prev_fault_code = 0u;
+    assert(host_vendor_e0(166u, 0x08u, 3u, 0u, 0, NULL, NULL, 0u) == 1u);
+
+    /* 0xE0 0x0B AUDIO_CFG GET/SET + range check */
+    g_mock_audio_cfg[0] = 0u;
+    g_mock_audio_cfg[1] = 20u;
+    g_mock_audio_cfg[2] = 1u;
+    g_mock_audio_cfg[3] = 0u;
+    usb_msc_set_audio_cfg_cb(mock_usb_audio_cfg_cb);
+    uint8_t acfg_out[4] = { 1u, 0xFFu, 2u, 1u };
+    assert(host_vendor_e0(167u, 0x0Bu, 0u, 0u, 0, acfg_out, NULL, 4u) == 0u);
+    uint8_t acfg_in[8];
+    assert(host_vendor_e0(168u, 0x0Bu, 0u, 0u, 1, NULL, acfg_in, 8u) == 0u);
+    assert(acfg_in[0] == 1u && acfg_in[1] == 20u && acfg_in[2] == 2u && acfg_in[3] == 1u);
+    assert((int16_t)(acfg_in[4] | (acfg_in[5] << 8)) == -185);
+    assert((uint16_t)(acfg_in[6] | (acfg_in[7] << 8)) == 3u);
+    uint8_t acfg_bad[4] = { 9u, 20u, 1u, 0u };
+    assert(host_vendor_e0(169u, 0x0Bu, 0u, 0u, 0, acfg_bad, NULL, 4u) == 1u);
+    usb_msc_set_audio_cfg_cb(NULL);
+
+    /* Deferred 0x08 REBOOT (mode=1 DFU): CSW PASS arrives before reboot triggers */
+    assert(host_vendor_e0(17u, 0x08u, 1u, 0u, 0, NULL, NULL, 0u) == 0u);
+    assert(usb_msc_is_active() == 1);
+    g_systick_ms += 300u;
+    g_wfi_armed = 1;
+    if (setjmp(g_wfi_jmp) == 0) {
+        usb_msc_poll();
+    }
     assert(usb_msc_is_active() == 0);
+    assert((g_soc.pmu_regs[0x23u] & 0xC0u) == 0xC0u);
+    assert((g_soc.pmu_regs[0x00u] & 0x01u) == 0x01u);
+    openfw_exp_set_host_runner(NULL);
 
     free(g_soc.sd_sectors);
     g_soc.sd_sectors = NULL;
-    printf("[OK] sdio + exfat + usb_musb + usb_scsi E2E MMIO (rx=%u tx=%u)\n", rx_p, tx_p);
+    printf("[OK] sdio + exfat + usb_musb + usb_scsi + 0xE0 E2E MMIO (rx=%u tx=%u)\n", rx_p, tx_p);
 }
 
 int main(int argc, char **argv)

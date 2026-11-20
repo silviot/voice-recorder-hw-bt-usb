@@ -8,6 +8,7 @@
 #include "sl6801_regs.h"
 #include "sl6801_rom.h"
 #include "openfw.h"
+#include "openfw_exp.h"
 #include "openfw_crypto.h"
 #include "openfw_bt_spp.h"
 #include "openfw_xrec.h"
@@ -152,6 +153,7 @@ static void bt_memmove(void *dst, const void *src, uint32_t n)
  * Nested PRIMASK Lock, IRQ 26 ISR Top/Bottom-Half, Static 8 KiB Heap & PRNG
  * ============================================================================ */
 static volatile uint32_t g_bt_irq_pending    = 0u;
+static volatile uint32_t g_bt_irq_count      = 0u;
 static volatile uint32_t g_irq_nest          = 0u;
 static volatile uint32_t g_irq_saved_primask = 0u;
 static uint32_t          g_prng_state        = 0x6D2B79F5u;
@@ -173,6 +175,7 @@ void RWBT_IRQHandler(void)
     }
     RWBT_INTACK = stat;
     g_bt_irq_pending |= stat;
+    g_bt_irq_count++;
 }
 
 static void bt_irq_lock(void)
@@ -1027,6 +1030,7 @@ static void rwbt_init_ld_layer(const uint8_t bd_addr[6])
     bt_memzero((void *)0x008030D8u, 0x148u);
     bt_memzero((void *)0x00803220u, 0x6Cu);
     bt_memzero((void *)0x00802BD0u, 8u);
+    REG8(0x00802BD1u) = 1u; /* Blocker #2 (0x00D5711C, read by BootROM) */
 
     bt_memzero((void *)0x00802B48u, 0x68u);
     bt_memzero((void *)0x00802208u, 0x614u);
@@ -1034,9 +1038,42 @@ static void rwbt_init_ld_layer(const uint8_t bd_addr[6])
     bt_memzero((void *)0x0080281Cu, 0xE8u);
     bt_memzero((void *)0x00802BD8u, 0x12u);
 
+    /* Blocker #1: 37 non-zero SRAM constants from stock ld_init prelude (0x00D56D00) */
+    REG16(0x00802B46u) = 0x001Cu;
+    REG16(0x00802B44u) = 0x0064u;
+    REG16(0x00802964u) = 0x0032u;
+    REG8(0x00803C14u)  = 0x00u;
+    REG8(0x00803C15u)  = 0x0Fu;
+    REG8(0x00803C16u)  = 0x27u;
+    REG8(0x00803C17u)  = 0x06u;
+    REG8(0x00802B42u)  = 0x1Eu;
+    REG8(0x00802966u)  = 0x07u;
+    REG8(0x00802967u)  = 0x0Fu;
+    REG8(0x00802968u)  = 0x02u;
+    REG8(0x00802969u)  = 0x03u;
+    REG8(0x0080296Au)  = 0x1Cu;
+    REG8(0x0080296Bu)  = 0x03u;
+    static const uint8_t k_2b36[12] = {
+        0x01u, 0x13u, 0x12u, 0x11u, 0x10u, 0x0Eu, 0x0Du, 0x0Cu, 0x0Bu, 0x0Au, 0x09u, 0x08u
+    };
+    for (uint32_t i = 0u; i < 12u; i++) {
+        REG8(0x00802B36u + i) = k_2b36[i];
+    }
+    REG8(0x00804208u)  = 0x02u;
+    REG8(0x00804209u)  = 0x0Au;
+    REG8(0x0080420Au)  = 0x02u;
+    REG8(0x0080420Bu)  = 0x0Eu;
+    REG8(0x00804222u)  = 0x03u;
+    REG8(0x00804223u)  = 0x16u;
+    REG8(0x0080422Au)  = 0x03u;
+    REG8(0x0080422Bu)  = 0x16u;
+    REG8(0x0080422Cu)  = 0x02u;
+    REG8(0x0080422Du)  = 0x12u;
+    REG8(0x0080422Eu)  = 0x1Eu;
+
     REG8(0x00802CF0u)  = 0x12u;
     REG16(0x00803C12u) = 0x14u;
-    REG8(0x00802B34u)  = 0u;
+    REG8(0x00802B34u)  = 1u;
 
     rom_ke_task_create(TASK_LD, (const void *)0x00800608u);
     rom_ld_bd_addr_set(bd_addr);
@@ -1094,9 +1131,6 @@ static void rwbt_init_ld_layer(const uint8_t bd_addr[6])
     /* Local LMP features (BR/EDR + SSP + eSCO) */
     REG32(0x00802C04u + 0x00u) = 0xFACDFE7Fu;
     REG32(0x00802C04u + 0x04u) = 0x877BFDDBu;
-    REG8(0x00802C04u  + 0x03u) = 0xF8u;
-    REG8(0x00802C04u  + 0x04u) = 0x5Bu;
-    REG8(0x00802C04u  + 0x05u) = 0x1Cu;
     REG32(0x00802C0Cu) = 0u;
     REG32(0x00802C10u) = 0u;
 
@@ -1180,6 +1214,7 @@ static void rwbt_controller_init(const uint8_t bd_addr[6])
     nvic_disable_irq(IRQ_BT);
     nvic_clear_pending(IRQ_BT);
     g_bt_irq_pending = 0u;
+    g_bt_irq_count   = 0u;
     g_irq_nest       = 0u;
 
     bt_memzero((void *)EM_BASE_ADDR, EM_SIZE_BYTES);
@@ -1233,7 +1268,7 @@ static char               g_dev_name[16];
 static uint16_t           g_conhdl = 0u;
 static uint8_t            g_acl_connected = 0u;
 static uint32_t           g_pair_deadline_ms = 0u;
-static uint8_t            g_pending_reboot_mode = 0u; /* 0=none, 1=reboot, 2=sd_ota */
+static uint8_t            g_pending_reboot_mode = 0u; /* 0=none, 1=reboot, 2=sd_ota, 3=dfu */
 static uint32_t           g_reboot_deadline_ms = 0u;
 static uint32_t           g_rx_acl_pkts = 0u;
 static uint32_t           g_tx_acl_pkts = 0u;
@@ -1375,6 +1410,7 @@ static void hci_advance_init(uint16_t opcode)
         hci_send_scan_enable(0x02u); /* Page Scan only until user opens 60s pairing */
     } else if (opcode == 0x0C1Au && g_hci_stage == HCI_ST_WAIT_SCAN) {
         g_hci_stage = HCI_ST_READY;
+        openfw_log_puts("BT HCI READY\n");
     }
 }
 
@@ -1409,12 +1445,18 @@ static void handle_hci_event(const uint8_t *evt, uint32_t len)
             g_acl_connected = 1u;
             bt_spp_reset_link(&g_spp, hdl);
             xrec_on_disconnect(&g_xrec);
+            openfw_log_puts("BT ACL CONN hdl=");
+            openfw_log_hex(hdl);
+            openfw_log_putc('\n');
         }
         break;
 
     case 0x05u: /* Disconnection Complete */
         if (len >= 6u) {
             uint16_t hdl = (uint16_t)evt[3] | ((uint16_t)evt[4] << 8);
+            openfw_log_puts("BT DISC reason=");
+            openfw_log_hex(evt[5]);
+            openfw_log_putc('\n');
             if (!g_acl_connected || hdl == g_conhdl) {
                 g_acl_connected  = 0u;
                 g_conhdl         = 0u;
@@ -1589,6 +1631,7 @@ static void xrec_cb_entropy(void *user, uint8_t out[16])
 static void xrec_cb_on_bound_key(void *user, const uint8_t key[32])
 {
     (void)user;
+    openfw_log_puts("BT XREC PAIRED\n");
     g_pair_deadline_ms = 0u;
     if (g_hci_stage == HCI_ST_READY) {
         hci_send_scan_enable(0x02u); /* Disable Inquiry Scan once paired */
@@ -1629,6 +1672,95 @@ static void xrec_cb_on_ota(void *user)
     (void)user;
     g_pending_reboot_mode = 2u;
     g_reboot_deadline_ms  = millis() + 250u;
+}
+
+static int xrec_cb_exp_write(void *user, uint32_t off, const uint8_t *data, uint16_t len)
+{
+    (void)user;
+    return openfw_exp_write(off, data, len);
+}
+
+static int xrec_cb_exp_run(void *user, uint32_t entry_off, uint32_t arg,
+                           uint32_t *rc, uint32_t *elapsed_ms,
+                           uint32_t *out_len, uint32_t *log_widx)
+{
+    (void)user;
+    openfw_exp_result_t res;
+    if (openfw_exp_run(entry_off, arg, &res) != 0) {
+        return -1;
+    }
+    if (rc)         *rc         = res.rc;
+    if (elapsed_ms) *elapsed_ms = res.elapsed_ms;
+    if (out_len)    *out_len    = res.out_len;
+    if (log_widx)   *log_widx   = res.log_widx;
+    return 0;
+}
+
+static uint32_t xrec_cb_read_log(void *user, uint32_t off, uint8_t *dst,
+                                 uint32_t max_len, uint32_t *out_widx)
+{
+    (void)user;
+    if (g_openfw_log.magic != OPENFW_LOG_MAGIC || g_openfw_log.size != OPENFW_LOG_SIZE) {
+        if (out_widx) {
+            *out_widx = 0u;
+        }
+        return 0u;
+    }
+    uint32_t widx  = g_openfw_log.write_idx;
+    uint32_t avail = (widx < OPENFW_LOG_SIZE) ? widx : OPENFW_LOG_SIZE;
+    if (out_widx) {
+        *out_widx = widx;
+    }
+    if (!dst || max_len == 0u || off >= avail) {
+        return 0u;
+    }
+    uint32_t start = (widx <= OPENFW_LOG_SIZE) ? 0u : (widx & (OPENFW_LOG_SIZE - 1u));
+    uint32_t n     = avail - off;
+    if (n > max_len) {
+        n = max_len;
+    }
+    for (uint32_t i = 0u; i < n; i++) {
+        dst[i] = (uint8_t)g_openfw_log.buf[(start + off + i) & (OPENFW_LOG_SIZE - 1u)];
+    }
+    return n;
+}
+
+static void xrec_cb_reset_log(void *user)
+{
+    (void)user;
+    openfw_log_reset();
+}
+
+static void xrec_cb_on_dfu(void *user)
+{
+    (void)user;
+    g_pending_reboot_mode = 3u;
+    g_reboot_deadline_ms  = millis() + 250u;
+}
+
+static int xrec_cb_audio_cfg(void *user, int set, uint8_t *dsp_profile,
+                             uint8_t *gain, uint8_t *channels, uint8_t *vor)
+{
+    (void)user;
+    if (set) {
+        if (dsp_profile && *dsp_profile <= 2u) {
+            recorder_set_dsp_profile((audio_dsp_profile_t)*dsp_profile);
+        }
+        if (gain && *gain <= 31u) {
+            recorder_set_gain(*gain);
+        }
+        if (channels && (*channels == 1u || *channels == 2u)) {
+            recorder_set_channels(*channels);
+        }
+        if (vor && *vor <= 1u) {
+            recorder_set_vor((int)*vor);
+        }
+    }
+    if (dsp_profile) *dsp_profile = (uint8_t)recorder_get_dsp_profile();
+    if (gain)        *gain        = recorder_get_gain();
+    if (channels)    *channels    = recorder_get_channels();
+    if (vor)         *vor         = (uint8_t)(recorder_get_vor() ? 1u : 0u);
+    return 0;
 }
 
 static int xrec_cb_rec_start(void *user, const char *opt_name, char *out_name, uint32_t out_max)
@@ -1725,6 +1857,12 @@ int bt_xrec_start(exfat_vol_t *vol, int sd_mounted)
         xrec_cb_rec_start,
         xrec_cb_rec_stop,
         xrec_cb_on_ota,
+        xrec_cb_exp_write,
+        xrec_cb_exp_run,
+        xrec_cb_read_log,
+        xrec_cb_reset_log,
+        xrec_cb_on_dfu,
+        xrec_cb_audio_cfg,
     };
 
     g_vol              = vol;
@@ -1740,6 +1878,9 @@ int bt_xrec_start(exfat_vol_t *vol, int sd_mounted)
     g_prng_state      ^= (uint32_t)us_timer_now() ^ pmu_read_vbat_mv();
 
     derive_local_bd_addr_and_name();
+    openfw_log_puts("BT start: ");
+    openfw_log_puts(g_dev_name);
+    openfw_log_putc('\n');
 
     xrec_init(&g_xrec, g_sd_mounted ? g_vol : 0, &ops, 0);
     load_bound_key_from_sd();
@@ -1823,6 +1964,8 @@ void bt_xrec_poll(void)
         g_pending_reboot_mode = 0u;
         if (mode == 2u) {
             pmu_reboot_to_sd_ota();
+        } else if (mode == 3u) {
+            pmu_reboot_to_usb_bootloader();
         }
         system_reboot();
     }
@@ -1840,6 +1983,7 @@ void bt_xrec_stop(void)
     nvic_clear_pending(IRQ_BT);
 
     g_bt_irq_pending      = 0u;
+    g_bt_irq_count        = 0u;
     g_active              = 0u;
     g_hci_stage           = HCI_ST_IDLE;
     g_acl_connected       = 0u;
@@ -1869,6 +2013,7 @@ void bt_xrec_get_status(bt_status_t *out)
     bt_memcpy(out->pair_pin, g_xrec.pair_pin, 8u);
     out->rx_acl_pkts   = g_rx_acl_pkts;
     out->tx_acl_pkts   = g_tx_acl_pkts;
+    out->irq_count     = g_bt_irq_count;
     bt_memcpy(out->bd_addr, g_bd_addr, 6u);
     bt_memcpy(out->dev_name, g_dev_name, 16u);
 }

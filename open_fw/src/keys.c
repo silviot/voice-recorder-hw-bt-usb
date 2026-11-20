@@ -16,6 +16,11 @@ void keys_init(void)
     /* PB6 = GPIO input for Record slide switch */
     gpio_set_mux(GPIO_PORT_B, 6u, 0u);
 
+    /* PB11 = GPIO input with pull-up for Earphone jack detect (active-low: 0=inserted) */
+    gpio_set_mux(GPIO_PORT_B, 11u, 0u);
+    openfw_mmio_rmw32(GPIOB_BASE + 0x24u, 3u << 22, 2u << 22);
+    openfw_mmio_clr32(GPIOB_BASE + 0x2Cu, 3u << 22);
+
     /* Release SARADC reset & enable clock (CRU bank 2 bit 20 = ID 0x54) */
     openfw_mmio_set32(CRU_SARADC_RST_ADDR, 1u << 20);
     openfw_mmio_set32(CRU_SARADC_CLK_ADDR, 1u << 20);
@@ -43,30 +48,35 @@ int keys_read_rec_switch(void)
     return (gpio_read(GPIO_PORT_B, 6u) == 0) ? 1 : 0;
 }
 
+int keys_read_hp_detect(void)
+{
+    return (gpio_read(GPIO_PORT_B, 11u) == 0) ? 1 : 0;
+}
+
 key_id_t keys_decode(uint16_t adc)
 {
-    if (adc > 3200u) {
-        return KEY_NONE;
-    }
-    if (adc >= 200u && adc <= 400u) {
+    if (adc < 336u) {
         return KEY_LEFT;
     }
-    if (adc >= 580u && adc <= 920u) {
+    if (adc < 848u) {
         return KEY_RIGHT;
     }
-    if (adc >= 1200u && adc <= 1500u) {
+    if (adc < 1424u) {
         return KEY_VOL_UP;
     }
-    if (adc >= 2050u && adc <= 2300u) {
+    if (adc < 1824u) {
+        return KEY_NONE;
+    }
+    if (adc < 2176u) {
         return KEY_VOL_DOWN;
     }
-    if (adc >= 2450u && adc <= 2650u) {
+    if (adc < 2560u) {
         return KEY_BACK;
     }
-    if (adc >= 2670u && adc <= 3050u) {
+    if (adc < 2960u) {
         return KEY_ENTER;
     }
-    return KEY_UNKNOWN;
+    return KEY_NONE;
 }
 
 const char *keys_name(key_id_t key)

@@ -1,9 +1,9 @@
 /*
- * Smartlink SL6801 Bare-Metal Audio ADC (AMIC1, 16 kHz / 16-bit) + DMAC CH1 Driver
+ * Smartlink SL6801 Bare-Metal Audio ADC (AMIC1 mono / AMIC1+AMIC2 stereo, 16 kHz / 16-bit) + DMAC CH1
  *
- * Configures Audio PLL (24.576 MHz), AMIC1 differential PGA on PB12/PB13,
- * 16 kHz mono 16-bit ADC capture, and DMAC Channel 1 (NVIC IRQ 61) into a
- * 4-slot (512 ms) lock-free ring buffer for glitch-free WAV streaming + VU meter.
+ * Configures Audio PLL (24.576 MHz), AMIC1 differential PGA (PB12/PB13) and
+ * optional AMIC2 differential PGA (PB14/PB15), 16 kHz 16-bit ADC capture,
+ * and DMAC Channel 1 (NVIC IRQ 61) into a 4-slot (32 KiB) lock-free ring buffer.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -11,23 +11,28 @@
 #include "sl6801_regs.h"
 #include "openfw.h"
 
-#define AUDIO_DMA_CH        1u
-#define AUDIO_RING_SLOTS    4u
-#define AUDIO_FRAME_SAMPLES 2048u /* 128 ms @ 16 kHz mono 16-bit */
-#define AUDIO_FRAME_BYTES   (AUDIO_FRAME_SAMPLES * sizeof(int16_t))
+#define AUDIO_DMA_CH           1u
+#define AUDIO_RING_SLOTS       4u
+#define AUDIO_FRAMES_PER_SLOT  2048u /* 128 ms @ 16 kHz */
+#define AUDIO_MAX_SLOT_SAMPLES (AUDIO_FRAMES_PER_SLOT * 2u)
 
-static int16_t g_pcm_buf[AUDIO_RING_SLOTS][AUDIO_FRAME_SAMPLES] __attribute__((aligned(4)));
-static volatile uint8_t  g_dma_slot = 0u;
-static volatile uint8_t  g_running  = 0u;
-static volatile uint8_t  g_peak_pct = 0u;
-static volatile uint32_t g_frames   = 0u;
-static volatile uint32_t g_wr_idx   = 0u;
-static volatile uint32_t g_rd_idx   = 0u;
-static volatile uint32_t g_overruns = 0u;
+static int16_t g_pcm_buf[AUDIO_RING_SLOTS][AUDIO_MAX_SLOT_SAMPLES] __attribute__((aligned(4)));
+static volatile uint8_t  g_dma_slot      = 0u;
+static volatile uint8_t  g_running       = 0u;
+static volatile uint8_t  g_channels      = 1u;
+static volatile uint8_t  g_peak_pct      = 0u;
+static volatile uint32_t g_frame_samples = AUDIO_FRAMES_PER_SLOT;
+static volatile uint32_t g_frame_bytes   = AUDIO_FRAMES_PER_SLOT * sizeof(int16_t);
+static volatile uint32_t g_frames        = 0u;
+static volatile uint32_t g_wr_idx        = 0u;
+static volatile uint32_t g_rd_idx        = 0u;
+static volatile uint32_t g_overruns      = 0u;
 
 static inline void dmac_arm_rx(void *dst_buf, uint32_t len_bytes)
 {
     OPENFW_HOST_DMAC_BUF(AUDIO_DMA_CH, dst_buf, len_bytes);
+    /* Clear CH_EN=0 before re-programming so single-shot DMAC sees a 0->1 rising edge */
+    openfw_mmio_clr32(DMAC_CH_CTL_ADDR(AUDIO_DMA_CH), DMAC_CTL_CH_EN);
     openfw_mmio_wr32(DMAC_CH_SRC_ADDR(AUDIO_DMA_CH), CODEC_ADC_RX_FIFO_ADDR);
     openfw_mmio_wr32(DMAC_CH_DST_ADDR(AUDIO_DMA_CH), (uint32_t)(uintptr_t)dst_buf);
     openfw_mmio_wr32(DMAC_CH_XFER_CNT_ADDR(AUDIO_DMA_CH), 0xFF000000u | (len_bytes & 0x3FFFFu));
@@ -73,16 +78,32 @@ void DMAC_CH1_IRQHandler(void)
             g_overruns++;
         }
 
-        dmac_arm_rx(g_pcm_buf[next_slot], AUDIO_FRAME_BYTES);
+        dmac_arm_rx(g_pcm_buf[next_slot], g_frame_bytes);
         OPENFW_DSB();
 
         g_wr_idx++;
-        g_peak_pct = compute_ac_peak_pct(g_pcm_buf[done_slot], AUDIO_FRAME_SAMPLES);
+        g_peak_pct = compute_ac_peak_pct(g_pcm_buf[done_slot], g_frame_samples);
         g_frames++;
     }
 }
 
-static void audio_amic1_16k_init(uint8_t gain_0_31)
+static void apply_pga_gain(uint8_t gain_0_31, uint8_t channels)
+{
+    if (gain_0_31 > 31u) {
+        gain_0_31 = 31u;
+    }
+    openfw_mmio_rmw32(CODEC_AMIC01_PGA_ADDR, 0x1F000000u,
+                      ((uint32_t)gain_0_31 & 0x1Fu) << 24);
+    if (channels == 2u) {
+        uint32_t g2 = (uint32_t)gain_0_31 * 3u;
+        if (g2 > 127u) {
+            g2 = 127u;
+        }
+        openfw_mmio_rmw32(CODEC_AMIC2_CTRL_ADDR, 0x00007F00u, g2 << 8);
+    }
+}
+
+static void audio_amic_16k_init(uint8_t gain_0_31, uint8_t channels)
 {
     if (gain_0_31 > 31u) {
         gain_0_31 = 31u;
@@ -131,21 +152,29 @@ static void audio_amic1_16k_init(uint8_t gain_0_31)
     while (!(openfw_mmio_rd32(CRU_APLL_CTRL_ADDR) & (1u << 28))) {
     }
 
-    /* 4. PB12 & PB13 = Analog (mux 15) for differential AMIC1 input */
+    /* 4. PB12/PB13 = AMIC1 analog (mux 15); PB14/PB15 = AMIC2 analog when stereo */
     gpio_set_mux(GPIO_PORT_B, 12u, 15u);
     gpio_set_mux(GPIO_PORT_B, 13u, 15u);
+    if (channels == 2u) {
+        gpio_set_mux(GPIO_PORT_B, 14u, 15u);
+        gpio_set_mux(GPIO_PORT_B, 15u, 15u);
+    }
 
-    /* 5. Analog core + AMIC1 differential PGA + MICBIAS0/1 */
+    /* 5. Analog core + AMIC1 (and optional AMIC2) differential PGA + MICBIAS0/1 */
     openfw_mmio_set32(CODEC_ANA_CTRL0_ADDR, 0x80000022u);
     openfw_mmio_set32(CODEC_ANA_CTRL0_ADDR, 0x40000000u);
     openfw_mmio_clr32(CODEC_ANA_MISC_ADDR, 0x1Fu);
     openfw_mmio_set32(CODEC_AMIC01_PGA_ADDR, 0x20430000u);
+    if (channels == 2u) {
+        openfw_mmio_set32(CODEC_AMIC2_CTRL_ADDR, 0x00010043u);
+    } else {
+        openfw_mmio_clr32(CODEC_AMIC2_CTRL_ADDR, 0x00010043u);
+    }
     mdelay(2u);
-    openfw_mmio_rmw32(CODEC_AMIC01_PGA_ADDR, 0x1F000000u,
-                      ((uint32_t)gain_0_31 & 0x1Fu) << 24);
+    apply_pga_gain(gain_0_31, channels);
     openfw_mmio_set32(CODEC_ANA_CTRL0_ADDR, 0x03000000u);
 
-    /* 6. ADC digital: 16 kHz (3), 16-bit + DMA req, AMIC1 (ch1) only, RUN */
+    /* 6. ADC digital: 16 kHz (3), 16-bit + DMA req, AMIC1 (ch1) or AMIC1+AMIC2 (ch1+ch2), RUN */
     openfw_mmio_clr32(CODEC_ADC_DIG_CTRL_ADDR, 0x2u);
     openfw_mmio_set32(CODEC_ADC_DIG_CTRL_ADDR, 0x1u);
     for (uint32_t ch = 0u; ch < 4u; ch++) {
@@ -153,10 +182,15 @@ static void audio_amic1_16k_init(uint8_t gain_0_31)
     }
     openfw_mmio_rmw32(CODEC_ADC_DIG_CTRL_ADDR, 0xF00u, (3u << 8));
     openfw_mmio_set32(CODEC_ADC_FIFO_CTRL_ADDR, 0x84u); /* bit 2 = 16-bit, bit 7 = RX FIFO & DMA req EN */
-    openfw_mmio_rmw32(CODEC_ADC_CH_MUX_ADDR, 0x000D0D0Du, 0x00000D00u);
+    openfw_mmio_rmw32(CODEC_ADC_CH_MUX_ADDR, 0x000D0D0Du,
+                      (channels == 2u) ? 0x000D0D00u : 0x00000D00u);
     openfw_mmio_clr32(CODEC_ADC_CH_CTRL_ADDR(0u), 0xBu);
-    openfw_mmio_rmw32(CODEC_ADC_CH_CTRL_ADDR(1u), 0x8u, 0x1u);
-    openfw_mmio_clr32(CODEC_ADC_CH_CTRL_ADDR(2u), 0xBu);
+    openfw_mmio_rmw32(CODEC_ADC_CH_CTRL_ADDR(1u), 0xBu, 0x9u); /* bit0=EN | bit3=FIFO_EN (Q16 verified) */
+    if (channels == 2u) {
+        openfw_mmio_rmw32(CODEC_ADC_CH_CTRL_ADDR(2u), 0xBu, 0x9u);
+    } else {
+        openfw_mmio_clr32(CODEC_ADC_CH_CTRL_ADDR(2u), 0xBu);
+    }
     openfw_mmio_clr32(CODEC_ADC_CH_CTRL_ADDR(3u), 0xBu);
     openfw_mmio_set32(CODEC_ADC_DIG_CTRL_ADDR, 0x2u);
 }
@@ -178,25 +212,41 @@ static void dmac_audio_rx_init(void)
     nvic_enable_irq(DMAC_IRQ_BASE + AUDIO_DMA_CH);
 }
 
-int audio_capture_start(uint8_t gain_0_31)
+int audio_capture_start_ex(uint8_t gain_0_31, uint8_t channels)
 {
     if (g_running) {
         return 0;
     }
 
-    g_dma_slot = 0u;
-    g_peak_pct = 0u;
-    g_frames   = 0u;
-    g_wr_idx   = 0u;
-    g_rd_idx   = 0u;
-    g_overruns = 0u;
+    uint8_t ch        = (channels == 2u) ? 2u : 1u;
+    g_channels        = ch;
+    g_frame_samples   = AUDIO_FRAMES_PER_SLOT * (uint32_t)ch;
+    g_frame_bytes     = g_frame_samples * (uint32_t)sizeof(int16_t);
+    g_dma_slot        = 0u;
+    g_peak_pct        = 0u;
+    g_frames          = 0u;
+    g_wr_idx          = 0u;
+    g_rd_idx          = 0u;
+    g_overruns        = 0u;
 
-    audio_amic1_16k_init(gain_0_31);
+    audio_amic_16k_init(gain_0_31, ch);
     dmac_audio_rx_init();
 
     g_running = 1u;
-    dmac_arm_rx(g_pcm_buf[0], AUDIO_FRAME_BYTES);
+    dmac_arm_rx(g_pcm_buf[0], g_frame_bytes);
     return 0;
+}
+
+int audio_capture_start(uint8_t gain_0_31)
+{
+    return audio_capture_start_ex(gain_0_31, 1u);
+}
+
+void audio_capture_set_gain(uint8_t gain_0_31)
+{
+    if (g_running) {
+        apply_pga_gain(gain_0_31, g_channels);
+    }
 }
 
 void audio_capture_stop(void)
@@ -217,7 +267,14 @@ void audio_capture_stop(void)
     openfw_mmio_clr32(CODEC_ADC_DIG_CTRL_ADDR, 0x3u);
     openfw_mmio_clr32(CODEC_ADC_FIFO_CTRL_ADDR, 0x80u);
     openfw_mmio_clr32(CODEC_ADC_CH_CTRL_ADDR(1u), 0x1u);
+    openfw_mmio_clr32(CODEC_ADC_CH_CTRL_ADDR(2u), 0x1u);
+    openfw_mmio_clr32(CODEC_AMIC2_CTRL_ADDR, 0x00010043u);
     openfw_mmio_clr32(CODEC_ANA_CTRL0_ADDR, 0x03000000u);
+}
+
+uint8_t audio_get_channels(void)
+{
+    return g_channels;
 }
 
 const int16_t *audio_pop_frame(uint32_t *out_bytes)
@@ -237,7 +294,7 @@ const int16_t *audio_pop_frame(uint32_t *out_bytes)
     OPENFW_DSB();
 
     if (out_bytes) {
-        *out_bytes = (uint32_t)AUDIO_FRAME_BYTES;
+        *out_bytes = g_frame_bytes;
     }
     return g_pcm_buf[slot];
 }

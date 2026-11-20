@@ -17,12 +17,29 @@
 #include "sl6801_regs.h"
 #include "sl6801_rom.h"
 #include "openfw.h"
+#include "audio_dsp.h"
 #include "openfw_fs.h"
 #include "openfw_wav.h"
 
 extern void DMAC_CH1_IRQHandler(void);
 
 volatile uint32_t g_systick_ms = 0u;
+static void (*g_dmac_ch0_cb)(void) = NULL;
+
+void openfw_exp_set_dmac_ch0_irq(void (*cb)(void))
+{
+    if (!cb) {
+        nvic_disable_irq(DMAC_IRQ_BASE);
+        openfw_mmio_wr32(DMAC_CH_IRQ_EN_ADDR(0u), 0u);
+        openfw_mmio_clr32(DMAC_CH_CTL_ADDR(0u), DMAC_CTL_CH_EN);
+        openfw_mmio_wr32(DMAC_CH_IRQ_STAT_ADDR(0u),
+                         openfw_mmio_rd32(DMAC_CH_IRQ_STAT_ADDR(0u)));
+        nvic_clear_pending(DMAC_IRQ_BASE);
+        g_dmac_ch0_cb = NULL;
+    } else {
+        g_dmac_ch0_cb = cb;
+    }
+}
 
 /* ============================================================================
  * Virtual SL6801 SoC State & MMIO / DMAC / ROM Hooks
@@ -406,6 +423,33 @@ static void sim_dma_deliver_frame(int32_t dc_offset, int32_t ac_amp, int16_t *co
     DMAC_CH1_IRQHandler();
 }
 
+static void sim_dma_deliver_stereo_frame(int32_t dc_l, int32_t amp_l,
+                                         int32_t dc_r, int32_t amp_r)
+{
+    assert((g_soc.dmac_regs[1][0] & DMAC_CTL_CH_EN) != 0u);
+    assert((g_soc.nvic_iser[1] & (1u << 29)) != 0u);
+    assert(g_soc.dmac_buf[1] != NULL);
+    assert(g_soc.dmac_len[1] == 8192u);
+
+    static const int16_t sin16_q14[16] = {
+        0, 6270, 11585, 15137, 16384, 15137, 11585, 6270,
+        0, -6270, -11585, -15137, -16384, -15137, -11585, -6270,
+    };
+    int16_t *dst = (int16_t *)g_soc.dmac_buf[1];
+    for (uint32_t i = 0u; i < 2048u; i++) {
+        int32_t l = dc_l + ((sin16_q14[i & 15u] * amp_l) / 16384);
+        int32_t r = dc_r + ((sin16_q14[i & 15u] * amp_r) / 16384);
+        if (l > 32767) l = 32767;
+        if (l < -32768) l = -32768;
+        if (r > 32767) r = 32767;
+        if (r < -32768) r = -32768;
+        dst[i * 2u + 0u] = (int16_t)l;
+        dst[i * 2u + 1u] = (int16_t)r;
+    }
+    g_soc.dmac_regs[1][9] |= DMAC_IRQ_TC;
+    DMAC_CH1_IRQHandler();
+}
+
 static int mem_read_sectors(void *ctx, uint32_t lba, uint32_t count, void *buf)
 {
     (void)ctx;
@@ -543,7 +587,11 @@ static void test_recorder(const char *exfat_img_path)
     exfat_vol_t vol;
     assert(exfat_mount(&vol, &dev) == 0);
 
-    /* Recording #1: 3 x 4096 B DMA frames -> /record/REC_0001.wav (12332 B) */
+    /* Recording #1: BYPASS bit-exact 3 x 4096 B DMA frames -> /record/REC_0001.wav (12332 B) */
+    recorder_set_gain(20u);
+    recorder_set_dsp_profile(AUDIO_DSP_BYPASS);
+    recorder_set_channels(1u);
+    recorder_set_vor(0);
     assert(recorder_start(&vol, 1) == 0);
     assert(recorder_is_saving() == 1);
     assert(strcmp(recorder_get_filename(), "REC_0001.wav") == 0);
@@ -571,25 +619,68 @@ static void test_recorder(const char *exfat_img_path)
     assert(info1.block_align == 2u && info1.byte_rate == 32000u && info1.data_bytes == 12288u);
     assert(memcmp(wav1 + 44u, expected_pcm, 12288u) == 0);
 
-    /* Recording #2: auto-increments to /record/REC_0002.wav */
+    /* Recording #2: AUDIO_DSP_ASR_RAW strips +4000 DC offset in REC_0002.wav */
+    recorder_set_dsp_profile(AUDIO_DSP_ASR_RAW);
     assert(recorder_start(&vol, 1) == 0);
     assert(recorder_is_saving() == 1);
     assert(strcmp(recorder_get_filename(), "REC_0002.wav") == 0);
-    sim_dma_deliver_frame(500, 8000, NULL);
-    recorder_poll();
+    for (int f = 0; f < 4; f++) {
+        sim_dma_deliver_frame(4000, 8000, NULL);
+        recorder_poll();
+    }
     assert(recorder_stop() == 0);
 
     exfat_entry_t ent2;
     assert(exfat_find_path(&vol, "/record/REC_0002.wav", &ent2) == 0);
-    assert(ent2.size == 44u + 4096u);
-
-    uint8_t hdr2[44];
+    assert(ent2.size == 44u + 4u * 4096u);
+    static uint8_t wav2[44u + 4u * 4096u];
     uint32_t got2 = 0u;
-    assert(exfat_read_file(&vol, &ent2, 0u, hdr2, sizeof(hdr2), &got2) == 0);
-    assert(got2 == 44u);
+    assert(exfat_read_file(&vol, &ent2, 0u, wav2, sizeof(wav2), &got2) == 0);
+    assert(got2 == sizeof(wav2));
     wav_info_t info2;
-    assert(wav_parse_header(hdr2, &info2) == 0);
-    assert(info2.data_bytes == 4096u);
+    assert(wav_parse_header(wav2, &info2) == 0);
+    assert(info2.data_bytes == 4u * 4096u);
+    const int16_t *pcm2 = (const int16_t *)(wav2 + 44u);
+    int64_t dc_sum = 0;
+    for (uint32_t i = 6144u; i < 8192u; i++) {
+        dc_sum += pcm2[i];
+    }
+    assert(llabs(dc_sum / 2048) < 25);
+
+    /* Recording #3: Dual-Mic Stereo AMIC1+AMIC2 (PB14/PB15, 2ch, 8192B DMA) -> REC_0003.wav */
+    recorder_set_gain(22u);
+    recorder_set_dsp_profile(AUDIO_DSP_ASR_RAW);
+    recorder_set_channels(2u);
+    assert(recorder_start(&vol, 1) == 0);
+    assert(audio_get_channels() == 2u);
+    /* Verify PB14/PB15 analog mux=15, CODEC_AMIC2_CTRL enable+gain (22*3=66), CH1+CH2 mux=0x000D0D00 */
+    assert(((g_soc.gpio_mux[1][1] >> 24) & 0xFFu) == 0xFFu);
+    uint32_t amic2 = g_soc.codec_regs[(CODEC_AMIC2_CTRL_ADDR - AUDIO_CODEC_BASE) >> 2];
+    assert((amic2 & 0x00010043u) == 0x00010043u);
+    assert(((amic2 >> 8) & 0x7Fu) == 66u);
+    uint32_t ch_mux = g_soc.codec_regs[(CODEC_ADC_CH_MUX_ADDR - AUDIO_CODEC_BASE) >> 2];
+    assert((ch_mux & 0x000D0D0Du) == 0x000D0D00u);
+
+    sim_dma_deliver_stereo_frame(2000, 12000, -1500, 6000);
+    recorder_poll();
+    assert(recorder_stop() == 0);
+
+    exfat_entry_t ent3;
+    assert(exfat_find_path(&vol, "/record/REC_0003.wav", &ent3) == 0);
+    assert(ent3.size == 44u + 8192u);
+    uint8_t hdr3[44];
+    uint32_t got3 = 0u;
+    assert(exfat_read_file(&vol, &ent3, 0u, hdr3, sizeof(hdr3), &got3) == 0);
+    assert(got3 == 44u);
+    wav_info_t info3;
+    assert(wav_parse_header(hdr3, &info3) == 0);
+    assert(info3.sample_rate == 16000u && info3.channels == 2u && info3.block_align == 4u);
+    assert(info3.byte_rate == 64000u && info3.data_bytes == 8192u);
+
+    /* Restore default recorder config */
+    recorder_set_gain(20u);
+    recorder_set_dsp_profile(AUDIO_DSP_ASR_RAW);
+    recorder_set_channels(1u);
 
     /* Flush updated sectors back to argv[1] so fsck.exfat -n validates the image */
     fp = fopen(exfat_img_path, "wb");
@@ -601,7 +692,85 @@ static void test_recorder(const char *exfat_img_path)
     free(g_soc.sd_buf);
     g_soc.sd_buf     = NULL;
     g_soc.sd_sectors = 0u;
-    printf("[OK] recorder -> exFAT (/record/REC_0001.wav=12332B, REC_0002.wav=4140B)\n");
+    printf("[OK] recorder -> exFAT (REC_0001.wav=raw, REC_0002.wav=ASR_RAW, REC_0003.wav=2ch stereo)\n");
+}
+
+/* ============================================================================
+ * Suite 4: Stereo Audio DAC0+DAC1 + DMAC CH0 TX + eFuse DC Trim Tests
+ * ============================================================================ */
+static void test_audio_dac(void)
+{
+    soc_reset();
+    /* Test eFuse DAC0/DAC1 DC trim extraction: W2[31:29]=5, W3[3:0]=9 => 0x4D; W3[10:4]=0x2B */
+    g_soc.efuse_words[2] = (5u << 29);
+    g_soc.efuse_words[3] = 0x09u | (0x2Bu << 4);
+
+    assert(audio_dac_start(16000u, 20u) == 0);
+    assert(g_dmac_ch0_cb != NULL);
+    assert((g_soc.cru_apll_ctrl & (1u << 28)) != 0u);
+    assert((g_soc.cru_apll_ctrl & 0x00003FE0u) == 0x3060u); /* 24.576 MHz int=3 */
+    assert(((g_soc.cru_apll_frac >> 14) & 0x1FFFFu) == 0x03126u);
+    assert(((g_soc.codec_regs[(CODEC_GLB_ADDR - AUDIO_CODEC_BASE) >> 2] >> 8) & 0xFu) == 3u);
+    assert(g_soc.codec_regs[(CODEC_DAC0_DC_ADDR - AUDIO_CODEC_BASE) >> 2] == 0x4Du);
+    assert(g_soc.codec_regs[(CODEC_DAC1_DC_ADDR - AUDIO_CODEC_BASE) >> 2] == 0x2Bu);
+    assert(((g_soc.codec_regs[(CODEC_DAC01_ANA_VOL_ADDR - AUDIO_CODEC_BASE) >> 2] >> 16) & 0x1Fu) == 20u);
+    assert(((g_soc.codec_regs[(CODEC_DAC01_ANA_VOL_ADDR - AUDIO_CODEC_BASE) >> 2] >> 24) & 0x1Fu) == 20u);
+    assert((g_soc.codec_regs[(CODEC_DAC0_DIG_EN_ADDR - AUDIO_CODEC_BASE) >> 2] & 0x3u) == 0x3u);
+    assert((g_soc.codec_regs[(CODEC_DAC1_DIG_EN_ADDR - AUDIO_CODEC_BASE) >> 2] & 0x3u) == 0x3u);
+    assert((g_soc.codec_regs[(CODEC_DAC2_DIG_EN_ADDR - AUDIO_CODEC_BASE) >> 2] & 0x3u) == 0u);
+    assert((g_soc.nvic_iser[1] & (1u << 28)) != 0u); /* IRQ 60 */
+
+    /* Queue two stereo buffers -> double-buffered DMAC CH0 chain */
+    int16_t sbuf[512];
+    for (uint32_t i = 0u; i < 256u; i++) {
+        sbuf[i * 2u + 0u] = (int16_t)(i * 10);
+        sbuf[i * 2u + 1u] = (int16_t)(-(int32_t)i * 10);
+    }
+    assert(audio_dac_write_stereo(sbuf, 256u) == 256);
+    assert(audio_dac_is_busy() == 1);
+    assert((g_soc.dmac_regs[0][0] & (DMAC_CTL_CH_EN | 0x00FFFFFFu)) == (DMAC_CTL_DAC_TX_BASE | DMAC_CTL_CH_EN));
+    assert(g_soc.dmac_regs[0][2] == CODEC_DAC_TX_FIFO_ADDR);
+    assert((g_soc.dmac_regs[0][3] & 0x3FFFFu) == 256u * 4u);
+    void *first_buf = g_soc.dmac_buf[0];
+
+    /* Enqueue second buffer while first is active */
+    assert(audio_dac_write_stereo(sbuf, 128u) == 128);
+    assert(audio_dac_write_stereo(sbuf, 128u) == 0); /* Both slots occupied */
+
+    /* Complete slot 0 -> seamlessly switches DMAC CH0 to slot 1 */
+    g_soc.dmac_regs[0][9] |= DMAC_IRQ_TC;
+    g_dmac_ch0_cb();
+    assert(audio_dac_is_busy() == 1);
+    assert(g_soc.dmac_buf[0] != first_buf);
+    assert((g_soc.dmac_regs[0][3] & 0x3FFFFu) == 128u * 4u);
+
+    /* Complete slot 1 -> idles cleanly */
+    g_soc.dmac_regs[0][9] |= DMAC_IRQ_TC;
+    g_dmac_ch0_cb();
+    assert(audio_dac_is_busy() == 0);
+    assert((g_soc.dmac_regs[0][0] & DMAC_CTL_CH_EN) == 0u);
+
+    /* Volume clamp & mute */
+    audio_dac_set_volume(99u, 600u);
+    assert(((g_soc.codec_regs[(CODEC_DAC01_ANA_VOL_ADDR - AUDIO_CODEC_BASE) >> 2] >> 16) & 0x1Fu) == 31u);
+    assert((g_soc.codec_regs[(CODEC_DAC0_VOL_ADDR - AUDIO_CODEC_BASE) >> 2] & 0x1FFu) == 0x1FFu);
+    audio_dac_set_mute(1);
+    assert((g_soc.codec_regs[(CODEC_DAC0_MUTE_ADDR - AUDIO_CODEC_BASE) >> 2] & (1u << 16)) != 0u);
+    audio_dac_set_mute(0);
+    assert((g_soc.codec_regs[(CODEC_DAC0_MUTE_ADDR - AUDIO_CODEC_BASE) >> 2] & (1u << 16)) == 0u);
+
+    /* 44.1 kHz family APLL verification */
+    assert(audio_dac_start(44100u, 15u) == 0);
+    assert((g_soc.cru_apll_ctrl & 0x00003FE0u) == 0x3040u); /* 22.5792 MHz int=2 */
+    assert(((g_soc.cru_apll_frac >> 14) & 0x1FFFFu) == 0x186C2u);
+    assert(((g_soc.codec_regs[(CODEC_GLB_ADDR - AUDIO_CODEC_BASE) >> 2] >> 8) & 0xFu) == 8u);
+
+    audio_dac_stop();
+    assert(g_dmac_ch0_cb == NULL);
+    assert((g_soc.nvic_iser[1] & (1u << 28)) == 0u);
+    assert((g_soc.codec_regs[(CODEC_DAC01_ANA_VOL_ADDR - AUDIO_CODEC_BASE) >> 2] & 0x1F1F0000u) == 0u);
+    assert((g_soc.codec_regs[(CODEC_DAC0_DIG_EN_ADDR - AUDIO_CODEC_BASE) >> 2] & 0x3u) == 0u);
+    printf("[OK] audio_dac MMIO (APLL 16k/44.1k, eFuse DC, DMAC CH0 double-buf, pop-free stop)\n");
 }
 
 /* ============================================================================
@@ -672,7 +841,8 @@ int main(int argc, char **argv)
     }
     test_audio_dma();
     test_recorder(argv[1]);
+    test_audio_dac();
     test_bt_rf();
-    printf("ALL AUDIO/RECORDER/BT_RF MMIO SUITES PASSED\n");
+    printf("ALL AUDIO/DAC/RECORDER/BT_RF MMIO SUITES PASSED\n");
     return 0;
 }

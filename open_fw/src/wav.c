@@ -90,3 +90,247 @@ int wav_parse_header(const uint8_t in[44], wav_info_t *out)
     out->data_bytes      = get_le32(&in[40]);
     return 0;
 }
+
+static uint32_t compute_duration_ms(uint32_t total_samples, uint32_t rate)
+{
+    if (rate == 0u || total_samples == 0u) {
+        return 0u;
+    }
+    uint32_t secs  = total_samples / rate;
+    uint32_t rem_s = total_samples % rate;
+    uint32_t ms    = (rem_s <= 0x3FFFFFu)
+                   ? ((rem_s * 1000u) / rate)
+                   : (((rem_s / 100u) * 1000u) / ((rate >= 100u) ? (rate / 100u) : 1u));
+    return secs * 1000u + ms;
+}
+
+int wav_parse_stream(const uint8_t *hdr, uint32_t hdr_len, wav_stream_info_t *out)
+{
+    if (!hdr || !out || hdr_len < 20u) {
+        return -1;
+    }
+    if (!tag_eq(&hdr[0], "RIFF") || !tag_eq(&hdr[8], "WAVE")) {
+        return -1;
+    }
+
+    int      have_fmt     = 0;
+    int      have_fact    = 0;
+    uint32_t fact_samples = 0u;
+
+    uint16_t fmt_tag      = 0u;
+    uint16_t channels     = 0u;
+    uint32_t sample_rate  = 0u;
+    uint16_t block_align  = 0u;
+    uint16_t bits         = 0u;
+    uint16_t spb          = 0u;
+
+    uint32_t pos = 12u;
+    while (pos + 8u <= hdr_len) {
+        const uint8_t *cid = &hdr[pos];
+        uint32_t csize     = get_le32(&hdr[pos + 4u]);
+        uint32_t payload   = pos + 8u;
+
+        if (tag_eq(cid, "fmt ")) {
+            if (csize < 16u || csize > (hdr_len - payload)) {
+                return -1;
+            }
+            fmt_tag     = get_le16(&hdr[payload + 0u]);
+            channels    = get_le16(&hdr[payload + 2u]);
+            sample_rate = get_le32(&hdr[payload + 4u]);
+            block_align = get_le16(&hdr[payload + 12u]);
+            bits        = get_le16(&hdr[payload + 14u]);
+
+            if (channels != 1u && channels != 2u) {
+                return -1;
+            }
+            if (sample_rate == 0u) {
+                return -1;
+            }
+
+            if (fmt_tag == WAV_FMT_PCM) {
+                if (bits != 16u || block_align != (uint16_t)(channels * 2u)) {
+                    return -1;
+                }
+                spb = 1u;
+            } else if (fmt_tag == WAV_FMT_IMA_ADPCM) {
+                uint32_t hdr_bytes = (uint32_t)channels * 4u;
+                if (bits != 4u || block_align < hdr_bytes) {
+                    return -1;
+                }
+                if (channels == 2u && ((block_align - hdr_bytes) & 7u) != 0u) {
+                    return -1;
+                }
+                spb = (uint16_t)(((uint32_t)(block_align - hdr_bytes) * 2u) / channels + 1u);
+                if (csize >= 20u) {
+                    uint16_t cb_size = get_le16(&hdr[payload + 16u]);
+                    if (cb_size >= 2u) {
+                        uint16_t hdr_spb = get_le16(&hdr[payload + 18u]);
+                        if (hdr_spb > 0u) {
+                            spb = hdr_spb;
+                        }
+                    }
+                }
+            } else {
+                return -1;
+            }
+            have_fmt = 1;
+        } else if (tag_eq(cid, "fact")) {
+            if (csize >= 4u && (hdr_len - payload) >= 4u) {
+                fact_samples = get_le32(&hdr[payload]);
+                have_fact    = 1;
+            }
+        } else if (tag_eq(cid, "data")) {
+            if (!have_fmt) {
+                return -1;
+            }
+            uint32_t total_samples;
+            if (have_fact && fact_samples > 0u) {
+                total_samples = fact_samples;
+            } else if (fmt_tag == WAV_FMT_PCM) {
+                total_samples = csize / block_align;
+            } else {
+                uint32_t full_blocks = csize / block_align;
+                uint32_t rem         = csize % block_align;
+                uint32_t hdr_bytes   = (uint32_t)channels * 4u;
+                uint32_t tail        = (rem >= hdr_bytes)
+                                     ? (((rem - hdr_bytes) * 2u) / channels + 1u)
+                                     : 0u;
+                total_samples = full_blocks * (uint32_t)spb + tail;
+            }
+
+            out->format_tag        = fmt_tag;
+            out->channels          = channels;
+            out->sample_rate       = sample_rate;
+            out->bits_per_sample   = bits;
+            out->block_align       = block_align;
+            out->samples_per_block = spb;
+            out->data_offset       = payload;
+            out->data_bytes        = csize;
+            out->total_samples     = total_samples;
+            out->duration_ms       = compute_duration_ms(total_samples, sample_rate);
+            return 0;
+        }
+
+        uint32_t step = csize + (csize & 1u);
+        if (step < csize || step > (hdr_len - payload)) {
+            break;
+        }
+        pos = payload + step;
+    }
+
+    return -1;
+}
+
+static int16_t ima_decode_nibble(int32_t *pred, int8_t *step_idx, uint8_t nib)
+{
+    static const int16_t k_ima_step[89] = {
+        7,     8,     9,     10,    11,    12,    13,    14,    16,    17,
+        19,    21,    23,    25,    28,    31,    34,    37,    41,    45,
+        50,    55,    60,    66,    73,    80,    88,    97,    107,   118,
+        130,   143,   157,   173,   190,   209,   230,   253,   279,   307,
+        337,   371,   408,   449,   494,   544,   598,   658,   724,   796,
+        876,   963,   1060,  1166,  1282,  1411,  1552,  1707,  1878,  2066,
+        2272,  2499,  2749,  3024,  3327,  3660,  4026,  4428,  4871,  5358,
+        5894,  6484,  7132,  7845,  8630,  9493,  10442, 11487, 12635, 13899,
+        15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767
+    };
+    static const int8_t k_ima_index[16] = {
+        -1, -1, -1, -1, 2, 4, 6, 8,
+        -1, -1, -1, -1, 2, 4, 6, 8
+    };
+
+    int32_t step = (int32_t)k_ima_step[*step_idx];
+    int32_t diff = step >> 3;
+    if (nib & 1u) {
+        diff += step >> 2;
+    }
+    if (nib & 2u) {
+        diff += step >> 1;
+    }
+    if (nib & 4u) {
+        diff += step;
+    }
+    if (nib & 8u) {
+        diff = -diff;
+    }
+
+    int32_t p = *pred + diff;
+    if (p > 32767) {
+        p = 32767;
+    } else if (p < -32768) {
+        p = -32768;
+    }
+    *pred = p;
+
+    int32_t ni = (int32_t)(*step_idx) + (int32_t)k_ima_index[nib & 0x0Fu];
+    if (ni < 0) {
+        ni = 0;
+    } else if (ni > 88) {
+        ni = 88;
+    }
+    *step_idx = (int8_t)ni;
+    return (int16_t)p;
+}
+
+int wav_decode_ima_adpcm_block(const uint8_t *block,
+                               uint16_t block_align,
+                               uint16_t channels,
+                               int16_t *out_pcm,
+                               uint32_t max_frames)
+{
+    if (!block || !out_pcm || (channels != 1u && channels != 2u)) {
+        return -1;
+    }
+    if (block_align < (uint16_t)(channels * 4u)) {
+        return -1;
+    }
+
+    if (channels == 1u) {
+        uint32_t frames = 1u + ((uint32_t)(block_align - 4u) * 2u);
+        if (frames > max_frames) {
+            return -1;
+        }
+        int32_t pred = (int16_t)get_le16(&block[0]);
+        int8_t  idx  = (int8_t)((block[2] > 88u) ? 88u : block[2]);
+        out_pcm[0]   = (int16_t)pred;
+
+        uint32_t f = 1u;
+        for (uint16_t off = 4u; off < block_align; off++) {
+            uint8_t b = block[off];
+            out_pcm[f++] = ima_decode_nibble(&pred, &idx, (uint8_t)(b & 0x0Fu));
+            out_pcm[f++] = ima_decode_nibble(&pred, &idx, (uint8_t)(b >> 4));
+        }
+        return (int)f;
+    }
+
+    if (((block_align - 8u) & 7u) != 0u) {
+        return -1;
+    }
+    uint32_t frames = 1u + (uint32_t)(block_align - 8u);
+    if (frames > max_frames) {
+        return -1;
+    }
+
+    int32_t pred_l = (int16_t)get_le16(&block[0]);
+    int8_t  idx_l  = (int8_t)((block[2] > 88u) ? 88u : block[2]);
+    int32_t pred_r = (int16_t)get_le16(&block[4]);
+    int8_t  idx_r  = (int8_t)((block[6] > 88u) ? 88u : block[6]);
+
+    out_pcm[0] = (int16_t)pred_l;
+    out_pcm[1] = (int16_t)pred_r;
+
+    uint32_t f = 1u;
+    for (uint16_t off = 8u; off + 8u <= block_align; off += 8u) {
+        for (uint16_t b = 0u; b < 4u; b++) {
+            uint8_t bl = block[off + b];
+            uint8_t br = block[off + 4u + b];
+            out_pcm[f * 2u + 0u] = ima_decode_nibble(&pred_l, &idx_l, (uint8_t)(bl & 0x0Fu));
+            out_pcm[f * 2u + 1u] = ima_decode_nibble(&pred_r, &idx_r, (uint8_t)(br & 0x0Fu));
+            f++;
+            out_pcm[f * 2u + 0u] = ima_decode_nibble(&pred_l, &idx_l, (uint8_t)(bl >> 4));
+            out_pcm[f * 2u + 1u] = ima_decode_nibble(&pred_r, &idx_r, (uint8_t)(br >> 4));
+            f++;
+        }
+    }
+    return (int)f;
+}

@@ -81,10 +81,16 @@ static inline void openfw_mmio_rmw32(uint32_t addr, uint32_t clear_mask, uint32_
 
 #define SCB_VTOR_ADDR       0xE000ED08u
 #define SCB_AIRCR_ADDR      0xE000ED0Cu
+#define SCB_SHCSR_ADDR      0xE000ED24u
+#define SCB_CFSR_ADDR       0xE000ED28u
+#define SCB_HFSR_ADDR       0xE000ED2Cu
+#define SCB_MMFAR_ADDR      0xE000ED34u
+#define SCB_BFAR_ADDR       0xE000ED38u
 #define SCB_CPACR_ADDR      0xE000ED88u
 
 #define SCB_AIRCR_VECTKEY   0x05FA0000u
 #define SCB_AIRCR_SYSRESET  (1u << 2)
+#define SCB_SHCSR_FAULTS_EN 0x00070000u /* MemManage | BusFault | UsageFault */
 #define SCB_CPACR_FPU_FULL  (0xFu << 20)
 
 #define NVIC_ISER_ADDR(n)   (0xE000E100u + 4u * (uint32_t)(n))
@@ -99,6 +105,11 @@ static inline void openfw_mmio_rmw32(uint32_t addr, uint32_t clear_mask, uint32_
 
 #define SCB_VTOR            REG32(SCB_VTOR_ADDR)
 #define SCB_AIRCR           REG32(SCB_AIRCR_ADDR)
+#define SCB_SHCSR           REG32(SCB_SHCSR_ADDR)
+#define SCB_CFSR            REG32(SCB_CFSR_ADDR)
+#define SCB_HFSR            REG32(SCB_HFSR_ADDR)
+#define SCB_MMFAR           REG32(SCB_MMFAR_ADDR)
+#define SCB_BFAR            REG32(SCB_BFAR_ADDR)
 #define SCB_CPACR           REG32(SCB_CPACR_ADDR)
 
 #define NVIC_ISER(n)        REG32(NVIC_ISER_ADDR(n))
@@ -197,11 +208,16 @@ static inline void nvic_clear_pending(uint32_t irq)
 #define US_TIMER_LO_ADDR    (US_TIMER_BASE + 0x04u)
 #define US_TIMER_HI_ADDR    (US_TIMER_BASE + 0x08u)
 
+#define WDT_EN_ADDR         (WDT_BASE + 0x00u)
+#define WDT_IRQ_CLR_ADDR    (WDT_BASE + 0x04u)
 #define WDT_FEED_ADDR       (WDT_BASE + 0x10u)
 #define WDT_TIMEOUT_ADDR    (WDT_BASE + 0x14u)
+#define WDT_MODE_ADDR       WDT_TIMEOUT_ADDR   /* 0x2001 = HW reset, 0x2004 = IRQ */
 #define WDT_CTRL0_ADDR      (WDT_BASE + 0x18u)
+#define WDT_CFG_ADDR        WDT_CTRL0_ADDR     /* [7:4] = timeout idx, [0] = enable */
 #define WDT_CTRL1_ADDR      (WDT_BASE + 0x1Cu)
 #define WDT_FEED_KEY        0x28000001u
+#define WDT_MODE_HW_RESET   0x2001u
 
 /* CRU raw registers & clock/reset IDs */
 #define CRU_PLL0_CTRL_ADDR     (CRU_BASE + 0x00u)
@@ -343,13 +359,17 @@ static inline int gpio_read(uint32_t port, uint32_t pin)
 #define RTC_ALARM0_CTRL_ADDR (AON_RTC_BASE + 0x18u)
 #define RTC_ALARM1_TIME_ADDR (AON_RTC_BASE + 0x20u)
 #define RTC_ALARM1_CTRL_ADDR (AON_RTC_BASE + 0x24u)
-#define AON_PWR_CTRL0_ADDR   (AON_RTC_BASE + 0x60u)
-#define AON_CLK_CFG_ADDR     (AON_RTC_BASE + 0x90u) /* [11:4]=XTAL cap, [16:12]=RTC clk, [31]=busy */
-#define AON_CLK_STAT_ADDR    (AON_RTC_BASE + 0x94u)
-#define AON_PWR_CTL0_ADDR    (AON_RTC_BASE + 0xA0u) /* bit 28 = RTC pwr gate (0=on) */
-#define AON_CLK_EN_ADDR      (AON_RTC_BASE + 0xA8u) /* bit 2 = RTC clk enable */
-#define AON_PLL_CTRL_ADDR    (AON_RTC_BASE + 0xD8u) /* bit 2 = PLL0 LDO/power */
-#define AON_BACKUP_ADDR(n)   (AON_RTC_BASE + 0x180u + 4u * (uint32_t)(n))
+#define AON_PWR_CTRL0_ADDR     (AON_RTC_BASE + 0x60u)
+#define AON_WDT_TRIM0_ADDR     (AON_RTC_BASE + 0x84u)
+#define AON_WDT_TRIM1_ADDR     (AON_RTC_BASE + 0x88u)
+#define AON_CLK_CFG_ADDR       (AON_RTC_BASE + 0x90u) /* [11:4]=XTAL cap, [16:12]=RTC clk, [31]=busy */
+#define AON_CLK_STAT_ADDR      (AON_RTC_BASE + 0x94u)
+#define AON_PWR_CTL0_ADDR      (AON_RTC_BASE + 0xA0u) /* bit 28 = RTC pwr gate (0=on) */
+#define AON_CLK_EN_ADDR        (AON_RTC_BASE + 0xA8u) /* bit 2 = RTC clk enable */
+#define AON_WDT_PMU_RST_CMD_ADDR (AON_RTC_BASE + 0xBCu) /* WDT->PMU reset auto-write */
+#define AON_PLL_CTRL_ADDR      (AON_RTC_BASE + 0xD8u) /* bit 2 = PLL0 LDO/power */
+#define AON_WDT_RST_CTL_ADDR   AON_PLL_CTRL_ADDR
+#define AON_BACKUP_ADDR(n)     (AON_RTC_BASE + 0x180u + 4u * (uint32_t)(n))
 
 #define RTWI_CTRL_ADDR      (RTWI_BASE + 0x00u)
 #define RTWI_CMD_ADDR       (RTWI_BASE + 0x04u) /* bit31=BUSY, bit30=1, [15:8]=reg, [7:0]=0x60/0x61 */
@@ -471,12 +491,28 @@ static inline int gpio_read(uint32_t port, uint32_t pin)
 #define CODEC_AMIC2_CTRL_ADDR    (AUDIO_CODEC_BASE + 0x00Cu) /* PGA gain bits [14:8] (0..127) */
 #define CODEC_ADC_CH_MUX_ADDR    (AUDIO_CODEC_BASE + 0x020u) /* bits [11:8] & [19:16] */
 #define CODEC_ADC_MUX_ADDR       CODEC_ADC_CH_MUX_ADDR
+#define CODEC_DAC2_ANA_VOL_ADDR  (AUDIO_CODEC_BASE + 0x02Cu)
+#define CODEC_DAC01_ANA_VOL_ADDR (AUDIO_CODEC_BASE + 0x030u) /* [20:16]=DAC0 L, [28:24]=DAC1 R */
+#define CODEC_DAC_ANA_CFG0_ADDR  (AUDIO_CODEC_BASE + 0x040u)
+#define CODEC_DAC_ANA_CFG1_ADDR  (AUDIO_CODEC_BASE + 0x04Cu)
+#define CODEC_DAC0_PWR_ADDR      (AUDIO_CODEC_BASE + 0x050u)
+#define CODEC_DAC1_PWR_ADDR      (AUDIO_CODEC_BASE + 0x054u)
+#define CODEC_DAC2_PWR_ADDR      (AUDIO_CODEC_BASE + 0x058u)
+#define CODEC_DAC0_DC_ADDR       (AUDIO_CODEC_BASE + 0x064u)
+#define CODEC_DAC1_DC_ADDR       (AUDIO_CODEC_BASE + 0x068u)
 #define CODEC_ANA_MISC_ADDR      (AUDIO_CODEC_BASE + 0x0FCu)
 #define CODEC_GLB_ADDR           (AUDIO_CODEC_BASE + 0x100u)
+#define CODEC_DAC_FIFO_CTRL_ADDR (AUDIO_CODEC_BASE + 0x108u)
+#define CODEC_DAC_TX_FIFO_ADDR   (AUDIO_CODEC_BASE + 0x10Cu)
+#define CODEC_DAC_DIG_CFG_ADDR   (AUDIO_CODEC_BASE + 0x110u)
+#define CODEC_DAC_FIFO_RST_ADDR  (AUDIO_CODEC_BASE + 0x114u)
+#define CODEC_DAC0_DIG_EN_ADDR   (AUDIO_CODEC_BASE + 0x130u)
 #define CODEC_DAC0_MUTE_ADDR     (AUDIO_CODEC_BASE + 0x134u)
 #define CODEC_DAC0_VOL_ADDR      (AUDIO_CODEC_BASE + 0x138u)
+#define CODEC_DAC1_DIG_EN_ADDR   (AUDIO_CODEC_BASE + 0x150u)
 #define CODEC_DAC1_MUTE_ADDR     (AUDIO_CODEC_BASE + 0x154u)
 #define CODEC_DAC1_VOL_ADDR      (AUDIO_CODEC_BASE + 0x158u)
+#define CODEC_DAC2_DIG_EN_ADDR   (AUDIO_CODEC_BASE + 0x170u)
 #define CODEC_DAC2_MUTE_ADDR     (AUDIO_CODEC_BASE + 0x174u)
 #define CODEC_DAC2_VOL_ADDR      (AUDIO_CODEC_BASE + 0x178u)
 #define CODEC_ADC_DIG_CTRL_ADDR  (AUDIO_CODEC_BASE + 0x200u)
@@ -527,6 +563,7 @@ static inline int gpio_read(uint32_t port, uint32_t pin)
 
 #define DMAC_REQ_AUDIO_ADC_RX 1u
 #define DMAC_CTL_ADC_RX_BASE  0x002A0281u /* SRC=ADC_RX(1) fixed 32b b4 -> DST=MEM inc 32b b4 */
+#define DMAC_CTL_DAC_TX_BASE  0x002812A0u /* SRC=MEM inc 32b b1 -> DST=DAC_TX(1) fixed 32b b1 */
 #define DMAC_CTL_CH_EN        (1u << 30)
 #define DMAC_CTL_RELOAD       (1u << 29)
 #define DMAC_IRQ_TC           (1u << 0)

@@ -59,9 +59,50 @@ void uart0_init_115200(void)
     openfw_mmio_wr32(UART0_CTRL_ADDR, (13u << 16) | (13u << 4) | 0x7u);
 }
 
-void uart0_putc(char c)
+void openfw_log_putc(char c)
 {
     log_ring_push(c);
+}
+
+void openfw_log_puts(const char *s)
+{
+    if (!s) {
+        return;
+    }
+    while (*s != '\0') {
+        openfw_log_putc(*s++);
+    }
+}
+
+void openfw_log_u32(uint32_t v)
+{
+    char buf[12];
+    int i = 0;
+    if (v == 0u) {
+        openfw_log_putc('0');
+        return;
+    }
+    while (v > 0u && i < 11) {
+        buf[i++] = (char)('0' + (v % 10u));
+        v /= 10u;
+    }
+    while (i > 0) {
+        openfw_log_putc(buf[--i]);
+    }
+}
+
+void openfw_log_hex(uint32_t v)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    openfw_log_puts("0x");
+    for (int shift = 28; shift >= 0; shift -= 4) {
+        openfw_log_putc(hex[(v >> shift) & 0xFu]);
+    }
+}
+
+void uart0_putc(char c)
+{
+    openfw_log_putc(c);
     if (c == '\n') {
         uart0_tx_raw((uint8_t)'\r');
     }

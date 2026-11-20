@@ -14,9 +14,11 @@ ENTRY(_start)
 
 MEMORY
 {
-    RAM_BOOT (rwx) : ORIGIN = 0x00804C00, LENGTH = 0x00001000
-    XIP      (rx)  : ORIGIN = 0x00C0F430, LENGTH = 0x001ECBD0
-    SRAM     (rwx) : ORIGIN = 0x0081A380, LENGTH = 0x00050480
+    RAM_BOOT  (rwx) : ORIGIN = 0x00804C00, LENGTH = 0x00001000
+    XIP       (rx)  : ORIGIN = 0x00C0F430, LENGTH = 0x001ECBD0
+    SRAM      (rwx) : ORIGIN = 0x0081A380, LENGTH = 0x00035C80
+    EXP_ARENA (rwx) : ORIGIN = 0x00850000, LENGTH = 0x00008000
+    EXP_OUT   (rw)  : ORIGIN = 0x00858000, LENGTH = 0x00004000
 }
 
 _estack = 0x0086AC08;
@@ -56,6 +58,16 @@ SECTIONS
         . = ALIGN(4);
         _ebss = .;
     } > SRAM
+
+    ASSERT(_ebss <= 0x00850000, ".data + .bss overflowed into EXP_ARENA")
+
+    .exp_arena 0x00850000 (NOLOAD) : ALIGN(4) {
+        KEEP(*(.exp_arena))
+    } > EXP_ARENA
+
+    .exp_out 0x00858000 (NOLOAD) : ALIGN(4) {
+        KEEP(*(.exp_out))
+    } > EXP_OUT
 
     /DISCARD/ : {
         *(.ARM.exidx* .ARM.extab* .comment .note*)

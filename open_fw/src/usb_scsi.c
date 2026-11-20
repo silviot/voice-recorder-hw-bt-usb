@@ -246,6 +246,7 @@ static void handle_cbw(usb_msc_state_t *st, const uint8_t *pkt, uint8_t len)
         break;
 
     case 0x1Eu: /* PREVENT ALLOW MEDIUM REMOVAL */
+    case 0x2Fu: /* VERIFY (10) */
     case 0x35u: /* SYNCHRONIZE CACHE (10) */
         st->csw_residue = data_len;
         st->phase       = MSC_PHASE_CSW;

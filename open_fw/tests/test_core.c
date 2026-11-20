@@ -12,6 +12,7 @@
 
 #include "openfw_bt_spp.h"
 #include "openfw_crypto.h"
+#include "openfw_cwx.h"
 #include "openfw_fs.h"
 #include "openfw_usb_msc.h"
 #include "openfw_wav.h"
@@ -119,6 +120,188 @@ static void test_wav(void)
     assert(info.block_align == 4u);
     assert(info.byte_rate == 64000u);
     printf("  [PASS] wav (mono blockAlign=2 & stereo blockAlign=4 build/parse)\n");
+}
+
+static void test_wav_stream_and_ima_adpcm(void)
+{
+    /* 1. PCM 16 kHz mono with an extra LIST chunk before data */
+    uint8_t pcm_wav[64];
+    memset(pcm_wav, 0, sizeof(pcm_wav));
+    memcpy(&pcm_wav[0], "RIFF", 4u);
+    put_le32(&pcm_wav[4], 56u);
+    memcpy(&pcm_wav[8], "WAVEfmt ", 8u);
+    put_le32(&pcm_wav[16], 16u);
+    put_le16(&pcm_wav[20], WAV_FMT_PCM);
+    put_le16(&pcm_wav[22], 1u);
+    put_le32(&pcm_wav[24], 16000u);
+    put_le32(&pcm_wav[28], 32000u);
+    put_le16(&pcm_wav[32], 2u);
+    put_le16(&pcm_wav[34], 16u);
+    memcpy(&pcm_wav[36], "LIST", 4u);
+    put_le32(&pcm_wav[40], 4u);
+    memcpy(&pcm_wav[48], "data", 4u);
+    put_le32(&pcm_wav[52], 32000u);
+
+    wav_stream_info_t ws;
+    assert(wav_parse_stream(pcm_wav, sizeof(pcm_wav), &ws) == 0);
+    assert(ws.format_tag == WAV_FMT_PCM && ws.channels == 1u);
+    assert(ws.sample_rate == 16000u && ws.data_offset == 56u && ws.data_bytes == 32000u);
+    assert(ws.total_samples == 16000u && ws.duration_ms == 1000u);
+
+    /* 2. Mono Microsoft IMA-ADPCM (16 kHz, block_align=256, 505 spb, fact chunk) */
+    uint8_t ima_hdr[72];
+    memset(ima_hdr, 0, sizeof(ima_hdr));
+    memcpy(&ima_hdr[0], "RIFF", 4u);
+    put_le32(&ima_hdr[4], 512u);
+    memcpy(&ima_hdr[8], "WAVEfmt ", 8u);
+    put_le32(&ima_hdr[16], 20u);
+    put_le16(&ima_hdr[20], WAV_FMT_IMA_ADPCM);
+    put_le16(&ima_hdr[22], 1u);
+    put_le32(&ima_hdr[24], 16000u);
+    put_le32(&ima_hdr[28], 8110u);
+    put_le16(&ima_hdr[32], 256u);
+    put_le16(&ima_hdr[34], 4u);
+    put_le16(&ima_hdr[36], 2u);
+    put_le16(&ima_hdr[38], 505u);
+    memcpy(&ima_hdr[40], "fact", 4u);
+    put_le32(&ima_hdr[44], 4u);
+    put_le32(&ima_hdr[48], 32000u); /* 2000 ms */
+    memcpy(&ima_hdr[52], "data", 4u);
+    put_le32(&ima_hdr[56], 256u * 63u);
+
+    assert(wav_parse_stream(ima_hdr, sizeof(ima_hdr), &ws) == 0);
+    assert(ws.format_tag == WAV_FMT_IMA_ADPCM && ws.channels == 1u);
+    assert(ws.block_align == 256u && ws.samples_per_block == 505u);
+    assert(ws.data_offset == 60u && ws.duration_ms == 2000u);
+
+    uint8_t mono_blk[256];
+    memset(mono_blk, 0x22u, sizeof(mono_blk));
+    put_le16(&mono_blk[0], (uint16_t)1000);
+    mono_blk[2] = 20u;
+    mono_blk[3] = 0u;
+    int16_t mono_pcm[512];
+    int nf = wav_decode_ima_adpcm_block(mono_blk, 256u, 1u, mono_pcm, 512u);
+    assert(nf == 505 && mono_pcm[0] == 1000 && mono_pcm[1] == 1031 && mono_pcm[2] > mono_pcm[1]);
+
+    /* 3. Stereo Microsoft IMA-ADPCM (block_align=512, 505 stereo frames) */
+    put_le16(&ima_hdr[22], 2u);
+    put_le16(&ima_hdr[32], 512u);
+    assert(wav_parse_stream(ima_hdr, sizeof(ima_hdr), &ws) == 0);
+    assert(ws.channels == 2u && ws.block_align == 512u && ws.samples_per_block == 505u);
+
+    uint8_t st_blk[512];
+    memset(st_blk, 0x11u, sizeof(st_blk));
+    put_le16(&st_blk[0], (uint16_t)500);
+    st_blk[2] = 15u;
+    st_blk[3] = 0u;
+    put_le16(&st_blk[4], (uint16_t)(uint16_t)-400);
+    st_blk[6] = 15u;
+    st_blk[7] = 0u;
+    int16_t st_pcm[1024];
+    nf = wav_decode_ima_adpcm_block(st_blk, 512u, 2u, st_pcm, 512u);
+    assert(nf == 505 && st_pcm[0] == 500 && st_pcm[1] == -400);
+    assert(st_pcm[2] > 500 && st_pcm[3] != st_pcm[2]);
+
+    printf("  [PASS] wav_stream + IMA-ADPCM (PCM/LIST, mono & stereo block decode)\n");
+}
+
+typedef struct {
+    const uint8_t *buf;
+    uint32_t       len;
+} mem_cwx_src_t;
+
+static int mem_cwx_read(void *user, uint32_t offset, void *dst, uint32_t len, uint32_t *out_read)
+{
+    const mem_cwx_src_t *src = (const mem_cwx_src_t *)user;
+    if (offset >= src->len) {
+        *out_read = 0u;
+        return 0;
+    }
+    uint32_t avail = src->len - offset;
+    uint32_t take  = (len < avail) ? len : avail;
+    memcpy(dst, src->buf + offset, take);
+    *out_read = take;
+    return 0;
+}
+
+static void append_cwx_word(uint8_t *buf, uint32_t *pos, uint32_t start_ms, uint32_t end_ms,
+                            uint8_t spk, uint8_t flags, const char *text)
+{
+    uint32_t tlen = (uint32_t)strlen(text);
+    put_le32(&buf[*pos + 0u], start_ms);
+    put_le32(&buf[*pos + 4u], end_ms);
+    buf[*pos + 8u]  = spk;
+    buf[*pos + 9u]  = flags;
+    buf[*pos + 10u] = (uint8_t)tlen;
+    memcpy(&buf[*pos + 11u], text, tlen);
+    *pos += 11u + tlen;
+}
+
+static void test_cwx_engine(void)
+{
+    uint8_t cwx_img[512];
+    memset(cwx_img, 0, sizeof(cwx_img));
+
+    uint32_t spk_off   = CWX_HEADER_SIZE;
+    uint32_t seek_off  = spk_off + 2u * CWX_SPEAKER_SIZE;
+    uint32_t words_off = seek_off + 3u * CWX_SEEK_SIZE;
+
+    memcpy(&cwx_img[0], "CWX1", 4u);
+    put_le16(&cwx_img[4], 1u);
+    put_le16(&cwx_img[6], 2u);
+    put_le32(&cwx_img[8], 2500u);
+    put_le32(&cwx_img[12], 6u);
+    put_le32(&cwx_img[16], spk_off);
+    put_le32(&cwx_img[20], seek_off);
+    put_le32(&cwx_img[24], 3u);
+    put_le32(&cwx_img[28], words_off);
+    memcpy(&cwx_img[32], "Cassini Test", 12u);
+
+    put_le16(&cwx_img[spk_off + 0u], 0x07FFu);
+    memcpy(&cwx_img[spk_off + 4u], "Alice", 5u);
+    put_le16(&cwx_img[spk_off + CWX_SPEAKER_SIZE + 0u], 0xFFE0u);
+    memcpy(&cwx_img[spk_off + CWX_SPEAKER_SIZE + 4u], "Bob", 3u);
+
+    uint32_t wpos = words_off;
+    uint32_t rel0 = wpos - words_off;
+    append_cwx_word(cwx_img, &wpos, 100u, 400u, 0u, CWX_FLAG_TURN_START, "Hello");
+    append_cwx_word(cwx_img, &wpos, 420u, 800u, 0u, 0u, "world");
+    append_cwx_word(cwx_img, &wpos, 850u, 1150u, 0u, 0u, "here");
+    uint32_t rel3 = wpos - words_off;
+    append_cwx_word(cwx_img, &wpos, 1200u, 1500u, 1u, CWX_FLAG_TURN_START, "Yes");
+    append_cwx_word(cwx_img, &wpos, 1550u, 1950u, 1u, 0u, "indeed");
+    uint32_t rel5 = wpos - words_off;
+    append_cwx_word(cwx_img, &wpos, 2000u, 2400u, 1u, 0u, "done!");
+
+    put_le32(&cwx_img[seek_off + 0u], rel0); put_le32(&cwx_img[seek_off + 4u], 0u);
+    put_le32(&cwx_img[seek_off + 8u], rel3); put_le32(&cwx_img[seek_off + 12u], 3u);
+    put_le32(&cwx_img[seek_off + 16u], rel5); put_le32(&cwx_img[seek_off + 20u], 5u);
+
+    mem_cwx_src_t src = { cwx_img, wpos };
+    cwx_stream_t cwx;
+    assert(cwx_open(&cwx, mem_cwx_read, &src, wpos) == 0);
+    assert(cwx.speaker_count == 2u && cwx.word_count == 6u && cwx.duration_ms == 2500u);
+    assert(strcmp(cwx.title, "Cassini Test") == 0);
+    assert(strcmp(cwx_speaker_label(&cwx, 0u), "Alice") == 0);
+    assert(strcmp(cwx_speaker_label(&cwx, 1u), "Bob") == 0);
+    assert(cwx_speaker_color(&cwx, 0u) == 0x07FFu && cwx_speaker_color(&cwx, 1u) == 0xFFE0u);
+
+    assert(cwx_seek_ms(&cwx, 1200u) == 0);
+    cwx_word_t wd;
+    assert(cwx_next_word(&cwx, &wd) == 1);
+    assert(wd.word_idx == 3u && wd.speaker_idx == 1u &&
+           (wd.flags & CWX_FLAG_TURN_START) != 0u && strcmp(wd.text, "Yes") == 0);
+
+    cwx_word_t win[4];
+    int active = -1;
+    int n = cwx_read_window(&cwx, 1300u, win, 4u, &active);
+    assert(n > 0 && active >= 0 && active < n && strcmp(win[active].text, "Yes") == 0);
+
+    n = cwx_read_window(&cwx, 2100u, win, 4u, &active);
+    assert(n > 0 && active >= 0 && active < n && strcmp(win[active].text, "done!") == 0);
+    assert(win[active].speaker_idx == 1u);
+
+    printf("  [PASS] cwx_engine (header, speakers, seek table, next_word, read_window)\n");
 }
 
 #define MEM_DISK_SECTORS 128u
@@ -820,20 +1003,38 @@ typedef struct {
     uint8_t     bound_key[32];
     int         bound_called;
     int         ota_called;
+    int         dfu_called;
+    uint8_t     exp_buf[1024];
+    uint32_t    exp_len;
+    int         exp_runs;
+    uint32_t    last_exp_arg;
+    char        log_buf[256];
+    uint32_t    log_widx;
+    int         log_cleared;
     uint8_t     rx_stream[4096];
     uint32_t    rx_len;
     uint32_t    rx_acl_pkts;
+    uint8_t     dsp_profile;
+    uint8_t     mic_gain;
+    uint8_t     channels;
+    uint8_t     vor_enabled;
 } sim_phone_t;
+
+static void send_xrec_put_target(bt_spp_t *spp, uint32_t offset, const char *target,
+                                 const uint8_t *chunk, uint16_t chunk_len, uint16_t crc)
+{
+    uint8_t pkt[96u + XREC_MAX_CHUNK];
+    int hlen = snprintf((char *)pkt, sizeof(pkt), "+XREC:PUT,%u,%u,%u,%s:",
+                        (unsigned)offset, (unsigned)chunk_len, (unsigned)crc, target);
+    assert(hlen > 0 && hlen + chunk_len <= (int)sizeof(pkt));
+    memcpy(&pkt[hlen], chunk, chunk_len);
+    send_rfcomm_client_uih(spp, 0x0041u, 2u, pkt, (uint16_t)(hlen + chunk_len));
+}
 
 static void send_xrec_put_chunk(bt_spp_t *spp, uint32_t offset, const uint8_t *chunk,
                                 uint16_t chunk_len, uint16_t crc)
 {
-    uint8_t pkt[64u + XREC_MAX_CHUNK];
-    int hlen = snprintf((char *)pkt, sizeof(pkt), "+XREC:PUT,%u,%u,%u,OTA:",
-                        (unsigned)offset, (unsigned)chunk_len, (unsigned)crc);
-    assert(hlen > 0 && hlen + chunk_len <= (int)sizeof(pkt));
-    memcpy(&pkt[hlen], chunk, chunk_len);
-    send_rfcomm_client_uih(spp, 0x0041u, 2u, pkt, (uint16_t)(hlen + chunk_len));
+    send_xrec_put_target(spp, offset, "OTA", chunk, chunk_len, crc);
 }
 
 static void mock_spp_data_cb(void *user, const uint8_t *data, uint16_t len)
@@ -899,6 +1100,84 @@ static void mock_xrec_on_ota(void *user)
 {
     sim_phone_t *sp = (sim_phone_t *)user;
     sp->ota_called++;
+}
+
+static int mock_xrec_exp_write(void *user, uint32_t off, const uint8_t *data, uint16_t len)
+{
+    sim_phone_t *sp = (sim_phone_t *)user;
+    if (off + len > sizeof(sp->exp_buf)) {
+        return -1;
+    }
+    memcpy(&sp->exp_buf[off], data, len);
+    if (off + len > sp->exp_len) {
+        sp->exp_len = off + len;
+    }
+    return 0;
+}
+
+static int mock_xrec_exp_run(void *user, uint32_t entry_off, uint32_t arg,
+                             uint32_t *rc, uint32_t *elapsed_ms,
+                             uint32_t *out_len, uint32_t *log_widx)
+{
+    (void)entry_off;
+    sim_phone_t *sp = (sim_phone_t *)user;
+    sp->exp_runs++;
+    sp->last_exp_arg = arg;
+    const char *msg = "EXP_OK_LOG\n";
+    uint32_t mlen = (uint32_t)strlen(msg);
+    memcpy(sp->log_buf, msg, mlen);
+    sp->log_widx = mlen;
+    *rc         = arg ^ 0x55u;
+    *elapsed_ms = 12u;
+    *out_len    = 4u;
+    *log_widx   = sp->log_widx;
+    return 0;
+}
+
+static uint32_t mock_xrec_read_log(void *user, uint32_t off, uint8_t *dst,
+                                   uint32_t max_len, uint32_t *out_widx)
+{
+    sim_phone_t *sp = (sim_phone_t *)user;
+    *out_widx = sp->log_widx;
+    if (off >= sp->log_widx) {
+        return 0u;
+    }
+    uint32_t take = sp->log_widx - off;
+    if (take > max_len) {
+        take = max_len;
+    }
+    memcpy(dst, &sp->log_buf[off], take);
+    return take;
+}
+
+static void mock_xrec_reset_log(void *user)
+{
+    sim_phone_t *sp = (sim_phone_t *)user;
+    sp->log_widx = 0u;
+    sp->log_cleared++;
+}
+
+static void mock_xrec_on_dfu(void *user)
+{
+    sim_phone_t *sp = (sim_phone_t *)user;
+    sp->dfu_called++;
+}
+
+static int mock_xrec_audio_cfg(void *user, int set, uint8_t *dsp_profile,
+                               uint8_t *gain, uint8_t *channels, uint8_t *vor)
+{
+    sim_phone_t *sp = (sim_phone_t *)user;
+    if (set) {
+        if (dsp_profile) sp->dsp_profile = *dsp_profile;
+        if (gain)        sp->mic_gain    = *gain;
+        if (channels)    sp->channels    = *channels;
+        if (vor)         sp->vor_enabled = *vor;
+    }
+    if (dsp_profile) *dsp_profile = sp->dsp_profile;
+    if (gain)        *gain        = sp->mic_gain;
+    if (channels)    *channels    = sp->channels;
+    if (vor)         *vor         = sp->vor_enabled;
+    return 0;
 }
 
 static void drain_acl_to_phone(bt_spp_t *spp, sim_phone_t *sp)
@@ -1010,15 +1289,21 @@ static void test_bt_spp_and_xrec(void)
     sim_phone_t sp;
     xrec_ctx_t  xrec;
     memset(&sp, 0, sizeof(sp));
-    sp.spp       = &spp;
-    sp.rtc.year  = 2026u;
-    sp.rtc.month = 11u;
-    sp.rtc.day   = 19u;
+    sp.spp         = &spp;
+    sp.rtc.year    = 2026u;
+    sp.rtc.month   = 11u;
+    sp.rtc.day     = 19u;
+    sp.dsp_profile = 0u;
+    sp.mic_gain    = 20u;
+    sp.channels    = 1u;
+    sp.vor_enabled = 0u;
 
     xrec_ops_t ops = {
         mock_xrec_send, mock_xrec_get_stat, mock_xrec_get_rtc,
         mock_xrec_set_rtc, mock_xrec_entropy, mock_xrec_bound, NULL,
         NULL, NULL, mock_xrec_on_ota,
+        mock_xrec_exp_write, mock_xrec_exp_run, mock_xrec_read_log,
+        mock_xrec_reset_log, mock_xrec_on_dfu, mock_xrec_audio_cfg,
     };
     xrec_init(&xrec, &vol, &ops, &sp);
     bt_spp_init(&spp, mock_spp_data_cb, &xrec);
@@ -1284,7 +1569,70 @@ static void test_bt_spp_and_xrec(void)
     assert(exfat_read_file(&vol, &ota_ent, 0u, ota_readback, sizeof(ota_readback), &ota_nread) == 0);
     assert(ota_nread == sizeof(ota_img) && memcmp(ota_readback, ota_img, sizeof(ota_img)) == 0);
 
-    printf("  [PASS] bt_spp + xrec (L2CAP, SDP, RFCOMM credits/DISC, +XREC auth/LS/DEL/GET/GETS+EOF/PUT+OTA)\n");
+    /* 7. +XREC EXP upload/run/log/clear, CAS,<filename>+PUTEND, and DFU */
+    send_rfcomm_client_credits(&spp, 0x0041u, 2u, 10u);
+    uint8_t exp_code[32];
+    for (uint32_t i = 0u; i < sizeof(exp_code); i++) {
+        exp_code[i] = (uint8_t)(0xE0u + i);
+    }
+    uint16_t exp_crc = openfw_crc16_ccitt_false(exp_code, sizeof(exp_code));
+    sp.rx_len = 0u;
+    send_xrec_put_target(&spp, 0u, "EXP", exp_code, sizeof(exp_code), (uint16_t)(exp_crc ^ 1u));
+    drain_acl_to_phone(&spp, &sp);
+    sp.rx_stream[sp.rx_len] = '\0';
+    assert(strcmp((const char *)sp.rx_stream, "+XREC:ERR,CRC\r\n") == 0);
+
+    sp.rx_len = 0u;
+    send_xrec_put_target(&spp, 0u, "EXP", exp_code, sizeof(exp_code), exp_crc);
+    const char *c_run = "+XREC:RUN,0,123\r+XREC:LOG,0,64\r+XREC:LOG,CLEAR\r";
+    send_rfcomm_client_uih(&spp, 0x0041u, 2u, (const uint8_t *)c_run, (uint16_t)strlen(c_run));
+    drain_acl_to_phone(&spp, &sp);
+    sp.rx_stream[sp.rx_len] = '\0';
+    assert(sp.exp_len == 32u && memcmp(sp.exp_buf, exp_code, 32u) == 0);
+    assert(sp.exp_runs == 1 && sp.last_exp_arg == 123u && sp.log_cleared == 1);
+    assert(strstr((const char *)sp.rx_stream, "+XREC:OK,PUT,0,32") != NULL);
+    assert(strstr((const char *)sp.rx_stream, "+XREC:OK,RUN,46,12,4,11") != NULL);
+    assert(strstr((const char *)sp.rx_stream, "+XREC:LOG,0,11,11:EXP_OK_LOG\n") != NULL);
+    assert(strstr((const char *)sp.rx_stream, "+XREC:OK,LOG,CLEAR") != NULL);
+
+    uint8_t cas_data[48];
+    for (uint32_t i = 0u; i < sizeof(cas_data); i++) {
+        cas_data[i] = (uint8_t)(i * 7u + 1u);
+    }
+    uint16_t cas_crc = openfw_crc16_ccitt_false(cas_data, sizeof(cas_data));
+    sp.rx_len = 0u;
+    send_xrec_put_target(&spp, 0u, "CAS,demo.cwx", cas_data, sizeof(cas_data), cas_crc);
+    const char *c_put_end = "+XREC:PUTEND\r";
+    send_rfcomm_client_uih(&spp, 0x0041u, 2u, (const uint8_t *)c_put_end, (uint16_t)strlen(c_put_end));
+    drain_acl_to_phone(&spp, &sp);
+    sp.rx_stream[sp.rx_len] = '\0';
+    assert(strstr((const char *)sp.rx_stream, "+XREC:OK,PUT,0,48") != NULL);
+    assert(strstr((const char *)sp.rx_stream, "+XREC:OK,PUTEND,48") != NULL);
+
+    sp.rx_len = 0u;
+    send_rfcomm_client_credits(&spp, 0x0041u, 2u, 10u);
+    const char *c_cfg_end = "+XREC:DSP\r+XREC:DSP=1\r+XREC:GAIN=25\r+XREC:CH=2\r+XREC:VOR=1\r+XREC:DSP=9\r+XREC:DFU\r";
+    send_rfcomm_client_uih(&spp, 0x0041u, 2u, (const uint8_t *)c_cfg_end, (uint16_t)strlen(c_cfg_end));
+    drain_acl_to_phone(&spp, &sp);
+    sp.rx_stream[sp.rx_len] = '\0';
+    assert(strstr((const char *)sp.rx_stream, "+XREC:OK,DSP,0") != NULL);
+    assert(strstr((const char *)sp.rx_stream, "+XREC:OK,DSP,1") != NULL);
+    assert(strstr((const char *)sp.rx_stream, "+XREC:OK,GAIN,25") != NULL);
+    assert(strstr((const char *)sp.rx_stream, "+XREC:OK,CH,2") != NULL);
+    assert(strstr((const char *)sp.rx_stream, "+XREC:OK,VOR,1") != NULL);
+    assert(strstr((const char *)sp.rx_stream, "+XREC:ERR,ARGS") != NULL);
+    assert(sp.dsp_profile == 1u && sp.mic_gain == 25u && sp.channels == 2u && sp.vor_enabled == 1u);
+    assert(strstr((const char *)sp.rx_stream, "+XREC:OK,DFU") != NULL);
+    assert(sp.dfu_called == 1);
+
+    exfat_entry_t cas_ent;
+    assert(exfat_find_path(&vol, "/cassini/demo.cwx", &cas_ent) == 0 && cas_ent.size == 48u);
+    uint8_t cas_rb[48];
+    uint32_t cas_nread = 0u;
+    assert(exfat_read_file(&vol, &cas_ent, 0u, cas_rb, sizeof(cas_rb), &cas_nread) == 0);
+    assert(cas_nread == 48u && memcmp(cas_rb, cas_data, 48u) == 0);
+
+    printf("  [PASS] bt_spp + xrec (L2CAP, SDP, RFCOMM credits/DISC, +XREC auth/LS/DEL/GET/GETS+EOF/PUT+OTA/EXP/RUN/LOG/CAS/DFU)\n");
 }
 
 int main(int argc, char **argv)
@@ -1297,6 +1645,8 @@ int main(int argc, char **argv)
     printf("Running open_fw host unit tests...\n");
     test_crypto();
     test_wav();
+    test_wav_stream_and_ima_adpcm();
+    test_cwx_engine();
     test_exfat();
     test_exfat_write();
     test_usb_msc();

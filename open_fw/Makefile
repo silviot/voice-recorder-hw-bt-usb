@@ -15,17 +15,18 @@ OBJCOPY  ?= $(shell which llvm-objcopy 2>/dev/null || find /usr/lib "$${ANDROID_
 
 BUILD_DIR ?= /tmp/sl6801_openfw
 
-CFLAGS   := --target=thumbv7em-none-eabi -mcpu=cortex-m4 -mfloat-abi=soft -mthumb \
+CFLAGS   := --target=thumbv7em-none-eabi -mcpu=cortex-m4 -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb \
             -Os -Wall -Wextra -ffreestanding -fno-builtin -fno-stack-protector \
             -Iinclude -I$(BUILD_DIR)
 
 HOST_CFLAGS := -O2 -Wall -Wextra -Werror -Iinclude
 
 SRCS      := src/startup.c src/wdt_timer.c src/rtc.c src/uart.c src/pmu.c \
-             src/keys.c src/lcd_st7735s.c src/sdio.c src/audio_dma.c \
-             src/usb_scsi.c src/usb_musb.c src/bt_rf.c src/bt_spp.c \
-             src/xrec_proto.c src/bt_hci.c src/recorder.c \
-             src/crypto.c src/wav.c src/exfat.c src/main.c
+             src/keys.c src/lcd_st7735s.c src/aa_fonts.c src/sdio.c src/audio_dma.c \
+             src/audio_dac.c src/audio_dsp.c src/usb_scsi.c src/usb_musb.c \
+             src/bt_rf.c src/bt_spp.c src/xrec_proto.c src/bt_hci.c \
+             src/recorder.c src/player.c src/exp_runner.c src/crypto.c \
+             src/wav.c src/cwx.c src/exfat.c src/main.c
 OBJS      := $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(SRCS))
 
 SPLASH_PNG  := ../assets/cassini_welcome_80x40.png
@@ -44,10 +45,10 @@ $(BUILD_DIR):
 $(SPLASH_HDR): $(SPLASH_PNG) tools/png_to_rgb565_h.py | $(BUILD_DIR)
 	python3 tools/png_to_rgb565_h.py $(SPLASH_PNG) --out $@
 
-$(BUILD_DIR)/main.o: src/main.c $(SPLASH_HDR) include/sl6801_regs.h include/openfw.h | $(BUILD_DIR)
+$(BUILD_DIR)/main.o: src/main.c $(SPLASH_HDR) include/sl6801_regs.h include/openfw.h include/openfw_exp.h include/openfw_player.h | $(BUILD_DIR)
 	$(CLANG) $(CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/%.o: src/%.c include/sl6801_regs.h include/sl6801_rom.h include/openfw.h include/openfw_crypto.h include/openfw_wav.h include/openfw_fs.h include/openfw_usb_msc.h include/openfw_bt_spp.h include/openfw_xrec.h | $(BUILD_DIR)
+$(BUILD_DIR)/%.o: src/%.c include/sl6801_regs.h include/sl6801_rom.h include/openfw.h include/audio_dsp.h include/openfw_exp.h include/openfw_crypto.h include/openfw_wav.h include/openfw_cwx.h include/openfw_player.h include/openfw_fs.h include/openfw_usb_msc.h include/openfw_bt_spp.h include/openfw_xrec.h | $(BUILD_DIR)
 	$(CLANG) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/open_fw.elf: $(OBJS) sl6801_firm.ld
@@ -65,7 +66,7 @@ $(BUILD_DIR)/xip.bin: $(BUILD_DIR)/open_fw.elf
 $(BUILD_DIR)/open_fw_firm.bin: $(BUILD_DIR)/ram_boot.bin $(BUILD_DIR)/xip.bin tools/pack_firm.py
 	python3 tools/pack_firm.py --ram-boot $(BUILD_DIR)/ram_boot.bin --xip $(BUILD_DIR)/xip.bin --out-firm $@
 
-test-host: tests/test_core.c src/crypto.c src/wav.c src/exfat.c src/usb_scsi.c src/bt_spp.c src/xrec_proto.c | $(BUILD_DIR)
+test-host: tests/test_core.c src/crypto.c src/wav.c src/cwx.c src/exfat.c src/usb_scsi.c src/bt_spp.c src/xrec_proto.c | $(BUILD_DIR)
 	$(HOST_CC) $(HOST_CFLAGS) $^ -o $(BUILD_DIR)/test_core
 	$(BUILD_DIR)/test_core
 	dd if=/dev/zero of=$(BUILD_DIR)/test_exfat.img bs=512 count=4096 status=none
@@ -74,11 +75,14 @@ test-host: tests/test_core.c src/crypto.c src/wav.c src/exfat.c src/usb_scsi.c s
 	/usr/sbin/fsck.exfat -n $(BUILD_DIR)/test_exfat.img
 	$(HOST_CC) $(HOST_CFLAGS) -DOPENFW_HOST_MMIO tests/test_drivers_mmio.c \
 		src/wdt_timer.c src/uart.c src/rtc.c src/pmu.c src/keys.c \
-		src/sdio.c src/lcd_st7735s.c src/usb_musb.c src/usb_scsi.c src/exfat.c \
+		src/sdio.c src/lcd_st7735s.c src/aa_fonts.c src/usb_musb.c src/usb_scsi.c src/exfat.c \
+		src/exp_runner.c src/crypto.c \
 		-o $(BUILD_DIR)/test_drivers_mmio
 	$(BUILD_DIR)/test_drivers_mmio $(BUILD_DIR)/test_exfat.img
+	$(HOST_CC) $(HOST_CFLAGS) tests/test_audio_dsp.c src/audio_dsp.c -lm -o $(BUILD_DIR)/test_audio_dsp
+	$(BUILD_DIR)/test_audio_dsp
 	$(HOST_CC) $(HOST_CFLAGS) -DOPENFW_HOST_MMIO tests/test_audio_bt_mmio.c \
-		src/audio_dma.c src/recorder.c src/bt_rf.c \
+		src/audio_dma.c src/audio_dac.c src/audio_dsp.c src/recorder.c src/bt_rf.c \
 		src/wav.c src/exfat.c src/rtc.c src/wdt_timer.c \
 		-o $(BUILD_DIR)/test_audio_bt_mmio
 	dd if=/dev/zero of=$(BUILD_DIR)/test_rec_exfat.img bs=512 count=4096 status=none
@@ -98,7 +102,7 @@ update-up: $(BUILD_DIR)/ram_boot.bin $(BUILD_DIR)/xip.bin tools/pack_firm.py
 $(BUILD_DIR)/qemu_boot_stub.bin: tools/qemu_boot_stub.S | $(BUILD_DIR)
 	@test -n "$(LLD)" || (echo "Error: ld.lld not found (set LLD=/path/to/ld.lld)" >&2; exit 1)
 	@test -n "$(OBJCOPY)" || (echo "Error: llvm-objcopy not found (set OBJCOPY=/path/to/llvm-objcopy)" >&2; exit 1)
-	$(CLANG) --target=thumbv7em-none-eabi -mcpu=cortex-m4 -mfloat-abi=soft -mthumb -c $< -o $(BUILD_DIR)/qemu_boot_stub.o
+	$(CLANG) --target=thumbv7em-none-eabi -mcpu=cortex-m4 -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb -c $< -o $(BUILD_DIR)/qemu_boot_stub.o
 	$(LLD) -Ttext=0x10000000 -e _qemu_stub_vectors $(BUILD_DIR)/qemu_boot_stub.o -o $(BUILD_DIR)/qemu_boot_stub.elf
 	$(OBJCOPY) -O binary $(BUILD_DIR)/qemu_boot_stub.elf $@
 

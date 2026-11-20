@@ -9,8 +9,10 @@
 #include "sl6801_rom.h"
 #include "openfw.h"
 
-#define ST7735S_X_OFFSET 26u
-#define ST7735S_Y_OFFSET 0u
+static uint16_t g_lcd_w     = LCD_WIDTH;
+static uint16_t g_lcd_h     = LCD_HEIGHT;
+static uint16_t g_lcd_x_off = 26u;
+static uint16_t g_lcd_y_off = 0u;
 
 static inline void lcdc_wait_idle(void)
 {
@@ -178,18 +180,54 @@ void lcd_init(void)
 
     st7735s_write_cmd(0x3Au); /* COLMOD: 16-bit RGB565 */
     st7735s_write_u8(0x05u);
-    st7735s_write_cmd(0x36u); /* MADCTL: MY=1, MX=1, BGR=1 */
-    st7735s_write_u8(0xC8u);
+    lcd_set_rotation(0);
+    /* Clear full 132x162 ST7735S GRAM before DISPON so no edge snow ever shows */
+    st7735s_write_cmd(0x2Au);
+    st7735s_write_data(pack_be16_pair(0u, 131u), 4u);
+    st7735s_write_cmd(0x2Bu);
+    st7735s_write_data(pack_be16_pair(0u, 161u), 4u);
+    st7735s_write_cmd(0x2Cu);
+    for (uint32_t i = 0u; i < (132u * 162u) / 2u; i++) {
+        st7735s_write_data(0u, 4u);
+    }
     st7735s_write_cmd(0x29u); /* DISPON */
     mdelay(10u);
 }
 
+void lcd_set_rotation(int landscape)
+{
+    st7735s_write_cmd(0x36u); /* MADCTL */
+    if (landscape) {
+        st7735s_write_u8(0xA8u); /* MY=1, MX=0, MV=1, BGR=1 (90 deg CCW -> 160x80) */
+        g_lcd_w     = 160u;
+        g_lcd_h     = 80u;
+        g_lcd_x_off = 1u; /* 162-col GRAM -> 1 px margin on left/right */
+        g_lcd_y_off = 26u;
+    } else {
+        st7735s_write_u8(0xC8u); /* MY=1, MX=1, MV=0, BGR=1 (portrait -> 80x160) */
+        g_lcd_w     = LCD_WIDTH;
+        g_lcd_h     = LCD_HEIGHT;
+        g_lcd_x_off = 26u;
+        g_lcd_y_off = 1u; /* 162-row GRAM -> 1 px margin on top/bottom */
+    }
+}
+
+uint16_t lcd_get_width(void)
+{
+    return g_lcd_w;
+}
+
+uint16_t lcd_get_height(void)
+{
+    return g_lcd_h;
+}
+
 void lcd_set_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1)
 {
-    uint16_t xs = (uint16_t)(x0 + ST7735S_X_OFFSET);
-    uint16_t xe = (uint16_t)(x1 + ST7735S_X_OFFSET);
-    uint16_t ys = (uint16_t)(y0 + ST7735S_Y_OFFSET);
-    uint16_t ye = (uint16_t)(y1 + ST7735S_Y_OFFSET);
+    uint16_t xs = (uint16_t)(x0 + g_lcd_x_off);
+    uint16_t xe = (uint16_t)(x1 + g_lcd_x_off);
+    uint16_t ys = (uint16_t)(y0 + g_lcd_y_off);
+    uint16_t ye = (uint16_t)(y1 + g_lcd_y_off);
 
     st7735s_write_cmd(0x2Au); /* CASET */
     st7735s_write_data(pack_be16_pair(xs, xe), 4u);
@@ -202,13 +240,13 @@ void lcd_set_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1)
 
 void lcd_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t color)
 {
-    if (w == 0u || h == 0u || x >= LCD_WIDTH || y >= LCD_HEIGHT) {
+    if (w == 0u || h == 0u || x >= g_lcd_w || y >= g_lcd_h) {
         return;
     }
     uint16_t x1 = (uint16_t)(x + w - 1u);
     uint16_t y1 = (uint16_t)(y + h - 1u);
-    if (x1 >= LCD_WIDTH)  x1 = LCD_WIDTH - 1u;
-    if (y1 >= LCD_HEIGHT) y1 = LCD_HEIGHT - 1u;
+    if (x1 >= g_lcd_w) x1 = (uint16_t)(g_lcd_w - 1u);
+    if (y1 >= g_lcd_h) y1 = (uint16_t)(g_lcd_h - 1u);
 
     lcd_set_window(x, y, x1, y1);
     uint32_t total = (uint32_t)(x1 - x + 1u) * (uint32_t)(y1 - y + 1u);
@@ -236,6 +274,43 @@ void lcd_blit_rgb565(uint16_t x, uint16_t y, uint16_t w, uint16_t h, const uint1
     }
     if (i < total) {
         uint16_t p = pixels[i];
+        uint32_t be = ((uint32_t)(p >> 8)) | (((uint32_t)(p & 0xFFu)) << 8);
+        st7735s_write_data(be, 2u);
+    }
+}
+
+static inline uint16_t rgb565_scale(uint16_t c, uint8_t alpha)
+{
+    if (alpha >= 255u) {
+        return c;
+    }
+    if (alpha == 0u || c == 0u) {
+        return 0u;
+    }
+    uint32_t a = (uint32_t)alpha + 1u;
+    uint32_t r = (((uint32_t)(c >> 11) & 0x1Fu) * a) >> 8;
+    uint32_t g = (((uint32_t)(c >> 5)  & 0x3Fu) * a) >> 8;
+    uint32_t b = (((uint32_t)c         & 0x1Fu) * a) >> 8;
+    return (uint16_t)((r << 11) | (g << 5) | b);
+}
+
+void lcd_blit_rgb565_alpha(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
+                           const uint16_t *pixels, uint8_t alpha)
+{
+    if (w == 0u || h == 0u || !pixels) {
+        return;
+    }
+    lcd_set_window(x, y, (uint16_t)(x + w - 1u), (uint16_t)(y + h - 1u));
+    uint32_t total = (uint32_t)w * (uint32_t)h;
+    uint32_t i = 0u;
+    while ((i + 2u) <= total) {
+        uint16_t p0 = rgb565_scale(pixels[i], alpha);
+        uint16_t p1 = rgb565_scale(pixels[i + 1u], alpha);
+        st7735s_write_data(pack_be16_pair(p0, p1), 4u);
+        i += 2u;
+    }
+    if (i < total) {
+        uint16_t p = rgb565_scale(pixels[i], alpha);
         uint32_t be = ((uint32_t)(p >> 8)) | (((uint32_t)(p & 0xFFu)) << 8);
         st7735s_write_data(be, 2u);
     }
@@ -342,7 +417,7 @@ static const uint8_t FONT5X7[95][5] = {
 
 void lcd_draw_char(uint16_t x, uint16_t y, char c, uint16_t fg, uint16_t bg)
 {
-    if ((uint16_t)(x + 6u) > LCD_WIDTH || (uint16_t)(y + 8u) > LCD_HEIGHT) {
+    if ((uint16_t)(x + 6u) > g_lcd_w || (uint16_t)(y + 8u) > g_lcd_h) {
         return;
     }
     uint8_t uc = (uint8_t)c;
@@ -368,9 +443,45 @@ void lcd_draw_char(uint16_t x, uint16_t y, char c, uint16_t fg, uint16_t bg)
 void lcd_draw_str(uint16_t x, uint16_t y, const char *s, uint16_t fg, uint16_t bg)
 {
     uint16_t cx = x;
-    while (*s != '\0' && (uint16_t)(cx + 6u) <= LCD_WIDTH) {
+    while (*s != '\0' && (uint16_t)(cx + 6u) <= g_lcd_w) {
         lcd_draw_char(cx, y, *s++, fg, bg);
         cx += 6u;
+    }
+}
+
+void lcd_draw_char_2x(uint16_t x, uint16_t y, char c, uint16_t fg, uint16_t bg)
+{
+    if ((uint16_t)(x + 12u) > g_lcd_w || (uint16_t)(y + 16u) > g_lcd_h) {
+        return;
+    }
+    uint8_t uc = (uint8_t)c;
+    if (uc < 0x20u || uc > 0x7Eu) {
+        uc = '?';
+    }
+    const uint8_t *cols = FONT5X7[uc - 0x20u];
+
+    lcd_set_window(x, y, (uint16_t)(x + 11u), (uint16_t)(y + 15u));
+    for (uint16_t row = 0u; row < 8u; row++) {
+        uint16_t px[6];
+        for (uint16_t col = 0u; col < 5u; col++) {
+            uint8_t on = (row < 7u) ? (uint8_t)((cols[col] >> row) & 1u) : 0u;
+            px[col] = on ? fg : bg;
+        }
+        px[5] = bg;
+        for (int dup = 0; dup < 2; dup++) {
+            for (int col = 0; col < 6; col++) {
+                st7735s_write_data(pack_be16_pair(px[col], px[col]), 4u);
+            }
+        }
+    }
+}
+
+void lcd_draw_str_2x(uint16_t x, uint16_t y, const char *s, uint16_t fg, uint16_t bg)
+{
+    uint16_t cx = x;
+    while (*s != '\0' && (uint16_t)(cx + 12u) <= g_lcd_w) {
+        lcd_draw_char_2x(cx, y, *s++, fg, bg);
+        cx += 12u;
     }
 }
 
@@ -387,7 +498,7 @@ void lcd_draw_u32(uint16_t x, uint16_t y, uint32_t v, uint16_t fg, uint16_t bg)
         v /= 10u;
     }
     uint16_t cx = x;
-    while (i > 0 && (uint16_t)(cx + 6u) <= LCD_WIDTH) {
+    while (i > 0 && (uint16_t)(cx + 6u) <= g_lcd_w) {
         lcd_draw_char(cx, y, buf[--i], fg, bg);
         cx += 6u;
     }
@@ -397,8 +508,281 @@ void lcd_draw_hex(uint16_t x, uint16_t y, uint32_t v, uint8_t digits, uint16_t f
 {
     static const char hex[] = "0123456789ABCDEF";
     uint16_t cx = x;
-    for (int d = (int)digits - 1; d >= 0 && (uint16_t)(cx + 6u) <= LCD_WIDTH; d--) {
+    for (int d = (int)digits - 1; d >= 0 && (uint16_t)(cx + 6u) <= g_lcd_w; d--) {
         lcd_draw_char(cx, y, hex[(v >> (d * 4)) & 0xFu], fg, bg);
         cx += 6u;
+    }
+}
+
+uint16_t lcd_blend_rgb565(uint16_t fg, uint16_t bg, uint8_t alpha4)
+{
+    if (alpha4 == 0u) {
+        return bg;
+    }
+    if (alpha4 >= 15u) {
+        return fg;
+    }
+    uint32_t inv  = 15u - (uint32_t)alpha4;
+    uint32_t fr   = (fg >> 11) & 0x1Fu;
+    uint32_t fg_c = (fg >> 5)  & 0x3Fu;
+    uint32_t fb   = fg         & 0x1Fu;
+    uint32_t br   = (bg >> 11) & 0x1Fu;
+    uint32_t bg_c = (bg >> 5)  & 0x3Fu;
+    uint32_t bb   = bg         & 0x1Fu;
+    uint32_t r    = (br   * inv + fr   * alpha4 + 7u) / 15u;
+    uint32_t g    = (bg_c * inv + fg_c * alpha4 + 7u) / 15u;
+    uint32_t b    = (bb   * inv + fb   * alpha4 + 7u) / 15u;
+    return (uint16_t)((r << 11) | (g << 5) | b);
+}
+
+static const aa_glyph_t *aa_lookup(const aa_font_t *font, uint8_t ch)
+{
+    if (!font) {
+        return (const aa_glyph_t *)0;
+    }
+    if (ch < font->first_char || ch > font->last_char) {
+        ch = (uint8_t)'?';
+        if (ch < font->first_char || ch > font->last_char) {
+            return (const aa_glyph_t *)0;
+        }
+    }
+    return &font->glyphs[ch - font->first_char];
+}
+
+uint16_t lcd_measure_str_aa(const char *s, const aa_font_t *font)
+{
+    if (!s || !font) {
+        return 0u;
+    }
+    uint16_t w = 0u;
+    while (*s != '\0') {
+        const aa_glyph_t *g = aa_lookup(font, (uint8_t)*s++);
+        if (g) {
+            w = (uint16_t)(w + g->x_adv);
+        }
+    }
+    return w;
+}
+
+static void lcd_draw_glyph_aa(int16_t x, int16_t y, const aa_font_t *font,
+                              const aa_glyph_t *g, uint16_t fg, uint16_t bg)
+{
+    if (!g || g->w == 0u || g->h == 0u) {
+        return;
+    }
+    int16_t gx0 = (int16_t)(x + g->x_off);
+    int16_t gy0 = (int16_t)(y + g->y_off);
+    int16_t gx1 = (int16_t)(gx0 + g->w - 1);
+    int16_t gy1 = (int16_t)(gy0 + g->h - 1);
+    if (gx1 < 0 || gy1 < 0 || gx0 >= (int16_t)g_lcd_w || gy0 >= (int16_t)g_lcd_h) {
+        return;
+    }
+
+    int16_t cx0 = (gx0 < 0) ? 0 : gx0;
+    int16_t cy0 = (gy0 < 0) ? 0 : gy0;
+    int16_t cx1 = (gx1 >= (int16_t)g_lcd_w) ? (int16_t)(g_lcd_w - 1) : gx1;
+    int16_t cy1 = (gy1 >= (int16_t)g_lcd_h) ? (int16_t)(g_lcd_h - 1) : gy1;
+
+    lcd_set_window((uint16_t)cx0, (uint16_t)cy0, (uint16_t)cx1, (uint16_t)cy1);
+
+    const uint8_t *src = &font->bitmap_data[g->data_off];
+    uint32_t have_p0 = 0u;
+    uint16_t p0 = 0u;
+
+    for (int16_t py = cy0; py <= cy1; py++) {
+        uint32_t row_off = (uint32_t)(py - gy0) * (uint32_t)g->w;
+        for (int16_t px = cx0; px <= cx1; px++) {
+            uint32_t idx = row_off + (uint32_t)(px - gx0);
+            uint8_t byte = src[idx >> 1];
+            uint8_t a4   = ((idx & 1u) == 0u) ? (uint8_t)(byte >> 4) : (uint8_t)(byte & 0x0Fu);
+            uint16_t p   = lcd_blend_rgb565(fg, bg, a4);
+            if (!have_p0) {
+                p0 = p;
+                have_p0 = 1u;
+            } else {
+                st7735s_write_data(pack_be16_pair(p0, p), 4u);
+                have_p0 = 0u;
+            }
+        }
+    }
+    if (have_p0) {
+        st7735s_write_data(((uint32_t)(p0 >> 8)) | (((uint32_t)(p0 & 0xFFu)) << 8), 2u);
+    }
+}
+
+void lcd_draw_str_aa(int16_t x, int16_t y, const char *s,
+                     const aa_font_t *font, uint16_t fg, uint16_t bg)
+{
+    if (!s || !font) {
+        return;
+    }
+    int16_t cx = x;
+    while (*s != '\0') {
+        const aa_glyph_t *g = aa_lookup(font, (uint8_t)*s++);
+        if (!g) {
+            continue;
+        }
+        lcd_draw_glyph_aa(cx, y, font, g, fg, bg);
+        cx = (int16_t)(cx + g->x_adv);
+        if (cx >= (int16_t)g_lcd_w) {
+            break;
+        }
+    }
+}
+
+void lcd_draw_str_aa_trunc(int16_t x, int16_t y, const char *s,
+                           const aa_font_t *font, uint16_t max_w,
+                           uint16_t fg, uint16_t bg)
+{
+    if (!s || !font || max_w == 0u) {
+        return;
+    }
+    if (lcd_measure_str_aa(s, font) <= max_w) {
+        lcd_draw_str_aa(x, y, s, font, fg, bg);
+        return;
+    }
+
+    uint16_t ell_w = lcd_measure_str_aa("...", font);
+    int16_t  cx    = x;
+    uint16_t used  = 0u;
+    while (*s != '\0') {
+        const aa_glyph_t *g = aa_lookup(font, (uint8_t)*s++);
+        if (!g) {
+            continue;
+        }
+        if ((uint16_t)(used + g->x_adv + ell_w) > max_w) {
+            break;
+        }
+        lcd_draw_glyph_aa(cx, y, font, g, fg, bg);
+        cx   = (int16_t)(cx + g->x_adv);
+        used = (uint16_t)(used + g->x_adv);
+    }
+    if (ell_w <= max_w) {
+        lcd_draw_str_aa(cx, y, "...", font, fg, bg);
+    }
+}
+
+void lcd_fill_circle_aa(int16_t cx, int16_t cy, int16_t r, uint16_t fg, uint16_t bg)
+{
+    if (r <= 0) {
+        return;
+    }
+    int16_t x0 = (int16_t)(cx - r - 1);
+    int16_t y0 = (int16_t)(cy - r - 1);
+    int16_t x1 = (int16_t)(cx + r + 1);
+    int16_t y1 = (int16_t)(cy + r + 1);
+    if (x1 < 0 || y1 < 0 || x0 >= (int16_t)g_lcd_w || y0 >= (int16_t)g_lcd_h) {
+        return;
+    }
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 >= (int16_t)g_lcd_w) x1 = (int16_t)(g_lcd_w - 1);
+    if (y1 >= (int16_t)g_lcd_h) y1 = (int16_t)(g_lcd_h - 1);
+
+    lcd_set_window((uint16_t)x0, (uint16_t)y0, (uint16_t)x1, (uint16_t)y1);
+
+    int32_t  r2_64   = (int32_t)r * (int32_t)r * 64;
+    uint32_t have_p0 = 0u;
+    uint16_t p0      = 0u;
+
+    for (int16_t py = y0; py <= y1; py++) {
+        for (int16_t px = x0; px <= x1; px++) {
+            uint32_t hits = 0u;
+            for (int32_t sy = 0; sy < 4; sy++) {
+                int32_t dy = ((int32_t)(py - cy) * 8) + (sy * 2) - 3;
+                for (int32_t sx = 0; sx < 4; sx++) {
+                    int32_t dx = ((int32_t)(px - cx) * 8) + (sx * 2) - 3;
+                    if ((dx * dx + dy * dy) <= r2_64) {
+                        hits++;
+                    }
+                }
+            }
+            uint8_t  a4 = (uint8_t)((hits * 15u + 8u) / 16u);
+            uint16_t p  = lcd_blend_rgb565(fg, bg, a4);
+            if (!have_p0) {
+                p0 = p;
+                have_p0 = 1u;
+            } else {
+                st7735s_write_data(pack_be16_pair(p0, p), 4u);
+                have_p0 = 0u;
+            }
+        }
+    }
+    if (have_p0) {
+        st7735s_write_data(((uint32_t)(p0 >> 8)) | (((uint32_t)(p0 & 0xFFu)) << 8), 2u);
+    }
+}
+
+void lcd_fill_rrect_aa(int16_t x, int16_t y, int16_t w, int16_t h, int16_t r,
+                       uint16_t fg, uint16_t bg)
+{
+    if (w <= 0 || h <= 0) {
+        return;
+    }
+    if (r < 0) r = 0;
+    if (r * 2 > w) r = (int16_t)(w / 2);
+    if (r * 2 > h) r = (int16_t)(h / 2);
+    if (r == 0) {
+        if (x >= 0 && y >= 0) {
+            lcd_fill_rect((uint16_t)x, (uint16_t)y, (uint16_t)w, (uint16_t)h, fg);
+        }
+        return;
+    }
+
+    int16_t x0 = x;
+    int16_t y0 = y;
+    int16_t x1 = (int16_t)(x + w - 1);
+    int16_t y1 = (int16_t)(y + h - 1);
+    if (x1 < 0 || y1 < 0 || x0 >= (int16_t)g_lcd_w || y0 >= (int16_t)g_lcd_h) {
+        return;
+    }
+    int16_t cx0 = (x0 < 0) ? 0 : x0;
+    int16_t cy0 = (y0 < 0) ? 0 : y0;
+    int16_t cx1 = (x1 >= (int16_t)g_lcd_w) ? (int16_t)(g_lcd_w - 1) : x1;
+    int16_t cy1 = (y1 >= (int16_t)g_lcd_h) ? (int16_t)(g_lcd_h - 1) : y1;
+
+    /* Fast interior solid fill + 4x4 AA corners */
+    lcd_set_window((uint16_t)cx0, (uint16_t)cy0, (uint16_t)cx1, (uint16_t)cy1);
+
+    int32_t  r2_64   = (int32_t)r * (int32_t)r * 64;
+    int32_t  lx      = (int32_t)(x0 + r);
+    int32_t  rx      = (int32_t)(x1 - r);
+    int32_t  ty      = (int32_t)(y0 + r);
+    int32_t  by      = (int32_t)(y1 - r);
+    uint32_t have_p0 = 0u;
+    uint16_t p0      = 0u;
+
+    for (int16_t py = cy0; py <= cy1; py++) {
+        int32_t c_y = (py < ty) ? ty : ((py > by) ? by : (int32_t)py);
+        for (int16_t px = cx0; px <= cx1; px++) {
+            uint16_t p;
+            if ((px >= lx && px <= rx) || (py >= ty && py <= by)) {
+                p = fg;
+            } else {
+                int32_t c_x = (px < lx) ? lx : rx;
+                uint32_t hits = 0u;
+                for (int32_t sy = 0; sy < 4; sy++) {
+                    int32_t dy = ((int32_t)py - c_y) * 8 + (sy * 2) - 3;
+                    for (int32_t sx = 0; sx < 4; sx++) {
+                        int32_t dx = ((int32_t)px - c_x) * 8 + (sx * 2) - 3;
+                        if ((dx * dx + dy * dy) <= r2_64) {
+                            hits++;
+                        }
+                    }
+                }
+                uint8_t a4 = (uint8_t)((hits * 15u + 8u) / 16u);
+                p = lcd_blend_rgb565(fg, bg, a4);
+            }
+            if (!have_p0) {
+                p0 = p;
+                have_p0 = 1u;
+            } else {
+                st7735s_write_data(pack_be16_pair(p0, p), 4u);
+                have_p0 = 0u;
+            }
+        }
+    }
+    if (have_p0) {
+        st7735s_write_data(((uint32_t)(p0 >> 8)) | (((uint32_t)(p0 & 0xFFu)) << 8), 2u);
     }
 }

@@ -47,7 +47,24 @@ typedef struct {
     int  (*rec_start)(void *user, const char *opt_name, char *out_name, uint32_t out_max);
     int  (*rec_stop)(void *user);
     void (*on_ota)(void *user);
+    int      (*exp_write)(void *user, uint32_t off, const uint8_t *data, uint16_t len);
+    int      (*exp_run)(void *user, uint32_t entry_off, uint32_t arg,
+                        uint32_t *rc, uint32_t *elapsed_ms,
+                        uint32_t *out_len, uint32_t *log_widx);
+    uint32_t (*read_log)(void *user, uint32_t off, uint8_t *dst,
+                         uint32_t max_len, uint32_t *out_widx);
+    void     (*reset_log)(void *user);
+    void     (*on_dfu)(void *user);
+    int      (*audio_cfg)(void *user, int set, uint8_t *dsp_profile,
+                          uint8_t *gain, uint8_t *channels, uint8_t *vor);
 } xrec_ops_t;
+
+typedef enum {
+    XREC_PUT_NONE = 0,
+    XREC_PUT_OTA  = 1,
+    XREC_PUT_EXP  = 2,
+    XREC_PUT_CAS  = 3,
+} xrec_put_target_t;
 
 typedef struct {
     exfat_vol_t   *vol;
@@ -74,22 +91,26 @@ typedef struct {
     uint32_t       gets_rem;
     uint16_t       gets_chunk_max;
 
-    /* Streaming +XREC:PUT -> /update.up OTA upload state */
+    /* Streaming +XREC:PUT -> OTA / EXP / CAS upload state */
     uint8_t        put_active;
     uint8_t        put_auth_ok;
+    uint8_t        put_target;
+    char           put_cas_name[32];
     uint32_t       put_offset;
     uint16_t       put_len;
     uint16_t       put_got;
     uint16_t       put_crc;
     uint8_t        put_buf[XREC_MAX_CHUNK];
 
-    uint8_t        ota_open;
-    uint8_t        ota_has_last;
-    exfat_writer_t ota_writer;
-    uint32_t       ota_written;
-    uint32_t       ota_last_off;
-    uint16_t       ota_last_len;
-    uint16_t       ota_last_crc;
+    uint8_t        put_stream_mode;
+    uint8_t        put_has_last;
+    uint8_t        put_last_mode;
+    char           put_stream_name[32];
+    exfat_writer_t put_writer;
+    uint32_t       put_written;
+    uint32_t       put_last_off;
+    uint16_t       put_last_len;
+    uint16_t       put_last_crc;
 } xrec_ctx_t;
 
 void xrec_init(xrec_ctx_t *ctx, exfat_vol_t *vol, const xrec_ops_t *ops, void *user);

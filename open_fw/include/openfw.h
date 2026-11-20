@@ -7,9 +7,27 @@
 #define OPENFW_H
 
 #include <stdint.h>
+#include "audio_dsp.h"
 #include "openfw_fs.h"
 
+#ifndef OPENFW_UNATTENDED_DEV
+#define OPENFW_UNATTENDED_DEV 1
+#endif
+
+#define OPENFW_EXP_TIMEOUT_MS    15000u
+#define OPENFW_FAULT_MAGIC_MASK  0xFFFFF000u
+#define OPENFW_FAULT_MAGIC_BASE  0xFA017000u
+#define OPENFW_FAULT_EXP_TIMEOUT 0xFA017E00u
+#define OPENFW_BOOT_STRIKE_MAGIC 0xB0070000u
+#define OPENFW_BOOT_MAX_STRIKES  3u
+
 /* Watchdog, Timers & System Reset (wdt_timer.c) */
+extern volatile uint32_t g_exp_running;
+extern volatile uint32_t g_exp_deadline_ms;
+extern uint32_t          g_prev_fault_code;
+
+void     wdt_start_reset(uint32_t timeout_sec, uint8_t pmu_reg20_cur);
+void     wdt_stop(void);
 void     wdt_feed(void);
 void     system_reboot(void);
 uint64_t us_timer_now(void);
@@ -57,6 +75,10 @@ typedef struct {
 
 extern openfw_log_t g_openfw_log;
 void     openfw_log_reset(void);
+void     openfw_log_putc(char c);
+void     openfw_log_puts(const char *s);
+void     openfw_log_u32(uint32_t v);
+void     openfw_log_hex(uint32_t v);
 
 /* PMU RTWI (pmu.c) */
 typedef enum {
@@ -70,10 +92,15 @@ uint8_t         pmu_read_reg(uint8_t reg);
 uint32_t        pmu_read_vbat_mv(void);
 pmu_chg_state_t pmu_get_charge_state(void);
 int             pmu_is_vbus_present(void);
+void            key_onoff_init(void);
+int             key_onoff_pressed(int *out_long_press);
+void            pmu_soft_poweroff(void) __attribute__((noreturn));
+void            pmu_unattended_init(void);
+void            pmu_poll_charge_manage(void);
 void            pmu_reboot_to_usb_bootloader(void) __attribute__((noreturn));
 void            pmu_reboot_to_sd_ota(void) __attribute__((noreturn));
 
-/* SARADC Keypad & Record Switch (keys.c) */
+/* SARADC Keypad, Record Switch (PB6) & Earphone Jack Detect (PB11) (keys.c) */
 typedef enum {
     KEY_NONE = 0,
     KEY_LEFT,
@@ -88,10 +115,11 @@ typedef enum {
 void        keys_init(void);
 uint16_t    keys_read_adc(void);
 int         keys_read_rec_switch(void);
+int         keys_read_hp_detect(void);
 key_id_t    keys_decode(uint16_t adc);
 const char *keys_name(key_id_t key);
 
-/* ST7735S 80x160 8080 Parallel LCD + PWM3 Backlight (lcd_st7735s.c) */
+/* ST7735S 80x160 / 160x80 8080 Parallel LCD + PWM3 Backlight (lcd_st7735s.c) */
 #define LCD_WIDTH   80u
 #define LCD_HEIGHT  160u
 
@@ -100,15 +128,56 @@ static inline uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b)
     return (uint16_t)(((uint16_t)(r >> 3) << 11) | ((uint16_t)(g >> 2) << 5) | (uint16_t)(b >> 3));
 }
 
-void lcd_backlight_set(uint8_t percent);
-void lcd_init(void);
-void lcd_set_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1);
-void lcd_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t color);
-void lcd_blit_rgb565(uint16_t x, uint16_t y, uint16_t w, uint16_t h, const uint16_t *pixels);
-void lcd_draw_char(uint16_t x, uint16_t y, char c, uint16_t fg, uint16_t bg);
-void lcd_draw_str(uint16_t x, uint16_t y, const char *s, uint16_t fg, uint16_t bg);
-void lcd_draw_u32(uint16_t x, uint16_t y, uint32_t v, uint16_t fg, uint16_t bg);
-void lcd_draw_hex(uint16_t x, uint16_t y, uint32_t v, uint8_t digits, uint16_t fg, uint16_t bg);
+void     lcd_backlight_set(uint8_t percent);
+void     lcd_init(void);
+void     lcd_set_rotation(int landscape);
+uint16_t lcd_get_width(void);
+uint16_t lcd_get_height(void);
+void     lcd_set_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1);
+void     lcd_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t color);
+void     lcd_blit_rgb565(uint16_t x, uint16_t y, uint16_t w, uint16_t h, const uint16_t *pixels);
+void     lcd_blit_rgb565_alpha(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
+                               const uint16_t *pixels, uint8_t alpha);
+void     lcd_draw_char(uint16_t x, uint16_t y, char c, uint16_t fg, uint16_t bg);
+void     lcd_draw_str(uint16_t x, uint16_t y, const char *s, uint16_t fg, uint16_t bg);
+void     lcd_draw_char_2x(uint16_t x, uint16_t y, char c, uint16_t fg, uint16_t bg);
+void     lcd_draw_str_2x(uint16_t x, uint16_t y, const char *s, uint16_t fg, uint16_t bg);
+void     lcd_draw_u32(uint16_t x, uint16_t y, uint32_t v, uint16_t fg, uint16_t bg);
+void     lcd_draw_hex(uint16_t x, uint16_t y, uint32_t v, uint8_t digits, uint16_t fg, uint16_t bg);
+
+/* 4-bit (16-level) Anti-Aliased Proportional Fonts & UI Primitives (aa_fonts.c, lcd_st7735s.c) */
+typedef struct {
+    uint8_t  w;
+    uint8_t  h;
+    int8_t   x_off;
+    int8_t   y_off;
+    uint8_t  x_adv;
+    uint16_t data_off;
+} aa_glyph_t;
+
+typedef struct {
+    uint8_t           first_char;
+    uint8_t           last_char;
+    uint8_t           line_height;
+    uint8_t           ascent;
+    const aa_glyph_t *glyphs;
+    const uint8_t    *bitmap_data;
+} aa_font_t;
+
+extern const aa_font_t g_font_ui_sm; /* 11px Regular: metadata, badges, hints */
+extern const aa_font_t g_font_ui_md; /* 14px Regular: filenames, lists, menus */
+extern const aa_font_t g_font_ui_lg; /* 22px Bold:    timers, primary headers */
+
+uint16_t lcd_blend_rgb565(uint16_t fg, uint16_t bg, uint8_t alpha4);
+uint16_t lcd_measure_str_aa(const char *s, const aa_font_t *font);
+void     lcd_draw_str_aa(int16_t x, int16_t y, const char *s,
+                         const aa_font_t *font, uint16_t fg, uint16_t bg);
+void     lcd_draw_str_aa_trunc(int16_t x, int16_t y, const char *s,
+                               const aa_font_t *font, uint16_t max_w,
+                               uint16_t fg, uint16_t bg);
+void     lcd_fill_circle_aa(int16_t cx, int16_t cy, int16_t r, uint16_t fg, uint16_t bg);
+void     lcd_fill_rrect_aa(int16_t x, int16_t y, int16_t w, int16_t h, int16_t r,
+                           uint16_t fg, uint16_t bg);
 
 /* 1-Bit SDIO / microSD Block Driver (sdio.c) */
 typedef struct {
@@ -123,29 +192,52 @@ int      sd_read_blocks(sd_card_t *card, uint32_t lba, uint32_t count, void *buf
 int      sd_write_blocks(sd_card_t *card, uint32_t lba, uint32_t count, const void *buf);
 blkdev_t sd_as_blkdev(sd_card_t *card);
 
-/* Audio ADC AMIC1 + DMAC CH1 4-Frame Ring Capture (audio_dma.c) */
+/* Audio ADC AMIC1/AMIC2 + DMAC CH1 4-Frame Ring Capture (audio_dma.c) */
 int            audio_capture_start(uint8_t gain_0_31);
+int            audio_capture_start_ex(uint8_t gain_0_31, uint8_t channels);
+void           audio_capture_set_gain(uint8_t gain_0_31);
 void           audio_capture_stop(void);
+uint8_t        audio_get_channels(void);
 uint8_t        audio_get_peak_pct(void);
 uint32_t       audio_get_frames(void);
 const int16_t *audio_pop_frame(uint32_t *out_bytes);
 uint32_t       audio_get_overruns(void);
 
-/* Real-Time WAV Recorder (recorder.c) */
-void        recorder_set_gain(uint8_t gain_0_31);
-uint8_t     recorder_get_gain(void);
-int         recorder_start(exfat_vol_t *vol, int sd_mounted);
-void        recorder_poll(void);
-int         recorder_stop(void);
-int         recorder_is_saving(void);
-uint32_t    recorder_get_seconds(void);
-const char *recorder_get_filename(void);
+/* Audio DAC0+DAC1 Stereo Headphone Playback + DMAC CH0 TX (audio_dac.c) */
+void audio_pll_set(uint32_t sample_rate);
+int  audio_dac_start(uint32_t sample_rate, uint8_t ana_vol_0_31);
+void audio_dac_set_volume(uint8_t ana_vol_0_31, uint16_t dig_vol_0_511);
+void audio_dac_set_mute(int muted);
+int  audio_dac_write_stereo(const int16_t *interleaved_lr, uint32_t num_frames);
+int  audio_dac_is_busy(void);
+void audio_dac_stop(void);
+
+/* Real-Time WAV Recorder + Clean-Room DSP (recorder.c) */
+void                recorder_set_gain(uint8_t gain_0_31);
+uint8_t             recorder_get_gain(void);
+void                recorder_set_dsp_profile(audio_dsp_profile_t profile);
+audio_dsp_profile_t recorder_get_dsp_profile(void);
+void                recorder_set_channels(uint8_t channels);
+uint8_t             recorder_get_channels(void);
+void                recorder_set_vor(int enabled);
+int                 recorder_get_vor(void);
+uint32_t            recorder_get_clip_events(void);
+int16_t             recorder_get_rms_dbfs_x10(void);
+int                 recorder_start(exfat_vol_t *vol, int sd_mounted);
+void                recorder_poll(void);
+int                 recorder_stop(void);
+int                 recorder_is_saving(void);
+uint32_t            recorder_get_seconds(void);
+const char         *recorder_get_filename(void);
 
 /* USB Mass Storage Full-Speed MUSB & PHY Plug Detect (usb_musb.c) */
+typedef int (*usb_audio_cfg_cb_t)(int set, uint8_t cfg[4], int16_t *rms_x10, uint16_t *clips);
+
 void usb_phy_det_arm(void);
 int  usb_phy_det_poll_host(void);
 uint16_t usb_musb_frame(void);
 void usb_msc_set_diag_info(uint8_t sd_mounted, uint8_t rec_active, uint8_t mic_gain);
+void usb_msc_set_audio_cfg_cb(usb_audio_cfg_cb_t cb);
 int  usb_msc_start(blkdev_t *dev);
 void usb_msc_stop(void);
 void usb_msc_poll(void);
@@ -170,6 +262,7 @@ typedef struct {
     char     pair_pin[8];
     uint32_t rx_acl_pkts;
     uint32_t tx_acl_pkts;
+    uint32_t irq_count;
     uint8_t  bd_addr[6];
     char     dev_name[16];
 } bt_status_t;

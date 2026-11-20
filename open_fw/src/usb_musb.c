@@ -10,6 +10,7 @@
 #include <stdint.h>
 #include "sl6801_regs.h"
 #include "openfw.h"
+#include "openfw_exp.h"
 #include "openfw_usb_msc.h"
 
 typedef enum {
@@ -23,7 +24,10 @@ static uint32_t        g_rx_pkts    = 0u;
 static uint32_t        g_tx_pkts    = 0u;
 static uint8_t         g_diag_sd_mounted = 0u;
 static uint8_t         g_diag_rec_active = 0u;
-static uint8_t         g_diag_mic_gain   = 24u;
+static uint8_t            g_diag_mic_gain   = 20u;
+static usb_audio_cfg_cb_t g_audio_cfg_cb    = 0;
+static uint8_t            g_usb_reboot_mode = 0u;
+static uint32_t        g_usb_reboot_deadline = 0u;
 
 static ep0_state_t     g_ep0_state      = EP0_IDLE;
 static const uint8_t  *g_ep0_tx_ptr     = 0;
@@ -386,6 +390,18 @@ static inline void musb_put_le32(uint8_t *p, uint32_t v)
     p[3] = (uint8_t)((v >> 24) & 0xFFu);
 }
 
+static void pack_exp_result(uint8_t out[32], const openfw_exp_result_t *res)
+{
+    musb_put_le32(&out[0],  res->magic);
+    musb_put_le32(&out[4],  res->rc);
+    musb_put_le32(&out[8],  res->elapsed_ms);
+    musb_put_le32(&out[12], res->out_len);
+    musb_put_le32(&out[16], res->log_widx);
+    musb_put_le32(&out[20], res->run_count);
+    musb_put_le32(&out[24], res->arena_crc_and_size);
+    musb_put_le32(&out[28], res->arena_base);
+}
+
 static int musb_vendor_scsi_cb(void *user, const uint8_t cdb[16],
                                uint8_t *io_buf, uint16_t *io_len, int is_out)
 {
@@ -413,7 +429,7 @@ static int musb_vendor_scsi_cb(void *user, const uint8_t cdb[16],
         musb_put_le32(&info[16], g_openfw_log.write_idx);
         musb_put_le32(&info[20], g_openfw_log.dropped_bytes);
         musb_put_le32(&info[24], OPENFW_LOG_SIZE);
-        musb_put_le32(&info[28], 0u);
+        musb_put_le32(&info[28], g_prev_fault_code);
 
         uint16_t n = (*io_len < 32u) ? *io_len : 32u;
         for (uint16_t i = 0u; i < n; i++) {
@@ -499,9 +515,155 @@ static int musb_vendor_scsi_cb(void *user, const uint8_t cdb[16],
         return 0;
     }
 
+    case 0x05u: /* EXP_WRITE (OUT 1..64 B) */ {
+        if (!is_out) {
+            return -1;
+        }
+        uint32_t offset = musb_get_le32(&cdb[2]);
+        uint32_t len    = musb_get_le32(&cdb[6]);
+        if (len == 0u || len != *io_len) {
+            return -1;
+        }
+        return openfw_exp_write(offset, io_buf, len);
+    }
+
+    case 0x06u: /* EXP_RUN (IN 32 B) */ {
+        if (is_out) {
+            return -1;
+        }
+        uint32_t entry_off = musb_get_le32(&cdb[2]);
+        uint32_t arg       = musb_get_le32(&cdb[6]);
+        openfw_exp_result_t res;
+        if (openfw_exp_run(entry_off, arg, &res) != 0) {
+            return -1;
+        }
+        uint8_t raw[32];
+        pack_exp_result(raw, &res);
+        uint16_t n = (*io_len < 32u) ? *io_len : 32u;
+        for (uint16_t i = 0u; i < n; i++) {
+            io_buf[i] = raw[i];
+        }
+        *io_len = n;
+        return 0;
+    }
+
+    case 0x07u: /* MEM_READ (IN 1..64 B) */ {
+        if (is_out) {
+            return -1;
+        }
+        uint32_t addr = musb_get_le32(&cdb[2]);
+        uint32_t req  = musb_get_le32(&cdb[6]);
+        if (req < 1u) {
+            req = 1u;
+        }
+        if (req > 64u) {
+            req = 64u;
+        }
+        if (req > *io_len) {
+            req = *io_len;
+        }
+        if (openfw_exp_mem_read(addr, io_buf, req) != 0) {
+            return -1;
+        }
+        *io_len = (uint16_t)req;
+        return 0;
+    }
+
+    case 0x08u: /* REBOOT (0 B, deferred after CSW) */ {
+        if (is_out) {
+            return -1;
+        }
+        uint32_t mode = musb_get_le32(&cdb[2]);
+        if (mode > 3u) {
+            return -1;
+        }
+#if OPENFW_UNATTENDED_DEV
+        if (mode == 3u) { /* Disallow soft power-off while in unattended dev mode */
+            return -1;
+        }
+#endif
+        g_usb_reboot_mode     = (uint8_t)(mode + 1u);
+        g_usb_reboot_deadline = millis() + 250u;
+        *io_len               = 0u;
+        return 0;
+    }
+
+    case 0x09u: /* EXP_STATUS (IN 32 B) */ {
+        if (is_out) {
+            return -1;
+        }
+        openfw_exp_result_t res;
+        openfw_exp_get_last_result(&res);
+        uint8_t raw[32];
+        pack_exp_result(raw, &res);
+        uint16_t n = (*io_len < 32u) ? *io_len : 32u;
+        for (uint16_t i = 0u; i < n; i++) {
+            io_buf[i] = raw[i];
+        }
+        *io_len = n;
+        return 0;
+    }
+
+    case 0x0Au: /* LOG_RESET (0 B) */ {
+        if (is_out) {
+            return -1;
+        }
+        openfw_log_reset();
+        *io_len = 0u;
+        return 0;
+    }
+
+    case 0x0Bu: /* AUDIO_CFG (IN 8 B / OUT 4 B) */ {
+        uint8_t  cfg[4]   = { 0u, g_diag_mic_gain, 1u, 0u };
+        int16_t  rms_x10  = -960;
+        uint16_t clips    = 0u;
+        if (is_out) {
+            if (*io_len != 4u) {
+                return -1;
+            }
+            if ((io_buf[0] != 0xFFu && io_buf[0] > 2u) ||
+                (io_buf[1] != 0xFFu && io_buf[1] > 31u) ||
+                (io_buf[2] != 0xFFu && io_buf[2] != 1u && io_buf[2] != 2u) ||
+                (io_buf[3] != 0xFFu && io_buf[3] > 1u)) {
+                return -1;
+            }
+            for (int i = 0; i < 4; i++) {
+                cfg[i] = io_buf[i];
+            }
+            if (io_buf[1] != 0xFFu) {
+                g_diag_mic_gain = io_buf[1];
+            }
+            if (g_audio_cfg_cb && g_audio_cfg_cb(1, cfg, &rms_x10, &clips) != 0) {
+                return -1;
+            }
+            return 0;
+        }
+        if (g_audio_cfg_cb) {
+            (void)g_audio_cfg_cb(0, cfg, &rms_x10, &clips);
+        }
+        uint8_t raw[8];
+        raw[0] = cfg[0];
+        raw[1] = cfg[1];
+        raw[2] = cfg[2];
+        raw[3] = cfg[3];
+        musb_put_le16(&raw[4], (uint16_t)rms_x10);
+        musb_put_le16(&raw[6], clips);
+        uint16_t n = (*io_len < 8u) ? *io_len : 8u;
+        for (uint16_t i = 0u; i < n; i++) {
+            io_buf[i] = raw[i];
+        }
+        *io_len = n;
+        return 0;
+    }
+
     default:
         return -1;
     }
+}
+
+void usb_msc_set_audio_cfg_cb(usb_audio_cfg_cb_t cb)
+{
+    g_audio_cfg_cb = cb;
 }
 
 void usb_msc_set_diag_info(uint8_t sd_mounted, uint8_t rec_active, uint8_t mic_gain)
@@ -526,12 +688,15 @@ int usb_msc_start(blkdev_t *dev)
     g_set_addr_pend = 0u;
     g_pending_addr  = 0u;
     g_usb_cfg       = 0u;
+    g_usb_reboot_mode     = 0u;
+    g_usb_reboot_deadline = 0u;
 
     usb_phy_power_on();
 
-    /* 5. PHY wrapper: disable plug-detect IRQ, Device mode (bit 12) + 50 ms */
+    /* 5. PHY wrapper: disarm plug-detect IRQ, Device mode (bit 12) + preserve/force analog bias bit 4 (0x1010) */
     openfw_mmio_clr32(USB_PHY_INTE_ADDR, 0x03u);
-    openfw_mmio_rmw32(USB_PHY_CTRL_ADDR, 0x103u, 1u << 12);
+    openfw_mmio_wr32(USB_PHY_INT_STATUS_ADDR, 0x07u);
+    openfw_mmio_rmw32(USB_PHY_CTRL_ADDR, 0x1F3u, 0x1010u);
     mdelay(50u);
 
     /* 6. Disconnect, flush EP0..3, clear pending flags, Force Full-Speed */
@@ -633,6 +798,23 @@ void usb_msc_poll(void)
         }
         openfw_mmio_wr16(MUSB_TXCSR_ADDR, (uint16_t)(openfw_mmio_rd16(MUSB_TXCSR_ADDR) | 0x0001u)); /* Set TxPktRdy */
         g_tx_pkts++;
+    }
+
+    if (g_usb_reboot_mode != 0u && !usb_msc_need_tx(&g_msc) &&
+        !(openfw_mmio_rd16(MUSB_TXCSR_ADDR) & 0x0001u) &&
+        (int32_t)(millis() - g_usb_reboot_deadline) >= 0) {
+        uint8_t mode = g_usb_reboot_mode;
+        g_usb_reboot_mode = 0u;
+        usb_msc_stop();
+        if (mode == 2u) {
+            pmu_reboot_to_usb_bootloader();
+        } else if (mode == 3u) {
+            pmu_reboot_to_sd_ota();
+        } else if (mode == 4u) {
+            pmu_soft_poweroff();
+        } else {
+            system_reboot();
+        }
     }
 }
 
