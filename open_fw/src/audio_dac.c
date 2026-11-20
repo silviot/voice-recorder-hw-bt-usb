@@ -34,6 +34,7 @@ static volatile uint8_t  g_tx_active     = 0u;
 static volatile uint8_t  g_active_slot   = 0u;
 static volatile uint8_t  g_slot_ready[2] = { 0u, 0u };
 static volatile uint32_t g_slot_bytes[2] = { 0u, 0u };
+static uint32_t          g_pcm_gain_q15;
 static int8_t            g_pa_state      = -1;
 
 void audio_pa_set(int enable)
@@ -62,13 +63,13 @@ static uint32_t dac_rate_code(uint32_t sample_rate)
     case 88200u:  return 10u;
     case 192000u: return 11u;
     case 176400u: return 12u;
-    default:      return 3u; /* 16 kHz safe default */
+    default:      return UINT32_MAX;
     }
 }
 
 void audio_pll_set(uint32_t sample_rate)
 {
-    uint32_t is_48k  = ((sample_rate % 8000u) == 0u) ? 1u : 0u;
+    uint32_t is_48k  = ((sample_rate % 11025u) != 0u) ? 1u : 0u;
     uint32_t int_div = is_48k ? 3u : 2u;
     uint32_t frac    = is_48k ? 0x03126u : 0x186C2u;
 
@@ -129,6 +130,8 @@ void audio_dac_set_volume(uint8_t ana_vol_0_31, uint16_t dig_vol_0_511)
     uint32_t av = (ana_vol_0_31 > 31u) ? 31u : (uint32_t)ana_vol_0_31;
     uint32_t dv = (dig_vol_0_511 > 0x1FFu) ? 0x1FFu : (uint32_t)dig_vol_0_511;
 
+    /* Apply the user level to both PCM channels, including a true silent level. */
+    g_pcm_gain_q15 = (av * av * 32768u) / (31u * 31u);
     openfw_mmio_rmw32(CODEC_DAC0_VOL_ADDR, 0x1FFu, dv);
     openfw_mmio_rmw32(CODEC_DAC1_VOL_ADDR, 0x1FFu, dv);
     if (openfw_mmio_rd32(CODEC_DAC0_PWR_ADDR) & (1u << 29)) {
@@ -152,6 +155,10 @@ void audio_dac_set_mute(int muted)
 
 int audio_dac_start(uint32_t sample_rate, uint8_t ana_vol_0_31)
 {
+    uint32_t rate_code = dac_rate_code(sample_rate);
+    if (rate_code == UINT32_MAX) {
+        return -1;
+    }
     if (g_dac_running) {
         audio_dac_stop();
     }
@@ -193,7 +200,7 @@ int audio_dac_start(uint32_t sample_rate, uint8_t ana_vol_0_31)
     audio_pll_set(sample_rate);
     openfw_mmio_set32(CODEC_ANA_CTRL0_ADDR, 0x80000022u);
     openfw_mmio_clr32(CODEC_DAC_DIG_CFG_ADDR, 0x03FFFFFFu);
-    openfw_mmio_rmw32(CODEC_GLB_ADDR, 0xF02u, 0x2u | (dac_rate_code(sample_rate) << 8));
+    openfw_mmio_rmw32(CODEC_GLB_ADDR, 0xF02u, 0x2u | (rate_code << 8));
     openfw_mmio_set32(CODEC_DAC_FIFO_CTRL_ADDR, 0x84u);
     openfw_mmio_set32(CODEC_DAC_FIFO_RST_ADDR, 0x2u);
     for (uint32_t t = 1000000u; t > 0u; t--) {
@@ -290,7 +297,7 @@ int audio_dac_write_stereo(const int16_t *interleaved_lr, uint32_t num_frames)
     uint32_t samples = frames * 2u;
     int16_t *dst     = g_dac_buf[slot];
     for (uint32_t i = 0u; i < samples; i++) {
-        dst[i] = interleaved_lr[i];
+        dst[i] = (int16_t)(((int32_t)interleaved_lr[i] * (int32_t)g_pcm_gain_q15) / 32768);
     }
 
     OPENFW_IRQ_SAVE(primask);

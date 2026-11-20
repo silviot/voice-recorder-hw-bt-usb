@@ -826,6 +826,28 @@ static void test_audio_dac(void)
     audio_dac_set_volume(99u, 600u);
     assert(((g_soc.codec_regs[(CODEC_DAC01_ANA_VOL_ADDR - AUDIO_CODEC_BASE) >> 2] >> 16) & 0x1Fu) == 31u);
     assert((g_soc.codec_regs[(CODEC_DAC0_VOL_ADDR - AUDIO_CODEC_BASE) >> 2] & 0x1FFu) == 0x1FFu);
+    /* Check the actual stereo samples that CH0 will send, including mute and unity. */
+    const int16_t stereo_pair[2] = { INT16_MAX, INT16_MIN };
+    int16_t previous_left = 0;
+    for (uint8_t level = 0; level <= 31u; level++) {
+        audio_dac_set_volume(level, 0x1FFu);
+        assert(audio_dac_write_stereo(stereo_pair, 1u) == 1);
+        const int16_t *output = g_soc.dmac_buf[0];
+        if (level == 0u) {
+            assert(output[0] == 0 && output[1] == 0);
+        } else {
+            assert(output[0] > previous_left && output[1] < 0);
+        }
+        if (level == 31u) {
+            assert(output[0] == INT16_MAX && output[1] == INT16_MIN);
+        }
+        previous_left = output[0];
+        g_soc.dmac_regs[0][9] |= DMAC_IRQ_TC;
+        g_dmac_ch0_cb();
+    }
+    assert(audio_dac_start(12345u, 20u) == -1);
+    assert(audio_dac_start(12000u, 20u) == 0);
+    assert((g_soc.cru_apll_ctrl & 0x00003FE0u) == 0x3060u);
     audio_dac_set_mute(1);
     assert((g_soc.codec_regs[(CODEC_DAC0_MUTE_ADDR - AUDIO_CODEC_BASE) >> 2] & (1u << 16)) != 0u);
     audio_dac_set_mute(0);

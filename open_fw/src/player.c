@@ -5,17 +5,21 @@
  */
 #include <stdint.h>
 #include "openfw.h"
+#include "sl6801_regs.h"
 #include "openfw_wav.h"
 #include "openfw_cwx.h"
 #include "openfw_player.h"
 
-static uint8_t  g_file_buf[1024]  __attribute__((aligned(4)));
+static uint8_t  g_file_buf[4096]  __attribute__((aligned(4)));
 static int16_t  g_dec_pcm[2048]   __attribute__((aligned(4)));
-static int16_t  g_stereo_tx[2048] __attribute__((aligned(4))); /* up to 1024 stereo frames */
+static int16_t  g_stereo_tx[4096] __attribute__((aligned(4))); /* up to 2048 stereo frames */
 
 typedef struct {
     exfat_vol_t   *vol;
     exfat_entry_t *ent;
+    uint32_t sector_off;
+    uint32_t valid;
+    uint8_t sector[512];
 } exfat_cwx_io_t;
 
 static int exfat_cwx_read_cb(void *user, uint32_t offset, void *dst, uint32_t len, uint32_t *out_read)
@@ -24,7 +28,28 @@ static int exfat_cwx_read_cb(void *user, uint32_t offset, void *dst, uint32_t le
     if (!io || !io->vol || !io->ent) {
         return -1;
     }
-    return exfat_read_file(io->vol, io->ent, (uint64_t)offset, dst, len, out_read);
+    *out_read = 0u;
+    while (len > 0u && offset < io->ent->size) {
+        uint32_t base = offset & ~511u;
+        if (!io->valid || io->sector_off != base) {
+            if (exfat_read_file(io->vol, io->ent, base, io->sector, sizeof(io->sector),
+                                &io->valid) != 0 || !io->valid) {
+                return -1;
+            }
+            io->sector_off = base;
+        }
+        uint32_t pos = offset - base;
+        if (pos >= io->valid) return -1;
+        uint32_t take = io->valid - pos;
+        if (take > len) take = len;
+        for (uint32_t i = 0; i < take; i++) {
+            ((uint8_t *)dst)[*out_read + i] = io->sector[pos + i];
+        }
+        *out_read += take;
+        offset += take;
+        len -= take;
+    }
+    return 0;
 }
 
 static void str_copy_cap(char *dst, int cap, const char *src)
@@ -220,7 +245,7 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
     int has_cwx = 0;
     cwx_stream_t cwx;
     exfat_entry_t cwx_ent;
-    exfat_cwx_io_t cwx_io = { vol, &cwx_ent };
+    exfat_cwx_io_t cwx_io = { .vol = vol, .ent = &cwx_ent };
     char cwx_path[96];
     if (make_cwx_path(cwx_path, (int)sizeof(cwx_path), dir_path, wav_name) == 0 &&
         exfat_find_path(vol, cwx_path, &cwx_ent) == 0 && !cwx_ent.is_dir &&
@@ -400,7 +425,8 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
         if (!paused && !eof_reached) {
             for (int iter = 0; iter < 4; iter++) {
                 if (buf_pos >= buf_frames) {
-                    if (data_off >= winfo.data_bytes) {
+                    if (data_off >= winfo.data_bytes || played_frames >= winfo.total_samples) {
+                        if (audio_dac_is_busy()) break;
                         eof_reached = 1;
                         peak_l_pct  = 0u;
                         peak_r_pct  = 0u;
@@ -409,32 +435,23 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
                         break;
                     }
                     uint32_t rem = winfo.data_bytes - data_off;
-                    uint32_t chunk;
+                    uint32_t frames_cap = (sizeof(g_dec_pcm) / sizeof(g_dec_pcm[0])) / winfo.channels;
+                    uint32_t frames_per_block = 1u;
                     if (winfo.format_tag == WAV_FMT_IMA_ADPCM) {
-                        if (rem < winfo.block_align) {
-                            eof_reached = 1;
-                            ui_dirty    = 1;
-                            break;
-                        }
-                        chunk = winfo.block_align;
-                    } else {
-                        uint32_t max_f = 1024u / (uint32_t)winfo.block_align;
-                        if (max_f > 512u) {
-                            max_f = 512u;
-                        }
-                        chunk = max_f * (uint32_t)winfo.block_align;
-                        if (chunk > rem) {
-                            chunk = (rem / (uint32_t)winfo.block_align) * (uint32_t)winfo.block_align;
-                        }
-                        if (chunk == 0u) {
-                            eof_reached = 1;
-                            ui_dirty    = 1;
-                            break;
-                        }
+                        frames_per_block = 1u + (winfo.block_align - 4u * winfo.channels) * 2u / winfo.channels;
+                    }
+                    uint32_t blocks = frames_cap / frames_per_block;
+                    uint32_t chunk = blocks * winfo.block_align;
+                    if (chunk > sizeof(g_file_buf)) chunk = sizeof(g_file_buf);
+                    if (chunk > rem) chunk = rem;
+                    chunk -= chunk % winfo.block_align;
+                    if (!chunk) {
+                        data_off = winfo.data_bytes;
+                        break;
                     }
 
                     uint32_t got = 0u;
-                    if (exfat_read_file(vol, &wav_ent, (uint64_t)(winfo.data_offset + data_off),
+                    if (exfat_read_file(vol, &wav_ent, (uint64_t)winfo.data_offset + data_off,
                                         g_file_buf, chunk, &got) != 0 || got < chunk) {
                         eof_reached = 1;
                         ui_dirty    = 1;
@@ -444,15 +461,16 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
 
                     uint32_t decoded_frames = 0u;
                     if (winfo.format_tag == WAV_FMT_IMA_ADPCM) {
-                        uint32_t dec_cap = (winfo.channels == 2u) ? 1024u : 2048u;
-                        int n = wav_decode_ima_adpcm_block(g_file_buf, winfo.block_align,
-                                                           winfo.channels, g_dec_pcm, dec_cap);
-                        if (n <= 0) {
-                            eof_reached = 1;
-                            ui_dirty    = 1;
-                            break;
+                        for (uint32_t off = 0; off < chunk; off += winfo.block_align) {
+                            int n = wav_decode_ima_adpcm_block(g_file_buf + off, winfo.block_align,
+                                            winfo.channels, g_dec_pcm + decoded_frames * winfo.channels,
+                                            frames_cap - decoded_frames);
+                            if (n <= 0) {
+                                data_off = winfo.data_bytes;
+                                break;
+                            }
+                            decoded_frames += (uint32_t)n;
                         }
-                        decoded_frames = (uint32_t)n;
                     } else {
                         decoded_frames = chunk / (uint32_t)winfo.block_align;
                         const int16_t *src = (const int16_t *)(const void *)g_file_buf;
@@ -462,8 +480,8 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
                         }
                     }
 
-                    if (decoded_frames > 1024u) {
-                        decoded_frames = 1024u;
+                    if (decoded_frames > winfo.total_samples - played_frames) {
+                        decoded_frames = winfo.total_samples - played_frames;
                     }
 
                     int32_t pl = 0, pr = 0;
@@ -533,8 +551,9 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
             ui_render_screen(UI_SCR_PLAYER, m);
         }
 
-        if (paused || eof_reached || (buf_pos < buf_frames && audio_dac_is_busy())) {
-            __asm__ volatile ("wfi");
+        if (paused || eof_reached || (audio_dac_is_busy() &&
+            (buf_pos < buf_frames || data_off >= winfo.data_bytes || played_frames >= winfo.total_samples))) {
+            OPENFW_WFI();
         }
     }
 
