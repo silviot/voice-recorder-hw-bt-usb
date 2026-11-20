@@ -1,12 +1,32 @@
 name: Cassini OpenFW CI
 
 on:
+  # Branch pushes are covered by pull_request; only main runs on push,
+  # so a commit on a PR branch no longer runs twice.
   push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '*.zip'
+      - '*.rules'
   pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '*.zip'
+      - '*.rules'
+  workflow_dispatch:
+
+# A newer push to the same branch / PR cancels the run still in progress.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
