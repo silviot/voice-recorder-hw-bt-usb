@@ -138,8 +138,9 @@ int sd_init(sd_card_t *card)
     card->rca          = 0u;
     card->sector_count = 0u;
     card->clk_div      = 0u;
-    card->stream_mode  = 0u;
-    card->stream_lba   = 0u;
+    card->async_active = 0u;
+    card->async_last_desc = 0u;
+    card->async_t0_us  = 0u;
 
     /* 1-bit SDIO pins on Port D: PD5=CLK, PD4=CMD (PU), PD6=D0 (PU) */
     rom_gpio_config(0x00032D90u);
@@ -367,9 +368,182 @@ static int sdio_read_one_sector(sd_card_t *card, uint32_t lba, uint8_t *dst)
     return 0;
 }
 
+typedef struct {
+    volatile uint32_t des0;
+    uint32_t          des1;
+    uint32_t          des2;
+    uint32_t          des3;
+} sdio_idmac_desc_t;
+
+#define IDMAC_DES0_OWN (1u << 31)
+#define IDMAC_DES0_CH  (1u << 4)
+#define IDMAC_DES0_FS  (1u << 3)
+#define IDMAC_DES0_LD  (1u << 2)
+#define IDMAC_DES0_DIC (1u << 1)
+
+#ifndef OPENFW_HOST_MMIO
+static sdio_idmac_desc_t g_idmac_desc[2] __attribute__((aligned(16)));
+#endif
+
+static void sdio_reset_dma_and_fifo(void)
+{
+    openfw_mmio_set32(SDIO_CTRL_ADDR, 0x6u); /* FIFO_RESET | DMA_RESET */
+    uint64_t t0 = us_timer_now();
+    while (openfw_mmio_rd32(SDIO_CTRL_ADDR) & 0x6u) {
+        if ((uint32_t)(us_timer_now() - t0) >= SDIO_CMD_TIMEOUT_US) {
+            break;
+        }
+    }
+}
+
+void sd_read_async_abort(sd_card_t *card)
+{
+    if (!card || !card->async_active) {
+        return;
+    }
+    card->async_active = 0u;
+    openfw_mmio_wr32(SDIO_IDMAC_BMOD_ADDR, 0u);
+    openfw_mmio_clr32(SDIO_CTRL_ADDR, SDIO_CTRL_USE_IDMAC);
+    (void)sdio_send_cmd(SD_CMD12_STOP, 0u, 1);
+    sdio_reset_dma_and_fifo();
+    openfw_mmio_wr32(SDIO_RINTSTS_ADDR, 0xFFFFFFFFu);
+    openfw_mmio_wr32(SDIO_IDSTS_ADDR,   0xFFFFFFFFu);
+}
+
+int sd_read_async_start(sd_card_t *card, uint32_t lba, uint32_t count, void *buf)
+{
+#ifdef OPENFW_HOST_MMIO
+    (void)card; (void)lba; (void)count; (void)buf;
+    return -2; /* 64-bit host pointer width cannot feed 32-bit IDMAC */
+#else
+    if (!card || !card->initialized || !buf) {
+        return -1;
+    }
+    if (card->async_active) {
+        sd_read_async_abort(card);
+    }
+    if (count < 2u || count > 16u || (((uintptr_t)buf & 3u) != 0u)) {
+        return -2; /* Caller falls back to synchronous PIO */
+    }
+    if (card->sector_count > 3u && lba + count > card->sector_count - 3u) {
+        return -2; /* Near end-of-disk: use single-block CMD17 */
+    }
+
+    uint32_t total_bytes = count * 512u;
+    uint32_t buf_addr    = (uint32_t)(uintptr_t)buf;
+    if (total_bytes <= 4096u) {
+        g_idmac_desc[0].des0 = IDMAC_DES0_OWN | IDMAC_DES0_CH | IDMAC_DES0_FS | IDMAC_DES0_LD;
+        g_idmac_desc[0].des1 = total_bytes;
+        g_idmac_desc[0].des2 = buf_addr;
+        g_idmac_desc[0].des3 = (uint32_t)(uintptr_t)&g_idmac_desc[0];
+        card->async_last_desc = 0u;
+    } else {
+        g_idmac_desc[0].des0 = IDMAC_DES0_OWN | IDMAC_DES0_CH | IDMAC_DES0_FS | IDMAC_DES0_DIC;
+        g_idmac_desc[0].des1 = 4096u;
+        g_idmac_desc[0].des2 = buf_addr;
+        g_idmac_desc[0].des3 = (uint32_t)(uintptr_t)&g_idmac_desc[1];
+        g_idmac_desc[1].des0 = IDMAC_DES0_OWN | IDMAC_DES0_CH | IDMAC_DES0_LD;
+        g_idmac_desc[1].des1 = total_bytes - 4096u;
+        g_idmac_desc[1].des2 = buf_addr + 4096u;
+        g_idmac_desc[1].des3 = (uint32_t)(uintptr_t)&g_idmac_desc[1];
+        card->async_last_desc = 1u;
+    }
+    __asm__ volatile ("dsb" ::: "memory");
+
+    sdio_reset_dma_and_fifo();
+    openfw_mmio_set32(SDIO_CTRL_ADDR, SDIO_CTRL_USE_IDMAC);
+    openfw_mmio_wr32(SDIO_IDMAC_BMOD_ADDR, SDIO_IDMAC_BMOD_SWR);
+    {
+        uint64_t t0 = us_timer_now();
+        while (openfw_mmio_rd32(SDIO_IDMAC_BMOD_ADDR) & SDIO_IDMAC_BMOD_SWR) {
+            if ((uint32_t)(us_timer_now() - t0) >= SDIO_CMD_TIMEOUT_US) {
+                openfw_mmio_clr32(SDIO_CTRL_ADDR, SDIO_CTRL_USE_IDMAC);
+                return -1;
+            }
+        }
+    }
+    openfw_mmio_wr32(SDIO_IDSTS_ADDR,      0xFFFFFFFFu);
+    openfw_mmio_wr32(SDIO_IDINTEN_ADDR,    SDIO_IDSTS_RI | SDIO_IDSTS_TI);
+    openfw_mmio_wr32(SDIO_DBADDR_ADDR,     (uint32_t)(uintptr_t)&g_idmac_desc[0]);
+    openfw_mmio_wr32(SDIO_IDMAC_BMOD_ADDR, SDIO_IDMAC_BMOD_DE | SDIO_IDMAC_BMOD_FB);
+
+    openfw_mmio_wr32(SDIO_BLKSIZ_ADDR,  512u);
+    openfw_mmio_wr32(SDIO_BYTCNT_ADDR,  total_bytes);
+    openfw_mmio_wr32(SDIO_RINTSTS_ADDR, 0xFFFFFFFFu);
+
+    uint32_t arg = card->is_sdhc ? lba : (lba << 9);
+    if (sdio_send_cmd(SD_CMD18_READ_MULTI, arg, 0) != 0) {
+        openfw_mmio_wr32(SDIO_IDMAC_BMOD_ADDR, 0u);
+        openfw_mmio_clr32(SDIO_CTRL_ADDR, SDIO_CTRL_USE_IDMAC);
+        sdio_reset_dma_and_fifo();
+        return -1;
+    }
+    openfw_mmio_wr32(SDIO_PLDMND_ADDR, 1u);
+
+    card->async_active = 1u;
+    card->async_t0_us  = (uint32_t)us_timer_now();
+    return 0;
+#endif
+}
+
+int sd_read_async_poll(sd_card_t *card)
+{
+#ifdef OPENFW_HOST_MMIO
+    (void)card;
+    return -1;
+#else
+    if (!card || !card->async_active) {
+        return 1;
+    }
+    uint32_t st    = openfw_mmio_rd32(SDIO_RINTSTS_ADDR);
+    uint32_t idsts = openfw_mmio_rd32(SDIO_IDSTS_ADDR);
+    if ((st & (SDIO_INT_RCRC | SDIO_INT_DCRC | SDIO_INT_RTO | SDIO_INT_DRTO)) ||
+        (idsts & (SDIO_IDSTS_FBE | SDIO_IDSTS_DU | SDIO_IDSTS_CES))) {
+        sd_read_async_abort(card);
+        return -1;
+    }
+    if ((st & SDIO_INT_DTO) &&
+        ((g_idmac_desc[card->async_last_desc].des0 & IDMAC_DES0_OWN) == 0u)) {
+        card->async_active = 0u;
+        openfw_mmio_wr32(SDIO_RINTSTS_ADDR,    0xFFFFFFFFu);
+        openfw_mmio_wr32(SDIO_IDSTS_ADDR,      0xFFFFFFFFu);
+        openfw_mmio_wr32(SDIO_IDMAC_BMOD_ADDR, 0u);
+        openfw_mmio_clr32(SDIO_CTRL_ADDR,      SDIO_CTRL_USE_IDMAC);
+        int stop_rc = sdio_send_cmd(SD_CMD12_STOP, 0u, 1);
+        sdio_reset_fifo();
+        __asm__ volatile ("dsb" ::: "memory");
+        return (stop_rc == 0) ? 1 : -1;
+    }
+    if ((uint32_t)((uint32_t)us_timer_now() - card->async_t0_us) >= SDIO_DAT_TIMEOUT_US) {
+        sd_read_async_abort(card);
+        return -1;
+    }
+    return 0;
+#endif
+}
+
+int sd_read_async_wait(sd_card_t *card)
+{
+    if (!card || !card->async_active) {
+        return 0;
+    }
+    while (1) {
+        wdt_feed();
+        int rc = sd_read_async_poll(card);
+        if (rc > 0) {
+            return 0;
+        }
+        if (rc < 0) {
+            return -1;
+        }
+    }
+}
+
 int sd_flush(sd_card_t *card)
 {
-    (void)card;
+    if (card && card->async_active) {
+        sd_read_async_abort(card);
+    }
     return 0;
 }
 
@@ -481,6 +655,9 @@ int sd_read_blocks(sd_card_t *card, uint32_t lba, uint32_t count, void *buf)
 {
     if (!card || !card->initialized || (!buf && count > 0u)) {
         return -1;
+    }
+    if (card->async_active) {
+        sd_read_async_abort(card);
     }
     uint8_t *dst = (uint8_t *)buf;
     uint32_t done = 0u;

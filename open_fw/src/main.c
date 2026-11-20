@@ -519,6 +519,9 @@ static int run_usb_msc_mode(int auto_mode)
     if (usb_msc_start(msc_dev) != 0) {
         return 0;
     }
+    if (g_sd_card.initialized) {
+        usb_msc_enable_sd_async(&g_sd_card);
+    }
 
     backlight_wake(millis());
 

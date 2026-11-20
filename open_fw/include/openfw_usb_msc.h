@@ -24,6 +24,18 @@ typedef int (*usb_msc_vendor_cb_t)(void *user, const uint8_t cdb[16],
                                    uint8_t *io_buf, uint16_t *io_len, int is_out);
 
 typedef struct {
+    int  (*read_start)(void *ctx, uint32_t lba, uint32_t count, void *buf);
+    int  (*read_wait)(void *ctx);
+    void (*read_abort)(void *ctx);
+    void *ctx;
+} usb_msc_async_read_t;
+
+#define USB_MSC_PP_SECTORS  16u
+#define USB_MSC_PP_BYTES    (USB_MSC_PP_SECTORS * 512u)
+#define USB_MSC_BUF_SECTORS 32u
+#define USB_MSC_BUF_BYTES   (USB_MSC_BUF_SECTORS * 512u)
+
+typedef struct {
     blkdev_t           *dev;
     usb_msc_phase_t     phase;
     uint32_t            csw_tag;
@@ -41,6 +53,13 @@ typedef struct {
     uint8_t             is_vendor_out;
     uint8_t             vendor_cdb[16];
 
+    /* Optional read-only async IDMAC ping-pong callbacks (preserved across usb_msc_reset) */
+    usb_msc_async_read_t async_read;
+    uint8_t             pp_active;
+    uint8_t             pp_prefetch;
+    uint16_t            pp_prefetch_secs;
+    uint32_t            pp_prefetch_lba;
+
     /* Streaming / inline transfer state */
     uint8_t             is_blk_xfer;
     uint32_t            cur_lba;
@@ -51,14 +70,12 @@ typedef struct {
     uint16_t            inline_pos;
     uint16_t            inline_len;
     uint8_t             inline_buf[64];
-    uint8_t             sec_buf[16384] __attribute__((aligned(4)));
+    uint8_t             sec_buf[USB_MSC_BUF_BYTES] __attribute__((aligned(4)));
 } usb_msc_state_t;
-
-#define USB_MSC_BUF_SECTORS 32u
-#define USB_MSC_BUF_BYTES   (USB_MSC_BUF_SECTORS * 512u)
 
 void    usb_msc_init_state(usb_msc_state_t *st, blkdev_t *dev);
 void    usb_msc_set_vendor_cb(usb_msc_state_t *st, usb_msc_vendor_cb_t cb, void *user);
+void    usb_msc_set_async_read(usb_msc_state_t *st, const usb_msc_async_read_t *ops);
 void    usb_msc_reset(usb_msc_state_t *st);
 void    usb_msc_on_rx_packet(usb_msc_state_t *st, const uint8_t *pkt, uint8_t len);
 int     usb_msc_need_tx(const usb_msc_state_t *st);

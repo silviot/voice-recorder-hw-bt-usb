@@ -204,14 +204,19 @@ typedef struct {
     uint16_t rca;
     uint32_t sector_count;
     uint8_t  clk_div;
-    uint8_t  stream_mode; /* 0 = idle, 1 = open-ended CMD18 read */
-    uint32_t stream_lba;
+    uint8_t  async_active;
+    uint8_t  async_last_desc;
+    uint32_t async_t0_us;
 } sd_card_t;
 
 int      sd_init(sd_card_t *card);
 int      sd_flush(sd_card_t *card);
 int      sd_read_blocks(sd_card_t *card, uint32_t lba, uint32_t count, void *buf);
 int      sd_write_blocks(sd_card_t *card, uint32_t lba, uint32_t count, const void *buf);
+int      sd_read_async_start(sd_card_t *card, uint32_t lba, uint32_t count, void *buf);
+int      sd_read_async_poll(sd_card_t *card);
+int      sd_read_async_wait(sd_card_t *card);
+void     sd_read_async_abort(sd_card_t *card);
 blkdev_t sd_as_blkdev(sd_card_t *card);
 
 /* Audio ADC AMIC1/AMIC2 + DMAC CH1 4-Frame Ring Capture (audio_dma.c) */
@@ -266,6 +271,7 @@ uint16_t usb_musb_frame(void);
 void usb_msc_set_diag_info(uint8_t sd_mounted, uint8_t rec_active, uint8_t mic_gain);
 void usb_msc_set_audio_cfg_cb(usb_audio_cfg_cb_t cb);
 int  usb_msc_start(blkdev_t *dev);
+void usb_msc_enable_sd_async(sd_card_t *card);
 void usb_msc_stop(void);
 void usb_msc_poll(void);
 int  usb_msc_is_active(void);

@@ -124,8 +124,19 @@ static uint32_t effective_sectors(const usb_msc_state_t *st)
     return st->dev->total_sectors;
 }
 
+static void abort_prefetch(usb_msc_state_t *st)
+{
+    if (st && st->pp_prefetch) {
+        st->pp_prefetch = 0u;
+        if (st->async_read.read_abort) {
+            st->async_read.read_abort(st->async_read.ctx);
+        }
+    }
+}
+
 static void handle_cbw(usb_msc_state_t *st, const uint8_t *pkt, uint8_t len)
 {
+    abort_prefetch(st);
     if (len != 31u || get_le32(pkt) != CBW_SIGNATURE) {
         st->csw_tag     = (len >= 8u) ? get_le32(pkt + 4u) : 0u;
         st->csw_status  = 2u; /* Phase error */
@@ -404,18 +415,34 @@ void usb_msc_set_vendor_cb(usb_msc_state_t *st, usb_msc_vendor_cb_t cb, void *us
     st->vendor_user = user;
 }
 
+void usb_msc_set_async_read(usb_msc_state_t *st, const usb_msc_async_read_t *ops)
+{
+    if (!st) {
+        return;
+    }
+    abort_prefetch(st);
+    if (ops) {
+        st->async_read = *ops;
+    } else {
+        mem_zero(&st->async_read, sizeof(st->async_read));
+    }
+}
+
 void usb_msc_reset(usb_msc_state_t *st)
 {
     if (!st) {
         return;
     }
-    blkdev_t           *dev         = st->dev;
-    usb_msc_vendor_cb_t vendor_cb   = st->vendor_cb;
-    void               *vendor_user = st->vendor_user;
+    abort_prefetch(st);
+    blkdev_t            *dev         = st->dev;
+    usb_msc_vendor_cb_t  vendor_cb   = st->vendor_cb;
+    void                *vendor_user = st->vendor_user;
+    usb_msc_async_read_t async_read  = st->async_read;
     mem_zero(st, sizeof(*st));
     st->dev         = dev;
     st->vendor_cb   = vendor_cb;
     st->vendor_user = vendor_user;
+    st->async_read  = async_read;
     st->phase       = MSC_PHASE_IDLE;
 }
 
@@ -543,24 +570,61 @@ uint8_t usb_msc_get_tx_packet(usb_msc_state_t *st, uint8_t out[64])
         }
 
         if (st->sec_off >= st->buf_len) {
-            uint32_t nsec = st->blocks_rem;
-            if (nsec > USB_MSC_BUF_SECTORS) {
-                nsec = USB_MSC_BUF_SECTORS;
+            if (st->pp_prefetch) {
+                int rc = st->async_read.read_wait
+                       ? st->async_read.read_wait(st->async_read.ctx)
+                       : -1;
+                st->pp_prefetch = 0u;
+                st->pp_active  ^= 1u;
+                uint32_t nsec   = st->pp_prefetch_secs;
+                uint32_t nbytes = nsec * 512u;
+                uint8_t *dst    = &st->sec_buf[(uint32_t)st->pp_active * USB_MSC_PP_BYTES];
+                if (rc != 0 && st->csw_status == 0u) {
+                    /* Automatic synchronous PIO fallback on any IDMAC error/timeout */
+                    if (st->dev->read_sectors(st->dev->ctx, st->pp_prefetch_lba, nsec, dst) != 0) {
+                        mem_zero(dst, nbytes);
+                        st->csw_status = 1u;
+                        set_sense(st, 0x03u, 0x11u, 0x00u);
+                    }
+                }
+                st->buf_len = (uint16_t)nbytes;
+                st->sec_off = 0u;
+            } else {
+                st->pp_active = 0u;
+                uint32_t max_sec = st->async_read.read_start ? USB_MSC_PP_SECTORS : USB_MSC_BUF_SECTORS;
+                uint32_t nsec    = st->blocks_rem;
+                if (nsec > max_sec) {
+                    nsec = max_sec;
+                }
+                if (nsec == 0u) {
+                    nsec = 1u;
+                }
+                uint32_t nbytes = nsec * 512u;
+                if (st->csw_status == 0u &&
+                    st->dev->read_sectors(st->dev->ctx, st->cur_lba, nsec, st->sec_buf) != 0) {
+                    mem_zero(st->sec_buf, nbytes);
+                    st->csw_status = 1u;
+                    set_sense(st, 0x03u, 0x11u, 0x00u); /* Medium read error */
+                }
+                st->cur_lba   += nsec;
+                st->blocks_rem = (st->blocks_rem > nsec) ? (st->blocks_rem - nsec) : 0u;
+                st->buf_len    = (uint16_t)nbytes;
+                st->sec_off    = 0u;
             }
-            if (nsec == 0u) {
-                nsec = 1u;
+
+            /* Overlap: start background IDMAC prefetch of next 8 KiB into the other half */
+            if (st->csw_status == 0u && st->blocks_rem >= 2u && st->async_read.read_start) {
+                uint32_t psec = (st->blocks_rem > USB_MSC_PP_SECTORS)
+                              ? USB_MSC_PP_SECTORS : st->blocks_rem;
+                uint8_t *pbuf = &st->sec_buf[(uint32_t)(st->pp_active ^ 1u) * USB_MSC_PP_BYTES];
+                if (st->async_read.read_start(st->async_read.ctx, st->cur_lba, psec, pbuf) == 0) {
+                    st->pp_prefetch      = 1u;
+                    st->pp_prefetch_lba  = st->cur_lba;
+                    st->pp_prefetch_secs = (uint16_t)psec;
+                    st->cur_lba         += psec;
+                    st->blocks_rem      -= psec;
+                }
             }
-            uint32_t nbytes = nsec * 512u;
-            if (st->csw_status == 0u &&
-                st->dev->read_sectors(st->dev->ctx, st->cur_lba, nsec, st->sec_buf) != 0) {
-                mem_zero(st->sec_buf, nbytes);
-                st->csw_status = 1u;
-                set_sense(st, 0x03u, 0x11u, 0x00u); /* Medium read error */
-            }
-            st->cur_lba += nsec;
-            st->blocks_rem = (st->blocks_rem > nsec) ? (st->blocks_rem - nsec) : 0u;
-            st->buf_len = (uint16_t)nbytes;
-            st->sec_off = 0u;
         }
 
         uint16_t sec_rem = (uint16_t)(st->buf_len - st->sec_off);
@@ -568,11 +632,12 @@ uint8_t usb_msc_get_tx_packet(usb_msc_state_t *st, uint8_t out[64])
         if (take > st->data_rem) {
             take = st->data_rem;
         }
-        mem_copy(out, &st->sec_buf[st->sec_off], take);
+        mem_copy(out, &st->sec_buf[(uint32_t)st->pp_active * USB_MSC_PP_BYTES + st->sec_off], take);
         st->sec_off   = (uint16_t)(st->sec_off + take);
         st->data_rem -= take;
 
         if (st->data_rem == 0u) {
+            abort_prefetch(st);
             st->is_blk_xfer = 0u;
             st->phase       = MSC_PHASE_CSW;
         }

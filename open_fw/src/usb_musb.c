@@ -735,12 +735,42 @@ int usb_msc_start(blkdev_t *dev)
     return 0;
 }
 
+static int musb_sd_async_start(void *ctx, uint32_t lba, uint32_t count, void *buf)
+{
+    return sd_read_async_start((sd_card_t *)ctx, lba, count, buf);
+}
+
+static int musb_sd_async_wait(void *ctx)
+{
+    return sd_read_async_wait((sd_card_t *)ctx);
+}
+
+static void musb_sd_async_abort(void *ctx)
+{
+    sd_read_async_abort((sd_card_t *)ctx);
+}
+
+void usb_msc_enable_sd_async(sd_card_t *card)
+{
+    if (!card || !card->initialized) {
+        usb_msc_set_async_read(&g_msc, 0);
+        return;
+    }
+    usb_msc_async_read_t ops;
+    ops.read_start = musb_sd_async_start;
+    ops.read_wait  = musb_sd_async_wait;
+    ops.read_abort = musb_sd_async_abort;
+    ops.ctx        = card;
+    usb_msc_set_async_read(&g_msc, &ops);
+}
+
 void usb_msc_stop(void)
 {
     if (!g_usb_active) {
         return;
     }
     g_usb_active = 0;
+    usb_msc_reset(&g_msc);
 
     openfw_mmio_wr8(MUSB_INTRUSBE_ADDR, 0u);
     openfw_mmio_wr16(MUSB_INTRTXE_ADDR, 0u);

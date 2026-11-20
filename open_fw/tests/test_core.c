@@ -956,6 +956,98 @@ static void test_usb_msc(void)
 }
 
 typedef struct {
+    blkdev_t *dev;
+    int       start_calls;
+    int       wait_calls;
+    int       abort_calls;
+    int       fail_wait_on_call;
+    int       active;
+    uint32_t  lba;
+    uint32_t  count;
+    void     *buf;
+} mock_async_rd_t;
+
+static int mock_async_start(void *ctx, uint32_t lba, uint32_t count, void *buf)
+{
+    mock_async_rd_t *m = (mock_async_rd_t *)ctx;
+    m->start_calls++;
+    m->active = 1;
+    m->lba    = lba;
+    m->count  = count;
+    m->buf    = buf;
+    return 0;
+}
+
+static int mock_async_wait(void *ctx)
+{
+    mock_async_rd_t *m = (mock_async_rd_t *)ctx;
+    m->wait_calls++;
+    assert(m->active);
+    m->active = 0;
+    if (m->fail_wait_on_call > 0 && m->wait_calls == m->fail_wait_on_call) {
+        return -1;
+    }
+    return m->dev->read_sectors(m->dev->ctx, m->lba, m->count, m->buf);
+}
+
+static void mock_async_abort(void *ctx)
+{
+    mock_async_rd_t *m = (mock_async_rd_t *)ctx;
+    m->abort_calls++;
+    m->active = 0;
+}
+
+static void test_usb_msc_async_pingpong(void)
+{
+    blkdev_t dev = { mem_read_sectors, mem_write_sectors, MEM_DISK_SECTORS, NULL };
+    /* Fill 40 sectors starting at LBA 20 with known pattern */
+    static uint8_t expected[40u * 512u];
+    static uint8_t actual[40u * 512u];
+    for (uint32_t i = 0u; i < sizeof(expected); i++) {
+        expected[i] = (uint8_t)((i * 53u + 17u) & 0xFFu);
+    }
+    memcpy(&g_disk[20u * 512u], expected, sizeof(expected));
+
+    usb_msc_state_t st;
+    usb_msc_init_state(&st, &dev);
+    mock_async_rd_t m = { &dev, 0, 0, 0, 0, 0, 0u, 0u, NULL };
+    usb_msc_async_read_t ops = { mock_async_start, mock_async_wait, mock_async_abort, &m };
+    usb_msc_set_async_read(&st, &ops);
+
+    /* 1. Normal 40-sector READ(10) -> chunk0(16) sync + prefetch(16) + prefetch(8) */
+    uint8_t rd_cdb[10] = { 0x28u, 0u };
+    put_be32(&rd_cdb[2], 20u);
+    put_be16(&rd_cdb[7], 40u);
+    uint8_t status = 99u;
+    uint32_t res = 99u, got = 0u;
+    scsi_xfer(&st, 100u, 0x80u, rd_cdb, 10u, NULL, actual, sizeof(actual), &status, &res, &got);
+    assert(status == 0u && res == 0u && got == sizeof(actual));
+    assert(memcmp(actual, expected, sizeof(expected)) == 0);
+    assert(m.start_calls == 2 && m.wait_calls == 2 && m.abort_calls == 0);
+
+    /* 2. Inject async IDMAC error on 1st prefetch -> must fall back to sync PIO cleanly */
+    memset(actual, 0, sizeof(actual));
+    m.start_calls = 0; m.wait_calls = 0; m.abort_calls = 0; m.fail_wait_on_call = 1;
+    scsi_xfer(&st, 101u, 0x80u, rd_cdb, 10u, NULL, actual, sizeof(actual), &status, &res, &got);
+    assert(status == 0u && res == 0u && got == sizeof(actual));
+    assert(memcmp(actual, expected, sizeof(expected)) == 0);
+    assert(m.start_calls == 2 && m.wait_calls == 2);
+
+    /* 3. Mid-transfer usb_msc_reset() must abort in-flight prefetch */
+    m.fail_wait_on_call = 0;
+    uint8_t cbw[31];
+    build_cbw(cbw, 102u, sizeof(actual), 0x80u, rd_cdb, 10u);
+    usb_msc_on_rx_packet(&st, cbw, 31u);
+    uint8_t pkt[64];
+    assert(usb_msc_get_tx_packet(&st, pkt) == 64u);
+    assert(m.active == 1);
+    usb_msc_reset(&st);
+    assert(m.abort_calls == 1 && m.active == 0);
+
+    printf("  [PASS] usb_msc async ping-pong (40-sector overlap, PIO fallback, reset abort)\n");
+}
+
+typedef struct {
     int      calls;
     int      fail_next;
     int      last_is_out;
@@ -2006,6 +2098,7 @@ int main(int argc, char **argv)
     test_exfat_checkpoint_fault_injection();
     test_exfat_replace_fault_injection();
     test_usb_msc();
+    test_usb_msc_async_pingpong();
     test_usb_msc_vendor_e0();
     test_bt_spp_and_xrec();
     printf("All open_fw host unit tests PASSED!\n");
