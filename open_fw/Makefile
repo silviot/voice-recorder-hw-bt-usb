@@ -22,7 +22,8 @@ CFLAGS   := --target=thumbv7em-none-eabi -mcpu=cortex-m4 -mfpu=fpv4-sp-d16 -mflo
 HOST_CFLAGS := -O2 -Wall -Wextra -Werror -Iinclude
 
 SRCS      := src/startup.c src/wdt_timer.c src/rtc.c src/uart.c src/pmu.c \
-             src/keys.c src/lcd_st7735s.c src/aa_fonts.c src/sdio.c src/audio_dma.c \
+             src/keys.c src/lcd_st7735s.c src/aa_fonts.c src/ui_icons.c \
+             src/ui_spectrogram.c src/ui_screens.c src/sdio.c src/audio_dma.c \
              src/audio_dac.c src/audio_dsp.c src/usb_scsi.c src/usb_musb.c \
              src/bt_rf.c src/bt_spp.c src/xrec_proto.c src/bt_hci.c \
              src/recorder.c src/player.c src/exp_runner.c src/crypto.c \
@@ -45,10 +46,10 @@ $(BUILD_DIR):
 $(SPLASH_HDR): $(SPLASH_PNG) tools/png_to_rgb565_h.py | $(BUILD_DIR)
 	python3 tools/png_to_rgb565_h.py $(SPLASH_PNG) --out $@
 
-$(BUILD_DIR)/main.o: src/main.c $(SPLASH_HDR) include/sl6801_regs.h include/openfw.h include/openfw_exp.h include/openfw_player.h | $(BUILD_DIR)
+$(BUILD_DIR)/main.o: src/main.c $(SPLASH_HDR) include/sl6801_regs.h include/openfw.h include/openfw_ui.h include/openfw_exp.h include/openfw_player.h | $(BUILD_DIR)
 	$(CLANG) $(CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/%.o: src/%.c include/sl6801_regs.h include/sl6801_rom.h include/openfw.h include/audio_dsp.h include/openfw_exp.h include/openfw_crypto.h include/openfw_wav.h include/openfw_cwx.h include/openfw_player.h include/openfw_fs.h include/openfw_usb_msc.h include/openfw_bt_spp.h include/openfw_xrec.h | $(BUILD_DIR)
+$(BUILD_DIR)/%.o: src/%.c include/sl6801_regs.h include/sl6801_rom.h include/openfw.h include/openfw_ui.h include/audio_dsp.h include/openfw_exp.h include/openfw_crypto.h include/openfw_wav.h include/openfw_cwx.h include/openfw_player.h include/openfw_fs.h include/openfw_usb_msc.h include/openfw_bt_spp.h include/openfw_xrec.h | $(BUILD_DIR)
 	$(CLANG) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/open_fw.elf: $(OBJS) sl6801_firm.ld
@@ -79,6 +80,10 @@ test-host: tests/test_core.c src/crypto.c src/wav.c src/cwx.c src/exfat.c src/us
 		src/exp_runner.c src/crypto.c \
 		-o $(BUILD_DIR)/test_drivers_mmio
 	$(BUILD_DIR)/test_drivers_mmio $(BUILD_DIR)/test_exfat.img
+	$(HOST_CC) $(HOST_CFLAGS) -DOPENFW_HOST_MMIO tests/test_ui_render.c \
+		src/lcd_st7735s.c src/aa_fonts.c src/ui_icons.c src/ui_spectrogram.c src/ui_screens.c \
+		-lm -o $(BUILD_DIR)/test_ui_render
+	$(BUILD_DIR)/test_ui_render $(BUILD_DIR)/ui_all_screens.ppm
 	$(HOST_CC) $(HOST_CFLAGS) tests/test_audio_dsp.c src/audio_dsp.c -lm -o $(BUILD_DIR)/test_audio_dsp
 	$(BUILD_DIR)/test_audio_dsp
 	$(HOST_CC) $(HOST_CFLAGS) -DOPENFW_HOST_MMIO tests/test_audio_bt_mmio.c \

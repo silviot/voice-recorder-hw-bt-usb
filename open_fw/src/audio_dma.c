@@ -18,9 +18,12 @@
 
 static int16_t g_pcm_buf[AUDIO_RING_SLOTS][AUDIO_MAX_SLOT_SAMPLES] __attribute__((aligned(4)));
 static volatile uint8_t  g_dma_slot      = 0u;
+static volatile uint8_t  g_last_done_slot = 0u;
 static volatile uint8_t  g_running       = 0u;
 static volatile uint8_t  g_channels      = 1u;
 static volatile uint8_t  g_peak_pct      = 0u;
+static volatile uint8_t  g_peak_l_pct    = 0u;
+static volatile uint8_t  g_peak_r_pct    = 0u;
 static volatile uint32_t g_frame_samples = AUDIO_FRAMES_PER_SLOT;
 static volatile uint32_t g_frame_bytes   = AUDIO_FRAMES_PER_SLOT * sizeof(int16_t);
 static volatile uint32_t g_frames        = 0u;
@@ -39,12 +42,12 @@ static inline void dmac_arm_rx(void *dst_buf, uint32_t len_bytes)
     openfw_mmio_rmw32(DMAC_CH_CTL_ADDR(AUDIO_DMA_CH), DMAC_CTL_RELOAD, DMAC_CTL_CH_EN);
 }
 
-static uint8_t compute_ac_peak_pct(const int16_t *samples, uint32_t count)
+static uint8_t compute_ac_peak_pct_stride(const int16_t *samples, uint32_t frames, uint32_t stride, uint32_t ch_off)
 {
-    int32_t min_s = samples[0];
-    int32_t max_s = samples[0];
-    for (uint32_t i = 1u; i < count; i++) {
-        int32_t s = (int32_t)samples[i];
+    int32_t min_s = samples[ch_off];
+    int32_t max_s = samples[ch_off];
+    for (uint32_t i = 1u; i < frames; i++) {
+        int32_t s = (int32_t)samples[i * stride + ch_off];
         if (s < min_s) {
             min_s = s;
         }
@@ -81,8 +84,20 @@ void DMAC_CH1_IRQHandler(void)
         dmac_arm_rx(g_pcm_buf[next_slot], g_frame_bytes);
         OPENFW_DSB();
 
+        g_last_done_slot = done_slot;
         g_wr_idx++;
-        g_peak_pct = compute_ac_peak_pct(g_pcm_buf[done_slot], g_frame_samples);
+        if (g_channels == 2u) {
+            uint8_t pl = compute_ac_peak_pct_stride(g_pcm_buf[done_slot], AUDIO_FRAMES_PER_SLOT, 2u, 0u);
+            uint8_t pr = compute_ac_peak_pct_stride(g_pcm_buf[done_slot], AUDIO_FRAMES_PER_SLOT, 2u, 1u);
+            g_peak_l_pct = pl;
+            g_peak_r_pct = pr;
+            g_peak_pct   = (pl > pr) ? pl : pr;
+        } else {
+            uint8_t pm = compute_ac_peak_pct_stride(g_pcm_buf[done_slot], AUDIO_FRAMES_PER_SLOT, 1u, 0u);
+            g_peak_l_pct = pm;
+            g_peak_r_pct = pm;
+            g_peak_pct   = pm;
+        }
         g_frames++;
     }
 }
@@ -223,7 +238,10 @@ int audio_capture_start_ex(uint8_t gain_0_31, uint8_t channels)
     g_frame_samples   = AUDIO_FRAMES_PER_SLOT * (uint32_t)ch;
     g_frame_bytes     = g_frame_samples * (uint32_t)sizeof(int16_t);
     g_dma_slot        = 0u;
+    g_last_done_slot  = 0u;
     g_peak_pct        = 0u;
+    g_peak_l_pct      = 0u;
+    g_peak_r_pct      = 0u;
     g_frames          = 0u;
     g_wr_idx          = 0u;
     g_rd_idx          = 0u;
@@ -254,8 +272,10 @@ void audio_capture_stop(void)
     if (!g_running) {
         return;
     }
-    g_running  = 0u;
-    g_peak_pct = 0u;
+    g_running    = 0u;
+    g_peak_pct   = 0u;
+    g_peak_l_pct = 0u;
+    g_peak_r_pct = 0u;
 
     nvic_disable_irq(DMAC_IRQ_BASE + AUDIO_DMA_CH);
     openfw_mmio_clr32(DMAC_CH_CTL_ADDR(AUDIO_DMA_CH), DMAC_CTL_CH_EN);
@@ -302,6 +322,46 @@ const int16_t *audio_pop_frame(uint32_t *out_bytes)
 uint8_t audio_get_peak_pct(void)
 {
     return g_peak_pct;
+}
+
+void audio_get_peak_lr_pct(uint8_t *out_l, uint8_t *out_r)
+{
+    if (out_l) {
+        *out_l = g_peak_l_pct;
+    }
+    if (out_r) {
+        *out_r = g_peak_r_pct;
+    }
+}
+
+uint32_t audio_dma_peek_pcm(int16_t *dst, uint32_t max_frames, uint8_t *out_channels)
+{
+    static uint32_t s_sub_chunk = 0u;
+    if (!dst || max_frames == 0u || !g_running || g_frames == 0u) {
+        if (out_channels) {
+            *out_channels = g_channels;
+        }
+        return 0u;
+    }
+    uint8_t  ch   = g_channels;
+    uint8_t  slot = g_last_done_slot;
+    uint32_t n    = (max_frames > AUDIO_FRAMES_PER_SLOT) ? AUDIO_FRAMES_PER_SLOT : max_frames;
+    /* Step through the 2048-frame slot so 20 Hz UI updates see distinct 128-frame windows */
+    uint32_t off  = (s_sub_chunk * n) % AUDIO_FRAMES_PER_SLOT;
+    if (off + n > AUDIO_FRAMES_PER_SLOT) {
+        off = AUDIO_FRAMES_PER_SLOT - n;
+    }
+    s_sub_chunk++;
+
+    const int16_t *src = &g_pcm_buf[slot][off * (uint32_t)ch];
+    uint32_t total = n * (uint32_t)ch;
+    for (uint32_t i = 0u; i < total; i++) {
+        dst[i] = src[i];
+    }
+    if (out_channels) {
+        *out_channels = ch;
+    }
+    return n;
 }
 
 uint32_t audio_get_frames(void)

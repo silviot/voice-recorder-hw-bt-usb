@@ -172,12 +172,18 @@ uint16_t lcd_blend_rgb565(uint16_t fg, uint16_t bg, uint8_t alpha4);
 uint16_t lcd_measure_str_aa(const char *s, const aa_font_t *font);
 void     lcd_draw_str_aa(int16_t x, int16_t y, const char *s,
                          const aa_font_t *font, uint16_t fg, uint16_t bg);
+void     lcd_draw_str_aa_bl(int16_t x, int16_t baseline_y, const char *s,
+                            const aa_font_t *font, uint16_t fg, uint16_t bg);
 void     lcd_draw_str_aa_trunc(int16_t x, int16_t y, const char *s,
                                const aa_font_t *font, uint16_t max_w,
                                uint16_t fg, uint16_t bg);
 void     lcd_fill_circle_aa(int16_t cx, int16_t cy, int16_t r, uint16_t fg, uint16_t bg);
 void     lcd_fill_rrect_aa(int16_t x, int16_t y, int16_t w, int16_t h, int16_t r,
                            uint16_t fg, uint16_t bg);
+void     lcd_fill_tri_aa(int16_t x0, int16_t y0, int16_t x1, int16_t y1,
+                         int16_t x2, int16_t y2, uint16_t fg, uint16_t bg);
+void     lcd_draw_line_aa(int16_t x0, int16_t y0, int16_t x1, int16_t y1,
+                          uint8_t width_px, uint16_t fg, uint16_t bg);
 
 /* 1-Bit SDIO / microSD Block Driver (sdio.c) */
 typedef struct {
@@ -199,6 +205,8 @@ void           audio_capture_set_gain(uint8_t gain_0_31);
 void           audio_capture_stop(void);
 uint8_t        audio_get_channels(void);
 uint8_t        audio_get_peak_pct(void);
+void           audio_get_peak_lr_pct(uint8_t *out_l, uint8_t *out_r);
+uint32_t       audio_dma_peek_pcm(int16_t *dst, uint32_t max_frames, uint8_t *out_channels);
 uint32_t       audio_get_frames(void);
 const int16_t *audio_pop_frame(uint32_t *out_bytes);
 uint32_t       audio_get_overruns(void);
@@ -227,6 +235,7 @@ int                 recorder_start(exfat_vol_t *vol, int sd_mounted);
 void                recorder_poll(void);
 int                 recorder_stop(void);
 int                 recorder_is_saving(void);
+int                 recorder_is_vor_waiting(void);
 uint32_t            recorder_get_seconds(void);
 const char         *recorder_get_filename(void);
 

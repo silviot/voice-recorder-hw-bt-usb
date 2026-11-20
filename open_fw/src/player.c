@@ -9,8 +9,8 @@
 #include "openfw_cwx.h"
 #include "openfw_player.h"
 
-static uint8_t  g_file_buf[1024] __attribute__((aligned(4)));
-static int16_t  g_dec_pcm[2048]  __attribute__((aligned(4)));
+static uint8_t  g_file_buf[1024]  __attribute__((aligned(4)));
+static int16_t  g_dec_pcm[2048]   __attribute__((aligned(4)));
 static int16_t  g_stereo_tx[2048] __attribute__((aligned(4))); /* up to 1024 stereo frames */
 
 typedef struct {
@@ -44,33 +44,6 @@ static void append_str(char *dst, int *pos, int max, const char *s)
 {
     while (s && *s != '\0' && *pos < (max - 1)) {
         dst[(*pos)++] = *s++;
-    }
-}
-
-static void append_u32(char *dst, int *pos, int max, uint32_t v)
-{
-    char tmp[12];
-    int n = 0;
-    if (v == 0u) {
-        if (*pos < (max - 1)) {
-            dst[(*pos)++] = '0';
-        }
-        return;
-    }
-    while (v > 0u && n < 11) {
-        tmp[n++] = (char)('0' + (v % 10u));
-        v /= 10u;
-    }
-    while (n > 0 && *pos < (max - 1)) {
-        dst[(*pos)++] = tmp[--n];
-    }
-}
-
-static void append_2d(char *dst, int *pos, int max, uint32_t v)
-{
-    if (*pos + 2 < max) {
-        dst[(*pos)++] = (char)('0' + ((v / 10u) % 10u));
-        dst[(*pos)++] = (char)('0' + (v % 10u));
     }
 }
 
@@ -123,203 +96,102 @@ static uint32_t frames_to_ms(uint32_t frames, uint32_t sample_rate)
     return secs * 1000u + ms;
 }
 
-static void draw_str_clip(uint16_t x, uint16_t y, const char *s, int max_chars, uint16_t fg, uint16_t bg)
+static uint8_t vbat_mv_to_pct(uint32_t mv)
 {
-    char buf[32];
-    int i = 0;
-    if (max_chars > 30) {
-        max_chars = 30;
-    }
-    while (s && s[i] != '\0' && i < max_chars) {
-        buf[i] = s[i];
-        i++;
-    }
-    while (i < max_chars) {
-        buf[i++] = ' ';
-    }
-    buf[i] = '\0';
-    lcd_draw_str(x, y, buf, fg, bg);
+    if (mv <= 3400u) return 0u;
+    if (mv >= 4180u) return 100u;
+    return (uint8_t)(((mv - 3400u) * 100u) / (4180u - 3400u));
 }
 
-static void draw_player_chrome(const char *wav_name,
-                               const wav_stream_info_t *winfo,
-                               const cwx_stream_t *cwx,
-                               int has_cwx,
-                               uint32_t pos_ms,
-                               uint32_t dur_ms,
-                               uint8_t volume,
-                               int paused,
-                               int eof_reached,
-                               int hp_in,
-                               uint8_t peak_pct)
+static void append_word_cap(char *dst, int cap, const char *w, int wlen)
 {
-    const uint16_t bg     = rgb565(0u, 0u, 0u);
-    const uint16_t bar_bg = rgb565(18u, 22u, 32u);
-    const uint16_t text   = rgb565(235u, 240u, 245u);
-    const uint16_t dim    = rgb565(135u, 145u, 160u);
-    const uint16_t green  = rgb565(100u, 255u, 140u);
-    const uint16_t yellow = rgb565(255u, 220u, 90u);
-    const uint16_t cyan   = rgb565(90u, 220u, 255u);
-    const uint16_t track  = rgb565(36u, 42u, 54u);
+    int len = 0;
+    while (len < cap - 1 && dst[len] != '\0') {
+        len++;
+    }
+    if (len > 0 && len < cap - 1) {
+        dst[len++] = ' ';
+    }
+    for (int i = 0; i < wlen && len < cap - 1; i++) {
+        dst[len++] = w[i];
+    }
+    dst[len] = '\0';
+}
 
-    /* Top Bar (y=0..10) */
-    lcd_fill_rect(0u, 0u, 160u, 11u, bar_bg);
+static void populate_transcript_lines(ui_model_t *m, cwx_stream_t *cwx, uint32_t pos_ms)
+{
+    m->tr_prev[0]          = '\0';
+    m->tr_curr_spoken[0]   = '\0';
+    m->tr_curr_upcoming[0] = '\0';
+    m->tr_next[0]          = '\0';
+    m->tr_speaker          = 0u;
 
-    const char *badge = wav_name;
-    uint16_t badge_col = cyan;
     cwx_word_t words[18];
-    int nwords = 0;
     int active_idx = -1;
-
-    if (has_cwx) {
-        nwords = cwx_read_window((cwx_stream_t *)cwx, pos_ms, words, 18u, &active_idx);
-        if (nwords > 0 && active_idx >= 0 && active_idx < nwords) {
-            uint8_t spk = words[active_idx].speaker_idx;
-            badge     = cwx_speaker_label(cwx, spk);
-            badge_col = cwx_speaker_color(cwx, spk);
-            if (badge_col == 0u) {
-                badge_col = cyan;
-            }
-        } else if (cwx->speaker_count > 0u) {
-            badge     = cwx_speaker_label(cwx, 0u);
-            badge_col = cwx_speaker_color(cwx, 0u);
-        }
+    int nwords = cwx_read_window(cwx, pos_ms, words, 18u, &active_idx);
+    if (nwords <= 0) {
+        str_copy_cap(m->tr_curr_spoken, (int)sizeof(m->tr_curr_spoken),
+                     cwx->title[0] ? cwx->title : m->play_file.filename);
+        return;
     }
-    draw_str_clip(2u, 2u, badge, 10, badge_col, bar_bg);
 
-    uint32_t cur_s = pos_ms / 1000u;
-    uint32_t tot_s = dur_ms / 1000u;
-    char tbuf[16];
-    int tpos = 0;
-    append_2d(tbuf, &tpos, (int)sizeof(tbuf), cur_s / 60u);
-    append_str(tbuf, &tpos, (int)sizeof(tbuf), ":");
-    append_2d(tbuf, &tpos, (int)sizeof(tbuf), cur_s % 60u);
-    append_str(tbuf, &tpos, (int)sizeof(tbuf), "/");
-    append_2d(tbuf, &tpos, (int)sizeof(tbuf), tot_s / 60u);
-    append_str(tbuf, &tpos, (int)sizeof(tbuf), ":");
-    append_2d(tbuf, &tpos, (int)sizeof(tbuf), tot_s % 60u);
-    tbuf[tpos] = '\0';
-    lcd_draw_str(66u, 2u, tbuf, text, bar_bg);
+    if (active_idx < 0) {
+        active_idx = 0;
+    } else if (active_idx >= nwords) {
+        active_idx = nwords - 1;
+    }
+    m->tr_speaker = words[active_idx].speaker_idx;
 
-    lcd_draw_str(136u, 2u, hp_in ? "H" : "-", hp_in ? green : yellow, bar_bg);
-    const char *st_icon = eof_reached ? "[]" : (paused ? "II" : "> ");
-    lcd_draw_str(146u, 2u, st_icon, (paused || eof_reached) ? yellow : green, bar_bg);
+    /* Partition words into prev (up to 4 before curr), curr (around active_idx), next */
+    int curr_start = (active_idx >= 2) ? (active_idx - 2) : 0;
+    int prev_start = (curr_start >= 4) ? (curr_start - 4) : 0;
+    int curr_end   = curr_start;
 
-    lcd_fill_rect(0u, 11u, 160u, 1u, rgb565(50u, 60u, 78u));
+    for (int i = prev_start; i < curr_start; i++) {
+        append_word_cap(m->tr_prev, (int)sizeof(m->tr_prev), words[i].text, (int)words[i].text_len);
+    }
 
-    /* Body area (y=13..56) */
-    lcd_fill_rect(0u, 12u, 160u, 45u, bg);
-    if (has_cwx && nwords > 0) {
-        /* Start rendering from just before active_idx so it fits naturally inside 3 wrapped rows */
-        int start_i = 0;
-        if (active_idx > 4) {
-            start_i = active_idx - 4;
+    /* Fill current line up to ~20 chars so it fits cleanly in 152px of 14px AA font */
+    int cur_chars = 0;
+    for (int i = curr_start; i < nwords; i++) {
+        int wl = (int)words[i].text_len;
+        if (i > active_idx && cur_chars + wl + 1 > 22) {
+            break;
         }
-        int cur_row = 0;
-        int cur_col = 0;
-        const int max_cols = 26;
-        const uint16_t row_y[3] = { 15u, 29u, 43u };
-
-        for (int wi = start_i; wi < nwords && cur_row < 3; wi++) {
-            int wlen = (int)words[wi].text_len;
-            if (wlen <= 0) {
-                continue;
+        if (i <= active_idx) {
+            append_word_cap(m->tr_curr_spoken, (int)sizeof(m->tr_curr_spoken), words[i].text, wl);
+        } else {
+            if (m->tr_curr_spoken[0] != '\0' && m->tr_curr_upcoming[0] == '\0') {
+                str_copy_cap(m->tr_curr_upcoming, (int)sizeof(m->tr_curr_upcoming), " ");
             }
-            if (wlen > max_cols) {
-                wlen = max_cols;
-            }
-            int need_space = (cur_col > 0) ? 1 : 0;
-            if (cur_col + need_space + wlen > max_cols) {
-                cur_row++;
-                cur_col = 0;
-                need_space = 0;
-                if (cur_row >= 3) {
-                    break;
-                }
-            }
-            if (need_space) {
-                lcd_draw_char((uint16_t)(2u + (uint16_t)cur_col * 6u), row_y[cur_row], ' ', text, bg);
-                cur_col++;
-            }
-
-            uint16_t wfg = (wi == active_idx) ? bg :
-                           ((words[wi].flags & CWX_FLAG_LOW_CONF) ? dim : text);
-            uint16_t wbg = (wi == active_idx) ? yellow : bg;
-
-            for (int ci = 0; ci < wlen && cur_col < max_cols; ci++) {
-                lcd_draw_char((uint16_t)(2u + (uint16_t)cur_col * 6u), row_y[cur_row],
-                              words[wi].text[ci], wfg, wbg);
-                cur_col++;
-            }
+            append_word_cap(m->tr_curr_upcoming, (int)sizeof(m->tr_curr_upcoming), words[i].text, wl);
         }
-    } else if (has_cwx) {
-        draw_str_clip(2u, 28u, cwx->title[0] ? cwx->title : wav_name, 26, cyan, bg);
-    } else {
-        draw_str_clip(2u, 16u, wav_name, 26, cyan, bg);
-        char fmt[32];
-        int fpos = 0;
-        append_u32(fmt, &fpos, (int)sizeof(fmt), winfo->sample_rate / 1000u);
-        append_str(fmt, &fpos, (int)sizeof(fmt), "k ");
-        append_u32(fmt, &fpos, (int)sizeof(fmt), winfo->channels);
-        append_str(fmt, &fpos, (int)sizeof(fmt), "CH ");
-        append_str(fmt, &fpos, (int)sizeof(fmt),
-                   (winfo->format_tag == WAV_FMT_IMA_ADPCM) ? "ADPCM" : "PCM16");
-        fmt[fpos] = '\0';
-        draw_str_clip(2u, 28u, fmt, 26, text, bg);
-
-        /* Stereo Output VU Bar (y=42, w=156, h=8) */
-        uint16_t vu_w = (uint16_t)(((uint32_t)peak_pct * 156u) / 100u);
-        if (vu_w > 156u) {
-            vu_w = 156u;
-        }
-        uint16_t vu_col = (peak_pct > 85u) ? rgb565(255u, 90u, 90u) :
-                          (peak_pct > 55u) ? yellow : green;
-        if (vu_w > 0u) {
-            lcd_fill_rect(2u, 42u, vu_w, 8u, vu_col);
-        }
-        if (vu_w < 156u) {
-            lcd_fill_rect((uint16_t)(2u + vu_w), 42u, (uint16_t)(156u - vu_w), 8u, track);
+        cur_chars += wl + 1;
+        curr_end = i + 1;
+        if (cur_chars >= 22 && i >= active_idx) {
+            break;
         }
     }
 
-    /* Progress Bar (y=59..64) */
-    uint16_t prog_w = 0u;
-    if (dur_ms > 0u) {
-        uint32_t p = pos_ms;
-        uint32_t d = dur_ms;
-        while (d > 0x00FFFFFFu) {
-            p >>= 4;
-            d >>= 4;
-        }
-        if (d > 0u) {
-            prog_w = (uint16_t)((p * 156u) / d);
-        }
-        if (prog_w > 156u) {
-            prog_w = 156u;
-        }
+    for (int i = curr_end; i < nwords && i < curr_end + 5; i++) {
+        append_word_cap(m->tr_next, (int)sizeof(m->tr_next), words[i].text, (int)words[i].text_len);
     }
-    if (prog_w > 0u) {
-        lcd_fill_rect(2u, 59u, prog_w, 5u, cyan);
-    }
-    if (prog_w < 156u) {
-        lcd_fill_rect((uint16_t)(2u + prog_w), 59u, (uint16_t)(156u - prog_w), 5u, track);
-    }
-
-    /* Bottom Footer (y=68..79) */
-    lcd_fill_rect(0u, 66u, 160u, 14u, bg);
-    char foot[32];
-    int pos = 0;
-    append_str(foot, &pos, (int)sizeof(foot), "V:");
-    append_2d(foot, &pos, (int)sizeof(foot), volume);
-    append_str(foot, &pos, (int)sizeof(foot), " E:PL LR:SK B:EX");
-    foot[pos] = '\0';
-    draw_str_clip(2u, 70u, foot, 26, yellow, bg);
 }
 
-void openfw_play_file(exfat_vol_t *vol, const char *dir_path, const char *wav_name)
+int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_name,
+                        ui_model_t *m)
 {
     if (!vol || !wav_name || wav_name[0] == '\0') {
-        return;
+        return 0;
+    }
+
+    ui_model_t local_m;
+    if (!m) {
+        for (uint32_t i = 0u; i < sizeof(local_m); i++) {
+            ((uint8_t *)&local_m)[i] = 0u;
+        }
+        ui_settings_defaults(&local_m.cfg);
+        m = &local_m;
     }
 
     char wav_path[96];
@@ -327,21 +199,21 @@ void openfw_play_file(exfat_vol_t *vol, const char *dir_path, const char *wav_na
 
     exfat_entry_t wav_ent;
     if (exfat_find_path(vol, wav_path, &wav_ent) != 0 || wav_ent.is_dir || wav_ent.size < 44u) {
-        return;
+        return 0;
     }
 
     uint32_t hdr_read = 0u;
     uint32_t hdr_want = (wav_ent.size > 512u) ? 512u : (uint32_t)wav_ent.size;
     if (exfat_read_file(vol, &wav_ent, 0u, g_file_buf, hdr_want, &hdr_read) != 0 || hdr_read < 44u) {
-        return;
+        return 0;
     }
 
     wav_stream_info_t winfo;
     if (wav_parse_stream(g_file_buf, hdr_read, &winfo) != 0) {
-        return;
+        return 0;
     }
     if (winfo.block_align == 0u || winfo.block_align > sizeof(g_file_buf)) {
-        return;
+        return 0;
     }
 
     /* Optional companion Cassini timed-word sidecar (.cwx) */
@@ -357,35 +229,61 @@ void openfw_play_file(exfat_vol_t *vol, const char *dir_path, const char *wav_na
         has_cwx = 1;
     }
 
-    uint8_t volume = 18u;
+    int hp_in = keys_read_hp_detect();
+    uint8_t volume = hp_in ? m->cfg.hp_vol : m->cfg.spk_vol;
+    if (volume > 31u) {
+        volume = 18u;
+    }
     if (audio_dac_start(winfo.sample_rate, volume) != 0) {
-        return;
+        return 0;
     }
 
     lcd_set_rotation(1); /* Landscape 160x80 */
-    lcd_fill_rect(0u, 0u, 160u, 80u, rgb565(0u, 0u, 0u));
 
-    uint32_t data_off     = 0u;
+    uint32_t dur_ms = (has_cwx && cwx.duration_ms > 0u) ? cwx.duration_ms : winfo.duration_ms;
+    str_copy_cap(m->play_file.filename, (int)sizeof(m->play_file.filename), wav_name);
+    m->play_file.duration_sec   = (dur_ms + 500u) / 1000u;
+    m->play_file.has_transcript = (uint8_t)has_cwx;
+    m->play_file.channels       = (uint8_t)winfo.channels;
+    m->play_has_transcript      = has_cwx;
+    m->play_vol_hi              = 0u;
+    m->play_vu_l                = 0u;
+    m->play_vu_r                = 0u;
+
+    uint32_t data_off      = 0u;
     uint32_t played_frames = 0u;
-    uint32_t buf_pos      = 0u;
-    uint32_t buf_frames   = 0u;
-    uint8_t  cur_peak_pct = 0u;
-    int      paused       = 0;
-    int      eof_reached  = 0;
-    uint32_t last_ui_ms   = 0u;
-    int      ui_dirty     = 1;
-    key_id_t prev_k       = KEY_ENTER;
+    uint32_t buf_pos       = 0u;
+    uint32_t buf_frames    = 0u;
+    uint8_t  peak_l_pct    = 0u;
+    uint8_t  peak_r_pct    = 0u;
+    int      paused        = 0;
+    int      eof_reached   = 0;
+    uint32_t last_ui_ms    = 0u;
+    uint32_t last_vol_ms   = 0u;
+    int      ui_dirty      = 1;
+    int      ret_code      = 0;
+    key_id_t prev_k        = KEY_ENTER;
 
     while (1) {
         wdt_feed();
         if (keys_read_rec_switch()) {
+            ret_code = 2;
             break;
         }
 
         uint32_t now = millis();
+        int cur_hp = keys_read_hp_detect();
+        if (cur_hp != hp_in) {
+            hp_in  = cur_hp;
+            volume = hp_in ? m->cfg.hp_vol : m->cfg.spk_vol;
+            audio_dac_set_volume(volume, 0x1FFu);
+            ui_dirty = 1;
+        }
+
         key_id_t k = keys_decode(keys_read_adc());
         if (k != KEY_NONE && k != prev_k) {
             if (k == KEY_BACK) {
+                ret_code = 0;
                 break;
             } else if (k == KEY_ENTER) {
                 if (eof_reached) {
@@ -400,21 +298,37 @@ void openfw_play_file(exfat_vol_t *vol, const char *dir_path, const char *wav_na
                 }
                 audio_dac_set_mute(paused);
                 ui_dirty = 1;
-            } else if (k == KEY_VOL_UP) {
-                if (volume < 31u) {
+            } else if (k == KEY_VOL_UP || k == KEY_VOL_DOWN) {
+                if (k == KEY_VOL_UP && volume < 31u) {
                     volume++;
-                    audio_dac_set_volume(volume, 0x1FFu);
-                }
-                ui_dirty = 1;
-            } else if (k == KEY_VOL_DOWN) {
-                if (volume > 0u) {
+                } else if (k == KEY_VOL_DOWN && volume > 0u) {
                     volume--;
-                    audio_dac_set_volume(volume, 0x1FFu);
                 }
-                ui_dirty = 1;
+                if (hp_in) {
+                    m->cfg.hp_vol = volume;
+                } else {
+                    m->cfg.spk_vol = volume;
+                }
+                audio_dac_set_volume(volume, 0x1FFu);
+                last_vol_ms = now ? now : 1u;
+                ui_dirty    = 1;
             } else if (k == KEY_LEFT || k == KEY_RIGHT) {
-                int64_t delta = (int64_t)winfo.sample_rate * 10LL;
-                int64_t target = (int64_t)played_frames + ((k == KEY_RIGHT) ? delta : -delta);
+                if (eof_reached && k == KEY_RIGHT) {
+                    ret_code = 1;
+                    break;
+                }
+                if (!has_cwx && m->cfg.skip_mode == UI_SKIP_TRACK) {
+                    ret_code = (k == KEY_RIGHT) ? 1 : -1;
+                    break;
+                }
+                int32_t step_s;
+                if (m->cfg.skip_mode == UI_SKIP_5_10) {
+                    step_s = (k == KEY_RIGHT) ? 10 : -5;
+                } else {
+                    step_s = (k == KEY_RIGHT) ? 30 : -10;
+                }
+                int64_t delta  = (int64_t)winfo.sample_rate * (int64_t)step_s;
+                int64_t target = (int64_t)played_frames + delta;
                 if (target < 0) {
                     target = 0;
                 }
@@ -447,9 +361,10 @@ void openfw_play_file(exfat_vol_t *vol, const char *dir_path, const char *wav_na
             for (int iter = 0; iter < 4; iter++) {
                 if (buf_pos >= buf_frames) {
                     if (data_off >= winfo.data_bytes) {
-                        eof_reached  = 1;
-                        cur_peak_pct = 0u;
-                        ui_dirty     = 1;
+                        eof_reached = 1;
+                        peak_l_pct  = 0u;
+                        peak_r_pct  = 0u;
+                        ui_dirty    = 1;
                         break;
                     }
                     uint32_t rem = winfo.data_bytes - data_off;
@@ -510,30 +425,32 @@ void openfw_play_file(exfat_vol_t *vol, const char *dir_path, const char *wav_na
                         decoded_frames = 1024u;
                     }
 
-                    int32_t peak = 0;
+                    int32_t pl = 0, pr = 0;
                     if (winfo.channels == 1u) {
                         for (uint32_t i = 0u; i < decoded_frames; i++) {
                             int16_t s = g_dec_pcm[i];
                             int32_t a = (s < 0) ? -(int32_t)s : (int32_t)s;
-                            if (a > peak) peak = a;
+                            if (a > pl) pl = a;
                             g_stereo_tx[i * 2u + 0u] = s;
                             g_stereo_tx[i * 2u + 1u] = s;
                         }
+                        pr = pl;
                     } else {
                         for (uint32_t i = 0u; i < decoded_frames; i++) {
                             int16_t l = g_dec_pcm[i * 2u + 0u];
                             int16_t r = g_dec_pcm[i * 2u + 1u];
                             int32_t al = (l < 0) ? -(int32_t)l : (int32_t)l;
                             int32_t ar = (r < 0) ? -(int32_t)r : (int32_t)r;
-                            if (al > peak) peak = al;
-                            if (ar > peak) peak = ar;
+                            if (al > pl) pl = al;
+                            if (ar > pr) pr = ar;
                             g_stereo_tx[i * 2u + 0u] = l;
                             g_stereo_tx[i * 2u + 1u] = r;
                         }
                     }
-                    cur_peak_pct = (uint8_t)((peak * 100) / 32767);
-                    buf_pos      = 0u;
-                    buf_frames   = decoded_frames;
+                    peak_l_pct = (uint8_t)((pl * 100) / 32767);
+                    peak_r_pct = (uint8_t)((pr * 100) / 32767);
+                    buf_pos    = 0u;
+                    buf_frames = decoded_frames;
                 }
 
                 if (buf_pos < buf_frames) {
@@ -552,13 +469,27 @@ void openfw_play_file(exfat_vol_t *vol, const char *dir_path, const char *wav_na
             last_ui_ms = now;
             ui_dirty   = 0;
             pmu_poll_charge_manage();
+            rtc_get(&m->now);
+            uint32_t mv = pmu_read_vbat_mv();
+            m->batt_mv    = (uint16_t)mv;
+            m->batt_pct   = vbat_mv_to_pct(mv);
+            m->charging   = (pmu_get_charge_state() == PMU_CHG_CHARGING) ? 1 : 0;
+            m->hp_plugged = hp_in;
+
             uint32_t pos_ms = frames_to_ms(played_frames, winfo.sample_rate);
-            uint32_t dur_ms = (has_cwx && cwx.duration_ms > 0u) ? cwx.duration_ms : winfo.duration_ms;
             if (pos_ms > dur_ms && dur_ms > 0u) {
                 pos_ms = dur_ms;
             }
-            draw_player_chrome(wav_name, &winfo, &cwx, has_cwx, pos_ms, dur_ms,
-                               volume, paused, eof_reached, keys_read_hp_detect(), cur_peak_pct);
+            m->play_pos_sec = pos_ms / 1000u;
+            m->play_state   = eof_reached ? 2u : (paused ? 1u : 0u);
+            m->play_vol_hi  = (last_vol_ms != 0u && (uint32_t)(now - last_vol_ms) < 1500u) ? 1u : 0u;
+            m->play_vu_l    = (paused || eof_reached) ? 0u : peak_l_pct;
+            m->play_vu_r    = (paused || eof_reached) ? 0u : peak_r_pct;
+
+            if (has_cwx) {
+                populate_transcript_lines(m, &cwx, pos_ms);
+            }
+            ui_render_screen(UI_SCR_PLAYER, m);
         }
 
         if (paused || eof_reached || (buf_pos < buf_frames && audio_dac_is_busy())) {
@@ -567,10 +498,17 @@ void openfw_play_file(exfat_vol_t *vol, const char *dir_path, const char *wav_na
     }
 
     audio_dac_stop();
-    lcd_set_rotation(1); /* Keep landscape 160x80 */
+    m->play_file.resume_sec = eof_reached ? 0u : m->play_pos_sec;
+    lcd_set_rotation(1);
 
     while (keys_decode(keys_read_adc()) == KEY_BACK) {
         wdt_feed();
         mdelay(20u);
     }
+    return ret_code;
+}
+
+void openfw_play_file(exfat_vol_t *vol, const char *dir_path, const char *wav_name)
+{
+    (void)openfw_play_file_ui(vol, dir_path, wav_name, (ui_model_t *)0);
 }

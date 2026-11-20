@@ -535,6 +535,36 @@ uint16_t lcd_blend_rgb565(uint16_t fg, uint16_t bg, uint8_t alpha4)
     return (uint16_t)((r << 11) | (g << 5) | b);
 }
 
+/* Decode next UTF-8 codepoint and map UI typography glyphs to slots 0x7F..0x83 */
+static uint8_t aa_next_slot(const char **ps)
+{
+    const uint8_t *p = (const uint8_t *)(*ps);
+    uint8_t c0 = p[0];
+    if (c0 < 0x80u) {
+        *ps = (const char *)(p + 1);
+        return c0;
+    }
+    if ((c0 & 0xE0u) == 0xC0u && p[1] != 0u) {
+        uint32_t cp = ((uint32_t)(c0 & 0x1Fu) << 6) | (uint32_t)(p[1] & 0x3Fu);
+        *ps = (const char *)(p + 2);
+        if (cp == 0x00B7u) return 0x7Fu; /* · middle dot */
+        if (cp == 0x00D7u) return 0x80u; /* × multiply */
+        if (cp == 0x00B1u) return 0x83u; /* ± plus-minus */
+        return (uint8_t)'?';
+    }
+    if ((c0 & 0xF0u) == 0xE0u && p[1] != 0u && p[2] != 0u) {
+        uint32_t cp = ((uint32_t)(c0 & 0x0Fu) << 12)
+                    | ((uint32_t)(p[1] & 0x3Fu) << 6)
+                    | (uint32_t)(p[2] & 0x3Fu);
+        *ps = (const char *)(p + 3);
+        if (cp == 0x2212u) return 0x81u; /* − minus */
+        if (cp == 0x2026u) return 0x82u; /* … ellipsis */
+        return (uint8_t)'?';
+    }
+    *ps = (const char *)(p + 1);
+    return (uint8_t)'?';
+}
+
 static const aa_glyph_t *aa_lookup(const aa_font_t *font, uint8_t ch)
 {
     if (!font) {
@@ -556,7 +586,8 @@ uint16_t lcd_measure_str_aa(const char *s, const aa_font_t *font)
     }
     uint16_t w = 0u;
     while (*s != '\0') {
-        const aa_glyph_t *g = aa_lookup(font, (uint8_t)*s++);
+        uint8_t slot = aa_next_slot(&s);
+        const aa_glyph_t *g = aa_lookup(font, slot);
         if (g) {
             w = (uint16_t)(w + g->x_adv);
         }
@@ -618,7 +649,8 @@ void lcd_draw_str_aa(int16_t x, int16_t y, const char *s,
     }
     int16_t cx = x;
     while (*s != '\0') {
-        const aa_glyph_t *g = aa_lookup(font, (uint8_t)*s++);
+        uint8_t slot = aa_next_slot(&s);
+        const aa_glyph_t *g = aa_lookup(font, slot);
         if (!g) {
             continue;
         }
@@ -628,6 +660,15 @@ void lcd_draw_str_aa(int16_t x, int16_t y, const char *s,
             break;
         }
     }
+}
+
+void lcd_draw_str_aa_bl(int16_t x, int16_t baseline_y, const char *s,
+                        const aa_font_t *font, uint16_t fg, uint16_t bg)
+{
+    if (!font) {
+        return;
+    }
+    lcd_draw_str_aa(x, (int16_t)(baseline_y - (int16_t)font->ascent), s, font, fg, bg);
 }
 
 void lcd_draw_str_aa_trunc(int16_t x, int16_t y, const char *s,
@@ -642,11 +683,13 @@ void lcd_draw_str_aa_trunc(int16_t x, int16_t y, const char *s,
         return;
     }
 
-    uint16_t ell_w = lcd_measure_str_aa("...", font);
+    static const char ell[] = "\xE2\x80\xA6"; /* U+2026 … */
+    uint16_t ell_w = lcd_measure_str_aa(ell, font);
     int16_t  cx    = x;
     uint16_t used  = 0u;
     while (*s != '\0') {
-        const aa_glyph_t *g = aa_lookup(font, (uint8_t)*s++);
+        uint8_t slot = aa_next_slot(&s);
+        const aa_glyph_t *g = aa_lookup(font, slot);
         if (!g) {
             continue;
         }
@@ -658,7 +701,7 @@ void lcd_draw_str_aa_trunc(int16_t x, int16_t y, const char *s,
         used = (uint16_t)(used + g->x_adv);
     }
     if (ell_w <= max_w) {
-        lcd_draw_str_aa(cx, y, "...", font, fg, bg);
+        lcd_draw_str_aa(cx, y, ell, font, fg, bg);
     }
 }
 
@@ -773,6 +816,165 @@ void lcd_fill_rrect_aa(int16_t x, int16_t y, int16_t w, int16_t h, int16_t r,
                 uint8_t a4 = (uint8_t)((hits * 15u + 8u) / 16u);
                 p = lcd_blend_rgb565(fg, bg, a4);
             }
+            if (!have_p0) {
+                p0 = p;
+                have_p0 = 1u;
+            } else {
+                st7735s_write_data(pack_be16_pair(p0, p), 4u);
+                have_p0 = 0u;
+            }
+        }
+    }
+    if (have_p0) {
+        st7735s_write_data(((uint32_t)(p0 >> 8)) | (((uint32_t)(p0 & 0xFFu)) << 8), 2u);
+    }
+}
+
+static inline int32_t tri_edge(int32_t ax, int32_t ay, int32_t bx, int32_t by, int32_t px, int32_t py)
+{
+    return (px - ax) * (by - ay) - (py - ay) * (bx - ax);
+}
+
+void lcd_fill_tri_aa(int16_t x0, int16_t y0, int16_t x1, int16_t y1,
+                     int16_t x2, int16_t y2, uint16_t fg, uint16_t bg)
+{
+    int16_t min_x = x0;
+    if (x1 < min_x) min_x = x1;
+    if (x2 < min_x) min_x = x2;
+    int16_t max_x = x0;
+    if (x1 > max_x) max_x = x1;
+    if (x2 > max_x) max_x = x2;
+    int16_t min_y = y0;
+    if (y1 < min_y) min_y = y1;
+    if (y2 < min_y) min_y = y2;
+    int16_t max_y = y0;
+    if (y1 > max_y) max_y = y1;
+    if (y2 > max_y) max_y = y2;
+
+    if (max_x < 0 || max_y < 0 || min_x >= (int16_t)g_lcd_w || min_y >= (int16_t)g_lcd_h) {
+        return;
+    }
+    if (min_x < 0) min_x = 0;
+    if (min_y < 0) min_y = 0;
+    if (max_x >= (int16_t)g_lcd_w) max_x = (int16_t)(g_lcd_w - 1);
+    if (max_y >= (int16_t)g_lcd_h) max_y = (int16_t)(g_lcd_h - 1);
+
+    /* Ensure consistent winding */
+    int32_t ax = (int32_t)x0 * 8, ay = (int32_t)y0 * 8;
+    int32_t bx = (int32_t)x1 * 8, by = (int32_t)y1 * 8;
+    int32_t cx = (int32_t)x2 * 8, cy = (int32_t)y2 * 8;
+    int32_t area = tri_edge(ax, ay, bx, by, cx, cy);
+    if (area == 0) {
+        return;
+    }
+    if (area < 0) {
+        int32_t tx = bx; bx = cx; cx = tx;
+        int32_t ty = by; by = cy; cy = ty;
+    }
+
+    lcd_set_window((uint16_t)min_x, (uint16_t)min_y, (uint16_t)max_x, (uint16_t)max_y);
+    uint32_t have_p0 = 0u;
+    uint16_t p0      = 0u;
+
+    for (int16_t py = min_y; py <= max_y; py++) {
+        for (int16_t px = min_x; px <= max_x; px++) {
+            uint32_t hits = 0u;
+            for (int32_t sy = 0; sy < 4; sy++) {
+                int32_t qy = (int32_t)py * 8 + sy * 2 + 1;
+                for (int32_t sx = 0; sx < 4; sx++) {
+                    int32_t qx = (int32_t)px * 8 + sx * 2 + 1;
+                    if (tri_edge(ax, ay, bx, by, qx, qy) >= 0 &&
+                        tri_edge(bx, by, cx, cy, qx, qy) >= 0 &&
+                        tri_edge(cx, cy, ax, ay, qx, qy) >= 0) {
+                        hits++;
+                    }
+                }
+            }
+            uint8_t  a4 = (uint8_t)((hits * 15u + 8u) / 16u);
+            uint16_t p  = lcd_blend_rgb565(fg, bg, a4);
+            if (!have_p0) {
+                p0 = p;
+                have_p0 = 1u;
+            } else {
+                st7735s_write_data(pack_be16_pair(p0, p), 4u);
+                have_p0 = 0u;
+            }
+        }
+    }
+    if (have_p0) {
+        st7735s_write_data(((uint32_t)(p0 >> 8)) | (((uint32_t)(p0 & 0xFFu)) << 8), 2u);
+    }
+}
+
+void lcd_draw_line_aa(int16_t x0, int16_t y0, int16_t x1, int16_t y1,
+                      uint8_t width_px, uint16_t fg, uint16_t bg)
+{
+    if (width_px == 0u) {
+        width_px = 1u;
+    }
+    int16_t pad = (int16_t)(width_px + 1u);
+    int16_t min_x = (int16_t)((x0 < x1 ? x0 : x1) - pad);
+    int16_t max_x = (int16_t)((x0 > x1 ? x0 : x1) + pad);
+    int16_t min_y = (int16_t)((y0 < y1 ? y0 : y1) - pad);
+    int16_t max_y = (int16_t)((y0 > y1 ? y0 : y1) + pad);
+
+    if (max_x < 0 || max_y < 0 || min_x >= (int16_t)g_lcd_w || min_y >= (int16_t)g_lcd_h) {
+        return;
+    }
+    if (min_x < 0) min_x = 0;
+    if (min_y < 0) min_y = 0;
+    if (max_x >= (int16_t)g_lcd_w) max_x = (int16_t)(g_lcd_w - 1);
+    if (max_y >= (int16_t)g_lcd_h) max_y = (int16_t)(g_lcd_h - 1);
+
+    /* Coordinates in 1/8-pixel units (center of pixel (x,y) is (8x+4, 8y+4)) */
+    int32_t ax = (int32_t)x0 * 8 + 4;
+    int32_t ay = (int32_t)y0 * 8 + 4;
+    int32_t bx = (int32_t)x1 * 8 + 4;
+    int32_t by = (int32_t)y1 * 8 + 4;
+    int32_t vx = bx - ax;
+    int32_t vy = by - ay;
+    int32_t vlen2 = vx * vx + vy * vy;
+    int32_t rad = (int32_t)width_px * 4; /* half-width in 1/8-pixel units */
+    int32_t rad2 = rad * rad;
+
+    lcd_set_window((uint16_t)min_x, (uint16_t)min_y, (uint16_t)max_x, (uint16_t)max_y);
+    uint32_t have_p0 = 0u;
+    uint16_t p0      = 0u;
+
+    for (int16_t py = min_y; py <= max_y; py++) {
+        for (int16_t px = min_x; px <= max_x; px++) {
+            uint32_t hits = 0u;
+            for (int32_t sy = 0; sy < 4; sy++) {
+                int32_t qy = (int32_t)py * 8 + sy * 2 + 1;
+                for (int32_t sx = 0; sx < 4; sx++) {
+                    int32_t qx = (int32_t)px * 8 + sx * 2 + 1;
+                    int32_t wx = qx - ax;
+                    int32_t wy = qy - ay;
+                    int32_t dx, dy;
+                    if (vlen2 == 0) {
+                        dx = wx; dy = wy;
+                    } else {
+                        int32_t dot = wx * vx + wy * vy;
+                        if (dot <= 0) {
+                            dx = wx; dy = wy;
+                        } else if (dot >= vlen2) {
+                            dx = qx - bx; dy = qy - by;
+                        } else {
+                            /* Distance squared to segment = (wx*vy - wy*vx)^2 / vlen2 */
+                            int64_t cross = (int64_t)wx * (int64_t)vy - (int64_t)wy * (int64_t)vx;
+                            if (cross * cross <= (int64_t)rad2 * (int64_t)vlen2) {
+                                hits++;
+                            }
+                            continue;
+                        }
+                    }
+                    if (dx * dx + dy * dy <= rad2) {
+                        hits++;
+                    }
+                }
+            }
+            uint8_t  a4 = (uint8_t)((hits * 15u + 8u) / 16u);
+            uint16_t p  = lcd_blend_rgb565(fg, bg, a4);
             if (!have_p0) {
                 p0 = p;
                 have_p0 = 1u;

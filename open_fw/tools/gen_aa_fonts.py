@@ -3,8 +3,15 @@
 Generate packed 4-bit (16-level) grayscale anti-aliased proportional C font
 tables for Cassini OpenFW (SL6801 ST7735S 160x80 RGB565 display).
 
-Each glyph stores its tight bounding box (w, h, x_off, y_off, x_adv) and
-4-bit alpha coverage packed 2 pixels per byte (high nibble first).
+Features:
+  - Printable ASCII (0x20..0x7E, 95 glyphs)
+  - 5 UI typography glyphs (0x7F..0x83 internal slots):
+      0x7F: U+00B7 middle dot   (·)
+      0x80: U+00D7 multiply     (×)
+      0x81: U+2212 minus        (−)
+      0x82: U+2026 ellipsis     (…)
+      0x83: U+00B1 plus-minus   (±)
+  - Tabular digits ('0'..'9' share a uniform advance width so timers never jitter)
 
 Usage:
     python3 open_fw/tools/gen_aa_fonts.py --out open_fw/src/aa_fonts.c
@@ -31,7 +38,14 @@ DEFAULT_BOLD = [
 ]
 
 FIRST_CHAR = 0x20
-LAST_CHAR = 0x7E
+EXTRA_CHARS = [
+    (0x00B7, "MIDDLE DOT"),
+    (0x00D7, "MULTIPLY"),
+    (0x2212, "MINUS"),
+    (0x2026, "ELLIPSIS"),
+    (0x00B1, "PLUS-MINUS"),
+]
+LAST_CHAR = 0x7E + len(EXTRA_CHARS)
 
 
 def pick_font(override: str | None, candidates: list[str]) -> str:
@@ -49,12 +63,22 @@ def rasterize_font(ttf_path: str, px_size: int):
     font = ImageFont.truetype(ttf_path, px_size)
     ascent, descent = font.getmetrics()
     line_height = ascent + descent
+
+    # Compute uniform tabular advance for digits '0'..'9'
+    digit_adv = max(int(round(font.getlength(str(d)))) for d in range(10))
+
     glyphs = []
     blob = bytearray()
 
-    for code in range(FIRST_CHAR, LAST_CHAR + 1):
-        ch = chr(code)
-        adv = max(1, int(round(font.getlength(ch))))
+    chars_list = [(c, chr(c)) for c in range(FIRST_CHAR, 0x7F)]
+    for idx, (cp, _) in enumerate(EXTRA_CHARS):
+        chars_list.append((0x7F + idx, chr(cp)))
+
+    for slot, ch in chars_list:
+        raw_adv = max(1, int(round(font.getlength(ch))))
+        is_digit = "0" <= ch <= "9"
+        adv = digit_adv if is_digit else raw_adv
+
         if ch == " ":
             glyphs.append((0, 0, 0, 0, adv, 0))
             continue
@@ -74,6 +98,9 @@ def rasterize_font(ttf_path: str, px_size: int):
         gw = x1 - x0
         gh = y1 - y0
         x_off = x0 - pad
+        if is_digit:
+            # Center glyph cleanly inside uniform tabular cell
+            x_off = (digit_adv - gw) // 2
         y_off = y0 - pad
         data_off = len(blob)
 
@@ -95,6 +122,7 @@ def rasterize_font(ttf_path: str, px_size: int):
         "px_size": px_size,
         "ascent": ascent,
         "line_height": line_height,
+        "digit_adv": digit_adv,
         "glyphs": glyphs,
         "blob": bytes(blob),
     }
@@ -104,14 +132,19 @@ def format_font_c(sym_name: str, desc: str, data: dict) -> str:
     glyphs = data["glyphs"]
     blob = data["blob"]
     lines = [
-        f"/* {desc} ({len(glyphs)} glyphs, {len(blob)} bytes packed 4-bit alpha) */",
+        f"/* {desc} ({len(glyphs)} glyphs, digit_adv={data['digit_adv']}px, {len(blob)} bytes packed 4-bit alpha) */",
         f"static const aa_glyph_t {sym_name}_glyphs[{len(glyphs)}] = {{",
     ]
     for idx, (gw, gh, xo, yo, adv, off) in enumerate(glyphs):
-        code = FIRST_CHAR + idx
-        ch_label = chr(code).replace("\\", "\\\\").replace("*/", "* /")
+        slot = FIRST_CHAR + idx
+        if slot <= 0x7E:
+            ch_label = chr(slot).replace("\\", "\\\\").replace("*/", "* /")
+            comment = f"0x{slot:02X} '{ch_label}'"
+        else:
+            cp, name = EXTRA_CHARS[slot - 0x7F]
+            comment = f"0x{slot:02X} U+{cp:04X} {name}"
         lines.append(
-            f"    {{ {gw:2d}u, {gh:2d}u, {xo:3d}, {yo:3d}, {adv:2d}u, {off:5d}u }}, /* 0x{code:02X} '{ch_label}' */"
+            f"    {{ {gw:2d}u, {gh:2d}u, {xo:3d}, {yo:3d}, {adv:2d}u, {off:5d}u }}, /* {comment} */"
         )
     lines.append("};")
     lines.append("")
@@ -167,7 +200,10 @@ def main() -> int:
         n_blob = len(font_data["blob"])
         n_tbl = len(font_data["glyphs"]) * 8
         total_bytes += n_blob + n_tbl
-        print(f"{sym:14s} ({desc:22s}): {n_blob:5d} B bitmap + {n_tbl:4d} B table = {n_blob + n_tbl:5d} B")
+        print(
+            f"{sym:14s} ({desc:22s}, digit={font_data['digit_adv']:2d}px): "
+            f"{n_blob:5d} B bitmap + {n_tbl:4d} B table = {n_blob + n_tbl:5d} B"
+        )
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)

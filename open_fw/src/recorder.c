@@ -292,6 +292,11 @@ int recorder_is_saving(void)
     return g_rec_saving;
 }
 
+int recorder_is_vor_waiting(void)
+{
+    return (g_rec_active && g_vor.enabled && !g_vor.gate_open) ? 1 : 0;
+}
+
 uint32_t recorder_get_seconds(void)
 {
     uint32_t bps = 32000u * (uint32_t)(g_active_channels ? g_active_channels : 1u);

@@ -33,6 +33,7 @@ from typing import Callable, TypeVar
 
 
 DEFAULT_QEMU = "/tmp/sl6801-emu/work/build/qemu-system-arm"
+REPO_ROOT = Path(__file__).resolve().parents[2]
 BUILD_DIR = Path("/tmp/sl6801_openfw")
 SL6801_ROM_SIZE = 0x5C000
 LCD_STRIDE = 128
@@ -100,6 +101,56 @@ def write_png_rgb(path: Path, width: int, height: int, rgb_bytes: bytes) -> None
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(png)
+
+
+def decode_fb_to_rgb24(
+    fb_raw: bytes, landscape: bool = True, scale: int = 1
+) -> tuple[int, int, bytes, int, int]:
+    """Decode active ST7735S GRAM pane (px=26..105, py=0..159) to scaled RGB24.
+
+    When MADCTL MV=1 (landscape 160x80) is active in QEMU, pixels are stored in
+    portrait GRAM at px = dcs_cy (26..105), py = 159 - (dcs_cx - 1) (0..159),
+    so landscape (lx, ly) maps back from (px = 26 + ly, py = 159 - lx).
+    """
+    if scale < 1:
+        raise ValueError(f"scale must be >= 1, got {scale}")
+
+    base_w, base_h = (LCD_H, LCD_W) if landscape else (LCD_W, LCD_H)
+    unique_colors: set[int] = set()
+    nonblack = 0
+    out_w = base_w * scale
+    out_h = base_h * scale
+    rgb = bytearray()
+
+    for y in range(base_h):
+        row = bytearray()
+        for x in range(base_w):
+            if landscape:
+                px_x = LCD_X_OFF + y
+                px_y = (LCD_H - 1) - x
+            else:
+                px_x = LCD_X_OFF + x
+                px_y = y
+            px, = struct.unpack_from("<H", fb_raw, (px_y * LCD_STRIDE + px_x) * 2)
+            unique_colors.add(px)
+            if px != 0:
+                nonblack += 1
+            r5 = (px >> 11) & 0x1F
+            g6 = (px >> 5) & 0x3F
+            b5 = px & 0x1F
+            pix = bytes((
+                (r5 << 3) | (r5 >> 2),
+                (g6 << 2) | (g6 >> 4),
+                (b5 << 3) | (b5 >> 2),
+            ))
+            if scale == 1:
+                row.extend(pix)
+            else:
+                row.extend(pix * scale)
+        for _ in range(scale):
+            rgb.extend(row)
+
+    return out_w, out_h, bytes(rgb), nonblack, len(unique_colors)
 
 
 class GdbRspClient:
@@ -204,9 +255,9 @@ def prepare_sd_image(img_path: Path, size_mb: int = 8) -> None:
 
 
 def build_machine_arg(
-    qemu_rom: Path, stub: Path, flash: Path, sd_img: Path, kadc_ch1: int
+    qemu_rom: Path, stub: Path, flash: Path, sd_img: Path, kadc_ch1: int, vbus_off: bool = False
 ) -> str:
-    return (
+    arg = (
         f"smartlink-sl6801,"
         f"rom={qemu_rom},"
         f"rom-stub={stub},"
@@ -218,6 +269,9 @@ def build_machine_arg(
         f"kadc-raw-ch1={kadc_ch1},"
         f"pmu-battery-code=90"
     )
+    if vbus_off:
+        arg += ",pmu-vbus=off"
+    return arg
 
 
 def run_qemu_session(
@@ -288,13 +342,38 @@ def main() -> int:
     ap.add_argument("--qemu", default=os.environ.get("QEMU_SL6801", DEFAULT_QEMU))
     ap.add_argument("--elf", type=Path, default=BUILD_DIR / "open_fw.elf")
     ap.add_argument("--stub", type=Path, default=BUILD_DIR / "qemu_boot_stub.bin")
-    ap.add_argument("--rom", type=Path, default=Path("../dumps/bootrom_384K.bin"))
-    ap.add_argument("--flash", type=Path, default=Path("../dumps/firmware_2M_openfw.bin"))
+    ap.add_argument("--rom", type=Path, default=REPO_ROOT / "dumps/bootrom_384K.bin")
+    ap.add_argument("--flash", type=Path, default=REPO_ROOT / "dumps/firmware_2M_openfw.bin")
     ap.add_argument("--boot-seconds", type=float, default=2.0)
     ap.add_argument("--keys-seconds", type=float, default=1.2)
     ap.add_argument("--skip-keys", action="store_true", help="Skip KEY_ENTER -> USB MSC check")
+    ap.add_argument("--vbus-off", action="store_true", help="Boot unplugged on battery (pmu-vbus=off)")
     ap.add_argument("--png-out", type=Path, default=BUILD_DIR / "qemu_lcd.png")
+    orient = ap.add_mutually_exclusive_group()
+    orient.add_argument(
+        "--landscape",
+        dest="landscape",
+        action="store_true",
+        default=True,
+        help="Capture 160x80 landscape image from MADCTL MV=1 GRAM mapping (default)",
+    )
+    orient.add_argument(
+        "--portrait",
+        dest="landscape",
+        action="store_false",
+        help="Capture raw 80x160 portrait GRAM pane without landscape un-rotation",
+    )
+    ap.add_argument(
+        "--scale",
+        type=int,
+        default=3,
+        help="Integer nearest-neighbor PNG scale factor (default: 3 -> 480x240 landscape)",
+    )
     args = ap.parse_args()
+
+    if args.scale < 1:
+        print(f"ERROR: --scale must be >= 1 (got {args.scale})", file=sys.stderr)
+        return 1
 
     qemu_bin = Path(args.qemu)
     if not qemu_bin.is_file():
@@ -354,7 +433,9 @@ def main() -> int:
             )
 
         try:
-            boot_machine = build_machine_arg(qemu_rom, args.stub, args.flash, sd_img, kadc_ch1=4095)
+            boot_machine = build_machine_arg(
+                qemu_rom, args.stub, args.flash, sd_img, kadc_ch1=4095, vbus_off=args.vbus_off
+            )
             boot_res, uart_stderr = run_qemu_session(qemu_bin, boot_machine, inspect_boot)
         except (RuntimeError, TimeoutError) as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
@@ -368,22 +449,11 @@ def main() -> int:
         sp, lr, pc = regs[13], regs[14], regs[15]
         xpsr = regs[16] if len(regs) > 16 else 0
 
-        # Convert active 80x160 pane (x=26..105, y=0..159) to RGB24 PNG
-        rgb = bytearray(LCD_W * LCD_H * 3)
-        unique_colors: set[int] = set()
-        nonblack = 0
-        for y in range(LCD_H):
-            for x in range(LCD_W):
-                px, = struct.unpack_from("<H", fb_raw, (y * LCD_STRIDE + (LCD_X_OFF + x)) * 2)
-                unique_colors.add(px)
-                if px != 0:
-                    nonblack += 1
-                r = ((px >> 11) & 0x1F) << 3
-                g = ((px >> 5) & 0x3F) << 2
-                b = (px & 0x1F) << 3
-                idx = (y * LCD_W + x) * 3
-                rgb[idx : idx + 3] = bytes((r, g, b))
-        write_png_rgb(args.png_out, LCD_W, LCD_H, bytes(rgb))
+        # Convert active GRAM pane (px=26..105, py=0..159) to landscape (160x80) or portrait (80x160) PNG
+        out_w, out_h, rgb, nonblack, n_colors = decode_fb_to_rgb24(
+            fb_raw, landscape=args.landscape, scale=args.scale
+        )
+        write_png_rgb(args.png_out, out_w, out_h, rgb)
 
         print(f"CPU state: PC=0x{pc:08x} SP=0x{sp:08x} LR=0x{lr:08x} xPSR=0x{xpsr:08x}")
         print(
@@ -405,9 +475,10 @@ def main() -> int:
             f"SDIO/FS:   sd_init={sd_init_ok} sdhc={sd_sdhc} rca=0x{sd_rca:04x} "
             f"sectors={sd_sectors} mounted={sd_mounted}"
         )
+        mode_str = "landscape 160x80" if args.landscape else "portrait 80x160"
         print(
-            f"LCD FB:    {LCD_W}x{LCD_H} @ 0x{FB_ADDR:08x}: nonblack={nonblack}/{LCD_W * LCD_H} "
-            f"unique_colors={len(unique_colors)} -> {args.png_out}"
+            f"LCD FB:    {mode_str} ({out_w}x{out_h} @{args.scale}x) @ 0x{FB_ADDR:08x}: "
+            f"nonblack={nonblack}/{LCD_W * LCD_H} unique_colors={n_colors} -> {args.png_out}"
         )
 
         failures = []
@@ -427,9 +498,9 @@ def main() -> int:
             failures.append("open_fw did not reach main loop banner")
         if sd_init_ok != 1 or sd_mounted != 1:
             failures.append(f"SD/exFAT mount failed in QEMU (sd_init={sd_init_ok}, mounted={sd_mounted})")
-        if nonblack < 400 or len(unique_colors) < 6:
+        if nonblack < 400 or n_colors < 6:
             failures.append(
-                f"LCD framebuffer appears blank or corrupted (nonblack={nonblack}, colors={len(unique_colors)})"
+                f"LCD framebuffer appears blank or corrupted (nonblack={nonblack}, colors={n_colors})"
             )
 
         if not args.skip_keys:

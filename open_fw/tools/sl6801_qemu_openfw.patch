@@ -11,7 +11,7 @@ index 8948261..0b93c6a 100644
  #include "qemu/timer.h"
  #include "hw/sysbus.h"
 diff --git a/emulator/qemu/smartlink_sl6801.c b/emulator/qemu/smartlink_sl6801.c
-index 26e7552..b582e00 100644
+index 26e7552..dc80ed3 100644
 --- a/emulator/qemu/smartlink_sl6801.c
 +++ b/emulator/qemu/smartlink_sl6801.c
 @@ -234,6 +234,8 @@ struct SL6801MachineState {
@@ -23,7 +23,15 @@ index 26e7552..b582e00 100644
      MemoryRegion io_cpld;
      MemoryRegion io_rcc;
      uint32_t rcc_dma_status;
-@@ -1118,6 +1120,32 @@ static void sl6801_console_write(void *opaque, hwaddr offset,
+@@ -277,6 +279,7 @@ struct SL6801MachineState {
+      * framebuffer so the real panel content is visible to the UI bridge.
+      */
+     uint8_t dcs_cmd;
++    uint8_t dcs_madctl;
+     uint8_t dcs_param[16];
+     unsigned dcs_nparam;
+     uint32_t dcs_value;
+@@ -1118,6 +1121,32 @@ static void sl6801_console_write(void *opaque, hwaddr offset,
      }
  }
  
@@ -56,7 +64,39 @@ index 26e7552..b582e00 100644
  static bool sl6801_rtc_localtime(SL6801MachineState *s, struct tm *tmv)
  {
      time_t now;
-@@ -2209,14 +2237,27 @@ static void sl6801_lcd2_write(void *opaque, hwaddr offset, uint64_t value,
+@@ -1847,6 +1876,10 @@ static void sl6801_lcd2_param(SL6801MachineState *s, uint8_t b)
+     if (s->dcs_nparam < sizeof(s->dcs_param)) {
+         s->dcs_param[s->dcs_nparam++] = b;
+     }
++    if (s->dcs_cmd == 0x36 && s->dcs_nparam == 1) {
++        s->dcs_madctl = b;
++        return;
++    }
+     if (s->dcs_nparam != 4) {
+         return;
+     }
+@@ -1867,9 +1900,18 @@ static void sl6801_lcd2_param(SL6801MachineState *s, uint8_t b)
+ static void sl6801_lcd2_put_pixel(SL6801MachineState *s, uint16_t v)
+ {
+     uint16_t *fb = (uint16_t *)memory_region_get_ram_ptr(&s->fb);
++    uint16_t px = s->dcs_cx;
++    uint16_t py = s->dcs_cy;
+ 
+-    if (s->dcs_cx < 128 && s->dcs_cy < 160) {
+-        fb[s->dcs_cy * 128 + s->dcs_cx] = v;
++    if (s->dcs_madctl & 0x20) {
++        /* Landscape MV=1 (x=1..160, y=26..105) -> portrait GRAM (px=26..105, py=0..159) */
++        uint16_t lx = (s->dcs_cx > 0) ? (s->dcs_cx - 1) : 0;
++        px = s->dcs_cy;
++        py = (lx < 160) ? (159 - lx) : 159;
++    }
++
++    if (px < 128 && py < 160) {
++        fb[py * 128 + px] = v;
+         s->dcs_dirty = true;
+     }
+ 
+@@ -2209,14 +2251,27 @@ static void sl6801_lcd2_write(void *opaque, hwaddr offset, uint64_t value,
      case 0x24:                      /* command byte */
          sl6801_lcd2_set_command(s, value & 0xff);
          break;
@@ -87,7 +127,7 @@ index 26e7552..b582e00 100644
          }
          break;
      case 0x14:
-@@ -2534,6 +2575,16 @@ static const MemoryRegionOps sl6801_console_ops = {
+@@ -2534,6 +2589,16 @@ static const MemoryRegionOps sl6801_console_ops = {
      .valid.max_access_size = 4,
  };
  
@@ -104,7 +144,7 @@ index 26e7552..b582e00 100644
  static const MemoryRegionOps sl6801_ones_ops = {
      .read = sl6801_ones_read,
      .write = sl6801_ones_write,
-@@ -3396,6 +3447,12 @@ static void sl6801_init(MachineState *machine)
+@@ -3396,6 +3461,12 @@ static void sl6801_init(MachineState *machine)
      memory_region_add_subregion_overlap(system_memory, 0x4000F000,
                                          &s->console, 3);
  
