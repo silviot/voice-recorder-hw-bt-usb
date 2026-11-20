@@ -216,10 +216,11 @@ static void refresh_telemetry(void)
     sanitize_rtc(&g_ui.now);
     uint32_t mv = pmu_read_vbat_mv();
     pmu_chg_state_t chg = pmu_get_charge_state();
-    g_ui.batt_mv    = (uint16_t)mv;
-    g_ui.batt_pct   = vbat_mv_to_pct(mv);
-    g_ui.charging   = (chg == PMU_CHG_CHARGING) ? 1 : 0;
-    g_ui.hp_plugged = keys_read_hp_detect();
+    g_ui.batt_mv      = (uint16_t)mv;
+    g_ui.batt_pct     = vbat_mv_to_pct(mv);
+    g_ui.charging     = (chg == PMU_CHG_CHARGING) ? 1 : 0;
+    g_ui.vbus_present = pmu_is_vbus_present() ? 1u : 0u;
+    g_ui.hp_plugged   = keys_read_hp_detect();
     g_ui.sd_ok      = g_sd_mounted ? 1 : 0;
     g_ui.sd_total_mb = g_sd_total_mb;
     uint32_t sec_per_mb = (g_ui.cfg.channels == 1u) ? 33u : 16u;
@@ -1626,7 +1627,7 @@ int openfw_main(void)
                                 dirty = 1;
                             }
                         } else if (key == KEY_RIGHT) {
-                            if (g_ui.set_sel < 8) {
+                            if (g_ui.set_sel < 9) {
                                 g_ui.set_sel++;
                                 if (g_ui.set_sel >= g_ui.set_scroll + 3) {
                                     g_ui.set_scroll = g_ui.set_sel - 2;
@@ -1647,6 +1648,18 @@ int openfw_main(void)
                                 g_ui.set_edit_clock = 1u;
                                 dirty = 1;
                             } else if (g_ui.set_sel == 8) {
+                                if (!pmu_is_vbus_present()) {
+                                    ui_show_toast("Plug in USB cable", UI_COL_AMBER, now_ms, 1500u);
+                                    dirty = 1;
+                                } else {
+                                    save_persisted_state();
+                                    int manual = run_usb_msc_mode(1);
+                                    usb_suppress_until_unpl = (manual && pmu_is_vbus_present()) ? 1 : 0;
+                                    g_ui_screen = (uint32_t)scr;
+                                    prev_key    = KEY_NONE;
+                                    dirty       = 1;
+                                }
+                            } else if (g_ui.set_sel == 9) {
                                 enter_press_ms = 0u;
                                 scr            = UI_SCR_ABOUT;
                                 g_ui_screen    = (uint32_t)scr;

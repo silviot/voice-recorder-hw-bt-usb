@@ -269,6 +269,7 @@ typedef struct {
     uint8_t        set_input_peak;
 
     /* USB */
+    uint8_t        vbus_present;
     uint8_t        usb_read_act;
     uint8_t        usb_write_act;
     uint64_t       usb_tx_bytes;    /* device -> host (IN) */

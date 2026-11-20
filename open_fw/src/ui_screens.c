@@ -728,6 +728,10 @@ static void format_setting_val(const ui_model_t *m, int idx, char *val, int vcap
         *adj = 0;
         break;
     case 7: s_copy(val, vcap, skip_mode_name(m->cfg.skip_mode)); break;
+    case 8:
+        s_copy(val, vcap, m->vbus_present ? "Connect" : "Unplugged");
+        *adj = 0;
+        break;
     default:
         s_copy(val, vcap, "v0.7");
         *adj = 0;
@@ -737,16 +741,16 @@ static void format_setting_val(const ui_model_t *m, int idx, char *val, int vcap
 
 static void render_settings(const ui_model_t *m)
 {
-    static const char * const labels[9] = {
+    static const char * const labels[10] = {
         "Mic gain", "Sound", "Mics", "Voice trigger",
-        "Brightness", "Screen off", "Clock", "Skip", "About"
+        "Brightness", "Screen off", "Clock", "Skip", "USB disk", "About"
     };
     lcd_fill_rect(0u, 0u, UI_W, UI_H, UI_COL_BG);
 
     char sub[12];
     sub[0] = '\0';
     s_append_u32(sub, (int)sizeof(sub), (uint32_t)(m->set_sel + 1));
-    s_append(sub, (int)sizeof(sub), " / 9");
+    s_append(sub, (int)sizeof(sub), " / 10");
 
     ui_status_bar_t sb;
     init_sb_common(&sb, m);
@@ -756,7 +760,7 @@ static void render_settings(const ui_model_t *m)
 
     for (int r = 0; r < 3; r++) {
         int idx = m->set_scroll + r;
-        if (idx >= 9) break;
+        if (idx >= 10) break;
         int16_t y = (int16_t)(15 + r * 17);
         int sel = (idx == m->set_sel);
         uint16_t row_bg = sel ? UI_COL_PILL : UI_COL_BG;
@@ -796,13 +800,14 @@ static void render_settings(const ui_model_t *m)
                 lcd_draw_str_aa_bl((int16_t)(138 - (int16_t)vw - 8), (int16_t)(y + 12),
                                    "-", &g_font_ui_sm, UI_COL_TEXT, row_bg);
             } else {
+                uint16_t vcol = (idx == 8 && sel && m->vbus_present) ? UI_COL_CYAN : UI_COL_DIM;
                 draw_right_bl(148, (int16_t)(y + 12), val, &g_font_ui_sm,
-                              UI_COL_DIM, row_bg);
+                              vcol, row_bg);
             }
         }
     }
 
-    draw_scrollbar(9, m->set_scroll, 3);
+    draw_scrollbar(10, m->set_scroll, 3);
 
     /* Footer explanation / live input meter / clock edit hints */
     if (m->set_edit_clock != 0u) {
@@ -826,6 +831,7 @@ static void render_settings(const ui_model_t *m)
         case 5: desc = "Recording continues"; break;
         case 6: desc = "OK to edit \xC2\xB7 syncs over USB"; break;
         case 7: desc = "Jump size in the player"; break;
+        case 8: desc = m->vbus_present ? "OK to mount as USB drive" : "Plug in USB cable first"; break;
         default: desc = "Version and update mode"; break;
         }
         draw_centered_bl(80, 77, desc, &g_font_ui_sm, UI_COL_DIM, UI_COL_BG);
