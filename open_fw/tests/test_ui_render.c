@@ -263,6 +263,8 @@ int main(int argc, char **argv)
     m.charging      = 1;
     m.usb_read_act  = 1;
     m.usb_write_act = 1;
+    m.usb_tx_bytes  = 14800000ull; /* 14.1 MB */
+    m.usb_rx_bytes  = 262144ull;   /* 256 KB */
     ui_render_screen(UI_SCR_USB, &m);
     capture_shot(11);
 

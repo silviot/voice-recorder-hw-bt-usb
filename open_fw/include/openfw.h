@@ -255,6 +255,7 @@ void usb_msc_stop(void);
 void usb_msc_poll(void);
 int  usb_msc_is_active(void);
 void usb_msc_get_stats(uint32_t *rx_pkts, uint32_t *tx_pkts);
+void usb_msc_get_bytes(uint64_t *rx_bytes, uint64_t *tx_bytes);
 
 /* BT RF & Modem Hardware Bring-Up (bt_rf.c) */
 uint32_t bt_rf_efuse_trim(void);

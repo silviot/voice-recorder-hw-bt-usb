@@ -598,6 +598,7 @@ static int run_usb_msc_mode(int auto_mode)
 
             uint32_t rxp = 0u, txp = 0u;
             usb_msc_get_stats(&rxp, &txp);
+            usb_msc_get_bytes(&g_ui.usb_rx_bytes, &g_ui.usb_tx_bytes);
             pmu_poll_charge_manage();
             if (rxp > 0u || txp > 0u || now >= 3000u) {
                 clear_boot_strikes_once();

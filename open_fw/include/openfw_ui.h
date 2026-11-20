@@ -271,6 +271,8 @@ typedef struct {
     /* USB */
     uint8_t        usb_read_act;
     uint8_t        usb_write_act;
+    uint64_t       usb_tx_bytes;    /* device -> host (IN) */
+    uint64_t       usb_rx_bytes;    /* host -> device (OUT) */
 
     /* Bluetooth Sync */
     uint8_t        bt_state;        /* 0=wait, 1=conn, 2=send */

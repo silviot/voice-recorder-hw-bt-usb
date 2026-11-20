@@ -1234,6 +1234,9 @@ static void test_sdio_exfat_and_usb_msc(const char *exfat_img_path)
     uint32_t rx_p = 0u, tx_p = 0u;
     usb_msc_get_stats(&rx_p, &tx_p);
     assert(rx_p > 0u && tx_p > 0u);
+    uint64_t rx_b = 0u, tx_b = 0u;
+    usb_msc_get_bytes(&rx_b, &tx_b);
+    assert(rx_b >= 512u && tx_b >= 512u);
 
     /* OpenFW 0xE0 experiment & memory commands (0x0A, 0x05, 0x07, 0x06, 0x09, 0x02, 0x08) */
     assert(host_vendor_e0(10u, 0x0Au, 0u, 0u, 0, NULL, NULL, 0u) == 0u); /* LOG_RESET */

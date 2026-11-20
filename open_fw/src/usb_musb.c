@@ -22,6 +22,8 @@ static usb_msc_state_t g_msc;
 static int             g_usb_active = 0;
 static uint32_t        g_rx_pkts    = 0u;
 static uint32_t        g_tx_pkts    = 0u;
+static uint64_t        g_rx_bytes   = 0u;
+static uint64_t        g_tx_bytes   = 0u;
 static uint8_t         g_diag_sd_mounted = 0u;
 static uint8_t         g_diag_rec_active = 0u;
 static uint8_t            g_diag_mic_gain   = 20u;
@@ -683,6 +685,8 @@ int usb_msc_start(blkdev_t *dev)
     usb_msc_set_vendor_cb(&g_msc, musb_vendor_scsi_cb, 0);
     g_rx_pkts       = 0u;
     g_tx_pkts       = 0u;
+    g_rx_bytes      = 0u;
+    g_tx_bytes      = 0u;
     g_ep0_state     = EP0_IDLE;
     g_ep0_tx_rem    = 0u;
     g_set_addr_pend = 0u;
@@ -785,6 +789,7 @@ void usb_msc_poll(void)
             openfw_mmio_wr16(MUSB_RXCSR_ADDR, (uint16_t)(openfw_mmio_rd16(MUSB_RXCSR_ADDR) & ~0x0001u)); /* Clear RxPktRdy */
             usb_msc_on_rx_packet(&g_msc, pkt, (uint8_t)cnt);
             g_rx_pkts++;
+            g_rx_bytes += (uint64_t)cnt;
         }
     }
 
@@ -798,6 +803,7 @@ void usb_msc_poll(void)
         }
         openfw_mmio_wr16(MUSB_TXCSR_ADDR, (uint16_t)(openfw_mmio_rd16(MUSB_TXCSR_ADDR) | 0x0001u)); /* Set TxPktRdy */
         g_tx_pkts++;
+        g_tx_bytes += (uint64_t)n;
     }
 
     if (g_usb_reboot_mode != 0u && !usb_msc_need_tx(&g_msc) &&
@@ -830,5 +836,15 @@ void usb_msc_get_stats(uint32_t *rx_pkts, uint32_t *tx_pkts)
     }
     if (tx_pkts) {
         *tx_pkts = g_tx_pkts;
+    }
+}
+
+void usb_msc_get_bytes(uint64_t *rx_bytes, uint64_t *tx_bytes)
+{
+    if (rx_bytes) {
+        *rx_bytes = g_rx_bytes;
+    }
+    if (tx_bytes) {
+        *tx_bytes = g_tx_bytes;
     }
 }

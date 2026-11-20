@@ -870,6 +870,40 @@ static void render_about(const ui_model_t *m)
 /* =========================================================================
  * System States: USB, Bluetooth, Charge, Power Off, Screen Off
  * ========================================================================= */
+static void format_bytes_short(char *dst, int cap, uint64_t bytes)
+{
+    dst[0] = '\0';
+    if (bytes < 1024ull) {
+        s_append_u32(dst, cap, (uint32_t)bytes);
+        s_append(dst, cap, " B");
+    } else if (bytes < (1024ull << 10)) {
+        uint32_t kb = (uint32_t)(bytes >> 10);
+        s_append_u32(dst, cap, kb);
+        if (kb < 10u) {
+            uint32_t tenths = (uint32_t)(((bytes & 1023ull) * 10ull) >> 10);
+            s_append(dst, cap, ".");
+            s_append_u32(dst, cap, tenths);
+        }
+        s_append(dst, cap, " KB");
+    } else if (bytes < (1024ull << 20)) {
+        uint32_t mb = (uint32_t)(bytes >> 20);
+        s_append_u32(dst, cap, mb);
+        if (mb < 100u) {
+            uint32_t tenths = (uint32_t)((((bytes >> 10) & 1023ull) * 10ull) >> 10);
+            s_append(dst, cap, ".");
+            s_append_u32(dst, cap, tenths);
+        }
+        s_append(dst, cap, " MB");
+    } else {
+        uint32_t gb = (uint32_t)(bytes >> 30);
+        uint32_t tenths = (uint32_t)((((bytes >> 20) & 1023ull) * 10ull) >> 10);
+        s_append_u32(dst, cap, gb);
+        s_append(dst, cap, ".");
+        s_append_u32(dst, cap, tenths);
+        s_append(dst, cap, " GB");
+    }
+}
+
 static void render_usb(const ui_model_t *m)
 {
     lcd_fill_rect(0u, 0u, UI_W, UI_H, UI_COL_BG);
@@ -883,11 +917,15 @@ static void render_usb(const ui_model_t *m)
     ui_draw_icon(6, 18, 26, UI_ICON_USB, UI_COL_CYAN, UI_COL_BG);
     lcd_draw_str_aa_bl(40, 37, "USB disk", &g_font_ui_lg, UI_COL_TEXT, UI_COL_BG);
 
+    char tx_s[16], rx_s[16];
+    format_bytes_short(tx_s, (int)sizeof(tx_s), m->usb_tx_bytes);
+    format_bytes_short(rx_s, (int)sizeof(rx_s), m->usb_rx_bytes);
+
     ui_draw_icon(40, 46, 7, UI_ICON_UP, m->usb_read_act ? UI_COL_CYAN : UI_COL_FAINT, UI_COL_BG);
-    lcd_draw_str_aa_bl(50, 53, "Read", &g_font_ui_sm,
+    lcd_draw_str_aa_bl(50, 53, tx_s, &g_font_ui_sm,
                        m->usb_read_act ? UI_COL_TEXT : UI_COL_DIM, UI_COL_BG);
-    ui_draw_icon(88, 46, 7, UI_ICON_DOWN, m->usb_write_act ? UI_COL_AMBER : UI_COL_FAINT, UI_COL_BG);
-    lcd_draw_str_aa_bl(98, 53, "Write", &g_font_ui_sm,
+    ui_draw_icon(100, 46, 7, UI_ICON_DOWN, m->usb_write_act ? UI_COL_AMBER : UI_COL_FAINT, UI_COL_BG);
+    lcd_draw_str_aa_bl(110, 53, rx_s, &g_font_ui_sm,
                        m->usb_write_act ? UI_COL_TEXT : UI_COL_DIM, UI_COL_BG);
 
     ui_draw_icon(4, 68, 8, UI_ICON_BOLT, UI_COL_GREEN, UI_COL_BG);
