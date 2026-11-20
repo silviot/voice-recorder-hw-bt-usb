@@ -238,6 +238,7 @@ int                 recorder_start(exfat_vol_t *vol, int sd_mounted);
 void                recorder_poll(void);
 int                 recorder_stop(void);
 int                 recorder_is_saving(void);
+int                 recorder_has_error(void);
 int                 recorder_is_vor_waiting(void);
 uint32_t            recorder_get_seconds(void);
 const char         *recorder_get_filename(void);

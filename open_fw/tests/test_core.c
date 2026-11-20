@@ -1000,8 +1000,47 @@ static void run_exfat_img_test(const char *path)
     /* Restore a valid settings.bin before fsck.exfat */
     assert(ui_persist_save(&vol3, &cfg_save, "REC_0001.wav", 42u, 1) == 0);
 
+    /* Crash-safe checkpoint test: stream 16 KiB, checkpoint WITHOUT closing, remount & verify */
+    exfat_writer_t cw;
+    assert(exfat_create_file(&vol3, "/record", "CKPT_TEST.wav", &cw) == 0);
+    uint8_t ckpt_hdr[44];
+    assert(wav_build_header(ckpt_hdr, 16000u, 1u, 16u, 0u) == 0);
+    assert(exfat_write(&cw, ckpt_hdr, 44u) == 0);
+    assert(exfat_write(&cw, pcm, (uint32_t)sizeof(pcm)) == 0);
+    uint64_t flushed = cw.bytes_written - (uint64_t)cw.sec_buf_used;
+    assert(flushed > 44u);
+    assert(wav_build_header(ckpt_hdr, 16000u, 1u, 16u, (uint32_t)(flushed - 44u)) == 0);
+    assert(exfat_checkpoint_file(&cw, ckpt_hdr, 44u) == 0);
+    /* Simulate power loss: do NOT call exfat_close_file(&cw); remount fresh volume */
+    exfat_vol_t vol4;
+    assert(exfat_mount(&vol4, &dev) == 0);
+    exfat_entry_t ck_ent;
+    assert(exfat_find_path(&vol4, "/record/CKPT_TEST.wav", &ck_ent) == 0);
+    assert(ck_ent.first_cluster >= 2u && ck_ent.size == flushed);
+    uint8_t ck_hdr_rb[44];
+    uint32_t ck_got = 0u;
+    assert(exfat_read_file(&vol4, &ck_ent, 0u, ck_hdr_rb, 44u, &ck_got) == 0 && ck_got == 44u);
+    wav_info_t ck_wi;
+    assert(wav_parse_header(ck_hdr_rb, &ck_wi) == 0 && ck_wi.data_bytes == (uint32_t)(flushed - 44u));
+
+    /* Atomic replace test: stage temp file and replace CKPT_TEST.wav */
+    exfat_writer_t tw;
+    assert(exfat_create_file(&vol4, "/record", "STAGED.tmp", &tw) == 0);
+    const char *staged_msg = "ATOMIC_REPLACE_OK";
+    assert(exfat_write(&tw, staged_msg, 17u) == 0);
+    assert(exfat_close_file(&tw) == 0);
+    assert(exfat_replace_file(&vol4, "/record", "STAGED.tmp", "CKPT_TEST.wav") == 0);
+    exfat_entry_t rep_ent;
+    assert(exfat_find_path(&vol4, "/record/STAGED.tmp", &rep_ent) != 0);
+    assert(exfat_find_path(&vol4, "/record/CKPT_TEST.wav", &rep_ent) == 0);
+    assert(rep_ent.size == 17u);
+    char rep_buf[20] = { 0 };
+    assert(exfat_read_file(&vol4, &rep_ent, 0u, rep_buf, 17u, &ck_got) == 0 && ck_got == 17u);
+    assert(memcmp(rep_buf, staged_msg, 17u) == 0);
+    assert(exfat_delete_file(&vol4, "/record", "CKPT_TEST.wav") == 0);
+
     fclose(fp);
-    printf("  [PASS] exfat-img (%s: 16,428 B multi-cluster WAV + settings.bin persist/CRC-16 verified)\n", path);
+    printf("  [PASS] exfat-img (%s: 16,428 B multi-cluster WAV + checkpoint + atomic replace + settings.bin verified)\n", path);
 }
 
 static uint8_t test_rfcomm_fcs(const uint8_t *data, uint32_t len)

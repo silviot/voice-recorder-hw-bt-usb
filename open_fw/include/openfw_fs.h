@@ -19,6 +19,12 @@ typedef struct {
 } blkdev_t;
 
 typedef struct {
+    uint32_t first_cluster;
+    uint32_t cluster_idx;
+    uint32_t cluster;
+} exfat_rd_cache_t;
+
+typedef struct {
     const blkdev_t *dev;
     uint32_t part_lba;
     uint32_t fat_lba;
@@ -33,6 +39,8 @@ typedef struct {
     uint32_t bitmap_bytes;
     uint32_t alloc_hint;
     uint32_t default_timestamp;
+    exfat_rd_cache_t rd_cache[4];
+    uint8_t  rd_cache_rr;
 } exfat_vol_t;
 
 #define EXFAT_MAX_NAME 64u
@@ -67,6 +75,8 @@ typedef int (*exfat_dir_cb_t)(const exfat_entry_t *entry, void *user);
 int exfat_mount(exfat_vol_t *vol, const blkdev_t *dev);
 int exfat_list_dir(const exfat_vol_t *vol, uint32_t dir_cluster, uint8_t no_fat_chain,
                    exfat_dir_cb_t cb, void *user);
+int exfat_list_dir_entry(const exfat_vol_t *vol, const exfat_entry_t *dir,
+                         exfat_dir_cb_t cb, void *user);
 int exfat_find_path(const exfat_vol_t *vol, const char *path, exfat_entry_t *out);
 int exfat_read_file(const exfat_vol_t *vol, const exfat_entry_t *file,
                     uint64_t offset, void *dst, uint32_t len, uint32_t *bytes_read);
@@ -78,7 +88,9 @@ int  exfat_mkdir(exfat_vol_t *vol, const char *name);
 int  exfat_create_file(exfat_vol_t *vol, const char *dir_path, const char *filename, exfat_writer_t *out);
 int  exfat_write(exfat_writer_t *w, const void *data, uint32_t len);
 int  exfat_patch_header(exfat_writer_t *w, const void *hdr, uint32_t len);
+int  exfat_checkpoint_file(exfat_writer_t *w, const void *hdr, uint32_t hdr_len);
 int  exfat_close_file(exfat_writer_t *w);
 int  exfat_delete_file(exfat_vol_t *vol, const char *dir_path, const char *filename);
+int  exfat_replace_file(exfat_vol_t *vol, const char *dir_path, const char *src_name, const char *dst_name);
 
 #endif /* OPENFW_FS_H */

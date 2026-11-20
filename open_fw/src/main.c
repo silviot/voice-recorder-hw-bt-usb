@@ -27,12 +27,13 @@
 #include "openfw_player.h"
 #include "cassini_splash.h"
 
-#define MENU_MAX_FILES 24
+#define MENU_MAX_FILES 32
 
 typedef struct {
     ui_file_entry_t *items;
     char           (*dirs)[12];
     int              count;
+    int              total_seen;
     int              max_items;
     const char      *dir_path;
 } menu_list_ctx_t;
@@ -330,10 +331,12 @@ static int menu_collect_cb(const exfat_entry_t *entry, void *user)
     if (!name_ends_with_ci(entry->name, ".wav")) {
         return 0;
     }
-    if (ctx->count >= ctx->max_items) {
-        return 1;
+    /* Ring-buffer the newest max_items entries so recording #25+ is never lost */
+    int idx = ctx->total_seen % ctx->max_items;
+    ctx->total_seen++;
+    if (ctx->count < ctx->max_items) {
+        ctx->count++;
     }
-    int idx = ctx->count++;
     ui_file_entry_t *dst = &ctx->items[idx];
     copy_cstr(ctx->dirs[idx], 12, ctx->dir_path);
     copy_cstr(dst->filename, (int)sizeof(dst->filename), entry->name);
@@ -355,7 +358,7 @@ static int menu_collect_cb(const exfat_entry_t *entry, void *user)
             dst->channels     = (uint8_t)(wi.channels ? wi.channels : 1u);
         }
     }
-    return (ctx->count >= ctx->max_items) ? 1 : 0;
+    return 0;
 }
 
 static void reload_files_and_sd_stats(void)
@@ -374,40 +377,36 @@ static void reload_files_and_sd_stats(void)
 
     (void)exfat_stat_fs(&g_exfat_vol, &g_sd_free_mb, &g_sd_total_mb);
 
+    static ui_file_entry_t ring_files[MENU_MAX_FILES];
+    static char            ring_dirs[MENU_MAX_FILES][12];
     menu_list_ctx_t ctx;
-    ctx.items     = g_files;
-    ctx.dirs      = g_file_dirs;
-    ctx.count     = 0;
-    ctx.max_items = MENU_MAX_FILES;
+    ctx.items      = ring_files;
+    ctx.dirs       = ring_dirs;
+    ctx.count      = 0;
+    ctx.total_seen = 0;
+    ctx.max_items  = MENU_MAX_FILES;
 
     exfat_entry_t dir_ent;
     if (exfat_find_path(&g_exfat_vol, "/record", &dir_ent) == 0 && dir_ent.is_dir) {
         ctx.dir_path = "/record";
-        (void)exfat_list_dir(&g_exfat_vol, dir_ent.first_cluster, dir_ent.no_fat_chain,
-                             menu_collect_cb, &ctx);
+        (void)exfat_list_dir_entry(&g_exfat_vol, &dir_ent, menu_collect_cb, &ctx);
     }
-    if (ctx.count < ctx.max_items &&
-        exfat_find_path(&g_exfat_vol, "/cassini", &dir_ent) == 0 && dir_ent.is_dir) {
+    if (exfat_find_path(&g_exfat_vol, "/cassini", &dir_ent) == 0 && dir_ent.is_dir) {
         ctx.dir_path = "/cassini";
-        (void)exfat_list_dir(&g_exfat_vol, dir_ent.first_cluster, dir_ent.no_fat_chain,
-                             menu_collect_cb, &ctx);
+        (void)exfat_list_dir_entry(&g_exfat_vol, &dir_ent, menu_collect_cb, &ctx);
     }
-    if (ctx.count < ctx.max_items) {
-        ctx.dir_path = "/";
-        (void)exfat_list_dir(&g_exfat_vol, g_exfat_vol.root_dir_cluster, 0u,
-                             menu_collect_cb, &ctx);
-    }
+    ctx.dir_path = "/";
+    (void)exfat_list_dir(&g_exfat_vol, g_exfat_vol.root_dir_cluster, 0u,
+                         menu_collect_cb, &ctx);
 
-    /* Reverse so newest recordings appear first */
-    for (int i = 0; i < ctx.count / 2; i++) {
-        int j = ctx.count - 1 - i;
-        ui_file_entry_t tmp = g_files[i];
-        g_files[i] = g_files[j];
-        g_files[j] = tmp;
-        char dtmp[12];
-        copy_cstr(dtmp, 12, g_file_dirs[i]);
-        copy_cstr(g_file_dirs[i], 12, g_file_dirs[j]);
-        copy_cstr(g_file_dirs[j], 12, dtmp);
+    /* Unwrap ring buffer in reverse chronological order (newest first) */
+    for (int i = 0; i < ctx.count; i++) {
+        int src_idx = (ctx.total_seen - 1 - i) % ctx.max_items;
+        if (src_idx < 0) {
+            src_idx += ctx.max_items;
+        }
+        g_files[i] = ring_files[src_idx];
+        copy_cstr(g_file_dirs[i], 12, ring_dirs[src_idx]);
     }
 
     /* Check matching .cwx transcript sidecars */
@@ -664,6 +663,7 @@ static void run_bt_xrec_mode(void)
     while (1) {
         wdt_feed();
         bt_xrec_poll();
+        recorder_poll();
 
         /* Sliding REC ON exits BT immediately so main loop starts recording */
         if (keys_read_rec_switch()) {
@@ -735,10 +735,14 @@ static void run_bt_xrec_mode(void)
         }
     }
 
+    if (recorder_is_saving()) {
+        (void)recorder_stop();
+    }
     bt_xrec_stop();
     g_ui.toast_msg[0] = '\0';
     wait_key_release(KEY_BACK);
     backlight_wake(millis());
+    reload_files_and_sd_stats();
 }
 
 static void play_boot_animation(void)
@@ -1232,27 +1236,38 @@ int openfw_main(void)
                 char     saved_name[32];
                 copy_cstr(saved_name, (int)sizeof(saved_name), recorder_get_filename());
                 int was_saving = recorder_is_saving();
+                int stop_rc    = -1;
                 if (rec_active) {
-                    (void)recorder_stop();
+                    stop_rc    = recorder_stop();
                     rec_active = 0;
                 }
                 reload_files_and_sd_stats();
 
-                if (was_saving && saved_name[0] != '\0') {
+                if (was_saving && stop_rc == 0 && saved_name[0] != '\0') {
                     g_ui.saved_sec      = rec_s;
                     g_ui.saved_channels = rec_ch;
                     g_ui.saved_frac_pct = 100u;
                     g_ui.saved_dt       = g_ui.now;
                     copy_cstr(g_ui.saved_filename, (int)sizeof(g_ui.saved_filename), saved_name);
-                    if (g_ui.file_count > 0) {
-                        g_ui.last_file = g_files[0];
-                        copy_cstr(g_last_dir, (int)sizeof(g_last_dir), g_file_dirs[0]);
+                    int match_idx = -1;
+                    for (int i = 0; i < g_ui.file_count; i++) {
+                        if (str_eq_ci(g_files[i].filename, saved_name)) {
+                            match_idx = i;
+                            break;
+                        }
+                    }
+                    if (match_idx >= 0) {
+                        g_ui.last_file = g_files[match_idx];
+                        copy_cstr(g_last_dir, (int)sizeof(g_last_dir), g_file_dirs[match_idx]);
                         g_ui.has_last = 1;
                     }
                     save_persisted_state();
                     saved_start_ms = now_ms;
                     scr            = UI_SCR_SAVED;
                 } else {
+                    if (was_saving || recorder_has_error()) {
+                        ui_show_toast("Save failed \xC2\xB7 card error", UI_COL_RED, now_ms, 2500u);
+                    }
                     scr = (prev_scr == UI_SCR_REC || prev_scr == UI_SCR_SAVED) ? UI_SCR_HOME : prev_scr;
                 }
                 g_ui_screen = (uint32_t)scr;
@@ -1263,6 +1278,13 @@ int openfw_main(void)
         /* 3. Active recording poll + 20 Hz spectrogram & peak meters */
         if (rec_active) {
             recorder_poll();
+            if (recorder_has_error()) {
+                (void)recorder_stop();
+                rec_active       = 0;
+                g_ui.rec_stopped = 1u;
+                copy_cstr(g_ui.rec_stop_reason, (int)sizeof(g_ui.rec_stop_reason), "Card full / error");
+                dirty            = 1;
+            }
             prev_vbus   = pmu_is_vbus_present();
             usb_probing = 0;
 

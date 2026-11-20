@@ -288,7 +288,7 @@ typedef struct {
 typedef int (*exfat_dir_loc_cb_t)(const exfat_entry_t *entry, const exfat_dir_loc_t *loc, void *user);
 
 static int list_dir_with_loc(const exfat_vol_t *vol, uint32_t dir_cluster, uint8_t no_fat_chain,
-                             exfat_dir_cb_t cb, exfat_dir_loc_cb_t loc_cb, void *user)
+                             uint64_t dir_size, exfat_dir_cb_t cb, exfat_dir_loc_cb_t loc_cb, void *user)
 {
     if (!vol || (!cb && !loc_cb) || dir_cluster < 2u) {
         return -1;
@@ -304,7 +304,19 @@ static int list_dir_with_loc(const exfat_vol_t *vol, uint32_t dir_cluster, uint8
     exfat_dir_loc_t prim_loc;
     mem_zero(&prim_loc, sizeof(prim_loc));
 
-    uint32_t cls = dir_cluster;
+    uint32_t cls_shift = 9u + (uint32_t)vol->spc_shift;
+    uint32_t max_cls   = 0u;
+    if (no_fat_chain) {
+        if (dir_size > 0u) {
+            uint64_t mc = (dir_size + ((uint64_t)vol->cluster_size - 1u)) >> cls_shift;
+            max_cls = (mc > vol->cluster_count) ? vol->cluster_count : (uint32_t)mc;
+        } else {
+            max_cls = 1u;
+        }
+    }
+
+    uint32_t cls     = dir_cluster;
+    uint32_t cls_idx = 0u;
     uint8_t sec[512];
 
     while (cls >= 2u && (cls - 2u) < vol->cluster_count) {
@@ -376,6 +388,10 @@ static int list_dir_with_loc(const exfat_vol_t *vol, uint32_t dir_cluster, uint8
                 }
             }
         }
+        cls_idx++;
+        if (no_fat_chain && cls_idx >= max_cls) {
+            break;
+        }
         uint32_t nxt = 0u;
         if (next_cluster(vol, cls, no_fat_chain, &nxt) != 0) {
             return -1;
@@ -389,7 +405,16 @@ static int list_dir_with_loc(const exfat_vol_t *vol, uint32_t dir_cluster, uint8
 int exfat_list_dir(const exfat_vol_t *vol, uint32_t dir_cluster, uint8_t no_fat_chain,
                    exfat_dir_cb_t cb, void *user)
 {
-    return list_dir_with_loc(vol, dir_cluster, no_fat_chain, cb, 0, user);
+    return list_dir_with_loc(vol, dir_cluster, no_fat_chain, 0u, cb, 0, user);
+}
+
+int exfat_list_dir_entry(const exfat_vol_t *vol, const exfat_entry_t *dir,
+                         exfat_dir_cb_t cb, void *user)
+{
+    if (!dir || !dir->is_dir) {
+        return -1;
+    }
+    return list_dir_with_loc(vol, dir->first_cluster, dir->no_fat_chain, dir->size, cb, 0, user);
 }
 
 typedef struct {
@@ -456,7 +481,7 @@ static int find_path_with_loc(const exfat_vol_t *vol, const char *path, exfat_en
         ctx.target     = seg;
         ctx.target_len = seg_len;
         ctx.found      = 0;
-        if (list_dir_with_loc(vol, cur.first_cluster, cur.no_fat_chain,
+        if (list_dir_with_loc(vol, cur.first_cluster, cur.no_fat_chain, cur.size,
                               0, find_entry_loc_cb, &ctx) != 0 || !ctx.found) {
             return -1;
         }
@@ -501,16 +526,34 @@ int exfat_read_file(const exfat_vol_t *vol, const exfat_entry_t *file,
     uint32_t cls_shift     = 9u + (uint32_t)vol->spc_shift;
     uint64_t skip_clusters = offset >> cls_shift;
     uint32_t in_cls_off    = (uint32_t)(offset & ((uint64_t)vol->cluster_size - 1u));
+    uint32_t cur_idx       = 0u;
+    exfat_vol_t *mvol      = (exfat_vol_t *)(uintptr_t)vol;
+    int      cache_slot    = -1;
+
     if (file->no_fat_chain) {
-        cls += (uint32_t)skip_clusters;
+        cls    += (uint32_t)skip_clusters;
+        cur_idx = (uint32_t)skip_clusters;
     } else {
-        for (uint64_t i = 0u; i < skip_clusters; i++) {
+        uint64_t start_idx = 0u;
+        for (int ci = 0; ci < 4; ci++) {
+            if (mvol->rd_cache[ci].first_cluster == file->first_cluster &&
+                mvol->rd_cache[ci].cluster >= 2u) {
+                cache_slot = ci;
+                if ((uint64_t)mvol->rd_cache[ci].cluster_idx <= skip_clusters) {
+                    cls       = mvol->rd_cache[ci].cluster;
+                    start_idx = (uint64_t)mvol->rd_cache[ci].cluster_idx;
+                }
+                break;
+            }
+        }
+        for (uint64_t i = start_idx; i < skip_clusters; i++) {
             uint32_t nxt = 0u;
             if (next_cluster(vol, cls, 0u, &nxt) != 0 || nxt == 0u) {
                 return -1;
             }
             cls = nxt;
         }
+        cur_idx = (uint32_t)skip_clusters;
     }
 
     uint8_t *out = (uint8_t *)dst;
@@ -551,7 +594,18 @@ int exfat_read_file(const exfat_vol_t *vol, const exfat_entry_t *file,
                 return -1;
             }
             cls = nxt;
+            cur_idx++;
         }
+    }
+
+    if (!file->no_fat_chain && cls >= 2u) {
+        if (cache_slot < 0) {
+            cache_slot = (int)(mvol->rd_cache_rr & 3u);
+            mvol->rd_cache_rr++;
+        }
+        mvol->rd_cache[cache_slot].first_cluster = file->first_cluster;
+        mvol->rd_cache[cache_slot].cluster_idx   = cur_idx;
+        mvol->rd_cache[cache_slot].cluster       = cls;
     }
 
     if (bytes_read) {
@@ -856,10 +910,22 @@ static int grow_dir_size_in_parent(const exfat_vol_t *vol, uint32_t parent_lba, 
 }
 
 static int dir_alloc_slots(exfat_vol_t *vol, uint32_t dir_cluster, uint8_t dir_no_fat_chain,
-                           uint32_t parent_lba, uint8_t parent_slot, uint8_t total_ents,
-                           uint32_t *out_lba, uint8_t *out_slot)
+                           uint64_t dir_size, uint32_t parent_lba, uint8_t parent_slot,
+                           uint8_t total_ents, uint32_t *out_lba, uint8_t *out_slot)
 {
-    uint32_t cls = dir_cluster;
+    uint32_t cls_shift = 9u + (uint32_t)vol->spc_shift;
+    uint32_t max_cls   = 0u;
+    if (dir_no_fat_chain) {
+        if (dir_size > 0u) {
+            uint64_t mc = (dir_size + ((uint64_t)vol->cluster_size - 1u)) >> cls_shift;
+            max_cls = (mc > vol->cluster_count) ? vol->cluster_count : (uint32_t)mc;
+        } else {
+            max_cls = 1u;
+        }
+    }
+
+    uint32_t cls     = dir_cluster;
+    uint32_t cls_idx = 0u;
     uint8_t  sec[512];
 
     while (cls >= 2u && (cls - 2u) < vol->cluster_count) {
@@ -904,13 +970,16 @@ static int dir_alloc_slots(exfat_vol_t *vol, uint32_t dir_cluster, uint8_t dir_n
             }
         }
 
+        cls_idx++;
         uint32_t nxt = 0u;
-        if (next_cluster(vol, cls, dir_no_fat_chain, &nxt) != 0) {
+        if (dir_no_fat_chain && cls_idx >= max_cls) {
+            nxt = 0u; /* Reached allocated end of contiguous NoFatChain directory */
+        } else if (next_cluster(vol, cls, dir_no_fat_chain, &nxt) != 0) {
             return -1;
         }
         if (nxt == 0u) {
             if (dir_no_fat_chain) {
-                return -1; /* Avoid mutating NoFatChain flag on foreign multi-cluster dir */
+                return -1; /* Avoid overflowing or mutating foreign NoFatChain directory */
             }
             if (alloc_cluster(vol, cls, &nxt) != 0 || zero_cluster(vol, nxt) != 0) {
                 return -1;
@@ -955,7 +1024,7 @@ int exfat_mkdir(exfat_vol_t *vol, const char *name)
     uint8_t total_ents = (name_len <= 15u) ? 3u : 4u;
     uint32_t slot_lba  = 0u;
     uint8_t  slot_idx  = 0u;
-    if (dir_alloc_slots(vol, vol->root_dir_cluster, 0u, 0u, 0u, total_ents,
+    if (dir_alloc_slots(vol, vol->root_dir_cluster, 0u, 0u, 0u, 0u, total_ents,
                         &slot_lba, &slot_idx) != 0) {
         return -1;
     }
@@ -998,7 +1067,7 @@ int exfat_create_file(exfat_vol_t *vol, const char *dir_path, const char *filena
     dup.target     = filename;
     dup.target_len = name_len;
     dup.found      = 0;
-    if (list_dir_with_loc(vol, dir_ent.first_cluster, dir_ent.no_fat_chain,
+    if (list_dir_with_loc(vol, dir_ent.first_cluster, dir_ent.no_fat_chain, dir_ent.size,
                           0, find_entry_loc_cb, &dup) != 0 || dup.found) {
         return -1;
     }
@@ -1006,7 +1075,7 @@ int exfat_create_file(exfat_vol_t *vol, const char *dir_path, const char *filena
     uint8_t total_ents = (name_len <= 15u) ? 3u : 4u;
     uint32_t slot_lba  = 0u;
     uint8_t  slot_idx  = 0u;
-    if (dir_alloc_slots(vol, dir_ent.first_cluster, dir_ent.no_fat_chain,
+    if (dir_alloc_slots(vol, dir_ent.first_cluster, dir_ent.no_fat_chain, dir_ent.size,
                         parent_lba, parent_slot, total_ents, &slot_lba, &slot_idx) != 0) {
         return -1;
     }
@@ -1113,6 +1182,47 @@ int exfat_patch_header(exfat_writer_t *w, const void *hdr, uint32_t len)
     }
     mem_copy(sec, hdr, len);
     return w->vol->dev->write_sectors(w->vol->dev->ctx, lba, 1u, sec);
+}
+
+int exfat_checkpoint_file(exfat_writer_t *w, const void *hdr, uint32_t hdr_len)
+{
+    if (!w || !w->active) {
+        return -1;
+    }
+    uint64_t flushed = (w->bytes_written >= (uint64_t)w->sec_buf_used)
+                     ? (w->bytes_written - (uint64_t)w->sec_buf_used)
+                     : 0u;
+    if (w->first_cluster < 2u || flushed == 0u) {
+        return 0; /* Nothing flushed to cluster heap yet */
+    }
+    if (hdr && hdr_len > 0u) {
+        if (hdr_len > 512u || (uint64_t)hdr_len > flushed) {
+            return -1;
+        }
+        if (exfat_patch_header(w, hdr, hdr_len) != 0) {
+            return -1;
+        }
+    }
+
+    uint8_t sec[512];
+    if (w->vol->dev->read_sectors(w->vol->dev->ctx, w->dir_lba, 1u, sec) != 0) {
+        return -1;
+    }
+    uint8_t *f = &sec[(uint32_t)w->dir_slot * 32u];
+    uint8_t *s = &sec[((uint32_t)w->dir_slot + 1u) * 32u];
+    if (f[0] != 0x85u || s[0] != 0xC0u) {
+        return -1;
+    }
+    if (w->vol->default_timestamp != 0u) {
+        put_le32(f + 12u, w->vol->default_timestamp);
+        put_le32(f + 16u, w->vol->default_timestamp);
+    }
+    s[1] = 0x01u; /* AllocationPossible=1, NoFatChain=0 */
+    put_le64(s + 8u, flushed);
+    put_le32(s + 20u, w->first_cluster);
+    put_le64(s + 24u, flushed);
+    put_le16(f + 2u, exfat_entry_set_checksum(f, w->total_ents));
+    return w->vol->dev->write_sectors(w->vol->dev->ctx, w->dir_lba, 1u, sec);
 }
 
 int exfat_close_file(exfat_writer_t *w)
@@ -1247,11 +1357,14 @@ int exfat_delete_file(exfat_vol_t *vol, const char *dir_path, const char *filena
     fc.target     = filename;
     fc.target_len = name_len;
     fc.found      = 0;
-    if (list_dir_with_loc(vol, dir_ent.first_cluster, dir_ent.no_fat_chain,
+    if (list_dir_with_loc(vol, dir_ent.first_cluster, dir_ent.no_fat_chain, dir_ent.size,
                           0, find_entry_loc_cb, &fc) != 0 ||
         !fc.found || fc.result.is_dir) {
         return -1;
     }
+
+    /* Invalidate read cluster cache for this volume */
+    mem_zero(vol->rd_cache, sizeof(vol->rd_cache));
 
     /* Clear bit 7 across all directory entries in the set across sector/cluster boundaries */
     uint8_t  sec[512];
@@ -1321,5 +1434,105 @@ int exfat_delete_file(exfat_vol_t *vol, const char *dir_path, const char *filena
         }
     }
 
+    return 0;
+}
+
+int exfat_replace_file(exfat_vol_t *vol, const char *dir_path, const char *src_name, const char *dst_name)
+{
+    if (!vol || !vol->dev || !vol->dev->read_sectors || !vol->dev->write_sectors ||
+        !dir_path || !src_name || !dst_name) {
+        return -1;
+    }
+    uint32_t src_len = ascii_len_checked(src_name, 30u);
+    uint32_t dst_len = ascii_len_checked(dst_name, 30u);
+    if (src_len == 0u || dst_len == 0u) {
+        return -1;
+    }
+    for (uint32_t i = 0u; i < dst_len; i++) {
+        if (dst_name[i] == '/' || dst_name[i] == '\\') {
+            return -1;
+        }
+    }
+
+    exfat_entry_t dir_ent;
+    uint32_t parent_lba  = 0u;
+    uint8_t  parent_slot = 0u;
+    if (find_path_with_loc(vol, dir_path, &dir_ent, &parent_lba, &parent_slot) != 0 || !dir_ent.is_dir) {
+        return -1;
+    }
+
+    find_ctx_t sc;
+    sc.target     = src_name;
+    sc.target_len = src_len;
+    sc.found      = 0;
+    if (list_dir_with_loc(vol, dir_ent.first_cluster, dir_ent.no_fat_chain, dir_ent.size,
+                          0, find_entry_loc_cb, &sc) != 0 ||
+        !sc.found || sc.result.is_dir) {
+        return -1;
+    }
+
+    if (str_eq_ci_n(src_name, dst_name, dst_len)) {
+        return 0;
+    }
+    (void)exfat_delete_file(vol, dir_path, dst_name);
+
+    uint8_t total_ents = (dst_len <= 15u) ? 3u : 4u;
+    uint32_t slot_lba  = 0u;
+    uint8_t  slot_idx  = 0u;
+    if (dir_alloc_slots(vol, dir_ent.first_cluster, dir_ent.no_fat_chain, dir_ent.size,
+                        parent_lba, parent_slot, total_ents, &slot_lba, &slot_idx) != 0) {
+        return -1;
+    }
+
+    uint8_t sec[512];
+    if (vol->dev->read_sectors(vol->dev->ctx, slot_lba, 1u, sec) != 0) {
+        return -1;
+    }
+    uint8_t *ent = &sec[(uint32_t)slot_idx * 32u];
+    build_entry_set(ent, total_ents, dst_name, dst_len,
+                    EXFAT_ATTR_ARCHIVE, sc.result.first_cluster, sc.result.size,
+                    vol->default_timestamp);
+    if (sc.result.no_fat_chain) {
+        ent[32u + 1u] = 0x03u;
+        put_le16(ent + 2u, exfat_entry_set_checksum(ent, total_ents));
+    }
+    if (vol->dev->write_sectors(vol->dev->ctx, slot_lba, 1u, sec) != 0) {
+        return -1;
+    }
+
+    /* Mark old src_name directory slots deleted WITHOUT freeing its data clusters */
+    uint32_t rem = 1u + (uint32_t)sc.loc.sec_cnt;
+    uint32_t c   = sc.loc.cls;
+    uint32_t s   = sc.loc.s;
+    uint32_t sl  = sc.loc.slot;
+    while (rem > 0u) {
+        if (c < 2u || (c - 2u) >= vol->cluster_count) {
+            return -1;
+        }
+        uint32_t lba = cluster_to_lba(vol, c) + s;
+        if (vol->dev->read_sectors(vol->dev->ctx, lba, 1u, sec) != 0) {
+            return -1;
+        }
+        while (sl < 16u && rem > 0u) {
+            sec[sl * 32u] &= 0x7Fu;
+            sl++;
+            rem--;
+        }
+        if (vol->dev->write_sectors(vol->dev->ctx, lba, 1u, sec) != 0) {
+            return -1;
+        }
+        sl = 0u;
+        s++;
+        if (s >= vol->sectors_per_cluster && rem > 0u) {
+            s = 0u;
+            uint32_t nxt = 0u;
+            if (next_cluster(vol, c, dir_ent.no_fat_chain, &nxt) != 0 || nxt == 0u) {
+                return -1;
+            }
+            c = nxt;
+        }
+    }
+
+    mem_zero(vol->rd_cache, sizeof(vol->rd_cache));
     return 0;
 }
