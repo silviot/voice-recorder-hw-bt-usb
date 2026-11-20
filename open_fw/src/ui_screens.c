@@ -599,9 +599,15 @@ static void render_player(const ui_model_t *m)
                           dt_s, &g_font_ui_sm, 100u, UI_COL_TEXT, UI_COL_BG);
 
     uint8_t vol = m->hp_plugged ? m->cfg.hp_vol : m->cfg.spk_vol;
+    /* Round the 32 DAC levels to tenths on the displayed 0..10 scale. */
+    uint32_t tenths = (vol * 100u + 15u) / 31u;
     char vbuf[8];
     vbuf[0] = '\0';
-    s_append_u32(vbuf, (int)sizeof(vbuf), vol);
+    s_append_u32(vbuf, (int)sizeof(vbuf), tenths / 10u);
+    if (tenths % 10u != 0u) {
+        s_append(vbuf, (int)sizeof(vbuf), ".");
+        s_append_u32(vbuf, (int)sizeof(vbuf), tenths % 10u);
+    }
     uint16_t vw = (uint16_t)(lcd_measure_str_aa(vbuf, &g_font_ui_sm) + 22u);
     int16_t  vx = (int16_t)(156 - (int16_t)vw);
     uint16_t vbg = m->play_vol_hi ? UI_COL_CYAN : UI_COL_TILE;

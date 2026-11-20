@@ -241,7 +241,7 @@ uint32_t exp_main(const openfw_exp_api_t *api, uint32_t arg)
 
     REG32(DMAC_CH_CTL_ADDR(0u))      = DMAC_CTL_DAC_TX_BASE;
     REG32(DMAC_CH_IRQ_STAT_ADDR(0u)) = REG32(DMAC_CH_IRQ_STAT_ADDR(0u));
-    REG32(DMAC_CH_IRQ_EN_ADDR(0u))   = 0x00080001u;
+    REG32(DMAC_CH_IRQ_EN_ADDR(0u))   = DMAC_AUDIO_IRQ_EN;
 
     g_dac_irq_cnt = 0u;
     g_dac_buf_idx = 0u;

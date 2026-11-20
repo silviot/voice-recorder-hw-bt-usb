@@ -28,6 +28,14 @@
 #define AUDIO_PA_GPIO_ON   0x0001F008u
 #define AUDIO_PA_GPIO_OFF  0x0001F000u
 
+/* Level zero mutes. Levels 1..31 span -48 dB to unity in 1.6 dB steps. */
+static const uint16_t pcm_gain_q15[32] = {
+    0, 130, 157, 189, 227, 273, 328, 394,
+    474, 569, 685, 823, 990, 1190, 1430, 1720,
+    2068, 2486, 2988, 3593, 4320, 5193, 6244, 7507,
+    9025, 10851, 13045, 15684, 18856, 22670, 27255, 32768,
+};
+
 static int16_t g_dac_buf[2][DAC_SLOT_SAMPLES] __attribute__((aligned(4)));
 static volatile uint8_t  g_dac_running   = 0u;
 static volatile uint8_t  g_tx_active     = 0u;
@@ -131,7 +139,7 @@ void audio_dac_set_volume(uint8_t ana_vol_0_31, uint16_t dig_vol_0_511)
     uint32_t dv = (dig_vol_0_511 > 0x1FFu) ? 0x1FFu : (uint32_t)dig_vol_0_511;
 
     /* Apply the user level to both PCM channels, including a true silent level. */
-    g_pcm_gain_q15 = (av * av * 32768u) / (31u * 31u);
+    g_pcm_gain_q15 = pcm_gain_q15[av];
     openfw_mmio_rmw32(CODEC_DAC0_VOL_ADDR, 0x1FFu, dv);
     openfw_mmio_rmw32(CODEC_DAC1_VOL_ADDR, 0x1FFu, dv);
     if (openfw_mmio_rd32(CODEC_DAC0_PWR_ADDR) & (1u << 29)) {
@@ -258,7 +266,7 @@ int audio_dac_start(uint32_t sample_rate, uint8_t ana_vol_0_31)
     openfw_mmio_wr32(DMAC_CH_CTL_ADDR(DAC_DMA_CH), DMAC_CTL_DAC_TX_BASE);
     openfw_mmio_wr32(DMAC_CH_IRQ_STAT_ADDR(DAC_DMA_CH),
                      openfw_mmio_rd32(DMAC_CH_IRQ_STAT_ADDR(DAC_DMA_CH)));
-    openfw_mmio_wr32(DMAC_CH_IRQ_EN_ADDR(DAC_DMA_CH), 0x00080001u); /* TC_IE */
+    openfw_mmio_wr32(DMAC_CH_IRQ_EN_ADDR(DAC_DMA_CH), DMAC_AUDIO_IRQ_EN); /* TC_IE */
 
     openfw_exp_set_dmac_ch0_irq(audio_dac_dmac_ch0_irq);
     nvic_clear_pending(DMAC_IRQ_BASE + DAC_DMA_CH);

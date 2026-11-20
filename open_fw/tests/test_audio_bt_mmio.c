@@ -427,7 +427,7 @@ static void sim_dma_deliver_frame(int32_t dc_offset, int32_t ac_amp, int16_t *co
     if (copy_out) {
         memcpy(copy_out, dst, 4096u);
     }
-    g_soc.dmac_regs[1][9] |= DMAC_IRQ_TC;
+    g_soc.dmac_regs[1][9] |= 0x02u; /* Transfer complete */
     DMAC_CH1_IRQHandler();
 }
 
@@ -454,7 +454,7 @@ static void sim_dma_deliver_stereo_frame(int32_t dc_l, int32_t amp_l,
         dst[i * 2u + 0u] = (int16_t)l;
         dst[i * 2u + 1u] = (int16_t)r;
     }
-    g_soc.dmac_regs[1][9] |= DMAC_IRQ_TC;
+    g_soc.dmac_regs[1][9] |= 0x02u; /* Transfer complete */
     DMAC_CH1_IRQHandler();
 }
 
@@ -516,6 +516,11 @@ static void test_audio_dma(void)
 
     /* Feed DC-biased (+/-16384 AC around +4000 DC) 1 kHz sine frame */
     void *slot0_ptr = g_soc.dmac_buf[1];
+    assert(g_soc.dmac_regs[1][8] == 0x00080002u);
+    g_soc.dmac_regs[1][9] |= 0x01u; /* Watermark while the final burst is pending */
+    DMAC_CH1_IRQHandler();
+    assert(audio_get_frames() == 0u);
+    assert(g_soc.dmac_buf[1] == slot0_ptr);
     sim_dma_deliver_frame(4000, 16384, NULL);
     assert(g_soc.dmac_regs[1][9] == 0u);
     assert(g_soc.dsb_count >= 1u);
@@ -564,7 +569,7 @@ static void test_audio_dma(void)
     assert((g_soc.codec_regs[(CODEC_ADC_FIFO_CTRL_ADDR - AUDIO_CODEC_BASE) >> 2] & 0x80u) == 0u);
     assert((g_soc.codec_regs[(CODEC_ANA_CTRL0_ADDR - AUDIO_CODEC_BASE) >> 2] & 0x03000000u) == 0u);
 
-    g_soc.dmac_regs[1][9] |= DMAC_IRQ_TC;
+    g_soc.dmac_regs[1][9] |= 0x02u; /* Transfer complete */
     DMAC_CH1_IRQHandler();
     assert(audio_get_frames() == 6u);
     printf("[OK] audio_dma MMIO + DMAC CH1 ring + AC VU\n");
@@ -809,15 +814,21 @@ static void test_audio_dac(void)
     assert(audio_dac_write_stereo(sbuf, 128u) == 128);
     assert(audio_dac_write_stereo(sbuf, 128u) == 0); /* Both slots occupied */
 
+    assert(g_soc.dmac_regs[0][8] == 0x00080002u);
+    g_soc.dmac_regs[0][9] |= 0x01u;
+    g_dmac_ch0_cb();
+    assert(g_soc.dmac_buf[0] == first_buf);
+    assert(audio_dac_write_stereo(sbuf, 128u) == 0);
+
     /* Complete slot 0 -> seamlessly switches DMAC CH0 to slot 1 */
-    g_soc.dmac_regs[0][9] |= DMAC_IRQ_TC;
+    g_soc.dmac_regs[0][9] |= 0x02u; /* Transfer complete */
     g_dmac_ch0_cb();
     assert(audio_dac_is_busy() == 1);
     assert(g_soc.dmac_buf[0] != first_buf);
     assert((g_soc.dmac_regs[0][3] & 0x3FFFFu) == 128u * 4u);
 
     /* Complete slot 1 -> idles cleanly */
-    g_soc.dmac_regs[0][9] |= DMAC_IRQ_TC;
+    g_soc.dmac_regs[0][9] |= 0x02u; /* Transfer complete */
     g_dmac_ch0_cb();
     assert(audio_dac_is_busy() == 0);
     assert((g_soc.dmac_regs[0][0] & DMAC_CTL_CH_EN) == 0u);
@@ -838,11 +849,17 @@ static void test_audio_dac(void)
         } else {
             assert(output[0] > previous_left && output[1] < 0);
         }
+        if (level == 1u) {
+            assert(output[1] == -130); /* -48 dB */
+        }
+        if (level == 16u) {
+            assert(output[1] == -2068); /* -24 dB */
+        }
         if (level == 31u) {
             assert(output[0] == INT16_MAX && output[1] == INT16_MIN);
         }
         previous_left = output[0];
-        g_soc.dmac_regs[0][9] |= DMAC_IRQ_TC;
+        g_soc.dmac_regs[0][9] |= 0x02u; /* Transfer complete */
         g_dmac_ch0_cb();
     }
     assert(audio_dac_start(12345u, 20u) == -1);

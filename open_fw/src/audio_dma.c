@@ -221,7 +221,7 @@ static void dmac_audio_rx_init(void)
     openfw_mmio_wr32(DMAC_CH_CTL_ADDR(AUDIO_DMA_CH), DMAC_CTL_ADC_RX_BASE);
     openfw_mmio_wr32(DMAC_CH_IRQ_STAT_ADDR(AUDIO_DMA_CH),
                      openfw_mmio_rd32(DMAC_CH_IRQ_STAT_ADDR(AUDIO_DMA_CH)));
-    openfw_mmio_wr32(DMAC_CH_IRQ_EN_ADDR(AUDIO_DMA_CH), 0x00080001u); /* TC_IE=1 */
+    openfw_mmio_wr32(DMAC_CH_IRQ_EN_ADDR(AUDIO_DMA_CH), DMAC_AUDIO_IRQ_EN); /* TC_IE=1 */
 
     nvic_clear_pending(DMAC_IRQ_BASE + AUDIO_DMA_CH);
     nvic_enable_irq(DMAC_IRQ_BASE + AUDIO_DMA_CH);

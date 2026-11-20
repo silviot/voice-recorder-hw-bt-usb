@@ -585,8 +585,9 @@ static inline int gpio_read(uint32_t port, uint32_t pin)
 #define DMAC_CTL_DAC_TX_BASE  0x002812A0u /* SRC=MEM inc 32b b1 -> DST=DAC_TX(1) fixed 32b b1 */
 #define DMAC_CTL_CH_EN        (1u << 30)
 #define DMAC_CTL_RELOAD       (1u << 29)
-#define DMAC_IRQ_TC           (1u << 0)
-#define DMAC_IRQ_HT           (1u << 1)
+#define DMAC_IRQ_WM           (1u << 0)
+#define DMAC_IRQ_TC           (1u << 1)
+#define DMAC_AUDIO_IRQ_EN     ((32u << 14) | DMAC_IRQ_TC)
 
 /* ============================================================================
  * Mentor MUSB USB 2.0 OTG Controller (0x40040000) & USB PHY Wrapper
