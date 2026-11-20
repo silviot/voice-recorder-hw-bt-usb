@@ -76,12 +76,14 @@ static struct {
     uint32_t dmac_len[8];
     uint32_t dmac_reg_calls[8];
 
-    /* eFuse + ROM CRU Hooks */
+    /* eFuse + ROM CRU/GPIO Hooks */
     uint32_t efuse_words[16];
     uint32_t rom_rst_last_id;
     uint32_t rom_rst_calls;
     uint32_t rom_clk_last_id;
     uint32_t rom_clk_calls;
+    uint32_t rom_gpio_last_cfg;
+    uint32_t rom_gpio_calls;
 
     /* BT RF BB / ANA / LUT + RWBT Exchange Memory */
     uint32_t rf_bb[256];      /* 0x40010000..0x400103FC (index 0 = RF_BB_CTRL) */
@@ -387,6 +389,12 @@ void rom_clk_enable(uint32_t clk_id)
 {
     g_soc.rom_clk_last_id = clk_id;
     g_soc.rom_clk_calls++;
+}
+
+void rom_gpio_config(uint32_t cfg)
+{
+    g_soc.rom_gpio_last_cfg = cfg;
+    g_soc.rom_gpio_calls++;
 }
 
 /* ============================================================================
@@ -765,12 +773,20 @@ static void test_audio_dac(void)
     assert(((g_soc.cru_apll_frac >> 14) & 0x1FFFFu) == 0x186C2u);
     assert(((g_soc.codec_regs[(CODEC_GLB_ADDR - AUDIO_CODEC_BASE) >> 2] >> 8) & 0xFu) == 8u);
 
+    /* Built-in speaker PA (PB30) ON / OFF + automatic shutdown in audio_dac_stop() */
+    audio_pa_set(1);
+    assert(g_soc.rom_gpio_last_cfg == 0x0001F008u);
+    uint32_t pa_calls = g_soc.rom_gpio_calls;
+    audio_pa_set(1); /* idempotent */
+    assert(g_soc.rom_gpio_calls == pa_calls);
+
     audio_dac_stop();
+    assert(g_soc.rom_gpio_last_cfg == 0x0001F000u);
     assert(g_dmac_ch0_cb == NULL);
     assert((g_soc.nvic_iser[1] & (1u << 28)) == 0u);
     assert((g_soc.codec_regs[(CODEC_DAC01_ANA_VOL_ADDR - AUDIO_CODEC_BASE) >> 2] & 0x1F1F0000u) == 0u);
     assert((g_soc.codec_regs[(CODEC_DAC0_DIG_EN_ADDR - AUDIO_CODEC_BASE) >> 2] & 0x3u) == 0u);
-    printf("[OK] audio_dac MMIO (APLL 16k/44.1k, eFuse DC, DMAC CH0 double-buf, pop-free stop)\n");
+    printf("[OK] audio_dac MMIO (APLL 16k/44.1k, eFuse DC, PB30 PA, DMAC CH0 double-buf, pop-free stop)\n");
 }
 
 /* ============================================================================

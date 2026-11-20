@@ -20,12 +20,31 @@
 #define EFUSE_RST_ID     0x58u
 #define EFUSE_CLK_ID     0x1Bu
 
+/*
+ * Built-in front speaker PA enable on PB30 (verified from HW_76 pen133_2.0.65):
+ *   ON  = PB30 mux=0, pull-up enabled  (rom_gpio_config(0x0001F008u))
+ *   OFF = PB30 mux=0, pull-up disabled (rom_gpio_config(0x0001F000u))
+ */
+#define AUDIO_PA_GPIO_ON   0x0001F008u
+#define AUDIO_PA_GPIO_OFF  0x0001F000u
+
 static int16_t g_dac_buf[2][DAC_SLOT_SAMPLES] __attribute__((aligned(4)));
 static volatile uint8_t  g_dac_running   = 0u;
 static volatile uint8_t  g_tx_active     = 0u;
 static volatile uint8_t  g_active_slot   = 0u;
 static volatile uint8_t  g_slot_ready[2] = { 0u, 0u };
 static volatile uint32_t g_slot_bytes[2] = { 0u, 0u };
+static int8_t            g_pa_state      = -1;
+
+void audio_pa_set(int enable)
+{
+    int8_t want = enable ? 1 : 0;
+    if (g_pa_state == want) {
+        return;
+    }
+    rom_gpio_config(want ? AUDIO_PA_GPIO_ON : AUDIO_PA_GPIO_OFF);
+    g_pa_state = want;
+}
 
 static uint32_t dac_rate_code(uint32_t sample_rate)
 {
@@ -306,6 +325,10 @@ void audio_dac_stop(void)
     g_slot_ready[1] = 0u;
     g_slot_bytes[0] = 0u;
     g_slot_bytes[1] = 0u;
+
+    /* Shut down built-in speaker PA first for pop-free teardown */
+    audio_pa_set(0);
+    mdelay(5u);
 
     openfw_exp_set_dmac_ch0_irq(0);
 

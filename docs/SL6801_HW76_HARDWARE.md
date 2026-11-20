@@ -14,7 +14,7 @@ This document is a clean-room hardware reference for the **Smartlink SL6801** vo
 | **Flash Storage** | **2 MiB SPI NOR** memory-mapped via XIP at `0x00C00000..0x00DFFFFF` |
 | **External Storage** | microSD slot on 1-bit SDIO (`PD4` / `PD5` / `PD6`), exFAT / FAT32 |
 | **Audio Input** | **Dual differential analog microphones** (`AMIC1 + AMIC2`, `18 mm` spacing), 16-bit & 24/32-bit ADC up to 48 kHz |
-| **Audio Output** | **Headphone-only** stereo DAC (`DAC0 + DAC1`), active-low jack detect on `PB11` (no onboard speaker) |
+| **Audio Output** | Stereo DAC (`DAC0 + DAC1`) feeding both the 3.5 mm headphone jack (`PB11` active-low detect) and built-in front speaker via external PA enabled on **`PB30`** (internal pull-up ON / Hi-Z OFF) |
 | **Display** | **80 × 160** SPI/DBI TFT (**ST7735S**, landscape `MADCTL = 0xA8`, `X_OFF = 1`, `Y_OFF = 26`), PWM backlight |
 | **USB** | Mentor **MUSB** USB 2.0 Full-Speed Device (`0x40040000`), Mask ROM DFU (`VID:PID 301a:2800`) |
 | **Bluetooth** | **BR/EDR Classic only** (no BLE), integrated baseband + 2.4 GHz RF + Mask ROM `RW-BT` HCI controller |
@@ -89,9 +89,10 @@ All 6 tactile buttons share a single analog resistor ladder on **`PD0`**:
   - **`ADC_DIG_CTRL (0x40009200)`:** Bit 0 (`0x01`) is a write-1 **self-clearing soft-reset pulse** (reads back `0`); bits `[11:8]` select the sample rate (`3` = 16 kHz, `7` = 48 kHz, `8` = 44.1 kHz); bit 1 (`0x02`, `ADC_DIG_EN`) is enabled **last**. `ADC_FIFO_CTRL (0x40009208)` sets bit 2 (`0x04` = 16-bit) and bit 7 (`0x80` = `DMA_EN`).
   - **DMAC RX (CH1, IRQ 61, RX FIFO `0x4000920C`):** Supports 16-bit and 24/32-bit PCM with `DMAC_CTL = 0x402A0281` and `XFER_CNT = 0xFF000000 | (len & 0x3FFFF)`. Live stereo `AMIC1 + AMIC2` 16 kHz capture is silicon-verified (`-29.0 / -29.1 dBFS`).
   - *Note on stock recordings:* Stock firmware enables an aggressive on-device voice DSP chain at `512 kbps` (350 Hz HPF + 2.2 kHz `+9 dB` high-shelf + `-15 dB` STFT noise suppressor + `2:1` AGC). For modern ASR models like **NVIDIA Parakeet** or **Cactus Whistle**, capturing clean raw audio with only a gentle ~75 Hz HPF and safety limiter gives significantly better accuracy; see [CLEAN_ROOM_AUDIO_PLAN.md](CLEAN_ROOM_AUDIO_PLAN.md).
-- **Headphone Playback (`DAC0 + DAC1`, `0x40009100`) — Live-Verified on Silicon:**
+- **Speaker & Headphone Playback (`DAC0 + DAC1`, `0x40009100`) — Live-Verified on Silicon:**
   - Stereo `DAC0 + DAC1` playback at 16 kHz (APLL `24.576 MHz`) is silicon-verified via **DMAC CH0 TX** (TX FIFO `0x4000910C`, `DMAC_CTL_DAC_TX_BASE = 0x002812A0`, `XFER_CNT = 0xFF000000 | (len & 0x3FFFF)`).
   - Apply factory eFuse DC-offset trims from **eFuse words 2 & 3** to `DAC0_DC (0x40009064)` (`{W3[3:0], W2[31:29]}`) and `DAC1_DC (0x40009068)` (`W3[10:4]`).
+  - **Built-in speaker PA (`PB30`):** Shares the same `DAC0 + DAC1` output (`DAC2` is unused) through an external PA enabled by **`PB30`** (`GPIOB_BASE = 0x40081400`, pin 30) configured as `mux = 0` (input/Hi-Z): internal pull-up ON (`rom_gpio_config(0x0001F008u)` -> `GPIOB+0x28[29:28] = 2`) turns the PA **ON**; no-pull/Hi-Z (`rom_gpio_config(0x0001F000u)` -> `0`) turns the PA **OFF** via external pull-down. Keep `PB30` OFF when headphones are inserted (`PB11 == 0`) and during DAC analog depop ramps.
 
 ---
 

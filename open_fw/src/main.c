@@ -1032,6 +1032,7 @@ int openfw_main(void)
     uart0_puts("Switching PD0 to SARADC key ladder & entering main loop...\n");
     keys_init();
     key_onoff_init();
+    audio_pa_set(0);
     play_boot_animation();
     usb_msc_set_audio_cfg_cb(main_usb_audio_cfg_cb);
     openfw_exp_bind_fs(&g_exfat_vol, &g_sd_mounted);

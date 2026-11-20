@@ -213,8 +213,9 @@ uint32_t       audio_get_frames(void);
 const int16_t *audio_pop_frame(uint32_t *out_bytes);
 uint32_t       audio_get_overruns(void);
 
-/* Audio DAC0+DAC1 Stereo Headphone Playback + DMAC CH0 TX (audio_dac.c) */
+/* Audio DAC0+DAC1 Stereo Headphone + Built-in Speaker PA (PB30) + DMAC CH0 TX (audio_dac.c) */
 void audio_pll_set(uint32_t sample_rate);
+void audio_pa_set(int enable);
 int  audio_dac_start(uint32_t sample_rate, uint8_t ana_vol_0_31);
 void audio_dac_set_volume(uint8_t ana_vol_0_31, uint16_t dig_vol_0_511);
 void audio_dac_set_mute(int muted);

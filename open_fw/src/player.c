@@ -237,6 +237,8 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
     if (audio_dac_start(winfo.sample_rate, volume) != 0) {
         return 0;
     }
+    /* Route audio to built-in speaker PA (PB30) when no 3.5 mm jack is inserted */
+    audio_pa_set(!hp_in);
 
     lcd_set_rotation(1); /* Landscape 160x80 */
 
@@ -304,11 +306,14 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
             audio_dac_set_volume(volume, 0x1FFu);
             if (was_hp && !hp_in && !paused && !eof_reached) {
                 paused = 1;
+                audio_pa_set(0);
                 audio_dac_set_mute(1);
                 str_copy_cap(m->toast_msg, (int)sizeof(m->toast_msg),
                              "Headphones out \xC2\xB7 paused");
                 m->toast_col = UI_COL_AMBER;
                 toast_until  = now + 1500u;
+            } else {
+                audio_pa_set((!hp_in && !paused && !eof_reached) ? 1 : 0);
             }
             ui_dirty = 1;
         }
@@ -330,6 +335,7 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
                     paused ^= 1;
                 }
                 audio_dac_set_mute(paused);
+                audio_pa_set((!hp_in && !paused && !eof_reached) ? 1 : 0);
                 ui_dirty = 1;
             } else if (k == KEY_VOL_UP || k == KEY_VOL_DOWN) {
                 if (k == KEY_VOL_UP && volume < 31u) {
@@ -384,6 +390,7 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
                 buf_pos     = 0u;
                 buf_frames  = 0u;
                 eof_reached = 0;
+                audio_pa_set((!hp_in && !paused) ? 1 : 0);
                 ui_dirty    = 1;
             }
         }
@@ -397,6 +404,7 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
                         eof_reached = 1;
                         peak_l_pct  = 0u;
                         peak_r_pct  = 0u;
+                        audio_pa_set(0);
                         ui_dirty    = 1;
                         break;
                     }
