@@ -55,7 +55,21 @@ def test_usb_sync_collisions() -> None:
         usb_sync.sync_recordings(mp, dest, delete_after_sync=True)
         assert not (dest / "REC_0001_4.wav").exists()
         assert not (mp / "record" / "REC_0001.wav").exists()
-    print("[PASS] usb_sync.py collision & deduplication safety")
+
+        # 5. Destination aliasing device record/ dir (direct or symlink) -> MUST refuse and preserve file
+        only_copy = mp / "record" / "REC_ONLY.wav"
+        only_copy.write_bytes(b"IRREPLACEABLE")
+        for bad_dest in (mp / "record", root / "record_alias"):
+            if bad_dest == root / "record_alias":
+                bad_dest.symlink_to(mp / "record")
+            refused = False
+            try:
+                usb_sync.sync_recordings(mp, bad_dest, delete_after_sync=True)
+            except ValueError:
+                refused = True
+            assert refused, f"Expected ValueError when dest aliases record/: {bad_dest}"
+            assert only_copy.exists() and only_copy.read_bytes() == b"IRREPLACEABLE"
+    print("[PASS] usb_sync.py collision, deduplication & alias-path safety")
 
 
 def _make_mbr_exfat_image(td: Path, total_sec: int = 4096, p1_start: int = 64) -> tuple[Path, int]:

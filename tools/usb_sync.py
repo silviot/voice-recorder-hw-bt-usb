@@ -92,6 +92,10 @@ def sync_recordings(
         return []
 
     dest_dir.mkdir(parents=True, exist_ok=True)
+    if os.path.samefile(record_dir, dest_dir):
+        raise ValueError(
+            f"Destination directory {dest_dir} resolves to the device record directory {record_dir}; refusing to sync in-place."
+        )
     synced_files: List[Path] = []
     audio_files = sorted(
         p for p in record_dir.iterdir()
@@ -123,6 +127,8 @@ def sync_recordings(
 
         if already_archived is not None:
             if delete_after_sync:
+                if os.path.samefile(src, already_archived):
+                    raise ValueError(f"Refusing to delete {src}: archive match {already_archived} is the same file")
                 src.unlink()
                 print(f"  -> Already archived at {already_archived.name}; removed {src.name} from device")
             continue

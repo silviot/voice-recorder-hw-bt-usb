@@ -13,7 +13,11 @@ HOST_CC  ?= cc
 LLD      ?= $(shell which ld.lld 2>/dev/null || find /usr/lib "$${ANDROID_HOME:-$$HOME/Android/Sdk}/ndk" -maxdepth 8 \( -type f -o -type l \) -executable -name ld.lld 2>/dev/null | head -n 1)
 OBJCOPY  ?= $(shell which llvm-objcopy 2>/dev/null || find /usr/lib "$${ANDROID_HOME:-$$HOME/Android/Sdk}/ndk" -maxdepth 8 \( -type f -o -type l \) -executable -name llvm-objcopy 2>/dev/null | head -n 1)
 
+ifeq ($(DEV_EXP),1)
+BUILD_DIR ?= /tmp/sl6801_openfw_devexp
+else
 BUILD_DIR ?= /tmp/sl6801_openfw
+endif
 
 CFLAGS   := --target=thumbv7em-none-eabi -mcpu=cortex-m4 -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb \
             -Os -Wall -Wextra -ffreestanding -fno-builtin -fno-stack-protector \
@@ -39,7 +43,13 @@ STOCK_DUMP  := ../dumps/firmware_2M.bin
 OUT_BIN     := ../dumps/firmware_2M_openfw.bin
 OUT_UP      := ../dumps/update_openfw.up
 
-.PHONY: all test-host test-host-san test-qemu qemu-stub update-up clean
+.PHONY: all test-host test-host-san test-qemu qemu-stub update-up clean force-config
+
+CONFIG_STAMP := $(BUILD_DIR)/.config
+
+$(CONFIG_STAMP): force-config | $(BUILD_DIR)
+	@printf '%s\n' '$(CFLAGS)' > $@.tmp
+	@if cmp -s $@.tmp $@ 2>/dev/null; then rm -f $@.tmp; else mv $@.tmp $@; fi
 
 all: $(BUILD_DIR)/open_fw_firm.bin
 
@@ -49,10 +59,10 @@ $(BUILD_DIR):
 $(SPLASH_HDR): $(SPLASH_PNG) tools/png_to_rgb565_h.py | $(BUILD_DIR)
 	python3 tools/png_to_rgb565_h.py $(SPLASH_PNG) --out $@
 
-$(BUILD_DIR)/main.o: src/main.c $(SPLASH_HDR) include/sl6801_regs.h include/openfw.h include/openfw_ui.h include/openfw_exp.h include/openfw_player.h | $(BUILD_DIR)
+$(BUILD_DIR)/main.o: src/main.c $(SPLASH_HDR) $(CONFIG_STAMP) include/sl6801_regs.h include/openfw.h include/openfw_ui.h include/openfw_exp.h include/openfw_player.h | $(BUILD_DIR)
 	$(CLANG) $(CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/%.o: src/%.c include/sl6801_regs.h include/sl6801_rom.h include/openfw.h include/openfw_ui.h include/audio_dsp.h include/openfw_exp.h include/openfw_crypto.h include/openfw_wav.h include/openfw_cwx.h include/openfw_player.h include/openfw_fs.h include/openfw_usb_msc.h include/openfw_bt_spp.h include/openfw_xrec.h | $(BUILD_DIR)
+$(BUILD_DIR)/%.o: src/%.c $(CONFIG_STAMP) include/sl6801_regs.h include/sl6801_rom.h include/openfw.h include/openfw_ui.h include/audio_dsp.h include/openfw_exp.h include/openfw_crypto.h include/openfw_wav.h include/openfw_cwx.h include/openfw_player.h include/openfw_fs.h include/openfw_usb_msc.h include/openfw_bt_spp.h include/openfw_xrec.h | $(BUILD_DIR)
 	$(CLANG) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/open_fw.elf: $(OBJS) sl6801_firm.ld
@@ -89,6 +99,8 @@ test-host: tests/test_core.c src/crypto.c src/wav.c src/cwx.c src/exfat.c src/pe
 	$(BUILD_DIR)/test_ui_render $(BUILD_DIR)/ui_all_screens.ppm
 	$(HOST_CC) $(HOST_CFLAGS) tests/test_audio_dsp.c src/audio_dsp.c -lm -o $(BUILD_DIR)/test_audio_dsp
 	$(BUILD_DIR)/test_audio_dsp
+	$(HOST_CC) $(HOST_CFLAGS) -DOPENFW_HOST_MMIO tests/test_player.c src/player.c src/wav.c src/cwx.c -o $(BUILD_DIR)/test_player
+	$(BUILD_DIR)/test_player
 	$(HOST_CC) $(HOST_CFLAGS) -DOPENFW_HOST_MMIO tests/test_audio_bt_mmio.c \
 		src/audio_dma.c src/audio_dac.c src/audio_dsp.c src/recorder.c src/bt_rf.c \
 		src/wav.c src/exfat.c src/rtc.c src/wdt_timer.c \

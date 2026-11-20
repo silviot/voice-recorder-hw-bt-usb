@@ -251,6 +251,7 @@ int exfat_mount(exfat_vol_t *vol, const blkdev_t *dev)
         return -1;
     }
 
+    mem_zero(vol, sizeof(*vol));
     vol->dev                 = dev;
     vol->part_lba            = part_lba;
     vol->fat_lba             = part_lba + fat_off;
@@ -261,9 +262,6 @@ int exfat_mount(exfat_vol_t *vol, const blkdev_t *dev)
     vol->spc_shift           = spc_shift;
     vol->sectors_per_cluster = 1u << spc_shift;
     vol->cluster_size        = 512u << spc_shift;
-    vol->bitmap_cluster      = 0u;
-    vol->bitmap_bytes        = 0u;
-    vol->alloc_hint          = 0u;
     vol->default_timestamp   = EXFAT_DOS_TIMESTAMP_DEFAULT;
 
     (void)scan_root_bitmap(vol);
@@ -1199,11 +1197,17 @@ int exfat_checkpoint_file(exfat_writer_t *w, const void *hdr, uint32_t hdr_len)
         if (hdr_len > 512u || (uint64_t)hdr_len > flushed) {
             return -1;
         }
-        if (exfat_patch_header(w, hdr, hdr_len) != 0) {
-            return -1;
-        }
     }
 
+    /*
+     * Write ordering guarantee:
+     * 1. Publish directory entry (first_cluster + flushed length) FIRST.
+     *    All clusters covering `flushed` are already on disk and FAT-linked.
+     * 2. Patch sector 0 header (e.g. WAV RIFF/data length) SECOND.
+     * If power fails between steps 1 and 2, the file on disk has all `flushed`
+     * bytes valid while the WAV header still reflects the previous (smaller)
+     * checkpoint, so the header NEVER over-claims past EOF.
+     */
     uint8_t sec[512];
     if (w->vol->dev->read_sectors(w->vol->dev->ctx, w->dir_lba, 1u, sec) != 0) {
         return -1;
@@ -1222,7 +1226,16 @@ int exfat_checkpoint_file(exfat_writer_t *w, const void *hdr, uint32_t hdr_len)
     put_le32(s + 20u, w->first_cluster);
     put_le64(s + 24u, flushed);
     put_le16(f + 2u, exfat_entry_set_checksum(f, w->total_ents));
-    return w->vol->dev->write_sectors(w->vol->dev->ctx, w->dir_lba, 1u, sec);
+    if (w->vol->dev->write_sectors(w->vol->dev->ctx, w->dir_lba, 1u, sec) != 0) {
+        return -1;
+    }
+
+    if (hdr && hdr_len > 0u) {
+        if (exfat_patch_header(w, hdr, hdr_len) != 0) {
+            return -1;
+        }
+    }
+    return 0;
 }
 
 int exfat_close_file(exfat_writer_t *w)
@@ -1437,6 +1450,44 @@ int exfat_delete_file(exfat_vol_t *vol, const char *dir_path, const char *filena
     return 0;
 }
 
+static int free_file_clusters(exfat_vol_t *vol, uint32_t first_cluster, uint64_t size, uint8_t no_fat_chain)
+{
+    if (first_cluster < 2u || size == 0u) {
+        return 0;
+    }
+    if (no_fat_chain) {
+        uint32_t cls_shift = 9u + (uint32_t)vol->spc_shift;
+        uint64_t n_cls64   = (size + ((uint64_t)vol->cluster_size - 1u)) >> cls_shift;
+        uint32_t n_cls     = (n_cls64 > vol->cluster_count) ? vol->cluster_count : (uint32_t)n_cls64;
+        for (uint32_t i = 0u; i < n_cls; i++) {
+            if (free_cluster_bit(vol, first_cluster + i) != 0) {
+                return -1;
+            }
+        }
+        return 0;
+    }
+    uint32_t cur   = first_cluster;
+    uint32_t steps = 0u;
+    while (cur >= 2u && (cur - 2u) < vol->cluster_count && steps < vol->cluster_count) {
+        uint32_t nxt = 0u;
+        if (fat_get_entry(vol, cur, &nxt) != 0) {
+            return -1;
+        }
+        if (free_cluster_bit(vol, cur) != 0) {
+            return -1;
+        }
+        if (fat_set_entry(vol, cur, 0u) != 0) {
+            return -1;
+        }
+        steps++;
+        if (nxt >= 0xFFFFFFF8u || nxt < 2u || (nxt - 2u) >= vol->cluster_count) {
+            break;
+        }
+        cur = nxt;
+    }
+    return 0;
+}
+
 int exfat_replace_file(exfat_vol_t *vol, const char *dir_path, const char *src_name, const char *dst_name)
 {
     if (!vol || !vol->dev || !vol->dev->read_sectors || !vol->dev->write_sectors ||
@@ -1474,30 +1525,120 @@ int exfat_replace_file(exfat_vol_t *vol, const char *dir_path, const char *src_n
     if (str_eq_ci_n(src_name, dst_name, dst_len)) {
         return 0;
     }
-    (void)exfat_delete_file(vol, dir_path, dst_name);
 
-    uint8_t total_ents = (dst_len <= 15u) ? 3u : 4u;
-    uint32_t slot_lba  = 0u;
-    uint8_t  slot_idx  = 0u;
-    if (dir_alloc_slots(vol, dir_ent.first_cluster, dir_ent.no_fat_chain, dir_ent.size,
-                        parent_lba, parent_slot, total_ents, &slot_lba, &slot_idx) != 0) {
+    /* Check if dst_name already exists in the directory */
+    find_ctx_t dc;
+    dc.target     = dst_name;
+    dc.target_len = dst_len;
+    dc.found      = 0;
+    if (list_dir_with_loc(vol, dir_ent.first_cluster, dir_ent.no_fat_chain, dir_ent.size,
+                          0, find_entry_loc_cb, &dc) != 0) {
+        return -1;
+    }
+    if (dc.found && dc.result.is_dir) {
         return -1;
     }
 
-    uint8_t sec[512];
-    if (vol->dev->read_sectors(vol->dev->ctx, slot_lba, 1u, sec) != 0) {
-        return -1;
-    }
-    uint8_t *ent = &sec[(uint32_t)slot_idx * 32u];
-    build_entry_set(ent, total_ents, dst_name, dst_len,
-                    EXFAT_ATTR_ARCHIVE, sc.result.first_cluster, sc.result.size,
-                    vol->default_timestamp);
-    if (sc.result.no_fat_chain) {
-        ent[32u + 1u] = 0x03u;
-        put_le16(ent + 2u, exfat_entry_set_checksum(ent, total_ents));
-    }
-    if (vol->dev->write_sectors(vol->dev->ctx, slot_lba, 1u, sec) != 0) {
-        return -1;
+    uint8_t  sec[512];
+    int      have_old_dst = 0;
+    uint32_t old_dst_cls  = 0u;
+    uint64_t old_dst_size = 0u;
+    uint8_t  old_dst_nfc  = 0u;
+
+    /*
+     * Publish dst_name BEFORE touching src_name's directory slots or freeing
+     * old destination clusters, so dst_name never disappears on interruption.
+     * When dst_name already exists within a single sector, swap its Stream
+     * Extension in-place in one atomic sector write.
+     */
+    if (dc.found && ((uint32_t)dc.loc.slot + 1u + (uint32_t)dc.loc.sec_cnt) <= 16u) {
+        have_old_dst = 1;
+        old_dst_cls  = dc.result.first_cluster;
+        old_dst_size = dc.result.size;
+        old_dst_nfc  = dc.result.no_fat_chain;
+
+        if (vol->dev->read_sectors(vol->dev->ctx, dc.loc.lba, 1u, sec) != 0) {
+            return -1;
+        }
+        uint8_t *f = &sec[(uint32_t)dc.loc.slot * 32u];
+        uint8_t *s = &sec[((uint32_t)dc.loc.slot + 1u) * 32u];
+        if (f[0] != 0x85u || s[0] != 0xC0u) {
+            return -1;
+        }
+        if (vol->default_timestamp != 0u) {
+            put_le32(f + 12u, vol->default_timestamp);
+            put_le32(f + 16u, vol->default_timestamp);
+        }
+        s[1] = sc.result.no_fat_chain ? 0x03u : 0x01u;
+        put_le64(s + 8u, sc.result.size);
+        put_le32(s + 20u, sc.result.first_cluster);
+        put_le64(s + 24u, sc.result.size);
+        put_le16(f + 2u, exfat_entry_set_checksum(f, 1u + (uint32_t)dc.loc.sec_cnt));
+        if (vol->dev->write_sectors(vol->dev->ctx, dc.loc.lba, 1u, sec) != 0) {
+            return -1;
+        }
+    } else {
+        if (dc.found) {
+            have_old_dst = 1;
+            old_dst_cls  = dc.result.first_cluster;
+            old_dst_size = dc.result.size;
+            old_dst_nfc  = dc.result.no_fat_chain;
+        }
+        uint8_t total_ents = (dst_len <= 15u) ? 3u : 4u;
+        uint32_t slot_lba  = 0u;
+        uint8_t  slot_idx  = 0u;
+        if (dir_alloc_slots(vol, dir_ent.first_cluster, dir_ent.no_fat_chain, dir_ent.size,
+                            parent_lba, parent_slot, total_ents, &slot_lba, &slot_idx) != 0) {
+            return -1;
+        }
+        if (vol->dev->read_sectors(vol->dev->ctx, slot_lba, 1u, sec) != 0) {
+            return -1;
+        }
+        uint8_t *ent = &sec[(uint32_t)slot_idx * 32u];
+        build_entry_set(ent, total_ents, dst_name, dst_len,
+                        EXFAT_ATTR_ARCHIVE, sc.result.first_cluster, sc.result.size,
+                        vol->default_timestamp);
+        if (sc.result.no_fat_chain) {
+            ent[32u + 1u] = 0x03u;
+            put_le16(ent + 2u, exfat_entry_set_checksum(ent, total_ents));
+        }
+        if (vol->dev->write_sectors(vol->dev->ctx, slot_lba, 1u, sec) != 0) {
+            return -1;
+        }
+        /* If dst existed spanning sectors, unlink its old dir slots now */
+        if (dc.found) {
+            uint32_t drem = 1u + (uint32_t)dc.loc.sec_cnt;
+            uint32_t dcl  = dc.loc.cls;
+            uint32_t ds   = dc.loc.s;
+            uint32_t dsl  = dc.loc.slot;
+            while (drem > 0u) {
+                if (dcl < 2u || (dcl - 2u) >= vol->cluster_count) {
+                    return -1;
+                }
+                uint32_t dlba = cluster_to_lba(vol, dcl) + ds;
+                if (vol->dev->read_sectors(vol->dev->ctx, dlba, 1u, sec) != 0) {
+                    return -1;
+                }
+                while (dsl < 16u && drem > 0u) {
+                    sec[dsl * 32u] &= 0x7Fu;
+                    dsl++;
+                    drem--;
+                }
+                if (vol->dev->write_sectors(vol->dev->ctx, dlba, 1u, sec) != 0) {
+                    return -1;
+                }
+                dsl = 0u;
+                ds++;
+                if (ds >= vol->sectors_per_cluster && drem > 0u) {
+                    ds = 0u;
+                    uint32_t nxt = 0u;
+                    if (next_cluster(vol, dcl, dir_ent.no_fat_chain, &nxt) != 0 || nxt == 0u) {
+                        return -1;
+                    }
+                    dcl = nxt;
+                }
+            }
+        }
     }
 
     /* Mark old src_name directory slots deleted WITHOUT freeing its data clusters */
@@ -1530,6 +1671,13 @@ int exfat_replace_file(exfat_vol_t *vol, const char *dir_path, const char *src_n
                 return -1;
             }
             c = nxt;
+        }
+    }
+
+    /* Free previous destination's old clusters LAST */
+    if (have_old_dst && old_dst_cls != sc.result.first_cluster) {
+        if (free_file_clusters(vol, old_dst_cls, old_dst_size, old_dst_nfc) != 0) {
+            return -1;
         }
     }
 

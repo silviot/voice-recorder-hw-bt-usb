@@ -576,6 +576,253 @@ static void test_exfat_write(void)
     printf("  [PASS] exfat write (mkdir, multi-cluster write, header patch, timestamp, sector wrap)\n");
 }
 
+typedef struct {
+    uint8_t *buf;
+    uint32_t sectors;
+    int      fail_write_at; /* <0 = never fail; >=0 = fail when write_count == fail_write_at */
+    int      write_count;
+} fault_disk_t;
+
+static int fault_read_sectors(void *ctx, uint32_t lba, uint32_t count, void *buf)
+{
+    fault_disk_t *d = (fault_disk_t *)ctx;
+    if (lba + count > d->sectors) return -1;
+    memcpy(buf, &d->buf[lba * 512u], count * 512u);
+    return 0;
+}
+
+static int fault_write_sectors(void *ctx, uint32_t lba, uint32_t count, const void *buf)
+{
+    fault_disk_t *d = (fault_disk_t *)ctx;
+    if (lba + count > d->sectors) return -1;
+    if (d->fail_write_at >= 0 && d->write_count >= d->fail_write_at) {
+        return -1;
+    }
+    d->write_count++;
+    memcpy(&d->buf[lba * 512u], buf, count * 512u);
+    return 0;
+}
+
+static void init_tiny_exfat(uint8_t *disk, uint32_t sectors)
+{
+    memset(disk, 0, sectors * 512u);
+    uint8_t *vbr = &disk[0];
+    memcpy(vbr + 3, "EXFAT   ", 8u);
+    put_le64(vbr + 0x48, sectors);
+    put_le32(vbr + 0x50, 16u); /* fat_offset */
+    put_le32(vbr + 0x54, 4u);  /* fat_length */
+    put_le32(vbr + 0x58, 20u); /* cluster_heap_offset */
+    put_le32(vbr + 0x5C, sectors - 20u); /* cluster_count */
+    put_le32(vbr + 0x60, 2u);  /* root_cluster */
+    vbr[0x6C] = 9u;            /* 512 B sectors */
+    vbr[0x6D] = 0u;            /* 512 B clusters */
+    vbr[510]  = 0x55u;
+    vbr[511]  = 0xAAu;
+
+    uint8_t *fat = &disk[16u * 512u];
+    put_le32(fat + 0u * 4u, 0xFFFFFFF8u);
+    put_le32(fat + 1u * 4u, 0xFFFFFFFFu);
+    put_le32(fat + 2u * 4u, 0xFFFFFFFFu); /* root */
+    put_le32(fat + 3u * 4u, 0xFFFFFFFFu); /* bitmap */
+
+    uint8_t *bmp_ent = &disk[20u * 512u];
+    bmp_ent[0] = 0x81u;
+    bmp_ent[1] = 0x00u;
+    put_le32(bmp_ent + 20u, 3u);
+    put_le64(bmp_ent + 24u, 8u);
+    disk[21u * 512u] = 0x03u;
+}
+
+static void test_exfat_remount_cache_invalidation(void)
+{
+    enum { SECS = 64u };
+    uint8_t disk_a[SECS * 512u];
+    uint8_t disk_b[SECS * 512u];
+    init_tiny_exfat(disk_a, SECS);
+    init_tiny_exfat(disk_b, SECS);
+
+    fault_disk_t fa = { disk_a, SECS, -1, 0 };
+    fault_disk_t fb = { disk_b, SECS, -1, 0 };
+    blkdev_t deva = { fault_read_sectors, fault_write_sectors, SECS, &fa };
+    blkdev_t devb = { fault_read_sectors, fault_write_sectors, SECS, &fb };
+
+    exfat_vol_t vol;
+    /* Disk A: /FILE.bin uses clusters 4 -> 5 (bytes 0x11, 0x22) */
+    assert(exfat_mount(&vol, &deva) == 0);
+    exfat_writer_t w;
+    uint8_t blk[512];
+    assert(exfat_create_file(&vol, "/", "FILE.bin", &w) == 0);
+    memset(blk, 0x11, sizeof(blk));
+    assert(exfat_write(&w, blk, sizeof(blk)) == 0);
+    memset(blk, 0x22, sizeof(blk));
+    assert(exfat_write(&w, blk, sizeof(blk)) == 0);
+    assert(exfat_close_file(&w) == 0);
+
+    /* Disk B: /FILE.bin starts at cluster 4, then skips cluster 5 (held by /OTHER.bin) to cluster 6 */
+    assert(exfat_mount(&vol, &devb) == 0);
+    exfat_writer_t wb, wo;
+    assert(exfat_create_file(&vol, "/", "FILE.bin", &wb) == 0);
+    memset(blk, 0x33, sizeof(blk));
+    assert(exfat_write(&wb, blk, sizeof(blk)) == 0); /* allocates cluster 4 */
+    assert(exfat_create_file(&vol, "/", "OTHER.bin", &wo) == 0);
+    memset(blk, 0xEE, sizeof(blk));
+    assert(exfat_write(&wo, blk, sizeof(blk)) == 0); /* allocates cluster 5 */
+    assert(exfat_close_file(&wo) == 0);
+    memset(blk, 0x66, sizeof(blk));
+    assert(exfat_write(&wb, blk, sizeof(blk)) == 0); /* allocates cluster 6 */
+    assert(exfat_close_file(&wb) == 0);
+
+    /* Mount disk A into `vol` and read offset 512 to populate vol.rd_cache (first=4, idx=1 -> cluster 5) */
+    assert(exfat_mount(&vol, &deva) == 0);
+    exfat_entry_t ea;
+    assert(exfat_find_path(&vol, "/FILE.bin", &ea) == 0);
+    assert(ea.first_cluster == 4u);
+    uint8_t byte_a = 0u;
+    uint32_t nr = 0u;
+    assert(exfat_read_file(&vol, &ea, 512u, &byte_a, 1u, &nr) == 0 && nr == 1u && byte_a == 0x22u);
+
+    /* Remount disk B into the SAME `vol` struct: cache MUST be cleared so offset 512 reads cluster 6 (0x66), not cluster 5 (0xEE) */
+    assert(exfat_mount(&vol, &devb) == 0);
+    exfat_entry_t eb;
+    assert(exfat_find_path(&vol, "/FILE.bin", &eb) == 0);
+    assert(eb.first_cluster == 4u);
+    uint8_t byte_b = 0u;
+    assert(exfat_read_file(&vol, &eb, 512u, &byte_b, 1u, &nr) == 0 && nr == 1u);
+    assert(byte_b == 0x66u);
+
+    printf("  [PASS] exfat remount cache invalidation (same first_cluster across two volumes)\n");
+}
+
+static void test_exfat_checkpoint_fault_injection(void)
+{
+    enum { SECS = 96u };
+    uint8_t base_disk[SECS * 512u];
+    uint8_t work_disk[SECS * 512u];
+    init_tiny_exfat(base_disk, SECS);
+
+    fault_disk_t fd = { base_disk, SECS, -1, 0 };
+    blkdev_t dev = { fault_read_sectors, fault_write_sectors, SECS, &fd };
+    exfat_vol_t vol;
+    assert(exfat_mount(&vol, &dev) == 0);
+    assert(exfat_mkdir(&vol, "record") == 0);
+
+    exfat_writer_t w;
+    assert(exfat_create_file(&vol, "/record", "REC_0001.wav", &w) == 0);
+
+    uint8_t hdr[44];
+    assert(wav_build_header(hdr, 16000u, 1u, 16u, 0u) == 0);
+    assert(exfat_write(&w, hdr, 44u) == 0);
+
+    uint8_t pcm[8148];
+    for (uint32_t i = 0u; i < sizeof(pcm); i++) {
+        pcm[i] = (uint8_t)((i * 37u + 11u) & 0xFFu);
+    }
+    /* First 4052 bytes -> total 4096 bytes, checkpoint #1 succeeds */
+    assert(exfat_write(&w, pcm, 4052u) == 0);
+    assert(wav_build_header(hdr, 16000u, 1u, 16u, 4052u) == 0);
+    assert(exfat_checkpoint_file(&w, hdr, 44u) == 0);
+
+    /* Next 4096 bytes -> total 8192 bytes (data_bytes = 8148) */
+    assert(exfat_write(&w, pcm + 4052u, 4096u) == 0);
+    uint8_t hdr2[44];
+    assert(wav_build_header(hdr2, 16000u, 1u, 16u, 8148u) == 0);
+
+    /* Interrupt checkpoint #2 at every write index 0..3 */
+    for (int fail_at = 0; fail_at <= 3; fail_at++) {
+        memcpy(work_disk, base_disk, sizeof(work_disk));
+        fault_disk_t fwork = { work_disk, SECS, fail_at, 0 };
+        blkdev_t dwork = { fault_read_sectors, fault_write_sectors, SECS, &fwork };
+        exfat_vol_t vwork = vol;
+        vwork.dev = &dwork;
+        exfat_writer_t wcopy = w;
+        wcopy.vol = &vwork;
+
+        (void)exfat_checkpoint_file(&wcopy, hdr2, 44u);
+
+        /* Remount fresh and verify WAV header NEVER exceeds exFAT file size */
+        fault_disk_t fchk = { work_disk, SECS, -1, 0 };
+        blkdev_t dchk = { fault_read_sectors, fault_write_sectors, SECS, &fchk };
+        exfat_vol_t vchk;
+        assert(exfat_mount(&vchk, &dchk) == 0);
+        exfat_entry_t ent;
+        assert(exfat_find_path(&vchk, "/record/REC_0001.wav", &ent) == 0);
+        assert(ent.size >= 4096u);
+
+        uint8_t rb[8192];
+        uint32_t nr = 0u;
+        assert(exfat_read_file(&vchk, &ent, 0u, rb, (uint32_t)ent.size, &nr) == 0);
+        assert(nr == (uint32_t)ent.size);
+
+        wav_info_t wi;
+        assert(wav_parse_header(rb, &wi) == 0);
+        assert(wi.data_bytes + 44u <= ent.size);
+        assert(wi.data_bytes == 4052u || wi.data_bytes == 8148u);
+        assert(memcmp(rb + 44u, pcm, wi.data_bytes) == 0);
+    }
+
+    printf("  [PASS] exfat checkpoint fault injection (WAV header never exceeds file size)\n");
+}
+
+static void test_exfat_replace_fault_injection(void)
+{
+    enum { SECS = 96u };
+    uint8_t base_disk[SECS * 512u];
+    uint8_t work_disk[SECS * 512u];
+    init_tiny_exfat(base_disk, SECS);
+
+    fault_disk_t fd = { base_disk, SECS, -1, 0 };
+    blkdev_t dev = { fault_read_sectors, fault_write_sectors, SECS, &fd };
+    exfat_vol_t vol;
+    assert(exfat_mount(&vol, &dev) == 0);
+    assert(exfat_mkdir(&vol, "cassini") == 0);
+
+    uint8_t old_data[1024];
+    uint8_t new_data[1024];
+    memset(old_data, 0x33, sizeof(old_data));
+    memset(new_data, 0x77, sizeof(new_data));
+
+    exfat_writer_t w;
+    assert(exfat_create_file(&vol, "/cassini", "DEST.bin", &w) == 0);
+    assert(exfat_write(&w, old_data, sizeof(old_data)) == 0);
+    assert(exfat_close_file(&w) == 0);
+
+    assert(exfat_create_file(&vol, "/cassini", ".tmp.bin", &w) == 0);
+    assert(exfat_write(&w, new_data, sizeof(new_data)) == 0);
+    assert(exfat_close_file(&w) == 0);
+
+    int saw_old = 0, saw_new = 0;
+    for (int fail_at = 0; fail_at <= 6; fail_at++) {
+        memcpy(work_disk, base_disk, sizeof(work_disk));
+        fault_disk_t fwork = { work_disk, SECS, fail_at, 0 };
+        blkdev_t dwork = { fault_read_sectors, fault_write_sectors, SECS, &fwork };
+        exfat_vol_t vwork;
+        assert(exfat_mount(&vwork, &dwork) == 0);
+        (void)exfat_replace_file(&vwork, "/cassini", ".tmp.bin", "DEST.bin");
+
+        fault_disk_t fchk = { work_disk, SECS, -1, 0 };
+        blkdev_t dchk = { fault_read_sectors, fault_write_sectors, SECS, &fchk };
+        exfat_vol_t vchk;
+        assert(exfat_mount(&vchk, &dchk) == 0);
+
+        exfat_entry_t ent;
+        assert(exfat_find_path(&vchk, "/cassini/DEST.bin", &ent) == 0);
+        assert(ent.size == sizeof(old_data));
+        uint8_t rb[1024];
+        uint32_t nr = 0u;
+        assert(exfat_read_file(&vchk, &ent, 0u, rb, sizeof(rb), &nr) == 0 && nr == sizeof(rb));
+        if (memcmp(rb, old_data, sizeof(old_data)) == 0) {
+            saw_old = 1;
+        } else if (memcmp(rb, new_data, sizeof(new_data)) == 0) {
+            saw_new = 1;
+        } else {
+            assert(0 && "DEST.bin corrupted during replace fault injection");
+        }
+    }
+    assert(saw_old && saw_new);
+
+    printf("  [PASS] exfat replace fault injection (destination never disappears across all write failures)\n");
+}
+
 static void build_cbw(uint8_t cbw[31], uint32_t tag, uint32_t data_len,
                       uint8_t flags, const uint8_t *cdb, uint8_t cdb_len)
 {
@@ -1755,6 +2002,9 @@ int main(int argc, char **argv)
     test_cwx_engine();
     test_exfat();
     test_exfat_write();
+    test_exfat_remount_cache_invalidation();
+    test_exfat_checkpoint_fault_injection();
+    test_exfat_replace_fault_injection();
     test_usb_msc();
     test_usb_msc_vendor_e0();
     test_bt_spp_and_xrec();

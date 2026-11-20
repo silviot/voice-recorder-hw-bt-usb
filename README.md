@@ -57,7 +57,7 @@ The standalone open-source firmware already boots and runs natively on the real 
 
 | Area | Host / ASan+UBSan | QEMU Emulator | Physical `HW_76` Device |
 | :--- | :---: | :---: | :---: |
-| **exFAT read/write, crash checkpointing, atomic replace & `fsck.exfat`** | Verified (CI) | Verified | Verified (live SDIO mount + recording) |
+| **exFAT read/write, crash checkpointing, staged replace & `fsck.exfat`** | Verified (CI) | Verified | Verified (live SDIO mount + recording) |
 | **Recording DSP (`Raw` / `Voice` / `Bypass`), VOR & fault-injected write/close** | Verified (CI) | — | Live stereo AMIC1+AMIC2 verified |
 | **DAC playback, `PB30` speaker PA & `PB11` headphone detect** | Verified (MMIO CI) | — | Live DAC verified (`PB30` PA ready to test) |
 | **160×80 AA UI, off-screen framebuffer & 6-screen navigation** | Verified (CI) | Verified (6 screens) | Live flicker-free UI verified |
