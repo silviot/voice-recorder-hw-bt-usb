@@ -16,6 +16,18 @@ Our goal is to replace that factory software with a **fast, reliable, easy-to-re
 | :---: | :---: | :---: |
 | <img src="docs/assets/device_photo.png" alt="Clip-on SL6801 voice recorder product photo" width="175"/><br/>*Front & side hardware profile* | <img src="docs/assets/stock_firmware_screen.png" alt="Real original stock firmware UI (Music, Recorder, Bluetooth, Settings) captured in SL6801 QEMU emulator" width="330"/><br/>*Real stock `pen133_2.0.65` UI (Music, Recorder, BT, Settings — captured in QEMU)* | <img src="docs/assets/openfw_qemu_home.png" alt="Real Cassini OpenFW 160x80 landscape anti-aliased Home screen captured in SL6801 QEMU emulator" width="300"/><br/>*Real `open_fw` 4-bit anti-aliased landscape UI (captured in QEMU)* |
 
+### `open_fw` UI Tour (Captured Live in QEMU)
+
+All screenshots below are captured directly from the emulated `160×80` ST7735S framebuffer running the real compiled `open_fw` ARM firmware in QEMU (`python3 open_fw/tools/capture_qemu_screenshots.py`):
+
+| Home | Files | Settings |
+| :---: | :---: | :---: |
+| <img src="docs/assets/openfw_qemu_home.png" alt="open_fw Home screen in QEMU" width="260"/><br/>*4-tile Home launcher* | <img src="docs/assets/openfw_qemu_files.png" alt="open_fw Files browser in QEMU" width="260"/><br/>*Recordings list (exFAT microSD)* | <img src="docs/assets/openfw_qemu_settings.png" alt="open_fw Settings menu in QEMU" width="260"/><br/>*Settings (Mic gain, Sound, Mics, USB disk…)* |
+
+| About | Bluetooth Sync | USB Disk |
+| :---: | :---: | :---: |
+| <img src="docs/assets/openfw_qemu_about.png" alt="open_fw About screen in QEMU" width="260"/><br/>*Version, storage, battery & DFU shortcut* | <img src="docs/assets/openfw_qemu_bt.png" alt="open_fw Bluetooth sync screen in QEMU" width="260"/><br/>*Classic BT SPP companion sync* | <img src="docs/assets/openfw_qemu_usb.png" alt="open_fw USB disk screen in QEMU" width="260"/><br/>*USB MSC drive mode with live TX/RX bytes* |
+
 ---
 
 ## Hardware & Buttons (From the Manual)
@@ -35,7 +47,7 @@ Under the hood, it runs on a **Smartlink SL6801** chip (ARM Cortex-M4F processor
 The standalone open-source firmware already boots and runs natively on the real hardware:
 
 - **Audio Recording:** Stereo WAV recording from the built-in dual microphones straight to the 64 GB exFAT storage.
-- **Audio Playback:** Headphone playback directly from saved recordings via the on-chip DAC.
+- **Audio Playback:** Automatic built-in speaker (`PB30` PA) and 3.5 mm headphone playback directly from saved recordings via the on-chip DAC, with headphone-unplug auto-pause.
 - **Crisp Anti-Aliased Display:** Custom 4-bit (16-level) anti-aliased fonts and rounded UI primitives that render in under 4 ms on the `0.96"` screen, plus a 2-second boot animation.
 - **Reliable USB-C Drive Mode:** Plug it into Linux, macOS, or Windows and copy recordings without the factory firmware's 15-second disconnect bug.
 - **Desktop Emulator & Safe Testing:** Prototype UI changes in a desktop QEMU emulator or test code directly in device RAM without wearing out flash memory.
