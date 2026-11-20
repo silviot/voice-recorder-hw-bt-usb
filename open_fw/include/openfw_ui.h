@@ -169,7 +169,7 @@ typedef enum {
 typedef struct {
     uint8_t auto_level;     /* 1=On (default), 0=Off */
     uint8_t mic_gain;       /* 0..31 (default 20) */
-    uint8_t sound_mode;     /* 0=Raw, 1=Clarity (default), 2=Bypass */
+    uint8_t sound_mode;     /* 0=Raw (default), 1=Clarity, 2=Bypass */
     uint8_t channels;       /* 1=1ch, 2=2ch (default) */
     uint8_t vor_enabled;    /* 0=Off (default), 1=On */
     uint8_t brightness_idx; /* 0..4 => 20,40,60,80(def),100% */
@@ -289,5 +289,29 @@ typedef struct {
 
 void ui_settings_defaults(ui_settings_t *cfg);
 void ui_render_screen(ui_screen_id_t scr, const ui_model_t *m);
+
+/* =========================================================================
+ * Persistent Settings & Last-Played Resume State (/cassini/settings.bin)
+ * ========================================================================= */
+#define OPENFW_PERSIST_MAGIC   0x3143464Fu /* "OFC1" little-endian */
+#define OPENFW_PERSIST_VERSION 1u
+
+typedef struct {
+    uint32_t      magic;
+    uint16_t      version;
+    uint8_t       has_last;
+    uint8_t       reserved0;
+    ui_settings_t cfg;
+    uint8_t       reserved1[2];
+    uint32_t      last_resume_sec;
+    char          last_filename[32];
+    uint8_t       reserved2[6];
+    uint16_t      crc16;
+} openfw_persist_t;
+
+int ui_persist_load(exfat_vol_t *vol, ui_settings_t *cfg,
+                    char *last_file, uint32_t *last_resume, int *has_last);
+int ui_persist_save(exfat_vol_t *vol, const ui_settings_t *cfg,
+                    const char *last_file, uint32_t last_resume, int has_last);
 
 #endif /* OPENFW_UI_H */

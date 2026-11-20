@@ -14,6 +14,7 @@
 #include "openfw_crypto.h"
 #include "openfw_cwx.h"
 #include "openfw_fs.h"
+#include "openfw_ui.h"
 #include "openfw_usb_msc.h"
 #include "openfw_wav.h"
 #include "openfw_xrec.h"
@@ -933,8 +934,74 @@ static void run_exfat_img_test(const char *path)
     assert(winfo.sample_rate == 16000u && winfo.data_bytes == sizeof(pcm));
     assert(memcmp(verify_buf + 44u, pcm, sizeof(pcm)) == 0);
 
+    /* Persistent settings (/cassini/settings.bin) round-trip, clamping, and CRC-16 rejection */
+    ui_settings_t cfg_def = {
+        .auto_level = 1u, .mic_gain = 20u, .sound_mode = 0u, .channels = 2u,
+        .vor_enabled = 0u, .brightness_idx = 3u, .screen_off_idx = UI_SCR_OFF_30S,
+        .skip_mode = UI_SKIP_5_10, .hp_vol = 18u, .spk_vol = 18u
+    };
+    ui_settings_t cfg_load = cfg_def;
+    char     last_name[32] = "UNCHANGED";
+    uint32_t last_resume   = 999u;
+    int      has_last      = 0;
+
+    /* Missing file -> -1, leaving defaults intact */
+    assert(ui_persist_load(&vol2, &cfg_load, last_name, &last_resume, &has_last) == -1);
+    assert(memcmp(&cfg_load, &cfg_def, sizeof(cfg_def)) == 0);
+    assert(strcmp(last_name, "UNCHANGED") == 0 && last_resume == 999u);
+
+    /* Save custom settings & last-played state, remount, and verify round-trip */
+    ui_settings_t cfg_save = {
+        .auto_level = 0u, .mic_gain = 27u, .sound_mode = 1u, .channels = 1u,
+        .vor_enabled = 1u, .brightness_idx = 4u, .screen_off_idx = UI_SCR_OFF_5M,
+        .skip_mode = UI_SKIP_10_30, .hp_vol = 22u, .spk_vol = 14u
+    };
+    assert(ui_persist_save(&vol2, &cfg_save, "REC_0001.wav", 42u, 1) == 0);
+
+    exfat_vol_t vol3;
+    assert(exfat_mount(&vol3, &dev) == 0);
+    assert(ui_persist_load(&vol3, &cfg_load, last_name, &last_resume, &has_last) == 0);
+    assert(memcmp(&cfg_load, &cfg_save, sizeof(cfg_save)) == 0);
+    assert(has_last == 1 && last_resume == 42u && strcmp(last_name, "REC_0001.wav") == 0);
+
+    /* Overwrite with out-of-range values -> verify clamping on save/load */
+    ui_settings_t cfg_oob = {
+        .auto_level = 5u, .mic_gain = 99u, .sound_mode = 7u, .channels = 9u,
+        .vor_enabled = 3u, .brightness_idx = 9u, .screen_off_idx = 9u,
+        .skip_mode = 9u, .hp_vol = 99u, .spk_vol = 99u
+    };
+    assert(ui_persist_save(&vol3, &cfg_oob, "", 123u, 0) == 0);
+    assert(ui_persist_load(&vol3, &cfg_load, last_name, &last_resume, &has_last) == 0);
+    assert(cfg_load.auto_level == 1u && cfg_load.mic_gain == 31u && cfg_load.sound_mode == 0u);
+    assert(cfg_load.channels == 2u && cfg_load.vor_enabled == 1u && cfg_load.brightness_idx == 3u);
+    assert(cfg_load.screen_off_idx == UI_SCR_OFF_30S && cfg_load.skip_mode == UI_SKIP_5_10);
+    assert(cfg_load.hp_vol == 31u && cfg_load.spk_vol == 31u);
+    assert(has_last == 0 && last_resume == 0u && last_name[0] == '\0');
+
+    /* Corrupt a byte inside /cassini/settings.bin -> CRC-16 must reject & keep defaults */
+    exfat_entry_t set_ent;
+    assert(exfat_find_path(&vol3, "/cassini/settings.bin", &set_ent) == 0);
+    assert(set_ent.size == sizeof(openfw_persist_t));
+    uint8_t raw_set[sizeof(openfw_persist_t)];
+    uint32_t raw_got = 0u;
+    assert(exfat_read_file(&vol3, &set_ent, 0u, raw_set, (uint32_t)sizeof(raw_set), &raw_got) == 0);
+    assert(raw_got == sizeof(raw_set));
+    raw_set[10] ^= 0xFFu;
+    assert(exfat_delete_file(&vol3, "/cassini", "settings.bin") == 0);
+    exfat_writer_t sw;
+    assert(exfat_create_file(&vol3, "/cassini", "settings.bin", &sw) == 0);
+    assert(exfat_write(&sw, raw_set, (uint32_t)sizeof(raw_set)) == 0);
+    assert(exfat_close_file(&sw) == 0);
+
+    cfg_load = cfg_def;
+    assert(ui_persist_load(&vol3, &cfg_load, last_name, &last_resume, &has_last) == -1);
+    assert(memcmp(&cfg_load, &cfg_def, sizeof(cfg_def)) == 0);
+
+    /* Restore a valid settings.bin before fsck.exfat */
+    assert(ui_persist_save(&vol3, &cfg_save, "REC_0001.wav", 42u, 1) == 0);
+
     fclose(fp);
-    printf("  [PASS] exfat-img (%s: 16,428 B multi-cluster WAV written & verified)\n", path);
+    printf("  [PASS] exfat-img (%s: 16,428 B multi-cluster WAV + settings.bin persist/CRC-16 verified)\n", path);
 }
 
 static uint8_t test_rfcomm_fcs(const uint8_t *data, uint32_t len)

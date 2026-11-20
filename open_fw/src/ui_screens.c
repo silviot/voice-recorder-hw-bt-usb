@@ -146,7 +146,7 @@ void ui_settings_defaults(ui_settings_t *cfg)
 {
     cfg->auto_level     = 1u;
     cfg->mic_gain       = 20u;
-    cfg->sound_mode     = 1u; /* Clarity */
+    cfg->sound_mode     = 0u; /* Raw */
     cfg->channels       = 2u; /* 2ch */
     cfg->vor_enabled    = 0u; /* Off */
     cfg->brightness_idx = 3u; /* 80% */

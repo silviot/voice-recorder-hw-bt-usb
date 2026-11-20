@@ -252,6 +252,24 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
 
     uint32_t data_off      = 0u;
     uint32_t played_frames = 0u;
+    if (m->play_file.resume_sec > 0u && winfo.sample_rate > 0u) {
+        uint64_t target = (uint64_t)m->play_file.resume_sec * (uint64_t)winfo.sample_rate;
+        if (target < winfo.total_samples) {
+            if (winfo.format_tag == WAV_FMT_PCM) {
+                uint32_t f_idx = (uint32_t)target;
+                data_off      = f_idx * (uint32_t)winfo.block_align;
+                played_frames = f_idx;
+            } else {
+                uint32_t spb = (winfo.samples_per_block > 0u) ? (uint32_t)winfo.samples_per_block : 1u;
+                uint32_t blk_idx = (uint32_t)target / spb;
+                data_off      = blk_idx * (uint32_t)winfo.block_align;
+                played_frames = blk_idx * spb;
+            }
+            if (data_off > winfo.data_bytes) {
+                data_off = winfo.data_bytes;
+            }
+        }
+    }
     uint32_t buf_pos       = 0u;
     uint32_t buf_frames    = 0u;
     uint8_t  peak_l_pct    = 0u;
@@ -260,6 +278,7 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
     int      eof_reached   = 0;
     uint32_t last_ui_ms    = 0u;
     uint32_t last_vol_ms   = 0u;
+    uint32_t toast_until   = 0u;
     int      ui_dirty      = 1;
     int      ret_code      = 0;
     key_id_t prev_k        = KEY_ENTER;
@@ -272,11 +291,25 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
         }
 
         uint32_t now = millis();
+        if (toast_until != 0u && (int32_t)(now - toast_until) >= 0) {
+            toast_until     = 0u;
+            m->toast_msg[0] = '\0';
+            ui_dirty        = 1;
+        }
         int cur_hp = keys_read_hp_detect();
         if (cur_hp != hp_in) {
+            int was_hp = hp_in;
             hp_in  = cur_hp;
             volume = hp_in ? m->cfg.hp_vol : m->cfg.spk_vol;
             audio_dac_set_volume(volume, 0x1FFu);
+            if (was_hp && !hp_in && !paused && !eof_reached) {
+                paused = 1;
+                audio_dac_set_mute(1);
+                str_copy_cap(m->toast_msg, (int)sizeof(m->toast_msg),
+                             "Headphones out \xC2\xB7 paused");
+                m->toast_col = UI_COL_AMBER;
+                toast_until  = now + 1500u;
+            }
             ui_dirty = 1;
         }
 

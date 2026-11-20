@@ -234,6 +234,84 @@ static void apply_cfg_to_recorder(void)
     recorder_set_vor((int)g_ui.cfg.vor_enabled);
 }
 
+static int str_eq_ci(const char *a, const char *b)
+{
+    if (!a || !b) return 0;
+    while (*a != '\0' && *b != '\0') {
+        char ca = *a++, cb = *b++;
+        if (ca >= 'A' && ca <= 'Z') ca = (char)(ca + ('a' - 'A'));
+        if (cb >= 'A' && cb <= 'Z') cb = (char)(cb + ('a' - 'A'));
+        if (ca != cb) return 0;
+    }
+    return (*a == '\0' && *b == '\0') ? 1 : 0;
+}
+
+static void save_persisted_state(void)
+{
+    if (!g_sd_mounted) {
+        return;
+    }
+    rtc_datetime_t now;
+    rtc_get(&now);
+    sanitize_rtc(&now);
+    exfat_set_timestamp(&g_exfat_vol, rtc_to_dos_timestamp(&now));
+    (void)ui_persist_save(&g_exfat_vol, &g_ui.cfg,
+                          g_ui.has_last ? g_ui.last_file.filename : "",
+                          g_ui.has_last ? g_ui.last_file.resume_sec : 0u,
+                          g_ui.has_last);
+}
+
+static void load_persisted_state(void)
+{
+    if (!g_sd_mounted) {
+        return;
+    }
+    char     last_name[32];
+    uint32_t last_resume = 0u;
+    int      has_last    = 0;
+    if (ui_persist_load(&g_exfat_vol, &g_ui.cfg, last_name, &last_resume, &has_last) != 0) {
+        return;
+    }
+
+    apply_cfg_to_recorder();
+    backlight_apply(user_bl_pct());
+
+    if (has_last && last_name[0] != '\0') {
+        int found = 0;
+        for (int i = 0; i < g_ui.file_count; i++) {
+            if (str_eq_ci(g_files[i].filename, last_name)) {
+                g_files[i].resume_sec = (last_resume < g_files[i].duration_sec) ? last_resume : 0u;
+                g_files[i].unplayed   = 0u;
+                g_ui.last_file        = g_files[i];
+                copy_cstr(g_last_dir, (int)sizeof(g_last_dir), g_file_dirs[i]);
+                g_ui.has_last         = 1;
+                found = 1;
+                break;
+            }
+        }
+        if (!found) {
+            char full[48];
+            int p = 0;
+            append_str(full, &p, (int)sizeof(full), "/record/");
+            append_str(full, &p, (int)sizeof(full), last_name);
+            full[p] = '\0';
+            exfat_entry_t ent;
+            if (exfat_find_path(&g_exfat_vol, full, &ent) == 0 && !ent.is_dir) {
+                copy_cstr(g_ui.last_file.filename, (int)sizeof(g_ui.last_file.filename), last_name);
+                g_ui.last_file.dt             = g_ui.now;
+                g_ui.last_file.duration_sec   = (ent.size > 44u) ? ((uint32_t)(ent.size - 44u) / 32000u) : 0u;
+                g_ui.last_file.resume_sec     = (last_resume < g_ui.last_file.duration_sec) ? last_resume : 0u;
+                g_ui.last_file.unplayed       = 0u;
+                g_ui.last_file.has_transcript = 0u;
+                g_ui.last_file.channels       = 1u;
+                copy_cstr(g_last_dir, (int)sizeof(g_last_dir), "/record");
+                g_ui.has_last = 1;
+            }
+        }
+    }
+    refresh_telemetry();
+}
+
 static void wait_key_release(key_id_t target)
 {
     while (keys_decode(keys_read_adc()) == target) {
@@ -848,6 +926,7 @@ static void play_file_at_index(int start_idx)
             break;
         }
     }
+    save_persisted_state();
 }
 
 static void delete_selected_file(uint32_t now_ms)
@@ -948,6 +1027,7 @@ int openfw_main(void)
     backlight_apply(0u); /* Backlight ramps up smoothly inside play_boot_animation() */
 
     probe_microsd_internal(1);
+    load_persisted_state();
 
     uart0_puts("Switching PD0 to SARADC key ladder & entering main loop...\n");
     keys_init();
@@ -1169,6 +1249,7 @@ int openfw_main(void)
                         copy_cstr(g_last_dir, (int)sizeof(g_last_dir), g_file_dirs[0]);
                         g_ui.has_last = 1;
                     }
+                    save_persisted_state();
                     saved_start_ms = now_ms;
                     scr            = UI_SCR_SAVED;
                 } else {
@@ -1344,6 +1425,7 @@ int openfw_main(void)
                                 (void)openfw_play_file_ui(&g_exfat_vol, g_last_dir,
                                                           g_ui.last_file.filename, &g_ui);
                                 g_ui.last_file.resume_sec = g_ui.play_file.resume_sec;
+                                save_persisted_state();
                                 g_ui_screen = (uint32_t)scr;
                                 prev_key    = KEY_NONE;
                                 dirty       = 1;
@@ -1404,6 +1486,8 @@ int openfw_main(void)
                         g_ui.play_file = g_ui.last_file;
                         (void)openfw_play_file_ui(&g_exfat_vol, "/record",
                                                   g_ui.saved_filename, &g_ui);
+                        g_ui.last_file.resume_sec = g_ui.play_file.resume_sec;
+                        save_persisted_state();
                         scr         = (prev_scr == UI_SCR_REC || prev_scr == UI_SCR_SAVED) ? UI_SCR_HOME : prev_scr;
                         g_ui_screen = (uint32_t)scr;
                         prev_key    = KEY_NONE;
@@ -1535,6 +1619,7 @@ int openfw_main(void)
                         }
                     } else {
                         if (key == KEY_BACK) {
+                            save_persisted_state();
                             scr         = UI_SCR_HOME;
                             g_ui_screen = (uint32_t)scr;
                             dirty       = 1;

@@ -27,7 +27,7 @@ SRCS      := src/startup.c src/wdt_timer.c src/rtc.c src/uart.c src/pmu.c \
              src/audio_dac.c src/audio_dsp.c src/usb_scsi.c src/usb_musb.c \
              src/bt_rf.c src/bt_spp.c src/xrec_proto.c src/bt_hci.c \
              src/recorder.c src/player.c src/exp_runner.c src/crypto.c \
-             src/wav.c src/cwx.c src/exfat.c src/main.c
+             src/wav.c src/cwx.c src/exfat.c src/persist.c src/main.c
 OBJS      := $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(SRCS))
 
 SPLASH_PNG  := ../assets/cassini_welcome_80x40.png
@@ -67,7 +67,7 @@ $(BUILD_DIR)/xip.bin: $(BUILD_DIR)/open_fw.elf
 $(BUILD_DIR)/open_fw_firm.bin: $(BUILD_DIR)/ram_boot.bin $(BUILD_DIR)/xip.bin tools/pack_firm.py
 	python3 tools/pack_firm.py --ram-boot $(BUILD_DIR)/ram_boot.bin --xip $(BUILD_DIR)/xip.bin --out-firm $@
 
-test-host: tests/test_core.c src/crypto.c src/wav.c src/cwx.c src/exfat.c src/usb_scsi.c src/bt_spp.c src/xrec_proto.c | $(BUILD_DIR)
+test-host: tests/test_core.c src/crypto.c src/wav.c src/cwx.c src/exfat.c src/persist.c src/usb_scsi.c src/bt_spp.c src/xrec_proto.c | $(BUILD_DIR)
 	$(HOST_CC) $(HOST_CFLAGS) $^ -o $(BUILD_DIR)/test_core
 	$(BUILD_DIR)/test_core
 	dd if=/dev/zero of=$(BUILD_DIR)/test_exfat.img bs=512 count=4096 status=none
