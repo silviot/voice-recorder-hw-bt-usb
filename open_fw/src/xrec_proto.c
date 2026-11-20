@@ -181,7 +181,9 @@ typedef struct {
     xrec_ctx_t *ctx;
     char        buf[512];
     int         pos;
-    int         err;
+    uint32_t    seen_files;
+    uint32_t    batch_files;
+    int         busy;
 } ls_ctx_t;
 
 static int ls_flush(ls_ctx_t *lc)
@@ -191,14 +193,16 @@ static int ls_flush(ls_ctx_t *lc)
     }
     if (!lc->ctx->ops.send ||
         lc->ctx->ops.send(lc->ctx->user, (const uint8_t *)lc->buf, (uint16_t)lc->pos) != 0) {
-        lc->err = -1;
+        lc->busy = 1;
         return -1;
     }
-    lc->pos = 0;
+    lc->ctx->ls_sent_cnt += lc->batch_files;
+    lc->batch_files       = 0u;
+    lc->pos               = 0;
     return 0;
 }
 
-static int ls_append(ls_ctx_t *lc, const char *line, int len)
+static int ls_append(ls_ctx_t *lc, const char *line, int len, int is_file_entry)
 {
     if ((lc->pos + len) > (int)sizeof(lc->buf)) {
         if (ls_flush(lc) != 0) {
@@ -207,6 +211,9 @@ static int ls_append(ls_ctx_t *lc, const char *line, int len)
     }
     for (int i = 0; i < len && lc->pos < (int)sizeof(lc->buf); i++) {
         lc->buf[lc->pos++] = line[i];
+    }
+    if (is_file_entry) {
+        lc->batch_files++;
     }
     return 0;
 }
@@ -217,6 +224,11 @@ static int ls_dir_cb(const exfat_entry_t *entry, void *user)
     if (entry->is_dir) {
         return 0;
     }
+    if (lc->seen_files < lc->ctx->ls_sent_cnt) {
+        lc->seen_files++;
+        return 0;
+    }
+    lc->seen_files++;
     char line[128];
     int pos = 0;
     uint32_t sz = (entry->size > 0xFFFFFFFFu) ? 0xFFFFFFFFu : (uint32_t)entry->size;
@@ -225,7 +237,7 @@ static int ls_dir_cb(const exfat_entry_t *entry, void *user)
     append_str(line, &pos, (int)sizeof(line), ",");
     append_str(line, &pos, (int)sizeof(line), entry->name);
     append_str(line, &pos, (int)sizeof(line), "\r\n");
-    if (ls_append(lc, line, pos) != 0) {
+    if (ls_append(lc, line, pos, 1) != 0) {
         return 1;
     }
     return 0;
@@ -422,32 +434,53 @@ static void handle_rtc(xrec_ctx_t *ctx, const char *args)
     send_text(ctx, ok, (int)(sizeof(ok) - 1u));
 }
 
+static void xrec_poll_ls(xrec_ctx_t *ctx)
+{
+    if (!ctx || !ctx->ls_active || !ctx->ops.send) {
+        return;
+    }
+    ls_ctx_t lc;
+    lc.ctx         = ctx;
+    lc.pos         = 0;
+    lc.seen_files  = 0u;
+    lc.batch_files = 0u;
+    lc.busy        = 0;
+
+    if (ctx->ls_has_dir) {
+        int rc = exfat_list_dir_entry(ctx->vol, &ctx->ls_dir, ls_dir_cb, &lc);
+        if (lc.busy) {
+            return; /* Retry on next xrec_poll() once RFCOMM credits/queue free up */
+        }
+        if (rc != 0) {
+            ctx->ls_active = 0u;
+            send_err(ctx, "SDIO");
+            return;
+        }
+    }
+
+    static const char end[] = "+XREC:END\r\n";
+    if (ls_append(&lc, end, (int)(sizeof(end) - 1u), 0) != 0 || ls_flush(&lc) != 0) {
+        return; /* Retry sending +XREC:END on next poll */
+    }
+    ctx->ls_active = 0u;
+}
+
 static void handle_ls(xrec_ctx_t *ctx)
 {
     if (!ctx->vol) {
         send_err(ctx, "NOSD");
         return;
     }
-    ls_ctx_t lc;
-    lc.ctx = ctx;
-    lc.pos = 0;
-    lc.err = 0;
+    ctx->ls_active   = 1u;
+    ctx->ls_sent_cnt = 0u;
+    ctx->ls_has_dir  = 0u;
 
     exfat_entry_t rec_dir;
     if (exfat_find_path(ctx->vol, "/record", &rec_dir) == 0 && rec_dir.is_dir) {
-        int rc = exfat_list_dir(ctx->vol, rec_dir.first_cluster, rec_dir.no_fat_chain, ls_dir_cb, &lc);
-        if (lc.err != 0) {
-            return;
-        }
-        if (rc != 0) {
-            send_err(ctx, "SDIO");
-            return;
-        }
+        ctx->ls_dir     = rec_dir;
+        ctx->ls_has_dir = 1u;
     }
-    static const char end[] = "+XREC:END\r\n";
-    if (ls_append(&lc, end, (int)(sizeof(end) - 1u)) == 0) {
-        (void)ls_flush(&lc);
-    }
+    xrec_poll_ls(ctx);
 }
 
 static void handle_get_common(xrec_ctx_t *ctx, const char *args, int is_stream)
@@ -569,6 +602,26 @@ static void send_put_ok(xrec_ctx_t *ctx, uint32_t offset, uint16_t chunk_len)
     send_text(ctx, buf, pos);
 }
 
+static void abort_staged_put(xrec_ctx_t *ctx)
+{
+    if (!ctx || ctx->put_stream_mode == XREC_PUT_NONE) {
+        return;
+    }
+    uint8_t mode = ctx->put_stream_mode;
+    (void)exfat_close_file(&ctx->put_writer);
+    if (ctx->vol) {
+        if (mode == XREC_PUT_CAS) {
+            (void)exfat_delete_file(ctx->vol, "/cassini", ".xrec_cas.tmp");
+        } else if (mode == XREC_PUT_OTA) {
+            (void)exfat_delete_file(ctx->vol, "/", ".xrec_ota.tmp");
+        }
+    }
+    ctx->put_stream_mode    = XREC_PUT_NONE;
+    ctx->put_has_last       = 0u;
+    ctx->put_written        = 0u;
+    ctx->put_stream_name[0] = '\0';
+}
+
 static void handle_put_complete(xrec_ctx_t *ctx)
 {
     if (!ctx->put_auth_ok || !ctx->auth) {
@@ -612,35 +665,26 @@ static void handle_put_complete(xrec_ctx_t *ctx)
 
     if (ctx->put_offset == 0u) {
         if (ctx->put_stream_mode != XREC_PUT_NONE) {
-            (void)exfat_close_file(&ctx->put_writer);
-            ctx->put_stream_mode = XREC_PUT_NONE;
+            abort_staged_put(ctx);
         }
 
-        const char *dir   = "/";
-        const char *fname = "update.up";
-        char full_path[64];
-        int p = 0;
+        const char *dir      = "/";
+        const char *fname    = "update.up";
+        const char *tmp_name = ".xrec_ota.tmp";
 
         if (ctx->put_target == XREC_PUT_CAS) {
             if (exfat_mkdir(ctx->vol, "cassini") != 0) {
                 send_err(ctx, "SDIO");
                 return;
             }
-            dir   = "/cassini";
-            fname = ctx->put_cas_name;
-            append_str(full_path, &p, (int)sizeof(full_path), "/cassini/");
-            append_str(full_path, &p, (int)sizeof(full_path), fname);
-            full_path[p] = '\0';
-        } else {
-            append_str(full_path, &p, (int)sizeof(full_path), "/update.up");
-            full_path[p] = '\0';
+            dir      = "/cassini";
+            fname    = ctx->put_cas_name;
+            tmp_name = ".xrec_cas.tmp";
         }
 
-        exfat_entry_t existing;
-        if (exfat_find_path(ctx->vol, full_path, &existing) == 0 && !existing.is_dir) {
-            (void)exfat_delete_file(ctx->vol, dir, fname);
-        }
-        if (exfat_create_file(ctx->vol, dir, fname, &ctx->put_writer) != 0) {
+        /* Stage under temporary name so interrupted uploads never clobber existing files */
+        (void)exfat_delete_file(ctx->vol, dir, tmp_name);
+        if (exfat_create_file(ctx->vol, dir, tmp_name, &ctx->put_writer) != 0) {
             send_err(ctx, "SDIO");
             return;
         }
@@ -681,12 +725,15 @@ static void handle_putend(xrec_ctx_t *ctx)
     }
 
     uint32_t total = ctx->put_written;
+    char final_name[32];
+    copy_cstr(final_name, (uint32_t)sizeof(final_name), ctx->put_stream_name);
     int rc = exfat_close_file(&ctx->put_writer);
     ctx->put_stream_mode    = XREC_PUT_NONE;
     ctx->put_has_last       = 0u;
     ctx->put_written        = 0u;
     ctx->put_stream_name[0] = '\0';
-    if (rc != 0) {
+    if (rc != 0 || exfat_replace_file(ctx->vol, "/cassini", ".xrec_cas.tmp", final_name) != 0) {
+        (void)exfat_delete_file(ctx->vol, "/cassini", ".xrec_cas.tmp");
         send_err(ctx, "SDIO");
         return;
     }
@@ -715,7 +762,8 @@ static void handle_ota(xrec_ctx_t *ctx)
     ctx->put_has_last       = 0u;
     ctx->put_written        = 0u;
     ctx->put_stream_name[0] = '\0';
-    if (rc != 0) {
+    if (rc != 0 || exfat_replace_file(ctx->vol, "/", ".xrec_ota.tmp", "update.up") != 0) {
+        (void)exfat_delete_file(ctx->vol, "/", ".xrec_ota.tmp");
         send_err(ctx, "SDIO");
         return;
     }
@@ -1079,12 +1127,15 @@ void xrec_on_disconnect(xrec_ctx_t *ctx)
         return;
     }
     if (ctx->put_stream_mode != XREC_PUT_NONE) {
-        (void)exfat_close_file(&ctx->put_writer);
+        abort_staged_put(ctx);
     }
     ctx->auth               = 0u;
     ctx->chal_active        = 0u;
     ctx->rx_len             = 0u;
     ctx->gets_active        = 0u;
+    ctx->ls_active          = 0u;
+    ctx->ls_has_dir         = 0u;
+    ctx->ls_sent_cnt        = 0u;
     ctx->put_active         = 0u;
     ctx->put_target         = XREC_PUT_NONE;
     ctx->put_cas_name[0]    = '\0';
@@ -1134,7 +1185,13 @@ void xrec_on_rx(xrec_ctx_t *ctx, const uint8_t *data, uint16_t len)
 
 void xrec_poll(xrec_ctx_t *ctx)
 {
-    if (!ctx || !ctx->gets_active || !ctx->ops.send) {
+    if (!ctx || !ctx->ops.send) {
+        return;
+    }
+    if (ctx->ls_active) {
+        xrec_poll_ls(ctx);
+    }
+    if (!ctx->gets_active) {
         return;
     }
 

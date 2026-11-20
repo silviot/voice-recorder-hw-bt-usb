@@ -14,6 +14,16 @@
 #define OPENFW_UNATTENDED_DEV 1
 #endif
 
+/*
+ * Privileged USB 0xE0 SRAM experiment & arbitrary memory read handlers
+ * (EXP_WRITE 0x05, EXP_RUN 0x06, MEM_READ 0x07, EXP_STATUS 0x09).
+ * Disabled by default in ordinary recorder builds; opt in explicitly via
+ * `make -C open_fw DEV_EXP=1`.
+ */
+#ifndef OPENFW_ENABLE_USB_EXP
+#define OPENFW_ENABLE_USB_EXP 0
+#endif
+
 #define OPENFW_EXP_TIMEOUT_MS    15000u
 #define OPENFW_FAULT_MAGIC_MASK  0xFFFFF000u
 #define OPENFW_FAULT_MAGIC_BASE  0xFA017000u

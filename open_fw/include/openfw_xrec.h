@@ -91,6 +91,12 @@ typedef struct {
     uint32_t       gets_rem;
     uint16_t       gets_chunk_max;
 
+    /* Resumable +XREC:LS state */
+    uint8_t        ls_active;
+    uint8_t        ls_has_dir;
+    exfat_entry_t  ls_dir;
+    uint32_t       ls_sent_cnt;
+
     /* Streaming +XREC:PUT -> OTA / EXP / CAS upload state */
     uint8_t        put_active;
     uint8_t        put_auth_ok;

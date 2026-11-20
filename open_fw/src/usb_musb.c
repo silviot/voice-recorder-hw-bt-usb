@@ -392,6 +392,7 @@ static inline void musb_put_le32(uint8_t *p, uint32_t v)
     p[3] = (uint8_t)((v >> 24) & 0xFFu);
 }
 
+#if OPENFW_ENABLE_USB_EXP
 static void pack_exp_result(uint8_t out[32], const openfw_exp_result_t *res)
 {
     musb_put_le32(&out[0],  res->magic);
@@ -403,6 +404,7 @@ static void pack_exp_result(uint8_t out[32], const openfw_exp_result_t *res)
     musb_put_le32(&out[24], res->arena_crc_and_size);
     musb_put_le32(&out[28], res->arena_base);
 }
+#endif
 
 static int musb_vendor_scsi_cb(void *user, const uint8_t cdb[16],
                                uint8_t *io_buf, uint16_t *io_len, int is_out)
@@ -517,6 +519,7 @@ static int musb_vendor_scsi_cb(void *user, const uint8_t cdb[16],
         return 0;
     }
 
+#if OPENFW_ENABLE_USB_EXP
     case 0x05u: /* EXP_WRITE (OUT 1..64 B) */ {
         if (!is_out) {
             return -1;
@@ -570,6 +573,7 @@ static int musb_vendor_scsi_cb(void *user, const uint8_t cdb[16],
         *io_len = (uint16_t)req;
         return 0;
     }
+#endif /* OPENFW_ENABLE_USB_EXP */
 
     case 0x08u: /* REBOOT (0 B, deferred after CSW) */ {
         if (is_out) {
@@ -590,6 +594,7 @@ static int musb_vendor_scsi_cb(void *user, const uint8_t cdb[16],
         return 0;
     }
 
+#if OPENFW_ENABLE_USB_EXP
     case 0x09u: /* EXP_STATUS (IN 32 B) */ {
         if (is_out) {
             return -1;
@@ -605,6 +610,7 @@ static int musb_vendor_scsi_cb(void *user, const uint8_t cdb[16],
         *io_len = n;
         return 0;
     }
+#endif /* OPENFW_ENABLE_USB_EXP */
 
     case 0x0Au: /* LOG_RESET (0 B) */ {
         if (is_out) {

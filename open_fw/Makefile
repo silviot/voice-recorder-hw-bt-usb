@@ -18,6 +18,9 @@ BUILD_DIR ?= /tmp/sl6801_openfw
 CFLAGS   := --target=thumbv7em-none-eabi -mcpu=cortex-m4 -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb \
             -Os -Wall -Wextra -ffreestanding -fno-builtin -fno-stack-protector \
             -Iinclude -I$(BUILD_DIR)
+ifeq ($(DEV_EXP),1)
+CFLAGS   += -DOPENFW_ENABLE_USB_EXP=1
+endif
 
 HOST_CFLAGS := -O2 -Wall -Wextra -Werror -Iinclude
 
@@ -36,7 +39,7 @@ STOCK_DUMP  := ../dumps/firmware_2M.bin
 OUT_BIN     := ../dumps/firmware_2M_openfw.bin
 OUT_UP      := ../dumps/update_openfw.up
 
-.PHONY: all test-host test-qemu update-up clean
+.PHONY: all test-host test-qemu qemu-stub update-up clean
 
 all: $(BUILD_DIR)/open_fw_firm.bin
 
@@ -74,7 +77,7 @@ test-host: tests/test_core.c src/crypto.c src/wav.c src/cwx.c src/exfat.c src/pe
 	/usr/sbin/mkfs.exfat -q -b 4096 -c 4096 $(BUILD_DIR)/test_exfat.img
 	$(BUILD_DIR)/test_core --exfat-img $(BUILD_DIR)/test_exfat.img
 	/usr/sbin/fsck.exfat -n $(BUILD_DIR)/test_exfat.img
-	$(HOST_CC) $(HOST_CFLAGS) -DOPENFW_HOST_MMIO tests/test_drivers_mmio.c \
+	$(HOST_CC) $(HOST_CFLAGS) -DOPENFW_HOST_MMIO -DOPENFW_ENABLE_USB_EXP=1 tests/test_drivers_mmio.c \
 		src/wdt_timer.c src/uart.c src/rtc.c src/pmu.c src/keys.c \
 		src/sdio.c src/lcd_st7735s.c src/aa_fonts.c src/usb_musb.c src/usb_scsi.c src/exfat.c \
 		src/exp_runner.c src/crypto.c \
@@ -103,6 +106,8 @@ update-up: $(BUILD_DIR)/ram_boot.bin $(BUILD_DIR)/xip.bin tools/pack_firm.py
 		--out-bin $(OUT_BIN) \
 		--out-update-up $(OUT_UP)
 	python3 ../tools/inspect_fw.py $(OUT_BIN)
+
+qemu-stub: $(BUILD_DIR)/qemu_boot_stub.bin
 
 $(BUILD_DIR)/qemu_boot_stub.bin: tools/qemu_boot_stub.S | $(BUILD_DIR)
 	@test -n "$(LLD)" || (echo "Error: ld.lld not found (set LLD=/path/to/ld.lld)" >&2; exit 1)
