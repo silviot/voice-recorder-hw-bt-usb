@@ -23,7 +23,9 @@ CFLAGS   := --target=thumbv7em-none-eabi -mcpu=cortex-m4 -mfpu=fpv4-sp-d16 -mflo
             -Os -Wall -Wextra -ffreestanding -fno-builtin -fno-stack-protector \
             -Iinclude -I$(BUILD_DIR)
 ifeq ($(DEV_EXP),1)
-CFLAGS   += -DOPENFW_ENABLE_USB_EXP=1
+CFLAGS   += -DOPENFW_ENABLE_USB_EXP=1 -DOPENFW_UNATTENDED_DEV=1
+else ifeq ($(UNATTENDED_DEV),1)
+CFLAGS   += -DOPENFW_UNATTENDED_DEV=1
 endif
 
 HOST_CFLAGS := -O2 -Wall -Wextra -Werror -Iinclude
@@ -87,7 +89,7 @@ test-host: tests/test_core.c src/crypto.c src/wav.c src/cwx.c src/exfat.c src/pe
 	/usr/sbin/mkfs.exfat -q -b 4096 -c 4096 $(BUILD_DIR)/test_exfat.img
 	$(BUILD_DIR)/test_core --exfat-img $(BUILD_DIR)/test_exfat.img
 	/usr/sbin/fsck.exfat -n $(BUILD_DIR)/test_exfat.img
-	$(HOST_CC) $(HOST_CFLAGS) -DOPENFW_HOST_MMIO -DOPENFW_ENABLE_USB_EXP=1 tests/test_drivers_mmio.c \
+	$(HOST_CC) $(HOST_CFLAGS) -DOPENFW_HOST_MMIO -DOPENFW_ENABLE_USB_EXP=1 -DOPENFW_UNATTENDED_DEV=1 tests/test_drivers_mmio.c \
 		src/wdt_timer.c src/uart.c src/rtc.c src/pmu.c src/keys.c \
 		src/sdio.c src/lcd_st7735s.c src/aa_fonts.c src/usb_musb.c src/usb_scsi.c src/exfat.c \
 		src/exp_runner.c src/crypto.c \

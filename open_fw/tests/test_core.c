@@ -814,13 +814,36 @@ static void test_exfat_replace_fault_injection(void)
             saw_old = 1;
         } else if (memcmp(rb, new_data, sizeof(new_data)) == 0) {
             saw_new = 1;
+            /* If .tmp.bin is still present sharing DEST.bin's clusters, deleting .tmp.bin
+             * MUST unlink it without freeing DEST.bin's live clusters. */
+            exfat_entry_t tmp_e;
+            if (exfat_find_path(&vchk, "/cassini/.tmp.bin", &tmp_e) == 0) {
+                assert(exfat_delete_file(&vchk, "/cassini", ".tmp.bin") == 0);
+                assert(exfat_find_path(&vchk, "/cassini/DEST.bin", &ent) == 0);
+                assert(exfat_read_file(&vchk, &ent, 0u, rb, sizeof(rb), &nr) == 0 && nr == sizeof(rb));
+                assert(memcmp(rb, new_data, sizeof(new_data)) == 0);
+            }
         } else {
             assert(0 && "DEST.bin corrupted during replace fault injection");
         }
     }
     assert(saw_old && saw_new);
 
-    printf("  [PASS] exfat replace fault injection (destination never disappears across all write failures)\n");
+    /* Corrupted FAT cycle on root directory must fail cleanly without infinite loop */
+    uint8_t loop_disk[SECS * 512u];
+    init_tiny_exfat(loop_disk, SECS);
+    put_le32(&loop_disk[16u * 512u + 2u * 4u], 2u); /* FAT[2] -> 2 self-loop */
+    for (uint32_t i = 0u; i < 16u; i++) {
+        loop_disk[20u * 512u + i * 32u] = 0x05u;    /* Fill cluster 2 with deleted entries so scan follows FAT[2] */
+    }
+    fault_disk_t floop = { loop_disk, SECS, -1, 0 };
+    blkdev_t dloop = { fault_read_sectors, fault_write_sectors, SECS, &floop };
+    exfat_vol_t vloop;
+    exfat_entry_t lent;
+    assert(exfat_mount(&vloop, &dloop) == 0);
+    assert(exfat_find_path(&vloop, "/NOPE", &lent) != 0);
+
+    printf("  [PASS] exfat replace fault injection (shared-cluster delete guard + FAT-cycle bound)\n");
 }
 
 static void build_cbw(uint8_t cbw[31], uint32_t tag, uint32_t data_len,
@@ -2055,6 +2078,12 @@ static void test_bt_spp_and_xrec(void)
     assert(strstr((const char *)sp.rx_stream, "+XREC:OK,PUTEND,48") != NULL);
 
     sp.rx_len = 0u;
+    /* Spoofed ACL handle (0x0042 != 0x0041) MUST be silently dropped */
+    const char *c_spoof = "+XREC:DEL,REC_0001.wav\r";
+    send_rfcomm_client_uih(&spp, 0x0042u, 2u, (const uint8_t *)c_spoof, (uint16_t)strlen(c_spoof));
+    drain_acl_to_phone(&spp, &sp);
+    assert(sp.rx_len == 0u);
+
     send_rfcomm_client_credits(&spp, 0x0041u, 2u, 10u);
     const char *c_cfg_end = "+XREC:DSP\r+XREC:DSP=1\r+XREC:GAIN=25\r+XREC:CH=2\r+XREC:VOR=1\r+XREC:DSP=9\r+XREC:DFU\r";
     send_rfcomm_client_uih(&spp, 0x0041u, 2u, (const uint8_t *)c_cfg_end, (uint16_t)strlen(c_cfg_end));

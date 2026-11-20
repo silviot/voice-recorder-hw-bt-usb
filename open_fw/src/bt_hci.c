@@ -1431,16 +1431,32 @@ static void handle_hci_event(const uint8_t *evt, uint32_t len)
 
     case 0x04u: /* Connection Request */
         if (len >= 12u) {
-            uint8_t accept[7];
-            bt_memcpy(accept, &evt[2], 6u);
-            accept[6] = 0x01u; /* Remain slave */
-            (void)openfw_hci_send_cmd(0x0409u, 7u, accept);
+            if (g_acl_connected) {
+                /* Reject concurrent connection while an active ACL session exists */
+                uint8_t reject[7];
+                bt_memcpy(reject, &evt[2], 6u);
+                reject[6] = 0x0Du; /* Connection Rejected due to Limited Resources */
+                (void)openfw_hci_send_cmd(0x040Au, 7u, reject);
+            } else {
+                uint8_t accept[7];
+                bt_memcpy(accept, &evt[2], 6u);
+                accept[6] = 0x01u; /* Remain slave */
+                (void)openfw_hci_send_cmd(0x0409u, 7u, accept);
+            }
         }
         break;
 
     case 0x03u: /* Connection Complete */
         if (len >= 13u && evt[2] == 0u && evt[11] == 0x01u) {
             uint16_t hdl = (uint16_t)evt[3] | ((uint16_t)evt[4] << 8);
+            if (g_acl_connected && hdl != g_conhdl) {
+                uint8_t disc[3];
+                disc[0] = (uint8_t)(hdl & 0xFFu);
+                disc[1] = (uint8_t)(hdl >> 8);
+                disc[2] = 0x13u; /* Remote User Terminated Connection */
+                (void)openfw_hci_send_cmd(0x0406u, 3u, disc);
+                break;
+            }
             g_conhdl        = hdl;
             g_acl_connected = 1u;
             bt_spp_reset_link(&g_spp, hdl);
@@ -1534,8 +1550,12 @@ static void eif_write(uint8_t *buf, uint32_t len, rwip_eif_cb_t cb)
             uint16_t conhdl    = (uint16_t)(hdr_flags & 0x0FFFu);
             uint8_t  pb_flag   = (uint8_t)((hdr_flags >> 12) & 0x03u);
             if ((5u + acl_len) <= len) {
-                g_rx_acl_pkts++;
-                bt_spp_on_acl_rx(&g_spp, conhdl, pb_flag, &buf[5], acl_len);
+                if (!g_acl_connected || conhdl != g_conhdl) {
+                    /* Ignore ACL packets from unknown or secondary handles */
+                } else {
+                    g_rx_acl_pkts++;
+                    bt_spp_on_acl_rx(&g_spp, conhdl, pb_flag, &buf[5], acl_len);
+                }
             }
         }
     }
@@ -1674,6 +1694,7 @@ static void xrec_cb_on_ota(void *user)
     g_reboot_deadline_ms  = millis() + 250u;
 }
 
+#if OPENFW_ENABLE_USB_EXP
 static int xrec_cb_exp_write(void *user, uint32_t off, const uint8_t *data, uint16_t len)
 {
     (void)user;
@@ -1695,6 +1716,7 @@ static int xrec_cb_exp_run(void *user, uint32_t entry_off, uint32_t arg,
     if (log_widx)   *log_widx   = res.log_widx;
     return 0;
 }
+#endif
 
 static uint32_t xrec_cb_read_log(void *user, uint32_t off, uint8_t *dst,
                                  uint32_t max_len, uint32_t *out_widx)
@@ -1857,8 +1879,13 @@ int bt_xrec_start(exfat_vol_t *vol, int sd_mounted)
         xrec_cb_rec_start,
         xrec_cb_rec_stop,
         xrec_cb_on_ota,
+#if OPENFW_ENABLE_USB_EXP
         xrec_cb_exp_write,
         xrec_cb_exp_run,
+#else
+        0,
+        0,
+#endif
         xrec_cb_read_log,
         xrec_cb_reset_log,
         xrec_cb_on_dfu,

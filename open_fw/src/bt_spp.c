@@ -722,6 +722,8 @@ void bt_spp_on_acl_rx(bt_spp_t *spp, uint16_t conhdl, uint8_t pb_flag,
     }
     if (spp->conhdl == 0u) {
         spp->conhdl = conhdl;
+    } else if (conhdl != spp->conhdl) {
+        return; /* Drop ACL traffic from any other connection handle */
     }
 
     if (pb_flag == 0x02u || pb_flag == 0x00u) { /* L2CAP Start */

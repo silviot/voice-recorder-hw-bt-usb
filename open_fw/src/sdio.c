@@ -287,7 +287,7 @@ static int sdio_fifo_read_words(uint8_t *dst, uint32_t words, uint64_t t0)
     uint32_t *dst32 = (uint32_t *)(void *)dst;
     for (uint32_t w = 0u; w < words; w++) {
         while (openfw_mmio_rd32(SDIO_STATUS_ADDR) & SDIO_STAT_FIFO_EMP) {
-            if (openfw_mmio_rd32(SDIO_RINTSTS_ADDR) & (SDIO_INT_RTO | SDIO_INT_DRTO)) {
+            if (openfw_mmio_rd32(SDIO_RINTSTS_ADDR) & SDIO_INT_DATA_ERRS) {
                 openfw_mmio_wr32(SDIO_RINTSTS_ADDR, 0xFFFFFFFFu);
                 return -1;
             }
@@ -315,7 +315,7 @@ static int sdio_fifo_write_words(const uint8_t *src, uint32_t words, uint64_t t0
     const uint32_t *src32 = (const uint32_t *)(const void *)src;
     for (uint32_t w = 0u; w < words; w++) {
         while (openfw_mmio_rd32(SDIO_STATUS_ADDR) & SDIO_STAT_FIFO_FULL) {
-            if (openfw_mmio_rd32(SDIO_RINTSTS_ADDR) & (SDIO_INT_RTO | SDIO_INT_DRTO)) {
+            if (openfw_mmio_rd32(SDIO_RINTSTS_ADDR) & SDIO_INT_DATA_ERRS) {
                 openfw_mmio_wr32(SDIO_RINTSTS_ADDR, 0xFFFFFFFFu);
                 return -1;
             }
@@ -362,7 +362,8 @@ static int sdio_read_one_sector(sd_card_t *card, uint32_t lba, uint8_t *dst)
     }
     uint32_t st = openfw_mmio_rd32(SDIO_RINTSTS_ADDR);
     openfw_mmio_wr32(SDIO_RINTSTS_ADDR, 0xFFFFFFFFu);
-    if (st & (SDIO_INT_RCRC | SDIO_INT_RTO | SDIO_INT_DRTO)) {
+    if (st & SDIO_INT_DATA_ERRS) {
+        sdio_reset_fifo();
         return -1;
     }
     return 0;
@@ -497,7 +498,7 @@ int sd_read_async_poll(sd_card_t *card)
     }
     uint32_t st    = openfw_mmio_rd32(SDIO_RINTSTS_ADDR);
     uint32_t idsts = openfw_mmio_rd32(SDIO_IDSTS_ADDR);
-    if ((st & (SDIO_INT_RCRC | SDIO_INT_DCRC | SDIO_INT_RTO | SDIO_INT_DRTO)) ||
+    if ((st & SDIO_INT_DATA_ERRS) ||
         (idsts & (SDIO_IDSTS_FBE | SDIO_IDSTS_DU | SDIO_IDSTS_CES))) {
         sd_read_async_abort(card);
         return -1;
@@ -579,7 +580,7 @@ static int sdio_read_multi(sd_card_t *card, uint32_t lba, uint32_t count, uint8_
     openfw_mmio_wr32(SDIO_RINTSTS_ADDR, 0xFFFFFFFFu);
     int stop_rc = sdio_send_cmd(SD_CMD12_STOP, 0u, 1);
     sdio_reset_fifo();
-    if (stop_rc != 0 || (st & (SDIO_INT_RCRC | SDIO_INT_RTO | SDIO_INT_DRTO))) {
+    if (stop_rc != 0 || (st & SDIO_INT_DATA_ERRS)) {
         return -1;
     }
     return 0;
@@ -589,6 +590,7 @@ static int sdio_write_one_sector(sd_card_t *card, uint32_t lba, const uint8_t *s
 {
     uint32_t arg = card->is_sdhc ? lba : (lba << 9);
 
+    sdio_reset_fifo();
     openfw_mmio_wr32(SDIO_BLKSIZ_ADDR,  512u);
     openfw_mmio_wr32(SDIO_BYTCNT_ADDR,  512u);
     openfw_mmio_wr32(SDIO_RINTSTS_ADDR, 0xFFFFFFFFu);
@@ -610,7 +612,12 @@ static int sdio_write_one_sector(sd_card_t *card, uint32_t lba, const uint8_t *s
             return -1;
         }
     }
+    uint32_t st = openfw_mmio_rd32(SDIO_RINTSTS_ADDR);
     openfw_mmio_wr32(SDIO_RINTSTS_ADDR, 0xFFFFFFFFu);
+    if (st & SDIO_INT_DATA_ERRS) {
+        sdio_reset_fifo();
+        return -1;
+    }
     return sdio_wait_card_ready(card);
 }
 
@@ -642,9 +649,11 @@ static int sdio_write_multi(sd_card_t *card, uint32_t lba, uint32_t count, const
             return -1;
         }
     }
+    uint32_t st = openfw_mmio_rd32(SDIO_RINTSTS_ADDR);
     openfw_mmio_wr32(SDIO_RINTSTS_ADDR, 0xFFFFFFFFu);
 
-    if (sdio_send_cmd(SD_CMD12_STOP, 0u, 1) != 0) {
+    int stop_rc = sdio_send_cmd(SD_CMD12_STOP, 0u, 1);
+    if (stop_rc != 0 || (st & SDIO_INT_DATA_ERRS)) {
         sdio_reset_fifo();
         return -1;
     }

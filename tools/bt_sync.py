@@ -407,6 +407,21 @@ class XRecRFCOMMClient:
         return h.hexdigest()
 
 
+def safe_dest_path(dest_root: Path, remote_name: str) -> Path:
+    """Validate a device-supplied filename against path traversal and control characters."""
+    if not remote_name or remote_name in (".", ".."):
+        raise ValueError(f"Unsafe remote filename: {remote_name!r}")
+    if "/" in remote_name or "\\" in remote_name or Path(remote_name).name != remote_name:
+        raise ValueError(f"Unsafe remote filename (path separator): {remote_name!r}")
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in remote_name):
+        raise ValueError(f"Unsafe remote filename (control char): {remote_name!r}")
+    root = dest_root.resolve()
+    dst = (root / remote_name).resolve()
+    if dst.parent != root:
+        raise ValueError(f"Remote filename escapes destination directory: {remote_name!r}")
+    return dst
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Download recordings from HW_76 over Bluetooth RFCOMM (+XREC).")
     parser.add_argument("--mac", type=str, default=None, help="Bluetooth MAC address of HW_76")
@@ -532,9 +547,10 @@ def main() -> None:
             return
 
         args.dest.mkdir(parents=True, exist_ok=True)
+        dest_root = args.dest.resolve()
         synced = 0
         for name, sz in files:
-            dst = args.dest / name
+            dst = safe_dest_path(dest_root, name)
             if dst.is_file() and dst.stat().st_size == sz:
                 print(f"Skipping already synced: {name} ({sz:,} bytes)")
                 continue

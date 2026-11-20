@@ -505,29 +505,38 @@ def main() -> int:
 
         if not args.skip_keys:
             usb_active_addr = syms["g_usb_active"][0]
+            ui_screen_addr = syms["g_ui_screen"][0]
 
             def inspect_key_enter(client: GdbRspClient):
                 _ = client.continue_for(args.keys_seconds)
-                for _ in range(4):
+                for _ in range(6):
                     k_regs = client.read_regs()
                     k_pc = k_regs[15]
                     k_systick = client.read_u32(systick_addr)
                     usb_active = client.read_i32(usb_active_addr)
-                    if is_in_fault(k_pc, default_handler) or usb_active == 1:
-                        return k_pc, k_systick, usb_active
+                    ui_screen = client.read_u32(ui_screen_addr)
+                    if is_in_fault(k_pc, default_handler) or usb_active == 1 or ui_screen == 3:
+                        return k_pc, k_systick, usb_active, ui_screen
                     _ = client.continue_for(0.4)
                 k_regs = client.read_regs()
-                return k_regs[15], client.read_u32(systick_addr), client.read_i32(usb_active_addr)
+                return (
+                    k_regs[15],
+                    client.read_u32(systick_addr),
+                    client.read_i32(usb_active_addr),
+                    client.read_u32(ui_screen_addr),
+                )
 
             try:
                 keys_machine = build_machine_arg(qemu_rom, args.stub, args.flash, sd_img, kadc_ch1=2850)
-                (k_pc, k_systick, usb_active), _ = run_qemu_session(qemu_bin, keys_machine, inspect_key_enter)
+                (k_pc, k_systick, usb_active, ui_screen), _ = run_qemu_session(
+                    qemu_bin, keys_machine, inspect_key_enter
+                )
             except (RuntimeError, TimeoutError) as exc:
                 failures.append(f"KEY_ENTER QEMU check failed: {exc}")
             else:
                 print(
                     f"Key check: PC=0x{k_pc:08x} g_systick_ms={k_systick} "
-                    f"g_usb_active={usb_active}"
+                    f"g_ui_screen={ui_screen} g_usb_active={usb_active}"
                 )
                 if is_in_fault(k_pc, default_handler):
                     failures.append(f"KEY_ENTER check trapped near Default_Handler (PC=0x{k_pc:08x})")
@@ -535,8 +544,12 @@ def main() -> int:
                     failures.append(f"KEY_ENTER check PC=0x{k_pc:08x} did not reach open_fw space")
                 if k_systick == 0:
                     failures.append("KEY_ENTER check g_systick_ms remained 0")
-                if usb_active != 1:
-                    failures.append(f"KEY_ENTER did not activate USB MSC (g_usb_active={usb_active})")
+                if ui_screen != 3 and usb_active != 1:
+                    failures.append(
+                        f"KEY_ENTER did not open Files or USB MSC (g_ui_screen={ui_screen}, g_usb_active={usb_active})"
+                    )
+                elif ui_screen == 3:
+                    print("[KEY_ENTER -> UI_SCR_FILES ACTIVE]")
                 else:
                     print("[KEY_ENTER -> USB MSC ACTIVE]")
 

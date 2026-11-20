@@ -43,6 +43,7 @@ static exfat_writer_t      g_writer;
 static uint32_t            g_pcm_bytes       = 0u;
 static uint32_t            g_last_ckpt_bytes = 0u;
 static uint32_t            g_prev_split_sec  = 0u;
+static uint32_t            g_last_overruns   = 0u;
 static char                g_filename[16];
 
 static uint32_t parse_rec_index(const char *name)
@@ -177,10 +178,17 @@ static int finalize_current_wav_file(void)
         rtc_get(&now);
         exfat_set_timestamp(g_writer.vol, rtc_to_dos_timestamp(&now));
     }
-    uint8_t hdr[44];
-    (void)wav_build_header(hdr, 16000u, (uint16_t)g_active_channels, 16u, g_pcm_bytes);
-    int rc_patch = exfat_patch_header(&g_writer, hdr, 44u);
+
     int rc_close = exfat_close_file(&g_writer);
+    uint32_t committed_pcm = (g_writer.bytes_written > 44u)
+                           ? (uint32_t)(g_writer.bytes_written - 44u)
+                           : 0u;
+    g_pcm_bytes = committed_pcm;
+    uint8_t hdr[44];
+    (void)wav_build_header(hdr, 16000u, (uint16_t)g_active_channels, 16u, committed_pcm);
+    int rc_patch = (g_writer.first_cluster >= 2u)
+                 ? exfat_patch_header(&g_writer, hdr, 44u)
+                 : -1;
     g_rec_saving = 0;
     return (rc_patch == 0 && rc_close == 0) ? 0 : -1;
 }
@@ -339,7 +347,8 @@ int recorder_start(exfat_vol_t *vol, int sd_mounted)
         return -1;
     }
 
-    g_rec_active = 1;
+    g_last_overruns = audio_get_overruns();
+    g_rec_active    = 1;
     return 0;
 }
 
@@ -347,6 +356,25 @@ void recorder_poll(void)
 {
     if (!g_rec_active) {
         return;
+    }
+
+    /* Compensate any DMA ring overruns with exact-length silence so WAV stays real-time */
+    uint32_t ov = audio_get_overruns();
+    if (ov != g_last_overruns) {
+        uint32_t dropped = ov - g_last_overruns;
+        g_last_overruns  = ov;
+        if (g_rec_saving) {
+            if (dropped > 16u) {
+                dropped = 16u;
+            }
+            uint32_t samps = 2048u * (uint32_t)g_active_channels;
+            for (uint32_t i = 0u; i < samps; i++) {
+                g_proc_buf[i] = 0;
+            }
+            for (uint32_t d = 0u; d < dropped && g_rec_saving; d++) {
+                rec_vor_emit_cb(0, g_proc_buf, 2048u);
+            }
+        }
     }
 
     uint32_t nbytes = 0u;

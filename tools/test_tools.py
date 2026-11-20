@@ -20,8 +20,24 @@ from pathlib import Path
 TOOLS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(TOOLS_DIR))
 
+import bt_sync  # noqa: E402
 import fix_exfat_boundary  # noqa: E402
 import usb_sync  # noqa: E402
+
+
+def test_bt_sync_path_traversal() -> None:
+    with tempfile.TemporaryDirectory(prefix="test_bt_sync_") as td:
+        root = Path(td)
+        ok = bt_sync.safe_dest_path(root, "REC_0001.wav")
+        assert ok == root.resolve() / "REC_0001.wav"
+        for bad in ("", ".", "..", "../evil.wav", "sub/a.wav", "sub\\a.wav", "/etc/passwd", "REC\x00.wav", "REC\n.wav"):
+            rejected = False
+            try:
+                bt_sync.safe_dest_path(root, bad)
+            except ValueError:
+                rejected = True
+            assert rejected, f"Expected safe_dest_path to reject {bad!r}"
+    print("[PASS] bt_sync.py remote filename traversal & control-char guard")
 
 
 def test_usb_sync_collisions() -> None:
@@ -146,6 +162,7 @@ def test_fix_exfat_boundary() -> None:
 
 
 def main() -> int:
+    test_bt_sync_path_traversal()
     test_usb_sync_collisions()
     test_fix_exfat_boundary()
     print("ALL HOST TOOL SAFETY TESTS PASSED")

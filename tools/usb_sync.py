@@ -53,7 +53,14 @@ def find_recorder_mountpoint(explicit_mount: Optional[Path] = None) -> Optional[
         vendor = (dev.get("vendor") or "").strip()
         model = (dev.get("model") or "").strip()
         serial = (dev.get("serial") or "").strip()
-        if "SMTLINK" in vendor or "CARDREADER" in model or serial == "20201111000001":
+        if (
+            "SMTLINK" in vendor
+            or "CARDREADER" in model
+            or serial == "20201111000001"
+            or "Cassini" in vendor
+            or "OpenFW" in model
+            or serial == "OPENFW01"
+        ):
             for child in dev.get("children", [dev]):
                 mp = child.get("mountpoint")
                 if mp and Path(mp).is_dir():

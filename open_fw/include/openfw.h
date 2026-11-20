@@ -11,7 +11,7 @@
 #include "openfw_fs.h"
 
 #ifndef OPENFW_UNATTENDED_DEV
-#define OPENFW_UNATTENDED_DEV 1
+#define OPENFW_UNATTENDED_DEV 0
 #endif
 
 /*

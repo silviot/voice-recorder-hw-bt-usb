@@ -172,10 +172,14 @@ static int next_bitmap_cluster(const exfat_vol_t *vol, uint32_t cur, uint32_t *o
 
 static int scan_root_bitmap(exfat_vol_t *vol)
 {
-    uint32_t cls = vol->root_dir_cluster;
+    uint32_t cls   = vol->root_dir_cluster;
+    uint32_t steps = 0u;
     uint8_t sec[512];
 
     while (cls >= 2u && (cls - 2u) < vol->cluster_count) {
+        if (++steps > vol->cluster_count) {
+            return -1; /* Corrupted FAT cycle */
+        }
         uint32_t base_lba = cluster_to_lba(vol, cls);
         for (uint32_t s = 0u; s < vol->sectors_per_cluster; s++) {
             if (vol->dev->read_sectors(vol->dev->ctx, base_lba + s, 1u, sec) != 0) {
@@ -318,6 +322,9 @@ static int list_dir_with_loc(const exfat_vol_t *vol, uint32_t dir_cluster, uint8
     uint8_t sec[512];
 
     while (cls >= 2u && (cls - 2u) < vol->cluster_count) {
+        if (cls_idx >= vol->cluster_count) {
+            return -1; /* Corrupted FAT cycle */
+        }
         uint32_t base_lba = cluster_to_lba(vol, cls);
         for (uint32_t s = 0u; s < vol->sectors_per_cluster; s++) {
             uint32_t lba = base_lba + s;
@@ -855,9 +862,9 @@ static void build_entry_set(uint8_t *dst, uint32_t total_ents, const char *name,
     put_le32(f + 8u, dos_timestamp);
     put_le32(f + 12u, dos_timestamp);
     put_le32(f + 16u, dos_timestamp);
-    f[22] = 0x80u; /* UTC offset valid (+00:00) */
-    f[23] = 0x80u;
-    f[24] = 0x80u;
+    f[22] = 0x00u; /* Local time (UTC offset not set per exFAT spec) */
+    f[23] = 0x00u;
+    f[24] = 0x00u;
 
     /* 0xC0 Stream Extension */
     uint8_t *s = dst + 32u;
@@ -979,12 +986,17 @@ static int dir_alloc_slots(exfat_vol_t *vol, uint32_t dir_cluster, uint8_t dir_n
             if (dir_no_fat_chain) {
                 return -1; /* Avoid overflowing or mutating foreign NoFatChain directory */
             }
-            if (alloc_cluster(vol, cls, &nxt) != 0 || zero_cluster(vol, nxt) != 0) {
+            /* Zero the newly allocated cluster BEFORE linking it into the directory chain */
+            if (alloc_cluster(vol, 0u, &nxt) != 0 || zero_cluster(vol, nxt) != 0 ||
+                fat_set_entry(vol, cls, nxt) != 0) {
                 return -1;
             }
             if (grow_dir_size_in_parent(vol, parent_lba, parent_slot) != 0) {
                 return -1;
             }
+        }
+        if (cls_idx >= vol->cluster_count) {
+            return -1; /* Corrupted FAT cycle */
         }
         cls = nxt;
     }
@@ -1161,7 +1173,10 @@ int exfat_write(exfat_writer_t *w, const void *data, uint32_t len)
 
 int exfat_patch_header(exfat_writer_t *w, const void *hdr, uint32_t len)
 {
-    if (!w || !w->active || !hdr || len > 512u || (uint64_t)len > w->bytes_written) {
+    if (!w || !w->vol || !hdr || len > 512u || (uint64_t)len > w->bytes_written) {
+        return -1;
+    }
+    if (!w->active && w->first_cluster < 2u) {
         return -1;
     }
     if (len == 0u) {
@@ -1244,10 +1259,17 @@ int exfat_close_file(exfat_writer_t *w)
         return -1;
     }
 
+    int tail_err = 0;
     if (w->sec_buf_used > 0u) {
         mem_zero(w->sec_buf + w->sec_buf_used, 512u - w->sec_buf_used);
         if (writer_write_sector(w, w->sec_buf) != 0) {
-            return -1;
+            /* Card full or write error: drop unflushed tail but still commit flushed sectors */
+            if (w->bytes_written >= (uint64_t)w->sec_buf_used) {
+                w->bytes_written -= (uint64_t)w->sec_buf_used;
+            } else {
+                w->bytes_written = 0u;
+            }
+            tail_err = -1;
         }
         w->sec_buf_used = 0u;
     }
@@ -1278,7 +1300,7 @@ int exfat_close_file(exfat_writer_t *w)
     }
 
     w->active = 0u;
-    return 0;
+    return tail_err;
 }
 
 int exfat_stat_fs(const exfat_vol_t *vol, uint32_t *free_mb, uint32_t *total_mb)
@@ -1342,6 +1364,23 @@ int exfat_stat_fs(const exfat_vol_t *vol, uint32_t *free_mb, uint32_t *total_mb)
     }
 
     *free_mb = ((free_cls >> 11) * spc) + (((free_cls & 0x7FFu) * spc) >> 11);
+    return 0;
+}
+
+static int free_file_clusters(exfat_vol_t *vol, uint32_t first_cluster, uint64_t size, uint8_t no_fat_chain);
+
+typedef struct {
+    uint32_t target_cluster;
+    int      found;
+} cluster_ref_ctx_t;
+
+static int cluster_ref_cb(const exfat_entry_t *ent, void *user)
+{
+    cluster_ref_ctx_t *ctx = (cluster_ref_ctx_t *)user;
+    if (!ent->is_dir && ent->first_cluster == ctx->target_cluster && ent->size > 0u) {
+        ctx->found = 1;
+        return 1; /* Stop walking */
+    }
     return 0;
 }
 
@@ -1413,36 +1452,15 @@ int exfat_delete_file(exfat_vol_t *vol, const char *dir_path, const char *filena
         }
     }
 
-    /* Return data clusters to the Allocation Bitmap (and clear FAT chain if used) */
+    /* Return data clusters ONLY if no other entry in this directory still references them
+     * (protects against power loss during exfat_replace_file leaving a shared cluster). */
     if (fc.result.first_cluster >= 2u && fc.result.size > 0u) {
-        if (fc.result.no_fat_chain) {
-            uint32_t cls_shift = 9u + (uint32_t)vol->spc_shift;
-            uint64_t n_cls64   = (fc.result.size + ((uint64_t)vol->cluster_size - 1u)) >> cls_shift;
-            uint32_t n_cls     = (n_cls64 > vol->cluster_count) ? vol->cluster_count : (uint32_t)n_cls64;
-            for (uint32_t i = 0u; i < n_cls; i++) {
-                if (free_cluster_bit(vol, fc.result.first_cluster + i) != 0) {
-                    return -1;
-                }
-            }
-        } else {
-            uint32_t cur   = fc.result.first_cluster;
-            uint32_t steps = 0u;
-            while (cur >= 2u && (cur - 2u) < vol->cluster_count && steps < vol->cluster_count) {
-                uint32_t nxt = 0u;
-                if (fat_get_entry(vol, cur, &nxt) != 0) {
-                    return -1;
-                }
-                if (free_cluster_bit(vol, cur) != 0) {
-                    return -1;
-                }
-                if (fat_set_entry(vol, cur, 0u) != 0) {
-                    return -1;
-                }
-                steps++;
-                if (nxt >= 0xFFFFFFF8u || nxt < 2u || (nxt - 2u) >= vol->cluster_count) {
-                    break;
-                }
-                cur = nxt;
+        cluster_ref_ctx_t ref = { fc.result.first_cluster, 0 };
+        (void)list_dir_with_loc(vol, dir_ent.first_cluster, dir_ent.no_fat_chain, dir_ent.size,
+                                cluster_ref_cb, 0, &ref);
+        if (!ref.found) {
+            if (free_file_clusters(vol, fc.result.first_cluster, fc.result.size, fc.result.no_fat_chain) != 0) {
+                return -1;
             }
         }
     }

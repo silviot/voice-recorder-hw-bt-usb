@@ -1173,6 +1173,7 @@ int openfw_main(void)
                     pmu_soft_poweroff();
                 }
                 prev_onoff = onoff_now;
+                recorder_poll();
                 wfi_sleep_ms(25u);
                 continue;
             }
