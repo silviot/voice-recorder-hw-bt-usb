@@ -995,6 +995,7 @@ static void render_power(const ui_model_t *m)
 void ui_render_screen(ui_screen_id_t scr, const ui_model_t *m)
 {
     if (!m) return;
+    lcd_fb_begin();
     switch (scr) {
     case UI_SCR_HOME:     render_home(m);      break;
     case UI_SCR_REC:      render_recording(m); break;
@@ -1011,6 +1012,7 @@ void ui_render_screen(ui_screen_id_t scr, const ui_model_t *m)
     case UI_SCR_OFF:
     default:
         lcd_fill_rect(0u, 0u, UI_W, UI_H, UI_COL_BLACK);
+        lcd_fb_flush();
         return;
     }
 
@@ -1018,4 +1020,5 @@ void ui_render_screen(ui_screen_id_t scr, const ui_model_t *m)
         uint16_t pcol = m->toast_col ? m->toast_col : UI_COL_AMBER;
         ui_draw_toast(m->toast_msg, pcol, UI_COL_BLACK, UI_COL_BG);
     }
+    lcd_fb_flush();
 }

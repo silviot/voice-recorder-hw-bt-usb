@@ -131,6 +131,8 @@ static inline uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b)
 void     lcd_backlight_set(uint8_t percent);
 void     lcd_init(void);
 void     lcd_set_rotation(int landscape);
+void     lcd_fb_begin(void);
+void     lcd_fb_flush(void);
 uint16_t lcd_get_width(void);
 uint16_t lcd_get_height(void);
 void     lcd_set_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1);
