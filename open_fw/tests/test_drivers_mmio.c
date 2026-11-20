@@ -132,6 +132,7 @@ static struct {
     uint32_t sdio_fifo_pos;
     uint32_t sdio_fifo_len;
     uint32_t sdio_active_lba;
+    uint32_t sdio_blocks_rem;
     int      sdio_app_cmd;
     int      sdio_acmd41_polls;
     int      sdio_selected;
@@ -302,14 +303,25 @@ static void sdio_exec_cmd(uint32_t val)
         g_soc.sdio_selected = 1;
         g_soc.sdio_resp[0] = 0x00000700u;
         break;
+    case 12u: /* CMD12 STOP_TRANSMISSION */
+        g_soc.sdio_blocks_rem = 0u;
+        g_soc.sdio_resp[0] = 0x00000900u;
+        break;
     case 13u: /* CMD13 SEND_STATUS */
         g_soc.sdio_resp[0] = 0x00000900u; /* READY_FOR_DATA | TRAN */
         break;
     case 17u: /* CMD17 READ_SINGLE_BLOCK */
+    case 18u: /* CMD18 READ_MULTIPLE_BLOCK (finite or BYTCNT=0 open-ended) */
     {
         uint32_t lba = g_soc.sdio_arg;
+        uint32_t blks = (cmd == 18u)
+            ? ((g_soc.sdio_bytcnt == 0u) ? 0xFFFFFFFFu : (g_soc.sdio_bytcnt / 512u))
+            : 1u;
         assert(g_soc.sdio_selected);
         assert(lba < g_soc.sd_num_sectors);
+        if (blks != 0xFFFFFFFFu) {
+            assert(blks >= 1u && lba + blks <= g_soc.sd_num_sectors);
+        }
         const uint8_t *src = &g_soc.sd_sectors[lba * 512u];
         for (uint32_t w = 0u; w < 128u; w++) {
             g_soc.sdio_fifo[w] = (uint32_t)src[w * 4u + 0u]
@@ -317,18 +329,27 @@ static void sdio_exec_cmd(uint32_t val)
                                | ((uint32_t)src[w * 4u + 2u] << 16)
                                | ((uint32_t)src[w * 4u + 3u] << 24);
         }
-        g_soc.sdio_fifo_pos  = 0u;
-        g_soc.sdio_fifo_len  = 128u;
-        g_soc.sdio_rintsts  |= SDIO_INT_DTO;
+        g_soc.sdio_active_lba = lba;
+        g_soc.sdio_blocks_rem = (blks == 0xFFFFFFFFu) ? 0xFFFFFFFFu : (blks - 1u);
+        g_soc.sdio_fifo_pos   = 0u;
+        g_soc.sdio_fifo_len   = 128u;
+        if (g_soc.sdio_blocks_rem == 0u) {
+            g_soc.sdio_rintsts |= SDIO_INT_DTO;
+        }
         break;
     }
     case 24u: /* CMD24 WRITE_BLOCK */
+    case 25u: /* CMD25 WRITE_MULTIPLE_BLOCK */
+    {
+        uint32_t blks = (cmd == 25u) ? (g_soc.sdio_bytcnt / 512u) : 1u;
         assert(g_soc.sdio_selected);
-        assert(g_soc.sdio_arg < g_soc.sd_num_sectors);
+        assert(blks >= 1u && g_soc.sdio_arg + blks <= g_soc.sd_num_sectors);
         g_soc.sdio_active_lba = g_soc.sdio_arg;
+        g_soc.sdio_blocks_rem = blks;
         g_soc.sdio_fifo_pos   = 0u;
         g_soc.sdio_fifo_len   = 128u;
         break;
+    }
     default:
         break;
     }
@@ -428,7 +449,28 @@ uint32_t openfw_mmio_rd32(uint32_t addr)
     }
     if (addr == SDIO_FIFO_ADDR) {
         assert(g_soc.sdio_fifo_pos < g_soc.sdio_fifo_len);
-        return g_soc.sdio_fifo[g_soc.sdio_fifo_pos++];
+        uint32_t word = g_soc.sdio_fifo[g_soc.sdio_fifo_pos++];
+        if (g_soc.sdio_fifo_pos == g_soc.sdio_fifo_len && g_soc.sdio_blocks_rem > 0u) {
+            g_soc.sdio_active_lba++;
+            if (g_soc.sdio_blocks_rem != 0xFFFFFFFFu) {
+                g_soc.sdio_blocks_rem--;
+            }
+            if (g_soc.sdio_active_lba < g_soc.sd_num_sectors) {
+                const uint8_t *src = &g_soc.sd_sectors[g_soc.sdio_active_lba * 512u];
+                for (uint32_t w = 0u; w < 128u; w++) {
+                    g_soc.sdio_fifo[w] = (uint32_t)src[w * 4u + 0u]
+                                       | ((uint32_t)src[w * 4u + 1u] << 8)
+                                       | ((uint32_t)src[w * 4u + 2u] << 16)
+                                       | ((uint32_t)src[w * 4u + 3u] << 24);
+                }
+                g_soc.sdio_fifo_pos = 0u;
+                g_soc.sdio_fifo_len = 128u;
+            }
+            if (g_soc.sdio_blocks_rem == 0u) {
+                g_soc.sdio_rintsts |= SDIO_INT_DTO;
+            }
+        }
+        return word;
     }
 
     if (addr == CRU_CLK_SRC_GATE_ADDR) return g_soc.cru_clk_src_gate;
@@ -573,7 +615,14 @@ void openfw_mmio_wr32(uint32_t addr, uint32_t val)
                 dst[w * 4u + 2u] = (uint8_t)(word >> 16);
                 dst[w * 4u + 3u] = (uint8_t)(word >> 24);
             }
-            g_soc.sdio_rintsts |= SDIO_INT_DTO;
+            g_soc.sdio_active_lba++;
+            if (g_soc.sdio_blocks_rem > 0u) {
+                g_soc.sdio_blocks_rem--;
+            }
+            g_soc.sdio_fifo_pos = 0u;
+            if (g_soc.sdio_blocks_rem == 0u) {
+                g_soc.sdio_rintsts |= SDIO_INT_DTO;
+            }
         }
         return;
     }
@@ -1149,6 +1198,17 @@ static void test_sdio_exfat_and_usb_msc(const char *exfat_img_path)
     uint8_t sector_buf[512];
     assert(sd_read_blocks(&card, 0u, 1u, sector_buf) == 0);
     assert(memcmp(sector_buf + 3, "EXFAT   ", 8) == 0);
+
+    /* Multi-block CMD25 write + CMD18 readback verification */
+    static uint8_t mb_wr[8 * 512];
+    static uint8_t mb_rd[8 * 512];
+    for (uint32_t i = 0u; i < sizeof(mb_wr); i++) {
+        mb_wr[i] = (uint8_t)((i * 29u + 7u) & 0xFFu);
+    }
+    assert(sd_write_blocks(&card, 8000u, 8u, mb_wr) == 0);
+    assert(sd_read_blocks(&card, 8000u, 8u, mb_rd) == 0);
+    assert(memcmp(mb_rd, mb_wr, sizeof(mb_wr)) == 0);
+    assert(sd_flush(&card) == 0);
 
     /* Now exercise full USB PHY + MUSB enumeration + SCSI BOT R/W over SDIO */
     usb_phy_det_arm();

@@ -47,11 +47,15 @@ typedef struct {
     uint32_t            blocks_rem;
     uint32_t            data_rem;
     uint16_t            sec_off;
+    uint16_t            buf_len;
     uint16_t            inline_pos;
     uint16_t            inline_len;
     uint8_t             inline_buf[64];
-    uint8_t             sec_buf[512];
+    uint8_t             sec_buf[16384] __attribute__((aligned(4)));
 } usb_msc_state_t;
+
+#define USB_MSC_BUF_SECTORS 32u
+#define USB_MSC_BUF_BYTES   (USB_MSC_BUF_SECTORS * 512u)
 
 void    usb_msc_init_state(usb_msc_state_t *st, blkdev_t *dev);
 void    usb_msc_set_vendor_cb(usb_msc_state_t *st, usb_msc_vendor_cb_t cb, void *user);

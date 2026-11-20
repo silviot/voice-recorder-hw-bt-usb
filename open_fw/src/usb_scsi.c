@@ -305,7 +305,8 @@ static void handle_cbw(usb_msc_state_t *st, const uint8_t *pkt, uint8_t len)
         st->is_blk_xfer = 1u;
         st->cur_lba     = lba;
         st->blocks_rem  = blocks;
-        st->sec_off     = 512u; /* Load sector lazily in get_tx_packet */
+        st->sec_off     = 0u;
+        st->buf_len     = 0u; /* Load first chunk lazily in get_tx_packet */
         st->data_rem    = xfer;
         st->csw_residue = data_len - xfer;
         st->phase       = MSC_PHASE_DATA_IN;
@@ -339,6 +340,7 @@ static void handle_cbw(usb_msc_state_t *st, const uint8_t *pkt, uint8_t len)
         st->cur_lba     = lba;
         st->blocks_rem  = blocks;
         st->sec_off     = 0u;
+        st->buf_len     = 0u;
         st->data_rem    = xfer;
         st->csw_residue = data_len - xfer;
         st->phase       = MSC_PHASE_DATA_OUT;
@@ -461,7 +463,7 @@ void usb_msc_on_rx_packet(usb_msc_state_t *st, const uint8_t *pkt, uint8_t len)
             continue;
         }
 
-        uint32_t space = 512u - st->sec_off;
+        uint32_t space = USB_MSC_BUF_BYTES - st->sec_off;
         uint32_t take  = len - pos;
         if (take > space) {
             take = space;
@@ -474,16 +476,15 @@ void usb_msc_on_rx_packet(usb_msc_state_t *st, const uint8_t *pkt, uint8_t len)
         pos         += take;
         st->data_rem -= take;
 
-        if (st->sec_off == 512u) {
+        if (st->sec_off == USB_MSC_BUF_BYTES || (st->data_rem == 0u && st->sec_off >= 512u)) {
+            uint32_t nsec = (uint32_t)(st->sec_off / 512u);
             if (st->csw_status == 0u &&
-                st->dev->write_sectors(st->dev->ctx, st->cur_lba, 1u, st->sec_buf) != 0) {
+                st->dev->write_sectors(st->dev->ctx, st->cur_lba, nsec, st->sec_buf) != 0) {
                 st->csw_status = 1u;
                 set_sense(st, 0x03u, 0x0Cu, 0x00u); /* Medium write error */
             }
-            st->cur_lba++;
-            if (st->blocks_rem > 0u) {
-                st->blocks_rem--;
-            }
+            st->cur_lba += nsec;
+            st->blocks_rem = (st->blocks_rem > nsec) ? (st->blocks_rem - nsec) : 0u;
             st->sec_off = 0u;
         }
     }
@@ -541,21 +542,28 @@ uint8_t usb_msc_get_tx_packet(usb_msc_state_t *st, uint8_t out[64])
             return n;
         }
 
-        if (st->sec_off >= 512u) {
+        if (st->sec_off >= st->buf_len) {
+            uint32_t nsec = st->blocks_rem;
+            if (nsec > USB_MSC_BUF_SECTORS) {
+                nsec = USB_MSC_BUF_SECTORS;
+            }
+            if (nsec == 0u) {
+                nsec = 1u;
+            }
+            uint32_t nbytes = nsec * 512u;
             if (st->csw_status == 0u &&
-                st->dev->read_sectors(st->dev->ctx, st->cur_lba, 1u, st->sec_buf) != 0) {
-                mem_zero(st->sec_buf, 512u);
+                st->dev->read_sectors(st->dev->ctx, st->cur_lba, nsec, st->sec_buf) != 0) {
+                mem_zero(st->sec_buf, nbytes);
                 st->csw_status = 1u;
                 set_sense(st, 0x03u, 0x11u, 0x00u); /* Medium read error */
             }
-            st->cur_lba++;
-            if (st->blocks_rem > 0u) {
-                st->blocks_rem--;
-            }
+            st->cur_lba += nsec;
+            st->blocks_rem = (st->blocks_rem > nsec) ? (st->blocks_rem - nsec) : 0u;
+            st->buf_len = (uint16_t)nbytes;
             st->sec_off = 0u;
         }
 
-        uint16_t sec_rem = 512u - st->sec_off;
+        uint16_t sec_rem = (uint16_t)(st->buf_len - st->sec_off);
         uint32_t take    = (sec_rem < 64u) ? sec_rem : 64u;
         if (take > st->data_rem) {
             take = st->data_rem;

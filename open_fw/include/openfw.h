@@ -203,9 +203,13 @@ typedef struct {
     int      is_sdhc;
     uint16_t rca;
     uint32_t sector_count;
+    uint8_t  clk_div;
+    uint8_t  stream_mode; /* 0 = idle, 1 = open-ended CMD18 read */
+    uint32_t stream_lba;
 } sd_card_t;
 
 int      sd_init(sd_card_t *card);
+int      sd_flush(sd_card_t *card);
 int      sd_read_blocks(sd_card_t *card, uint32_t lba, uint32_t count, void *buf);
 int      sd_write_blocks(sd_card_t *card, uint32_t lba, uint32_t count, const void *buf);
 blkdev_t sd_as_blkdev(sd_card_t *card);

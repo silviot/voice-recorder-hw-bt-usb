@@ -538,9 +538,12 @@ static int run_usb_msc_mode(int auto_mode)
     int      exit_armed      = 0;
     int      manual_exit     = 0;
 
+    uint32_t last_render = 0u;
     while (1) {
         wdt_feed();
-        usb_msc_poll();
+        for (int burst = 0; burst < 32; burst++) {
+            usb_msc_poll();
+        }
 
         uint32_t now = millis();
         if ((uint32_t)(now - last_ui) >= 100u) {
@@ -599,7 +602,6 @@ static int run_usb_msc_mode(int auto_mode)
             uint32_t rxp = 0u, txp = 0u;
             usb_msc_get_stats(&rxp, &txp);
             usb_msc_get_bytes(&g_ui.usb_rx_bytes, &g_ui.usb_tx_bytes);
-            pmu_poll_charge_manage();
             if (rxp > 0u || txp > 0u || now >= 3000u) {
                 clear_boot_strikes_once();
             }
@@ -617,14 +619,20 @@ static int run_usb_msc_mode(int auto_mode)
 
             g_ui.usb_read_act  = ((int32_t)(now - rd_blink_until) < 0) ? 1u : 0u;
             g_ui.usb_write_act = ((int32_t)(now - wr_blink_until) < 0) ? 1u : 0u;
-            refresh_telemetry();
-            if (!g_screen_off) {
-                ui_render_screen(UI_SCR_USB, &g_ui);
+            uint32_t render_period = (g_ui.usb_read_act || g_ui.usb_write_act) ? 500u : 300u;
+            if ((uint32_t)(now - last_render) >= render_period) {
+                last_render = now;
+                pmu_poll_charge_manage();
+                refresh_telemetry();
+                if (!g_screen_off) {
+                    ui_render_screen(UI_SCR_USB, &g_ui);
+                }
             }
         }
     }
 
     usb_msc_stop();
+    (void)sd_flush(&g_sd_card);
     wait_key_release(KEY_BACK);
     backlight_wake(millis());
 
