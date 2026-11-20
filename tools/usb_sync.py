@@ -13,6 +13,7 @@ SPDX-License-Identifier: MIT
 import argparse
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -99,21 +100,52 @@ def sync_recordings(
 
     for src in audio_files:
         stat = src.stat()
+        src_hash = sha256_file(src)
         dst = dest_dir / src.name
 
-        if dst.is_file() and dst.stat().st_size == stat.st_size:
+        # Check for existing archive copy with identical content, or pick a
+        # collision-free name when the recorder reuses REC_0001.wav after deletion.
+        already_archived: Optional[Path] = None
+        if dst.is_file():
+            if dst.stat().st_size == stat.st_size and sha256_file(dst) == src_hash:
+                already_archived = dst
+            else:
+                suffix_idx = 2
+                while True:
+                    cand = dest_dir / f"{src.stem}_{suffix_idx}{src.suffix}"
+                    if not cand.exists():
+                        dst = cand
+                        break
+                    if cand.is_file() and cand.stat().st_size == stat.st_size and sha256_file(cand) == src_hash:
+                        already_archived = cand
+                        break
+                    suffix_idx += 1
+
+        if already_archived is not None:
+            if delete_after_sync:
+                src.unlink()
+                print(f"  -> Already archived at {already_archived.name}; removed {src.name} from device")
             continue
 
-        print(f"Syncing {src.name} ({stat.st_size:,} bytes)...")
-        tmp_dst = dest_dir / f".{src.name}.part"
+        print(f"Syncing {src.name} -> {dst.name} ({stat.st_size:,} bytes)...")
+        tmp_dst = dest_dir / f".{dst.name}.part"
         shutil.copy2(src, tmp_dst)
-        src_hash = sha256_file(src)
+        with open(tmp_dst, "rb") as f_sync:
+            os.fsync(f_sync.fileno())
         dst_hash = sha256_file(tmp_dst)
         if src_hash != dst_hash:
             tmp_dst.unlink(missing_ok=True)
             raise RuntimeError(f"Checksum mismatch while copying {src.name}")
 
         tmp_dst.replace(dst)
+        try:
+            dir_fd = os.open(dest_dir, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
         synced_files.append(dst)
         print(f"  -> Saved to {dst} (SHA-256: {dst_hash[:16]}...)")
 

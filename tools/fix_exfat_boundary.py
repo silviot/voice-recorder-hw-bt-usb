@@ -22,10 +22,68 @@ Solution:
 
 SPDX-License-Identifier: MIT
 """
+import fcntl
 import os
+import stat
 import struct
 import sys
 from pathlib import Path
+
+BLKGETSIZE64 = 0x80081272
+
+
+def get_disk_sectors(disk, dev_path: Path) -> int:
+    st = os.fstat(disk.fileno())
+    if stat.S_ISBLK(st.st_mode):
+        buf = bytearray(8)
+        fcntl.ioctl(disk.fileno(), BLKGETSIZE64, buf)
+        return struct.unpack("<Q", buf)[0] // 512
+    return st.st_size // 512
+
+
+def find_exfat_bitmap(disk, heap_lba: int, root_cluster: int, sec_per_clus: int) -> tuple[int, int]:
+    """Scan the first cluster of the exFAT root directory for the 0x81 Allocation Bitmap."""
+    lba = heap_lba + (root_cluster - 2) * sec_per_clus
+    disk.seek(lba * 512)
+    root_data = disk.read(sec_per_clus * 512)
+    for off in range(0, len(root_data), 32):
+        etype = root_data[off]
+        if etype == 0x00:
+            break
+        if etype == 0x81:
+            bmap_cluster = struct.unpack_from("<I", root_data, off + 20)[0]
+            bmap_len = struct.unpack_from("<Q", root_data, off + 24)[0]
+            return bmap_cluster, bmap_len
+    raise RuntimeError("exFAT 0x81 Allocation Bitmap entry not found in root directory")
+
+
+def is_cluster_allocated(
+    disk,
+    fat_lba: int,
+    heap_lba: int,
+    sec_per_clus: int,
+    bmap_cluster: int,
+    bmap_len: int,
+    cluster_idx_0based: int,
+) -> bool:
+    byte_off = cluster_idx_0based // 8
+    bit_mask = 1 << (cluster_idx_0based % 8)
+    if byte_off >= bmap_len:
+        raise RuntimeError(f"Cluster index {cluster_idx_0based} exceeds bitmap length {bmap_len}")
+    cluster_bytes = sec_per_clus * 512
+    step_clusters = byte_off // cluster_bytes
+    in_clus_off = byte_off % cluster_bytes
+    cur = bmap_cluster
+    for _ in range(step_clusters):
+        disk.seek(fat_lba * 512 + cur * 4)
+        nxt = struct.unpack("<I", disk.read(4))[0]
+        if nxt >= 0xFFFFFFF8 or nxt < 2:
+            cur = cur + 1  # Contiguous bitmap fallback
+        else:
+            cur = nxt
+    disk.seek((heap_lba + (cur - 2) * sec_per_clus) * 512 + in_clus_off)
+    b = disk.read(1)[0]
+    return (b & bit_mask) != 0
 
 
 def exfat_vbr_checksum(sectors_11: bytes) -> int:
@@ -55,15 +113,41 @@ def fix_device(dev_path: Path, dry_run: bool = False) -> None:
         if vbr_region[3:11] != b"EXFAT   ":
             raise RuntimeError(f"Partition at sector {p1_start} is not exFAT")
 
-        vol_off, vol_len, fat_off, fat_len, clus_off, clus_cnt = struct.unpack_from(
-            "<QQIIII", vbr_region, 0x40
+        vol_off, vol_len, fat_off, fat_len, clus_off, clus_cnt, root_clus = struct.unpack_from(
+            "<QQIIIII", vbr_region, 0x40
         )
         sec_per_clus_shift = vbr_region[0x6D]
         sec_per_clus = 1 << sec_per_clus_shift
+        total_sectors = get_disk_sectors(disk, dev_path)
         print(
             f"exFAT VBR:       vol_off={vol_off}, vol_len={vol_len}, "
-            f"clus_cnt={clus_cnt}, sec_per_clus={sec_per_clus}"
+            f"clus_cnt={clus_cnt}, sec_per_clus={sec_per_clus}, disk_sectors={total_sectors}"
         )
+
+        if vol_off != p1_start or vol_len != p1_size:
+            raise RuntimeError(
+                f"MBR/VBR geometry mismatch (MBR={p1_start}+{p1_size}, VBR={vol_off}+{vol_len}); aborting."
+            )
+
+        if total_sectors > 0 and (p1_start + p1_size + sec_per_clus) <= total_sectors:
+            print(
+                f"Partition already leaves {total_sectors - (p1_start + p1_size)} tail sectors "
+                f"(>= 1 cluster of {sec_per_clus} sectors); already fixed — nothing to do."
+            )
+            return
+
+        if clus_cnt < 2:
+            raise RuntimeError(f"Unexpected cluster count {clus_cnt}; aborting.")
+
+        # Verify the tail cluster being removed is FREE in the Allocation Bitmap
+        fat_lba = p1_start + fat_off
+        heap_lba = p1_start + clus_off
+        bmap_cluster, bmap_len = find_exfat_bitmap(disk, heap_lba, root_clus, sec_per_clus)
+        if is_cluster_allocated(disk, fat_lba, heap_lba, sec_per_clus, bmap_cluster, bmap_len, clus_cnt - 1):
+            raise RuntimeError(
+                f"Tail cluster #{clus_cnt - 1} is currently ALLOCATED in exFAT bitmap! "
+                "Refusing to shrink volume and lose data."
+            )
 
         # Shrink by 1 cluster (256 sectors = 128 KiB)
         new_size = p1_size - sec_per_clus
