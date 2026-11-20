@@ -59,6 +59,8 @@ typedef struct {
 } player_keys_t;
 
 void            player_keys_init(player_keys_t *s, key_id_t initial, uint32_t now_ms);
+player_action_t player_keys_tick(player_keys_t *s, uint32_t now_ms);
+player_action_t player_keys_edge(player_keys_t *s, key_id_t key, uint32_t now_ms);
 player_action_t player_keys_step(player_keys_t *s, key_id_t raw, uint32_t now_ms);
 
 /*

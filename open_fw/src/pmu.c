@@ -90,6 +90,27 @@ int key_onoff_pressed(int *out_long_press)
     return (int)g_key_onoff_down;
 }
 
+uint8_t key_onoff_poll(void)
+{
+    uint8_t st = pmu_read_reg(0x31u);
+    uint8_t ev = 0u;
+    if (st != 0u) {
+        pmu_write_reg(0x31u, st); /* W1C */
+        if (st & 0x40u) {
+            g_key_onoff_down = 1u;
+            ev |= KEY_ONOFF_PRESS;
+        }
+        if (st & 0x20u) {
+            ev |= KEY_ONOFF_LONG;
+        }
+        if (st & 0x10u) {
+            g_key_onoff_down = 0u;
+            ev |= KEY_ONOFF_RELEASE;
+        }
+    }
+    return ev;
+}
+
 void pmu_soft_poweroff(void)
 {
     pmu_write_reg(0x20u, 0x2Fu); /* wake: KEY_ONOFF + VBUS */

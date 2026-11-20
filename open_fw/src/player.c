@@ -226,6 +226,91 @@ static int is_seek_key(key_id_t k)
     return k == KEY_LEFT || k == KEY_RIGHT;
 }
 
+player_action_t player_keys_tick(player_keys_t *s, uint32_t now_ms)
+{
+    /* A single tap whose double-tap window ran out becomes one seek step */
+    if (s->tap_key != KEY_NONE && time_reached(now_ms, s->tap_deadline)) {
+        key_id_t k = s->tap_key;
+        s->tap_key = KEY_NONE;
+        return (k == KEY_RIGHT) ? PLAYER_ACT_SEEK_FWD : PLAYER_ACT_SEEK_BACK;
+    }
+
+    if (s->held == KEY_NONE || s->ignore) {
+        return PLAYER_ACT_NONE;
+    }
+    if ((s->held == KEY_VOL_UP || s->held == KEY_VOL_DOWN) &&
+        time_reached(now_ms, s->next_repeat)) {
+        s->next_repeat = now_ms + PLAYER_KEY_REPEAT_MS;
+        return (s->held == KEY_VOL_UP) ? PLAYER_ACT_VOL_UP : PLAYER_ACT_VOL_DOWN;
+    }
+    if (is_seek_key(s->held) && time_reached(now_ms, s->next_repeat)) {
+        s->hold_active = 1u;
+        s->next_repeat = now_ms + PLAYER_KEY_SCRUB_MS;
+        return (s->held == KEY_RIGHT) ? PLAYER_ACT_SCRUB_FWD : PLAYER_ACT_SCRUB_BACK;
+    }
+    return PLAYER_ACT_NONE;
+}
+
+player_action_t player_keys_edge(player_keys_t *s, key_id_t key, uint32_t now_ms)
+{
+    if (key == s->held) {
+        return PLAYER_ACT_NONE;
+    }
+
+    /* Debounced change. A LEFT/RIGHT let go before its hold started is a tap. */
+    if (is_seek_key(s->held) && !s->hold_active && !s->ignore) {
+        s->tap_key      = s->held;
+        s->tap_deadline = now_ms + PLAYER_KEY_DOUBLE_TAP_MS;
+    }
+
+    s->held        = key;
+    s->held_since  = now_ms;
+    s->hold_active = 0u;
+    s->ignore      = 0u;
+
+    if (is_seek_key(key)) {
+        if (s->tap_key == key) {
+            /* Second tap of the same key inside the window */
+            s->tap_key = KEY_NONE;
+            s->ignore  = 1u;
+            return (key == KEY_RIGHT) ? PLAYER_ACT_NEXT_FILE : PLAYER_ACT_PREV_FILE;
+        }
+        s->next_repeat = now_ms + PLAYER_KEY_HOLD_MS;
+        if (s->tap_key != KEY_NONE) {
+            /* Pending tap of the other key: settle it now */
+            key_id_t k = s->tap_key;
+            s->tap_key = KEY_NONE;
+            return (k == KEY_RIGHT) ? PLAYER_ACT_SEEK_FWD : PLAYER_ACT_SEEK_BACK;
+        }
+        return PLAYER_ACT_NONE;
+    }
+
+    if (key != KEY_NONE && s->tap_key != KEY_NONE) {
+        /* Another key pressed while a tap waits: settle the tap first and
+         * make the new key wait for a fresh press. */
+        key_id_t k = s->tap_key;
+        s->tap_key = KEY_NONE;
+        s->ignore  = 1u;
+        return (k == KEY_RIGHT) ? PLAYER_ACT_SEEK_FWD : PLAYER_ACT_SEEK_BACK;
+    }
+
+    switch (key) {
+    case KEY_NONE:
+        return PLAYER_ACT_NONE;
+    case KEY_ENTER:
+        return PLAYER_ACT_PLAY_PAUSE;
+    case KEY_BACK:
+        return PLAYER_ACT_BACK;
+    case KEY_VOL_UP:
+    case KEY_VOL_DOWN:
+        s->next_repeat = now_ms + PLAYER_KEY_REPEAT_DELAY_MS;
+        return (key == KEY_VOL_UP) ? PLAYER_ACT_VOL_UP : PLAYER_ACT_VOL_DOWN;
+    default:
+        s->ignore = 1u;
+        return PLAYER_ACT_NONE;
+    }
+}
+
 player_action_t player_keys_step(player_keys_t *s, key_id_t raw, uint32_t now_ms)
 {
     /* A single tap whose double-tap window ran out becomes one seek step */
@@ -247,75 +332,9 @@ player_action_t player_keys_step(player_keys_t *s, key_id_t raw, uint32_t now_ms
     }
 
     if (raw == s->held) {
-        /* Key still held (or still released) */
-        if (s->held == KEY_NONE || s->ignore) {
-            return PLAYER_ACT_NONE;
-        }
-        if ((s->held == KEY_VOL_UP || s->held == KEY_VOL_DOWN) &&
-            time_reached(now_ms, s->next_repeat)) {
-            s->next_repeat = now_ms + PLAYER_KEY_REPEAT_MS;
-            return (s->held == KEY_VOL_UP) ? PLAYER_ACT_VOL_UP : PLAYER_ACT_VOL_DOWN;
-        }
-        if (is_seek_key(s->held) && time_reached(now_ms, s->next_repeat)) {
-            s->hold_active = 1u;
-            s->next_repeat = now_ms + PLAYER_KEY_SCRUB_MS;
-            return (s->held == KEY_RIGHT) ? PLAYER_ACT_SCRUB_FWD : PLAYER_ACT_SCRUB_BACK;
-        }
-        return PLAYER_ACT_NONE;
+        return player_keys_tick(s, now_ms);
     }
-
-    /* Debounced change. A LEFT/RIGHT let go before its hold started is a tap. */
-    if (is_seek_key(s->held) && !s->hold_active && !s->ignore) {
-        s->tap_key      = s->held;
-        s->tap_deadline = now_ms + PLAYER_KEY_DOUBLE_TAP_MS;
-    }
-
-    s->held        = raw;
-    s->held_since  = s->raw_since;
-    s->hold_active = 0u;
-    s->ignore      = 0u;
-
-    if (is_seek_key(raw)) {
-        if (s->tap_key == raw) {
-            /* Second tap of the same key inside the window */
-            s->tap_key = KEY_NONE;
-            s->ignore  = 1u;
-            return (raw == KEY_RIGHT) ? PLAYER_ACT_NEXT_FILE : PLAYER_ACT_PREV_FILE;
-        }
-        s->next_repeat = s->held_since + PLAYER_KEY_HOLD_MS;
-        if (s->tap_key != KEY_NONE) {
-            /* Pending tap of the other key: settle it now */
-            key_id_t k = s->tap_key;
-            s->tap_key = KEY_NONE;
-            return (k == KEY_RIGHT) ? PLAYER_ACT_SEEK_FWD : PLAYER_ACT_SEEK_BACK;
-        }
-        return PLAYER_ACT_NONE;
-    }
-
-    if (raw != KEY_NONE && s->tap_key != KEY_NONE) {
-        /* Another key pressed while a tap waits: settle the tap first and
-         * make the new key wait for a fresh press. */
-        key_id_t k = s->tap_key;
-        s->tap_key = KEY_NONE;
-        s->ignore  = 1u;
-        return (k == KEY_RIGHT) ? PLAYER_ACT_SEEK_FWD : PLAYER_ACT_SEEK_BACK;
-    }
-
-    switch (raw) {
-    case KEY_NONE:
-        return PLAYER_ACT_NONE;
-    case KEY_ENTER:
-        return PLAYER_ACT_PLAY_PAUSE;
-    case KEY_BACK:
-        return PLAYER_ACT_BACK;
-    case KEY_VOL_UP:
-    case KEY_VOL_DOWN:
-        s->next_repeat = now_ms + PLAYER_KEY_REPEAT_DELAY_MS;
-        return (raw == KEY_VOL_UP) ? PLAYER_ACT_VOL_UP : PLAYER_ACT_VOL_DOWN;
-    default:
-        s->ignore = 1u;
-        return PLAYER_ACT_NONE;
-    }
+    return player_keys_edge(s, raw, now_ms);
 }
 
 int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_name,
@@ -423,8 +442,9 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
     uint32_t toast_until   = 0u;
     int      ui_dirty      = 1;
     int      ret_code      = 0;
+    keys_flush_events();
     player_keys_t keys;
-    player_keys_init(&keys, keys_decode(keys_read_adc()), millis());
+    player_keys_init(&keys, keys_state((uint32_t *)0), millis());
 
     while (1) {
         wdt_feed();
@@ -459,7 +479,22 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
             ui_dirty = 1;
         }
 
-        player_action_t act = player_keys_step(&keys, keys_decode(keys_read_adc()), now);
+        player_action_t act = PLAYER_ACT_NONE;
+        key_event_t ev;
+        while (keys_peek_event(&ev)) {
+            act = player_keys_tick(&keys, ev.t_ms);
+            if (act != PLAYER_ACT_NONE) {
+                break;
+            }
+            keys_pop_event(&ev);
+            act = player_keys_edge(&keys, ev.pressed ? ev.key : KEY_NONE, ev.t_ms);
+            if (act != PLAYER_ACT_NONE) {
+                break;
+            }
+        }
+        if (act == PLAYER_ACT_NONE) {
+            act = player_keys_tick(&keys, now);
+        }
         int file_dir = 0; /* -1: previous file, +1: next file */
         if (act == PLAYER_ACT_BACK) {
             ret_code = 0;
@@ -679,8 +714,9 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
             ui_render_screen(UI_SCR_PLAYER, m);
         }
 
-        if (paused || eof_reached || (audio_dac_is_busy() &&
-            (buf_pos < buf_frames || data_off >= winfo.data_bytes || played_frames >= winfo.total_samples))) {
+        if (!keys_event_pending() &&
+            (paused || eof_reached || (audio_dac_is_busy() &&
+            (buf_pos < buf_frames || data_off >= winfo.data_bytes || played_frames >= winfo.total_samples)))) {
             OPENFW_WFI();
         }
     }
@@ -689,10 +725,11 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
     m->play_file.resume_sec = eof_reached ? 0u : m->play_pos_sec;
     lcd_set_rotation(1);
 
-    while (keys_decode(keys_read_adc()) == KEY_BACK) {
+    while (keys_state((uint32_t *)0) == KEY_BACK) {
         wdt_feed();
         mdelay(20u);
     }
+    keys_flush_events();
     return ret_code;
 }
 

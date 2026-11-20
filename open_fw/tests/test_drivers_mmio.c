@@ -930,6 +930,18 @@ static void test_pmu_driver(void)
     g_soc.pmu_regs[0x31u] = 0x10u; /* Release */
     assert(key_onoff_pressed(&lp) == 0 && lp == 0 && g_soc.pmu_regs[0x31u] == 0x00u);
 
+    /* key_onoff_poll: brief press+release latched in a single read is preserved */
+    g_soc.pmu_regs[0x31u] = 0x50u; /* Press (0x40) | Release (0x10) */
+    assert(key_onoff_poll() == (KEY_ONOFF_PRESS | KEY_ONOFF_RELEASE));
+    assert(g_soc.pmu_regs[0x31u] == 0x00u);
+    assert(key_onoff_poll() == 0u);
+    g_soc.pmu_regs[0x31u] = 0x40u;
+    assert(key_onoff_poll() == KEY_ONOFF_PRESS);
+    g_soc.pmu_regs[0x31u] = 0x20u;
+    assert(key_onoff_poll() == KEY_ONOFF_LONG);
+    g_soc.pmu_regs[0x31u] = 0x10u;
+    assert(key_onoff_poll() == KEY_ONOFF_RELEASE);
+
     /* Unattended always-on PMU init + charge management */
     g_soc.pmu_regs[0x00u] = 0xCFu;
     g_soc.pmu_regs[0x17u] = 0x01u;
@@ -992,7 +1004,103 @@ static void test_keys_driver(void)
     assert(keys_read_hp_detect() == 0);
     g_soc.gpio_in[1] &= ~(1u << 11); /* PB11 low = Earphones inserted */
     assert(keys_read_hp_detect() == 1);
-    printf("[OK] keys SARADC + PB6/PB11 MMIO\n");
+
+    /* 1 kHz keys_scan_tick: 8-sample debounce & brief 16 ms tap */
+    g_soc.saradc_ch1_data = 4095u;
+    keys_init();
+    assert(keys_state(NULL) == KEY_NONE);
+    assert(keys_event_pending() == 0);
+
+    uint32_t t = 100u;
+    g_soc.saradc_ch1_data = 2850u; /* KEY_ENTER */
+    for (int i = 0; i < 7; i++) {
+        keys_scan_tick(t++);
+    }
+    assert(keys_event_pending() == 0);
+    assert(keys_state(NULL) == KEY_NONE);
+    keys_scan_tick(t++); /* 8th sample at t=107 -> press accepted */
+    assert(keys_event_pending() == 1);
+    uint32_t since = 0u;
+    assert(keys_state(&since) == KEY_ENTER && since == 107u);
+    for (int i = 0; i < 8; i++) {
+        keys_scan_tick(t++); /* hold to 16 ms total */
+    }
+    g_soc.saradc_ch1_data = 4095u; /* release */
+    for (int i = 0; i < 8; i++) {
+        keys_scan_tick(t++); /* accepted at t=123 */
+    }
+    key_event_t ev;
+    assert(keys_peek_event(&ev) == 1 && ev.key == KEY_ENTER && ev.pressed == 1u && ev.t_ms == 107u);
+    assert(keys_pop_event(&ev) == 1 && ev.key == KEY_ENTER && ev.pressed == 1u && ev.t_ms == 107u);
+    assert(keys_pop_event(&ev) == 1 && ev.key == KEY_ENTER && ev.pressed == 0u && ev.t_ms == 123u);
+    assert(keys_pop_event(&ev) == 0);
+    assert(keys_state(NULL) == KEY_NONE);
+
+    /* Resistor-ladder sweep glitch rejection (ENTER->BACK->VOL_DOWN 2 ms each -> LEFT 10 ms) */
+    const uint16_t sweep_adc[] = { 2850u, 2850u, 2550u, 2550u, 2150u, 2150u };
+    for (unsigned i = 0u; i < sizeof(sweep_adc) / sizeof(sweep_adc[0]); i++) {
+        g_soc.saradc_ch1_data = sweep_adc[i];
+        keys_scan_tick(t++);
+    }
+    assert(keys_event_pending() == 0);
+    g_soc.saradc_ch1_data = 100u; /* KEY_LEFT */
+    for (int i = 0; i < 10; i++) {
+        keys_scan_tick(t++);
+    }
+    assert(keys_pop_event(&ev) == 1 && ev.key == KEY_LEFT && ev.pressed == 1u);
+    assert(keys_pop_event(&ev) == 0);
+
+    /* Direct key-to-key transition: LEFT -> RIGHT emits release(LEFT) + press(RIGHT) */
+    g_soc.saradc_ch1_data = 600u; /* KEY_RIGHT */
+    for (int i = 0; i < 8; i++) {
+        keys_scan_tick(t++);
+    }
+    key_event_t ev1, ev2;
+    assert(keys_pop_event(&ev1) == 1 && ev1.key == KEY_LEFT && ev1.pressed == 0u);
+    assert(keys_pop_event(&ev2) == 1 && ev2.key == KEY_RIGHT && ev2.pressed == 1u);
+    assert(ev1.t_ms == ev2.t_ms);
+    assert(keys_pop_event(&ev) == 0);
+
+    /* Release RIGHT before testing g_exp_running pause */
+    g_soc.saradc_ch1_data = 4095u;
+    for (int i = 0; i < 8; i++) {
+        keys_scan_tick(t++);
+    }
+    keys_flush_events();
+
+    /* g_exp_running != 0 skips scanning and flushes/resyncs cleanly on exit */
+    g_exp_running = 1u;
+    g_soc.saradc_ch1_data = 2850u;
+    for (int i = 0; i < 12; i++) {
+        keys_scan_tick(t++);
+    }
+    assert(keys_event_pending() == 0);
+    g_exp_running = 0u;
+    g_soc.saradc_ch1_data = 4095u;
+    keys_scan_tick(t++);
+    assert(keys_event_pending() == 0);
+    assert(keys_state(NULL) == KEY_NONE);
+
+    /* SPSC overflow resync: >16 events queued, ending with KEY_BACK held -> flush & ignore until release */
+    for (int rep = 0; rep < 10; rep++) {
+        g_soc.saradc_ch1_data = 2550u; /* KEY_BACK */
+        for (int i = 0; i < 8; i++) keys_scan_tick(t++);
+        if (rep < 9) {
+            g_soc.saradc_ch1_data = 4095u;
+            for (int i = 0; i < 8; i++) keys_scan_tick(t++);
+        }
+    }
+    assert(keys_pop_event(&ev) == 0);       /* overflow flushed queue */
+    assert(keys_state(NULL) == KEY_NONE);   /* held KEY_BACK ignored until released */
+    g_soc.saradc_ch1_data = 4095u;
+    for (int i = 0; i < 8; i++) keys_scan_tick(t++); /* release clears resync_ignore */
+    assert(keys_pop_event(&ev) == 0);       /* no spurious release */
+    g_soc.saradc_ch1_data = 2850u;          /* fresh KEY_ENTER press works */
+    for (int i = 0; i < 8; i++) keys_scan_tick(t++);
+    assert(keys_pop_event(&ev) == 1 && ev.key == KEY_ENTER && ev.pressed == 1u);
+    assert(keys_state(NULL) == KEY_ENTER);
+
+    printf("[OK] keys SARADC + PB6/PB11 + 1kHz scanner/debounce/SPSC MMIO\n");
 }
 
 static void test_lcd_driver(void)

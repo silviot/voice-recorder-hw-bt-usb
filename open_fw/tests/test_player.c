@@ -15,6 +15,55 @@ static int strict = 1;           /* full-drain assertions (plain playback runs) 
 static key_id_t (*key_script)(unsigned ms);
 static unsigned vol_calls;
 
+/* Simulated 1 kHz SysTick key debouncer + SPSC queue */
+static key_event_t stub_q[32];
+static unsigned    stub_q_head, stub_q_tail;
+static key_id_t    stub_stable = KEY_NONE;
+static uint32_t    stub_stable_since = 0;
+static key_id_t    stub_cand = KEY_NONE;
+static unsigned    stub_cand_cnt = 0;
+
+static void stub_keys_reset(void)
+{
+    stub_q_head = stub_q_tail = 0;
+    stub_stable = KEY_NONE;
+    stub_stable_since = 0;
+    stub_cand = KEY_NONE;
+    stub_cand_cnt = 0;
+}
+
+static void stub_keys_push(uint32_t t, key_id_t k, uint8_t pressed)
+{
+    if (stub_q_head - stub_q_tail < 32u) {
+        stub_q[stub_q_head & 31u] = (key_event_t){ t, k, pressed };
+        stub_q_head++;
+    }
+}
+
+static void stub_keys_tick_1ms(unsigned t)
+{
+    key_id_t raw = key_script ? key_script(t) : KEY_NONE;
+    if (raw == stub_stable) {
+        stub_cand = raw;
+        stub_cand_cnt = 0;
+        return;
+    }
+    if (raw == stub_cand) {
+        stub_cand_cnt++;
+    } else {
+        stub_cand = raw;
+        stub_cand_cnt = 1;
+    }
+    if (stub_cand_cnt >= 8u) {
+        key_id_t old = stub_stable;
+        stub_stable = raw;
+        stub_stable_since = t;
+        stub_cand_cnt = 0;
+        if (old != KEY_NONE) stub_keys_push(t, old, 0u);
+        if (raw != KEY_NONE) stub_keys_push(t, raw, 1u);
+    }
+}
+
 static int16_t sample(unsigned frame, unsigned channel)
 {
     return (int16_t)((int)(frame % 30000) * (channel ? -1 : 1));
@@ -22,8 +71,11 @@ static int16_t sample(unsigned frame, unsigned channel)
 
 static void advance(unsigned ms)
 {
-    now_ms += ms;
-    assert(now_ms < 6000);
+    for (unsigned i = 0; i < ms; i++) {
+        now_ms++;
+        assert(now_ms < 6000);
+        stub_keys_tick_1ms(now_ms);
+    }
     unsigned frames = 16 * ms;
     while (frames && count) {
         unsigned take = slots[head] < frames ? slots[head] : frames;
@@ -94,6 +146,26 @@ int keys_read_rec_switch(void) { return strict && ended; }
 int keys_read_hp_detect(void) { return 0; }
 uint16_t keys_read_adc(void) { return 0; }
 key_id_t keys_decode(uint16_t raw) { (void)raw; return key_script ? key_script(now_ms) : KEY_NONE; }
+int keys_event_pending(void) { return stub_q_head != stub_q_tail; }
+int keys_peek_event(key_event_t *out)
+{
+    if (stub_q_head == stub_q_tail) return 0;
+    if (out) *out = stub_q[stub_q_tail & 31u];
+    return 1;
+}
+int keys_pop_event(key_event_t *out)
+{
+    if (stub_q_head == stub_q_tail) return 0;
+    if (out) *out = stub_q[stub_q_tail & 31u];
+    stub_q_tail++;
+    return 1;
+}
+void keys_flush_events(void) { stub_q_tail = stub_q_head; }
+key_id_t keys_state(uint32_t *since_ms)
+{
+    if (since_ms) *since_ms = stub_stable_since;
+    return stub_stable;
+}
 void lcd_set_rotation(int rotation) { (void)rotation; }
 void pmu_poll_charge_manage(void) { }
 pmu_chg_state_t pmu_get_charge_state(void) { return PMU_CHG_DISCHARGING; }
@@ -224,7 +296,21 @@ static void test_key_gestures(void)
     }
     assert(n == 1 && acts[0] == PLAYER_ACT_NEXT_FILE);
 
-    puts("[OK] player key gestures (double tap file, tap/hold seek, VOL repeat, debounce, held-at-start)");
+    /* Direct edge+tick API: press/release with no tick in between -> SEEK after 350 ms */
+    player_keys_init(&k, KEY_NONE, 0);
+    assert(player_keys_edge(&k, KEY_RIGHT, 100u) == PLAYER_ACT_NONE);
+    assert(player_keys_edge(&k, KEY_NONE,  120u) == PLAYER_ACT_NONE);
+    assert(player_keys_tick(&k, 469u) == PLAYER_ACT_NONE);
+    assert(player_keys_tick(&k, 470u) == PLAYER_ACT_SEEK_FWD);
+    assert(player_keys_tick(&k, 900u) == PLAYER_ACT_NONE);
+
+    /* Direct edge+tick API: brief 20 ms VOL_UP tap -> one step, no repeat */
+    player_keys_init(&k, KEY_NONE, 0);
+    assert(player_keys_edge(&k, KEY_VOL_UP, 100u) == PLAYER_ACT_VOL_UP);
+    assert(player_keys_edge(&k, KEY_NONE,   120u) == PLAYER_ACT_NONE);
+    assert(player_keys_tick(&k, 700u) == PLAYER_ACT_NONE);
+
+    puts("[OK] player key gestures (double tap file, tap/hold seek, VOL repeat, debounce, held-at-start, edge+tick)");
 }
 
 /* ---- playback loop with scripted keys --------------------------------------- */
@@ -251,6 +337,14 @@ static key_id_t hold_vol_up(unsigned ms)
     if (ms >= 1500 && ms < 1700) return KEY_BACK;
     return KEY_NONE;
 }
+static key_id_t brief_tap_during_render(unsigned ms)
+{
+    /* First ui_render_screen runs at t=1..46 ms (45 ms stall); a 20 ms VOL+ tap
+     * at 10..30 ms starts and ends entirely inside that render stall. */
+    if (ms >= 10 && ms < 30) return KEY_VOL_UP;
+    if (ms >= 200 && ms < 220) return KEY_BACK;
+    return KEY_NONE;
+}
 
 static void reset_run(key_id_t (*script)(unsigned))
 {
@@ -258,6 +352,7 @@ static void reset_run(key_id_t (*script)(unsigned))
     ended = 0;
     strict = 0;
     key_script = script;
+    stub_keys_reset();
 }
 
 static void test_scripted_keys(void)
@@ -298,9 +393,18 @@ static void test_scripted_keys(void)
     assert(m.cfg.spk_vol >= 22 && m.cfg.spk_vol <= 31);
     assert(vol_calls == (unsigned)(m.cfg.spk_vol - 18));
 
+    /* Brief 20 ms VOL+ tap during a 45 ms render stall, then brief 20 ms BACK tap */
+    memset(&m, 0, sizeof(m));
+    m.cfg.spk_vol = 18;
+    reset_run(brief_tap_during_render);
+    assert(openfw_play_file_ui(&vol, "/record", "test.wav", &m) == 0);
+    assert(m.cfg.spk_vol == 19 && vol_calls == 1);
+    assert(now_ms < 400);
+
     key_script = NULL;
+    stub_keys_reset();
     strict = 1;
-    puts("[OK] player loop: double tap RIGHT -> next file, double tap LEFT at start -> stays, hold RIGHT seeks, hold VOL+ repeats");
+    puts("[OK] player loop: double tap RIGHT -> next file, double tap LEFT at start -> stays, hold RIGHT seeks, hold VOL+ repeats, brief 20ms tap in render stall");
 }
 
 int main(void)

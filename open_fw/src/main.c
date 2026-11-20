@@ -76,6 +76,9 @@ static void wfi_sleep_ms(uint32_t ms)
     uint32_t start = millis();
     while ((uint32_t)(millis() - start) < ms) {
         wdt_feed();
+        if (keys_event_pending()) {
+            break;
+        }
         __asm__ volatile ("wfi");
     }
     wdt_feed();
@@ -316,10 +319,11 @@ static void load_persisted_state(void)
 
 static void wait_key_release(key_id_t target)
 {
-    while (keys_decode(keys_read_adc()) == target) {
+    while (keys_state((uint32_t *)0) == target) {
         wdt_feed();
         mdelay(20u);
     }
+    keys_flush_events();
 }
 
 static int menu_collect_cb(const exfat_entry_t *entry, void *user)
@@ -542,6 +546,8 @@ static int run_usb_msc_mode(int auto_mode)
     int      manual_exit     = 0;
 
     uint32_t last_render = 0u;
+    keys_flush_events();
+    (void)key_onoff_poll();
     while (1) {
         wdt_feed();
         for (int burst = 0; burst < 32; burst++) {
@@ -549,26 +555,46 @@ static int run_usb_msc_mode(int auto_mode)
         }
 
         uint32_t now = millis();
-        if ((uint32_t)(now - last_ui) >= 100u) {
-            last_ui = now;
 
-            key_id_t k = keys_decode(keys_read_adc());
-            if (k != KEY_NONE) {
-                backlight_wake(now);
+        key_event_t kev;
+        while (keys_pop_event(&kev)) {
+            if (kev.pressed) {
+                backlight_wake(kev.t_ms);
+                if (exit_armed && kev.key == KEY_BACK) {
+                    back_press_ms = kev.t_ms ? kev.t_ms : 1u;
+                } else {
+                    back_press_ms = 0u;
+                }
+            } else {
+                if (kev.key == KEY_BACK) {
+                    back_press_ms = 0u;
+                }
+                if (keys_state((uint32_t *)0) == KEY_NONE) {
+                    exit_armed = 1;
+                }
             }
-            if (k == KEY_NONE) {
+        }
+        {
+            uint32_t st_since = 0u;
+            key_id_t st_k = keys_state(&st_since);
+            if (st_k == KEY_NONE) {
                 exit_armed    = 1;
                 back_press_ms = 0u;
-            } else if (exit_armed && k == KEY_BACK) {
+            } else if (exit_armed && st_k == KEY_BACK) {
                 if (back_press_ms == 0u) {
-                    back_press_ms = now ? now : 1u;
-                } else if ((uint32_t)(now - back_press_ms) >= 600u) {
+                    back_press_ms = st_since ? st_since : (now ? now : 1u);
+                }
+                if ((uint32_t)(now - back_press_ms) >= 600u) {
                     manual_exit = 1;
                     break;
                 }
             } else {
                 back_press_ms = 0u;
             }
+        }
+
+        if ((uint32_t)(now - last_ui) >= 100u) {
+            last_ui = now;
 
 #if OPENFW_UNATTENDED_DEV
             if (auto_mode) {
@@ -637,6 +663,7 @@ static int run_usb_msc_mode(int auto_mode)
     usb_msc_stop();
     (void)sd_flush(&g_sd_card);
     wait_key_release(KEY_BACK);
+    (void)key_onoff_poll();
     backlight_wake(millis());
 
     /* Remount exFAT because USB host may have written or deleted files */
@@ -669,8 +696,9 @@ static void run_bt_xrec_mode(void)
     uint8_t  prev_acl    = 0u;
     uint8_t  prev_spp    = 0u;
     int      exit_armed  = 0;
-    key_id_t prev_bt_key = KEY_ENTER;
 
+    keys_flush_events();
+    (void)key_onoff_poll();
     while (1) {
         wdt_feed();
         bt_xrec_poll();
@@ -682,23 +710,32 @@ static void run_bt_xrec_mode(void)
             break;
         }
 
+        int bt_exit = 0;
+        key_event_t kev;
+        while (keys_pop_event(&kev)) {
+            if (kev.pressed) {
+                backlight_wake(kev.t_ms);
+                if (exit_armed && kev.key == KEY_BACK) {
+                    bt_exit = 1;
+                    break;
+                } else if (exit_armed && kev.key == KEY_ENTER) {
+                    bt_xrec_open_pairing(60000u);
+                }
+            } else if (keys_state((uint32_t *)0) == KEY_NONE) {
+                exit_armed = 1;
+            }
+        }
+        if (bt_exit) {
+            break;
+        }
+        if (!exit_armed && keys_state((uint32_t *)0) == KEY_NONE) {
+            exit_armed = 1;
+        }
+
         uint32_t now = millis();
         if ((uint32_t)(now - last_ui) >= 150u || last_ui == 0u) {
             last_ui = now;
             pmu_poll_charge_manage();
-
-            key_id_t k = keys_decode(keys_read_adc());
-            if (k != KEY_NONE) {
-                backlight_wake(now);
-            }
-            if (k == KEY_NONE) {
-                exit_armed = 1;
-            } else if (exit_armed && k == KEY_BACK) {
-                break;
-            } else if (exit_armed && k == KEY_ENTER && prev_bt_key != KEY_ENTER) {
-                bt_xrec_open_pairing(60000u);
-            }
-            prev_bt_key = k;
 
             bt_status_t st;
             bt_xrec_get_status(&st);
@@ -752,6 +789,7 @@ static void run_bt_xrec_mode(void)
     bt_xrec_stop();
     g_ui.toast_msg[0] = '\0';
     wait_key_release(KEY_BACK);
+    (void)key_onoff_poll();
     backlight_wake(millis());
     reload_files_and_sd_stats();
 }
@@ -786,7 +824,8 @@ static void play_boot_animation(void)
 
     for (uint32_t frame = 0u; frame < 50u; frame++) {
         wdt_feed();
-        if (keys_read_rec_switch() || keys_decode(keys_read_adc()) != KEY_NONE) {
+        if (keys_read_rec_switch() || keys_decode(keys_read_adc()) != KEY_NONE ||
+            keys_event_pending()) {
             break;
         }
 
@@ -1174,16 +1213,32 @@ int openfw_main(void)
         }
 
         /* 1. Power button (short press = screen off/wake; 2s hold unplugged = power off) */
-        int onoff_long = 0;
-        int onoff_now  = key_onoff_pressed(&onoff_long);
-        if (onoff_now && !prev_onoff) {
-            pwr_press_ms = now_ms ? now_ms : 1u;
+        uint8_t onoff_ev   = key_onoff_poll();
+        int     onoff_long = (onoff_ev & KEY_ONOFF_LONG) ? 1 : 0;
+        if (onoff_ev & KEY_ONOFF_PRESS) {
+            prev_onoff = 1;
             if (g_screen_off) {
                 backlight_wake(now_ms);
-                dirty = 1;
+                dirty        = 1;
                 pwr_press_ms = 0u; /* Wake press swallowed */
+            } else {
+                pwr_press_ms = now_ms ? now_ms : 1u;
             }
-        } else if (onoff_now && pwr_press_ms != 0u) {
+        }
+        if (onoff_ev & KEY_ONOFF_RELEASE) {
+            prev_onoff = 0;
+            if (pwr_press_ms != 0u) {
+                uint32_t held = (uint32_t)(now_ms - pwr_press_ms);
+                pwr_press_ms = 0u;
+                if (held < 300u) {
+                    backlight_sleep_now();
+                } else {
+                    /* Cancelled power off hold */
+                    g_ui_screen = (uint32_t)scr;
+                    dirty = 1;
+                }
+            }
+        } else if (prev_onoff && pwr_press_ms != 0u) {
             uint32_t held = (uint32_t)(now_ms - pwr_press_ms);
             if (!pmu_is_vbus_present() && (held >= 300u || onoff_long)) {
                 uint32_t pct = (held >= 2000u || onoff_long) ? 100u : ((held * 100u) / 2000u);
@@ -1197,25 +1252,11 @@ int openfw_main(void)
                     mdelay(150u);
                     pmu_soft_poweroff();
                 }
-                prev_onoff = onoff_now;
                 recorder_poll();
                 wfi_sleep_ms(25u);
                 continue;
             }
-        } else if (!onoff_now && prev_onoff) {
-            if (pwr_press_ms != 0u) {
-                uint32_t held = (uint32_t)(now_ms - pwr_press_ms);
-                pwr_press_ms = 0u;
-                if (held < 300u) {
-                    backlight_sleep_now();
-                } else {
-                    /* Cancelled power off hold */
-                    g_ui_screen = (uint32_t)scr;
-                    dirty = 1;
-                }
-            }
         }
-        prev_onoff = onoff_now;
 
         /* 2. Record slide switch (overrides any screen immediately) */
         int rec_sw = keys_read_rec_switch();
@@ -1435,323 +1476,342 @@ int openfw_main(void)
                 int manual = run_usb_msc_mode(1);
                 usb_suppress_until_unpl = (manual && pmu_is_vbus_present()) ? 1 : 0;
                 g_ui_screen = (uint32_t)scr;
+                keys_flush_events();
+                (void)key_onoff_poll();
                 prev_key    = KEY_NONE;
                 dirty       = 1;
                 continue;
             }
         }
 
-        /* 4. Key input handling */
-        key_id_t key = keys_decode(keys_read_adc());
+        /* 4. Key input handling (drain queued debounced edges, then final state pass for holds) */
+        for (;;) {
+            key_event_t kev;
+            int         have       = keys_pop_event(&kev);
+            key_id_t    key        = have ? (kev.pressed ? kev.key : KEY_NONE) : keys_state((uint32_t *)0);
+            uint32_t    t          = have ? kev.t_ms : now_ms;
+            int         modal_done = 0;
 
-        if (g_screen_off) {
-            if (key != KEY_NONE && prev_key == KEY_NONE) {
-                backlight_wake(now_ms);
-                swallow_until_release = 1;
-                dirty = 1;
-            }
-            prev_key = key;
-        } else if (swallow_until_release) {
-            if (key == KEY_NONE) {
-                swallow_until_release = 0;
-            }
-            prev_key = key;
-        } else {
-            if (key != KEY_NONE) {
-                backlight_wake(now_ms);
-            }
-
-            int rising = (key != KEY_NONE && key != prev_key) ? 1 : 0;
-
-            switch (scr) {
-            case UI_SCR_HOME:
-                if (rising) {
-                    if (key == KEY_LEFT) {
-                        if (g_ui.home_focus > 0u) {
-                            g_ui.home_focus--;
-                            dirty = 1;
-                        }
-                    } else if (key == KEY_RIGHT) {
-                        if (g_ui.home_focus < 3u) {
-                            g_ui.home_focus++;
-                            dirty = 1;
-                        }
-                    } else if (key == KEY_ENTER) {
-                        if (g_ui.home_focus == 0u) {
-                            if (g_ui.has_last && g_sd_mounted) {
-                                char dir[sizeof(g_last_dir)];
-                                copy_cstr(dir, (int)sizeof(dir), g_last_dir);
-                                play_named_file(dir, &g_ui.last_file);
-                                g_ui_screen = (uint32_t)scr;
-                                prev_key    = KEY_NONE;
-                                dirty       = 1;
-                            } else {
-                                ui_show_toast("Nothing played yet", UI_COL_AMBER, now_ms, 1500u);
-                                dirty = 1;
-                            }
-                        } else if (g_ui.home_focus == 1u) {
-                            reload_files_and_sd_stats();
-                            scr         = UI_SCR_FILES;
-                            g_ui_screen = (uint32_t)scr;
-                            dirty       = 1;
-                        } else if (g_ui.home_focus == 2u) {
-                            g_ui.set_edit_clock = 0u;
-                            scr                 = UI_SCR_SETTINGS;
-                            g_ui_screen         = (uint32_t)scr;
-                            dirty               = 1;
-                        } else {
-                            run_bt_xrec_mode();
-                            g_ui_screen = (uint32_t)scr;
-                            prev_key    = KEY_NONE;
-                            dirty       = 1;
-                        }
-                    }
+            if (g_screen_off) {
+                if (key != KEY_NONE && prev_key == KEY_NONE) {
+                    backlight_wake(t);
+                    swallow_until_release = 1;
+                    dirty = 1;
                 }
-                break;
-
-            case UI_SCR_REC:
-                if (rising) {
-                    if (key == KEY_BACK) {
-                        backlight_sleep_now();
-                    } else if (key == KEY_ENTER && rec_active) {
-                        ui_spec_drop_marker(&g_spec);
-                        g_ui.rec_markers++;
-                        dirty = 1;
-                    } else if ((key == KEY_VOL_UP || key == KEY_VOL_DOWN) && rec_active) {
-                        int g = (int)g_ui.cfg.mic_gain + ((key == KEY_VOL_UP) ? 1 : -1);
-                        if (g < 0) g = 0;
-                        if (g > 31) g = 31;
-                        g_ui.cfg.mic_gain = (uint8_t)g;
-                        recorder_set_gain(g_ui.cfg.mic_gain);
-                        g_ui.rec_gain_bar = 1u;
-                        rec_gain_until_ms = now_ms + 1500u;
-                        dirty = 1;
-                    }
-                }
-                break;
-
-            case UI_SCR_SAVED:
-                if (rising) {
-                    if (key == KEY_ENTER && g_sd_mounted && g_ui.saved_filename[0] != '\0') {
-                        ui_file_entry_t saved = g_ui.last_file;
-                        copy_cstr(saved.filename, (int)sizeof(saved.filename), g_ui.saved_filename);
-                        play_named_file("/record", &saved);
-                        g_ui.last_file.resume_sec = saved.resume_sec;
-                        scr         = (prev_scr == UI_SCR_REC || prev_scr == UI_SCR_SAVED) ? UI_SCR_HOME : prev_scr;
-                        g_ui_screen = (uint32_t)scr;
-                        prev_key    = KEY_NONE;
-                        dirty       = 1;
-                    } else if (key == KEY_BACK) {
-                        scr         = (prev_scr == UI_SCR_REC || prev_scr == UI_SCR_SAVED) ? UI_SCR_HOME : prev_scr;
-                        g_ui_screen = (uint32_t)scr;
-                        dirty       = 1;
-                    }
-                }
-                break;
-
-            case UI_SCR_FILES:
-                if (rising) {
-                    if (key == KEY_BACK) {
-                        scr         = UI_SCR_HOME;
-                        g_ui_screen = (uint32_t)scr;
-                        dirty       = 1;
-                    } else if ((key == KEY_LEFT || key == KEY_VOL_UP) && g_ui.file_count > 0) {
-                        if (g_ui.file_sel > 0) {
-                            g_ui.file_sel--;
-                            if (g_ui.file_sel < g_ui.file_scroll) {
-                                g_ui.file_scroll = g_ui.file_sel;
-                            }
-                            dirty = 1;
-                        }
-                    } else if ((key == KEY_RIGHT || key == KEY_VOL_DOWN) && g_ui.file_count > 0) {
-                        if (g_ui.file_sel + 1 < g_ui.file_count) {
-                            g_ui.file_sel++;
-                            if (g_ui.file_sel >= g_ui.file_scroll + 3) {
-                                g_ui.file_scroll = g_ui.file_sel - 2;
-                            }
-                            dirty = 1;
-                        }
-                    } else if (key == KEY_ENTER && g_ui.file_count > 0) {
-                        enter_press_ms   = now_ms ? now_ms : 1u;
-                        enter_long_fired = 0;
-                    }
-                } else if (key == KEY_ENTER && enter_press_ms != 0u && !enter_long_fired) {
-                    if ((uint32_t)(now_ms - enter_press_ms) >= 600u) {
-                        enter_long_fired = 1;
-                        enter_press_ms   = 0u;
-                        del_armed        = 0;
-                        g_ui.del_hold_pct = 0u;
-                        g_ui.del_holding  = 0u;
-                        scr               = UI_SCR_DELETE;
-                        g_ui_screen       = (uint32_t)scr;
-                        dirty             = 1;
-                    }
-                } else if (key != KEY_ENTER && prev_key == KEY_ENTER && enter_press_ms != 0u && !enter_long_fired) {
-                    enter_press_ms = 0u;
-                    if (g_ui.file_count > 0) {
-                        play_file_at_index(g_ui.file_sel);
-                        g_ui_screen = (uint32_t)scr;
-                        prev_key    = KEY_NONE;
-                        dirty       = 1;
-                    }
-                }
-                break;
-
-            case UI_SCR_DELETE:
+                prev_key = key;
+            } else if (swallow_until_release) {
                 if (key == KEY_NONE) {
-                    del_armed = 1;
-                    if (g_ui.del_holding || g_ui.del_hold_pct != 0u) {
-                        g_ui.del_holding  = 0u;
-                        g_ui.del_hold_pct = 0u;
-                        enter_press_ms    = 0u;
-                        dirty             = 1;
-                    }
-                } else if (rising && key == KEY_BACK) {
-                    scr         = UI_SCR_FILES;
-                    g_ui_screen = (uint32_t)scr;
-                    dirty       = 1;
-                } else if (del_armed && key == KEY_ENTER) {
-                    if (enter_press_ms == 0u) {
-                        enter_press_ms   = now_ms ? now_ms : 1u;
-                        g_ui.del_holding = 1u;
-                        dirty            = 1;
-                    } else {
-                        uint32_t held = (uint32_t)(now_ms - enter_press_ms);
-                        uint8_t  pct  = (held >= 1200u) ? 100u : (uint8_t)((held * 100u) / 1200u);
-                        if (pct != g_ui.del_hold_pct) {
-                            g_ui.del_hold_pct = pct;
-                            dirty = 1;
-                        }
-                        if (held >= 1200u) {
-                            enter_press_ms    = 0u;
-                            g_ui.del_holding  = 0u;
-                            g_ui.del_hold_pct = 0u;
-                            delete_selected_file(now_ms);
-                            scr         = UI_SCR_FILES;
-                            g_ui_screen = (uint32_t)scr;
-                            wait_key_release(KEY_ENTER);
-                            prev_key = KEY_NONE;
-                            dirty    = 1;
-                        }
-                    }
+                    swallow_until_release = 0;
                 }
-                break;
+                prev_key = key;
+            } else {
+                if (key != KEY_NONE) {
+                    backlight_wake(t);
+                }
 
-            case UI_SCR_SETTINGS:
-                if (rising) {
-                    if (g_ui.set_edit_clock != 0u) {
-                        if (key == KEY_BACK) {
-                            g_ui.set_edit_clock = 0u;
-                            dirty = 1;
-                        } else if (key == KEY_LEFT || key == KEY_RIGHT) {
-                            g_ui.set_edit_clock = (g_ui.set_edit_clock == 1u) ? 2u : 1u;
-                            dirty = 1;
-                        } else if (key == KEY_VOL_UP || key == KEY_VOL_DOWN) {
-                            int d = (key == KEY_VOL_UP) ? 1 : -1;
-                            if (g_ui.set_edit_clock == 1u) {
-                                g_ui.set_edit_h = (uint8_t)((g_ui.set_edit_h + (d > 0 ? 1u : 23u)) % 24u);
-                            } else {
-                                g_ui.set_edit_m = (uint8_t)((g_ui.set_edit_m + (d > 0 ? 1u : 59u)) % 60u);
-                            }
-                            dirty = 1;
-                        } else if (key == KEY_ENTER) {
-                            rtc_datetime_t dt;
-                            rtc_get(&dt);
-                            sanitize_rtc(&dt);
-                            dt.hour   = g_ui.set_edit_h;
-                            dt.minute = g_ui.set_edit_m;
-                            dt.second = 0u;
-                            rtc_set(&dt);
-                            g_ui.set_edit_clock = 0u;
-                            ui_show_toast("Clock saved", UI_COL_GREEN, now_ms, 1200u);
-                            dirty = 1;
-                        }
-                    } else {
-                        if (key == KEY_BACK) {
-                            save_persisted_state();
-                            scr         = UI_SCR_HOME;
-                            g_ui_screen = (uint32_t)scr;
-                            dirty       = 1;
-                        } else if (key == KEY_LEFT) {
-                            if (g_ui.set_sel > 0) {
-                                g_ui.set_sel--;
-                                if (g_ui.set_sel < g_ui.set_scroll) {
-                                    g_ui.set_scroll = g_ui.set_sel;
-                                }
+                int rising = (key != KEY_NONE && key != prev_key) ? 1 : 0;
+
+                switch (scr) {
+                case UI_SCR_HOME:
+                    if (rising) {
+                        if (key == KEY_LEFT) {
+                            if (g_ui.home_focus > 0u) {
+                                g_ui.home_focus--;
                                 dirty = 1;
                             }
                         } else if (key == KEY_RIGHT) {
-                            if (g_ui.set_sel < 9) {
-                                g_ui.set_sel++;
-                                if (g_ui.set_sel >= g_ui.set_scroll + 3) {
-                                    g_ui.set_scroll = g_ui.set_sel - 2;
-                                }
+                            if (g_ui.home_focus < 3u) {
+                                g_ui.home_focus++;
                                 dirty = 1;
                             }
-                        } else if (key == KEY_VOL_UP) {
-                            adjust_setting(g_ui.set_sel, 1, now_ms);
-                            dirty = 1;
-                        } else if (key == KEY_VOL_DOWN) {
-                            adjust_setting(g_ui.set_sel, -1, now_ms);
-                            dirty = 1;
                         } else if (key == KEY_ENTER) {
-                            if (g_ui.set_sel == 6) {
-                                refresh_telemetry();
-                                g_ui.set_edit_h     = g_ui.now.hour;
-                                g_ui.set_edit_m     = g_ui.now.minute;
-                                g_ui.set_edit_clock = 1u;
-                                dirty = 1;
-                            } else if (g_ui.set_sel == 8) {
-                                if (!pmu_is_vbus_present()) {
-                                    ui_show_toast("Plug in USB cable", UI_COL_AMBER, now_ms, 1500u);
-                                    dirty = 1;
-                                } else {
-                                    save_persisted_state();
-                                    int manual = run_usb_msc_mode(1);
-                                    usb_suppress_until_unpl = (manual && pmu_is_vbus_present()) ? 1 : 0;
+                            if (g_ui.home_focus == 0u) {
+                                if (g_ui.has_last && g_sd_mounted) {
+                                    char dir[sizeof(g_last_dir)];
+                                    copy_cstr(dir, (int)sizeof(dir), g_last_dir);
+                                    play_named_file(dir, &g_ui.last_file);
                                     g_ui_screen = (uint32_t)scr;
-                                    prev_key    = KEY_NONE;
                                     dirty       = 1;
+                                    modal_done  = 1;
+                                } else {
+                                    ui_show_toast("Nothing played yet", UI_COL_AMBER, t, 1500u);
+                                    dirty = 1;
                                 }
-                            } else if (g_ui.set_sel == 9) {
-                                enter_press_ms = 0u;
-                                scr            = UI_SCR_ABOUT;
-                                g_ui_screen    = (uint32_t)scr;
-                                dirty          = 1;
+                            } else if (g_ui.home_focus == 1u) {
+                                reload_files_and_sd_stats();
+                                scr         = UI_SCR_FILES;
+                                g_ui_screen = (uint32_t)scr;
+                                dirty       = 1;
+                            } else if (g_ui.home_focus == 2u) {
+                                g_ui.set_edit_clock = 0u;
+                                scr                 = UI_SCR_SETTINGS;
+                                g_ui_screen         = (uint32_t)scr;
+                                dirty               = 1;
                             } else {
-                                adjust_setting(g_ui.set_sel, 1, now_ms);
-                                dirty = 1;
+                                run_bt_xrec_mode();
+                                g_ui_screen = (uint32_t)scr;
+                                dirty       = 1;
+                                modal_done  = 1;
                             }
                         }
                     }
-                }
-                break;
+                    break;
 
-            case UI_SCR_ABOUT:
-                if (rising && key == KEY_BACK) {
-                    enter_press_ms = 0u;
-                    scr            = UI_SCR_SETTINGS;
-                    g_ui_screen    = (uint32_t)scr;
-                    dirty          = 1;
-                } else if (key == KEY_ENTER) {
-                    if (enter_press_ms == 0u) {
-                        enter_press_ms = now_ms ? now_ms : 1u;
-                    } else if ((uint32_t)(now_ms - enter_press_ms) >= 600u) {
-                        (void)recorder_stop();
-                        ui_show_toast("Entering update mode", UI_COL_CYAN, now_ms, 1000u);
-                        ui_render_screen(UI_SCR_ABOUT, &g_ui);
-                        mdelay(150u);
-                        pmu_reboot_to_usb_bootloader();
+                case UI_SCR_REC:
+                    if (rising) {
+                        if (key == KEY_BACK) {
+                            backlight_sleep_now();
+                        } else if (key == KEY_ENTER && rec_active) {
+                            ui_spec_drop_marker(&g_spec);
+                            g_ui.rec_markers++;
+                            dirty = 1;
+                        } else if ((key == KEY_VOL_UP || key == KEY_VOL_DOWN) && rec_active) {
+                            int g = (int)g_ui.cfg.mic_gain + ((key == KEY_VOL_UP) ? 1 : -1);
+                            if (g < 0) g = 0;
+                            if (g > 31) g = 31;
+                            g_ui.cfg.mic_gain = (uint8_t)g;
+                            recorder_set_gain(g_ui.cfg.mic_gain);
+                            g_ui.rec_gain_bar = 1u;
+                            rec_gain_until_ms = t + 1500u;
+                            dirty = 1;
+                        }
                     }
-                } else {
-                    enter_press_ms = 0u;
-                }
-                break;
+                    break;
 
-            default:
+                case UI_SCR_SAVED:
+                    if (rising) {
+                        if (key == KEY_ENTER && g_sd_mounted && g_ui.saved_filename[0] != '\0') {
+                            ui_file_entry_t saved = g_ui.last_file;
+                            copy_cstr(saved.filename, (int)sizeof(saved.filename), g_ui.saved_filename);
+                            play_named_file("/record", &saved);
+                            g_ui.last_file.resume_sec = saved.resume_sec;
+                            scr         = (prev_scr == UI_SCR_REC || prev_scr == UI_SCR_SAVED) ? UI_SCR_HOME : prev_scr;
+                            g_ui_screen = (uint32_t)scr;
+                            dirty       = 1;
+                            modal_done  = 1;
+                        } else if (key == KEY_BACK) {
+                            scr         = (prev_scr == UI_SCR_REC || prev_scr == UI_SCR_SAVED) ? UI_SCR_HOME : prev_scr;
+                            g_ui_screen = (uint32_t)scr;
+                            dirty       = 1;
+                        }
+                    }
+                    break;
+
+                case UI_SCR_FILES:
+                    if (rising) {
+                        if (key == KEY_BACK) {
+                            scr         = UI_SCR_HOME;
+                            g_ui_screen = (uint32_t)scr;
+                            dirty       = 1;
+                        } else if ((key == KEY_LEFT || key == KEY_VOL_UP) && g_ui.file_count > 0) {
+                            if (g_ui.file_sel > 0) {
+                                g_ui.file_sel--;
+                                if (g_ui.file_sel < g_ui.file_scroll) {
+                                    g_ui.file_scroll = g_ui.file_sel;
+                                }
+                                dirty = 1;
+                            }
+                        } else if ((key == KEY_RIGHT || key == KEY_VOL_DOWN) && g_ui.file_count > 0) {
+                            if (g_ui.file_sel + 1 < g_ui.file_count) {
+                                g_ui.file_sel++;
+                                if (g_ui.file_sel >= g_ui.file_scroll + 3) {
+                                    g_ui.file_scroll = g_ui.file_sel - 2;
+                                }
+                                dirty = 1;
+                            }
+                        } else if (key == KEY_ENTER && g_ui.file_count > 0) {
+                            enter_press_ms   = t ? t : 1u;
+                            enter_long_fired = 0;
+                        }
+                    } else if (key == KEY_ENTER && enter_press_ms != 0u && !enter_long_fired) {
+                        if ((uint32_t)(t - enter_press_ms) >= 600u) {
+                            enter_long_fired = 1;
+                            enter_press_ms   = 0u;
+                            del_armed        = 0;
+                            g_ui.del_hold_pct = 0u;
+                            g_ui.del_holding  = 0u;
+                            scr               = UI_SCR_DELETE;
+                            g_ui_screen       = (uint32_t)scr;
+                            dirty             = 1;
+                        }
+                    } else if (key != KEY_ENTER && prev_key == KEY_ENTER && enter_press_ms != 0u && !enter_long_fired) {
+                        enter_press_ms = 0u;
+                        if (g_ui.file_count > 0) {
+                            play_file_at_index(g_ui.file_sel);
+                            g_ui_screen = (uint32_t)scr;
+                            dirty       = 1;
+                            modal_done  = 1;
+                        }
+                    }
+                    break;
+
+                case UI_SCR_DELETE:
+                    if (key == KEY_NONE) {
+                        del_armed = 1;
+                        if (g_ui.del_holding || g_ui.del_hold_pct != 0u) {
+                            g_ui.del_holding  = 0u;
+                            g_ui.del_hold_pct = 0u;
+                            enter_press_ms    = 0u;
+                            dirty             = 1;
+                        }
+                    } else if (rising && key == KEY_BACK) {
+                        scr         = UI_SCR_FILES;
+                        g_ui_screen = (uint32_t)scr;
+                        dirty       = 1;
+                    } else if (del_armed && key == KEY_ENTER) {
+                        if (enter_press_ms == 0u) {
+                            enter_press_ms   = t ? t : 1u;
+                            g_ui.del_holding = 1u;
+                            dirty            = 1;
+                        } else {
+                            uint32_t held = (uint32_t)(t - enter_press_ms);
+                            uint8_t  pct  = (held >= 1200u) ? 100u : (uint8_t)((held * 100u) / 1200u);
+                            if (pct != g_ui.del_hold_pct) {
+                                g_ui.del_hold_pct = pct;
+                                dirty = 1;
+                            }
+                            if (held >= 1200u) {
+                                enter_press_ms    = 0u;
+                                g_ui.del_holding  = 0u;
+                                g_ui.del_hold_pct = 0u;
+                                delete_selected_file(t);
+                                scr         = UI_SCR_FILES;
+                                g_ui_screen = (uint32_t)scr;
+                                wait_key_release(KEY_ENTER);
+                                dirty       = 1;
+                                modal_done  = 1;
+                            }
+                        }
+                    }
+                    break;
+
+                case UI_SCR_SETTINGS:
+                    if (rising) {
+                        if (g_ui.set_edit_clock != 0u) {
+                            if (key == KEY_BACK) {
+                                g_ui.set_edit_clock = 0u;
+                                dirty = 1;
+                            } else if (key == KEY_LEFT || key == KEY_RIGHT) {
+                                g_ui.set_edit_clock = (g_ui.set_edit_clock == 1u) ? 2u : 1u;
+                                dirty = 1;
+                            } else if (key == KEY_VOL_UP || key == KEY_VOL_DOWN) {
+                                int d = (key == KEY_VOL_UP) ? 1 : -1;
+                                if (g_ui.set_edit_clock == 1u) {
+                                    g_ui.set_edit_h = (uint8_t)((g_ui.set_edit_h + (d > 0 ? 1u : 23u)) % 24u);
+                                } else {
+                                    g_ui.set_edit_m = (uint8_t)((g_ui.set_edit_m + (d > 0 ? 1u : 59u)) % 60u);
+                                }
+                                dirty = 1;
+                            } else if (key == KEY_ENTER) {
+                                rtc_datetime_t dt;
+                                rtc_get(&dt);
+                                sanitize_rtc(&dt);
+                                dt.hour   = g_ui.set_edit_h;
+                                dt.minute = g_ui.set_edit_m;
+                                dt.second = 0u;
+                                rtc_set(&dt);
+                                g_ui.set_edit_clock = 0u;
+                                ui_show_toast("Clock saved", UI_COL_GREEN, t, 1200u);
+                                dirty = 1;
+                            }
+                        } else {
+                            if (key == KEY_BACK) {
+                                save_persisted_state();
+                                scr         = UI_SCR_HOME;
+                                g_ui_screen = (uint32_t)scr;
+                                dirty       = 1;
+                            } else if (key == KEY_LEFT) {
+                                if (g_ui.set_sel > 0) {
+                                    g_ui.set_sel--;
+                                    if (g_ui.set_sel < g_ui.set_scroll) {
+                                        g_ui.set_scroll = g_ui.set_sel;
+                                    }
+                                    dirty = 1;
+                                }
+                            } else if (key == KEY_RIGHT) {
+                                if (g_ui.set_sel < 9) {
+                                    g_ui.set_sel++;
+                                    if (g_ui.set_sel >= g_ui.set_scroll + 3) {
+                                        g_ui.set_scroll = g_ui.set_sel - 2;
+                                    }
+                                    dirty = 1;
+                                }
+                            } else if (key == KEY_VOL_UP) {
+                                adjust_setting(g_ui.set_sel, 1, t);
+                                dirty = 1;
+                            } else if (key == KEY_VOL_DOWN) {
+                                adjust_setting(g_ui.set_sel, -1, t);
+                                dirty = 1;
+                            } else if (key == KEY_ENTER) {
+                                if (g_ui.set_sel == 6) {
+                                    refresh_telemetry();
+                                    g_ui.set_edit_h     = g_ui.now.hour;
+                                    g_ui.set_edit_m     = g_ui.now.minute;
+                                    g_ui.set_edit_clock = 1u;
+                                    dirty = 1;
+                                } else if (g_ui.set_sel == 8) {
+                                    if (!pmu_is_vbus_present()) {
+                                        ui_show_toast("Plug in USB cable", UI_COL_AMBER, t, 1500u);
+                                        dirty = 1;
+                                    } else {
+                                        save_persisted_state();
+                                        int manual = run_usb_msc_mode(1);
+                                        usb_suppress_until_unpl = (manual && pmu_is_vbus_present()) ? 1 : 0;
+                                        g_ui_screen = (uint32_t)scr;
+                                        dirty       = 1;
+                                        modal_done  = 1;
+                                    }
+                                } else if (g_ui.set_sel == 9) {
+                                    enter_press_ms = 0u;
+                                    scr            = UI_SCR_ABOUT;
+                                    g_ui_screen    = (uint32_t)scr;
+                                    dirty          = 1;
+                                } else {
+                                    adjust_setting(g_ui.set_sel, 1, t);
+                                    dirty = 1;
+                                }
+                            }
+                        }
+                    }
+                    break;
+
+                case UI_SCR_ABOUT:
+                    if (rising && key == KEY_BACK) {
+                        enter_press_ms = 0u;
+                        scr            = UI_SCR_SETTINGS;
+                        g_ui_screen    = (uint32_t)scr;
+                        dirty          = 1;
+                    } else if (key == KEY_ENTER) {
+                        if (enter_press_ms == 0u) {
+                            enter_press_ms = t ? t : 1u;
+                        } else if ((uint32_t)(t - enter_press_ms) >= 600u) {
+                            (void)recorder_stop();
+                            ui_show_toast("Entering update mode", UI_COL_CYAN, t, 1000u);
+                            ui_render_screen(UI_SCR_ABOUT, &g_ui);
+                            mdelay(150u);
+                            pmu_reboot_to_usb_bootloader();
+                        }
+                    } else {
+                        enter_press_ms = 0u;
+                    }
+                    break;
+
+                default:
+                    break;
+                }
+
+                if (modal_done) {
+                    keys_flush_events();
+                    (void)key_onoff_poll();
+                    prev_key = KEY_NONE;
+                    break;
+                }
+                prev_key = key;
+            }
+
+            if (!have) {
                 break;
             }
-            prev_key = key;
         }
 
         /* 5. Saved-card 8-second countdown */

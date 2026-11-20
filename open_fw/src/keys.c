@@ -7,8 +7,96 @@
 #include "sl6801_regs.h"
 #include "openfw.h"
 
+#define KEYS_QUEUE_SIZE       16u
+#define KEYS_QUEUE_MASK       (KEYS_QUEUE_SIZE - 1u)
+#define KEYS_DEBOUNCE_SAMPLES 8u
+
+static key_event_t       g_key_q[KEYS_QUEUE_SIZE];
+static volatile uint32_t g_key_q_head        = 0u;
+static volatile uint32_t g_key_q_tail        = 0u;
+static volatile uint8_t  g_key_overflow      = 0u;
+static volatile uint8_t  g_key_resync_ignore = 0u;
+static volatile uint8_t  g_keys_scan_en      = 0u;
+static volatile uint8_t  g_keys_exp_paused   = 0u;
+static volatile key_id_t g_key_stable        = KEY_NONE;
+static volatile uint32_t g_key_stable_since  = 0u;
+static key_id_t          g_key_cand          = KEY_NONE;
+static uint8_t           g_key_cand_count    = 0u;
+
+static inline __attribute__((always_inline)) void keys_barrier(void)
+{
+#ifdef OPENFW_HOST_MMIO
+    __asm__ volatile ("" ::: "memory");
+#else
+    __asm__ volatile ("dmb" ::: "memory");
+#endif
+}
+
+static inline __attribute__((always_inline)) key_id_t keys_decode_inline(uint16_t adc)
+{
+    if (adc < 336u) {
+        return KEY_LEFT;
+    }
+    if (adc < 848u) {
+        return KEY_RIGHT;
+    }
+    if (adc < 1424u) {
+        return KEY_VOL_UP;
+    }
+    if (adc < 1824u) {
+        return KEY_NONE;
+    }
+    if (adc < 2176u) {
+        return KEY_VOL_DOWN;
+    }
+    if (adc < 2560u) {
+        return KEY_BACK;
+    }
+    if (adc < 2960u) {
+        return KEY_ENTER;
+    }
+    return KEY_NONE;
+}
+
+static inline __attribute__((always_inline)) void keys_push_event(uint32_t t_ms,
+                                                                  key_id_t key,
+                                                                  uint8_t pressed)
+{
+    uint32_t head = g_key_q_head;
+    uint32_t tail = g_key_q_tail;
+    if ((uint32_t)(head - tail) >= KEYS_QUEUE_SIZE) {
+        g_key_overflow = 1u;
+        return;
+    }
+    g_key_q[head & KEYS_QUEUE_MASK].t_ms    = t_ms;
+    g_key_q[head & KEYS_QUEUE_MASK].key     = key;
+    g_key_q[head & KEYS_QUEUE_MASK].pressed = pressed;
+    keys_barrier();
+    g_key_q_head = head + 1u;
+}
+
+static void keys_handle_overflow(void)
+{
+    if (!g_key_overflow) {
+        return;
+    }
+    uint32_t pm;
+    OPENFW_IRQ_SAVE(pm);
+    if (g_key_overflow) {
+        g_key_q_tail   = g_key_q_head;
+        g_key_overflow = 0u;
+        if (g_key_stable != KEY_NONE) {
+            g_key_resync_ignore = 1u;
+        }
+    }
+    OPENFW_IRQ_RESTORE(pm);
+}
+
 void keys_init(void)
 {
+    g_keys_scan_en = 0u;
+    keys_barrier();
+
     /* PD0 = Analog mode (mux=15, floating) for kadc_ch1 resistor ladder */
     openfw_mmio_clr32(GPIOD_BASE + 0x24u, 0x3u);
     gpio_set_mux(GPIO_PORT_D, 0u, 15u);
@@ -36,6 +124,149 @@ void keys_init(void)
     openfw_mmio_wr32(SARADC_CH1_THR_ADDR, 0x0FFF0030u);
     mdelay(5u);
     openfw_mmio_wr32(SARADC_START_ADDR,   0x0000A800u);
+    mdelay(5u);
+
+    /* Reset scanner & queue with stable=KEY_NONE so a key held at boot still fires */
+    g_key_q_head        = 0u;
+    g_key_q_tail        = 0u;
+    g_key_overflow      = 0u;
+    g_key_resync_ignore = 0u;
+    g_keys_exp_paused   = 0u;
+    g_key_stable        = KEY_NONE;
+    g_key_stable_since  = 0u;
+    g_key_cand          = KEY_NONE;
+    g_key_cand_count    = 0u;
+    keys_barrier();
+    g_keys_scan_en      = 1u;
+}
+
+OPENFW_RAMFUNC
+void keys_scan_tick(uint32_t now_ms)
+{
+    if (!g_keys_scan_en) {
+        return;
+    }
+    if (g_exp_running != 0u) {
+        g_keys_exp_paused = 1u;
+        return;
+    }
+
+    uint16_t adc = (uint16_t)(openfw_mmio_rd32(SARADC_CH1_DATA_ADDR) & 0x0FFFu);
+    key_id_t raw = keys_decode_inline(adc);
+
+    if (g_keys_exp_paused) {
+        g_keys_exp_paused  = 0u;
+        g_key_stable_since = now_ms;
+        keys_barrier();
+        g_key_stable       = raw;
+        g_key_cand         = raw;
+        g_key_cand_count   = 0u;
+        g_key_overflow     = 1u;
+        return;
+    }
+
+    if (raw == g_key_stable) {
+        g_key_cand       = raw;
+        g_key_cand_count = 0u;
+        return;
+    }
+
+    if (raw == g_key_cand) {
+        g_key_cand_count++;
+    } else {
+        g_key_cand       = raw;
+        g_key_cand_count = 1u;
+    }
+
+    if (g_key_cand_count >= KEYS_DEBOUNCE_SAMPLES) {
+        key_id_t old       = g_key_stable;
+        g_key_stable_since = now_ms;
+        keys_barrier();
+        g_key_stable       = raw;
+        g_key_cand_count   = 0u;
+
+        if (g_key_resync_ignore) {
+            if (raw == KEY_NONE) {
+                g_key_resync_ignore = 0u;
+            }
+            return;
+        }
+
+        if (old != KEY_NONE) {
+            keys_push_event(now_ms, old, 0u);
+        }
+        if (raw != KEY_NONE) {
+            keys_push_event(now_ms, raw, 1u);
+        }
+    }
+}
+
+int keys_event_pending(void)
+{
+    keys_handle_overflow();
+    return (g_key_q_head != g_key_q_tail) ? 1 : 0;
+}
+
+int keys_peek_event(key_event_t *out)
+{
+    keys_handle_overflow();
+    uint32_t tail = g_key_q_tail;
+    uint32_t head = g_key_q_head;
+    if (head == tail) {
+        return 0;
+    }
+    keys_barrier();
+    if (out) {
+        *out = g_key_q[tail & KEYS_QUEUE_MASK];
+    }
+    return 1;
+}
+
+int keys_pop_event(key_event_t *out)
+{
+    keys_handle_overflow();
+    uint32_t tail = g_key_q_tail;
+    uint32_t head = g_key_q_head;
+    if (head == tail) {
+        return 0;
+    }
+    keys_barrier();
+    if (out) {
+        *out = g_key_q[tail & KEYS_QUEUE_MASK];
+    }
+    keys_barrier();
+    g_key_q_tail = tail + 1u;
+    return 1;
+}
+
+void keys_flush_events(void)
+{
+    uint32_t pm;
+    OPENFW_IRQ_SAVE(pm);
+    g_key_q_tail        = g_key_q_head;
+    g_key_overflow      = 0u;
+    g_key_resync_ignore = 0u;
+    OPENFW_IRQ_RESTORE(pm);
+}
+
+key_id_t keys_state(uint32_t *since_ms)
+{
+    uint32_t pm;
+    OPENFW_IRQ_SAVE(pm);
+    if (g_key_overflow) {
+        g_key_q_tail   = g_key_q_head;
+        g_key_overflow = 0u;
+        if (g_key_stable != KEY_NONE) {
+            g_key_resync_ignore = 1u;
+        }
+    }
+    key_id_t st = g_key_resync_ignore ? KEY_NONE : g_key_stable;
+    uint32_t sc = g_key_stable_since;
+    OPENFW_IRQ_RESTORE(pm);
+    if (since_ms) {
+        *since_ms = sc;
+    }
+    return st;
 }
 
 uint16_t keys_read_adc(void)
@@ -55,28 +286,7 @@ int keys_read_hp_detect(void)
 
 key_id_t keys_decode(uint16_t adc)
 {
-    if (adc < 336u) {
-        return KEY_LEFT;
-    }
-    if (adc < 848u) {
-        return KEY_RIGHT;
-    }
-    if (adc < 1424u) {
-        return KEY_VOL_UP;
-    }
-    if (adc < 1824u) {
-        return KEY_NONE;
-    }
-    if (adc < 2176u) {
-        return KEY_VOL_DOWN;
-    }
-    if (adc < 2560u) {
-        return KEY_BACK;
-    }
-    if (adc < 2960u) {
-        return KEY_ENTER;
-    }
-    return KEY_NONE;
+    return keys_decode_inline(adc);
 }
 
 const char *keys_name(key_id_t key)

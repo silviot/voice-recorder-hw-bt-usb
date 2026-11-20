@@ -24,6 +24,12 @@
 #define OPENFW_ENABLE_USB_EXP 0
 #endif
 
+#ifdef OPENFW_HOST_MMIO
+#define OPENFW_RAMFUNC
+#else
+#define OPENFW_RAMFUNC __attribute__((section(".ramtext")))
+#endif
+
 #define OPENFW_EXP_TIMEOUT_MS    15000u
 #define OPENFW_FAULT_MAGIC_MASK  0xFFFFF000u
 #define OPENFW_FAULT_MAGIC_BASE  0xFA017000u
@@ -102,8 +108,13 @@ uint8_t         pmu_read_reg(uint8_t reg);
 uint32_t        pmu_read_vbat_mv(void);
 pmu_chg_state_t pmu_get_charge_state(void);
 int             pmu_is_vbus_present(void);
+#define KEY_ONOFF_PRESS   0x01u
+#define KEY_ONOFF_LONG    0x02u
+#define KEY_ONOFF_RELEASE 0x04u
+
 void            key_onoff_init(void);
 int             key_onoff_pressed(int *out_long_press);
+uint8_t         key_onoff_poll(void);
 void            pmu_soft_poweroff(void) __attribute__((noreturn));
 void            pmu_unattended_init(void);
 void            pmu_poll_charge_manage(void);
@@ -122,12 +133,24 @@ typedef enum {
     KEY_UNKNOWN,
 } key_id_t;
 
+typedef struct {
+    uint32_t t_ms;
+    key_id_t key;
+    uint8_t  pressed;
+} key_event_t;
+
 void        keys_init(void);
 uint16_t    keys_read_adc(void);
 int         keys_read_rec_switch(void);
 int         keys_read_hp_detect(void);
 key_id_t    keys_decode(uint16_t adc);
 const char *keys_name(key_id_t key);
+void        keys_scan_tick(uint32_t now_ms);
+int         keys_peek_event(key_event_t *out);
+int         keys_pop_event(key_event_t *out);
+int         keys_event_pending(void);
+void        keys_flush_events(void);
+key_id_t    keys_state(uint32_t *since_ms);
 
 /* ST7735S 80x160 / 160x80 8080 Parallel LCD + PWM3 Backlight (lcd_st7735s.c) */
 #define LCD_WIDTH   80u

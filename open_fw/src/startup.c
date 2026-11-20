@@ -179,6 +179,7 @@ void SysTick_Handler(void)
         __asm__ volatile ("dsb" ::: "memory");
         ram_soc_wdt_reset();
     }
+    keys_scan_tick(now);
 }
 
 __attribute__((section(".ramtext")))
