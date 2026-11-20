@@ -855,31 +855,28 @@ static void play_boot_animation(void)
 static void adjust_setting(int idx, int delta, uint32_t now_ms)
 {
     switch (idx) {
-    case 0: /* Auto level */
-        g_ui.cfg.auto_level ^= 1u;
+    case 0: /* Mic gain */
+    {
+        int g = (int)g_ui.cfg.mic_gain + delta;
+        if (g < 0) g = 0;
+        if (g > 31) g = 31;
+        g_ui.cfg.mic_gain = (uint8_t)g;
+        recorder_set_gain(g_ui.cfg.mic_gain);
         break;
-    case 1: /* Mic gain */
-        if (!g_ui.cfg.auto_level) {
-            int g = (int)g_ui.cfg.mic_gain + delta;
-            if (g < 0) g = 0;
-            if (g > 31) g = 31;
-            g_ui.cfg.mic_gain = (uint8_t)g;
-            recorder_set_gain(g_ui.cfg.mic_gain);
-        }
-        break;
-    case 2: /* Sound: Raw / Clarity / Bypass */
+    }
+    case 1: /* Sound: Raw / Clarity / Bypass */
         g_ui.cfg.sound_mode = (uint8_t)((g_ui.cfg.sound_mode + (delta > 0 ? 1u : 2u)) % 3u);
         recorder_set_dsp_profile((audio_dsp_profile_t)g_ui.cfg.sound_mode);
         break;
-    case 3: /* Mics: 1ch / 2ch */
+    case 2: /* Mics: 1ch / 2ch */
         g_ui.cfg.channels = (g_ui.cfg.channels == 1u) ? 2u : 1u;
         recorder_set_channels(g_ui.cfg.channels);
         break;
-    case 4: /* Voice trigger */
+    case 3: /* Voice trigger */
         g_ui.cfg.vor_enabled ^= 1u;
         recorder_set_vor((int)g_ui.cfg.vor_enabled);
         break;
-    case 5: /* Brightness */
+    case 4: /* Brightness */
     {
         int b = (int)g_ui.cfg.brightness_idx + delta;
         if (b < 0) b = 0;
@@ -888,10 +885,10 @@ static void adjust_setting(int idx, int delta, uint32_t now_ms)
         backlight_wake(now_ms);
         break;
     }
-    case 6: /* Screen off */
+    case 5: /* Screen off */
         g_ui.cfg.screen_off_idx = (uint8_t)((g_ui.cfg.screen_off_idx + (delta > 0 ? 1u : 4u)) % 5u);
         break;
-    case 8: /* Skip */
+    case 7: /* Skip */
         g_ui.cfg.skip_mode = (uint8_t)((g_ui.cfg.skip_mode + (delta > 0 ? 1u : 2u)) % 3u);
         break;
     default:
@@ -1463,19 +1460,14 @@ int openfw_main(void)
                         g_ui.rec_markers++;
                         dirty = 1;
                     } else if ((key == KEY_VOL_UP || key == KEY_VOL_DOWN) && rec_active) {
-                        if (g_ui.cfg.auto_level) {
-                            ui_show_toast("Auto level is on", UI_COL_AMBER, now_ms, 1500u);
-                            dirty = 1;
-                        } else {
-                            int g = (int)g_ui.cfg.mic_gain + ((key == KEY_VOL_UP) ? 1 : -1);
-                            if (g < 0) g = 0;
-                            if (g > 31) g = 31;
-                            g_ui.cfg.mic_gain = (uint8_t)g;
-                            recorder_set_gain(g_ui.cfg.mic_gain);
-                            g_ui.rec_gain_bar = 1u;
-                            rec_gain_until_ms = now_ms + 1500u;
-                            dirty = 1;
-                        }
+                        int g = (int)g_ui.cfg.mic_gain + ((key == KEY_VOL_UP) ? 1 : -1);
+                        if (g < 0) g = 0;
+                        if (g > 31) g = 31;
+                        g_ui.cfg.mic_gain = (uint8_t)g;
+                        recorder_set_gain(g_ui.cfg.mic_gain);
+                        g_ui.rec_gain_bar = 1u;
+                        rec_gain_until_ms = now_ms + 1500u;
+                        dirty = 1;
                     }
                 }
                 break;
@@ -1633,7 +1625,7 @@ int openfw_main(void)
                                 dirty = 1;
                             }
                         } else if (key == KEY_RIGHT) {
-                            if (g_ui.set_sel < 9) {
+                            if (g_ui.set_sel < 8) {
                                 g_ui.set_sel++;
                                 if (g_ui.set_sel >= g_ui.set_scroll + 3) {
                                     g_ui.set_scroll = g_ui.set_sel - 2;
@@ -1647,13 +1639,13 @@ int openfw_main(void)
                             adjust_setting(g_ui.set_sel, -1, now_ms);
                             dirty = 1;
                         } else if (key == KEY_ENTER) {
-                            if (g_ui.set_sel == 7) {
+                            if (g_ui.set_sel == 6) {
                                 refresh_telemetry();
                                 g_ui.set_edit_h     = g_ui.now.hour;
                                 g_ui.set_edit_m     = g_ui.now.minute;
                                 g_ui.set_edit_clock = 1u;
                                 dirty = 1;
-                            } else if (g_ui.set_sel == 9) {
+                            } else if (g_ui.set_sel == 8) {
                                 enter_press_ms = 0u;
                                 scr            = UI_SCR_ABOUT;
                                 g_ui_screen    = (uint32_t)scr;

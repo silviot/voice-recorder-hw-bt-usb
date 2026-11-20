@@ -246,8 +246,8 @@ int main(int argc, char **argv)
     capture_shot(8);
 
     /* 9: Settings Clock Edit */
-    m.set_sel        = 7;
-    m.set_scroll     = 6;
+    m.set_sel        = 6;
+    m.set_scroll     = 5;
     m.set_edit_clock = 1;
     m.set_edit_h     = 14;
     m.set_edit_m     = 32;

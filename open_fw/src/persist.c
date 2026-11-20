@@ -38,7 +38,7 @@ static void persist_copy_str(char *dst, uint32_t cap, const char *src)
 
 static void persist_clamp_settings(ui_settings_t *dst, const ui_settings_t *src)
 {
-    dst->auto_level     = src->auto_level ? 1u : 0u;
+    dst->reserved0      = 0u;
     dst->mic_gain       = (src->mic_gain <= 31u) ? src->mic_gain : 31u;
     dst->sound_mode     = (src->sound_mode <= 2u) ? src->sound_mode : 0u;
     dst->channels       = (src->channels == 1u || src->channels == 2u) ? src->channels : 2u;

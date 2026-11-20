@@ -144,7 +144,7 @@ static void draw_scrollbar(int total, int scroll, int visible)
 
 void ui_settings_defaults(ui_settings_t *cfg)
 {
-    cfg->auto_level     = 1u;
+    cfg->reserved0      = 0u;
     cfg->mic_gain       = 20u;
     cfg->sound_mode     = 0u; /* Raw */
     cfg->channels       = 2u; /* 2ch */
@@ -231,12 +231,8 @@ static void render_home(const ui_model_t *m)
         s_copy(line2, (int)sizeof(line2), free_s);
         s_append(line2, (int)sizeof(line2), " of space left");
     } else if (m->home_focus == 2u) {
-        if (m->cfg.auto_level) {
-            s_copy(line1, (int)sizeof(line1), "Auto level");
-        } else {
-            s_copy(line1, (int)sizeof(line1), "Gain ");
-            s_append_u32(line1, (int)sizeof(line1), m->cfg.mic_gain);
-        }
+        s_copy(line1, (int)sizeof(line1), "Gain ");
+        s_append_u32(line1, (int)sizeof(line1), m->cfg.mic_gain);
         s_append(line1, (int)sizeof(line1), " \xC2\xB7 ");
         s_append(line1, (int)sizeof(line1), (m->cfg.channels == 1u) ? "1ch" : "2ch");
         s_append(line1, (int)sizeof(line1), " \xC2\xB7 ");
@@ -331,22 +327,12 @@ static void render_recording(const ui_model_t *m)
     lcd_draw_str_aa_bl(3, 36, tbuf, &g_font_ui_lg,
                        m->rec_vor_wait ? UI_COL_MUTE : UI_COL_TEXT, UI_COL_BG);
 
-    /* Right column: Auto level / Gain pill + free time left */
+    /* Right column: Gain pill + free time left */
     char pill_txt[20];
-    uint16_t pill_bg  = UI_COL_TILE;
-    uint16_t pill_fg  = UI_COL_DIM;
-    if (m->cfg.auto_level) {
-        s_copy(pill_txt, (int)sizeof(pill_txt), "Auto level");
-    } else {
-        s_copy(pill_txt, (int)sizeof(pill_txt), "Gain ");
-        s_append_u32(pill_txt, (int)sizeof(pill_txt), m->cfg.mic_gain);
-        if (m->rec_gain_bar) {
-            pill_bg = UI_COL_CYAN;
-            pill_fg = UI_COL_BLACK;
-        } else {
-            pill_fg = UI_COL_TEXT;
-        }
-    }
+    uint16_t pill_bg  = m->rec_gain_bar ? UI_COL_CYAN  : UI_COL_TILE;
+    uint16_t pill_fg  = m->rec_gain_bar ? UI_COL_BLACK : UI_COL_TEXT;
+    s_copy(pill_txt, (int)sizeof(pill_txt), "Gain ");
+    s_append_u32(pill_txt, (int)sizeof(pill_txt), m->cfg.mic_gain);
     uint16_t pw = (uint16_t)(lcd_measure_str_aa(pill_txt, &g_font_ui_sm) + 10u);
     int16_t px = (int16_t)(157 - (int16_t)pw);
     lcd_fill_rrect_aa(px, 16, (int16_t)pw, 13, 6, pill_bg, UI_COL_BG);
@@ -379,7 +365,7 @@ static void render_recording(const ui_model_t *m)
         uint16_t tfg  = (wcol == UI_COL_RED) ? UI_COL_TEXT : UI_COL_BLACK;
         lcd_fill_rrect_aa(2, 67, 156, 13, 6, wcol, UI_COL_BG);
         draw_centered_bl(80, 77, m->rec_warn, &g_font_ui_sm, tfg, wcol);
-    } else if (m->rec_gain_bar && !m->cfg.auto_level) {
+    } else if (m->rec_gain_bar) {
         lcd_fill_rrect_aa(2, 68, 156, 11, 5, UI_COL_TILE, UI_COL_BG);
         for (int i = 0; i < 31; i++) {
             int16_t bx = (int16_t)(8 + (i * 46) / 10);
@@ -728,24 +714,20 @@ static void format_setting_val(const ui_model_t *m, int idx, char *val, int vcap
     *adj = 1;
     val[0] = '\0';
     switch (idx) {
-    case 0: s_copy(val, vcap, m->cfg.auto_level ? "On" : "Off"); break;
-    case 1:
-        if (m->cfg.auto_level) { s_copy(val, vcap, "Auto"); *adj = 0; }
-        else { s_append_u32(val, vcap, m->cfg.mic_gain); }
-        break;
-    case 2: s_copy(val, vcap, sound_mode_name(m->cfg.sound_mode)); break;
-    case 3: s_copy(val, vcap, (m->cfg.channels == 1u) ? "1ch" : "2ch"); break;
-    case 4: s_copy(val, vcap, m->cfg.vor_enabled ? "On" : "Off"); break;
-    case 5:
+    case 0: s_append_u32(val, vcap, m->cfg.mic_gain); break;
+    case 1: s_copy(val, vcap, sound_mode_name(m->cfg.sound_mode)); break;
+    case 2: s_copy(val, vcap, (m->cfg.channels == 1u) ? "1ch" : "2ch"); break;
+    case 3: s_copy(val, vcap, m->cfg.vor_enabled ? "On" : "Off"); break;
+    case 4:
         s_append_u32(val, vcap, brt_pct[m->cfg.brightness_idx < 5u ? m->cfg.brightness_idx : 3u]);
         s_append(val, vcap, "%");
         break;
-    case 6: s_copy(val, vcap, screen_off_name(m->cfg.screen_off_idx)); break;
-    case 7:
+    case 5: s_copy(val, vcap, screen_off_name(m->cfg.screen_off_idx)); break;
+    case 6:
         ui_format_clock(val, vcap, m->now.hour, m->now.minute);
         *adj = 0;
         break;
-    case 8: s_copy(val, vcap, skip_mode_name(m->cfg.skip_mode)); break;
+    case 7: s_copy(val, vcap, skip_mode_name(m->cfg.skip_mode)); break;
     default:
         s_copy(val, vcap, "v0.7");
         *adj = 0;
@@ -755,8 +737,8 @@ static void format_setting_val(const ui_model_t *m, int idx, char *val, int vcap
 
 static void render_settings(const ui_model_t *m)
 {
-    static const char * const labels[10] = {
-        "Auto level", "Mic gain", "Sound", "Mics", "Voice trigger",
+    static const char * const labels[9] = {
+        "Mic gain", "Sound", "Mics", "Voice trigger",
         "Brightness", "Screen off", "Clock", "Skip", "About"
     };
     lcd_fill_rect(0u, 0u, UI_W, UI_H, UI_COL_BG);
@@ -764,7 +746,7 @@ static void render_settings(const ui_model_t *m)
     char sub[12];
     sub[0] = '\0';
     s_append_u32(sub, (int)sizeof(sub), (uint32_t)(m->set_sel + 1));
-    s_append(sub, (int)sizeof(sub), " / 10");
+    s_append(sub, (int)sizeof(sub), " / 9");
 
     ui_status_bar_t sb;
     init_sb_common(&sb, m);
@@ -774,19 +756,18 @@ static void render_settings(const ui_model_t *m)
 
     for (int r = 0; r < 3; r++) {
         int idx = m->set_scroll + r;
-        if (idx >= 10) break;
+        if (idx >= 9) break;
         int16_t y = (int16_t)(15 + r * 17);
         int sel = (idx == m->set_sel);
-        int disabled = (idx == 1 && m->cfg.auto_level);
         uint16_t row_bg = sel ? UI_COL_PILL : UI_COL_BG;
         if (sel) {
             lcd_fill_rrect_aa(2, y, 151, 16, 8, UI_COL_PILL, UI_COL_BG);
         }
 
         lcd_draw_str_aa_bl(9, (int16_t)(y + 12), labels[idx], &g_font_ui_md,
-                           disabled ? UI_COL_MUTE : UI_COL_TEXT, row_bg);
+                           UI_COL_TEXT, row_bg);
 
-        if (idx == 7 && sel && m->set_edit_clock != 0u) {
+        if (idx == 6 && sel && m->set_edit_clock != 0u) {
             /* Inline HH:MM edit with white pill around active field */
             char hh[4], mm[4];
             hh[0] = '\0'; mm[0] = '\0';
@@ -816,12 +797,12 @@ static void render_settings(const ui_model_t *m)
                                    "-", &g_font_ui_sm, UI_COL_TEXT, row_bg);
             } else {
                 draw_right_bl(148, (int16_t)(y + 12), val, &g_font_ui_sm,
-                              disabled ? UI_COL_MUTE : UI_COL_DIM, row_bg);
+                              UI_COL_DIM, row_bg);
             }
         }
     }
 
-    draw_scrollbar(10, m->set_scroll, 3);
+    draw_scrollbar(9, m->set_scroll, 3);
 
     /* Footer explanation / live input meter / clock edit hints */
     if (m->set_edit_clock != 0u) {
@@ -831,22 +812,20 @@ static void render_settings(const ui_model_t *m)
             { UI_ICON_NONE, UI_ICON_NONE,  "OK", "Save"  },
         };
         ui_draw_footer_hints(77, h, 3, UI_COL_BG);
-    } else if (m->set_sel == 1 && !m->cfg.auto_level) {
+    } else if (m->set_sel == 0) {
         lcd_draw_str_aa_bl(4, 77, "Input", &g_font_ui_sm, UI_COL_DIM, UI_COL_BG);
         ui_draw_hbar(36, 70, 120, 5, m->set_input_vu, m->set_input_peak, UI_COL_BG);
     } else {
         const char *desc = "";
         switch (m->set_sel) {
-        case 0: desc = m->cfg.auto_level ? "Evens out loud and quiet" : "Fixed gain, set it below"; break;
-        case 1: desc = "Turn Auto level off to set"; break;
-        case 2: desc = (m->cfg.sound_mode == 0u) ? "Best for transcripts" :
+        case 1: desc = (m->cfg.sound_mode == 0u) ? "Best for transcripts" :
                        (m->cfg.sound_mode == 1u ? "Cleaner voice, less noise" : "No processing at all"); break;
-        case 3: desc = (m->cfg.channels == 1u) ? "One mic, half the file size" : "Both mics, stereo"; break;
-        case 4: desc = "Pauses the file during silence"; break;
-        case 5: desc = "Lower saves battery"; break;
-        case 6: desc = "Recording continues"; break;
-        case 7: desc = "OK to edit \xC2\xB7 syncs over USB"; break;
-        case 8: desc = "Jump size in the player"; break;
+        case 2: desc = (m->cfg.channels == 1u) ? "One mic, half the file size" : "Both mics, stereo"; break;
+        case 3: desc = "Pauses the file during silence"; break;
+        case 4: desc = "Lower saves battery"; break;
+        case 5: desc = "Recording continues"; break;
+        case 6: desc = "OK to edit \xC2\xB7 syncs over USB"; break;
+        case 7: desc = "Jump size in the player"; break;
         default: desc = "Version and update mode"; break;
         }
         draw_centered_bl(80, 77, desc, &g_font_ui_sm, UI_COL_DIM, UI_COL_BG);

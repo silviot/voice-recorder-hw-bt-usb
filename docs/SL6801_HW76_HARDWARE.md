@@ -92,7 +92,7 @@ All 6 tactile buttons share a single analog resistor ladder on **`PD0`**:
 - **Speaker & Headphone Playback (`DAC0 + DAC1`, `0x40009100`) — Live-Verified on Silicon:**
   - Stereo `DAC0 + DAC1` playback at 16 kHz (APLL `24.576 MHz`) is silicon-verified via **DMAC CH0 TX** (TX FIFO `0x4000910C`, `DMAC_CTL_DAC_TX_BASE = 0x002812A0`, `XFER_CNT = 0xFF000000 | (len & 0x3FFFF)`).
   - Apply factory eFuse DC-offset trims from **eFuse words 2 & 3** to `DAC0_DC (0x40009064)` (`{W3[3:0], W2[31:29]}`) and `DAC1_DC (0x40009068)` (`W3[10:4]`).
-  - **Built-in speaker PA (`PB30`):** Shares the same `DAC0 + DAC1` output (`DAC2` is unused) through an external PA enabled by **`PB30`** (`GPIOB_BASE = 0x40081400`, pin 30) configured as `mux = 0` (input/Hi-Z): internal pull-up ON (`rom_gpio_config(0x0001F008u)` -> `GPIOB+0x28[29:28] = 2`) turns the PA **ON**; no-pull/Hi-Z (`rom_gpio_config(0x0001F000u)` -> `0`) turns the PA **OFF** via external pull-down. Keep `PB30` OFF when headphones are inserted (`PB11 == 0`) and during DAC analog depop ramps.
+  - **Built-in speaker PA (`PB30`):** Shares the same `DAC0 + DAC1` output (`DAC2` is unused) through an external PA enabled by **`PB30`** (`GPIOB_BASE = 0x40081040`, pin 30) configured as `mux = 0` (input/Hi-Z): internal pull-up ON (`rom_gpio_config(0x0001F008u)` -> `0x40081068[29:28] = 2`, `0x40081070[29:28] = 0`) turns the PA **ON**; no-pull/Hi-Z (`rom_gpio_config(0x0001F000u)` -> `0` / `0`) turns the PA **OFF** via external pull-down. Keep `PB30` OFF when headphones are inserted (`PB11 == 0`) and during DAC analog depop ramps.
 
 ---
 

@@ -167,7 +167,7 @@ typedef enum {
 } ui_screen_off_t;
 
 typedef struct {
-    uint8_t auto_level;     /* 1=On (default), 0=Off */
+    uint8_t reserved0;      /* reserved (0); keeps openfw_persist_t 64-byte layout */
     uint8_t mic_gain;       /* 0..31 (default 20) */
     uint8_t sound_mode;     /* 0=Raw (default), 1=Clarity, 2=Bypass */
     uint8_t channels;       /* 1=1ch, 2=2ch (default) */
