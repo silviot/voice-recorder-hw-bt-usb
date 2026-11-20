@@ -918,7 +918,9 @@ static void play_file_at_index(int start_idx)
     int idx = start_idx;
     while (idx >= 0 && idx < g_ui.file_count) {
         g_ui_screen = UI_SCR_PLAYER;
-        g_ui.play_file = g_files[idx];
+        g_ui.play_file     = g_files[idx];
+        g_ui.play_has_prev = (idx > 0) ? 1u : 0u;
+        g_ui.play_has_next = (idx + 1 < g_ui.file_count) ? 1u : 0u;
         int rc = openfw_play_file_ui(&g_exfat_vol, g_file_dirs[idx], g_files[idx].filename, &g_ui);
         g_files[idx].unplayed   = 0u;
         g_files[idx].resume_sec = g_ui.play_file.resume_sec;
@@ -940,6 +942,29 @@ static void play_file_at_index(int start_idx)
             break;
         }
     }
+    save_persisted_state();
+}
+
+/*
+ * Play dir/name, going through the file list when the file is in it so that
+ * holding LEFT/RIGHT can move to the neighbouring recordings.
+ */
+static void play_named_file(const char *dir, ui_file_entry_t *entry)
+{
+    for (int i = 0; i < g_ui.file_count; i++) {
+        if (str_eq_ci(g_file_dirs[i], dir) && str_eq_ci(g_files[i].filename, entry->filename)) {
+            g_files[i].resume_sec = entry->resume_sec;
+            play_file_at_index(i);
+            entry->resume_sec = g_ui.last_file.resume_sec;
+            return;
+        }
+    }
+    g_ui_screen        = UI_SCR_PLAYER;
+    g_ui.play_file     = *entry;
+    g_ui.play_has_prev = 0u;
+    g_ui.play_has_next = 0u;
+    (void)openfw_play_file_ui(&g_exfat_vol, dir, entry->filename, &g_ui);
+    entry->resume_sec = g_ui.play_file.resume_sec;
     save_persisted_state();
 }
 
@@ -1454,12 +1479,9 @@ int openfw_main(void)
                     } else if (key == KEY_ENTER) {
                         if (g_ui.home_focus == 0u) {
                             if (g_ui.has_last && g_sd_mounted) {
-                                g_ui_screen = UI_SCR_PLAYER;
-                                g_ui.play_file = g_ui.last_file;
-                                (void)openfw_play_file_ui(&g_exfat_vol, g_last_dir,
-                                                          g_ui.last_file.filename, &g_ui);
-                                g_ui.last_file.resume_sec = g_ui.play_file.resume_sec;
-                                save_persisted_state();
+                                char dir[sizeof(g_last_dir)];
+                                copy_cstr(dir, (int)sizeof(dir), g_last_dir);
+                                play_named_file(dir, &g_ui.last_file);
                                 g_ui_screen = (uint32_t)scr;
                                 prev_key    = KEY_NONE;
                                 dirty       = 1;
@@ -1511,12 +1533,10 @@ int openfw_main(void)
             case UI_SCR_SAVED:
                 if (rising) {
                     if (key == KEY_ENTER && g_sd_mounted && g_ui.saved_filename[0] != '\0') {
-                        g_ui_screen = UI_SCR_PLAYER;
-                        g_ui.play_file = g_ui.last_file;
-                        (void)openfw_play_file_ui(&g_exfat_vol, "/record",
-                                                  g_ui.saved_filename, &g_ui);
-                        g_ui.last_file.resume_sec = g_ui.play_file.resume_sec;
-                        save_persisted_state();
+                        ui_file_entry_t saved = g_ui.last_file;
+                        copy_cstr(saved.filename, (int)sizeof(saved.filename), g_ui.saved_filename);
+                        play_named_file("/record", &saved);
+                        g_ui.last_file.resume_sec = saved.resume_sec;
                         scr         = (prev_scr == UI_SCR_REC || prev_scr == UI_SCR_SAVED) ? UI_SCR_HOME : prev_scr;
                         g_ui_screen = (uint32_t)scr;
                         prev_key    = KEY_NONE;

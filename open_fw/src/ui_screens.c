@@ -648,7 +648,7 @@ static void render_player(const ui_model_t *m)
             { UI_ICON_NONE,  UI_ICON_NONE, "OK", "Replay"    },
             { UI_ICON_RIGHT, UI_ICON_NONE, (const char *)0, "Next file" },
         };
-        ui_draw_footer_hints(76, h, 2, UI_COL_BG);
+        ui_draw_footer_hints(76, h, m->play_has_next ? 2 : 1, UI_COL_BG);
     } else {
         const char *l_act = (m->cfg.skip_mode == UI_SKIP_5_10) ? "5s" :
                             (m->cfg.skip_mode == UI_SKIP_10_30 ? "10s" : "Prev");

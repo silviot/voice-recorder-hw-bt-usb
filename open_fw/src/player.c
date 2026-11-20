@@ -203,6 +203,121 @@ static void populate_transcript_lines(ui_model_t *m, cwx_stream_t *cwx, uint32_t
     }
 }
 
+void player_keys_init(player_keys_t *s, key_id_t initial, uint32_t now_ms)
+{
+    s->raw          = initial;
+    s->raw_since    = now_ms;
+    s->held         = initial;
+    s->held_since   = now_ms;
+    s->next_repeat  = now_ms;
+    s->hold_active  = 0u;
+    s->ignore       = (initial != KEY_NONE) ? 1u : 0u;
+    s->tap_key      = KEY_NONE;
+    s->tap_deadline = now_ms;
+}
+
+static int time_reached(uint32_t now_ms, uint32_t when_ms)
+{
+    return (int32_t)(now_ms - when_ms) >= 0;
+}
+
+static int is_seek_key(key_id_t k)
+{
+    return k == KEY_LEFT || k == KEY_RIGHT;
+}
+
+player_action_t player_keys_step(player_keys_t *s, key_id_t raw, uint32_t now_ms)
+{
+    /* A single tap whose double-tap window ran out becomes one seek step */
+    if (s->tap_key != KEY_NONE && time_reached(now_ms, s->tap_deadline)) {
+        key_id_t k = s->tap_key;
+        s->tap_key = KEY_NONE;
+        return (k == KEY_RIGHT) ? PLAYER_ACT_SEEK_FWD : PLAYER_ACT_SEEK_BACK;
+    }
+
+    /* Debounce: the resistor ladder passes through other keys' voltage bands
+     * while a button moves, so act only on a decode that stayed put. */
+    if (raw != s->raw) {
+        s->raw       = raw;
+        s->raw_since = now_ms;
+        return PLAYER_ACT_NONE;
+    }
+    if (!time_reached(now_ms, s->raw_since + PLAYER_KEY_DEBOUNCE_MS)) {
+        return PLAYER_ACT_NONE;
+    }
+
+    if (raw == s->held) {
+        /* Key still held (or still released) */
+        if (s->held == KEY_NONE || s->ignore) {
+            return PLAYER_ACT_NONE;
+        }
+        if ((s->held == KEY_VOL_UP || s->held == KEY_VOL_DOWN) &&
+            time_reached(now_ms, s->next_repeat)) {
+            s->next_repeat = now_ms + PLAYER_KEY_REPEAT_MS;
+            return (s->held == KEY_VOL_UP) ? PLAYER_ACT_VOL_UP : PLAYER_ACT_VOL_DOWN;
+        }
+        if (is_seek_key(s->held) && time_reached(now_ms, s->next_repeat)) {
+            s->hold_active = 1u;
+            s->next_repeat = now_ms + PLAYER_KEY_SCRUB_MS;
+            return (s->held == KEY_RIGHT) ? PLAYER_ACT_SCRUB_FWD : PLAYER_ACT_SCRUB_BACK;
+        }
+        return PLAYER_ACT_NONE;
+    }
+
+    /* Debounced change. A LEFT/RIGHT let go before its hold started is a tap. */
+    if (is_seek_key(s->held) && !s->hold_active && !s->ignore) {
+        s->tap_key      = s->held;
+        s->tap_deadline = now_ms + PLAYER_KEY_DOUBLE_TAP_MS;
+    }
+
+    s->held        = raw;
+    s->held_since  = s->raw_since;
+    s->hold_active = 0u;
+    s->ignore      = 0u;
+
+    if (is_seek_key(raw)) {
+        if (s->tap_key == raw) {
+            /* Second tap of the same key inside the window */
+            s->tap_key = KEY_NONE;
+            s->ignore  = 1u;
+            return (raw == KEY_RIGHT) ? PLAYER_ACT_NEXT_FILE : PLAYER_ACT_PREV_FILE;
+        }
+        s->next_repeat = s->held_since + PLAYER_KEY_HOLD_MS;
+        if (s->tap_key != KEY_NONE) {
+            /* Pending tap of the other key: settle it now */
+            key_id_t k = s->tap_key;
+            s->tap_key = KEY_NONE;
+            return (k == KEY_RIGHT) ? PLAYER_ACT_SEEK_FWD : PLAYER_ACT_SEEK_BACK;
+        }
+        return PLAYER_ACT_NONE;
+    }
+
+    if (raw != KEY_NONE && s->tap_key != KEY_NONE) {
+        /* Another key pressed while a tap waits: settle the tap first and
+         * make the new key wait for a fresh press. */
+        key_id_t k = s->tap_key;
+        s->tap_key = KEY_NONE;
+        s->ignore  = 1u;
+        return (k == KEY_RIGHT) ? PLAYER_ACT_SEEK_FWD : PLAYER_ACT_SEEK_BACK;
+    }
+
+    switch (raw) {
+    case KEY_NONE:
+        return PLAYER_ACT_NONE;
+    case KEY_ENTER:
+        return PLAYER_ACT_PLAY_PAUSE;
+    case KEY_BACK:
+        return PLAYER_ACT_BACK;
+    case KEY_VOL_UP:
+    case KEY_VOL_DOWN:
+        s->next_repeat = now_ms + PLAYER_KEY_REPEAT_DELAY_MS;
+        return (raw == KEY_VOL_UP) ? PLAYER_ACT_VOL_UP : PLAYER_ACT_VOL_DOWN;
+    default:
+        s->ignore = 1u;
+        return PLAYER_ACT_NONE;
+    }
+}
+
 int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_name,
                         ui_model_t *m)
 {
@@ -308,7 +423,8 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
     uint32_t toast_until   = 0u;
     int      ui_dirty      = 1;
     int      ret_code      = 0;
-    key_id_t prev_k        = KEY_ENTER;
+    player_keys_t keys;
+    player_keys_init(&keys, keys_decode(keys_read_adc()), millis());
 
     while (1) {
         wdt_feed();
@@ -343,53 +459,55 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
             ui_dirty = 1;
         }
 
-        key_id_t k = keys_decode(keys_read_adc());
-        if (k != KEY_NONE && k != prev_k) {
-            if (k == KEY_BACK) {
-                ret_code = 0;
-                break;
-            } else if (k == KEY_ENTER) {
-                if (eof_reached) {
-                    data_off      = 0u;
-                    played_frames = 0u;
-                    buf_pos       = 0u;
-                    buf_frames    = 0u;
-                    eof_reached   = 0;
-                    paused        = 0;
-                } else {
-                    paused ^= 1;
-                }
-                audio_dac_set_mute(paused);
-                audio_pa_set((!hp_in && !paused && !eof_reached) ? 1 : 0);
-                ui_dirty = 1;
-            } else if (k == KEY_VOL_UP || k == KEY_VOL_DOWN) {
-                if (k == KEY_VOL_UP && volume < 31u) {
-                    volume++;
-                } else if (k == KEY_VOL_DOWN && volume > 0u) {
-                    volume--;
-                }
-                if (hp_in) {
-                    m->cfg.hp_vol = volume;
-                } else {
-                    m->cfg.spk_vol = volume;
-                }
-                audio_dac_set_volume(volume, 0x1FFu);
-                last_vol_ms = now ? now : 1u;
-                ui_dirty    = 1;
-            } else if (k == KEY_LEFT || k == KEY_RIGHT) {
-                if (eof_reached && k == KEY_RIGHT) {
-                    ret_code = 1;
-                    break;
-                }
-                if (!has_cwx && m->cfg.skip_mode == UI_SKIP_TRACK) {
-                    ret_code = (k == KEY_RIGHT) ? 1 : -1;
-                    break;
-                }
+        player_action_t act = player_keys_step(&keys, keys_decode(keys_read_adc()), now);
+        int file_dir = 0; /* -1: previous file, +1: next file */
+        if (act == PLAYER_ACT_BACK) {
+            ret_code = 0;
+            break;
+        } else if (act == PLAYER_ACT_PLAY_PAUSE) {
+            if (eof_reached) {
+                data_off      = 0u;
+                played_frames = 0u;
+                buf_pos       = 0u;
+                buf_frames    = 0u;
+                eof_reached   = 0;
+                paused        = 0;
+            } else {
+                paused ^= 1;
+            }
+            audio_dac_set_mute(paused);
+            audio_pa_set((!hp_in && !paused && !eof_reached) ? 1 : 0);
+            ui_dirty = 1;
+        } else if (act == PLAYER_ACT_VOL_UP || act == PLAYER_ACT_VOL_DOWN) {
+            if (act == PLAYER_ACT_VOL_UP && volume < 31u) {
+                volume++;
+            } else if (act == PLAYER_ACT_VOL_DOWN && volume > 0u) {
+                volume--;
+            }
+            if (hp_in) {
+                m->cfg.hp_vol = volume;
+            } else {
+                m->cfg.spk_vol = volume;
+            }
+            audio_dac_set_volume(volume, 0x1FFu);
+            last_vol_ms = now ? now : 1u;
+            ui_dirty    = 1;
+        } else if (act == PLAYER_ACT_PREV_FILE || act == PLAYER_ACT_NEXT_FILE) {
+            file_dir = (act == PLAYER_ACT_NEXT_FILE) ? 1 : -1;
+        } else if (act == PLAYER_ACT_SEEK_BACK || act == PLAYER_ACT_SEEK_FWD ||
+                   act == PLAYER_ACT_SCRUB_BACK || act == PLAYER_ACT_SCRUB_FWD) {
+            int fwd = (act == PLAYER_ACT_SEEK_FWD || act == PLAYER_ACT_SCRUB_FWD);
+            int tap = (act == PLAYER_ACT_SEEK_BACK || act == PLAYER_ACT_SEEK_FWD);
+            /* A tap keeps the old meaning in "Track" skip mode and at the end of
+             * the file; a hold always seeks. */
+            if (tap && ((eof_reached && fwd) || (!has_cwx && m->cfg.skip_mode == UI_SKIP_TRACK))) {
+                file_dir = fwd ? 1 : -1;
+            } else {
                 int32_t step_s;
                 if (m->cfg.skip_mode == UI_SKIP_5_10) {
-                    step_s = (k == KEY_RIGHT) ? 10 : -5;
+                    step_s = fwd ? 10 : -5;
                 } else {
-                    step_s = (k == KEY_RIGHT) ? 30 : -10;
+                    step_s = fwd ? 30 : -10;
                 }
                 int64_t delta  = (int64_t)winfo.sample_rate * (int64_t)step_s;
                 int64_t target = (int64_t)played_frames + delta;
@@ -419,7 +537,17 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
                 ui_dirty    = 1;
             }
         }
-        prev_k = k;
+        if (file_dir != 0) {
+            if ((file_dir > 0) ? m->play_has_next : m->play_has_prev) {
+                ret_code = file_dir;
+                break;
+            }
+            str_copy_cap(m->toast_msg, (int)sizeof(m->toast_msg),
+                         (file_dir > 0) ? "End of list" : "Start of list");
+            m->toast_col = UI_COL_AMBER;
+            toast_until  = now + 1500u;
+            ui_dirty     = 1;
+        }
 
         /* Refill PCM decode staging buffer & push to double-buffered DMAC CH0 TX */
         if (!paused && !eof_reached) {

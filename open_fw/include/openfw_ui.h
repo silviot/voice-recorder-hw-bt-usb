@@ -249,6 +249,8 @@ typedef struct {
     uint8_t        play_vu_l;
     uint8_t        play_vu_r;
     int            play_has_transcript;
+    uint8_t        play_has_prev;   /* set by caller: a previous file exists */
+    uint8_t        play_has_next;   /* set by caller: a next file exists */
     char           tr_prev[48];
     char           tr_curr_spoken[48];
     char           tr_curr_upcoming[48];
