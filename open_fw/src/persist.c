@@ -130,15 +130,24 @@ int ui_persist_save(exfat_vol_t *vol, const ui_settings_t *cfg,
         return -1;
     }
 
-    (void)exfat_delete_file(vol, "/cassini", "settings.bin");
+    (void)exfat_delete_file(vol, "/cassini", "settings.tmp");
 
     exfat_writer_t w;
-    if (exfat_create_file(vol, "/cassini", "settings.bin", &w) != 0) {
+    if (exfat_create_file(vol, "/cassini", "settings.tmp", &w) != 0) {
         return -1;
     }
     if (exfat_write(&w, &rec, (uint32_t)sizeof(rec)) != 0) {
         (void)exfat_close_file(&w);
+        (void)exfat_delete_file(vol, "/cassini", "settings.tmp");
         return -1;
     }
-    return exfat_close_file(&w);
+    if (exfat_close_file(&w) != 0) {
+        (void)exfat_delete_file(vol, "/cassini", "settings.tmp");
+        return -1;
+    }
+    if (exfat_replace_file(vol, "/cassini", "settings.tmp", "settings.bin") != 0) {
+        (void)exfat_delete_file(vol, "/cassini", "settings.tmp");
+        return -1;
+    }
+    return 0;
 }

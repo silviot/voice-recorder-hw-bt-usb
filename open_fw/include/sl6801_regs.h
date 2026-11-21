@@ -25,6 +25,7 @@ void     openfw_host_dmac_register_ptr(uint32_t ch, void *buf, uint32_t len);
 
 #define OPENFW_NOP() openfw_mmio_nop()
 #define OPENFW_DSB() openfw_mmio_dsb()
+#define OPENFW_ISB() __asm__ volatile ("" ::: "memory")
 #define OPENFW_WFI() openfw_mmio_wfi()
 #define OPENFW_IRQ_SAVE(pm)                do { (pm) = 0u; } while (0)
 #define OPENFW_IRQ_RESTORE(pm)             do { (void)(pm); } while (0)
@@ -43,6 +44,7 @@ static inline void     openfw_mmio_wr8(uint32_t addr, uint8_t v)    { REG8(addr)
 
 #define OPENFW_NOP() __asm__ volatile ("nop")
 #define OPENFW_DSB() __asm__ volatile ("dsb" ::: "memory")
+#define OPENFW_ISB() __asm__ volatile ("isb" ::: "memory")
 #define OPENFW_WFI() __asm__ volatile ("wfi")
 #define OPENFW_IRQ_SAVE(pm) do { \
     __asm__ volatile ("mrs %0, primask" : "=r"(pm)); \
@@ -663,6 +665,7 @@ static inline int gpio_read(uint32_t port, uint32_t pin)
 /* ============================================================================
  * RivieraWaves RW-BT Baseband Controller (0x40020000)
  * ============================================================================ */
+#ifndef OPENFW_HOST_MMIO
 #define RWBT_REG(off)       REG32(RWBT_BB_BASE + (uint32_t)(off))
 #define RWBT_CNTL           REG32(RWBT_BB_BASE + 0x000u)
 #define RWBT_INTCNTL        REG32(RWBT_BB_BASE + 0x00Cu)
@@ -684,5 +687,6 @@ static inline int gpio_read(uint32_t port, uint32_t pin)
 #define CPU1_BOOT_TRAMP     REG32(0x30000600u)
 #define CPU1_BOOT_SP        REG32(0x30000604u)
 #define CPU1_BOOT_ENTRY     REG32(0x30000608u)
+#endif
 
 #endif /* SL6801_REGS_H */

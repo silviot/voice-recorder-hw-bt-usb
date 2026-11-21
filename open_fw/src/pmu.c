@@ -8,13 +8,19 @@
 #include "sl6801_rom.h"
 #include "openfw.h"
 
+#define RTWI_WAIT_MAX 100000u
+
 int pmu_write_reg(uint8_t reg, uint8_t val)
 {
     openfw_mmio_wr32(RTWI_WDATA_ADDR, (uint32_t)val);
     uint32_t cmd = 0x40000060u | ((uint32_t)reg << 8);
     openfw_mmio_wr32(RTWI_CMD_ADDR, cmd);
     openfw_mmio_wr32(RTWI_CMD_ADDR, cmd | (1u << 31));
+    uint32_t wait = RTWI_WAIT_MAX;
     while ((int32_t)openfw_mmio_rd32(RTWI_CMD_ADDR) < 0) {
+        if (--wait == 0u) {
+            return 1;
+        }
     }
     return (openfw_mmio_rd32(RTWI_STATUS_ADDR) & 0xF000u) ? 1 : 0;
 }
@@ -24,7 +30,11 @@ uint8_t pmu_read_reg(uint8_t reg)
     uint32_t cmd = 0x40000061u | ((uint32_t)reg << 8);
     openfw_mmio_wr32(RTWI_CMD_ADDR, cmd);
     openfw_mmio_wr32(RTWI_CMD_ADDR, cmd | (1u << 31));
+    uint32_t wait = RTWI_WAIT_MAX;
     while ((int32_t)openfw_mmio_rd32(RTWI_CMD_ADDR) < 0) {
+        if (--wait == 0u) {
+            return 0u;
+        }
     }
     return (uint8_t)(openfw_mmio_rd32(RTWI_RDATA_ADDR) & 0xFFu);
 }
@@ -134,20 +144,27 @@ power_button_action_t power_button_update(uint8_t events, uint32_t now, int scre
     if (!down) {
         return POWER_BUTTON_IDLE;
     }
-    uint32_t held = now - pressed_at;
-    if (!shutdown_armed && ((events & KEY_ONOFF_LONG) || held >= 2000u)) {
+    /* A hardware PMU long-press arms shutdown immediately. */
+    if (!shutdown_armed && (events & KEY_ONOFF_LONG)) {
         shutdown_armed = 1;
         armed_at = now;
     }
-    /* Prefer release, but a lost PMU edge must not strand the shutdown UI. */
+    /* ON/OFF is a wake source: prefer release after arming, with a 1s fallback
+     * because SL6801 PMU SK (0x10) does not fire after LK (0x20). */
     if (shutdown_armed) {
-        if ((events & KEY_ONOFF_RELEASE) || now - armed_at >= 1000u) {
+        if ((events & KEY_ONOFF_RELEASE) || (uint32_t)(now - armed_at) >= 1000u) {
             down = 0;
+            shutdown_armed = 0;
             return POWER_BUTTON_SHUTDOWN;
         }
-        *progress = 100u;
+        if (progress) {
+            *progress = 100u;
+        }
         return POWER_BUTTON_PROGRESS;
     }
+    uint32_t held = (uint32_t)(now - pressed_at);
+    /* Check release BEFORE held >= 2000u so a delayed poll after a short press
+     * never triggers an accidental shutdown. */
     if (events & KEY_ONOFF_RELEASE) {
         down = 0;
         if (held >= 300u) {
@@ -156,27 +173,43 @@ power_button_action_t power_button_update(uint8_t events, uint32_t now, int scre
         if (!woke_screen) {
             return POWER_BUTTON_SLEEP;
         }
-    } else if (held >= 300u) {
-        *progress = (uint8_t)(held / 20u);
+        return wake ? POWER_BUTTON_WAKE : POWER_BUTTON_IDLE;
+    }
+    if (held >= 2000u) {
+        shutdown_armed = 1;
+        armed_at = now;
+        if (progress) {
+            *progress = 100u;
+        }
+        return POWER_BUTTON_PROGRESS;
+    }
+    if (held >= 300u) {
+        if (progress) {
+            *progress = (uint8_t)(held / 20u);
+        }
         return POWER_BUTTON_PROGRESS;
     }
     return wake ? POWER_BUTTON_WAKE : POWER_BUTTON_IDLE;
 }
 
 /* The HW_76 wakes straight back up when its PMU cuts power with VBUS high.
- * Keep the charger serviced with USB and the display off until unplug or
- * a new power-key hold. The press that initiated shutdown cannot wake it. */
+ * Keep the charger serviced with USB and the display off until unplug,
+ * Record slider activation (PB6), or a new Power button press. */
 static void wait_in_charging_standby(void)
 {
-    uint32_t last_vbus = millis();
-    uint32_t last_poll = last_vbus;
+    uint32_t start = millis();
+    uint32_t last_vbus = start;
+    uint32_t last_poll = start;
     uint32_t pressed_at = 0u;
     int new_press = 0;
+    int prev_rec = keys_read_rec_switch();
+
+    /* Discard any residual edge from the shutdown gesture and debounce 250 ms. */
     (void)key_onoff_poll();
     for (;;) {
         OPENFW_WFI();
         uint32_t now = millis();
-        if (now - last_poll < 50u) {
+        if ((uint32_t)(now - last_poll) < 50u) {
             continue;
         }
         last_poll = now;
@@ -184,21 +217,120 @@ static void wait_in_charging_standby(void)
         if (pmu_is_vbus_present()) {
             last_vbus = now;
             pmu_poll_charge_manage();
-        } else if (now - last_vbus >= 500u) {
+        } else if ((uint32_t)(now - last_vbus) >= 500u) {
             return;
         }
 
         uint8_t events = key_onoff_poll();
+        /* Ignore residual shutdown button edges for the first 250 ms */
+        if ((uint32_t)(now - start) < 250u) {
+            prev_rec = keys_read_rec_switch();
+            continue;
+        }
+
+        /* Activating the Record slider switches the recorder back on immediately */
+        int rec_now = keys_read_rec_switch();
+        if (rec_now && !prev_rec) {
+#ifndef OPENFW_HOST_MMIO
+            AON_BACKUP(7u) = OPENFW_BOOT_STRIKE_MAGIC;
+#endif
+            system_reboot();
+        }
+        prev_rec = rec_now;
+
+        /* Any deliberate Power press (clean tap, >=500 ms hold, or LK) powers back on */
+        int wake_now = 0;
         if (events & KEY_ONOFF_PRESS) {
             new_press = 1;
             pressed_at = now;
         }
-        if (new_press && ((events & KEY_ONOFF_LONG) || now - pressed_at >= 2000u)) {
+        if (events & KEY_ONOFF_LONG) {
+            wake_now = 1;
+        } else if (new_press && ((events & KEY_ONOFF_RELEASE) || (uint32_t)(now - pressed_at) >= 500u)) {
+            wake_now = 1;
+        }
+        if (wake_now) {
+#ifndef OPENFW_HOST_MMIO
+            AON_BACKUP(7u) = OPENFW_BOOT_STRIKE_MAGIC;
+#endif
+            (void)key_onoff_poll();
             system_reboot();
         }
-        if (events & KEY_ONOFF_RELEASE) {
-            new_press = 0;
+    }
+}
+
+OPENFW_RAMFUNC __attribute__((noinline))
+static uint8_t pmu_ram_read_reg(uint8_t reg)
+{
+    uint32_t cmd = 0x40000061u | ((uint32_t)reg << 8);
+    openfw_mmio_wr32(RTWI_CMD_ADDR, cmd);
+    openfw_mmio_wr32(RTWI_CMD_ADDR, cmd | (1u << 31));
+    for (uint32_t t = 0u; t < RTWI_WAIT_MAX && (int32_t)openfw_mmio_rd32(RTWI_CMD_ADDR) < 0; t++) {
+    }
+    return (uint8_t)(openfw_mmio_rd32(RTWI_RDATA_ADDR) & 0xFFu);
+}
+
+OPENFW_RAMFUNC __attribute__((noinline))
+static void pmu_ram_write_reg(uint8_t reg, uint8_t val)
+{
+    openfw_mmio_wr32(RTWI_WDATA_ADDR, (uint32_t)val);
+    uint32_t cmd = 0x40000060u | ((uint32_t)reg << 8);
+    openfw_mmio_wr32(RTWI_CMD_ADDR, cmd);
+    openfw_mmio_wr32(RTWI_CMD_ADDR, cmd | (1u << 31));
+    for (uint32_t t = 0u; t < RTWI_WAIT_MAX && (int32_t)openfw_mmio_rd32(RTWI_CMD_ADDR) < 0; t++) {
+    }
+}
+
+/* Executes purely from SRAM (.ramtext) + Mask ROM after tearing down NOR/PLL0 */
+OPENFW_RAMFUNC __attribute__((noinline, noreturn))
+static void pmu_soft_poweroff_ram(void)
+{
+    for (uint32_t c = 0x11u; c <= 0x20u; c++) {
+        if (c != 0x15u) {
+            rom_clk_disable(c);
         }
+    }
+    rom_clk_set_src(CRU_CLK_CPU, CRU_CLK_SRC_HOSC24M);
+    rom_clk_set_src(CRU_CLK_BUS6, CRU_CLK_SRC_HOSC24M);
+    rom_clk_set_src(CRU_CLK_NOR, CRU_CLK_SRC_HOSC24M);
+    rom_us_delay(5000u);
+    for (uint32_t c = 3u; c <= 6u; c++) {
+        rom_clk_div(c, 1u);
+    }
+    rom_us_delay(5000u);
+    rom_clk_disable(0x29u);
+    rom_clk_disable(8u);
+    rom_clk_disable(9u);
+    rom_clk_disable(0x26u);
+    rom_us_delay(5000u);
+    rom_clk_disable(CRU_CLK_PLL0);
+    rom_clk_disable(CRU_CLK_APLL);
+
+    openfw_mmio_wr32(AON_RTC_BASE + 0x60u, 1u);
+    openfw_mmio_clr32(AON_RTC_BASE + 0xD8u, 0x6u);
+    pmu_ram_write_reg(0x00u, (uint8_t)(pmu_ram_read_reg(0x00u) & ~0xC0u));
+    for (uint32_t i = 0u; i < 8u; i++) {
+        openfw_mmio_wr32(NVIC_ICER_ADDR(i), 0xFFFFFFFFu);
+        openfw_mmio_wr32(NVIC_ICPR_ADDR(i), 0xFFFFFFFFu);
+    }
+
+    openfw_mmio_clr32(AON_RTC_BASE + 0x80u, 0x80000000u);
+    openfw_mmio_wr32(AON_RTC_BASE + 0x80u, 0x8FA00001u);
+
+    uint8_t r21 = pmu_ram_read_reg(0x21u);
+    openfw_mmio_wr32(AON_RTC_BASE + 0xB0u, (((uint32_t)(r21 | 0x03u) & 0xFFu) << 8) | 0x21u);
+    openfw_mmio_set32(AON_RTC_BASE + 0xD0u, 0x01u);
+    uint32_t v_hi = (uint32_t)((r21 & 0xE7u) | 0x04u);
+    uint32_t v_lo = v_hi & 0xFBu;
+    openfw_mmio_wr32(AON_RTC_BASE + 0xB8u, (v_lo << 24) | (v_hi << 16) | 0x21u);
+    pmu_ram_write_reg(0x00u, (uint8_t)(pmu_ram_read_reg(0x00u) | 0x08u));
+    openfw_mmio_set32(AON_RTC_BASE + 0xD0u, 0x08u);
+
+    /* Ensure watchdog is stopped right before final WFI */
+    openfw_mmio_wr32(WDT_CFG_ADDR, 0u);
+    OPENFW_DSB();
+    while (1) {
+        OPENFW_WFI();
     }
 }
 
@@ -206,6 +338,18 @@ void pmu_soft_poweroff(void)
 {
     if (pmu_is_vbus_present()) {
         wait_in_charging_standby();
+    } else {
+#ifndef OPENFW_HOST_MMIO
+        /* Display is already blanked by lcd_shutdown(); give the user up to
+         * 400 ms to lift their finger so ON/OFF does not immediately re-wake. */
+        for (int i = 0; i < 40; i++) {
+            wdt_feed();
+            if (key_onoff_poll() & KEY_ONOFF_RELEASE) {
+                break;
+            }
+            mdelay(10u);
+        }
+#endif
     }
     /* No code will service the reset watchdog once the CPU enters WFI. */
     wdt_stop();
@@ -238,50 +382,7 @@ void pmu_soft_poweroff(void)
         (void)pm;
     }
 
-    for (uint32_t c = 0x11u; c <= 0x20u; c++) {
-        if (c != 0x15u) {
-            rom_clk_disable(c);
-        }
-    }
-    rom_clk_set_src(CRU_CLK_CPU, CRU_CLK_SRC_HOSC24M);
-    rom_clk_set_src(CRU_CLK_BUS6, CRU_CLK_SRC_HOSC24M);
-    rom_clk_set_src(CRU_CLK_NOR, CRU_CLK_SRC_HOSC24M);
-    mdelay(5u);
-    for (uint32_t c = 3u; c <= 6u; c++) {
-        rom_clk_div(c, 1u);
-    }
-    mdelay(5u);
-    rom_clk_disable(0x29u);
-    rom_clk_disable(8u);
-    rom_clk_disable(9u);
-    rom_clk_disable(0x26u);
-    mdelay(5u);
-    rom_clk_disable(CRU_CLK_PLL0);
-    rom_clk_disable(CRU_CLK_APLL);
-
-    openfw_mmio_wr32(AON_RTC_BASE + 0x60u, 1u);
-    openfw_mmio_clr32(AON_RTC_BASE + 0xD8u, 0x6u);
-    pmu_write_reg(0x00u, (uint8_t)(pmu_read_reg(0x00u) & ~0xC0u));
-    for (uint32_t i = 0u; i < 8u; i++) {
-        openfw_mmio_wr32(NVIC_ICER_ADDR(i), 0xFFFFFFFFu);
-        openfw_mmio_wr32(NVIC_ICPR_ADDR(i), 0xFFFFFFFFu);
-    }
-
-    openfw_mmio_clr32(AON_RTC_BASE + 0x80u, 0x80000000u);
-    openfw_mmio_wr32(AON_RTC_BASE + 0x80u, 0x8FA00001u);
-
-    uint8_t r21 = pmu_read_reg(0x21u);
-    openfw_mmio_wr32(AON_RTC_BASE + 0xB0u, (((uint32_t)(r21 | 0x03u) & 0xFFu) << 8) | 0x21u);
-    openfw_mmio_set32(AON_RTC_BASE + 0xD0u, 0x01u);
-    uint32_t v_hi = (uint32_t)((r21 & 0xE7u) | 0x04u);
-    uint32_t v_lo = v_hi & 0xFBu;
-    openfw_mmio_wr32(AON_RTC_BASE + 0xB8u, (v_lo << 24) | (v_hi << 16) | 0x21u);
-    pmu_write_reg(0x00u, (uint8_t)(pmu_read_reg(0x00u) | 0x08u));
-    openfw_mmio_set32(AON_RTC_BASE + 0xD0u, 0x08u);
-
-    while (1) {
-        OPENFW_WFI();
-    }
+    pmu_soft_poweroff_ram();
 }
 
 void pmu_unattended_init(void)
@@ -295,6 +396,8 @@ void pmu_unattended_init(void)
     pmu_write_reg(0x20u, 0x2Fu);
     pmu_write_reg(0x22u, 0x00u);
     pmu_write_reg(0x23u, (uint8_t)(pmu_read_reg(0x23u) & ~0xC0u));
+    /* Runtime ON/OFF timings: 2s LK (0x01), 8s hardware force-reset (0x04) */
+    pmu_write_reg(0x24u, (uint8_t)((pmu_read_reg(0x24u) & ~0x0Fu) | 0x05u));
     /* Acknowledge any latched PMU status 0 IRQ flags (W1C) */
     pmu_write_reg(0x30u, pmu_read_reg(0x30u));
     if (pmu_is_vbus_present()) {

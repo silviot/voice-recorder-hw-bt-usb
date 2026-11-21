@@ -54,10 +54,10 @@ void wdt_start_reset(uint32_t timeout_sec, uint8_t pmu_reg20_cur)
     openfw_mmio_wr32(WDT_CFG_ADDR, 0u);
     openfw_mmio_set32(WDT_EN_ADDR, 1u);
     openfw_mmio_wr32(WDT_MODE_ADDR, WDT_MODE_HW_RESET);
-    openfw_mmio_wr32(WDT_CFG_ADDR, timeout_bits | 1u);
     if (ctrl1 != 0u) {
         openfw_mmio_wr32(WDT_CTRL1_ADDR, ctrl1);
     }
+    openfw_mmio_wr32(WDT_CFG_ADDR, timeout_bits | 1u);
 }
 
 void wdt_feed(void)
@@ -68,9 +68,7 @@ void wdt_feed(void)
     }
 }
 
-#ifndef OPENFW_HOST_MMIO
-__attribute__((section(".ramtext"), noinline))
-#endif
+OPENFW_RAMFUNC __attribute__((noinline))
 void system_reboot(void)
 {
     uint32_t pm;
@@ -145,8 +143,15 @@ void mdelay(uint32_t ms)
 
 void systick_init(uint32_t cpu_hz)
 {
+    uint32_t reload = (cpu_hz >= 1000u) ? ((cpu_hz / 1000u) - 1u) : 0u;
+    if (reload > 0x00FFFFFFu) {
+        reload = 0x00FFFFFFu;
+    }
+    if (reload == 0u) {
+        reload = 1u;
+    }
     openfw_mmio_wr32(SYSTICK_CSR_ADDR, 0u);
-    openfw_mmio_wr32(SYSTICK_RVR_ADDR, (cpu_hz / 1000u) - 1u);
+    openfw_mmio_wr32(SYSTICK_RVR_ADDR, reload);
     openfw_mmio_wr32(SYSTICK_CVR_ADDR, 0u);
     openfw_mmio_wr32(SYSTICK_CSR_ADDR, 0x7u); /* CLKSOURCE=CPU | TICKINT | ENABLE */
 }

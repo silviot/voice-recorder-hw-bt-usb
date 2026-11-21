@@ -29,15 +29,29 @@
 #include "cassini_splash.h"
 
 #define MENU_MAX_FILES 32
+#define MENU_MAX_CWX   64
+
+typedef struct {
+    uint64_t size;
+    uint32_t first_cluster;
+    uint8_t  no_fat_chain;
+} wav_loc_t;
 
 typedef struct {
     ui_file_entry_t *items;
     char           (*dirs)[12];
+    wav_loc_t       *locs;
+    uint64_t        *cwx_hashes;
+    int              cwx_count;
+    int              cwx_cap;
+    int              cwx_overflow;
     int              count;
     int              total_seen;
     int              max_items;
     const char      *dir_path;
 } menu_list_ctx_t;
+
+extern volatile uint8_t g_openfw_boot_strike_counted;
 
 static sd_card_t        g_sd_card;
 static blkdev_t         g_sd_blkdev;
@@ -45,6 +59,12 @@ static blkdev_t         g_null_blkdev = { 0, 0, 0u, 0 };
 static exfat_vol_t      g_exfat_vol;
 static int              g_sd_mounted = 0;
 static int              g_boot_strikes_cleared = 0;
+static int              g_usb_cfg_dirty = 0;
+static int              g_cached_vbus = 0;
+static uint32_t         g_vbus_poll_ms = 0u;
+static int              g_vbus_cache_valid = 0;
+
+static void save_persisted_state(void);
 
 volatile uint32_t       g_ui_screen = UI_SCR_HOME;
 static ui_model_t       g_ui;
@@ -73,6 +93,7 @@ static void clear_boot_strikes_once(void)
 {
     if (!g_boot_strikes_cleared) {
         AON_BACKUP(7u) = OPENFW_BOOT_STRIKE_MAGIC;
+        g_openfw_boot_strike_counted = 0u;
         g_boot_strikes_cleared = 1;
     }
 }
@@ -123,10 +144,19 @@ int ui_poll_power_button(ui_screen_id_t screen, ui_model_t *model, uint32_t now)
     /* USB and audio service loops can run many times in a millisecond.
      * The PMU latches edges until acknowledged. */
     static uint32_t last_poll;
+    static int      seen_press_after_boot;
     if (now - last_poll >= 16u) {
         last_poll = now;
+        uint8_t ev = key_onoff_poll();
+        if (ev & KEY_ONOFF_PRESS) {
+            seen_press_after_boot = 1;
+        }
+        /* Ignore residual PMU LK from the power-on hold during early boot */
+        if (!seen_press_after_boot && now < 3000u) {
+            ev &= (uint8_t)~KEY_ONOFF_LONG;
+        }
         uint8_t progress = 0;
-        power_button_action_t action = power_button_update(key_onoff_poll(), now,
+        power_button_action_t action = power_button_update(ev, now,
                                                            g_screen_off, &progress);
         switch (action) {
         case POWER_BUTTON_SLEEP:
@@ -154,8 +184,12 @@ int ui_poll_power_button(ui_screen_id_t screen, ui_model_t *model, uint32_t now)
                 bt_xrec_stop();
             } else if (screen == UI_SCR_PLAYER) {
                 audio_dac_stop();
+                g_ui.last_file.resume_sec = g_ui.play_file.resume_sec;
             }
             (void)recorder_stop();
+            if (screen == UI_SCR_SETTINGS || screen == UI_SCR_PLAYER) {
+                save_persisted_state();
+            }
             (void)sd_flush(&g_sd_card);
             pmu_soft_poweroff();
         case POWER_BUTTON_IDLE:
@@ -267,16 +301,30 @@ static void sanitize_rtc(rtc_datetime_t *dt)
     if (dt->second > 59u)                    dt->second = 0u;
 }
 
+static int vbus_present_cached(uint32_t now_ms)
+{
+    if (!g_vbus_cache_valid || (uint32_t)(now_ms - g_vbus_poll_ms) >= 100u) {
+        g_cached_vbus      = pmu_is_vbus_present();
+        g_vbus_poll_ms     = now_ms;
+        g_vbus_cache_valid = 1;
+    }
+    return g_cached_vbus;
+}
+
 static void refresh_telemetry(void)
 {
     rtc_get(&g_ui.now);
     sanitize_rtc(&g_ui.now);
     uint32_t mv = pmu_read_vbat_mv();
     pmu_chg_state_t chg = pmu_get_charge_state();
+    int vbus            = (chg != PMU_CHG_DISCHARGING) ? 1 : 0;
+    g_cached_vbus       = vbus;
+    g_vbus_poll_ms      = millis();
+    g_vbus_cache_valid  = 1;
     g_ui.batt_mv      = (uint16_t)mv;
     g_ui.batt_pct     = vbat_mv_to_pct(mv);
     g_ui.charging     = (chg == PMU_CHG_CHARGING) ? 1 : 0;
-    g_ui.vbus_present = pmu_is_vbus_present() ? 1u : 0u;
+    g_ui.vbus_present = (uint8_t)vbus;
     g_ui.hp_plugged   = keys_read_hp_detect();
     g_ui.sd_ok      = g_sd_mounted ? 1 : 0;
     g_ui.sd_total_mb = g_sd_total_mb;
@@ -319,6 +367,25 @@ static void save_persisted_state(void)
                           g_ui.has_last);
 }
 
+static void fill_wav_metadata(const exfat_entry_t *entry, ui_file_entry_t *dst)
+{
+    dst->channels     = 1u;
+    dst->duration_sec = (entry->size > 44u) ? ((uint32_t)(entry->size - 44u) / 32000u) : 0u;
+
+    /* 512-byte WAV header read covers LIST/INFO/JUNK/fact chunks before data */
+    uint8_t hdr[512];
+    uint32_t got = 0u;
+    if (entry->size >= 44u &&
+        exfat_read_file(&g_exfat_vol, entry, 0u, hdr, (uint32_t)sizeof(hdr), &got) == 0 &&
+        got >= 44u) {
+        wav_stream_info_t wi;
+        if (wav_parse_stream(hdr, got, &wi) == 0) {
+            dst->duration_sec = (wi.duration_ms + 500u) / 1000u;
+            dst->channels     = (uint8_t)(wi.channels ? wi.channels : 1u);
+        }
+    }
+}
+
 static void load_persisted_state(void)
 {
     if (!g_sd_mounted) {
@@ -357,11 +424,10 @@ static void load_persisted_state(void)
             if (exfat_find_path(&g_exfat_vol, full, &ent) == 0 && !ent.is_dir) {
                 copy_cstr(g_ui.last_file.filename, (int)sizeof(g_ui.last_file.filename), last_name);
                 g_ui.last_file.dt             = g_ui.now;
-                g_ui.last_file.duration_sec   = (ent.size > 44u) ? ((uint32_t)(ent.size - 44u) / 32000u) : 0u;
+                fill_wav_metadata(&ent, &g_ui.last_file);
                 g_ui.last_file.resume_sec     = (last_resume < g_ui.last_file.duration_sec) ? last_resume : 0u;
                 g_ui.last_file.unplayed       = 0u;
                 g_ui.last_file.has_transcript = 0u;
-                g_ui.last_file.channels       = 1u;
                 copy_cstr(g_last_dir, (int)sizeof(g_last_dir), "/record");
                 g_ui.has_last = 1;
             }
@@ -373,22 +439,80 @@ static void load_persisted_state(void)
 static void wait_key_release(key_id_t target)
 {
     while (keys_state((uint32_t *)0) == target) {
-        wdt_feed();
-        mdelay(20u);
+        keys_flush_events();
+        wfi_sleep_ms(20u);
     }
     keys_flush_events();
+}
+
+static uint64_t hash_dir_stem_ci(const char *dir, const char *name)
+{
+    uint64_t h = 14695981039346656037ULL;
+    if (dir) {
+        for (const char *p = dir; *p != '\0'; p++) {
+            uint8_t c = (uint8_t)*p;
+            if (c >= 'A' && c <= 'Z') c = (uint8_t)(c + ('a' - 'A'));
+            h ^= c;
+            h *= 1099511628211ULL;
+        }
+    }
+    h ^= 0xFFu;
+    h *= 1099511628211ULL;
+    int len = 0;
+    while (name && name[len] != '\0') {
+        len++;
+    }
+    int stem_len = (len >= 4) ? (len - 4) : len;
+    for (int i = 0; i < stem_len; i++) {
+        uint8_t c = (uint8_t)name[i];
+        if (c >= 'A' && c <= 'Z') c = (uint8_t)(c + ('a' - 'A'));
+        h ^= c;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static void reverse_file_range(ui_file_entry_t *items, char (*dirs)[12], wav_loc_t *locs,
+                               int lo, int hi)
+{
+    while (lo < hi) {
+        ui_file_entry_t tf = items[lo];
+        items[lo] = items[hi];
+        items[hi] = tf;
+
+        char td[12];
+        copy_cstr(td, 12, dirs[lo]);
+        copy_cstr(dirs[lo], 12, dirs[hi]);
+        copy_cstr(dirs[hi], 12, td);
+
+        wav_loc_t tl = locs[lo];
+        locs[lo] = locs[hi];
+        locs[hi] = tl;
+
+        lo++;
+        hi--;
+    }
 }
 
 static int menu_collect_cb(const exfat_entry_t *entry, void *user)
 {
     menu_list_ctx_t *ctx = (menu_list_ctx_t *)user;
+    wdt_feed();
     if (entry->is_dir) {
+        return 0;
+    }
+    if (name_ends_with_ci(entry->name, ".cwx")) {
+        if (ctx->cwx_count < ctx->cwx_cap) {
+            ctx->cwx_hashes[ctx->cwx_count++] = hash_dir_stem_ci(ctx->dir_path, entry->name);
+        } else {
+            ctx->cwx_overflow = 1;
+        }
         return 0;
     }
     if (!name_ends_with_ci(entry->name, ".wav")) {
         return 0;
     }
-    /* Ring-buffer the newest max_items entries so recording #25+ is never lost */
+    /* Ring-buffer the newest max_items entries in-place; defer WAV header reads */
     int idx = ctx->total_seen % ctx->max_items;
     ctx->total_seen++;
     if (ctx->count < ctx->max_items) {
@@ -404,17 +528,9 @@ static int menu_collect_cb(const exfat_entry_t *entry, void *user)
     dst->channels       = 1u;
     dst->duration_sec   = (entry->size > 44u) ? ((uint32_t)(entry->size - 44u) / 32000u) : 0u;
 
-    /* Quick 64-byte WAV header peek for exact duration & channel count */
-    uint8_t hdr[64];
-    uint32_t got = 0u;
-    if (entry->size >= 44u &&
-        exfat_read_file(&g_exfat_vol, entry, 0u, hdr, 64u, &got) == 0 && got >= 44u) {
-        wav_stream_info_t wi;
-        if (wav_parse_stream(hdr, got, &wi) == 0) {
-            dst->duration_sec = (wi.duration_ms + 500u) / 1000u;
-            dst->channels     = (uint8_t)(wi.channels ? wi.channels : 1u);
-        }
-    }
+    ctx->locs[idx].size          = entry->size;
+    ctx->locs[idx].first_cluster = entry->first_cluster;
+    ctx->locs[idx].no_fat_chain  = entry->no_fat_chain;
     return 0;
 }
 
@@ -432,16 +548,22 @@ static void reload_files_and_sd_stats(void)
         return;
     }
 
+    wdt_feed();
     (void)exfat_stat_fs(&g_exfat_vol, &g_sd_free_mb, &g_sd_total_mb);
 
-    static ui_file_entry_t ring_files[MENU_MAX_FILES];
-    static char            ring_dirs[MENU_MAX_FILES][12];
+    wav_loc_t locs[MENU_MAX_FILES];
+    uint64_t  cwx_hashes[MENU_MAX_CWX];
     menu_list_ctx_t ctx;
-    ctx.items      = ring_files;
-    ctx.dirs       = ring_dirs;
-    ctx.count      = 0;
-    ctx.total_seen = 0;
-    ctx.max_items  = MENU_MAX_FILES;
+    ctx.items        = g_files;
+    ctx.dirs         = g_file_dirs;
+    ctx.locs         = locs;
+    ctx.cwx_hashes   = cwx_hashes;
+    ctx.cwx_count    = 0;
+    ctx.cwx_cap      = MENU_MAX_CWX;
+    ctx.cwx_overflow = 0;
+    ctx.count        = 0;
+    ctx.total_seen   = 0;
+    ctx.max_items    = MENU_MAX_FILES;
 
     exfat_entry_t dir_ent;
     if (exfat_find_path(&g_exfat_vol, "/record", &dir_ent) == 0 && dir_ent.is_dir) {
@@ -456,35 +578,59 @@ static void reload_files_and_sd_stats(void)
     (void)exfat_list_dir(&g_exfat_vol, g_exfat_vol.root_dir_cluster, 0u,
                          menu_collect_cb, &ctx);
 
-    /* Unwrap ring buffer in reverse chronological order (newest first) */
-    for (int i = 0; i < ctx.count; i++) {
-        int src_idx = (ctx.total_seen - 1 - i) % ctx.max_items;
-        if (src_idx < 0) {
-            src_idx += ctx.max_items;
+    /* Unwrap ring buffer in-place into reverse chronological order (newest first) */
+    if (ctx.count > 1) {
+        int head = (ctx.total_seen > ctx.max_items) ? (ctx.total_seen % ctx.max_items) : 0;
+        if (head > 1) {
+            reverse_file_range(g_files, g_file_dirs, locs, 0, head - 1);
         }
-        g_files[i] = ring_files[src_idx];
-        copy_cstr(g_file_dirs[i], 12, ring_dirs[src_idx]);
+        if (head < ctx.count - 1) {
+            reverse_file_range(g_files, g_file_dirs, locs, head, ctx.count - 1);
+        }
     }
 
-    /* Check matching .cwx transcript sidecars */
+    /* Read 512 B WAV headers & match .cwx transcripts only for the selected files */
     for (int i = 0; i < ctx.count; i++) {
-        char cpath[96];
-        int p = 0;
-        if (!(g_file_dirs[i][0] == '/' && g_file_dirs[i][1] == '\0')) {
-            append_str(cpath, &p, (int)sizeof(cpath), g_file_dirs[i]);
-        }
-        append_str(cpath, &p, (int)sizeof(cpath), "/");
-        append_str(cpath, &p, (int)sizeof(cpath), g_files[i].filename);
-        cpath[p] = '\0';
-        if (p >= 4) {
-            cpath[p - 3] = 'c';
-            cpath[p - 2] = 'w';
-            cpath[p - 1] = 'x';
-            exfat_entry_t cent;
-            if (exfat_find_path(&g_exfat_vol, cpath, &cent) == 0 && !cent.is_dir) {
-                g_files[i].has_transcript = 1u;
+        wdt_feed();
+        exfat_entry_t wav_ent;
+        wav_ent.name[0]       = '\0';
+        wav_ent.size          = locs[i].size;
+        wav_ent.first_cluster = locs[i].first_cluster;
+        wav_ent.file_attr     = 0u;
+        wav_ent.no_fat_chain  = locs[i].no_fat_chain;
+        wav_ent.is_dir        = 0u;
+        fill_wav_metadata(&wav_ent, &g_files[i]);
+
+        int has_cwx = 0;
+        if (ctx.cwx_count > 0) {
+            uint64_t h = hash_dir_stem_ci(g_file_dirs[i], g_files[i].filename);
+            for (int c = 0; c < ctx.cwx_count; c++) {
+                if (cwx_hashes[c] == h) {
+                    has_cwx = 1;
+                    break;
+                }
             }
         }
+        if (!has_cwx && ctx.cwx_overflow) {
+            char cpath[96];
+            int p = 0;
+            if (!(g_file_dirs[i][0] == '/' && g_file_dirs[i][1] == '\0')) {
+                append_str(cpath, &p, (int)sizeof(cpath), g_file_dirs[i]);
+            }
+            append_str(cpath, &p, (int)sizeof(cpath), "/");
+            append_str(cpath, &p, (int)sizeof(cpath), g_files[i].filename);
+            cpath[p] = '\0';
+            if (p >= 4) {
+                cpath[p - 3] = 'c';
+                cpath[p - 2] = 'w';
+                cpath[p - 1] = 'x';
+                exfat_entry_t cent;
+                if (exfat_find_path(&g_exfat_vol, cpath, &cent) == 0 && !cent.is_dir) {
+                    has_cwx = 1;
+                }
+            }
+        }
+        g_files[i].has_transcript = has_cwx ? 1u : 0u;
     }
 
     g_ui.file_count = ctx.count;
@@ -537,18 +683,22 @@ static int main_usb_audio_cfg_cb(int set, uint8_t cfg[4], int16_t *rms_x10, uint
         if (cfg[0] != 0xFFu) {
             recorder_set_dsp_profile((audio_dsp_profile_t)cfg[0]);
             g_ui.cfg.sound_mode = (uint8_t)recorder_get_dsp_profile();
+            g_usb_cfg_dirty = 1;
         }
         if (cfg[1] != 0xFFu) {
             recorder_set_gain(cfg[1]);
             g_ui.cfg.mic_gain = recorder_get_gain();
+            g_usb_cfg_dirty = 1;
         }
         if (cfg[2] != 0xFFu) {
             recorder_set_channels(cfg[2]);
             g_ui.cfg.channels = recorder_get_channels();
+            g_usb_cfg_dirty = 1;
         }
         if (cfg[3] != 0xFFu) {
             recorder_set_vor((int)cfg[3]);
             g_ui.cfg.vor_enabled = (uint8_t)(recorder_get_vor() ? 1u : 0u);
+            g_usb_cfg_dirty = 1;
         }
     }
     cfg[0] = (uint8_t)recorder_get_dsp_profile();
@@ -565,6 +715,7 @@ static int run_usb_msc_mode(int auto_mode)
     g_ui_screen        = UI_SCR_USB;
     g_ui.usb_read_act  = 0u;
     g_ui.usb_write_act = 0u;
+    g_usb_cfg_dirty    = 0;
     refresh_telemetry();
     ui_render_screen(UI_SCR_USB, &g_ui);
 
@@ -606,9 +757,6 @@ static int run_usb_msc_mode(int auto_mode)
             usb_msc_poll();
         }
 
-        uint32_t now = millis();
-        int show_usb = ui_poll_power_button(UI_SCR_USB, &g_ui, now);
-
         key_event_t kev;
         while (keys_pop_event(&kev)) {
             if (kev.pressed) {
@@ -627,23 +775,23 @@ static int run_usb_msc_mode(int auto_mode)
                 }
             }
         }
-        {
-            uint32_t st_since = 0u;
-            key_id_t st_k = keys_state(&st_since);
-            if (st_k == KEY_NONE) {
-                exit_armed    = 1;
-                back_press_ms = 0u;
-            } else if (exit_armed && st_k == KEY_BACK) {
-                if (back_press_ms == 0u) {
-                    back_press_ms = st_since ? st_since : (now ? now : 1u);
-                }
-                if ((uint32_t)(now - back_press_ms) >= 600u) {
-                    manual_exit = 1;
-                    break;
-                }
-            } else {
-                back_press_ms = 0u;
+        uint32_t st_since = 0u;
+        key_id_t st_k = keys_state(&st_since);
+        uint32_t now = millis();
+        int show_usb = ui_poll_power_button(UI_SCR_USB, &g_ui, now);
+        if (st_k == KEY_NONE) {
+            exit_armed    = 1;
+            back_press_ms = 0u;
+        } else if (exit_armed && st_k == KEY_BACK) {
+            if (back_press_ms == 0u) {
+                back_press_ms = st_since ? st_since : (now ? now : 1u);
             }
+            if ((int32_t)(now - back_press_ms) >= 600) {
+                manual_exit = 1;
+                break;
+            }
+        } else {
+            back_press_ms = 0u;
         }
 
         if ((uint32_t)(now - last_ui) >= 100u) {
@@ -666,17 +814,20 @@ static int run_usb_msc_mode(int auto_mode)
                     break;
                 }
                 uint16_t frame = usb_musb_frame();
-                if (frame != 0u) {
-                    if (seen_sof && frame == last_frame) {
-                        stale_ticks++;
-                        if (stale_ticks >= 8u) { /* >= 800 ms without SOF */
-                            break;
-                        }
-                    } else {
+                if (!seen_sof) {
+                    if (frame != 0u) {
                         seen_sof    = 1;
                         last_frame  = frame;
                         stale_ticks = 0u;
                     }
+                } else if (frame == last_frame) {
+                    stale_ticks++;
+                    if (stale_ticks >= 8u) { /* >= 800 ms without SOF */
+                        break;
+                    }
+                } else {
+                    last_frame  = frame;
+                    stale_ticks = 0u;
                 }
             }
 #endif
@@ -692,16 +843,24 @@ static int run_usb_msc_mode(int auto_mode)
             }
             if (txp != prev_txp) {
                 prev_txp       = txp;
-                rd_blink_until = now + 250u;
+                uint32_t dl    = now + 250u;
+                rd_blink_until = dl ? dl : 1u;
             }
             if (rxp != prev_rxp) {
                 prev_rxp       = rxp;
-                wr_blink_until = now + 250u;
+                uint32_t dl    = now + 250u;
+                wr_blink_until = dl ? dl : 1u;
             }
             backlight_update();
 
-            g_ui.usb_read_act  = ((int32_t)(now - rd_blink_until) < 0) ? 1u : 0u;
-            g_ui.usb_write_act = ((int32_t)(now - wr_blink_until) < 0) ? 1u : 0u;
+            if (rd_blink_until != 0u && (int32_t)(now - rd_blink_until) >= 0) {
+                rd_blink_until = 0u;
+            }
+            if (wr_blink_until != 0u && (int32_t)(now - wr_blink_until) >= 0) {
+                wr_blink_until = 0u;
+            }
+            g_ui.usb_read_act  = (rd_blink_until != 0u) ? 1u : 0u;
+            g_ui.usb_write_act = (wr_blink_until != 0u) ? 1u : 0u;
             uint32_t render_period = (g_ui.usb_read_act || g_ui.usb_write_act) ? 500u : 300u;
             if ((uint32_t)(now - last_render) >= render_period) {
                 last_render = now;
@@ -723,6 +882,11 @@ static int run_usb_msc_mode(int auto_mode)
     if (g_sd_card.initialized) {
         g_sd_mounted = (exfat_mount(&g_exfat_vol, &g_sd_blkdev) == 0) ? 1 : 0;
     }
+    if (g_usb_cfg_dirty && g_sd_mounted) {
+        g_usb_cfg_dirty = 0;
+        save_persisted_state();
+    }
+    g_vbus_cache_valid = 0;
     reload_files_and_sd_stats();
     return manual_exit;
 }
@@ -750,6 +914,8 @@ static void run_bt_xrec_mode(void)
     uint8_t  prev_spp    = 0u;
     int      exit_armed  = 0;
 
+    uint32_t iter_rx     = 0u;
+    uint32_t iter_tx     = 0u;
     keys_flush_events();
     while (1) {
         wdt_feed();
@@ -848,6 +1014,18 @@ static void run_bt_xrec_mode(void)
                 ui_render_screen(UI_SCR_BT, &g_ui);
             }
         }
+
+        /* Sleep via WFI when idle (woken immediately by RW-BT IRQ or 1 ms SysTick) */
+        if (!keys_event_pending() && !recorder_is_saving()) {
+            bt_status_t cur_st;
+            bt_xrec_get_status(&cur_st);
+            if (cur_st.rx_acl_pkts == iter_rx && cur_st.tx_acl_pkts == iter_tx) {
+                OPENFW_WFI();
+            } else {
+                iter_rx = cur_st.rx_acl_pkts;
+                iter_tx = cur_st.tx_acl_pkts;
+            }
+        }
     }
 
     if (recorder_is_saving()) {
@@ -890,7 +1068,7 @@ static void play_boot_animation(void)
 
     for (uint32_t frame = 0u; frame < 50u; frame++) {
         wdt_feed();
-        if (keys_read_rec_switch() || keys_decode(keys_read_adc()) != KEY_NONE ||
+        if (keys_read_rec_switch() || keys_state((uint32_t *)0) != KEY_NONE ||
             keys_event_pending()) {
             break;
         }
@@ -963,14 +1141,14 @@ static void play_boot_animation(void)
         uint32_t target_ms = t_start + (frame + 1u) * 40u;
         while ((int32_t)(millis() - target_ms) < 0) {
             wdt_feed();
-            if (keys_read_rec_switch() || keys_decode(keys_read_adc()) != KEY_NONE) {
+            if (keys_read_rec_switch() || keys_state((uint32_t *)0) != KEY_NONE ||
+                keys_event_pending()) {
                 break;
             }
             wfi_sleep_ms(4u);
         }
     }
 
-    lcd_fill_rect(0u, 0u, 160u, 80u, UI_COL_BG);
     backlight_wake(millis());
 }
 
@@ -1080,6 +1258,9 @@ static void delete_selected_file(uint32_t now_ms)
     }
     const char *dir  = g_file_dirs[g_ui.file_sel];
     const char *name = g_files[g_ui.file_sel].filename;
+    int deleted_was_last = (g_ui.has_last &&
+                            str_eq_ci(g_last_dir, dir) &&
+                            str_eq_ci(g_ui.last_file.filename, name)) ? 1 : 0;
     int rc = exfat_delete_file(&g_exfat_vol, dir, name);
     if (rc == 0) {
         /* Also remove matching .cwx sidecar if present */
@@ -1094,11 +1275,69 @@ static void delete_selected_file(uint32_t now_ms)
             (void)exfat_delete_file(&g_exfat_vol, dir, cwx_name);
         }
         reload_files_and_sd_stats();
+        if (deleted_was_last) {
+            g_ui.has_last                 = 0;
+            g_ui.last_file.filename[0]    = '\0';
+            g_ui.last_file.resume_sec     = 0u;
+            g_ui.last_file.duration_sec   = 0u;
+            g_ui.last_file.has_transcript = 0u;
+            save_persisted_state();
+        }
         ui_show_toast("Deleted", UI_COL_GREEN, now_ms, 1500u);
     } else {
         ui_show_toast("Delete failed", UI_COL_AMBER, now_ms, 1500u);
     }
 }
+
+static const openfw_exp_api_t k_exp_api = {
+    .magic                 = OPENFW_EXP_ABI_MAGIC,
+    .arena_base            = 0,
+    .arena_size            = OPENFW_EXP_ARENA_SIZE,
+    .out_buf               = 0,
+    .out_size              = OPENFW_EXP_OUT_SIZE,
+    .out_len_ptr           = 0,
+    .wdt_feed              = wdt_feed,
+    .millis                = millis,
+    .us_timer_now          = us_timer_now,
+    .udelay                = udelay,
+    .mdelay                = mdelay,
+    .log_reset             = openfw_log_reset,
+    .log_putc              = openfw_log_putc,
+    .log_puts              = openfw_log_puts,
+    .log_u32               = openfw_log_u32,
+    .log_hex               = openfw_log_hex,
+    .pmu_read_reg          = pmu_read_reg,
+    .pmu_write_reg         = pmu_write_reg,
+    .pmu_read_vbat_mv      = pmu_read_vbat_mv,
+    .pmu_is_vbus_present   = pmu_is_vbus_present,
+    .key_onoff_init        = key_onoff_init,
+    .key_onoff_pressed     = key_onoff_pressed,
+    .keys_read_adc         = keys_read_adc,
+    .keys_decode           = keys_decode,
+    .keys_read_rec_switch  = keys_read_rec_switch,
+    .keys_read_hp_detect   = keys_read_hp_detect,
+    .lcd_set_rotation      = lcd_set_rotation,
+    .lcd_get_width         = lcd_get_width,
+    .lcd_get_height        = lcd_get_height,
+    .lcd_fill_rect         = lcd_fill_rect,
+    .lcd_draw_str          = lcd_draw_str,
+    .lcd_backlight_set     = lcd_backlight_set,
+    .sd_write_file         = openfw_exp_sd_write_file,
+    .sd_dump_log           = openfw_exp_sd_dump_log,
+    .audio_capture_start   = audio_capture_start,
+    .audio_capture_stop    = audio_capture_stop,
+    .audio_pop_frame       = audio_pop_frame,
+    .audio_get_peak_pct    = audio_get_peak_pct,
+    .audio_get_frames      = audio_get_frames,
+    .audio_get_overruns    = audio_get_overruns,
+    .set_dmac_ch0_irq      = openfw_exp_set_dmac_ch0_irq,
+    .bt_rf_init_calibrated = bt_rf_init_calibrated,
+    .bt_xrec_start         = bt_xrec_start,
+    .bt_xrec_poll          = bt_xrec_poll,
+    .bt_xrec_stop          = bt_xrec_stop,
+    .bt_xrec_open_pairing  = bt_xrec_open_pairing,
+    .bt_xrec_get_status    = bt_xrec_get_status,
+};
 
 int openfw_main(void)
 {
@@ -1111,6 +1350,7 @@ int openfw_main(void)
         pmu_reboot_to_usb_bootloader();
     }
     AON_BACKUP(7u) = OPENFW_BOOT_STRIKE_MAGIC | ((boot_strikes + 1u) & 0xFFFFu);
+    g_openfw_boot_strike_counted = 1u;
 
     uint32_t prev_f0     = AON_BACKUP(0u);
     uint32_t prev_pc     = AON_BACKUP(1u);
@@ -1126,10 +1366,12 @@ int openfw_main(void)
         g_prev_fault_code = 0u;
     }
 
+    /* Arm WDT before early RTC/RTWI init so a bus hang still recovers */
+    wdt_start_reset(32u, 0u);
+    wdt_feed();
     systick_init(96000000u); /* Boosted in .ram_boot: PLL0 192 MHz / 2 */
     rtc_ensure_running();
     pmu_unattended_init();
-    wdt_start_reset(32u, pmu_read_reg(0x20u));
     wdt_feed();
 
     /* Emit early UART0 banner before keys_init() switches PD0 to SARADC */
@@ -1172,7 +1414,6 @@ int openfw_main(void)
 
     lcd_init();
     lcd_set_rotation(1); /* Landscape 160x80 */
-    lcd_fill_rect(0u, 0u, 160u, 80u, UI_COL_BLACK);
     g_cur_bl_pct = 255u;
     backlight_apply(0u); /* Backlight ramps up smoothly inside play_boot_animation() */
 
@@ -1183,60 +1424,15 @@ int openfw_main(void)
     keys_init();
     key_onoff_init();
     audio_pa_set(0);
-    play_boot_animation();
+    /* Skip the 2-second boot animation when the Record slider is already ON */
+    if (!keys_read_rec_switch()) {
+        play_boot_animation();
+    }
+    /* Discard any residual power-on button edges latched during boot */
+    (void)key_onoff_poll();
     usb_msc_set_audio_cfg_cb(main_usb_audio_cfg_cb);
     openfw_exp_bind_fs(&g_exfat_vol, &g_sd_mounted);
-    {
-        openfw_exp_api_t exp_api;
-        exp_api.magic               = OPENFW_EXP_ABI_MAGIC;
-        exp_api.arena_base          = 0;
-        exp_api.arena_size          = OPENFW_EXP_ARENA_SIZE;
-        exp_api.out_buf             = 0;
-        exp_api.out_size            = OPENFW_EXP_OUT_SIZE;
-        exp_api.out_len_ptr         = 0;
-        exp_api.wdt_feed            = wdt_feed;
-        exp_api.millis              = millis;
-        exp_api.us_timer_now        = us_timer_now;
-        exp_api.udelay              = udelay;
-        exp_api.mdelay              = mdelay;
-        exp_api.log_reset           = openfw_log_reset;
-        exp_api.log_putc            = openfw_log_putc;
-        exp_api.log_puts            = openfw_log_puts;
-        exp_api.log_u32             = openfw_log_u32;
-        exp_api.log_hex             = openfw_log_hex;
-        exp_api.pmu_read_reg        = pmu_read_reg;
-        exp_api.pmu_write_reg       = pmu_write_reg;
-        exp_api.pmu_read_vbat_mv    = pmu_read_vbat_mv;
-        exp_api.pmu_is_vbus_present = pmu_is_vbus_present;
-        exp_api.key_onoff_init      = key_onoff_init;
-        exp_api.key_onoff_pressed   = key_onoff_pressed;
-        exp_api.keys_read_adc       = keys_read_adc;
-        exp_api.keys_decode         = keys_decode;
-        exp_api.keys_read_rec_switch = keys_read_rec_switch;
-        exp_api.keys_read_hp_detect = keys_read_hp_detect;
-        exp_api.lcd_set_rotation    = lcd_set_rotation;
-        exp_api.lcd_get_width       = lcd_get_width;
-        exp_api.lcd_get_height      = lcd_get_height;
-        exp_api.lcd_fill_rect       = lcd_fill_rect;
-        exp_api.lcd_draw_str        = lcd_draw_str;
-        exp_api.lcd_backlight_set   = lcd_backlight_set;
-        exp_api.sd_write_file       = openfw_exp_sd_write_file;
-        exp_api.sd_dump_log         = openfw_exp_sd_dump_log;
-        exp_api.audio_capture_start = audio_capture_start;
-        exp_api.audio_capture_stop  = audio_capture_stop;
-        exp_api.audio_pop_frame     = audio_pop_frame;
-        exp_api.audio_get_peak_pct  = audio_get_peak_pct;
-        exp_api.audio_get_frames    = audio_get_frames;
-        exp_api.audio_get_overruns  = audio_get_overruns;
-        exp_api.set_dmac_ch0_irq    = openfw_exp_set_dmac_ch0_irq;
-        exp_api.bt_rf_init_calibrated = bt_rf_init_calibrated;
-        exp_api.bt_xrec_start       = bt_xrec_start;
-        exp_api.bt_xrec_poll        = bt_xrec_poll;
-        exp_api.bt_xrec_stop        = bt_xrec_stop;
-        exp_api.bt_xrec_open_pairing = bt_xrec_open_pairing;
-        exp_api.bt_xrec_get_status  = bt_xrec_get_status;
-        openfw_exp_init_api(&exp_api);
-    }
+    openfw_exp_init_api(&k_exp_api);
     backlight_wake(millis());
 
     ui_screen_id_t scr          = UI_SCR_HOME;
@@ -1246,7 +1442,7 @@ int openfw_main(void)
     int      rec_active              = 0;
     int      prev_rec_sw             = 0;
     int      prev_vbus               = 0;
-    int      prev_vbus_bl            = pmu_is_vbus_present();
+    int      prev_vbus_bl            = vbus_present_cached(millis());
     int      usb_probing             = 0;
     int      usb_suppress_until_unpl = 0;
     int      low_batt_cutoff         = 0;
@@ -1262,6 +1458,7 @@ int openfw_main(void)
     uint32_t enter_press_ms          = 0u;
     int      enter_long_fired        = 0;
     int      del_armed               = 0;
+    int      about_armed             = 0;
     key_id_t prev_key                = KEY_NONE;
     int      swallow_until_release   = 0;
     int      dirty                   = 1;
@@ -1293,7 +1490,9 @@ int openfw_main(void)
         int rec_sw = keys_read_rec_switch();
         if (rec_sw != prev_rec_sw) {
             backlight_wake(now_ms);
-            prev_rec_sw = rec_sw;
+            prev_rec_sw      = rec_sw;
+            enter_press_ms   = 0u;
+            enter_long_fired = 0;
             if (rec_sw) {
                 if (scr != UI_SCR_REC && scr != UI_SCR_SAVED) {
                     prev_scr = scr;
@@ -1394,7 +1593,7 @@ int openfw_main(void)
                 copy_cstr(g_ui.rec_stop_reason, (int)sizeof(g_ui.rec_stop_reason), "Card full / error");
                 dirty            = 1;
             }
-            prev_vbus   = pmu_is_vbus_present();
+            prev_vbus   = vbus_present_cached(now_ms);
             usb_probing = 0;
 
             if ((uint32_t)(now_ms - last_spec_ms) >= 50u) {
@@ -1420,14 +1619,22 @@ int openfw_main(void)
 
                 uint32_t clips = recorder_get_clip_events();
                 if (vl >= 98u || clips != prev_clip_events) {
-                    rec_clip_l_until_ms = now_ms + 1500u;
+                    uint32_t dl = now_ms + 1500u;
+                    rec_clip_l_until_ms = dl ? dl : 1u;
                 }
                 if (g_ui.rec_vu_r >= 98u || clips != prev_clip_events) {
-                    rec_clip_r_until_ms = now_ms + 1500u;
+                    uint32_t dl = now_ms + 1500u;
+                    rec_clip_r_until_ms = dl ? dl : 1u;
                 }
                 prev_clip_events = clips;
-                g_ui.rec_clip_l  = ((int32_t)(now_ms - rec_clip_l_until_ms) < 0) ? 1u : 0u;
-                g_ui.rec_clip_r  = ((int32_t)(now_ms - rec_clip_r_until_ms) < 0) ? 1u : 0u;
+                if (rec_clip_l_until_ms != 0u && (int32_t)(now_ms - rec_clip_l_until_ms) >= 0) {
+                    rec_clip_l_until_ms = 0u;
+                }
+                if (rec_clip_r_until_ms != 0u && (int32_t)(now_ms - rec_clip_r_until_ms) >= 0) {
+                    rec_clip_r_until_ms = 0u;
+                }
+                g_ui.rec_clip_l  = (rec_clip_l_until_ms != 0u) ? 1u : 0u;
+                g_ui.rec_clip_r  = (rec_clip_r_until_ms != 0u) ? 1u : 0u;
 
                 if (g_ui.rec_gain_bar && (int32_t)(now_ms - rec_gain_until_ms) >= 0) {
                     g_ui.rec_gain_bar = 0u;
@@ -1449,7 +1656,7 @@ int openfw_main(void)
             }
         } else {
             /* Idle: VBUS auto-USB detection & SD hot-plug re-probe */
-            int vbus_now       = pmu_is_vbus_present();
+            int vbus_now       = vbus_present_cached(now_ms);
             int enter_usb_auto = 0;
 
             if (vbus_now != prev_vbus_bl) {
@@ -1534,6 +1741,7 @@ int openfw_main(void)
                 }
 
                 int rising = (key != KEY_NONE && key != prev_key) ? 1 : 0;
+                ui_screen_id_t scr_before = scr;
 
                 switch (scr) {
                 case UI_SCR_HOME:
@@ -1605,10 +1813,18 @@ int openfw_main(void)
                 case UI_SCR_SAVED:
                     if (rising) {
                         if (key == KEY_ENTER && g_sd_mounted && g_ui.saved_filename[0] != '\0') {
-                            ui_file_entry_t saved = g_ui.last_file;
+                            ui_file_entry_t saved;
+                            saved.dt             = g_ui.saved_dt;
+                            saved.duration_sec   = g_ui.saved_sec;
+                            saved.resume_sec     = 0u;
+                            saved.unplayed       = 0u;
+                            saved.has_transcript = 0u;
+                            saved.channels       = g_ui.saved_channels ? g_ui.saved_channels : 1u;
                             copy_cstr(saved.filename, (int)sizeof(saved.filename), g_ui.saved_filename);
                             play_named_file("/record", &saved);
-                            g_ui.last_file.resume_sec = saved.resume_sec;
+                            if (g_ui.has_last && str_eq_ci(g_ui.last_file.filename, saved.filename)) {
+                                g_ui.last_file.resume_sec = saved.resume_sec;
+                            }
                             scr         = (prev_scr == UI_SCR_REC || prev_scr == UI_SCR_SAVED) ? UI_SCR_HOME : prev_scr;
                             g_ui_screen = (uint32_t)scr;
                             dirty       = 1;
@@ -1787,6 +2003,7 @@ int openfw_main(void)
                                     }
                                 } else if (g_ui.set_sel == 9) {
                                     enter_press_ms = 0u;
+                                    about_armed    = 0;
                                     scr            = UI_SCR_ABOUT;
                                     g_ui_screen    = (uint32_t)scr;
                                     dirty          = 1;
@@ -1800,16 +2017,21 @@ int openfw_main(void)
                     break;
 
                 case UI_SCR_ABOUT:
-                    if (rising && key == KEY_BACK) {
+                    if (key == KEY_NONE) {
+                        about_armed    = 1;
+                        enter_press_ms = 0u;
+                    } else if (rising && key == KEY_BACK) {
                         enter_press_ms = 0u;
                         scr            = UI_SCR_SETTINGS;
                         g_ui_screen    = (uint32_t)scr;
                         dirty          = 1;
-                    } else if (key == KEY_ENTER) {
+                    } else if (about_armed && key == KEY_ENTER) {
                         if (enter_press_ms == 0u) {
                             enter_press_ms = t ? t : 1u;
-                        } else if ((uint32_t)(t - enter_press_ms) >= 600u) {
+                        } else if ((int32_t)(t - enter_press_ms) >= 600) {
                             (void)recorder_stop();
+                            save_persisted_state();
+                            (void)sd_flush(&g_sd_card);
                             ui_show_toast("Entering update mode", UI_COL_CYAN, t, 1000u);
                             ui_render_screen(UI_SCR_ABOUT, &g_ui);
                             mdelay(150u);
@@ -1822,6 +2044,11 @@ int openfw_main(void)
 
                 default:
                     break;
+                }
+
+                if (scr != scr_before) {
+                    enter_press_ms   = 0u;
+                    enter_long_fired = 0;
                 }
 
                 if (modal_done) {
@@ -1837,15 +2064,21 @@ int openfw_main(void)
             }
         }
 
-        /* 5. Saved-card 8-second countdown */
+        /* 5. Saved-card 8-second countdown (5% / ~400 ms steps) */
         if (scr == UI_SCR_SAVED) {
             uint32_t elapsed = (uint32_t)(now_ms - saved_start_ms);
             if (elapsed >= 8000u) {
-                scr         = (prev_scr == UI_SCR_REC || prev_scr == UI_SCR_SAVED) ? UI_SCR_HOME : prev_scr;
-                g_ui_screen = (uint32_t)scr;
-                dirty       = 1;
+                scr              = (prev_scr == UI_SCR_REC || prev_scr == UI_SCR_SAVED) ? UI_SCR_HOME : prev_scr;
+                g_ui_screen      = (uint32_t)scr;
+                enter_press_ms   = 0u;
+                enter_long_fired = 0;
+                dirty            = 1;
             } else {
-                uint8_t frac = (uint8_t)(((8000u - elapsed) * 100u) / 8000u);
+                uint32_t rem  = 8000u - elapsed;
+                uint8_t  frac = (uint8_t)(((rem + 399u) / 400u) * 5u);
+                if (frac > 100u) {
+                    frac = 100u;
+                }
                 if (frac != g_ui.saved_frac_pct) {
                     g_ui.saved_frac_pct = frac;
                     dirty = 1;

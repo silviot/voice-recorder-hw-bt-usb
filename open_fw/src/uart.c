@@ -74,12 +74,12 @@ void openfw_log_puts(const char *s)
     }
 }
 
-void openfw_log_u32(uint32_t v)
+static void fmt_u32(void (*putc_fn)(char), uint32_t v)
 {
     char buf[12];
     int i = 0;
     if (v == 0u) {
-        openfw_log_putc('0');
+        putc_fn('0');
         return;
     }
     while (v > 0u && i < 11) {
@@ -87,17 +87,28 @@ void openfw_log_u32(uint32_t v)
         v /= 10u;
     }
     while (i > 0) {
-        openfw_log_putc(buf[--i]);
+        putc_fn(buf[--i]);
     }
+}
+
+static void fmt_hex(void (*putc_fn)(char), uint32_t v)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    putc_fn('0');
+    putc_fn('x');
+    for (int shift = 28; shift >= 0; shift -= 4) {
+        putc_fn(hex[(v >> shift) & 0xFu]);
+    }
+}
+
+void openfw_log_u32(uint32_t v)
+{
+    fmt_u32(openfw_log_putc, v);
 }
 
 void openfw_log_hex(uint32_t v)
 {
-    static const char hex[] = "0123456789ABCDEF";
-    openfw_log_puts("0x");
-    for (int shift = 28; shift >= 0; shift -= 4) {
-        openfw_log_putc(hex[(v >> shift) & 0xFu]);
-    }
+    fmt_hex(openfw_log_putc, v);
 }
 
 void uart0_putc(char c)
@@ -111,6 +122,9 @@ void uart0_putc(char c)
 
 void uart0_puts(const char *s)
 {
+    if (!s) {
+        return;
+    }
     while (*s != '\0') {
         uart0_putc(*s++);
     }
@@ -118,26 +132,10 @@ void uart0_puts(const char *s)
 
 void uart0_put_u32(uint32_t v)
 {
-    char buf[12];
-    int i = 0;
-    if (v == 0u) {
-        uart0_putc('0');
-        return;
-    }
-    while (v > 0u && i < 11) {
-        buf[i++] = (char)('0' + (v % 10u));
-        v /= 10u;
-    }
-    while (i > 0) {
-        uart0_putc(buf[--i]);
-    }
+    fmt_u32(uart0_putc, v);
 }
 
 void uart0_put_hex(uint32_t v)
 {
-    static const char hex[] = "0123456789ABCDEF";
-    uart0_puts("0x");
-    for (int shift = 28; shift >= 0; shift -= 4) {
-        uart0_putc(hex[(v >> shift) & 0xFu]);
-    }
+    fmt_hex(uart0_putc, v);
 }

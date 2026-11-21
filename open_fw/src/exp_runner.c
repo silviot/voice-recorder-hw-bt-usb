@@ -53,6 +53,8 @@ void openfw_exp_set_dmac_ch0_irq(void (*cb)(void))
 {
     if (!cb) {
         nvic_disable_irq(DMAC_IRQ_BASE);
+        OPENFW_DSB();
+        OPENFW_ISB();
         openfw_mmio_wr32(DMAC_CH_IRQ_EN_ADDR(0u), 0u);
         openfw_mmio_clr32(DMAC_CH_CTL_ADDR(0u), DMAC_CTL_CH_EN);
         openfw_mmio_wr32(DMAC_CH_IRQ_STAT_ADDR(0u),
@@ -129,7 +131,7 @@ int openfw_exp_write(uint32_t off, const uint8_t *data, uint32_t len)
 
 int openfw_exp_run(uint32_t entry_off, uint32_t arg, openfw_exp_result_t *out)
 {
-    if ((entry_off & ~1u) >= OPENFW_EXP_ARENA_SIZE) {
+    if (g_exp_loaded_size == 0u || (entry_off & ~1u) >= OPENFW_EXP_ARENA_SIZE) {
         return -1;
     }
     if (!g_exp_api_ready) {
@@ -211,7 +213,7 @@ void openfw_exp_get_last_result(openfw_exp_result_t *out)
 
 int openfw_exp_mem_read(uint32_t addr, uint8_t *dst, uint32_t len)
 {
-    if (!dst || len == 0u || len > 64u) {
+    if (!dst || len == 0u || len > 64u || addr > (0xFFFFFFFFu - len)) {
         return -1;
     }
 #ifdef OPENFW_HOST_MMIO
@@ -265,12 +267,9 @@ int openfw_exp_mem_read(uint32_t addr, uint8_t *dst, uint32_t len)
 #endif
 }
 
-int openfw_exp_sd_write_file(const char *dir, const char *name, const void *data, uint32_t len)
+static int exp_sd_open_for_overwrite(const char *dir, const char *name, exfat_writer_t *w)
 {
     if (!g_exp_vol || !g_exp_sd_mounted || !(*g_exp_sd_mounted) || !name || name[0] == '\0') {
-        return -1;
-    }
-    if (len > 0u && !data) {
         return -1;
     }
 
@@ -299,7 +298,10 @@ int openfw_exp_sd_write_file(const char *dir, const char *name, const void *data
     path[pos] = '\0';
 
     exfat_entry_t existing;
-    if (exfat_find_path(g_exp_vol, path, &existing) == 0 && !existing.is_dir) {
+    if (exfat_find_path(g_exp_vol, path, &existing) == 0) {
+        if (existing.is_dir) {
+            return -1;
+        }
         if (exfat_delete_file(g_exp_vol, use_dir, name) != 0) {
             return -1;
         }
@@ -309,8 +311,17 @@ int openfw_exp_sd_write_file(const char *dir, const char *name, const void *data
     rtc_get(&dt);
     exfat_set_timestamp(g_exp_vol, rtc_to_dos_timestamp(&dt));
 
+    return exfat_create_file(g_exp_vol, use_dir, name, w);
+}
+
+int openfw_exp_sd_write_file(const char *dir, const char *name, const void *data, uint32_t len)
+{
+    if (len > 0u && !data) {
+        return -1;
+    }
+
     exfat_writer_t w;
-    if (exfat_create_file(g_exp_vol, use_dir, name, &w) != 0) {
+    if (exp_sd_open_for_overwrite(dir, name, &w) != 0) {
         return -1;
     }
     if (len > 0u && exfat_write(&w, data, len) != 0) {
@@ -323,28 +334,32 @@ int openfw_exp_sd_write_file(const char *dir, const char *name, const void *data
 int openfw_exp_sd_dump_log(const char *name)
 {
     const char *fname = (name && name[0] != '\0') ? name : "exp.log";
-    if (!g_exp_vol || !g_exp_sd_mounted || !(*g_exp_sd_mounted)) {
-        return -1;
-    }
     if (g_openfw_log.magic != OPENFW_LOG_MAGIC || g_openfw_log.size != OPENFW_LOG_SIZE) {
         return -1;
     }
 
-    char ordered[OPENFW_LOG_SIZE];
-    uint32_t out_len = 0u;
-    uint32_t widx = g_openfw_log.write_idx;
-    if (widx <= OPENFW_LOG_SIZE) {
-        for (uint32_t i = 0u; i < widx; i++) {
-            ordered[i] = g_openfw_log.buf[i];
-        }
-        out_len = widx;
-    } else {
-        uint32_t start = widx & (OPENFW_LOG_SIZE - 1u);
-        for (uint32_t i = 0u; i < OPENFW_LOG_SIZE; i++) {
-            ordered[i] = g_openfw_log.buf[(start + i) & (OPENFW_LOG_SIZE - 1u)];
-        }
-        out_len = OPENFW_LOG_SIZE;
+    exfat_writer_t w;
+    if (exp_sd_open_for_overwrite("/", fname, &w) != 0) {
+        return -1;
     }
 
-    return openfw_exp_sd_write_file("/", fname, ordered, out_len);
+    uint32_t widx = g_openfw_log.write_idx;
+    int rc = 0;
+    if (widx <= OPENFW_LOG_SIZE) {
+        if (widx > 0u) {
+            rc = exfat_write(&w, g_openfw_log.buf, widx);
+        }
+    } else {
+        uint32_t start     = widx & (OPENFW_LOG_SIZE - 1u);
+        uint32_t first_len = OPENFW_LOG_SIZE - start;
+        rc = exfat_write(&w, &g_openfw_log.buf[start], first_len);
+        if (rc == 0 && start > 0u) {
+            rc = exfat_write(&w, &g_openfw_log.buf[0], start);
+        }
+    }
+    if (rc != 0) {
+        (void)exfat_close_file(&w);
+        return -1;
+    }
+    return exfat_close_file(&w);
 }

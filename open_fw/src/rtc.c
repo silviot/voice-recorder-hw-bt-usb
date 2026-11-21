@@ -29,7 +29,8 @@ void rtc_read_raw(uint32_t *date_reg, uint32_t *time_reg)
 
 void rtc_ensure_running(void)
 {
-    while ((int32_t)openfw_mmio_rd32(AON_CLK_CFG_ADDR) < 0) {
+    uint32_t wait = 100000u;
+    while ((int32_t)openfw_mmio_rd32(AON_CLK_CFG_ADDR) < 0 && --wait > 0u) {
     }
     openfw_mmio_rmw32(AON_CLK_CFG_ADDR, 0x0001F000u, (0x18u << 12));
     (void)openfw_mmio_rd32(AON_CLK_STAT_ADDR);
@@ -61,20 +62,30 @@ void rtc_set(const rtc_datetime_t *dt)
         return;
     }
     uint32_t y_full = dt->year;
-    uint32_t y_off  = (y_full >= 2000u) ? (y_full - 2000u) : 0u;
+    if (y_full < 2000u) {
+        y_full = 2000u;
+    } else if (y_full > 2127u) {
+        y_full = 2127u;
+    }
+    uint32_t y_off   = y_full - 2000u;
+    uint32_t m_val   = (dt->month >= 1u && dt->month <= 12u) ? dt->month : 1u;
+    uint32_t d_val   = (dt->day >= 1u && dt->day <= 31u) ? dt->day : 1u;
     uint32_t is_leap = ((y_full % 4u == 0u && y_full % 100u != 0u) ||
                         (y_full % 400u == 0u)) ? 1u : 0u;
 
     /* Kim Larsen weekday (0 = Mon .. 6 = Sun) */
     uint32_t yw = y_full;
-    uint32_t mw = dt->month;
+    uint32_t mw = m_val;
     if (mw <= 2u) {
         mw += 12u;
         yw -= 1u;
     }
-    uint32_t wday = (dt->day + 2u * mw + (3u * (mw + 1u)) / 5u +
+    uint32_t wday = (d_val + 2u * mw + (3u * (mw + 1u)) / 5u +
                      yw + yw / 4u - yw / 100u + yw / 400u) % 7u;
 
+    /* Halt RTC counter across TIME + DATE writes for atomic update */
+    uint32_t ctrl = openfw_mmio_rd32(AON_RTC_CTRL_ADDR);
+    openfw_mmio_wr32(AON_RTC_CTRL_ADDR, ctrl | (1u << 8));
     openfw_mmio_wr32(RTC_TIME_ADDR,
                      ((wday & 0x07u) << 24)
                    | (((uint32_t)dt->hour   & 0x1Fu) << 16)
@@ -83,8 +94,9 @@ void rtc_set(const rtc_datetime_t *dt)
     openfw_mmio_wr32(RTC_DATE_ADDR,
                      (is_leap << 24)
                    | ((y_off & 0x7Fu) << 16)
-                   | (((uint32_t)dt->month & 0x0Fu) << 8)
-                   | ((uint32_t)dt->day    & 0x1Fu));
+                   | ((m_val & 0x0Fu) << 8)
+                   | (d_val & 0x1Fu));
+    openfw_mmio_wr32(AON_RTC_CTRL_ADDR, ctrl & ~(1u << 8));
 }
 
 uint32_t rtc_to_dos_timestamp(const rtc_datetime_t *dt)
@@ -94,7 +106,10 @@ uint32_t rtc_to_dos_timestamp(const rtc_datetime_t *dt)
         dt->minute > 59u || dt->second > 59u) {
         return 0x5C210000u; /* Valid fallback: 2026-01-01 00:00:00 */
     }
-    uint32_t yr = (uint32_t)(dt->year - 1980u) & 0x7Fu;
+    uint32_t yr = (uint32_t)(dt->year - 1980u);
+    if (yr > 127u) {
+        yr = 127u; /* Clamp to 2107 instead of wrapping */
+    }
     return (yr << 25)
          | ((uint32_t)dt->month << 21)
          | ((uint32_t)dt->day << 16)

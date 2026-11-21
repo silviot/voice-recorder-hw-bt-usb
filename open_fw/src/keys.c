@@ -112,7 +112,9 @@ void keys_init(void)
     /* Release SARADC reset & enable clock (CRU bank 2 bit 20 = ID 0x54) */
     openfw_mmio_set32(CRU_SARADC_RST_ADDR, 1u << 20);
     openfw_mmio_set32(CRU_SARADC_CLK_ADDR, 1u << 20);
-    while ((openfw_mmio_rd32(CRU_SARADC_CLK_ADDR) & (1u << 20)) == 0u) {
+    for (uint32_t wait = 0u;
+         wait < 100000u && (openfw_mmio_rd32(CRU_SARADC_CLK_ADDR) & (1u << 20)) == 0u;
+         wait++) {
     }
 
     /* Configure continuous polling scan on ch1 (0x40096034) */

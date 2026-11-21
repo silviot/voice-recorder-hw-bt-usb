@@ -230,6 +230,17 @@ int cwx_next_word(cwx_stream_t *s, cwx_word_t *out)
     return 1;
 }
 
+static void cwx_reverse_words(cwx_word_t *arr, uint32_t lo, uint32_t hi)
+{
+    while (lo < hi) {
+        cwx_word_t tmp = arr[lo];
+        arr[lo]        = arr[hi];
+        arr[hi]        = tmp;
+        lo++;
+        hi--;
+    }
+}
+
 int cwx_read_window(cwx_stream_t *s,
                     uint32_t pos_ms,
                     cwx_word_t *out_words,
@@ -251,6 +262,7 @@ int cwx_read_window(cwx_stream_t *s,
         return -1;
     }
 
+    uint32_t head       = 0u;
     uint32_t count      = 0u;
     uint32_t after_best = 0u;
     uint32_t lookahead  = (max_words > 2u) ? (max_words / 2u) : 1u;
@@ -271,19 +283,26 @@ int cwx_read_window(cwx_stream_t *s,
         }
 
         if (count == max_words) {
-            if (best_idx == 0) {
+            if (best_idx == 0 && !take_best) {
                 break;
             }
-            for (uint32_t i = 1u; i < max_words; i++) {
-                out_words[i - 1u] = out_words[i];
+            head++;
+            if (head == max_words) {
+                head = 0u;
             }
             count--;
             if (best_idx > 0) {
                 best_idx--;
+            } else if (best_idx == 0) {
+                best_idx = -1;
             }
         }
 
-        out_words[count] = cur;
+        uint32_t slot = head + count;
+        if (slot >= max_words) {
+            slot -= max_words;
+        }
+        out_words[slot] = cur;
         if (take_best) {
             best_idx   = (int)count;
             best_exact = is_exact;
@@ -294,16 +313,23 @@ int cwx_read_window(cwx_stream_t *s,
         count++;
 
         if (best_idx >= 0 && after_best >= lookahead &&
-            (count >= max_words || cur.start_ms > (pos_ms + 2500u))) {
+            (count >= max_words || (cur.start_ms > pos_ms && (cur.start_ms - pos_ms) > 2500u))) {
             break;
         }
         if (best_idx < 0 && count >= 1u &&
-            (count >= max_words || cur.start_ms > (pos_ms + 5000u))) {
+            (count >= max_words || (cur.start_ms > pos_ms && (cur.start_ms - pos_ms) > 5000u))) {
             break;
         }
     }
     if (rc < 0) {
         return -1;
+    }
+
+    /* Unwrap circular buffer in-place via 3 reversals when head rotated */
+    if (head != 0u && count > 1u) {
+        cwx_reverse_words(out_words, 0u, head - 1u);
+        cwx_reverse_words(out_words, head, count - 1u);
+        cwx_reverse_words(out_words, 0u, count - 1u);
     }
 
     if (out_active_idx) {

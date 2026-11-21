@@ -19,6 +19,7 @@ extern uint32_t _sbss, _ebss;
 extern int openfw_main(void);
 
 volatile uint32_t g_systick_ms = 0;
+volatile uint8_t  g_openfw_boot_strike_counted = 0u;
 
 void _start(void);
 void reset_c_entry(void);
@@ -75,34 +76,6 @@ static void ram_pmu_write_reg(uint8_t reg, uint8_t val)
     }
 }
 
-__attribute__((section(".ramtext"), noinline, noreturn))
-static void ram_soc_wdt_reset(void)
-{
-    /* Exact HLKJ 0x008284D6 clock/PLL teardown to HOSC from SRAM (Q14 verified) */
-    REG32(0x40080040u) &= ~0x03u;
-    REG32(0x40080048u) &= ~0x03u;
-    REG32(0x400800A0u) &= ~0x30u;
-    for (volatile uint32_t i = 0u; i < 32u; i++) {
-        __asm__ volatile ("nop");
-    }
-    REG32(0x40080030u) &= ~0x70u;
-    REG32(0x40080010u) &= ~0xC0000000u;
-    REG32(0x40080000u) &= ~0xC0010000u;
-    REG32(0x400800FCu) &= ~0x10u;
-
-    REG32(AON_WDT_PMU_RST_CMD_ADDR) = 0u;
-    REG32(AON_WDT_RST_CTL_ADDR) &= ~0x02u;
-    REG32(WDT_CFG_ADDR) = 0u;
-    REG32(WDT_EN_ADDR) |= 1u;
-    REG32(WDT_MODE_ADDR) = WDT_MODE_HW_RESET;
-    REG32(WDT_CFG_ADDR) = 0x01u;
-    __asm__ volatile ("dsb" ::: "memory");
-    /* Wait purely for SoC WDT digital reset (~1 s); never hit SCB_AIRCR on silicon */
-    while (1) {
-        __asm__ volatile ("nop");
-    }
-}
-
 __attribute__((section(".ramtext"), used, noreturn))
 void fault_handler_c(const uint32_t *frame, uint32_t ipsr)
 {
@@ -111,14 +84,16 @@ void fault_handler_c(const uint32_t *frame, uint32_t ipsr)
     uint32_t faddr = (uint32_t)(uintptr_t)frame;
     uint32_t lr    = 0xDEAD57ACu;
     uint32_t pc    = 0xDEAD57ACu;
-    if ((faddr & 3u) == 0u && faddr >= 0x00800000u && faddr <= 0x0086B000u) {
+    if ((faddr & 3u) == 0u && faddr >= 0x00800000u && faddr <= (0x0086AC08u - 28u)) {
         lr = frame[5];
         pc = frame[6];
     }
 
     uint32_t cfsr   = SCB_CFSR;
     uint32_t hfsr   = SCB_HFSR;
-    uint32_t bfar   = (cfsr & (1u << 15)) ? SCB_BFAR : hfsr;
+    uint32_t far    = (cfsr & (1u << 15)) ? SCB_BFAR
+                    : (cfsr & (1u << 7))  ? SCB_MMFAR
+                    : hfsr;
     uint32_t in_exp = (g_exp_running != 0u) ? 1u : 0u;
     g_exp_running   = 0u;
 
@@ -127,13 +102,15 @@ void fault_handler_c(const uint32_t *frame, uint32_t ipsr)
     AON_BACKUP(1u) = pc;
     AON_BACKUP(2u) = lr;
     AON_BACKUP(3u) = cfsr;
-    AON_BACKUP(4u) = bfar;
+    AON_BACKUP(4u) = far;
     AON_BACKUP(5u) = in_exp;
 
     if (!in_exp) {
         uint32_t b7      = AON_BACKUP(7u);
         uint32_t strikes = ((b7 & 0xFFFF0000u) == OPENFW_BOOT_STRIKE_MAGIC) ? (b7 & 0xFFFFu) : 0u;
-        strikes++;
+        if (!g_openfw_boot_strike_counted) {
+            strikes++;
+        }
         if (strikes >= OPENFW_BOOT_MAX_STRIKES) {
             AON_BACKUP(7u) = 0u;
             ram_pmu_write_reg(0x23u, (uint8_t)(ram_pmu_read_reg(0x23u) | 0xC0u));
@@ -144,7 +121,10 @@ void fault_handler_c(const uint32_t *frame, uint32_t ipsr)
     }
 
     __asm__ volatile ("dsb" ::: "memory");
-    ram_soc_wdt_reset();
+    system_reboot();
+    while (1) {
+        __asm__ volatile ("nop");
+    }
 }
 
 __attribute__((section(".ramtext"), naked, used))
@@ -177,17 +157,15 @@ void SysTick_Handler(void)
         AON_BACKUP(4u) = 0u;
         AON_BACKUP(5u) = 1u;
         __asm__ volatile ("dsb" ::: "memory");
-        ram_soc_wdt_reset();
+        system_reboot();
     }
     keys_scan_tick(now);
 }
 
-__attribute__((section(".ramtext")))
+__attribute__((section(".ramtext"), naked, used))
 void Default_Handler(void)
 {
-    while (1) {
-        __asm__ volatile ("wfi");
-    }
+    __asm__ volatile ("b.w Fault_Handler_Asm\n");
 }
 
 __attribute__((section(".text.entry"), naked, used))
@@ -309,6 +287,13 @@ void reset_c_entry(void)
         *dst = 0u;
     }
 
+    /* Ensure no stale SysTick or NVIC interrupts fire when IRQs are enabled */
+    SYSTICK_CSR = 0u;
+    for (uint32_t i = 0u; i < 8u; i++) {
+        NVIC_ICER(i) = 0xFFFFFFFFu;
+        NVIC_ICPR(i) = 0xFFFFFFFFu;
+    }
+
     /* Enable interrupts (Stage-1 entered with cpsid i) */
     __asm__ volatile ("dsb\nisb\ncpsie i");
 
@@ -316,46 +301,79 @@ void reset_c_entry(void)
 
     /* Reboot cleanly if main ever returns */
     __asm__ volatile ("cpsid i\ndsb" ::: "memory");
-    ram_soc_wdt_reset();
+    system_reboot();
+    while (1) {
+        __asm__ volatile ("nop");
+    }
 }
 
 /* Bare-metal ARM EABI memory helpers emitted by Clang for struct copies */
-void __aeabi_memcpy(void *dst, const void *src, uint32_t n)
+void __aeabi_memcpy4(void *dst, const void *src, uint32_t n)
 {
-    uint8_t *d = (uint8_t *)dst;
-    const uint8_t *s = (const uint8_t *)src;
+    uint32_t *dw = (uint32_t *)dst;
+    const uint32_t *sw = (const uint32_t *)src;
+    while (n >= 4u) {
+        *dw++ = *sw++;
+        n -= 4u;
+    }
+    uint8_t *d = (uint8_t *)dw;
+    const uint8_t *s = (const uint8_t *)sw;
     while (n-- > 0u) {
         *d++ = *s++;
     }
 }
 
-void __aeabi_memcpy4(void *dst, const void *src, uint32_t n)
+void __aeabi_memcpy(void *dst, const void *src, uint32_t n)
 {
-    __aeabi_memcpy(dst, src, n);
+    uint8_t *d = (uint8_t *)dst;
+    const uint8_t *s = (const uint8_t *)src;
+    if (n >= 4u && (((uintptr_t)d ^ (uintptr_t)s) & 3u) == 0u) {
+        while (((uintptr_t)d & 3u) != 0u) {
+            *d++ = *s++;
+            n--;
+        }
+        __aeabi_memcpy4(d, s, n);
+        return;
+    }
+    while (n-- > 0u) {
+        *d++ = *s++;
+    }
 }
 
 void __aeabi_memcpy8(void *dst, const void *src, uint32_t n)
 {
-    __aeabi_memcpy(dst, src, n);
+    __aeabi_memcpy4(dst, src, n);
+}
+
+void __aeabi_memset4(void *dst, uint32_t n, int c)
+{
+    uint8_t v = (uint8_t)c;
+    uint32_t w = (uint32_t)v * 0x01010101u;
+    uint32_t *dw = (uint32_t *)dst;
+    while (n >= 4u) {
+        *dw++ = w;
+        n -= 4u;
+    }
+    uint8_t *d = (uint8_t *)dw;
+    while (n-- > 0u) {
+        *d++ = v;
+    }
 }
 
 void __aeabi_memset(void *dst, uint32_t n, int c)
 {
     uint8_t *d = (uint8_t *)dst;
     uint8_t v = (uint8_t)c;
-    while (n-- > 0u) {
+    while (n > 0u && ((uintptr_t)d & 3u) != 0u) {
         *d++ = v;
+        n--;
     }
-}
-
-void __aeabi_memset4(void *dst, uint32_t n, int c)
-{
-    __aeabi_memset(dst, n, c);
+    __aeabi_memset4(d, n, c);
 }
 
 void __aeabi_memset8(void *dst, uint32_t n, int c)
 {
-    __aeabi_memset(dst, n, c);
+    __aeabi_memset4(dst, n, c);
 }
 
 void __aeabi_memclr(void *dst, uint32_t n)
@@ -365,12 +383,12 @@ void __aeabi_memclr(void *dst, uint32_t n)
 
 void __aeabi_memclr4(void *dst, uint32_t n)
 {
-    __aeabi_memset(dst, n, 0);
+    __aeabi_memset4(dst, n, 0);
 }
 
 void __aeabi_memclr8(void *dst, uint32_t n)
 {
-    __aeabi_memset(dst, n, 0);
+    __aeabi_memset4(dst, n, 0);
 }
 
 /* Bare-metal 64-bit integer division helpers (ARM EABI: q in r0:r1, r in r2:r3) */
@@ -413,15 +431,15 @@ static void aeabi_ldivmod_c(int64_t num, int64_t den, aeabi_uldiv_t *out)
     uint64_t ud = (den < 0) ? (uint64_t)(-(den + 1)) + 1ull : (uint64_t)den;
     uint64_t r = 0ull;
     uint64_t q = udivmod64(un, ud, &r);
-    out->q = neg_q ? (uint64_t)(-(int64_t)q) : q;
-    out->r = neg_r ? (uint64_t)(-(int64_t)r) : r;
+    out->q = neg_q ? (0ull - q) : q;
+    out->r = neg_r ? (0ull - r) : r;
 }
 
 __attribute__((naked))
 void __aeabi_uldivmod(void)
 {
     __asm__ volatile (
-        "push {lr}\n"
+        "push {r4, lr}\n"
         "sub sp, sp, #24\n"
         "add r12, sp, #8\n"
         "str r12, [sp, #0]\n"
@@ -431,7 +449,7 @@ void __aeabi_uldivmod(void)
         "ldr r2, [sp, #16]\n"
         "ldr r3, [sp, #20]\n"
         "add sp, sp, #24\n"
-        "pop {pc}\n"
+        "pop {r4, pc}\n"
     );
 }
 
@@ -439,7 +457,7 @@ __attribute__((naked))
 void __aeabi_ldivmod(void)
 {
     __asm__ volatile (
-        "push {lr}\n"
+        "push {r4, lr}\n"
         "sub sp, sp, #24\n"
         "add r12, sp, #8\n"
         "str r12, [sp, #0]\n"
@@ -449,6 +467,6 @@ void __aeabi_ldivmod(void)
         "ldr r2, [sp, #16]\n"
         "ldr r3, [sp, #20]\n"
         "add sp, sp, #24\n"
-        "pop {pc}\n"
+        "pop {r4, pc}\n"
     );
 }

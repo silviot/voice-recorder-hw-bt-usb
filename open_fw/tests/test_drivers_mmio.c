@@ -781,6 +781,11 @@ static void test_wdt_timer(void)
     systick_init(192000000u);
     assert(g_soc.systick_rvr == 191999u);
     assert(g_soc.systick_csr == 0x7u);
+    systick_init(0u);
+    assert(g_soc.systick_rvr == 1u);
+    systick_init(500u);
+    assert(g_soc.systick_rvr == 1u);
+    systick_init(192000000u);
     g_systick_ms = 4242u;
     assert(millis() == 4242u);
 
@@ -853,6 +858,8 @@ static void test_uart_and_log_ring(void)
     /* PD0-safe openfw_log_puts appends to SRAM ring without touching UART0 MMIO */
     uint32_t tx_before   = g_soc.uart0_tx_len;
     uint32_t drop_before = g_openfw_log.dropped_bytes;
+    uart0_puts(NULL);
+    assert(g_soc.uart0_tx_len == tx_before);
     openfw_log_puts("SRAM_ONLY");
     assert(g_soc.uart0_tx_len == tx_before);
     assert(g_openfw_log.dropped_bytes == drop_before);
@@ -891,6 +898,18 @@ static void test_rtc_driver(void)
     assert(got.weekday == 3u);
     uint32_t dos = rtc_to_dos_timestamp(&got);
     assert(((dos >> 25) + 1980u) == 2026u && ((dos >> 21) & 0xFu) == 11u && ((dos >> 16) & 0x1Fu) == 19u);
+
+    /* rtc_to_dos_timestamp year clamp (>2107 clamps to 127 = 2107 instead of wrapping) */
+    rtc_datetime_t future = { 2120u, 6u, 15u, 0u, 12u, 0u, 0u };
+    uint32_t dos_hi = rtc_to_dos_timestamp(&future);
+    assert((dos_hi >> 25) == 127u && ((dos_hi >> 21) & 0xFu) == 6u && ((dos_hi >> 16) & 0x1Fu) == 15u);
+
+    /* rtc_set year=0 clamps safely to 2000 (no uint32 underflow) and releases HALT bit */
+    rtc_datetime_t zero_yr = { 0u, 1u, 1u, 0u, 0u, 0u, 0u };
+    rtc_set(&zero_yr);
+    assert((g_soc.aon_rtc_ctrl & (1u << 8)) == 0u);
+    rtc_get(&got);
+    assert(got.year == 2000u && got.month == 1u && got.day == 1u && got.weekday == 5u);
 
     rtc_set_alarm0_seconds(10u);
     assert(g_soc.rtc_alarm0_val == 9u && g_soc.rtc_alarm0_ctrl == 1u);
@@ -987,6 +1006,23 @@ static void test_pmu_driver(void)
     assert(power_button_update(KEY_ONOFF_LONG, 10000u, 0, &progress) == POWER_BUTTON_PROGRESS);
     assert(power_button_update(KEY_ONOFF_PRESS, 10500u, 0, &progress) == POWER_BUTTON_PROGRESS);
     assert(power_button_update(0, 11000u, 0, &progress) == POWER_BUTTON_SHUTDOWN);
+
+    /* Delayed poll after button release (held >= 2000 ms without KEY_ONOFF_LONG) must NOT shutdown */
+    assert(power_button_update(KEY_ONOFF_PRESS, 12000u, 0, &progress) == POWER_BUTTON_IDLE);
+    assert(power_button_update(KEY_ONOFF_RELEASE, 14500u, 0, &progress) == POWER_BUTTON_CANCEL);
+    assert(power_button_update(0u, 14600u, 0, &progress) == POWER_BUTTON_IDLE);
+
+    /* NULL progress pointer must not dereference */
+    assert(power_button_update(KEY_ONOFF_PRESS, 20000u, 0, NULL) == POWER_BUTTON_IDLE);
+    assert(power_button_update(0u, 20500u, 0, NULL) == POWER_BUTTON_PROGRESS);
+    assert(power_button_update(0u, 22100u, 0, NULL) == POWER_BUTTON_PROGRESS);
+    assert(power_button_update(KEY_ONOFF_RELEASE, 22200u, 0, NULL) == POWER_BUTTON_SHUTDOWN);
+
+    /* KEY_ONOFF_LONG when !down still arms shutdown and finishes cleanly on release */
+    progress = 0u;
+    assert(power_button_update(KEY_ONOFF_LONG, 30000u, 0, &progress) == POWER_BUTTON_PROGRESS);
+    assert(progress == 100u);
+    assert(power_button_update(KEY_ONOFF_RELEASE, 30100u, 0, &progress) == POWER_BUTTON_SHUTDOWN);
 
     /* Unattended always-on PMU init + charge management */
     g_soc.pmu_regs[0x00u] = 0xCFu;
@@ -1147,6 +1183,78 @@ static void test_keys_driver(void)
     assert(keys_state(NULL) == KEY_ENTER);
 
     printf("[OK] keys SARADC + PB6/PB11 + 1kHz scanner/debounce/SPSC MMIO\n");
+}
+
+static int exp_test_blk_read(void *ctx, uint32_t lba, uint32_t count, void *buf)
+{
+    uint8_t *img = (uint8_t *)ctx;
+    if (lba + count > 4096u) return -1;
+    memcpy(buf, img + (size_t)lba * 512u, (size_t)count * 512u);
+    return 0;
+}
+
+static int exp_test_blk_write(void *ctx, uint32_t lba, uint32_t count, const void *buf)
+{
+    uint8_t *img = (uint8_t *)ctx;
+    if (lba + count > 4096u) return -1;
+    memcpy(img + (size_t)lba * 512u, buf, (size_t)count * 512u);
+    return 0;
+}
+
+static void test_exp_runner_guards(const char *exfat_img_path)
+{
+    soc_reset();
+
+    /* Reject openfw_exp_run() before any payload is loaded */
+    openfw_exp_result_t res;
+    assert(openfw_exp_run(0u, 0u, &res) == -1);
+
+    /* Reject address+len 32-bit wraparound in openfw_exp_mem_read() */
+    uint8_t mbuf[8];
+    assert(openfw_exp_mem_read(0xFFFFFFFEu, mbuf, 4u) == -1);
+    assert(openfw_exp_mem_read(0xFFFFFFFFu, mbuf, 1u) == -1);
+
+    /* Disabling DMAC CH0 IRQ emits DSB barrier */
+    uint32_t dsb_before = g_soc.dsb_count;
+    openfw_exp_set_dmac_ch0_irq(NULL);
+    assert(g_soc.dsb_count > dsb_before);
+
+    /* Directory collision rejection & wrapped ring log dump (zero 4 KiB stack copy) */
+    uint8_t *img = (uint8_t *)calloc(4096u, 512u);
+    assert(img != NULL);
+    FILE *f = fopen(exfat_img_path, "rb");
+    assert(f != NULL);
+    assert(fread(img, 512u, 4096u, f) == 4096u);
+    fclose(f);
+
+    blkdev_t dev = { exp_test_blk_read, exp_test_blk_write, 4096u, img };
+    exfat_vol_t vol;
+    assert(exfat_mount(&vol, &dev) == 0);
+    int mounted = 1;
+    openfw_exp_bind_fs(&vol, &mounted);
+
+    assert(exfat_mkdir(&vol, "COLLIDE") == 0);
+    assert(openfw_exp_sd_write_file("/", "COLLIDE", "abc", 3u) == -1);
+    assert(openfw_exp_sd_write_file("/", "exp_ok.txt", "xyz", 3u) == 0);
+
+    openfw_log_reset();
+    for (uint32_t i = 0u; i < OPENFW_LOG_SIZE + 123u; i++) {
+        openfw_log_putc((char)('A' + (i % 26u)));
+    }
+    assert(openfw_exp_sd_dump_log("wrapped.log") == 0);
+
+    exfat_entry_t lent;
+    assert(exfat_find_path(&vol, "/wrapped.log", &lent) == 0 && lent.size == OPENFW_LOG_SIZE);
+    uint8_t log_rb[OPENFW_LOG_SIZE];
+    uint32_t got = 0u;
+    assert(exfat_read_file(&vol, &lent, 0u, log_rb, OPENFW_LOG_SIZE, &got) == 0 && got == OPENFW_LOG_SIZE);
+    for (uint32_t i = 0u; i < OPENFW_LOG_SIZE; i++) {
+        assert(log_rb[i] == (uint8_t)('A' + ((123u + i) % 26u)));
+    }
+
+    openfw_exp_bind_fs(NULL, NULL);
+    free(img);
+    printf("[OK] exp_runner guards + wrapped log dump MMIO\n");
 }
 
 static void test_lcd_driver(void)
@@ -1579,8 +1687,9 @@ int main(int argc, char **argv)
     test_rtc_driver();
     test_pmu_driver();
     test_keys_driver();
+    test_exp_runner_guards(argv[1]);
     test_lcd_driver();
     test_sdio_exfat_and_usb_msc(argv[1]);
-    printf("ALL 7 MMIO DRIVER SUITES PASSED\n");
+    printf("ALL 8 MMIO DRIVER SUITES PASSED\n");
     return 0;
 }
