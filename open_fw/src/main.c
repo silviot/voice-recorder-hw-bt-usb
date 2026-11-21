@@ -61,7 +61,12 @@ static const uint32_t   k_scr_off_ms[5]    = { 15000u, 30000u, 60000u, 300000u, 
 #endif
 static uint8_t          g_cur_bl_pct       = 255u;
 static uint32_t         g_last_activity_ms = 0u;
-static int              g_screen_off       = 0;
+enum screen_sleep_state {
+    SCREEN_AWAKE,
+    SCREEN_IDLE_TIMEOUT,
+    SCREEN_MANUALLY_OFF
+};
+static enum screen_sleep_state g_screen_off = SCREEN_AWAKE;
 static uint32_t         g_toast_until_ms   = 0u;
 
 static void clear_boot_strikes_once(void)
@@ -102,13 +107,13 @@ static void backlight_apply(uint8_t pct)
 static void backlight_wake(uint32_t now_ms)
 {
     g_last_activity_ms = now_ms;
-    g_screen_off       = 0;
+    g_screen_off       = SCREEN_AWAKE;
     backlight_apply(user_bl_pct());
 }
 
-static void backlight_sleep_now(void)
+static void backlight_sleep_now(enum screen_sleep_state reason)
 {
-    g_screen_off = 1;
+    g_screen_off = reason;
     backlight_apply(0u);
     ui_render_screen(UI_SCR_OFF, &g_ui);
 }
@@ -125,7 +130,7 @@ int ui_poll_power_button(ui_screen_id_t screen, ui_model_t *model, uint32_t now)
                                                            g_screen_off, &progress);
         switch (action) {
         case POWER_BUTTON_SLEEP:
-            backlight_sleep_now();
+            backlight_sleep_now(SCREEN_MANUALLY_OFF);
             break;
         case POWER_BUTTON_WAKE:
         case POWER_BUTTON_CANCEL:
@@ -178,7 +183,7 @@ static void backlight_update(void)
     /* A queued key may have arrived after the main loop sampled its clock. */
     uint32_t idle_ms = millis() - g_last_activity_ms;
     if (idle_ms >= off_ms) {
-        backlight_sleep_now();
+        backlight_sleep_now(SCREEN_IDLE_TIMEOUT);
     } else if (off_ms >= 20000u && idle_ms >= (off_ms / 2u)) {
         uint8_t u = user_bl_pct();
         uint8_t dim = (u < 15u) ? u : 15u;
@@ -682,15 +687,16 @@ static int run_usb_msc_mode(int auto_mode)
             if (rxp > 0u || txp > 0u || now >= 3000u) {
                 clear_boot_strikes_once();
             }
+            if ((txp != prev_txp || rxp != prev_rxp) && g_screen_off != SCREEN_MANUALLY_OFF) {
+                backlight_wake(now);
+            }
             if (txp != prev_txp) {
                 prev_txp       = txp;
                 rd_blink_until = now + 250u;
-                backlight_wake(now);
             }
             if (rxp != prev_rxp) {
                 prev_rxp       = rxp;
                 wr_blink_until = now + 250u;
-                backlight_wake(now);
             }
             backlight_update();
 
@@ -797,7 +803,9 @@ static void run_bt_xrec_mode(void)
                 prev_tx  = st.tx_acl_pkts;
                 prev_acl = st.acl_connected;
                 prev_spp = st.spp_open;
-                backlight_wake(now);
+                if (g_screen_off != SCREEN_MANUALLY_OFF) {
+                    backlight_wake(now);
+                }
             }
             backlight_update();
 
@@ -1564,7 +1572,7 @@ int openfw_main(void)
                 case UI_SCR_REC:
                     if (rising) {
                         if (key == KEY_BACK) {
-                            backlight_sleep_now();
+                            backlight_sleep_now(SCREEN_MANUALLY_OFF);
                         } else if (key == KEY_ENTER && rec_active) {
                             ui_spec_drop_marker(&g_spec);
                             g_ui.rec_markers++;
