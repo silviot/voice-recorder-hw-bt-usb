@@ -94,6 +94,13 @@ uint8_t key_onoff_poll(void)
 {
     uint8_t st = pmu_read_reg(0x31u);
     uint8_t ev = 0u;
+    if (st & 0x70u) {
+        openfw_log_puts("KEY_ONOFF ");
+        openfw_log_u32(millis());
+        openfw_log_putc(' ');
+        openfw_log_hex(st);
+        openfw_log_putc('\n');
+    }
     if (st != 0u) {
         pmu_write_reg(0x31u, st); /* W1C */
         if (st & 0x40u) {
@@ -117,7 +124,7 @@ power_button_action_t power_button_update(uint8_t events, uint32_t now, int scre
     static int down, woke_screen, shutdown_armed;
     static uint32_t pressed_at, armed_at;
     int wake = 0;
-    if (events & KEY_ONOFF_PRESS) {
+    if (!down && (events & (KEY_ONOFF_PRESS | KEY_ONOFF_LONG))) {
         down = 1;
         pressed_at = now;
         shutdown_armed = 0;

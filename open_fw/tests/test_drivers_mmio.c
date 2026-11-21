@@ -971,6 +971,11 @@ static void test_pmu_driver(void)
     assert(power_button_update(0, 8000u, 0, &progress) == POWER_BUTTON_PROGRESS);
     assert(power_button_update(0, 9000u, 0, &progress) == POWER_BUTTON_SHUTDOWN);
 
+    /* The PMU can report a long press before we observe any press edge. */
+    assert(power_button_update(KEY_ONOFF_LONG, 10000u, 0, &progress) == POWER_BUTTON_PROGRESS);
+    assert(power_button_update(KEY_ONOFF_PRESS, 10500u, 0, &progress) == POWER_BUTTON_PROGRESS);
+    assert(power_button_update(0, 11000u, 0, &progress) == POWER_BUTTON_SHUTDOWN);
+
     /* Unattended always-on PMU init + charge management */
     g_soc.pmu_regs[0x00u] = 0xCFu;
     g_soc.pmu_regs[0x17u] = 0x01u;
