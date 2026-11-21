@@ -14,10 +14,12 @@
 #include <stdint.h>
 
 typedef enum {
-    AUDIO_DSP_ASR_RAW       = 0, /* 75 Hz HPF + safety limiter (default for Parakeet/Whistle) */
+    AUDIO_DSP_ASR_RAW       = 0, /* 75 Hz HPF + safety limiter (for speech recognition) */
     AUDIO_DSP_VOICE_CLARITY = 1, /* 350 Hz HPF + 2.2 kHz +9 dB shelf + 2:1 comp + limiter     */
     AUDIO_DSP_BYPASS        = 2, /* Raw ADC samples, no processing                            */
 } audio_dsp_profile_t;
+
+#define AUDIO_DSP_DEFAULT_PROFILE AUDIO_DSP_VOICE_CLARITY
 
 typedef struct {
     float b0, b1, b2, a1, a2;

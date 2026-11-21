@@ -9,7 +9,7 @@
 enum { FRAMES = 16017, SLOT_FRAMES = 1024 };
 static uint8_t recording[44 + FRAMES * 4];
 static unsigned channels, file_size, now_ms, submitted, consumed, gaps;
-static unsigned slots[2], head, count;
+static unsigned slots[AUDIO_DAC_QUEUE_SLOTS], head, count;
 static int ended;
 static int strict = 1;           /* full-drain assertions (plain playback runs) */
 static key_id_t (*key_script)(unsigned ms);
@@ -83,7 +83,7 @@ static void advance(unsigned ms)
         frames -= take;
         consumed += take;
         if (!slots[head]) {
-            head ^= 1;
+            head = (head + 1u) % AUDIO_DAC_QUEUE_SLOTS;
             count--;
         }
     }
@@ -97,14 +97,14 @@ int audio_dac_start(uint32_t rate, uint8_t level)
 }
 int audio_dac_write_stereo(const int16_t *pcm, uint32_t frames)
 {
-    if (count == 2) return 0;
+    if (count == AUDIO_DAC_QUEUE_SLOTS) return 0;
     if (frames > SLOT_FRAMES) frames = SLOT_FRAMES;
     for (unsigned i = 0; strict && i < frames; i++) { /* in-order samples */
         assert(pcm[2*i] == sample(submitted+i, 0));
         assert(pcm[2*i+1] == sample(submitted+i, channels-1));
     }
     submitted += frames;
-    slots[(head + count) % 2] = frames;
+    slots[(head + count) % AUDIO_DAC_QUEUE_SLOTS] = frames;
     count++;
     return (int)frames;
 }
@@ -141,7 +141,7 @@ void ui_render_screen(ui_screen_id_t screen, const ui_model_t *m)
 {
     assert(screen == UI_SCR_PLAYER);
     ended = m->play_state == 2;
-    advance(45);
+    advance(strict ? 150u : 45u);
 }
 void ui_settings_defaults(ui_settings_t *cfg) { cfg->spk_vol = 18; }
 void openfw_mmio_wfi(void) { advance(1); }

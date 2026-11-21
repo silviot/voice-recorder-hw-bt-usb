@@ -437,6 +437,7 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
     uint8_t  peak_r_pct    = 0u;
     int      paused        = 0;
     int      eof_reached   = 0;
+    uint32_t telemetry_ms   = millis() - 1000u;
     uint32_t last_ui_ms    = 0u;
     uint32_t last_vol_ms   = 0u;
     uint32_t toast_until   = 0u;
@@ -585,9 +586,9 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
             ui_dirty     = 1;
         }
 
-        /* Refill PCM decode staging buffer & push to double-buffered DMAC CH0 TX */
+        /* Refill PCM decode staging buffer & fill the DAC queue before doing display work */
         if (!paused && !eof_reached) {
-            for (int iter = 0; iter < 4; iter++) {
+            for (unsigned iter = 0; iter < AUDIO_DAC_QUEUE_SLOTS; iter++) {
                 if (buf_pos >= buf_frames) {
                     if (data_off >= winfo.data_bytes || played_frames >= winfo.total_samples) {
                         if (audio_dac_is_busy()) break;
@@ -691,12 +692,15 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
         if (ui_dirty || (uint32_t)(now - last_ui_ms) >= 120u) {
             last_ui_ms = now;
             ui_dirty   = 0;
-            pmu_poll_charge_manage();
-            rtc_get(&m->now);
-            uint32_t mv = pmu_read_vbat_mv();
-            m->batt_mv    = (uint16_t)mv;
-            m->batt_pct   = vbat_mv_to_pct(mv);
-            m->charging   = (pmu_get_charge_state() == PMU_CHG_CHARGING) ? 1 : 0;
+            if ((uint32_t)(now - telemetry_ms) >= 1000u) {
+                telemetry_ms = now;
+                pmu_poll_charge_manage();
+                rtc_get(&m->now);
+                uint32_t mv = pmu_read_vbat_mv();
+                m->batt_mv    = (uint16_t)mv;
+                m->batt_pct   = vbat_mv_to_pct(mv);
+                m->charging   = (pmu_get_charge_state() == PMU_CHG_CHARGING) ? 1 : 0;
+            }
             m->hp_plugged = hp_in;
 
             uint32_t pos_ms = frames_to_ms(played_frames, winfo.sample_rate);

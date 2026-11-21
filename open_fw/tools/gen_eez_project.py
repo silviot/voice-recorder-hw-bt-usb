@@ -263,11 +263,24 @@ def build_pages() -> list[dict]:
                         "ui_font_sm", COL["text"] if i == 1 else COL["dim"], "CENTER"),
             ],
         ))
+    home_details = []
+    for i, (title, detail) in enumerate([
+        ("Last recording", "Play from start"),
+        ("4 recordings", "18h 20m of space left"),
+        ("Gain 20", "Voice trigger off"),
+        ("Bluetooth file sync", "Device name HW_76"),
+    ]):
+        for row, (text, color) in enumerate([(title, COL["text"]), (detail, COL["dim"])]):
+            ident = f"home_detail_{i}_{row}"
+            home_details.append(w_label(ident, ident, i * 154, row * 12, 154, 12,
+                                        text, "ui_font_sm", color, "CENTER", "DOT"))
     pages.append(make_page("home", COL["bg"], [
         make_status_bar("home", "Fri 20 Nov", "14:32", COL["bar"], COL["dim"]),
         *home_tiles,
-        w_label("home_l1", "home_line1", 3, 55, 154, 12, "4 recordings", "ui_font_sm", COL["text"], "CENTER", "DOT"),
-        w_label("home_l2", "home_line2", 3, 67, 154, 12, "18h 20m of space left", "ui_font_sm", COL["dim"], "CENTER", "DOT"),
+        w_panel("home_focus_mark", "home_focus_mark", 51, 53, 19, 2,
+                bg=COL["cyan"], bg_opa=255, radius=1),
+        w_panel("home_details", "home_details", 3, 55, 154, 24,
+                bg=COL["bg"], bg_opa=255, children=home_details),
     ]))
 
     # 2. Recording (active / VOR wait)

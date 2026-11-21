@@ -756,6 +756,18 @@ static void run_bt_xrec_mode(void)
         bt_xrec_poll();
         recorder_poll();
 
+        /* Keep remote settings when the REC switch hands control to the menu. */
+        if (g_ui.cfg.mic_gain != recorder_get_gain() ||
+            g_ui.cfg.sound_mode != (uint8_t)recorder_get_dsp_profile() ||
+            g_ui.cfg.channels != recorder_get_channels() ||
+            g_ui.cfg.vor_enabled != (uint8_t)recorder_get_vor()) {
+            g_ui.cfg.mic_gain = recorder_get_gain();
+            g_ui.cfg.sound_mode = (uint8_t)recorder_get_dsp_profile();
+            g_ui.cfg.channels = recorder_get_channels();
+            g_ui.cfg.vor_enabled = (uint8_t)recorder_get_vor();
+            save_persisted_state();
+        }
+
         /* Sliding REC ON exits BT immediately so main loop starts recording */
         if (keys_read_rec_switch()) {
             backlight_wake(millis());

@@ -66,8 +66,16 @@ typedef struct _objects_t {
     lv_obj_t *home_tile_3;
     lv_obj_t *home_tile_ic_3;
     lv_obj_t *home_tile_lbl_3;
-    lv_obj_t *home_line1;
-    lv_obj_t *home_line2;
+    lv_obj_t *home_focus_mark;
+    lv_obj_t *home_details;
+    lv_obj_t *home_detail_0_0;
+    lv_obj_t *home_detail_0_1;
+    lv_obj_t *home_detail_1_0;
+    lv_obj_t *home_detail_1_1;
+    lv_obj_t *home_detail_2_0;
+    lv_obj_t *home_detail_2_1;
+    lv_obj_t *home_detail_3_0;
+    lv_obj_t *home_detail_3_1;
     lv_obj_t *rec_bar;
     lv_obj_t *rec_bar_ic;
     lv_obj_t *rec_bar_l;

@@ -18,6 +18,7 @@
 #include "openfw.h"
 #include "openfw_ui.h"
 #include "ui_port.h"
+#include "eez/screens.h"
 
 /* Minimal host MMIO mock for LCDC (0x40095000) + ROM/GPIO stubs */
 static uint16_t g_fb[80][160];
@@ -169,6 +170,7 @@ int main(int argc, char **argv)
     ui_model_t m;
     memset(&m, 0, sizeof(m));
     ui_settings_defaults(&m.cfg);
+    assert(m.cfg.sound_mode == AUDIO_DSP_VOICE_CLARITY);
     m.now          = (rtc_datetime_t){ 2026, 11, 20, 5, 14, 32, 0 };
     m.batt_pct     = 72;
     m.batt_mv      = 3920;
@@ -189,6 +191,55 @@ int main(int argc, char **argv)
     /* 0: Home (Files focused) */
     ui_render_screen(UI_SCR_HOME, &m);
     capture_shot(0);
+
+    /* Drive the real UI timers at 30 Hz. Only the footer and underline
+     * should be flushed once the newly selected tiles have been painted. */
+    lv_obj_t *footer = objects.home_details;
+    int32_t page_width = lv_obj_get_width(footer);
+    assert(lv_obj_get_scroll_x(footer) == page_width);
+    m.home_focus = 0;
+    ui_render_screen(UI_SCR_HOME, &m);
+    int32_t last_scroll = page_width;
+    unsigned moving_frames = 0;
+    for (unsigned frame = 0; frame < 10; frame++) {
+        uint32_t start = g_written_pixels;
+        s_now += 33u;
+        ui_port_task_handler();
+        int32_t offset = lv_obj_get_scroll_x(footer);
+        assert(offset <= last_scroll);
+        if (g_written_pixels > start) moving_frames++;
+        assert(g_written_pixels - start <= 160u * 27u);
+        last_scroll = offset;
+    }
+    assert(last_scroll == 0 && moving_frames >= 7);
+    assert(!ui_port_is_animating());
+    int32_t mid_x = lv_obj_get_x(objects.home_focus_mark);
+    uint32_t before;
+
+    for (uint8_t focus = 1; focus <= 3; focus++) {
+        m.home_focus = focus;
+        ui_render_screen(UI_SCR_HOME, &m);
+        assert(lv_obj_get_x(objects.home_focus_mark) == mid_x);
+        assert(lv_anim_count_running() == 1u);
+        s_now += 16u;
+        ui_port_task_handler();
+        ui_port_render_now();
+        mid_x = lv_obj_get_x(objects.home_focus_mark);
+    }
+    s_now += 300u;
+    ui_port_task_handler();
+    ui_port_render_now();
+    assert(lv_obj_get_x(objects.home_focus_mark) == lv_obj_get_x(objects.home_tile_3) +
+           (lv_obj_get_width(objects.home_tile_3) - lv_obj_get_width(objects.home_focus_mark)) / 2);
+    assert(lv_obj_get_scroll_x(footer) == 3 * page_width);
+    assert(!ui_port_is_animating());
+    before = g_written_pixels;
+    ui_render_screen(UI_SCR_HOME, &m);
+    assert(g_written_pixels == before);
+
+    /* Enter recording while the return animation is running. */
+    m.home_focus = 1;
+    ui_render_screen(UI_SCR_HOME, &m);
 
     /* 1: Recording (live spectrogram + markers) */
     m.rec_sec     = 13u * 60u + 21u;
@@ -230,6 +281,12 @@ int main(int argc, char **argv)
     m.play_has_transcript = 0;
     ui_render_screen(UI_SCR_PLAYER, &m);
     capture_shot(5);
+    uint32_t player_pixels = g_written_pixels;
+    ui_render_screen(UI_SCR_PLAYER, &m);
+    assert(g_written_pixels == player_pixels);
+    m.play_vu_l = 20u;
+    ui_render_screen(UI_SCR_PLAYER, &m);
+    assert(g_written_pixels > player_pixels && g_written_pixels - player_pixels < 160u * 10u);
 
     /* 6: Player (Transcript mode) */
     m.play_has_transcript = 1;

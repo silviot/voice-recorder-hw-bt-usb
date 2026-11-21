@@ -229,6 +229,7 @@ void audio_pa_set(int enable);
 int  audio_dac_start(uint32_t sample_rate, uint8_t ana_vol_0_31);
 void audio_dac_set_volume(uint8_t ana_vol_0_31, uint16_t dig_vol_0_511);
 void audio_dac_set_mute(int muted);
+#define AUDIO_DAC_QUEUE_SLOTS 4u
 int  audio_dac_write_stereo(const int16_t *interleaved_lr, uint32_t num_frames);
 int  audio_dac_is_busy(void);
 void audio_dac_stop(void);

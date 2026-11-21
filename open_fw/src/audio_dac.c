@@ -36,12 +36,12 @@ static const uint16_t pcm_gain_q15[32] = {
     9025, 10851, 13045, 15684, 18856, 22670, 27255, 32768,
 };
 
-static int16_t g_dac_buf[2][DAC_SLOT_SAMPLES] __attribute__((aligned(4)));
+static int16_t g_dac_buf[AUDIO_DAC_QUEUE_SLOTS][DAC_SLOT_SAMPLES] __attribute__((aligned(4)));
 static volatile uint8_t  g_dac_running   = 0u;
 static volatile uint8_t  g_tx_active     = 0u;
 static volatile uint8_t  g_active_slot   = 0u;
-static volatile uint8_t  g_slot_ready[2] = { 0u, 0u };
-static volatile uint32_t g_slot_bytes[2] = { 0u, 0u };
+static uint8_t           g_write_slot;
+static volatile uint32_t g_slot_bytes[AUDIO_DAC_QUEUE_SLOTS];
 static uint32_t          g_pcm_gain_q15;
 static int8_t            g_pa_state      = -1;
 
@@ -120,10 +120,9 @@ static void audio_dac_dmac_ch0_irq(void)
 
     if (st & DMAC_IRQ_TC) {
         uint8_t done = g_active_slot;
-        uint8_t next = (uint8_t)(done ^ 1u);
-        g_slot_ready[done] = 0u;
+        uint8_t next = (done + 1u) % AUDIO_DAC_QUEUE_SLOTS;
         g_slot_bytes[done] = 0u;
-        if (g_slot_ready[next]) {
+        if (g_slot_bytes[next]) {
             dmac_arm_tx_slot(next);
             OPENFW_DSB();
         } else {
@@ -254,10 +253,8 @@ int audio_dac_start(uint32_t sample_rate, uint8_t ana_vol_0_31)
     /* 4. Configure DMAC CH0 TX + NVIC IRQ 60 */
     g_tx_active     = 0u;
     g_active_slot   = 0u;
-    g_slot_ready[0] = 0u;
-    g_slot_ready[1] = 0u;
-    g_slot_bytes[0] = 0u;
-    g_slot_bytes[1] = 0u;
+    g_write_slot = 0u;
+    for (unsigned i = 0; i < AUDIO_DAC_QUEUE_SLOTS; i++) g_slot_bytes[i] = 0u;
 
     openfw_mmio_set32(CRU_RST_SET1_ADDR, (1u << 1));
     openfw_mmio_set32(CRU_RST_STAT1_ADDR, (1u << 1));
@@ -283,21 +280,9 @@ int audio_dac_write_stereo(const int16_t *interleaved_lr, uint32_t num_frames)
     }
 
     uint32_t primask;
-    uint8_t slot = 255u;
-    OPENFW_IRQ_SAVE(primask);
-    if (g_tx_active) {
-        uint8_t other = (uint8_t)(g_active_slot ^ 1u);
-        if (!g_slot_ready[other]) {
-            slot = other;
-        }
-    } else if (!g_slot_ready[0]) {
-        slot = 0u;
-    } else if (!g_slot_ready[1]) {
-        slot = 1u;
-    }
-    OPENFW_IRQ_RESTORE(primask);
-
-    if (slot > 1u) {
+    /* Single producer. The IRQ releases a slot only after its DMA completes. */
+    uint8_t slot = g_write_slot;
+    if (g_slot_bytes[slot]) {
         return 0;
     }
 
@@ -311,7 +296,7 @@ int audio_dac_write_stereo(const int16_t *interleaved_lr, uint32_t num_frames)
     OPENFW_IRQ_SAVE(primask);
     if (g_dac_running) {
         g_slot_bytes[slot] = frames * 4u;
-        g_slot_ready[slot] = 1u;
+        g_write_slot = (slot + 1u) % AUDIO_DAC_QUEUE_SLOTS;
         OPENFW_DSB();
         if (!g_tx_active) {
             dmac_arm_tx_slot(slot);
@@ -326,7 +311,7 @@ int audio_dac_write_stereo(const int16_t *interleaved_lr, uint32_t num_frames)
 
 int audio_dac_is_busy(void)
 {
-    return (g_tx_active || g_slot_ready[0] || g_slot_ready[1]) ? 1 : 0;
+    return g_tx_active;
 }
 
 void audio_dac_stop(void)
@@ -336,10 +321,7 @@ void audio_dac_stop(void)
     }
     g_dac_running   = 0u;
     g_tx_active     = 0u;
-    g_slot_ready[0] = 0u;
-    g_slot_ready[1] = 0u;
-    g_slot_bytes[0] = 0u;
-    g_slot_bytes[1] = 0u;
+
 
     /* Shut down built-in speaker PA first for pop-free teardown */
     audio_pa_set(0);

@@ -682,13 +682,31 @@ static void test_recorder(const char *exfat_img_path)
     uint32_t ch_mux = g_soc.codec_regs[(CODEC_ADC_CH_MUX_ADDR - AUDIO_CODEC_BASE) >> 2];
     assert((ch_mux & 0x000D0D0Du) == 0x000D0D00u);
 
-    sim_dma_deliver_stereo_frame(2000, 12000, -1500, 6000);
+    /* Input dynamics must never move the analog PGAs. Only an explicit gain
+     * change adjusts them, including during a recording. */
+    uint32_t *pga = &g_soc.codec_regs[(CODEC_AMIC01_PGA_ADDR - AUDIO_CODEC_BASE) >> 2];
+    sim_dma_deliver_stereo_frame(0, 4000, 0, 30000);
     recorder_poll();
+    assert(((*pga >> 24) & 31u) == 22u);
+    for (int i = 0; i < 8; i++) {
+        sim_dma_deliver_stereo_frame(0, 0, 0, 0);
+        recorder_poll();
+    }
+    assert(((*pga >> 24) & 31u) == 22u);
+    for (int i = 0; i < 8; i++) {
+        sim_dma_deliver_stereo_frame(0, 5000, 0, 3000);
+        recorder_poll();
+    }
+    assert(((*pga >> 24) & 31u) == 22u);
+    assert(((g_soc.codec_regs[(CODEC_AMIC2_CTRL_ADDR - AUDIO_CODEC_BASE) >> 2] >> 8) & 127u) == 66u);
+    recorder_set_gain(21u);
+    assert(((*pga >> 24) & 31u) == 21u);
+    assert(((g_soc.codec_regs[(CODEC_AMIC2_CTRL_ADDR - AUDIO_CODEC_BASE) >> 2] >> 8) & 127u) == 63u);
     assert(recorder_stop() == 0);
 
     exfat_entry_t ent3;
     assert(exfat_find_path(&vol, "/record/REC_0003.wav", &ent3) == 0);
-    assert(ent3.size == 44u + 8192u);
+    assert(ent3.size == 44u + 17u * 8192u);
     uint8_t hdr3[44];
     uint32_t got3 = 0u;
     assert(exfat_read_file(&vol, &ent3, 0u, hdr3, sizeof(hdr3), &got3) == 0);
@@ -696,7 +714,7 @@ static void test_recorder(const char *exfat_img_path)
     wav_info_t info3;
     assert(wav_parse_header(hdr3, &info3) == 0);
     assert(info3.sample_rate == 16000u && info3.channels == 2u && info3.block_align == 4u);
-    assert(info3.byte_rate == 64000u && info3.data_bytes == 8192u);
+    assert(info3.byte_rate == 64000u && info3.data_bytes == 17u * 8192u);
 
     /* Recording #4: Power-loss checkpoint recovery (remount WITHOUT calling recorder_stop) */
     recorder_set_gain(20u);
@@ -797,7 +815,7 @@ static void test_audio_dac(void)
     assert((g_soc.codec_regs[(CODEC_DAC2_DIG_EN_ADDR - AUDIO_CODEC_BASE) >> 2] & 0x3u) == 0u);
     assert((g_soc.nvic_iser[1] & (1u << 28)) != 0u); /* IRQ 60 */
 
-    /* Queue two stereo buffers -> double-buffered DMAC CH0 chain */
+    /* Fill the stereo DMA queue and verify each transfer length in order. */
     int16_t sbuf[512];
     for (uint32_t i = 0u; i < 256u; i++) {
         sbuf[i * 2u + 0u] = (int16_t)(i * 10);
@@ -812,7 +830,9 @@ static void test_audio_dac(void)
 
     /* Enqueue second buffer while first is active */
     assert(audio_dac_write_stereo(sbuf, 128u) == 128);
-    assert(audio_dac_write_stereo(sbuf, 128u) == 0); /* Both slots occupied */
+    assert(audio_dac_write_stereo(sbuf, 64u) == 64);
+    assert(audio_dac_write_stereo(sbuf, 32u) == 32);
+    assert(audio_dac_write_stereo(sbuf, 128u) == 0); /* Queue full */
 
     assert(g_soc.dmac_regs[0][8] == 0x00080002u);
     g_soc.dmac_regs[0][9] |= 0x01u;
@@ -827,7 +847,12 @@ static void test_audio_dac(void)
     assert(g_soc.dmac_buf[0] != first_buf);
     assert((g_soc.dmac_regs[0][3] & 0x3FFFFu) == 128u * 4u);
 
-    /* Complete slot 1 -> idles cleanly */
+    for (unsigned frames = 64; frames >= 32; frames /= 2) {
+        g_soc.dmac_regs[0][9] |= 0x02u;
+        g_dmac_ch0_cb();
+        assert((g_soc.dmac_regs[0][3] & 0x3FFFFu) == frames * 4u);
+    }
+    /* Final transfer idles cleanly. */
     g_soc.dmac_regs[0][9] |= 0x02u; /* Transfer complete */
     g_dmac_ch0_cb();
     assert(audio_dac_is_busy() == 0);
@@ -889,7 +914,7 @@ static void test_audio_dac(void)
     assert((g_soc.nvic_iser[1] & (1u << 28)) == 0u);
     assert((g_soc.codec_regs[(CODEC_DAC01_ANA_VOL_ADDR - AUDIO_CODEC_BASE) >> 2] & 0x1F1F0000u) == 0u);
     assert((g_soc.codec_regs[(CODEC_DAC0_DIG_EN_ADDR - AUDIO_CODEC_BASE) >> 2] & 0x3u) == 0u);
-    printf("[OK] audio_dac MMIO (APLL 16k/44.1k, eFuse DC, PB30 PA, DMAC CH0 double-buf, pop-free stop)\n");
+    printf("[OK] audio_dac MMIO (APLL 16k/44.1k, eFuse DC, PB30 PA, DMAC CH0 playback queue, pop-free stop)\n");
 }
 
 /* ============================================================================

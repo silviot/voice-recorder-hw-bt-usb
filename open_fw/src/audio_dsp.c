@@ -60,13 +60,12 @@ static float dsp_pow2f(float x)
     if (x > 127.0f) {
         x = 127.0f;
     }
-    int32_t k = (int32_t)x;
-    if ((float)k > x) {
-        k -= 1;
-    }
+    /* Center the polynomial on zero. Envelope exponents sit just below
+     * zero, where a small coefficient error compounds over thousands of samples. */
+    int32_t k = (int32_t)(x >= 0.0f ? x + 0.5f : x - 0.5f);
     float f = x - (float)k;
     float u = f * DSP_LN2;
-    /* Degree-5 Taylor polynomial on u in [0, ln2) -> max error < 1.5e-4 */
+    /* Degree-5 Taylor polynomial for |u| <= ln(2)/2. */
     float p = 1.0f + u * (1.0f + u * (0.5f + u * (0.16666667f +
               u * (0.04166667f + u * 0.00833333f))));
     union {

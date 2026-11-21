@@ -155,7 +155,7 @@ typedef enum {
 typedef struct {
     uint8_t reserved0;      /* reserved (0); keeps openfw_persist_t 64-byte layout */
     uint8_t mic_gain;       /* 0..31 (default 20) */
-    uint8_t sound_mode;     /* 0=Raw (default), 1=Clarity, 2=Bypass */
+    uint8_t sound_mode;     /* 0=Raw, 1=Clarity (default), 2=Bypass */
     uint8_t channels;       /* 1=1ch, 2=2ch (default) */
     uint8_t vor_enabled;    /* 0=Off (default), 1=On */
     uint8_t brightness_idx; /* 0..4 => 20,40,60,80(def),100% */

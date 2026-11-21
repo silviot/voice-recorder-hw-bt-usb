@@ -4,14 +4,14 @@
 **Primary Downstream Consumers:**
 1. **NVIDIA Parakeet-TDT-0.6B (`v2` / `v3`)** — 16 kHz mono FastConformer-TDT, high native noise robustness, degraded by aggressive spectral subtraction or steep formant-distorting EQ.
 2. **Cactus Whistle (55M / 16.9 MB)** — 16 kHz mono edge ASR (≤30 s chunks, 80-bin log-mel, built-in Aho-Corasick keyword biasing), benefits from clean host-side VAD + `150–7000 Hz` bandpass.
-3. **Human Playback ("Voice Clarity" Mode)** — Optional clean-room replica of the stock firmware's "human voice focus" sound signature (without reverse-engineered binary blobs).
+3. **Human Playback ("Voice Clarity" Mode)** — Default recording profile and clean-room approximation of the stock firmware's "human voice focus" sound signature (without reverse-engineered binary blobs).
 
 ---
 
 ## 1. Design Principles
 
-1. **Preserve raw acoustic truth on the recorder by default.**  
-   On-device DSP should prevent hardware/acoustic failure modes (DC offset, handling rumble, ADC clipping) while leaving spectral detail and dual-mic phase intact for Parakeet, Whistle, and host-side beamforming.
+1. **Preserve natural speech dynamics in the Raw profile.**
+   Raw processing should prevent hardware/acoustic failure modes (DC offset, handling rumble, ADC clipping) while leaving spectral detail and dual-mic phase intact for Parakeet, Whistle, and host-side beamforming.
 2. **Zero proprietary blobs, zero heap allocations.**  
    Pure C99 (`float32_t` using Cortex-M4F hardware FPU, or Q31 fallback), static per-channel state structs, deterministic execution inside `recorder_poll()` (never inside `DMAC_CH1_IRQHandler`).
 3. **Zero-overhead drop-in to `open_fw`.**  
@@ -40,7 +40,7 @@ open_fw/
 
 ## 3. On-Device DSP Profiles (`audio_dsp_profile_t`)
 
-### Profile A: `AUDIO_DSP_ASR_RAW` *(Default — Optimal for Parakeet & Whistle)*
+### Profile A: `AUDIO_DSP_ASR_RAW` *(For Parakeet & Whistle)*
 Minimal, phase-safe, non-destructive capture conditioning:
 
 1. **Stage 1 — 75 Hz 2nd-Order Butterworth High-Pass Filter (per channel)**
@@ -56,7 +56,7 @@ Minimal, phase-safe, non-destructive capture conditioning:
      - Soft-knee ceiling starting at `-3.0 dBFS` (`0.707`), hard asymptote at `-0.5 dBFS` (`0.944`) via smooth `tanh`-like rational saturator or envelope-follower gain reduction (`attack = 1 ms`, `release = 80 ms`).
    - **Stereo linking (Phase 2):** Compute peak envelope as `max(|L|, |R|)` and apply identical gain to both channels to preserve inter-channel level/phase cues for host beamforming.
 
-### Profile B: `AUDIO_DSP_VOICE_CLARITY` *(Optional — Clean-Room Human-Voice Focus)*
+### Profile B: `AUDIO_DSP_VOICE_CLARITY` *(Default for voice recording and listening)*
 Replicates the intelligible "broadcast voice" signature of stock `codec.admomini` using standard textbook DSP:
 
 1. **Stage 1 — 350 Hz 2nd-Order Butterworth HPF (`fs = 16000 Hz, Q = 0.7071`)**
@@ -82,7 +82,7 @@ Replicates the intelligible "broadcast voice" signature of stock `codec.admomini
 #include <stdint.h>
 
 typedef enum {
-    AUDIO_DSP_ASR_RAW       = 0, /* 75 Hz HPF + safety limiter (default for Parakeet/Whistle) */
+    AUDIO_DSP_ASR_RAW       = 0, /* 75 Hz HPF + safety limiter (for speech recognition) */
     AUDIO_DSP_VOICE_CLARITY = 1, /* 350 Hz HPF + 2.2 kHz +9 dB shelf + 2:1 comp + limiter     */
     AUDIO_DSP_BYPASS        = 2, /* Raw ADC samples, no processing                            */
 } audio_dsp_profile_t;
@@ -155,16 +155,16 @@ void audio_dsp_process_i16(audio_dsp_t *dsp, int16_t *pcm, size_t num_frames);
   - Test 2: Sine frequency sweep (`30 Hz`, `75 Hz`, `350 Hz`, `1 kHz`, `2.2 kHz`, `5 kHz`) → verify gain within `±0.5 dB` of analytical Butterworth / RBJ shelf curves.
   - Test 3: Overdriven `+6 dB` burst → verify limiter holds peak `<= 32767` with zero wrap-around and smooth release.
   - Test 4: Stereo phase-link test → verify identical gain reduction on L and R channels.
-- [ ] Wire `audio_dsp_init()` in `recorder_start()` and `audio_dsp_process_i16()` in `recorder_poll()` (`open_fw/src/recorder.c`), defaulting to `AUDIO_DSP_ASR_RAW`.
+- [x] Wire `audio_dsp_init()` in `recorder_start()` and `audio_dsp_process_i16()` in `recorder_poll()` (`open_fw/src/recorder.c`), defaulting to `AUDIO_DSP_VOICE_CLARITY`.
 
 ### Phase 2 — True Dual-Mic Stereo Capture (`AMIC1 + AMIC2`) in `audio_dma.c`
 - [x] Verify `AMIC2` analog GPIO mux pins (`PB14/PB15`), `CODEC_ADC_CH_MUX = 0x000D0D00`, and `ADC_CH1/2_CTRL = 0x09` (`0x40009250`/`0x40009280`) — **live-verified on silicon**.
 - [ ] Keep stereo mode in `audio_dma.c` (`4096` samples = `8192` bytes per 128 ms slot, `32 KiB` total ring buffer) with `DMAC_CH_IRQ_EN = 0x00080002u` verified gap-free in `BYPASS` mode.
-- [ ] Update `audio_dac.c` volume control to the 32-entry logarithmic dB Q15 curve.
+- [x] Update `audio_dac.c` volume control to the 32-entry logarithmic dB Q15 curve.
 - [ ] Optional: add 24-bit-in-32-bit capture mode if extra dynamic range is needed (avoids PGA tuning altogether).
 
 ### Phase 3 — Runtime Control & Host ASR Pipeline
-- [ ] Expose `+XREC:DSP=<0|1|2>` and `+XREC:GAIN=<0..31>` in `open_fw/src/xrec_proto.c` (persisted in `PSMP` or config).
+- [x] Expose `+XREC:DSP=<0|1|2>` and `+XREC:GAIN=<0..31>`. The recorder menu saves changes from Bluetooth mode to `/cassini/settings.bin` when the SD card is mounted. Gain sets the analog PGA immediately. Profile changes apply to the next recording.
 - [ ] Add host helper script (`tools/asr_prep.py` or pipeline doc) implementing the two downstream recipes:
   - **Parakeet (`parakeet-tdt-0.6b-v2`/`v3`):** stereo-to-mono sum (or MVDR if SNR < 0 dB) → Silero VAD → 16 kHz mono WAV → Parakeet.
   - **Whistle (Cactus 55M):** stereo-to-mono sum/beamform → `150–7000 Hz` bandpass → Silero VAD (pause-aligned chunks `≤ 30 s`) → Whistle + keyword biasing list.

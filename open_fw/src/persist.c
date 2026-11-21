@@ -40,7 +40,7 @@ static void persist_clamp_settings(ui_settings_t *dst, const ui_settings_t *src)
 {
     dst->reserved0      = 0u;
     dst->mic_gain       = (src->mic_gain <= 31u) ? src->mic_gain : 31u;
-    dst->sound_mode     = (src->sound_mode <= 2u) ? src->sound_mode : 0u;
+    dst->sound_mode     = (src->sound_mode <= 2u) ? src->sound_mode : AUDIO_DSP_DEFAULT_PROFILE;
     dst->channels       = (src->channels == 1u || src->channels == 2u) ? src->channels : 2u;
     dst->vor_enabled    = src->vor_enabled ? 1u : 0u;
     dst->brightness_idx = (src->brightness_idx <= 4u) ? src->brightness_idx : 3u;

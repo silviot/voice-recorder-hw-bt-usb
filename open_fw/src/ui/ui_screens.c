@@ -66,7 +66,7 @@ void ui_settings_defaults(ui_settings_t *cfg)
 {
     cfg->reserved0      = 0u;
     cfg->mic_gain       = 20u;
-    cfg->sound_mode     = 0u;
+    cfg->sound_mode     = AUDIO_DSP_DEFAULT_PROFILE;
     cfg->channels       = 2u;
     cfg->vor_enabled    = 0u;
     cfg->brightness_idx = 3u;
@@ -74,6 +74,40 @@ void ui_settings_defaults(ui_settings_t *cfg)
     cfg->skip_mode      = UI_SKIP_5_10;
     cfg->hp_vol         = 18u;
     cfg->spk_vol        = 18u;
+}
+
+/* LVGL invalidates a label even when its text is identical. */
+static void set_changed_text(lv_obj_t *obj, const char *text)
+{
+    if (lv_strcmp(lv_label_get_text(obj), text) != 0) lv_label_set_text(obj, text);
+}
+
+static void set_changed_text_color(lv_obj_t *obj, lv_color_t color)
+{
+    if (!lv_color_eq(lv_obj_get_style_text_color(obj, LV_PART_MAIN), color)) {
+        lv_obj_set_style_text_color(obj, color, 0);
+    }
+}
+
+static void set_changed_bg_color(lv_obj_t *obj, lv_color_t color)
+{
+    if (!lv_color_eq(lv_obj_get_style_bg_color(obj, LV_PART_MAIN), color)) {
+        lv_obj_set_style_bg_color(obj, color, 0);
+    }
+}
+
+static void set_changed_border_color(lv_obj_t *obj, lv_color_t color)
+{
+    if (!lv_color_eq(lv_obj_get_style_border_color(obj, LV_PART_MAIN), color)) {
+        lv_obj_set_style_border_color(obj, color, 0);
+    }
+}
+
+static void set_hidden(lv_obj_t *obj, bool hidden)
+{
+    if (lv_obj_has_flag(obj, LV_OBJ_FLAG_HIDDEN) != hidden) {
+        lv_obj_update_flag(obj, LV_OBJ_FLAG_HIDDEN, hidden);
+    }
 }
 
 static void bind_status_bar(lv_obj_t *bar, lv_obj_t *ic, lv_obj_t *lbl, lv_obj_t *sub,
@@ -85,60 +119,56 @@ static void bind_status_bar(lv_obj_t *bar, lv_obj_t *ic, lv_obj_t *lbl, lv_obj_t
                             const char *right_txt, int no_clock)
 {
     if (!bar) return;
-    lv_obj_set_style_bg_color(bar, ui_color_from_rgb565(bg565), 0);
+    set_changed_bg_color(bar, ui_color_from_rgb565(bg565));
 
     if (ic) {
         if (icon != UI_ICON_NONE) {
-            lv_obj_remove_flag(ic, LV_OBJ_FLAG_HIDDEN);
-            lv_label_set_text(ic, ui_icon_glyph(icon));
-            lv_obj_set_style_text_color(ic, ui_color_from_rgb565(icon565), 0);
+            set_hidden(ic, false);
+            set_changed_text(ic, ui_icon_glyph(icon));
+            set_changed_text_color(ic, ui_color_from_rgb565(icon565));
             if (lbl) lv_obj_set_x(lbl, 14);
         } else {
-            lv_obj_add_flag(ic, LV_OBJ_FLAG_HIDDEN);
+            set_hidden(ic, true);
             if (lbl) lv_obj_set_x(lbl, 3);
         }
     }
 
     if (lbl) {
-        lv_label_set_text(lbl, left_txt ? left_txt : "");
-        lv_obj_set_style_text_color(lbl, ui_color_from_rgb565(fg565), 0);
+        set_changed_text(lbl, left_txt ? left_txt : "");
+        set_changed_text_color(lbl, ui_color_from_rgb565(fg565));
     }
 
     if (sub) {
         if (sub_txt && sub_txt[0] != '\0') {
-            lv_obj_remove_flag(sub, LV_OBJ_FLAG_HIDDEN);
-            lv_label_set_text(sub, sub_txt);
+            set_hidden(sub, false);
+            set_changed_text(sub, sub_txt);
         } else {
-            lv_obj_add_flag(sub, LV_OBJ_FLAG_HIDDEN);
+            set_hidden(sub, true);
         }
     }
 
     if (r_lbl) {
         if (no_clock) {
             if (right_txt && right_txt[0] != '\0') {
-                lv_obj_remove_flag(r_lbl, LV_OBJ_FLAG_HIDDEN);
-                lv_label_set_text(r_lbl, right_txt);
-                lv_obj_set_style_text_color(r_lbl, ui_color_from_rgb565(fg565), 0);
+                set_hidden(r_lbl, false);
+                set_changed_text(r_lbl, right_txt);
+                set_changed_text_color(r_lbl, ui_color_from_rgb565(fg565));
                 lv_obj_set_x(r_lbl, 86);
             } else {
-                lv_obj_add_flag(r_lbl, LV_OBJ_FLAG_HIDDEN);
+                set_hidden(r_lbl, true);
             }
         } else {
             char clk[8];
             ui_format_clock(clk, (int)sizeof(clk), m->now.hour, m->now.minute);
-            lv_obj_remove_flag(r_lbl, LV_OBJ_FLAG_HIDDEN);
-            lv_label_set_text(r_lbl, clk);
-            lv_obj_set_style_text_color(r_lbl, lv_color_hex(UI_HEX_DIM), 0);
+            set_hidden(r_lbl, false);
+            set_changed_text(r_lbl, clk);
+            set_changed_text_color(r_lbl, lv_color_hex(UI_HEX_DIM));
             lv_obj_set_x(r_lbl, m->hp_plugged ? 70 : 86);
         }
     }
 
     if (hp) {
-        if (m->hp_plugged && !no_clock) {
-            lv_obj_remove_flag(hp, LV_OBJ_FLAG_HIDDEN);
-        } else {
-            lv_obj_add_flag(hp, LV_OBJ_FLAG_HIDDEN);
-        }
+        set_hidden(hp, !m->hp_plugged || no_clock);
     }
 
     uint8_t pct = (m->batt_pct > 100u) ? 100u : m->batt_pct;
@@ -148,11 +178,11 @@ static void bind_status_bar(lv_obj_t *bar, lv_obj_t *ic, lv_obj_t *lbl, lv_obj_t
                       (pct <= 15u ? lv_color_hex(UI_HEX_RED) :
                        (pct <= 30u ? lv_color_hex(UI_HEX_AMBER) : lv_color_hex(UI_HEX_TEXT)));
     lv_color_t ocol = (fg565 == UI_COL_BLACK) ? lv_color_hex(UI_HEX_BLACK) : lv_color_hex(UI_HEX_DIM);
-    if (batt)      lv_obj_set_style_border_color(batt, ocol, 0);
-    if (batt_nub)  lv_obj_set_style_bg_color(batt_nub, ocol, 0);
+    if (batt)      set_changed_border_color(batt, ocol);
+    if (batt_nub)  set_changed_bg_color(batt_nub, ocol);
     if (batt_fill) {
         lv_obj_set_width(batt_fill, fw);
-        lv_obj_set_style_bg_color(batt_fill, bcol, 0);
+        set_changed_bg_color(batt_fill, bcol);
     }
 }
 
@@ -201,35 +231,38 @@ static void bind_scrollbar(lv_obj_t *thumb, int total, int scroll, int visible, 
 /* =========================================================================
  * Per-Screen Data Binders
  * ========================================================================= */
-static void bind_home(const ui_model_t *m)
+/* The footer and underline share one native scroll animation. */
+static void home_scroll_event(lv_event_t *event)
 {
-    char date_str[20];
-    lv_snprintf(date_str, sizeof(date_str), "%s %u %s",
-                weekday_name(m->now.year, m->now.month, m->now.day),
-                (unsigned)m->now.day, month_name(m->now.month));
-    bind_status_bar(objects.home_bar, objects.home_bar_ic, objects.home_bar_l, objects.home_bar_sub,
-                    objects.home_bar_r, objects.home_bar_hp, objects.home_batt,
-                    objects.home_batt_fill, objects.home_batt_nub,
-                    m, UI_COL_BAR, UI_COL_DIM, UI_ICON_NONE, UI_COL_TEXT, date_str, NULL, NULL, 0);
-
-    lv_obj_t *tiles[4] = { objects.home_tile_0, objects.home_tile_1, objects.home_tile_2, objects.home_tile_3 };
-    lv_obj_t *ics[4]   = { objects.home_tile_ic_0, objects.home_tile_ic_1, objects.home_tile_ic_2, objects.home_tile_ic_3 };
-    lv_obj_t *lbls[4]  = { objects.home_tile_lbl_0, objects.home_tile_lbl_1, objects.home_tile_lbl_2, objects.home_tile_lbl_3 };
-    for (int i = 0; i < 4; i++) {
-        int f = ((int)m->home_focus == i);
-        lv_obj_set_style_bg_color(tiles[i], lv_color_hex(f ? UI_HEX_PILL : UI_HEX_TILE), 0);
-        lv_color_t ink = lv_color_hex(f ? UI_HEX_TEXT : UI_HEX_DIM);
-        lv_obj_set_style_text_color(ics[i], ink, 0);
-        lv_obj_set_style_text_color(lbls[i], ink, 0);
+    if (lv_event_get_code(event) == LV_EVENT_SCROLL_BEGIN) {
+        lv_anim_t *anim = lv_event_get_param(event);
+        if (anim) {
+            lv_anim_set_duration(anim, 264u);
+            lv_anim_set_path_cb(anim, lv_anim_path_ease_in_out);
+        }
+        return;
     }
+    lv_obj_t *view = lv_event_get_target(event);
+    int32_t first_x = lv_obj_get_x(objects.home_tile_0);
+    int32_t stride = lv_obj_get_x(objects.home_tile_1) - first_x;
+    int32_t center = (lv_obj_get_width(objects.home_tile_0) -
+                      lv_obj_get_width(objects.home_focus_mark)) / 2;
+    int32_t width = lv_obj_get_width(view);
+    if (width > 0) {
+        lv_obj_set_x(objects.home_focus_mark, first_x + center +
+                     (lv_obj_get_scroll_x(view) * stride + width / 2) / width);
+    }
+}
 
+static void bind_home_detail(const ui_model_t *m, unsigned page, lv_obj_t *title, lv_obj_t *detail)
+{
     char l1[48] = "", l2[48] = "";
     uint32_t col1 = UI_HEX_TEXT;
     if (!m->sd_ok) {
         lv_snprintf(l1, sizeof(l1), "Storage error");
         lv_snprintf(l2, sizeof(l2), "Connect USB to check it");
         col1 = UI_HEX_RED;
-    } else if (m->home_focus == 0u) {
+    } else if (page == 0u) {
         if (!m->has_last) {
             lv_snprintf(l1, sizeof(l1), "Nothing played yet");
             col1 = UI_HEX_DIM;
@@ -245,12 +278,12 @@ static void bind_home(const ui_model_t *m)
                 lv_snprintf(l2, sizeof(l2), "Play from start");
             }
         }
-    } else if (m->home_focus == 1u) {
+    } else if (page == 1u) {
         char free_s[20];
         ui_format_free_time(free_s, (int)sizeof(free_s), m->sd_free_sec);
         lv_snprintf(l1, sizeof(l1), "%d %s", m->file_count, (m->file_count == 1) ? "recording" : "recordings");
         lv_snprintf(l2, sizeof(l2), "%s of space left", free_s);
-    } else if (m->home_focus == 2u) {
+    } else if (page == 2u) {
         lv_snprintf(l1, sizeof(l1), "Gain %u \xC2\xB7 %s \xC2\xB7 %s",
                     (unsigned)m->cfg.mic_gain, (m->cfg.channels == 1u) ? "1ch" : "2ch",
                     sound_mode_name(m->cfg.sound_mode));
@@ -259,9 +292,59 @@ static void bind_home(const ui_model_t *m)
         lv_snprintf(l1, sizeof(l1), "Bluetooth file sync");
         lv_snprintf(l2, sizeof(l2), "Device name %s", m->bt_name[0] ? m->bt_name : "HW_76");
     }
-    lv_label_set_text(objects.home_line1, l1);
-    lv_obj_set_style_text_color(objects.home_line1, lv_color_hex(col1), 0);
-    lv_label_set_text(objects.home_line2, l2);
+    set_changed_text(title, l1);
+    set_changed_text_color(title, lv_color_hex(col1));
+    set_changed_text(detail, l2);
+}
+
+static void bind_home(const ui_model_t *m, bool entering)
+{
+    char date_str[20];
+    lv_snprintf(date_str, sizeof(date_str), "%s %u %s",
+                weekday_name(m->now.year, m->now.month, m->now.day),
+                (unsigned)m->now.day, month_name(m->now.month));
+    bind_status_bar(objects.home_bar, objects.home_bar_ic, objects.home_bar_l, objects.home_bar_sub,
+                    objects.home_bar_r, objects.home_bar_hp, objects.home_batt,
+                    objects.home_batt_fill, objects.home_batt_nub,
+                    m, UI_COL_BAR, UI_COL_DIM, UI_ICON_NONE, UI_COL_TEXT, date_str, NULL, NULL, 0);
+
+    lv_obj_t *tiles[4] = { objects.home_tile_0, objects.home_tile_1, objects.home_tile_2, objects.home_tile_3 };
+    lv_obj_t *ics[4]   = { objects.home_tile_ic_0, objects.home_tile_ic_1, objects.home_tile_ic_2, objects.home_tile_ic_3 };
+    lv_obj_t *lbls[4]  = { objects.home_tile_lbl_0, objects.home_tile_lbl_1, objects.home_tile_lbl_2, objects.home_tile_lbl_3 };
+    static uint8_t previous_focus;
+    uint8_t focus = m->home_focus;
+    if (focus < 4 && (entering || focus != previous_focus)) {
+        for (int i = 0; i < 4; i++) {
+            if (!entering && i != previous_focus && i != focus) continue;
+            bool selected = i == focus;
+            set_changed_bg_color(tiles[i], lv_color_hex(selected ? UI_HEX_PILL : UI_HEX_TILE));
+            lv_color_t ink = lv_color_hex(selected ? UI_HEX_TEXT : UI_HEX_DIM);
+            set_changed_text_color(ics[i], ink);
+            set_changed_text_color(lbls[i], ink);
+        }
+
+        lv_obj_t *view = objects.home_details;
+        if (entering) {
+            lv_obj_set_scrollbar_mode(view, LV_SCROLLBAR_MODE_OFF);
+            lv_obj_add_event_cb(view, home_scroll_event, LV_EVENT_SCROLL_BEGIN, NULL);
+            lv_obj_add_event_cb(view, home_scroll_event, LV_EVENT_SCROLL, NULL);
+            /* Scroll offset zero already represents Last on a new screen. */
+            lv_obj_set_x(objects.home_focus_mark, lv_obj_get_style_x(tiles[0], LV_PART_MAIN) +
+                         (lv_obj_get_style_width(tiles[0], LV_PART_MAIN) -
+                          lv_obj_get_style_width(objects.home_focus_mark, LV_PART_MAIN)) / 2);
+        }
+        lv_obj_scroll_to_x(view, focus * lv_obj_get_style_width(view, LV_PART_MAIN),
+                           entering ? LV_ANIM_OFF : LV_ANIM_ON);
+        previous_focus = focus;
+    }
+
+    lv_obj_t *titles[] = {objects.home_detail_0_0, objects.home_detail_1_0,
+                          objects.home_detail_2_0, objects.home_detail_3_0};
+    lv_obj_t *details[] = {objects.home_detail_0_1, objects.home_detail_1_1,
+                           objects.home_detail_2_1, objects.home_detail_3_1};
+    for (unsigned page = 0; page < 4; page++) {
+        bind_home_detail(m, page, titles[page], details[page]);
+    }
 }
 
 static void bind_rec(const ui_model_t *m)
@@ -504,13 +587,13 @@ static void bind_player(const ui_model_t *m)
                         pos_s, dur_s, NULL, 0);
         lv_bar_set_value(objects.ptr_prog, pct, LV_ANIM_OFF);
         static const uint32_t spk_cols[4] = { UI_HEX_CYAN, UI_HEX_AMBER, UI_HEX_GREEN, UI_HEX_PINK };
-        lv_obj_set_style_bg_color(objects.ptr_bar_curr, lv_color_hex(spk_cols[m->tr_speaker & 3u]), 0);
-        lv_label_set_text(objects.ptr_prev, m->tr_prev);
+        set_changed_bg_color(objects.ptr_bar_curr, lv_color_hex(spk_cols[m->tr_speaker & 3u]));
+        set_changed_text(objects.ptr_prev, m->tr_prev);
         char curr_line[96];
         lv_snprintf(curr_line, sizeof(curr_line), "%s%s", m->tr_curr_spoken, m->tr_curr_upcoming);
-        lv_label_set_text(objects.ptr_curr_spoken, curr_line);
-        lv_label_set_text(objects.ptr_next, m->tr_next);
-        lv_label_set_text(objects.ptr_footer,
+        set_changed_text(objects.ptr_curr_spoken, curr_line);
+        set_changed_text(objects.ptr_next, m->tr_next);
+        set_changed_text(objects.ptr_footer,
                           (m->play_state == 0u)
                               ? "\xE2\x97\x80\xE2\x96\xB6 Line \xC2\xB7 OK Pause \xC2\xB7 \xC2\xB1 Vol"
                               : "\xE2\x97\x80\xE2\x96\xB6 Line \xC2\xB7 OK Play \xC2\xB7 \xC2\xB1 Vol");
@@ -527,7 +610,7 @@ static void bind_player(const ui_model_t *m)
 
     char dt_s[28], vbuf[16], pos_s[14], tmp[12], tot_s[16], ftxt[48];
     ui_format_date_label(dt_s, (int)sizeof(dt_s), &m->now, &m->play_file.dt);
-    lv_label_set_text(objects.player_date, dt_s);
+    set_changed_text(objects.player_date, dt_s);
 
     uint8_t  vol    = m->hp_plugged ? m->cfg.hp_vol : m->cfg.spk_vol;
     uint32_t tenths = (vol * 100u + 15u) / 31u;
@@ -537,28 +620,28 @@ static void bind_player(const ui_model_t *m)
     } else {
         lv_snprintf(vbuf, sizeof(vbuf), "%s %u", m->hp_plugged ? "HP" : "SPK", (unsigned)(tenths / 10u));
     }
-    lv_label_set_text(objects.player_vol_lbl, vbuf);
-    lv_obj_set_style_bg_color(objects.player_vol_pill, lv_color_hex(m->play_vol_hi ? UI_HEX_CYAN : UI_HEX_TILE), 0);
-    lv_obj_set_style_text_color(objects.player_vol_lbl, lv_color_hex(m->play_vol_hi ? UI_HEX_BLACK : UI_HEX_DIM), 0);
+    set_changed_text(objects.player_vol_lbl, vbuf);
+    set_changed_bg_color(objects.player_vol_pill, lv_color_hex(m->play_vol_hi ? UI_HEX_CYAN : UI_HEX_TILE));
+    set_changed_text_color(objects.player_vol_lbl, lv_color_hex(m->play_vol_hi ? UI_HEX_BLACK : UI_HEX_DIM));
 
     ui_format_duration(pos_s, (int)sizeof(pos_s), pos);
     ui_format_duration(tmp, (int)sizeof(tmp), dur);
     lv_snprintf(tot_s, sizeof(tot_s), "/ %s", tmp);
-    lv_label_set_text(objects.player_pos, pos_s);
-    lv_obj_set_style_text_color(objects.player_pos, lv_color_hex((m->play_state == 2u) ? UI_HEX_MUTE : UI_HEX_TEXT), 0);
-    lv_label_set_text(objects.player_tot, tot_s);
+    set_changed_text(objects.player_pos, pos_s);
+    set_changed_text_color(objects.player_pos, lv_color_hex((m->play_state == 2u) ? UI_HEX_MUTE : UI_HEX_TEXT));
+    set_changed_text(objects.player_tot, tot_s);
     lv_bar_set_value(objects.player_vu_l, (int32_t)m->play_vu_l, LV_ANIM_OFF);
     lv_bar_set_value(objects.player_vu_r, (int32_t)m->play_vu_r, LV_ANIM_OFF);
     lv_bar_set_value(objects.player_prog, pct, LV_ANIM_OFF);
 
     if (m->play_state == 2u) {
-        lv_label_set_text(objects.player_footer, m->play_has_next ? "OK Replay \xC2\xB7 \xE2\x96\xB6 Next file" : "OK Replay");
+        set_changed_text(objects.player_footer, m->play_has_next ? "OK Replay \xC2\xB7 \xE2\x96\xB6 Next file" : "OK Replay");
     } else {
         const char *la = (m->cfg.skip_mode == UI_SKIP_5_10) ? "5s" : (m->cfg.skip_mode == UI_SKIP_10_30 ? "10s" : "Prev");
         const char *ra = (m->cfg.skip_mode == UI_SKIP_5_10) ? "10s" : (m->cfg.skip_mode == UI_SKIP_10_30 ? "30s" : "Next");
         lv_snprintf(ftxt, sizeof(ftxt), "\xE2\x97\x80 %s \xC2\xB7 OK %s \xC2\xB7 \xE2\x96\xB6 %s",
                     la, (m->play_state == 0u) ? "Pause" : "Play", ra);
-        lv_label_set_text(objects.player_footer, ftxt);
+        set_changed_text(objects.player_footer, ftxt);
     }
 }
 
@@ -660,7 +743,7 @@ static void bind_settings(const ui_model_t *m)
         const char *desc = "Version and update mode";
         switch (m->set_sel) {
         case 1: desc = (m->cfg.sound_mode == 0u) ? "Best for transcripts" :
-                       (m->cfg.sound_mode == 1u ? "Cleaner voice, less noise" : "No processing at all"); break;
+                       (m->cfg.sound_mode == 1u ? "More even voice levels" : "No processing at all"); break;
         case 2: desc = (m->cfg.channels == 1u) ? "One mic, half the file size" : "Both mics, stereo"; break;
         case 3: desc = "Pauses the file during silence"; break;
         case 4: desc = "Lower saves battery"; break;
@@ -779,11 +862,12 @@ void ui_render_screen(ui_screen_id_t scr, const ui_model_t *m)
     ui_port_init();
 
     enum ScreensEnum target = map_eez_screen(scr, m);
+    bool entering = target != s_active_eez_scr;
     loadScreen(target);
     s_active_eez_scr = target;
 
     switch (target) {
-    case SCREEN_ID_HOME:           bind_home(m); break;
+    case SCREEN_ID_HOME:           bind_home(m, entering); break;
     case SCREEN_ID_REC:            bind_rec(m); break;
     case SCREEN_ID_REC_ERR:        bind_rec_err(m); break;
     case SCREEN_ID_SAVED:          bind_saved(m); break;

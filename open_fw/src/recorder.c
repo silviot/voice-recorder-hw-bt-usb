@@ -3,7 +3,7 @@
  *
  * Streams 16 kHz / 16-bit mono (AMIC1) or dual-mic stereo (AMIC1+AMIC2) PCM
  * frames from DMAC CH1 ring buffers through clean-room audio_dsp_process_i16()
- * (defaulting to AUDIO_DSP_ASR_RAW) and optional opt-in VOR pre-roll gating
+ * (defaulting to Voice Clarity) and optional opt-in VOR pre-roll gating
  * into /record/REC_NNNN.wav on exFAT.
  *
  * Crash-safety & durability:
@@ -32,7 +32,7 @@ static int                 g_rec_error       = 0;
 static uint8_t             g_mic_gain        = 20u;
 static uint8_t             g_cfg_channels    = 1u;
 static uint8_t             g_active_channels = 1u;
-static audio_dsp_profile_t g_dsp_profile     = AUDIO_DSP_ASR_RAW;
+static audio_dsp_profile_t g_dsp_profile     = AUDIO_DSP_DEFAULT_PROFILE;
 static int                 g_vor_enabled     = 0;
 
 static audio_dsp_t         g_dsp;
@@ -268,7 +268,7 @@ uint8_t recorder_get_gain(void)
 void recorder_set_dsp_profile(audio_dsp_profile_t profile)
 {
     if ((uint32_t)profile > (uint32_t)AUDIO_DSP_BYPASS) {
-        profile = AUDIO_DSP_ASR_RAW;
+        profile = AUDIO_DSP_DEFAULT_PROFILE;
     }
     g_dsp_profile = profile;
 }

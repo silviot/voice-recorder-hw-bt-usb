@@ -124,6 +124,31 @@ static void test_frequency_sweep(void)
     printf("  [PASS] audio_dsp frequency sweep (30, 75, 350, 1000, 2200, 5000 Hz) within +/-0.5 dB\n");
 }
 
+static void test_voice_compression_ratio(void)
+{
+    /* Both tones are above the Clarity threshold and below the limiter knee.
+     * Quadrupling the input (+12 dB) should double the output (+6 dB). */
+    audio_dsp_t dsp;
+    audio_dsp_init(&dsp, AUDIO_DSP_VOICE_CLARITY, 16000u, 1u);
+    double low_gain = measure_sine_gain_db(&dsp, 1000.0, 4000.0);
+    double high_gain = measure_sine_gain_db(&dsp, 1000.0, 16000.0);
+    double input_step = 20.0 * log10(4.0);
+    assert(fabs(input_step + high_gain - low_gain - input_step / 2.0) < 0.25);
+
+    /* With a silent input the envelope decays to 1/e after 120 ms. */
+    int16_t silence[1920] = { 0 };
+    audio_dsp_reset(&dsp);
+    dsp.comp_env = 1.0f;
+    audio_dsp_process_i16(&dsp, silence, 1920u);
+    assert(fabs(dsp.comp_env - exp(-1.0)) < 0.002);
+
+    audio_dsp_init(&dsp, AUDIO_DSP_ASR_RAW, 16000u, 1u);
+    low_gain = measure_sine_gain_db(&dsp, 1000.0, 4000.0);
+    high_gain = measure_sine_gain_db(&dsp, 1000.0, 16000.0);
+    assert(fabs(high_gain - low_gain) < 0.1);
+    puts("  [PASS] Clarity compresses 2:1 and Raw preserves speech dynamics");
+}
+
 /* Test 3: Overdriven burst -> safety limiter holds peak <= 32767, zero wrap-around, smooth release */
 static void test_safety_limiter(void)
 {
@@ -309,10 +334,11 @@ int main(void)
     printf("Running test_audio_dsp...\n");
     test_dc_rejection();
     test_frequency_sweep();
+    test_voice_compression_ratio();
     test_safety_limiter();
     test_stereo_link_and_beamform();
     test_bypass_and_rms();
     test_vor_gate();
-    printf("ALL 6 AUDIO DSP + VOR SUITES PASSED!\n");
+    printf("ALL 7 AUDIO DSP + VOR SUITES PASSED!\n");
     return 0;
 }

@@ -275,21 +275,41 @@ void lcd_blit_rgb565(uint16_t x, uint16_t y, uint16_t w, uint16_t h, const uint1
     lcd_blit_rgb565_stride(x, y, w, h, pixels, w);
 }
 
+static inline void lcd_write_pixel_pair(uint32_t ctrl, uint16_t first, uint16_t second)
+{
+    openfw_mmio_wr32(LCDC_TX_DATA_ADDR, pack_be16_pair(first, second));
+    lcdc_wait_idle();
+    openfw_mmio_wr32(LCDC_XFER_CTRL_ADDR, ctrl);
+    lcdc_wait_done();
+}
+
 void lcd_blit_rgb565_stride(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
                             const uint16_t *pixels, uint16_t stride)
 {
     if (w == 0u || h == 0u || !pixels) return;
     lcd_set_window(x, y, (uint16_t)(x + w - 1u), (uint16_t)(y + h - 1u));
+    /* Each RAMWR window uses one data-transfer mode. Stream pixel pairs
+     * across row boundaries so even an odd-width window has only one tail. */
+    const uint32_t data_ctrl = (openfw_mmio_rd32(LCDC_XFER_CTRL_ADDR) & ~0x0Eu) | 0x0Bu;
+    openfw_mmio_wr32(LCDC_DATA_LEN_ADDR, 3u);
+    uint16_t pending = 0;
+    int have_pending = 0;
     for (uint16_t row = 0; row < h; row++) {
         const uint16_t *line = pixels + (uint32_t)row * stride;
         uint32_t i = 0;
+        if (have_pending) {
+            lcd_write_pixel_pair(data_ctrl, pending, line[i++]);
+            have_pending = 0;
+        }
         for (; i + 1u < w; i += 2u) {
-            st7735s_write_data(pack_be16_pair(line[i], line[i + 1u]), 4u);
+            lcd_write_pixel_pair(data_ctrl, line[i], line[i + 1u]);
         }
         if (i < w) {
-            st7735s_write_data(pack_be16_pair(line[i], 0u), 2u);
+            pending = line[i];
+            have_pending = 1;
         }
     }
+    if (have_pending) st7735s_write_data(pack_be16_pair(pending, 0u), 2u);
 }
 
 static inline uint16_t rgb565_scale(uint16_t c, uint8_t alpha)
