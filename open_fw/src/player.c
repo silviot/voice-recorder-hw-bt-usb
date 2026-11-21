@@ -10,9 +10,18 @@
 #include "openfw_cwx.h"
 #include "openfw_player.h"
 
-static uint8_t  g_file_buf[4096]  __attribute__((aligned(4)));
-static int16_t  g_dec_pcm[2048]   __attribute__((aligned(4)));
-static int16_t  g_stereo_tx[4096] __attribute__((aligned(4))); /* up to 2048 stereo frames */
+#define PLAYER_DAC_CHUNK_FRAMES 1024u
+
+/*
+ * Static playback buffers (16 KiB total, zero net SRAM growth):
+ *   g_file_buf : 4096 B raw SD read buffer (used directly for 16-bit PCM)
+ *   g_dec_pcm  : 8192 B (4096 samples) IMA-ADPCM decode buffer: fits
+ *                block_align=2048 for both mono (4089) and stereo (2041) frames
+ *   g_mono_tx  : 4096 B (1024 stereo frames) mono->stereo expansion staging
+ */
+static uint8_t  g_file_buf[4096] __attribute__((aligned(4)));
+static int16_t  g_dec_pcm[4096]  __attribute__((aligned(4)));
+static int16_t  g_mono_tx[PLAYER_DAC_CHUNK_FRAMES * 2u] __attribute__((aligned(4)));
 
 typedef struct {
     exfat_vol_t   *vol;
@@ -98,7 +107,7 @@ static int make_cwx_path(char *out, int cap, const char *dir_path, const char *w
     while (cwx_name[len] != '\0') {
         len++;
     }
-    if (len < 5) {
+    if (len < 5 || cwx_name[len - 4] != '.') {
         return -1;
     }
     cwx_name[len - 3] = 'c';
@@ -113,12 +122,8 @@ static uint32_t frames_to_ms(uint32_t frames, uint32_t sample_rate)
     if (sample_rate == 0u || frames == 0u) {
         return 0u;
     }
-    uint32_t secs  = frames / sample_rate;
-    uint32_t rem_f = frames % sample_rate;
-    uint32_t ms    = (rem_f <= 0x3FFFFFu)
-                   ? ((rem_f * 1000u) / sample_rate)
-                   : (((rem_f / 100u) * 1000u) / ((sample_rate >= 100u) ? (sample_rate / 100u) : 1u));
-    return secs * 1000u + ms;
+    uint64_t ms = ((uint64_t)frames * 1000ull) / (uint64_t)sample_rate;
+    return (ms > 0xFFFFFFFFull) ? 0xFFFFFFFFu : (uint32_t)ms;
 }
 
 static uint8_t vbat_mv_to_pct(uint32_t mv)
@@ -185,10 +190,17 @@ static void populate_transcript_lines(ui_model_t *m, cwx_stream_t *cwx, uint32_t
         }
         if (i <= active_idx) {
             append_word_cap(m->tr_curr_spoken, (int)sizeof(m->tr_curr_spoken), words[i].text, wl);
-        } else {
-            if (m->tr_curr_spoken[0] != '\0' && m->tr_curr_upcoming[0] == '\0') {
-                str_copy_cap(m->tr_curr_upcoming, (int)sizeof(m->tr_curr_upcoming), " ");
+        } else if (m->tr_curr_spoken[0] != '\0' && m->tr_curr_upcoming[0] == '\0') {
+            int pos = 0;
+            int cap = (int)sizeof(m->tr_curr_upcoming);
+            if (pos < cap - 1) {
+                m->tr_curr_upcoming[pos++] = ' ';
             }
+            for (int k = 0; k < wl && pos < cap - 1; k++) {
+                m->tr_curr_upcoming[pos++] = words[i].text[k];
+            }
+            m->tr_curr_upcoming[pos] = '\0';
+        } else {
             append_word_cap(m->tr_curr_upcoming, (int)sizeof(m->tr_curr_upcoming), words[i].text, wl);
         }
         cur_chars += wl + 1;
@@ -337,6 +349,50 @@ player_action_t player_keys_step(player_keys_t *s, key_id_t raw, uint32_t now_ms
     return player_keys_edge(s, raw, now_ms);
 }
 
+static uint32_t player_heard_frames(uint32_t played_frames, uint32_t skip_frames)
+{
+    uint32_t queued = audio_dac_queued_frames();
+    uint32_t base   = (played_frames > queued) ? (played_frames - queued) : 0u;
+    return base + skip_frames;
+}
+
+static void player_seek_to_frame(const wav_stream_info_t *winfo, uint64_t target,
+                                 uint32_t *data_off, uint32_t *played_frames)
+{
+    if (target >= (uint64_t)winfo->total_samples) {
+        target = (winfo->total_samples > 0u) ? (uint64_t)(winfo->total_samples - 1u) : 0u;
+    }
+    uint64_t off64;
+    if (winfo->format_tag == WAV_FMT_PCM) {
+        off64          = target * (uint64_t)winfo->block_align;
+        *played_frames = (uint32_t)target;
+    } else {
+        uint32_t spb     = (winfo->samples_per_block > 0u) ? (uint32_t)winfo->samples_per_block : 1u;
+        uint64_t blk_idx = target / (uint64_t)spb;
+        off64            = blk_idx * (uint64_t)winfo->block_align;
+        *played_frames   = (uint32_t)(blk_idx * (uint64_t)spb);
+    }
+    if (off64 > (uint64_t)winfo->data_bytes) {
+        off64 = (uint64_t)winfo->data_bytes;
+    }
+    *data_off = (uint32_t)off64;
+}
+
+static void player_pause_rewind(const wav_stream_info_t *winfo,
+                                uint32_t *data_off,
+                                uint32_t *played_frames,
+                                uint32_t *buf_pos,
+                                uint32_t *buf_frames,
+                                uint32_t *skip_frames)
+{
+    uint32_t heard = player_heard_frames(*played_frames, *skip_frames);
+    player_seek_to_frame(winfo, (uint64_t)heard, data_off, played_frames);
+    *skip_frames = (heard > *played_frames) ? (heard - *played_frames) : 0u;
+    *buf_pos     = 0u;
+    *buf_frames  = 0u;
+    audio_dac_flush();
+}
+
 int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_name,
                         ui_model_t *m)
 {
@@ -361,18 +417,56 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
         return 0;
     }
 
+    /* Fast path: parse standard WAV headers within the first 512 B sector.
+     * Fall back to scanning up to 4096 B when LIST/bext/JUNK chunks precede data. */
+    wav_stream_info_t winfo;
     uint32_t hdr_read = 0u;
     uint32_t hdr_want = (wav_ent.size > 512u) ? 512u : (uint32_t)wav_ent.size;
     if (exfat_read_file(vol, &wav_ent, 0u, g_file_buf, hdr_want, &hdr_read) != 0 || hdr_read < 44u) {
         return 0;
     }
-
-    wav_stream_info_t winfo;
     if (wav_parse_stream(g_file_buf, hdr_read, &winfo) != 0) {
-        return 0;
+        if (wav_ent.size <= 512u) {
+            return 0;
+        }
+        uint32_t scan_want = (wav_ent.size > sizeof(g_file_buf))
+                           ? (uint32_t)sizeof(g_file_buf)
+                           : (uint32_t)wav_ent.size;
+        if (exfat_read_file(vol, &wav_ent, 0u, g_file_buf, scan_want, &hdr_read) != 0 ||
+            wav_parse_stream(g_file_buf, hdr_read, &winfo) != 0) {
+            return 0;
+        }
     }
     if (winfo.block_align == 0u || winfo.block_align > sizeof(g_file_buf)) {
         return 0;
+    }
+    if ((uint64_t)winfo.data_offset > wav_ent.size) {
+        return 0;
+    }
+    if (winfo.format_tag == WAV_FMT_IMA_ADPCM) {
+        uint32_t dec_cap = (uint32_t)(sizeof(g_dec_pcm) / sizeof(g_dec_pcm[0])) / (uint32_t)winfo.channels;
+        uint32_t hdr_bytes = (uint32_t)winfo.channels * 4u;
+        uint32_t blk_frames = 1u + ((uint32_t)(winfo.block_align - hdr_bytes) * 2u) / (uint32_t)winfo.channels;
+        if (blk_frames > dec_cap) {
+            return 0;
+        }
+    }
+
+    /* Clamp data_bytes to actual file size so truncated WAV headers never read past EOF */
+    uint64_t avail_bytes = wav_ent.size - (uint64_t)winfo.data_offset;
+    if ((uint64_t)winfo.data_bytes > avail_bytes) {
+        winfo.data_bytes = (avail_bytes > 0xFFFFFFFFull) ? 0xFFFFFFFFu : (uint32_t)avail_bytes;
+        uint64_t max_samples;
+        if (winfo.format_tag == WAV_FMT_PCM) {
+            max_samples = (uint64_t)(winfo.data_bytes / winfo.block_align);
+        } else {
+            uint32_t full_blocks = winfo.data_bytes / winfo.block_align;
+            max_samples = (uint64_t)full_blocks * (uint64_t)winfo.samples_per_block;
+        }
+        if ((uint64_t)winfo.total_samples > max_samples) {
+            winfo.total_samples = (max_samples > 0xFFFFFFFFull) ? 0xFFFFFFFFu : (uint32_t)max_samples;
+        }
+        winfo.duration_ms = frames_to_ms(winfo.total_samples, winfo.sample_rate);
     }
 
     /* Optional companion Cassini timed-word sidecar (.cwx) */
@@ -415,29 +509,21 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
     uint32_t played_frames = 0u;
     if (m->play_file.resume_sec > 0u && winfo.sample_rate > 0u) {
         uint64_t target = (uint64_t)m->play_file.resume_sec * (uint64_t)winfo.sample_rate;
-        if (target < winfo.total_samples) {
-            if (winfo.format_tag == WAV_FMT_PCM) {
-                uint32_t f_idx = (uint32_t)target;
-                data_off      = f_idx * (uint32_t)winfo.block_align;
-                played_frames = f_idx;
-            } else {
-                uint32_t spb = (winfo.samples_per_block > 0u) ? (uint32_t)winfo.samples_per_block : 1u;
-                uint32_t blk_idx = (uint32_t)target / spb;
-                data_off      = blk_idx * (uint32_t)winfo.block_align;
-                played_frames = blk_idx * spb;
-            }
-            if (data_off > winfo.data_bytes) {
-                data_off = winfo.data_bytes;
-            }
+        if (target < (uint64_t)winfo.total_samples) {
+            player_seek_to_frame(&winfo, target, &data_off, &played_frames);
         }
     }
+    const int16_t *pcm_buf = (winfo.format_tag == WAV_FMT_PCM)
+                           ? (const int16_t *)(const void *)g_file_buf
+                           : g_dec_pcm;
     uint32_t buf_pos       = 0u;
     uint32_t buf_frames    = 0u;
+    uint32_t skip_frames   = 0u;
     uint8_t  peak_l_pct    = 0u;
     uint8_t  peak_r_pct    = 0u;
     int      paused        = 0;
     int      eof_reached   = 0;
-    uint32_t telemetry_ms   = millis() - 1000u;
+    uint32_t telemetry_ms  = millis() - 1000u;
     uint32_t last_ui_ms    = 0u;
     uint32_t last_vol_ms   = 0u;
     uint32_t toast_until   = 0u;
@@ -471,6 +557,8 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
                 paused = 1;
                 audio_pa_set(0);
                 audio_dac_set_mute(1);
+                player_pause_rewind(&winfo, &data_off, &played_frames,
+                                    &buf_pos, &buf_frames, &skip_frames);
                 str_copy_cap(m->toast_msg, (int)sizeof(m->toast_msg),
                              "Headphones out \xC2\xB7 paused");
                 m->toast_col = UI_COL_AMBER;
@@ -507,10 +595,18 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
                 played_frames = 0u;
                 buf_pos       = 0u;
                 buf_frames    = 0u;
+                skip_frames   = 0u;
                 eof_reached   = 0;
                 paused        = 0;
+                audio_dac_flush();
             } else {
                 paused ^= 1;
+                if (paused) {
+                    audio_dac_set_mute(1);
+                    audio_pa_set(0);
+                    player_pause_rewind(&winfo, &data_off, &played_frames,
+                                        &buf_pos, &buf_frames, &skip_frames);
+                }
             }
             audio_dac_set_mute(paused);
             audio_pa_set((!hp_in && !paused && !eof_reached) ? 1 : 0);
@@ -546,30 +642,18 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
                 } else {
                     step_s = fwd ? 30 : -10;
                 }
+                uint32_t heard = player_heard_frames(played_frames, skip_frames);
                 int64_t delta  = (int64_t)winfo.sample_rate * (int64_t)step_s;
-                int64_t target = (int64_t)played_frames + delta;
+                int64_t target = (int64_t)heard + delta;
                 if (target < 0) {
                     target = 0;
                 }
-                if ((uint64_t)target >= winfo.total_samples) {
-                    target = (winfo.total_samples > 0u) ? (int64_t)(winfo.total_samples - 1u) : 0;
-                }
-                if (winfo.format_tag == WAV_FMT_PCM) {
-                    uint32_t f_idx = (uint32_t)target;
-                    data_off      = f_idx * (uint32_t)winfo.block_align;
-                    played_frames = f_idx;
-                } else {
-                    uint32_t spb = (winfo.samples_per_block > 0u) ? (uint32_t)winfo.samples_per_block : 1u;
-                    uint32_t blk_idx = (uint32_t)target / spb;
-                    data_off      = blk_idx * (uint32_t)winfo.block_align;
-                    played_frames = blk_idx * spb;
-                }
-                if (data_off > winfo.data_bytes) {
-                    data_off = winfo.data_bytes;
-                }
+                player_seek_to_frame(&winfo, (uint64_t)target, &data_off, &played_frames);
                 buf_pos     = 0u;
                 buf_frames  = 0u;
+                skip_frames = 0u;
                 eof_reached = 0;
+                audio_dac_flush();
                 audio_pa_set((!hp_in && !paused) ? 1 : 0);
                 ui_dirty    = 1;
             }
@@ -600,33 +684,59 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
                         break;
                     }
                     uint32_t rem = winfo.data_bytes - data_off;
-                    uint32_t frames_cap = (sizeof(g_dec_pcm) / sizeof(g_dec_pcm[0])) / winfo.channels;
-                    uint32_t frames_per_block = 1u;
+                    uint32_t chunk;
+                    uint32_t frames_cap = 0u;
                     if (winfo.format_tag == WAV_FMT_IMA_ADPCM) {
-                        frames_per_block = 1u + (winfo.block_align - 4u * winfo.channels) * 2u / winfo.channels;
+                        frames_cap = (uint32_t)(sizeof(g_dec_pcm) / sizeof(g_dec_pcm[0])) / winfo.channels;
+                        uint32_t frames_per_block = 1u + ((uint32_t)(winfo.block_align - 4u * winfo.channels) * 2u) / winfo.channels;
+                        uint32_t blocks = frames_cap / frames_per_block;
+                        chunk = blocks * (uint32_t)winfo.block_align;
+                        if (chunk > sizeof(g_file_buf)) chunk = (uint32_t)sizeof(g_file_buf);
+                    } else {
+                        chunk = (uint32_t)sizeof(g_file_buf);
+                        /* Align the first unaligned PCM read to a 512 B file boundary so
+                         * subsequent reads take exfat_read_file()'s zero-copy aligned path. */
+                        uint32_t file_off = winfo.data_offset + data_off;
+                        uint32_t misalign = file_off & 511u;
+                        if (misalign != 0u) {
+                            uint32_t to_align = 512u - misalign;
+                            if ((to_align % (uint32_t)winfo.block_align) == 0u && to_align < chunk) {
+                                chunk = to_align;
+                            }
+                        }
                     }
-                    uint32_t blocks = frames_cap / frames_per_block;
-                    uint32_t chunk = blocks * winfo.block_align;
-                    if (chunk > sizeof(g_file_buf)) chunk = sizeof(g_file_buf);
                     if (chunk > rem) chunk = rem;
                     chunk -= chunk % winfo.block_align;
                     if (!chunk) {
                         data_off = winfo.data_bytes;
+                        if (!audio_dac_is_busy()) {
+                            eof_reached = 1;
+                            peak_l_pct  = 0u;
+                            peak_r_pct  = 0u;
+                            audio_pa_set(0);
+                            ui_dirty    = 1;
+                        }
                         break;
                     }
 
                     uint32_t got = 0u;
                     if (exfat_read_file(vol, &wav_ent, (uint64_t)winfo.data_offset + data_off,
                                         g_file_buf, chunk, &got) != 0 || got < chunk) {
-                        eof_reached = 1;
-                        ui_dirty    = 1;
+                        data_off = winfo.data_bytes;
+                        if (!audio_dac_is_busy()) {
+                            eof_reached = 1;
+                            peak_l_pct  = 0u;
+                            peak_r_pct  = 0u;
+                            audio_pa_set(0);
+                            ui_dirty    = 1;
+                        }
                         break;
                     }
                     data_off += chunk;
 
                     uint32_t decoded_frames = 0u;
                     if (winfo.format_tag == WAV_FMT_IMA_ADPCM) {
-                        for (uint32_t off = 0; off < chunk; off += winfo.block_align) {
+                        for (uint32_t off = 0u; off < chunk; off += winfo.block_align) {
                             int n = wav_decode_ima_adpcm_block(g_file_buf + off, winfo.block_align,
                                             winfo.channels, g_dec_pcm + decoded_frames * winfo.channels,
                                             frames_cap - decoded_frames);
@@ -638,48 +748,61 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
                         }
                     } else {
                         decoded_frames = chunk / (uint32_t)winfo.block_align;
-                        const int16_t *src = (const int16_t *)(const void *)g_file_buf;
-                        uint32_t total_s = decoded_frames * (uint32_t)winfo.channels;
-                        for (uint32_t i = 0u; i < total_s; i++) {
-                            g_dec_pcm[i] = src[i];
-                        }
                     }
 
                     if (decoded_frames > winfo.total_samples - played_frames) {
                         decoded_frames = winfo.total_samples - played_frames;
                     }
 
+                    uint32_t start_pos = 0u;
+                    if (skip_frames > 0u) {
+                        start_pos      = (skip_frames > decoded_frames) ? decoded_frames : skip_frames;
+                        played_frames += start_pos;
+                        skip_frames   -= start_pos;
+                    }
+
                     int32_t pl = 0, pr = 0;
                     if (winfo.channels == 1u) {
-                        for (uint32_t i = 0u; i < decoded_frames; i++) {
-                            int16_t s = g_dec_pcm[i];
+                        for (uint32_t i = start_pos; i < decoded_frames; i++) {
+                            int16_t s = pcm_buf[i];
                             int32_t a = (s < 0) ? -(int32_t)s : (int32_t)s;
                             if (a > pl) pl = a;
-                            g_stereo_tx[i * 2u + 0u] = s;
-                            g_stereo_tx[i * 2u + 1u] = s;
                         }
                         pr = pl;
                     } else {
-                        for (uint32_t i = 0u; i < decoded_frames; i++) {
-                            int16_t l = g_dec_pcm[i * 2u + 0u];
-                            int16_t r = g_dec_pcm[i * 2u + 1u];
+                        for (uint32_t i = start_pos; i < decoded_frames; i++) {
+                            int16_t l = pcm_buf[i * 2u + 0u];
+                            int16_t r = pcm_buf[i * 2u + 1u];
                             int32_t al = (l < 0) ? -(int32_t)l : (int32_t)l;
                             int32_t ar = (r < 0) ? -(int32_t)r : (int32_t)r;
                             if (al > pl) pl = al;
                             if (ar > pr) pr = ar;
-                            g_stereo_tx[i * 2u + 0u] = l;
-                            g_stereo_tx[i * 2u + 1u] = r;
                         }
                     }
                     peak_l_pct = (uint8_t)((pl * 100) / 32767);
                     peak_r_pct = (uint8_t)((pr * 100) / 32767);
-                    buf_pos    = 0u;
+                    buf_pos    = start_pos;
                     buf_frames = decoded_frames;
                 }
 
                 if (buf_pos < buf_frames) {
-                    int sent = audio_dac_write_stereo(&g_stereo_tx[buf_pos * 2u],
+                    int sent;
+                    if (winfo.channels == 2u) {
+                        sent = audio_dac_write_stereo(&pcm_buf[buf_pos * 2u],
                                                       buf_frames - buf_pos);
+                    } else {
+                        uint32_t n = buf_frames - buf_pos;
+                        if (n > PLAYER_DAC_CHUNK_FRAMES) {
+                            n = PLAYER_DAC_CHUNK_FRAMES;
+                        }
+                        const int16_t *src = &pcm_buf[buf_pos];
+                        for (uint32_t i = 0u; i < n; i++) {
+                            int16_t s = src[i];
+                            g_mono_tx[i * 2u + 0u] = s;
+                            g_mono_tx[i * 2u + 1u] = s;
+                        }
+                        sent = audio_dac_write_stereo(g_mono_tx, n);
+                    }
                     if (sent <= 0) {
                         break;
                     }
@@ -703,7 +826,8 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
             }
             m->hp_plugged = hp_in;
 
-            uint32_t pos_ms = frames_to_ms(played_frames, winfo.sample_rate);
+            uint32_t heard  = eof_reached ? played_frames : player_heard_frames(played_frames, skip_frames);
+            uint32_t pos_ms = frames_to_ms(heard, winfo.sample_rate);
             if (pos_ms > dur_ms && dur_ms > 0u) {
                 pos_ms = dur_ms;
             }

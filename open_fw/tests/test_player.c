@@ -7,11 +7,18 @@
 #include "openfw_wav.h"
 
 enum { FRAMES = 16017, SLOT_FRAMES = 1024 };
-static uint8_t recording[44 + FRAMES * 4];
-static unsigned channels, file_size, now_ms, submitted, consumed, gaps;
+static uint8_t recording[4096 + FRAMES * 4];
+static unsigned channels, file_size, now_ms, submitted, consumed, gaps, flush_calls;
 static unsigned slots[AUDIO_DAC_QUEUE_SLOTS], head, count;
 static int ended;
 static int strict = 1;           /* full-drain assertions (plain playback runs) */
+static int track_pcm = 0;        /* capture heard PCM stream across pause/resume */
+static int16_t heard_l[FRAMES + 2048];
+static unsigned heard_n;
+static int16_t slot_l[AUDIO_DAC_QUEUE_SLOTS][SLOT_FRAMES];
+static unsigned slot_off[AUDIO_DAC_QUEUE_SLOTS];
+static unsigned unaligned_reads_after_first;
+static unsigned pcm_read_idx;
 static key_id_t (*key_script)(unsigned ms);
 static unsigned vol_calls;
 
@@ -79,10 +86,17 @@ static void advance(unsigned ms)
     unsigned frames = 16 * ms;
     while (frames && count) {
         unsigned take = slots[head] < frames ? slots[head] : frames;
+        if (track_pcm) {
+            for (unsigned i = 0; i < take && heard_n < (FRAMES + 2048); i++) {
+                heard_l[heard_n++] = slot_l[head][slot_off[head] + i];
+            }
+        }
+        slot_off[head] += take;
         slots[head] -= take;
         frames -= take;
         consumed += take;
         if (!slots[head]) {
+            slot_off[head] = 0;
             head = (head + 1u) % AUDIO_DAC_QUEUE_SLOTS;
             count--;
         }
@@ -103,12 +117,36 @@ int audio_dac_write_stereo(const int16_t *pcm, uint32_t frames)
         assert(pcm[2*i] == sample(submitted+i, 0));
         assert(pcm[2*i+1] == sample(submitted+i, channels-1));
     }
+    unsigned idx = (head + count) % AUDIO_DAC_QUEUE_SLOTS;
+    if (track_pcm) {
+        for (unsigned i = 0; i < frames; i++) {
+            slot_l[idx][i] = pcm[2*i];
+        }
+        slot_off[idx] = 0;
+    }
     submitted += frames;
-    slots[(head + count) % AUDIO_DAC_QUEUE_SLOTS] = frames;
+    slots[idx] = frames;
     count++;
     return (int)frames;
 }
 int audio_dac_is_busy(void) { return count != 0; }
+void audio_dac_flush(void)
+{
+    flush_calls++;
+    head = count = 0;
+    for (unsigned i = 0; i < AUDIO_DAC_QUEUE_SLOTS; i++) {
+        slots[i] = 0;
+        slot_off[i] = 0;
+    }
+}
+uint32_t audio_dac_queued_frames(void)
+{
+    uint32_t total = 0u;
+    for (unsigned i = 0u; i < count; i++) {
+        total += slots[(head + i) % AUDIO_DAC_QUEUE_SLOTS];
+    }
+    return total;
+}
 void audio_pa_set(int on) { if (!on && strict) assert(consumed == FRAMES); }
 void audio_dac_stop(void) { if (strict) assert(!count); count = 0; }
 void audio_dac_set_volume(uint8_t level, uint16_t digital) { (void)level; (void)digital; vol_calls++; }
@@ -126,6 +164,12 @@ int exfat_read_file(const exfat_vol_t *vol, const exfat_entry_t *ent,
 {
     (void)vol;
     assert(offset + len <= ent->size);
+    if (offset > 0u) {
+        if (pcm_read_idx > 0u && (offset & 511u) != 0u) {
+            unaligned_reads_after_first++;
+        }
+        pcm_read_idx++;
+    }
     memcpy(dst, recording + offset, len);
     *got = len;
     advance(1);
@@ -352,13 +396,142 @@ static key_id_t brief_tap_during_render(unsigned ms)
     return KEY_NONE;
 }
 
+static unsigned ended_at_ms;
+
 static void reset_run(key_id_t (*script)(unsigned))
 {
-    now_ms = submitted = consumed = gaps = head = count = vol_calls = 0;
+    now_ms = submitted = consumed = gaps = head = count = vol_calls = flush_calls = 0;
+    heard_n = unaligned_reads_after_first = pcm_read_idx = ended_at_ms = 0;
     ended = 0;
     strict = 0;
+    track_pcm = 0;
     key_script = script;
     stub_keys_reset();
+}
+
+static key_id_t pause_resume_then_finish(unsigned ms)
+{
+    if (ended) {
+        if (ended_at_ms == 0u) ended_at_ms = ms;
+        return (ms < ended_at_ms + 40u) ? KEY_BACK : KEY_NONE;
+    }
+    if (ms >= 200 && ms < 240) return KEY_ENTER; /* pause while DAC queue has frames */
+    if (ms >= 420 && ms < 460) return KEY_ENTER; /* resume */
+    return KEY_NONE;
+}
+
+static void put_le16_t(uint8_t *p, uint16_t v)
+{
+    p[0] = (uint8_t)(v & 0xFFu);
+    p[1] = (uint8_t)((v >> 8) & 0xFFu);
+}
+
+static void put_le32_t(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)(v & 0xFFu);
+    p[1] = (uint8_t)((v >> 8) & 0xFFu);
+    p[2] = (uint8_t)((v >> 16) & 0xFFu);
+    p[3] = (uint8_t)((v >> 24) & 0xFFu);
+}
+
+static void test_pause_zero_loss_and_ima2048(void)
+{
+    static ui_model_t m;
+    exfat_vol_t vol = {0};
+
+    /* 1. Pause/Resume zero-sample-loss on 16-bit stereo PCM (already in recording[]) */
+    channels = 2;
+    memset(&m, 0, sizeof(m));
+    m.cfg.spk_vol = 18;
+    reset_run(pause_resume_then_finish);
+    track_pcm = 1;
+    assert(openfw_play_file_ui(&vol, "/record", "test.wav", &m) == 0);
+    assert(ended == 1);
+    assert(flush_calls >= 1u);
+    assert(heard_n == FRAMES);
+    for (unsigned i = 0; i < FRAMES; i++) {
+        assert(heard_l[i] == sample(i, 0));
+    }
+
+    /* 2. Seek flushes DAC queue immediately */
+    memset(&m, 0, sizeof(m));
+    m.cfg.spk_vol = 18;
+    reset_run(hold_right_then_back);
+    assert(openfw_play_file_ui(&vol, "/record", "test.wav", &m) == 0);
+    assert(flush_calls >= 1u);
+
+    /* 3. IMA-ADPCM block_align=2048 (both mono 4089 spb & stereo 2041 spb) decodes cleanly */
+    for (unsigned ch = 1; ch <= 2; ch++) {
+        uint16_t ba  = 2048u;
+        uint16_t spb = (ch == 1u) ? 4089u : 2041u;
+        uint32_t nblk = 2u;
+        uint32_t data_bytes = nblk * ba;
+        memset(recording, 0, 60u + data_bytes);
+        memcpy(&recording[0], "RIFF", 4u);
+        put_le32_t(&recording[4], 52u + data_bytes);
+        memcpy(&recording[8], "WAVEfmt ", 8u);
+        put_le32_t(&recording[16], 20u);
+        put_le16_t(&recording[20], WAV_FMT_IMA_ADPCM);
+        put_le16_t(&recording[22], (uint16_t)ch);
+        put_le32_t(&recording[24], 16000u);
+        put_le32_t(&recording[28], 16000u * ba / spb);
+        put_le16_t(&recording[32], ba);
+        put_le16_t(&recording[34], 4u);
+        put_le16_t(&recording[36], 2u);
+        put_le16_t(&recording[38], spb);
+        memcpy(&recording[40], "fact", 4u);
+        put_le32_t(&recording[44], 4u);
+        put_le32_t(&recording[48], nblk * spb);
+        memcpy(&recording[52], "data", 4u);
+        put_le32_t(&recording[56], data_bytes);
+        for (uint32_t b = 0u; b < nblk; b++) {
+            uint8_t *blk = &recording[60u + b * ba];
+            put_le16_t(&blk[0], (uint16_t)1200);
+            blk[2] = 10u;
+            if (ch == 2u) {
+                put_le16_t(&blk[4], (uint16_t)-1200);
+                blk[6] = 10u;
+            }
+        }
+        file_size = 60u + data_bytes;
+        channels  = ch;
+        memset(&m, 0, sizeof(m));
+        m.cfg.spk_vol = 18;
+        reset_run(pause_resume_then_finish);
+        assert(openfw_play_file_ui(&vol, "/record", "test.wav", &m) == 0);
+        assert(ended == 1);
+        assert(consumed == nblk * spb);
+    }
+
+    /* 4. WAV header with 1024-byte JUNK chunk before data (>512 B) parses & plays */
+    uint32_t junk_len = 1024u;
+    uint32_t pcm_frames = 2048u;
+    uint32_t pcm_bytes = pcm_frames * 2u;
+    memset(recording, 0, 44u + 8u + junk_len + pcm_bytes);
+    memcpy(&recording[0], "RIFF", 4u);
+    put_le32_t(&recording[4], 36u + 8u + junk_len + pcm_bytes);
+    memcpy(&recording[8], "WAVEfmt ", 8u);
+    put_le32_t(&recording[16], 16u);
+    put_le16_t(&recording[20], WAV_FMT_PCM);
+    put_le16_t(&recording[22], 1u);
+    put_le32_t(&recording[24], 16000u);
+    put_le32_t(&recording[28], 32000u);
+    put_le16_t(&recording[32], 2u);
+    put_le16_t(&recording[34], 16u);
+    memcpy(&recording[36], "JUNK", 4u);
+    put_le32_t(&recording[40], junk_len);
+    uint32_t data_hdr = 44u + junk_len;
+    memcpy(&recording[data_hdr], "data", 4u);
+    put_le32_t(&recording[data_hdr + 4u], pcm_bytes);
+    file_size = data_hdr + 8u + pcm_bytes;
+    channels  = 1u;
+    memset(&m, 0, sizeof(m));
+    m.cfg.spk_vol = 18;
+    reset_run(pause_resume_then_finish);
+    assert(openfw_play_file_ui(&vol, "/record", "test.wav", &m) == 0);
+    assert(ended == 1 && consumed == pcm_frames);
+
+    puts("[OK] player pause/resume 0-loss, seek flush, IMA-ADPCM block_align=2048 (1ch/2ch), >512B JUNK header");
 }
 
 static void test_scripted_keys(void)
@@ -428,13 +601,16 @@ int main(void)
                 recording[off+1] = (uint8_t)(s >> 8);
             }
         }
-        now_ms = submitted = consumed = gaps = head = count = 0;
+        now_ms = submitted = consumed = gaps = head = count = flush_calls = 0;
+        unaligned_reads_after_first = pcm_read_idx = 0;
         ended = 0;
         exfat_vol_t vol = {0};
         assert(openfw_play_file_ui(&vol, "/record", "test.wav", NULL) == 2);
         assert(consumed == FRAMES && gaps == 0);
+        assert(unaligned_reads_after_first == 0u);
     }
-    puts("[OK] 16 kHz mono and stereo playback, blocking display, complete DMA drain");
+    puts("[OK] 16 kHz mono and stereo playback, 512B aligned SD reads, blocking display, complete DMA drain");
     test_scripted_keys(); /* uses the stereo fixture left by the loop above */
+    test_pause_zero_loss_and_ima2048();
     return 0;
 }

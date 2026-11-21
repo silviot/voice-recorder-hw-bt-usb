@@ -221,18 +221,21 @@ void           audio_get_peak_lr_pct(uint8_t *out_l, uint8_t *out_r);
 uint32_t       audio_dma_peek_pcm(int16_t *dst, uint32_t max_frames, uint8_t *out_channels);
 uint32_t       audio_get_frames(void);
 const int16_t *audio_pop_frame(uint32_t *out_bytes);
+int            audio_pop_frame_copy(int16_t *dst, uint32_t max_bytes, uint32_t *out_bytes);
 uint32_t       audio_get_overruns(void);
 
 /* Audio DAC0+DAC1 Stereo Headphone + Built-in Speaker PA (PB30) + DMAC CH0 TX (audio_dac.c) */
-void audio_pll_set(uint32_t sample_rate);
-void audio_pa_set(int enable);
-int  audio_dac_start(uint32_t sample_rate, uint8_t ana_vol_0_31);
-void audio_dac_set_volume(uint8_t ana_vol_0_31, uint16_t dig_vol_0_511);
-void audio_dac_set_mute(int muted);
+void     audio_pll_set(uint32_t sample_rate);
+void     audio_pa_set(int enable);
+int      audio_dac_start(uint32_t sample_rate, uint8_t ana_vol_0_31);
+void     audio_dac_set_volume(uint8_t ana_vol_0_31, uint16_t dig_vol_0_511);
+void     audio_dac_set_mute(int muted);
 #define AUDIO_DAC_QUEUE_SLOTS 4u
-int  audio_dac_write_stereo(const int16_t *interleaved_lr, uint32_t num_frames);
-int  audio_dac_is_busy(void);
-void audio_dac_stop(void);
+int      audio_dac_write_stereo(const int16_t *interleaved_lr, uint32_t num_frames);
+int      audio_dac_is_busy(void);
+void     audio_dac_flush(void);
+uint32_t audio_dac_queued_frames(void);
+void     audio_dac_stop(void);
 
 /* Real-Time WAV Recorder + Clean-Room DSP (recorder.c) */
 void                recorder_set_gain(uint8_t gain_0_31);

@@ -313,9 +313,10 @@ static void test_vor_gate(void)
         audio_vor_feed(&vor, chunk, 320u, vor_capture_cb, &vc);
     }
     assert(vor.gate_open == 1u);
-    /* Emitted 200 ms pre-roll (3200) + 300 ms speech (4800) = 8000 frames; verify pre-roll marker preserved */
+    /* Emitted 200 ms pre-roll (3200) + 300 ms speech (4800) = 8000 frames;
+     * first 5 ms (80 frames) fades in smoothly, markers past 5 ms remain intact */
     assert(vc.frames == 8000u);
-    assert(vc.out[0] == 16 && vc.out[320] == 17);
+    assert(vc.out[0] == 0 && vc.out[320] == 17 && vc.out[640] == 18);
 
     /* 3. Feed 800 ms (40 x 320 = 12800) silence -> emits 500 ms hangover (8000) then closes! */
     memset(chunk, 0, sizeof(chunk));
@@ -329,6 +330,95 @@ static void test_vor_gate(void)
            (unsigned)vc.frames);
 }
 
+typedef struct {
+    int16_t out[64000];
+    size_t  frames;
+    uint8_t ch;
+} vor_st_cap_t;
+
+static void vor_st_capture_cb(void *user, const int16_t *pcm, size_t num_frames)
+{
+    vor_st_cap_t *vc = (vor_st_cap_t *)user;
+    assert((vc->frames + num_frames) * vc->ch <= 64000u);
+    memcpy(&vc->out[vc->frames * vc->ch], pcm, num_frames * vc->ch * sizeof(int16_t));
+    vc->frames += num_frames;
+}
+
+static void test_vor_stereo_and_fades(void)
+{
+    /* 1. Anti-phase stereo (L=+s, R=-s) must trigger VOR via phase-invariant RMS */
+    audio_vor_t vor;
+    vor_st_cap_t vc;
+    memset(&vc, 0, sizeof(vc));
+    vc.ch = 2u;
+    audio_vor_init(&vor, 16000u, 2u, 1);
+
+    int16_t st[320 * 2];
+    /* Pre-fill pre-roll with low-level DC/floor (below open threshold) to observe fade-in */
+    for (int f = 0; f < 10; f++) {
+        for (size_t i = 0u; i < 320u; i++) {
+            st[i * 2u + 0u] = 160;
+            st[i * 2u + 1u] = -160;
+        }
+        audio_vor_feed(&vor, st, 320u, vor_st_capture_cb, &vc);
+    }
+    assert(vor.gate_open == 0u && vc.frames == 0u);
+
+    /* Feed anti-phase 1 kHz tone at -18 dBFS */
+    for (int f = 0; f < 5; f++) {
+        for (size_t i = 0u; i < 320u; i++) {
+            int16_t s = (int16_t)llround(4500.0 * sin(2.0 * M_PI * 1000.0 * (double)i / 16000.0));
+            st[i * 2u + 0u] = s;
+            st[i * 2u + 1u] = (int16_t)-s;
+        }
+        audio_vor_feed(&vor, st, 320u, vor_st_capture_cb, &vc);
+    }
+    assert(vor.gate_open == 1u);
+    assert(vc.frames == 3200u + 5u * 320u);
+    /* Verify 5 ms (80-frame) fade-in: frame 0 is 0, frame 40 is ~half, frame 80 is full 160 */
+    assert(vc.out[0] == 0 && vc.out[1] == 0);
+    assert(vc.out[40 * 2 + 0] == 80 && vc.out[40 * 2 + 1] == -80);
+    assert(vc.out[80 * 2 + 0] == 160 && vc.out[80 * 2 + 1] == -160);
+
+    /* Close gate on non-zero quiet floor (-46 dBFS < -40 dBFS close_thresh) -> verify 5 ms fade-out */
+    for (int f = 0; f < 30; f++) {
+        for (size_t i = 0u; i < 320u; i++) {
+            st[i * 2u + 0u] = 160;
+            st[i * 2u + 1u] = -160;
+        }
+        audio_vor_feed(&vor, st, 320u, vor_st_capture_cb, &vc);
+    }
+    assert(vor.gate_open == 0u);
+    size_t last = vc.frames - 1u;
+    assert(vc.out[last * 2 + 0] == 0 && vc.out[last * 2 + 1] == 0);
+    assert(vc.out[(last - 80u) * 2 + 0] == 160 && vc.out[(last - 80u) * 2 + 1] == -160);
+
+    /* 2. Right-channel-only speech triggers VOR via dual-channel ZCR */
+    memset(&vc, 0, sizeof(vc));
+    vc.ch = 2u;
+    audio_vor_init(&vor, 16000u, 2u, 1);
+    for (size_t i = 0u; i < 320u; i++) {
+        st[i * 2u + 0u] = 0;
+        st[i * 2u + 1u] = (int16_t)llround(2500.0 * sin(2.0 * M_PI * 1000.0 * (double)i / 16000.0));
+    }
+    audio_vor_feed(&vor, st, 320u, vor_st_capture_cb, &vc);
+    assert(vor.gate_open == 1u && vc.frames == 320u);
+    /* Fade-in still applies when pre-roll was empty */
+    assert(vc.out[0] == 0 && vc.out[1] == 0);
+
+    /* 3. Low sample-rate Nyquist clamp produces valid finite samples */
+    audio_dsp_t low_sr;
+    audio_dsp_init(&low_sr, AUDIO_DSP_VOICE_CLARITY, 4000u, 1u);
+    int16_t low_buf[256];
+    for (size_t i = 0u; i < 256u; i++) {
+        low_buf[i] = (int16_t)llround(4000.0 * sin(2.0 * M_PI * 500.0 * (double)i / 4000.0));
+    }
+    audio_dsp_process_i16(&low_sr, low_buf, 256u);
+    assert(low_sr.rms_dbfs > -96.0f && low_sr.rms_dbfs <= 0.0f);
+
+    printf("  [PASS] audio_vor stereo RMS/ZCR + 5ms fade-in/out + Nyquist clamp\n");
+}
+
 int main(void)
 {
     printf("Running test_audio_dsp...\n");
@@ -339,6 +429,7 @@ int main(void)
     test_stereo_link_and_beamform();
     test_bypass_and_rms();
     test_vor_gate();
-    printf("ALL 7 AUDIO DSP + VOR SUITES PASSED!\n");
+    test_vor_stereo_and_fades();
+    printf("ALL 8 AUDIO DSP + VOR SUITES PASSED!\n");
     return 0;
 }

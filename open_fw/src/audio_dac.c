@@ -2,7 +2,7 @@
  * Smartlink SL6801 Bare-Metal Stereo Audio DAC0+DAC1 Headphone + DMAC CH0 TX Driver
  *
  * Implements verified Audio PLL (24.576 / 22.5792 MHz), eFuse DAC0/DAC1
- * DC-offset trims, pop-free analog power-up/down, and double-buffered
+ * DC-offset trims, pop-free analog power-up/down, and 4-slot queued
  * DMAC CH0 (NVIC IRQ 60) stereo 16-bit FIFO playback.
  *
  * SPDX-License-Identifier: MIT
@@ -13,12 +13,19 @@
 #include "openfw.h"
 #include "openfw_exp.h"
 
-#define DAC_DMA_CH       0u
-#define DAC_SLOT_FRAMES  1024u
-#define DAC_SLOT_SAMPLES (DAC_SLOT_FRAMES * 2u)
+#define DAC_DMA_CH           0u
+#define DAC_SLOT_FRAMES      1024u
+#define DAC_SLOT_SAMPLES     (DAC_SLOT_FRAMES * 2u)
+#define DAC_WAIT_MAX_ITERS   1000000u
 
-#define EFUSE_RST_ID     0x58u
-#define EFUSE_CLK_ID     0x1Bu
+#define EFUSE_RST_ID         0x58u
+#define EFUSE_CLK_ID         0x1Bu
+
+#ifdef OPENFW_HOST_MMIO
+#define AUDIO_DAC_ISB() do { } while (0)
+#else
+#define AUDIO_DAC_ISB() __asm__ volatile ("isb" ::: "memory")
+#endif
 
 /*
  * Built-in front speaker PA enable on PB30 (verified from HW_76 pen133_2.0.65):
@@ -44,6 +51,15 @@ static uint8_t           g_write_slot;
 static volatile uint32_t g_slot_bytes[AUDIO_DAC_QUEUE_SLOTS];
 static uint32_t          g_pcm_gain_q15;
 static int8_t            g_pa_state      = -1;
+
+static void dac_wait_mmio_mask(uint32_t addr, uint32_t mask, uint32_t expect)
+{
+    for (uint32_t t = 0u; t < DAC_WAIT_MAX_ITERS; t++) {
+        if ((openfw_mmio_rd32(addr) & mask) == expect) {
+            return;
+        }
+    }
+}
 
 void audio_pa_set(int enable)
 {
@@ -81,8 +97,7 @@ void audio_pll_set(uint32_t sample_rate)
     uint32_t int_div = is_48k ? 3u : 2u;
     uint32_t frac    = is_48k ? 0x03126u : 0x186C2u;
 
-    while (openfw_mmio_rd32(CRU_APLL_FRAC_ADDR) & (1u << 11)) {
-    }
+    dac_wait_mmio_mask(CRU_APLL_FRAC_ADDR, (1u << 11), 0u);
     openfw_mmio_wr32(CRU_APLL_CTRL_ADDR,
                      (openfw_mmio_rd32(CRU_APLL_CTRL_ADDR) & 0xFC1F0000u) |
                      0x3000u | (int_div << 5));
@@ -90,10 +105,10 @@ void audio_pll_set(uint32_t sample_rate)
                      (openfw_mmio_rd32(CRU_APLL_FRAC_ADDR) & 0x00003800u) |
                      0x80000400u | (frac << 14));
     openfw_mmio_set32(CRU_APLL_CTRL_ADDR, 0xC0000000u);
-    while (!(openfw_mmio_rd32(CRU_APLL_CTRL_ADDR) & (1u << 28))) {
-    }
+    dac_wait_mmio_mask(CRU_APLL_CTRL_ADDR, (1u << 28), (1u << 28));
 }
 
+OPENFW_RAMFUNC
 static void dmac_arm_tx_slot(uint8_t slot)
 {
     uint32_t len_bytes = g_slot_bytes[slot];
@@ -108,6 +123,7 @@ static void dmac_arm_tx_slot(uint8_t slot)
     openfw_mmio_wr32(DMAC_CH_CTL_ADDR(DAC_DMA_CH), DMAC_CTL_DAC_TX_BASE | DMAC_CTL_CH_EN);
 }
 
+OPENFW_RAMFUNC
 static void audio_dac_dmac_ch0_irq(void)
 {
     uint32_t st = openfw_mmio_rd32(DMAC_CH_IRQ_STAT_ADDR(DAC_DMA_CH));
@@ -120,7 +136,7 @@ static void audio_dac_dmac_ch0_irq(void)
 
     if (st & DMAC_IRQ_TC) {
         uint8_t done = g_active_slot;
-        uint8_t next = (done + 1u) % AUDIO_DAC_QUEUE_SLOTS;
+        uint8_t next = (uint8_t)((done + 1u) % AUDIO_DAC_QUEUE_SLOTS);
         g_slot_bytes[done] = 0u;
         if (g_slot_bytes[next]) {
             dmac_arm_tx_slot(next);
@@ -137,7 +153,8 @@ void audio_dac_set_volume(uint8_t ana_vol_0_31, uint16_t dig_vol_0_511)
     uint32_t av = (ana_vol_0_31 > 31u) ? 31u : (uint32_t)ana_vol_0_31;
     uint32_t dv = (dig_vol_0_511 > 0x1FFu) ? 0x1FFu : (uint32_t)dig_vol_0_511;
 
-    /* Apply the user level to both PCM channels, including a true silent level. */
+    /* Hardware-verified SL6801 volume control: logarithmic Q15 software gain
+     * plus DAC0/1 analog gain register so all 32 steps span full audible range. */
     g_pcm_gain_q15 = pcm_gain_q15[av];
     openfw_mmio_rmw32(CODEC_DAC0_VOL_ADDR, 0x1FFu, dv);
     openfw_mmio_rmw32(CODEC_DAC1_VOL_ADDR, 0x1FFu, dv);
@@ -175,8 +192,7 @@ int audio_dac_start(uint32_t sample_rate, uint8_t ana_vol_0_31)
     /* 1. CRU codec rst 0x25 + clk 0x13 + global enable + 20ms + clear codec SRAM */
     openfw_mmio_set32(CRU_RST_SET1_ADDR, (1u << 5));
     openfw_mmio_set32(CRU_RST_STAT1_ADDR, (1u << 5));
-    while (!(openfw_mmio_rd32(CRU_RST_STAT1_ADDR) & (1u << 5))) {
-    }
+    dac_wait_mmio_mask(CRU_RST_STAT1_ADDR, (1u << 5), (1u << 5));
     openfw_mmio_set32(CRU_CLK_EN_AUDIO_ADDR, 1u);
     openfw_mmio_set32(CODEC_GLB_ADDR, 1u);
     mdelay(20u);
@@ -188,8 +204,7 @@ int audio_dac_start(uint32_t sample_rate, uint8_t ana_vol_0_31)
 
     openfw_mmio_set32(CRU_RST_SET1_ADDR, 1u);
     openfw_mmio_set32(CRU_RST_STAT1_ADDR, 1u);
-    while (!(openfw_mmio_rd32(CRU_RST_STAT1_ADDR) & 1u)) {
-    }
+    dac_wait_mmio_mask(CRU_RST_STAT1_ADDR, 1u, 1u);
     openfw_mmio_set32(SYSCTL_CODEC_SRAM_ADDR, (1u << 2));
     for (uint32_t a = CODEC_SRAM_START; a < CODEC_SRAM_END; a += 4u) {
         openfw_mmio_wr32(a, 0u);
@@ -210,11 +225,7 @@ int audio_dac_start(uint32_t sample_rate, uint8_t ana_vol_0_31)
     openfw_mmio_rmw32(CODEC_GLB_ADDR, 0xF02u, 0x2u | (rate_code << 8));
     openfw_mmio_set32(CODEC_DAC_FIFO_CTRL_ADDR, 0x84u);
     openfw_mmio_set32(CODEC_DAC_FIFO_RST_ADDR, 0x2u);
-    for (uint32_t t = 1000000u; t > 0u; t--) {
-        if (!(openfw_mmio_rd32(CODEC_DAC_FIFO_RST_ADDR) & 0x2u)) {
-            break;
-        }
-    }
+    dac_wait_mmio_mask(CODEC_DAC_FIFO_RST_ADDR, 0x2u, 0u);
     openfw_mmio_set32(CODEC_DAC0_DIG_EN_ADDR, 0x3u);
     openfw_mmio_set32(CODEC_DAC1_DIG_EN_ADDR, 0x3u);
     openfw_mmio_clr32(CODEC_DAC2_DIG_EN_ADDR, 0x3u);
@@ -251,15 +262,16 @@ int audio_dac_start(uint32_t sample_rate, uint8_t ana_vol_0_31)
     audio_dac_set_volume(ana_vol_0_31, 0x1FFu);
 
     /* 4. Configure DMAC CH0 TX + NVIC IRQ 60 */
-    g_tx_active     = 0u;
-    g_active_slot   = 0u;
-    g_write_slot = 0u;
-    for (unsigned i = 0; i < AUDIO_DAC_QUEUE_SLOTS; i++) g_slot_bytes[i] = 0u;
+    g_tx_active   = 0u;
+    g_active_slot = 0u;
+    g_write_slot  = 0u;
+    for (unsigned i = 0u; i < AUDIO_DAC_QUEUE_SLOTS; i++) {
+        g_slot_bytes[i] = 0u;
+    }
 
     openfw_mmio_set32(CRU_RST_SET1_ADDR, (1u << 1));
     openfw_mmio_set32(CRU_RST_STAT1_ADDR, (1u << 1));
-    while (!(openfw_mmio_rd32(CRU_RST_STAT1_ADDR) & (1u << 1))) {
-    }
+    dac_wait_mmio_mask(CRU_RST_STAT1_ADDR, (1u << 1), (1u << 1));
     openfw_mmio_wr32(DMAC_CH_CTL_ADDR(DAC_DMA_CH), DMAC_CTL_DAC_TX_BASE);
     openfw_mmio_wr32(DMAC_CH_IRQ_STAT_ADDR(DAC_DMA_CH),
                      openfw_mmio_rd32(DMAC_CH_IRQ_STAT_ADDR(DAC_DMA_CH)));
@@ -289,14 +301,37 @@ int audio_dac_write_stereo(const int16_t *interleaved_lr, uint32_t num_frames)
     uint32_t frames  = (num_frames > DAC_SLOT_FRAMES) ? DAC_SLOT_FRAMES : num_frames;
     uint32_t samples = frames * 2u;
     int16_t *dst     = g_dac_buf[slot];
-    for (uint32_t i = 0u; i < samples; i++) {
-        dst[i] = (int16_t)(((int32_t)interleaved_lr[i] * (int32_t)g_pcm_gain_q15) / 32768);
+    uint32_t gain    = g_pcm_gain_q15;
+
+    if (gain == 0u) {
+        uint32_t *d32 = (uint32_t *)(void *)dst;
+        for (uint32_t i = 0u; i < frames; i++) {
+            d32[i] = 0u;
+        }
+    } else if (gain == 32768u) {
+        if (((uintptr_t)interleaved_lr & 3u) == 0u) {
+            const uint32_t *s32 = (const uint32_t *)(const void *)interleaved_lr;
+            uint32_t       *d32 = (uint32_t *)(void *)dst;
+            for (uint32_t i = 0u; i < frames; i++) {
+                d32[i] = s32[i];
+            }
+        } else {
+            for (uint32_t i = 0u; i < samples; i++) {
+                dst[i] = interleaved_lr[i];
+            }
+        }
+    } else {
+        int32_t g = (int32_t)gain;
+        for (uint32_t i = 0u; i < samples; i++) {
+            int32_t prod = (int32_t)interleaved_lr[i] * g;
+            dst[i] = (int16_t)((prod + 16384) >> 15);
+        }
     }
 
     OPENFW_IRQ_SAVE(primask);
     if (g_dac_running) {
         g_slot_bytes[slot] = frames * 4u;
-        g_write_slot = (slot + 1u) % AUDIO_DAC_QUEUE_SLOTS;
+        g_write_slot = (uint8_t)((slot + 1u) % AUDIO_DAC_QUEUE_SLOTS);
         OPENFW_DSB();
         if (!g_tx_active) {
             dmac_arm_tx_slot(slot);
@@ -314,20 +349,67 @@ int audio_dac_is_busy(void)
     return g_tx_active;
 }
 
+void audio_dac_flush(void)
+{
+    if (!g_dac_running) {
+        return;
+    }
+
+    nvic_disable_irq(DMAC_IRQ_BASE + DAC_DMA_CH);
+    OPENFW_DSB();
+    AUDIO_DAC_ISB();
+    openfw_mmio_clr32(DMAC_CH_CTL_ADDR(DAC_DMA_CH), DMAC_CTL_CH_EN);
+    openfw_mmio_wr32(DMAC_CH_IRQ_STAT_ADDR(DAC_DMA_CH),
+                     openfw_mmio_rd32(DMAC_CH_IRQ_STAT_ADDR(DAC_DMA_CH)));
+    nvic_clear_pending(DMAC_IRQ_BASE + DAC_DMA_CH);
+
+    g_tx_active   = 0u;
+    g_active_slot = 0u;
+    g_write_slot  = 0u;
+    for (unsigned i = 0u; i < AUDIO_DAC_QUEUE_SLOTS; i++) {
+        g_slot_bytes[i] = 0u;
+    }
+    OPENFW_DSB();
+    nvic_enable_irq(DMAC_IRQ_BASE + DAC_DMA_CH);
+}
+
+uint32_t audio_dac_queued_frames(void)
+{
+    if (!g_dac_running) {
+        return 0u;
+    }
+    uint32_t primask;
+    OPENFW_IRQ_SAVE(primask);
+    uint32_t total_bytes = 0u;
+    for (unsigned i = 0u; i < AUDIO_DAC_QUEUE_SLOTS; i++) {
+        total_bytes += g_slot_bytes[i];
+    }
+    OPENFW_IRQ_RESTORE(primask);
+    return total_bytes >> 2;
+}
+
 void audio_dac_stop(void)
 {
     if (!g_dac_running) {
         return;
     }
-    g_dac_running   = 0u;
-    g_tx_active     = 0u;
+    g_dac_running = 0u;
 
-
-    /* Shut down built-in speaker PA first for pop-free teardown */
+    /* Assert digital mute + shut down speaker PA + halt DMAC CH0 before ramp-down delay */
+    audio_dac_set_mute(1);
     audio_pa_set(0);
-    mdelay(5u);
-
     openfw_exp_set_dmac_ch0_irq(0);
+    OPENFW_DSB();
+    AUDIO_DAC_ISB();
+
+    g_tx_active   = 0u;
+    g_active_slot = 0u;
+    g_write_slot  = 0u;
+    for (unsigned i = 0u; i < AUDIO_DAC_QUEUE_SLOTS; i++) {
+        g_slot_bytes[i] = 0u;
+    }
+
+    mdelay(5u);
 
     openfw_mmio_clr32(CODEC_DAC01_ANA_VOL_ADDR, 0x1F1F0000u);
     for (uint32_t i = 0u; i < 10u; i++) {

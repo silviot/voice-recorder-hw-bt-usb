@@ -33,6 +33,10 @@ typedef struct {
     uint8_t  beamform_mono;     /* Optional broadside (L+R)*0.5 downmix in VOICE_CLARITY */
     audio_biquad_t hpf[2];
     audio_biquad_t shelf[2];
+    float lim_att;              /* Precomputed limiter attack coeff */
+    float lim_rel;              /* Precomputed limiter release coeff */
+    float comp_att;             /* Precomputed compressor attack coeff */
+    float comp_rel;             /* Precomputed compressor release coeff */
     float comp_env;             /* Linear peak envelope for compressor */
     float lim_env;              /* Linear peak envelope for safety limiter */
     uint32_t clip_events;       /* Counter of frames engaging safety limiter */

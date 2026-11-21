@@ -46,12 +46,22 @@ int wav_build_header(uint8_t out[44],
                      uint16_t bits_per_sample,
                      uint32_t data_bytes)
 {
-    if (!out || sample_rate == 0u || channels == 0u || (bits_per_sample % 8u) != 0u || bits_per_sample == 0u) {
+    if (!out || sample_rate == 0u || channels == 0u ||
+        bits_per_sample == 0u || (bits_per_sample % 8u) != 0u) {
         return -1;
     }
 
-    uint16_t block_align = (uint16_t)(channels * (bits_per_sample / 8u));
-    uint32_t byte_rate   = sample_rate * (uint32_t)block_align;
+    uint32_t ba32 = (uint32_t)channels * (uint32_t)(bits_per_sample / 8u);
+    if (ba32 == 0u || ba32 > 0xFFFFu) {
+        return -1;
+    }
+    uint64_t br64 = (uint64_t)sample_rate * (uint64_t)ba32;
+    if (br64 > 0xFFFFFFFFull || data_bytes > (0xFFFFFFFFu - 36u)) {
+        return -1;
+    }
+
+    uint16_t block_align = (uint16_t)ba32;
+    uint32_t byte_rate   = (uint32_t)br64;
 
     out[0] = 'R'; out[1] = 'I'; out[2] = 'F'; out[3] = 'F';
     put_le32(&out[4], 36u + data_bytes);
@@ -82,12 +92,27 @@ int wav_parse_header(const uint8_t in[44], wav_info_t *out)
         return -1;
     }
 
-    out->channels        = get_le16(&in[22]);
-    out->sample_rate     = get_le32(&in[24]);
-    out->byte_rate       = get_le32(&in[28]);
-    out->block_align     = get_le16(&in[32]);
-    out->bits_per_sample = get_le16(&in[34]);
-    out->data_bytes      = get_le32(&in[40]);
+    uint16_t channels        = get_le16(&in[22]);
+    uint32_t sample_rate     = get_le32(&in[24]);
+    uint32_t byte_rate       = get_le32(&in[28]);
+    uint16_t block_align     = get_le16(&in[32]);
+    uint16_t bits_per_sample = get_le16(&in[34]);
+    uint32_t data_bytes      = get_le32(&in[40]);
+
+    if (channels == 0u || sample_rate == 0u || block_align == 0u ||
+        bits_per_sample == 0u || (bits_per_sample % 8u) != 0u) {
+        return -1;
+    }
+    if ((uint32_t)channels * (uint32_t)(bits_per_sample / 8u) != (uint32_t)block_align) {
+        return -1;
+    }
+
+    out->channels        = channels;
+    out->sample_rate     = sample_rate;
+    out->byte_rate       = byte_rate;
+    out->block_align     = block_align;
+    out->bits_per_sample = bits_per_sample;
+    out->data_bytes      = data_bytes;
     return 0;
 }
 
@@ -96,12 +121,8 @@ static uint32_t compute_duration_ms(uint32_t total_samples, uint32_t rate)
     if (rate == 0u || total_samples == 0u) {
         return 0u;
     }
-    uint32_t secs  = total_samples / rate;
-    uint32_t rem_s = total_samples % rate;
-    uint32_t ms    = (rem_s <= 0x3FFFFFu)
-                   ? ((rem_s * 1000u) / rate)
-                   : (((rem_s / 100u) * 1000u) / ((rate >= 100u) ? (rate / 100u) : 1u));
-    return secs * 1000u + ms;
+    uint64_t ms = ((uint64_t)total_samples * 1000ull) / (uint64_t)rate;
+    return (ms > 0xFFFFFFFFull) ? 0xFFFFFFFFu : (uint32_t)ms;
 }
 
 int wav_parse_stream(const uint8_t *hdr, uint32_t hdr_len, wav_stream_info_t *out)
@@ -125,7 +146,7 @@ int wav_parse_stream(const uint8_t *hdr, uint32_t hdr_len, wav_stream_info_t *ou
     uint16_t spb          = 0u;
 
     uint32_t pos = 12u;
-    while (pos + 8u <= hdr_len) {
+    while (pos <= hdr_len - 8u) {
         const uint8_t *cid = &hdr[pos];
         uint32_t csize     = get_le32(&hdr[pos + 4u]);
         uint32_t payload   = pos + 8u;
@@ -160,13 +181,17 @@ int wav_parse_stream(const uint8_t *hdr, uint32_t hdr_len, wav_stream_info_t *ou
                 if (channels == 2u && ((block_align - hdr_bytes) & 7u) != 0u) {
                     return -1;
                 }
-                spb = (uint16_t)(((uint32_t)(block_align - hdr_bytes) * 2u) / channels + 1u);
+                uint32_t calc_spb = ((uint32_t)(block_align - hdr_bytes) * 2u) / (uint32_t)channels + 1u;
+                if (calc_spb == 0u || calc_spb > 0xFFFFu) {
+                    return -1;
+                }
+                spb = (uint16_t)calc_spb;
                 if (csize >= 20u) {
                     uint16_t cb_size = get_le16(&hdr[payload + 16u]);
                     if (cb_size >= 2u) {
                         uint16_t hdr_spb = get_le16(&hdr[payload + 18u]);
-                        if (hdr_spb > 0u) {
-                            spb = hdr_spb;
+                        if (hdr_spb > 0u && hdr_spb != spb) {
+                            return -1;
                         }
                     }
                 }
@@ -183,20 +208,31 @@ int wav_parse_stream(const uint8_t *hdr, uint32_t hdr_len, wav_stream_info_t *ou
             if (!have_fmt) {
                 return -1;
             }
-            uint32_t total_samples;
-            if (have_fact && fact_samples > 0u) {
-                total_samples = fact_samples;
-            } else if (fmt_tag == WAV_FMT_PCM) {
-                total_samples = csize / block_align;
+            uint64_t data_samples;
+            if (fmt_tag == WAV_FMT_PCM) {
+                data_samples = (uint64_t)(csize / block_align);
             } else {
                 uint32_t full_blocks = csize / block_align;
                 uint32_t rem         = csize % block_align;
                 uint32_t hdr_bytes   = (uint32_t)channels * 4u;
                 uint32_t tail        = (rem >= hdr_bytes)
-                                     ? (((rem - hdr_bytes) * 2u) / channels + 1u)
+                                     ? (((rem - hdr_bytes) * 2u) / (uint32_t)channels + 1u)
                                      : 0u;
-                total_samples = full_blocks * (uint32_t)spb + tail;
+                data_samples = (uint64_t)full_blocks * (uint64_t)spb + (uint64_t)tail;
             }
+
+            uint64_t total64 = data_samples;
+            if (have_fact && fact_samples > 0u) {
+                if (fmt_tag == WAV_FMT_PCM) {
+                    /* Never allow a fact chunk to extend PCM total_samples past data bytes */
+                    if ((uint64_t)fact_samples < data_samples) {
+                        total64 = (uint64_t)fact_samples;
+                    }
+                } else {
+                    total64 = (uint64_t)fact_samples;
+                }
+            }
+            uint32_t total_samples = (total64 > 0xFFFFFFFFull) ? 0xFFFFFFFFu : (uint32_t)total64;
 
             out->format_tag        = fmt_tag;
             out->channels          = channels;

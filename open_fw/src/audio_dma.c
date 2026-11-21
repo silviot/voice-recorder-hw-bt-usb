@@ -15,21 +15,38 @@
 #define AUDIO_RING_SLOTS       4u
 #define AUDIO_FRAMES_PER_SLOT  2048u /* 128 ms @ 16 kHz */
 #define AUDIO_MAX_SLOT_SAMPLES (AUDIO_FRAMES_PER_SLOT * 2u)
+#define AUDIO_WAIT_MAX_ITERS   1000000u
+
+#ifdef OPENFW_HOST_MMIO
+#define AUDIO_DMA_ISB() do { } while (0)
+#else
+#define AUDIO_DMA_ISB() __asm__ volatile ("isb" ::: "memory")
+#endif
 
 static int16_t g_pcm_buf[AUDIO_RING_SLOTS][AUDIO_MAX_SLOT_SAMPLES] __attribute__((aligned(4)));
-static volatile uint8_t  g_dma_slot      = 0u;
+static volatile uint8_t  g_dma_slot       = 0u;
 static volatile uint8_t  g_last_done_slot = 0u;
-static volatile uint8_t  g_running       = 0u;
-static volatile uint8_t  g_channels      = 1u;
-static volatile uint8_t  g_peak_pct      = 0u;
-static volatile uint8_t  g_peak_l_pct    = 0u;
-static volatile uint8_t  g_peak_r_pct    = 0u;
-static volatile uint32_t g_frame_samples = AUDIO_FRAMES_PER_SLOT;
-static volatile uint32_t g_frame_bytes   = AUDIO_FRAMES_PER_SLOT * sizeof(int16_t);
-static volatile uint32_t g_frames        = 0u;
-static volatile uint32_t g_wr_idx        = 0u;
-static volatile uint32_t g_rd_idx        = 0u;
-static volatile uint32_t g_overruns      = 0u;
+static volatile uint8_t  g_running        = 0u;
+static volatile uint8_t  g_channels       = 1u;
+static uint8_t           g_peak_pct       = 0u;
+static uint8_t           g_peak_l_pct     = 0u;
+static uint8_t           g_peak_r_pct     = 0u;
+static uint32_t          g_peak_seq       = 0u;
+static volatile uint32_t g_frame_samples  = AUDIO_FRAMES_PER_SLOT;
+static volatile uint32_t g_frame_bytes    = AUDIO_FRAMES_PER_SLOT * sizeof(int16_t);
+static volatile uint32_t g_frames         = 0u;
+static volatile uint32_t g_wr_idx         = 0u;
+static volatile uint32_t g_rd_idx         = 0u;
+static volatile uint32_t g_overruns       = 0u;
+
+static void wait_mmio_mask(uint32_t addr, uint32_t mask, uint32_t expect)
+{
+    for (uint32_t t = 0u; t < AUDIO_WAIT_MAX_ITERS; t++) {
+        if ((openfw_mmio_rd32(addr) & mask) == expect) {
+            return;
+        }
+    }
+}
 
 static inline void dmac_arm_rx(void *dst_buf, uint32_t len_bytes)
 {
@@ -42,25 +59,60 @@ static inline void dmac_arm_rx(void *dst_buf, uint32_t len_bytes)
     openfw_mmio_rmw32(DMAC_CH_CTL_ADDR(AUDIO_DMA_CH), DMAC_CTL_RELOAD, DMAC_CTL_CH_EN);
 }
 
-static uint8_t compute_ac_peak_pct_stride(const int16_t *samples, uint32_t frames, uint32_t stride, uint32_t ch_off)
+static uint8_t ac_peak_to_pct(int32_t min_s, int32_t max_s)
 {
-    int32_t min_s = samples[ch_off];
-    int32_t max_s = samples[ch_off];
-    for (uint32_t i = 1u; i < frames; i++) {
-        int32_t s = (int32_t)samples[i * stride + ch_off];
-        if (s < min_s) {
-            min_s = s;
-        }
-        if (s > max_s) {
-            max_s = s;
-        }
-    }
     /* Half peak-to-peak removes any ADC DC offset */
     uint32_t ac_amp = (uint32_t)(max_s - min_s) >> 1;
     uint32_t pct    = (ac_amp * 100u) / 32767u;
     return (pct > 100u) ? 100u : (uint8_t)pct;
 }
 
+static void audio_update_peak_if_needed(void)
+{
+    if (!g_running) {
+        return;
+    }
+    uint32_t seq = g_frames;
+    if (seq == 0u || seq == g_peak_seq) {
+        return;
+    }
+
+    uint8_t slot = g_last_done_slot;
+    uint8_t ch   = g_channels;
+    const int16_t *samples = g_pcm_buf[slot];
+
+    if (ch == 2u) {
+        int32_t min_l = samples[0], max_l = samples[0];
+        int32_t min_r = samples[1], max_r = samples[1];
+        for (uint32_t i = 1u; i < AUDIO_FRAMES_PER_SLOT; i++) {
+            int32_t sl = (int32_t)samples[i * 2u + 0u];
+            int32_t sr = (int32_t)samples[i * 2u + 1u];
+            if (sl < min_l) min_l = sl;
+            if (sl > max_l) max_l = sl;
+            if (sr < min_r) min_r = sr;
+            if (sr > max_r) max_r = sr;
+        }
+        uint8_t pl = ac_peak_to_pct(min_l, max_l);
+        uint8_t pr = ac_peak_to_pct(min_r, max_r);
+        g_peak_l_pct = pl;
+        g_peak_r_pct = pr;
+        g_peak_pct   = (pl > pr) ? pl : pr;
+    } else {
+        int32_t min_m = samples[0], max_m = samples[0];
+        for (uint32_t i = 1u; i < AUDIO_FRAMES_PER_SLOT; i++) {
+            int32_t sm = (int32_t)samples[i];
+            if (sm < min_m) min_m = sm;
+            if (sm > max_m) max_m = sm;
+        }
+        uint8_t pm = ac_peak_to_pct(min_m, max_m);
+        g_peak_l_pct = pm;
+        g_peak_r_pct = pm;
+        g_peak_pct   = pm;
+    }
+    g_peak_seq = seq;
+}
+
+OPENFW_RAMFUNC
 void DMAC_CH1_IRQHandler(void)
 {
     uint32_t st = openfw_mmio_rd32(DMAC_CH_IRQ_STAT_ADDR(AUDIO_DMA_CH));
@@ -86,18 +138,6 @@ void DMAC_CH1_IRQHandler(void)
 
         g_last_done_slot = done_slot;
         g_wr_idx++;
-        if (g_channels == 2u) {
-            uint8_t pl = compute_ac_peak_pct_stride(g_pcm_buf[done_slot], AUDIO_FRAMES_PER_SLOT, 2u, 0u);
-            uint8_t pr = compute_ac_peak_pct_stride(g_pcm_buf[done_slot], AUDIO_FRAMES_PER_SLOT, 2u, 1u);
-            g_peak_l_pct = pl;
-            g_peak_r_pct = pr;
-            g_peak_pct   = (pl > pr) ? pl : pr;
-        } else {
-            uint8_t pm = compute_ac_peak_pct_stride(g_pcm_buf[done_slot], AUDIO_FRAMES_PER_SLOT, 1u, 0u);
-            g_peak_l_pct = pm;
-            g_peak_r_pct = pm;
-            g_peak_pct   = pm;
-        }
         g_frames++;
     }
 }
@@ -127,8 +167,7 @@ static void audio_amic_16k_init(uint8_t gain_0_31, uint8_t channels)
     /* 1. CRU: release codec reset 0x25 and enable codec clock 0x13 */
     openfw_mmio_set32(CRU_RST_SET1_ADDR, (1u << 5));
     openfw_mmio_set32(CRU_RST_STAT1_ADDR, (1u << 5));
-    while (!(openfw_mmio_rd32(CRU_RST_STAT1_ADDR) & (1u << 5))) {
-    }
+    wait_mmio_mask(CRU_RST_STAT1_ADDR, (1u << 5), (1u << 5));
     openfw_mmio_set32(CRU_CLK_EN_AUDIO_ADDR, 1u);
 
     /* 2. Global codec enable + 20 ms settle + clear codec SRAM (0x40009400..0x400095FF) */
@@ -141,8 +180,7 @@ static void audio_amic_16k_init(uint8_t gain_0_31, uint8_t channels)
 
     openfw_mmio_set32(CRU_RST_SET1_ADDR, 1u);
     openfw_mmio_set32(CRU_RST_STAT1_ADDR, 1u);
-    while (!(openfw_mmio_rd32(CRU_RST_STAT1_ADDR) & 1u)) {
-    }
+    wait_mmio_mask(CRU_RST_STAT1_ADDR, 1u, 1u);
     openfw_mmio_set32(SYSCTL_CODEC_SRAM_ADDR, (1u << 2));
     for (uint32_t a = CODEC_SRAM_START; a < CODEC_SRAM_END; a += 4u) {
         openfw_mmio_wr32(a, 0u);
@@ -157,15 +195,13 @@ static void audio_amic_16k_init(uint8_t gain_0_31, uint8_t channels)
     openfw_mmio_clr32(CODEC_DAC2_MUTE_ADDR, (1u << 16));
 
     /* 3. Program Audio PLL = 24.576 MHz & wait for lock */
-    while (openfw_mmio_rd32(CRU_APLL_FRAC_ADDR) & (1u << 11)) {
-    }
+    wait_mmio_mask(CRU_APLL_FRAC_ADDR, (1u << 11), 0u);
     openfw_mmio_wr32(CRU_APLL_CTRL_ADDR,
                      (openfw_mmio_rd32(CRU_APLL_CTRL_ADDR) & 0xFC1F0000u) | 0x3060u);
     openfw_mmio_wr32(CRU_APLL_FRAC_ADDR,
                      (openfw_mmio_rd32(CRU_APLL_FRAC_ADDR) & 0x00003800u) | 0x80000400u | (0x3126u << 14));
     openfw_mmio_set32(CRU_APLL_CTRL_ADDR, 0xC0000000u);
-    while (!(openfw_mmio_rd32(CRU_APLL_CTRL_ADDR) & (1u << 28))) {
-    }
+    wait_mmio_mask(CRU_APLL_CTRL_ADDR, (1u << 28), (1u << 28));
 
     /* 4. PB12/PB13 = AMIC1 analog (mux 15); PB14/PB15 = AMIC2 analog when stereo */
     gpio_set_mux(GPIO_PORT_B, 12u, 15u);
@@ -189,7 +225,8 @@ static void audio_amic_16k_init(uint8_t gain_0_31, uint8_t channels)
     apply_pga_gain(gain_0_31, channels);
     openfw_mmio_set32(CODEC_ANA_CTRL0_ADDR, 0x03000000u);
 
-    /* 6. ADC digital: 16 kHz (3), 16-bit + DMA req, AMIC1 (ch1) or AMIC1+AMIC2 (ch1+ch2), RUN */
+    /* 6. ADC digital: 16 kHz (3), 16-bit + DMA req, AMIC1 (ch1) or AMIC1+AMIC2 (ch1+ch2).
+     * Leave ADC RUN bit (0x2) cleared until DMAC CH1 is armed to avoid initial FIFO overrun. */
     openfw_mmio_clr32(CODEC_ADC_DIG_CTRL_ADDR, 0x2u);
     openfw_mmio_set32(CODEC_ADC_DIG_CTRL_ADDR, 0x1u);
     for (uint32_t ch = 0u; ch < 4u; ch++) {
@@ -207,7 +244,6 @@ static void audio_amic_16k_init(uint8_t gain_0_31, uint8_t channels)
         openfw_mmio_clr32(CODEC_ADC_CH_CTRL_ADDR(2u), 0xBu);
     }
     openfw_mmio_clr32(CODEC_ADC_CH_CTRL_ADDR(3u), 0xBu);
-    openfw_mmio_set32(CODEC_ADC_DIG_CTRL_ADDR, 0x2u);
 }
 
 static void dmac_audio_rx_init(void)
@@ -215,8 +251,7 @@ static void dmac_audio_rx_init(void)
     /* Release DMAC reset 0x21 (bank 1 bit 1) */
     openfw_mmio_set32(CRU_RST_SET1_ADDR, (1u << 1));
     openfw_mmio_set32(CRU_RST_STAT1_ADDR, (1u << 1));
-    while (!(openfw_mmio_rd32(CRU_RST_STAT1_ADDR) & (1u << 1))) {
-    }
+    wait_mmio_mask(CRU_RST_STAT1_ADDR, (1u << 1), (1u << 1));
 
     openfw_mmio_wr32(DMAC_CH_CTL_ADDR(AUDIO_DMA_CH), DMAC_CTL_ADC_RX_BASE);
     openfw_mmio_wr32(DMAC_CH_IRQ_STAT_ADDR(AUDIO_DMA_CH),
@@ -242,6 +277,7 @@ int audio_capture_start_ex(uint8_t gain_0_31, uint8_t channels)
     g_peak_pct        = 0u;
     g_peak_l_pct      = 0u;
     g_peak_r_pct      = 0u;
+    g_peak_seq        = 0u;
     g_frames          = 0u;
     g_wr_idx          = 0u;
     g_rd_idx          = 0u;
@@ -250,8 +286,11 @@ int audio_capture_start_ex(uint8_t gain_0_31, uint8_t channels)
     audio_amic_16k_init(gain_0_31, ch);
     dmac_audio_rx_init();
 
+    /* Arm DMAC CH1 before enabling ADC digital RUN bit (0x2) */
     g_running = 1u;
     dmac_arm_rx(g_pcm_buf[0], g_frame_bytes);
+    OPENFW_DSB();
+    openfw_mmio_set32(CODEC_ADC_DIG_CTRL_ADDR, 0x2u);
     return 0;
 }
 
@@ -276,8 +315,11 @@ void audio_capture_stop(void)
     g_peak_pct   = 0u;
     g_peak_l_pct = 0u;
     g_peak_r_pct = 0u;
+    g_peak_seq   = 0u;
 
     nvic_disable_irq(DMAC_IRQ_BASE + AUDIO_DMA_CH);
+    OPENFW_DSB();
+    AUDIO_DMA_ISB();
     openfw_mmio_clr32(DMAC_CH_CTL_ADDR(AUDIO_DMA_CH), DMAC_CTL_CH_EN);
     openfw_mmio_wr32(DMAC_CH_IRQ_EN_ADDR(AUDIO_DMA_CH), 0u);
     openfw_mmio_wr32(DMAC_CH_IRQ_STAT_ADDR(AUDIO_DMA_CH),
@@ -319,13 +361,71 @@ const int16_t *audio_pop_frame(uint32_t *out_bytes)
     return g_pcm_buf[slot];
 }
 
+int audio_pop_frame_copy(int16_t *dst, uint32_t max_bytes, uint32_t *out_bytes)
+{
+    if (!dst || max_bytes < sizeof(int16_t)) {
+        return 0;
+    }
+
+    for (;;) {
+        uint32_t primask;
+        OPENFW_IRQ_SAVE(primask);
+        if (g_rd_idx == g_wr_idx) {
+            OPENFW_IRQ_RESTORE(primask);
+            return 0;
+        }
+        uint32_t rd    = g_rd_idx;
+        uint32_t bytes = g_frame_bytes;
+        OPENFW_IRQ_RESTORE(primask);
+
+        if (bytes > max_bytes) {
+            bytes = max_bytes;
+        }
+        bytes &= ~1u;
+
+        uint32_t slot = rd & (AUDIO_RING_SLOTS - 1u);
+        const int16_t *src = g_pcm_buf[slot];
+        if (((uintptr_t)dst & 3u) == 0u) {
+            const uint32_t *s32 = (const uint32_t *)(const void *)src;
+            uint32_t       *d32 = (uint32_t *)(void *)dst;
+            uint32_t words = bytes >> 2;
+            for (uint32_t i = 0u; i < words; i++) {
+                d32[i] = s32[i];
+            }
+            if (bytes & 2u) {
+                dst[(bytes >> 1) - 1u] = src[(bytes >> 1) - 1u];
+            }
+        } else {
+            uint32_t samps = bytes >> 1;
+            for (uint32_t i = 0u; i < samps; i++) {
+                dst[i] = src[i];
+            }
+        }
+
+        /* Release slot only AFTER copy completes, and retry if ISR overran it mid-copy */
+        OPENFW_IRQ_SAVE(primask);
+        if (g_rd_idx == rd) {
+            g_rd_idx = rd + 1u;
+            OPENFW_IRQ_RESTORE(primask);
+            OPENFW_DSB();
+            if (out_bytes) {
+                *out_bytes = bytes;
+            }
+            return 1;
+        }
+        OPENFW_IRQ_RESTORE(primask);
+    }
+}
+
 uint8_t audio_get_peak_pct(void)
 {
+    audio_update_peak_if_needed();
     return g_peak_pct;
 }
 
 void audio_get_peak_lr_pct(uint8_t *out_l, uint8_t *out_r)
 {
+    audio_update_peak_if_needed();
     if (out_l) {
         *out_l = g_peak_l_pct;
     }

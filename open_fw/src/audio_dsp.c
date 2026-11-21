@@ -18,13 +18,31 @@
 /* -3.0 dBFS knee and -0.5 dBFS ceiling for transparent safety peak limiter */
 #define LIM_KNEE_LIN  0.70794578f
 #define LIM_CEIL_LIN  0.94406088f
+#define LIM_SPAN_LIN  (LIM_CEIL_LIN - LIM_KNEE_LIN)
 /* -24.0 dBFS threshold and +6.0 dB makeup gain for 2:1 VOICE_CLARITY compressor */
 #define COMP_THRESH_LIN 0.06309573f
 #define COMP_MAKEUP_LIN 1.99526231f
+/* sqrt(COMP_THRESH_LIN) * COMP_MAKEUP_LIN = 10^(-6/20) */
+#define COMP_SCALE_K    0.50118723f
+
+#define VOR_FADE_BUF_MAX 256u /* >= 5 ms @ 48 kHz (240 frames) */
 
 static inline float dsp_fabsf(float x)
 {
     return (x < 0.0f) ? -x : x;
+}
+
+static inline float dsp_rsqrtf(float x)
+{
+    union {
+        float    f;
+        uint32_t u;
+    } conv;
+    conv.f = x;
+    conv.u = 0x5F375A86u - (conv.u >> 1);
+    float y = conv.f;
+    y = y * (1.5f - 0.5f * x * y * y);
+    return y;
 }
 
 static float dsp_sqrtf(float x)
@@ -160,6 +178,14 @@ static void biquad_set_unity(audio_biquad_t *bq)
 
 static void biquad_design_hpf(audio_biquad_t *bq, float fc_hz, uint32_t sample_rate)
 {
+    float max_fc = 0.45f * (float)sample_rate;
+    if (fc_hz > max_fc) {
+        fc_hz = max_fc;
+    }
+    if (fc_hz < 1.0f) {
+        fc_hz = 1.0f;
+    }
+
     if (sample_rate == 16000u && fc_hz > 74.5f && fc_hz < 75.5f) {
         /* Standard 75 Hz Butterworth HPF @ 16 kHz, Q=0.70710678 */
         bq->b0 =  0.9793881f;
@@ -186,8 +212,8 @@ static void biquad_design_hpf(audio_biquad_t *bq, float fc_hz, uint32_t sample_r
     float w0 = DSP_TWO_PI * fc_hz / (float)sample_rate;
     float sw = 0.0f, cw = 1.0f;
     dsp_sincosf(w0, &sw, &cw);
-    float alpha = sw / (2.0f * DSP_SQRT2_2);
-    float a0    = 1.0f + alpha;
+    float alpha  = sw / (2.0f * DSP_SQRT2_2);
+    float a0     = 1.0f + alpha;
     float inv_a0 = 1.0f / a0;
 
     bq->b0 = ((1.0f + cw) * 0.5f) * inv_a0;
@@ -201,6 +227,14 @@ static void biquad_design_hpf(audio_biquad_t *bq, float fc_hz, uint32_t sample_r
 
 static void biquad_design_high_shelf(audio_biquad_t *bq, float fc_hz, float db_gain, uint32_t sample_rate)
 {
+    float max_fc = 0.45f * (float)sample_rate;
+    if (fc_hz > max_fc) {
+        fc_hz = max_fc;
+    }
+    if (fc_hz < 1.0f) {
+        fc_hz = 1.0f;
+    }
+
     float A  = dsp_pow2f((db_gain / 40.0f) * 3.32192809f); /* 10^(dBgain/40) */
     float w0 = DSP_TWO_PI * fc_hz / (float)sample_rate;
     float sw = 0.0f, cw = 1.0f;
@@ -233,10 +267,9 @@ static inline float limiter_gain_for_env(float env, uint32_t *clip_events)
     if (env <= LIM_KNEE_LIN) {
         return 1.0f;
     }
-    float span   = LIM_CEIL_LIN - LIM_KNEE_LIN;
     float excess = env - LIM_KNEE_LIN;
-    float target = LIM_KNEE_LIN + span * (excess / (excess + span));
-    float gain   = target / env;
+    float gain   = (LIM_KNEE_LIN * LIM_SPAN_LIN + LIM_CEIL_LIN * excess)
+                 / (env * (excess + LIM_SPAN_LIN));
     if (clip_events && gain < 0.999f) {
         (*clip_events)++;
     }
@@ -265,6 +298,10 @@ void audio_dsp_init(audio_dsp_t *dsp, audio_dsp_profile_t profile,
     dsp->sample_rate   = (sample_rate > 0u) ? sample_rate : 16000u;
     dsp->channels      = (channels == 2u) ? 2u : 1u;
     dsp->beamform_mono = 0u;
+    dsp->lim_att       = dsp_exp_decay(0.001f, dsp->sample_rate);
+    dsp->lim_rel       = dsp_exp_decay(0.080f, dsp->sample_rate);
+    dsp->comp_att      = dsp_exp_decay(0.005f, dsp->sample_rate);
+    dsp->comp_rel      = dsp_exp_decay(0.120f, dsp->sample_rate);
     dsp->comp_env      = 0.0f;
     dsp->lim_env       = 0.0f;
     dsp->clip_events   = 0u;
@@ -328,88 +365,117 @@ void audio_dsp_process_i16(audio_dsp_t *dsp, int16_t *pcm, size_t num_frames)
         return;
     }
 
-    const float lim_att  = dsp_exp_decay(0.001f, dsp->sample_rate);
-    const float lim_rel  = dsp_exp_decay(0.080f, dsp->sample_rate);
-    const float comp_att = dsp_exp_decay(0.005f, dsp->sample_rate);
-    const float comp_rel = dsp_exp_decay(0.120f, dsp->sample_rate);
+    const float lim_att  = dsp->lim_att;
+    const float lim_rel  = dsp->lim_rel;
+    const float comp_att = dsp->comp_att;
+    const float comp_rel = dsp->comp_rel;
     float lim_env        = dsp->lim_env;
     float comp_env       = dsp->comp_env;
+    uint32_t clips       = dsp->clip_events;
 
-    for (size_t i = 0u; i < num_frames; i++) {
-        float l = (float)pcm[i * (size_t)ch] * inv_i16;
-        float r = (ch == 2u) ? ((float)pcm[i * 2u + 1u] * inv_i16) : 0.0f;
-
-        if (ch == 2u && dsp->profile == AUDIO_DSP_VOICE_CLARITY && dsp->beamform_mono) {
-            float mono = 0.5f * (l + r);
-            l = mono;
-            r = mono;
-        }
-
-        l = biquad_step(&dsp->hpf[0], l);
-        if (ch == 2u) {
-            r = biquad_step(&dsp->hpf[1], r);
-        }
-
-        if (dsp->profile == AUDIO_DSP_VOICE_CLARITY) {
-            l = biquad_step(&dsp->shelf[0], l);
-            if (ch == 2u) {
-                r = biquad_step(&dsp->shelf[1], r);
+    if (dsp->profile == AUDIO_DSP_ASR_RAW) {
+        if (ch == 1u) {
+            for (size_t i = 0u; i < num_frames; i++) {
+                float l = biquad_step(&dsp->hpf[0], (float)pcm[i] * inv_i16);
+                float lpeak = dsp_fabsf(l);
+                float lc = (lpeak > lim_env) ? lim_att : lim_rel;
+                lim_env = lpeak + lc * (lim_env - lpeak);
+                float peak_eff = (lpeak > lim_env) ? lpeak : lim_env;
+                l *= limiter_gain_for_env(peak_eff, &clips);
+                pcm[i] = float_to_i16(l);
+                sum_sq += l * l;
             }
-
-            float cpeak = dsp_fabsf(l);
-            if (ch == 2u) {
+        } else {
+            for (size_t i = 0u; i < num_frames; i++) {
+                float l = biquad_step(&dsp->hpf[0], (float)pcm[i * 2u + 0u] * inv_i16);
+                float r = biquad_step(&dsp->hpf[1], (float)pcm[i * 2u + 1u] * inv_i16);
+                float al = dsp_fabsf(l);
                 float ar = dsp_fabsf(r);
-                if (ar > cpeak) {
-                    cpeak = ar;
-                }
+                float lpeak = (ar > al) ? ar : al;
+                float lc = (lpeak > lim_env) ? lim_att : lim_rel;
+                lim_env = lpeak + lc * (lim_env - lpeak);
+                float peak_eff = (lpeak > lim_env) ? lpeak : lim_env;
+                float lgain = limiter_gain_for_env(peak_eff, &clips);
+                l *= lgain;
+                r *= lgain;
+                pcm[i * 2u + 0u] = float_to_i16(l);
+                pcm[i * 2u + 1u] = float_to_i16(r);
+                sum_sq += l * l + r * r;
             }
+        }
+    } else if (ch == 1u || dsp->beamform_mono) {
+        /* Mono Clarity or dual-mic broadside beamformer: single biquad/comp/limiter pass */
+        const float half_inv_i16 = 0.5f * inv_i16;
+        for (size_t i = 0u; i < num_frames; i++) {
+            float m = (ch == 2u)
+                    ? ((float)((int32_t)pcm[i * 2u + 0u] + (int32_t)pcm[i * 2u + 1u]) * half_inv_i16)
+                    : ((float)pcm[i] * inv_i16);
+            m = biquad_step(&dsp->hpf[0], m);
+            m = biquad_step(&dsp->shelf[0], m);
+
+            float cpeak = dsp_fabsf(m);
             float cc = (cpeak > comp_env) ? comp_att : comp_rel;
-            comp_env = cc * comp_env + (1.0f - cc) * cpeak;
+            comp_env = cpeak + cc * (comp_env - cpeak);
+            float total_c = (comp_env > COMP_THRESH_LIN)
+                          ? (COMP_SCALE_K * dsp_rsqrtf(comp_env))
+                          : COMP_MAKEUP_LIN;
+            m *= total_c;
 
-            float cgain = 1.0f;
-            if (comp_env > COMP_THRESH_LIN) {
-                cgain = dsp_sqrtf(COMP_THRESH_LIN / comp_env);
-            }
-            float total_c = cgain * COMP_MAKEUP_LIN;
-            l *= total_c;
+            float lpeak = dsp_fabsf(m);
+            float lc = (lpeak > lim_env) ? lim_att : lim_rel;
+            lim_env = lpeak + lc * (lim_env - lpeak);
+            float peak_eff = (lpeak > lim_env) ? lpeak : lim_env;
+            m *= limiter_gain_for_env(peak_eff, &clips);
+
+            int16_t om = float_to_i16(m);
             if (ch == 2u) {
-                r *= total_c;
+                pcm[i * 2u + 0u] = om;
+                pcm[i * 2u + 1u] = om;
+                sum_sq += 2.0f * m * m;
+            } else {
+                pcm[i] = om;
+                sum_sq += m * m;
             }
         }
+    } else {
+        /* Stereo Clarity */
+        for (size_t i = 0u; i < num_frames; i++) {
+            float l = biquad_step(&dsp->hpf[0], (float)pcm[i * 2u + 0u] * inv_i16);
+            float r = biquad_step(&dsp->hpf[1], (float)pcm[i * 2u + 1u] * inv_i16);
+            l = biquad_step(&dsp->shelf[0], l);
+            r = biquad_step(&dsp->shelf[1], r);
 
-        float lpeak = dsp_fabsf(l);
-        if (ch == 2u) {
+            float al = dsp_fabsf(l);
             float ar = dsp_fabsf(r);
-            if (ar > lpeak) {
-                lpeak = ar;
-            }
-        }
-        float lc = (lpeak > lim_env) ? lim_att : lim_rel;
-        lim_env = lc * lim_env + (1.0f - lc) * lpeak;
+            float cpeak = (ar > al) ? ar : al;
+            float cc = (cpeak > comp_env) ? comp_att : comp_rel;
+            comp_env = cpeak + cc * (comp_env - cpeak);
+            float total_c = (comp_env > COMP_THRESH_LIN)
+                          ? (COMP_SCALE_K * dsp_rsqrtf(comp_env))
+                          : COMP_MAKEUP_LIN;
+            l *= total_c;
+            r *= total_c;
 
-        float peak_eff = (lpeak > lim_env) ? lpeak : lim_env;
-        float lgain = limiter_gain_for_env(peak_eff, &dsp->clip_events);
-        l *= lgain;
-        if (ch == 2u) {
+            float lal = dsp_fabsf(l);
+            float lar = dsp_fabsf(r);
+            float lpeak = (lar > lal) ? lar : lal;
+            float lc = (lpeak > lim_env) ? lim_att : lim_rel;
+            lim_env = lpeak + lc * (lim_env - lpeak);
+            float peak_eff = (lpeak > lim_env) ? lpeak : lim_env;
+            float lgain = limiter_gain_for_env(peak_eff, &clips);
+            l *= lgain;
             r *= lgain;
-        }
 
-        int16_t ol = float_to_i16(l);
-        pcm[i * (size_t)ch] = ol;
-        float fl = (float)ol * inv_i16;
-        sum_sq += fl * fl;
-
-        if (ch == 2u) {
-            int16_t or = float_to_i16(r);
-            pcm[i * 2u + 1u] = or;
-            float fr = (float)or * inv_i16;
-            sum_sq += fr * fr;
+            pcm[i * 2u + 0u] = float_to_i16(l);
+            pcm[i * 2u + 1u] = float_to_i16(r);
+            sum_sq += l * l + r * r;
         }
     }
 
-    dsp->lim_env  = lim_env;
-    dsp->comp_env = comp_env;
-    dsp->rms_dbfs = dsp_lin_to_dbfs(dsp_sqrtf(sum_sq / (float)(num_frames * (size_t)ch)));
+    dsp->lim_env     = lim_env;
+    dsp->comp_env    = comp_env;
+    dsp->clip_events = clips;
+    dsp->rms_dbfs    = dsp_lin_to_dbfs(dsp_sqrtf(sum_sq / (float)(num_frames * (size_t)ch)));
 }
 
 /* ============================================================================
@@ -449,6 +515,18 @@ void audio_vor_reset(audio_vor_t *vor)
     vor->preroll_fill = 0u;
 }
 
+static uint32_t vor_fade_len(const audio_vor_t *vor)
+{
+    uint32_t f = (vor->sample_rate * 5u) / 1000u; /* 5 ms fade-in/out */
+    if (f < 1u) {
+        f = 1u;
+    }
+    if (f > VOR_FADE_BUF_MAX) {
+        f = VOR_FADE_BUF_MAX;
+    }
+    return f;
+}
+
 static void vor_push_preroll(audio_vor_t *vor, const int16_t *pcm, size_t num_frames)
 {
     uint32_t cap = vor->preroll_cap_frames;
@@ -469,15 +547,29 @@ static void vor_push_preroll(audio_vor_t *vor, const int16_t *pcm, size_t num_fr
     }
 }
 
-static void vor_flush_preroll(audio_vor_t *vor, audio_vor_emit_fn_t emit_cb, void *user)
+/* Flush pre-roll ring with a 5 ms fade-in at gate open; returns frames faded so far. */
+static uint32_t vor_flush_preroll_fadein(audio_vor_t *vor, uint32_t fade_len,
+                                         audio_vor_emit_fn_t emit_cb, void *user)
 {
     if (vor->preroll_fill == 0u || !emit_cb) {
-        return;
+        return 0u;
     }
     uint32_t cap   = vor->preroll_cap_frames;
     uint32_t fill  = vor->preroll_fill;
     uint32_t start = (vor->preroll_wr >= fill) ? (vor->preroll_wr - fill) : (cap + vor->preroll_wr - fill);
     uint8_t  ch    = vor->channels;
+
+    /* Apply linear 5 ms fade-in directly in preroll_buf before emitting */
+    uint32_t nfade = (fill < fade_len) ? fill : fade_len;
+    for (uint32_t k = 0u; k < nfade; k++) {
+        uint32_t idx = ((start + k) % cap) * (uint32_t)ch;
+        int32_t  num = (int32_t)k;
+        int32_t  den = (int32_t)fade_len;
+        vor->preroll_buf[idx] = (int16_t)(((int32_t)vor->preroll_buf[idx] * num) / den);
+        if (ch == 2u) {
+            vor->preroll_buf[idx + 1u] = (int16_t)(((int32_t)vor->preroll_buf[idx + 1u] * num) / den);
+        }
+    }
 
     if (start + fill <= cap) {
         emit_cb(user, &vor->preroll_buf[start * (uint32_t)ch], fill);
@@ -488,6 +580,61 @@ static void vor_flush_preroll(audio_vor_t *vor, audio_vor_emit_fn_t emit_cb, voi
     }
     vor->preroll_wr   = 0u;
     vor->preroll_fill = 0u;
+    return nfade;
+}
+
+static void vor_emit_with_fadein(const int16_t *blk, size_t n, uint8_t ch,
+                                 uint32_t faded_so_far, uint32_t fade_len,
+                                 audio_vor_emit_fn_t emit_cb, void *user)
+{
+    if (faded_so_far >= fade_len) {
+        emit_cb(user, blk, n);
+        return;
+    }
+    uint32_t rem = fade_len - faded_so_far;
+    if (rem > (uint32_t)n) {
+        rem = (uint32_t)n;
+    }
+    if (rem > VOR_FADE_BUF_MAX) {
+        rem = VOR_FADE_BUF_MAX;
+    }
+    int16_t tmp[VOR_FADE_BUF_MAX * 2u];
+    int32_t den = (int32_t)fade_len;
+    for (uint32_t k = 0u; k < rem; k++) {
+        int32_t num = (int32_t)(faded_so_far + k);
+        tmp[k * (uint32_t)ch] = (int16_t)(((int32_t)blk[k * (uint32_t)ch] * num) / den);
+        if (ch == 2u) {
+            tmp[k * 2u + 1u] = (int16_t)(((int32_t)blk[k * 2u + 1u] * num) / den);
+        }
+    }
+    emit_cb(user, tmp, rem);
+    if ((size_t)rem < n) {
+        emit_cb(user, blk + (size_t)rem * (size_t)ch, n - (size_t)rem);
+    }
+}
+
+static void vor_emit_with_fadeout(const int16_t *blk, size_t n, uint8_t ch,
+                                  uint32_t fade_len, audio_vor_emit_fn_t emit_cb, void *user)
+{
+    uint32_t tail = (n < (size_t)fade_len) ? (uint32_t)n : fade_len;
+    if (tail > VOR_FADE_BUF_MAX) {
+        tail = VOR_FADE_BUF_MAX;
+    }
+    size_t prefix = n - (size_t)tail;
+    if (prefix > 0u) {
+        emit_cb(user, blk, prefix);
+    }
+    int16_t tmp[VOR_FADE_BUF_MAX * 2u];
+    const int16_t *src = blk + prefix * (size_t)ch;
+    int32_t den = (int32_t)tail;
+    for (uint32_t k = 0u; k < tail; k++) {
+        int32_t num = (int32_t)(tail - 1u - k);
+        tmp[k * (uint32_t)ch] = (int16_t)(((int32_t)src[k * (uint32_t)ch] * num) / den);
+        if (ch == 2u) {
+            tmp[k * 2u + 1u] = (int16_t)(((int32_t)src[k * 2u + 1u] * num) / den);
+        }
+    }
+    emit_cb(user, tmp, tail);
 }
 
 void audio_vor_feed(audio_vor_t *vor, const int16_t *pcm, size_t num_frames,
@@ -503,6 +650,7 @@ void audio_vor_feed(audio_vor_t *vor, const int16_t *pcm, size_t num_frames,
 
     const uint8_t ch = vor->channels;
     const float inv_i16 = 1.0f / 32768.0f;
+    const uint32_t fade_len = vor_fade_len(vor);
     size_t sub_max = (vor->sample_rate * 20u) / 1000u; /* 20 ms evaluation blocks */
     if (sub_max < 64u) {
         sub_max = 64u;
@@ -517,43 +665,68 @@ void audio_vor_feed(audio_vor_t *vor, const int16_t *pcm, size_t num_frames,
         const int16_t *blk = pcm + pos * (size_t)ch;
 
         float sum_sq = 0.0f;
-        uint32_t zc  = 0u;
-        int16_t prev = blk[0];
-        for (size_t i = 0u; i < n; i++) {
-            float s = (float)blk[i * (size_t)ch] * inv_i16;
-            if (ch == 2u) {
-                float sr = (float)blk[i * 2u + 1u] * inv_i16;
-                s = 0.5f * (s + sr);
+        uint32_t zc_l = 0u;
+        uint32_t zc_r = 0u;
+        if (ch == 2u) {
+            int16_t prev_l = blk[0];
+            int16_t prev_r = blk[1];
+            for (size_t i = 0u; i < n; i++) {
+                int16_t cl = blk[i * 2u + 0u];
+                int16_t cr = blk[i * 2u + 1u];
+                float sl = (float)cl * inv_i16;
+                float sr = (float)cr * inv_i16;
+                /* Phase-invariant stereo power avoids L/R cancellation */
+                sum_sq += 0.5f * (sl * sl + sr * sr);
+                if ((cl >= 0 && prev_l < 0) || (cl < 0 && prev_l >= 0)) {
+                    zc_l++;
+                }
+                if ((cr >= 0 && prev_r < 0) || (cr < 0 && prev_r >= 0)) {
+                    zc_r++;
+                }
+                prev_l = cl;
+                prev_r = cr;
             }
-            sum_sq += s * s;
-            int16_t cur = blk[i * (size_t)ch];
-            if ((cur >= 0 && prev < 0) || (cur < 0 && prev >= 0)) {
-                zc++;
+        } else {
+            int16_t prev = blk[0];
+            for (size_t i = 0u; i < n; i++) {
+                int16_t cur = blk[i];
+                float s = (float)cur * inv_i16;
+                sum_sq += s * s;
+                if ((cur >= 0 && prev < 0) || (cur < 0 && prev >= 0)) {
+                    zc_l++;
+                }
+                prev = cur;
             }
-            prev = cur;
         }
 
         float rms_db = dsp_lin_to_dbfs(dsp_sqrtf(sum_sq / (float)n));
-        float zcr    = (n > 1u) ? ((float)zc / (float)(n - 1u)) : 0.0f;
-        int speech_zcr = (zcr >= vor->min_zcr && zcr <= vor->max_zcr) ? 1 : 0;
+        float inv_nm1 = (n > 1u) ? (1.0f / (float)(n - 1u)) : 0.0f;
+        float zcr_l = (float)zc_l * inv_nm1;
+        int speech_zcr = (zcr_l >= vor->min_zcr && zcr_l <= vor->max_zcr) ? 1 : 0;
+        if (!speech_zcr && ch == 2u) {
+            float zcr_r = (float)zc_r * inv_nm1;
+            speech_zcr = (zcr_r >= vor->min_zcr && zcr_r <= vor->max_zcr) ? 1 : 0;
+        }
         int trigger = (rms_db >= vor->open_thresh_dbfs &&
                        (speech_zcr || rms_db >= (vor->open_thresh_dbfs + 12.0f)));
 
         if (vor->gate_open) {
-            emit_cb(user, blk, n);
             if (rms_db >= vor->close_thresh_dbfs) {
+                emit_cb(user, blk, n);
                 vor->hangover_rem = vor->hangover_frames;
             } else if (vor->hangover_rem > (uint32_t)n) {
+                emit_cb(user, blk, n);
                 vor->hangover_rem -= (uint32_t)n;
             } else {
+                vor_emit_with_fadeout(blk, n, ch, fade_len, emit_cb, user);
                 vor->hangover_rem = 0u;
                 vor->gate_open    = 0u;
             }
         } else if (trigger) {
             vor->gate_open    = 1u;
             vor->hangover_rem = vor->hangover_frames;
-            vor_flush_preroll(vor, emit_cb, user);
-            emit_cb(user, blk, n);
+            uint32_t faded = vor_flush_preroll_fadein(vor, fade_len, emit_cb, user);
+            vor_emit_with_fadein(blk, n, ch, faded, fade_len, emit_cb, user);
         } else {
             vor_push_preroll(vor, blk, n);
         }

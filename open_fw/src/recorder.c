@@ -285,7 +285,7 @@ void recorder_set_channels(uint8_t channels)
 
 uint8_t recorder_get_channels(void)
 {
-    return g_cfg_channels;
+    return g_rec_active ? g_active_channels : g_cfg_channels;
 }
 
 void recorder_set_vor(int enabled)
@@ -358,14 +358,15 @@ void recorder_poll(void)
         return;
     }
 
-    /* Compensate any DMA ring overruns with exact-length silence so WAV stays real-time */
+    /* Compensate any DMA ring overruns with silence (only when not paused by VOR gate,
+     * and capped per poll so an SD hiccup cannot trigger a cascading zero-write storm). */
     uint32_t ov = audio_get_overruns();
     if (ov != g_last_overruns) {
         uint32_t dropped = ov - g_last_overruns;
         g_last_overruns  = ov;
-        if (g_rec_saving) {
-            if (dropped > 16u) {
-                dropped = 16u;
+        if (g_rec_saving && (!g_vor.enabled || g_vor.gate_open)) {
+            if (dropped > 2u) {
+                dropped = 2u;
             }
             uint32_t samps = 2048u * (uint32_t)g_active_channels;
             for (uint32_t i = 0u; i < samps; i++) {
@@ -378,15 +379,8 @@ void recorder_poll(void)
     }
 
     uint32_t nbytes = 0u;
-    const int16_t *frame;
-    while ((frame = audio_pop_frame(&nbytes)) != 0) {
+    while (audio_pop_frame_copy(g_proc_buf, (uint32_t)sizeof(g_proc_buf), &nbytes)) {
         uint32_t total_samples = nbytes / (uint32_t)sizeof(int16_t);
-        if (total_samples > 4096u) {
-            total_samples = 4096u;
-        }
-        for (uint32_t i = 0u; i < total_samples; i++) {
-            g_proc_buf[i] = frame[i];
-        }
         size_t num_frames = total_samples / (size_t)g_active_channels;
         audio_dsp_process_i16(&g_dsp, g_proc_buf, num_frames);
         if (g_rec_saving) {
@@ -434,6 +428,9 @@ uint32_t recorder_get_seconds(void)
     uint32_t bps = 32000u * (uint32_t)(g_active_channels ? g_active_channels : 1u);
     if (g_pcm_bytes > 0u || g_prev_split_sec > 0u) {
         return g_prev_split_sec + (g_pcm_bytes / bps);
+    }
+    if (g_vor.enabled) {
+        return 0u;
     }
     return (audio_get_frames() * 128u) / 1000u;
 }

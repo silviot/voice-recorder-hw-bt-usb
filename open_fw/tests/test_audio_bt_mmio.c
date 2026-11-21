@@ -559,6 +559,16 @@ static void test_audio_dma(void)
     assert(r2 != NULL && r2[0] == 4500);
     assert(audio_pop_frame(&nbytes) == NULL);
 
+    /* Race-free audio_pop_frame_copy(): preserves FIFO order when 3 slots queued */
+    sim_dma_deliver_frame(4600, 16384, NULL);
+    sim_dma_deliver_frame(4700, 16384, NULL);
+    sim_dma_deliver_frame(4800, 16384, NULL);
+    static int16_t copy_buf[2048] __attribute__((aligned(4)));
+    assert(audio_pop_frame_copy(copy_buf, sizeof(copy_buf), &nbytes) == 1 && nbytes == 4096u && copy_buf[0] == 4600);
+    assert(audio_pop_frame_copy(copy_buf, sizeof(copy_buf), &nbytes) == 1 && nbytes == 4096u && copy_buf[0] == 4700);
+    assert(audio_pop_frame_copy(copy_buf, sizeof(copy_buf), &nbytes) == 1 && nbytes == 4096u && copy_buf[0] == 4800);
+    assert(audio_pop_frame_copy(copy_buf, sizeof(copy_buf), &nbytes) == 0);
+
     /* Stop capture and verify hardware quiesced */
     audio_capture_stop();
     assert((g_soc.nvic_iser[1] & (1u << 29)) == 0u);
@@ -571,8 +581,8 @@ static void test_audio_dma(void)
 
     g_soc.dmac_regs[1][9] |= 0x02u; /* Transfer complete */
     DMAC_CH1_IRQHandler();
-    assert(audio_get_frames() == 6u);
-    printf("[OK] audio_dma MMIO + DMAC CH1 ring + AC VU\n");
+    assert(audio_get_frames() == 9u);
+    printf("[OK] audio_dma MMIO + DMAC CH1 ring + audio_pop_frame_copy + on-demand AC VU\n");
 }
 
 /* ============================================================================
@@ -768,6 +778,34 @@ static void test_recorder(const char *exfat_img_path)
     assert(recorder_has_error() == 1);
     g_sd_fail_after = -1;
 
+    /* Recording #7: VOR wait timer stays 0, overrun during VOR wait does not emit silence,
+     * and recorder_get_channels() reports active channels during recording */
+    memcpy(g_soc.sd_buf, sd_clean, (size_t)sz);
+    assert(exfat_mount(&vol, &dev) == 0);
+    recorder_set_dsp_profile(AUDIO_DSP_BYPASS);
+    recorder_set_channels(2u);
+    recorder_set_vor(1);
+    assert(recorder_start(&vol, 1) == 0);
+    recorder_set_channels(1u); /* config change mid-recording must not alter active channels */
+    assert(recorder_get_channels() == 2u);
+    /* Deliver 10 silent frames (> 1 s) including ring overrun while VOR gate is closed */
+    for (int i = 0; i < 6; i++) {
+        sim_dma_deliver_stereo_frame(0, 0, 0, 0);
+    }
+    recorder_poll();
+    for (int i = 0; i < 6; i++) {
+        sim_dma_deliver_stereo_frame(0, 0, 0, 0);
+        recorder_poll();
+    }
+    assert(recorder_is_vor_waiting() == 1);
+    assert(recorder_get_seconds() == 0u);
+    assert(recorder_stop() == 0);
+    assert(recorder_get_channels() == 1u);
+    exfat_entry_t ent7;
+    assert(exfat_find_path(&vol, "/record/REC_0005.wav", &ent7) == 0);
+    assert(ent7.size == 44u); /* 0 PCM bytes emitted while VOR gate stayed closed */
+    recorder_set_vor(0);
+
     /* Restore clean snapshot for fsck.exfat validation */
     memcpy(g_soc.sd_buf, sd_clean, (size_t)sz);
     free(sd_clean);
@@ -832,6 +870,7 @@ static void test_audio_dac(void)
     assert(audio_dac_write_stereo(sbuf, 128u) == 128);
     assert(audio_dac_write_stereo(sbuf, 64u) == 64);
     assert(audio_dac_write_stereo(sbuf, 32u) == 32);
+    assert(audio_dac_queued_frames() == 256u + 128u + 64u + 32u);
     assert(audio_dac_write_stereo(sbuf, 128u) == 0); /* Queue full */
 
     assert(g_soc.dmac_regs[0][8] == 0x00080002u);
@@ -844,6 +883,7 @@ static void test_audio_dac(void)
     g_soc.dmac_regs[0][9] |= 0x02u; /* Transfer complete */
     g_dmac_ch0_cb();
     assert(audio_dac_is_busy() == 1);
+    assert(audio_dac_queued_frames() == 128u + 64u + 32u);
     assert(g_soc.dmac_buf[0] != first_buf);
     assert((g_soc.dmac_regs[0][3] & 0x3FFFFu) == 128u * 4u);
 
@@ -856,7 +896,23 @@ static void test_audio_dac(void)
     g_soc.dmac_regs[0][9] |= 0x02u; /* Transfer complete */
     g_dmac_ch0_cb();
     assert(audio_dac_is_busy() == 0);
+    assert(audio_dac_queued_frames() == 0u);
     assert((g_soc.dmac_regs[0][0] & DMAC_CTL_CH_EN) == 0u);
+
+    /* Flush drops queued slots immediately while keeping codec & IRQ warm */
+    assert(audio_dac_write_stereo(sbuf, 200u) == 200);
+    assert(audio_dac_write_stereo(sbuf, 100u) == 100);
+    assert(audio_dac_queued_frames() == 300u);
+    audio_dac_flush();
+    assert(audio_dac_is_busy() == 0);
+    assert(audio_dac_queued_frames() == 0u);
+    assert((g_soc.dmac_regs[0][0] & DMAC_CTL_CH_EN) == 0u);
+    assert((g_soc.nvic_iser[1] & (1u << 28)) != 0u);
+    assert(audio_dac_write_stereo(sbuf, 64u) == 64);
+    assert(audio_dac_queued_frames() == 64u);
+    g_soc.dmac_regs[0][9] |= 0x02u;
+    g_dmac_ch0_cb();
+    assert(audio_dac_queued_frames() == 0u);
 
     /* Volume clamp & mute */
     audio_dac_set_volume(99u, 600u);
@@ -914,7 +970,46 @@ static void test_audio_dac(void)
     assert((g_soc.nvic_iser[1] & (1u << 28)) == 0u);
     assert((g_soc.codec_regs[(CODEC_DAC01_ANA_VOL_ADDR - AUDIO_CODEC_BASE) >> 2] & 0x1F1F0000u) == 0u);
     assert((g_soc.codec_regs[(CODEC_DAC0_DIG_EN_ADDR - AUDIO_CODEC_BASE) >> 2] & 0x3u) == 0u);
-    printf("[OK] audio_dac MMIO (APLL 16k/44.1k, eFuse DC, PB30 PA, DMAC CH0 playback queue, pop-free stop)\n");
+
+    /* WAV parser/builder edge-case validation */
+    uint8_t whdr[64];
+    wav_info_t wi;
+    wav_stream_info_t wsi;
+    assert(wav_build_header(whdr, 16000u, 1u, 16u, 0xFFFFFFF0u) == -1); /* RIFF size overflow */
+    assert(wav_build_header(whdr, 0x80000000u, 2u, 16u, 0u) == -1);     /* byte_rate overflow */
+    assert(wav_build_header(whdr, 16000u, 1u, 16u, 32000u) == 0);
+    whdr[22] = 0u; whdr[23] = 0u; /* channels = 0 */
+    assert(wav_parse_header(whdr, &wi) == -1);
+    assert(wav_build_header(whdr, 16000u, 1u, 16u, 32000u) == 0);
+    whdr[32] = 0u; whdr[33] = 0u; /* block_align = 0 */
+    assert(wav_parse_header(whdr, &wi) == -1);
+    /* PCM fact chunk must not extend total_samples past data bytes */
+    memset(whdr, 0, sizeof(whdr));
+    memcpy(&whdr[0], "RIFF", 4u);
+    memcpy(&whdr[8], "WAVEfmt ", 8u);
+    whdr[16] = 16u; whdr[20] = 1u; whdr[22] = 1u;
+    whdr[24] = 0x80u; whdr[25] = 0x3Eu; /* 16000 */
+    whdr[32] = 2u; whdr[34] = 16u;
+    memcpy(&whdr[36], "fact", 4u);
+    whdr[40] = 4u;
+    whdr[44] = 0xFFu; whdr[45] = 0xFFu; whdr[46] = 0x00u; /* 65535 > 100 samples */
+    memcpy(&whdr[48], "data", 4u);
+    whdr[52] = 200u; /* 100 mono 16-bit samples */
+    assert(wav_parse_stream(whdr, 56u, &wsi) == 0 && wsi.total_samples == 100u);
+    /* IMA-ADPCM hdr_spb mismatch rejected */
+    memset(whdr, 0, sizeof(whdr));
+    memcpy(&whdr[0], "RIFF", 4u);
+    memcpy(&whdr[8], "WAVEfmt ", 8u);
+    whdr[16] = 20u; whdr[20] = WAV_FMT_IMA_ADPCM; whdr[22] = 1u;
+    whdr[24] = 0x80u; whdr[25] = 0x3Eu;
+    whdr[32] = 0x00u; whdr[33] = 0x01u; /* block_align = 256 -> calc_spb = 505 */
+    whdr[34] = 4u; whdr[36] = 2u;
+    whdr[38] = 0xFFu; whdr[39] = 0x03u; /* bogus hdr_spb = 1023 != 505 */
+    memcpy(&whdr[40], "data", 4u);
+    whdr[44] = 0x00u; whdr[45] = 0x01u;
+    assert(wav_parse_stream(whdr, 48u, &wsi) == -1);
+
+    printf("[OK] audio_dac MMIO + flush/queued + WAV validation\n");
 }
 
 /* ============================================================================
