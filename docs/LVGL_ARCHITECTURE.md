@@ -56,14 +56,12 @@ To bring `open_fw` up on a different recorder with similar hardware:
 
 ## 4. Editing Screens with EEZ Studio
 
-[EEZ Studio](https://www.envox.eu/studio/studio-introduction/) natively exports LVGL 9.x C code and fits cleanly into `src/ui/`:
+The UI is authored as a native **EEZ Studio (LVGL 9.2.2)** project at **`open_fw/cassini.eez-project`**:
 
-1. Create a new **LVGL** project in EEZ Studio with:
-   - **LVGL Version:** `9.x`
-   - **Display Resolution:** `160 × 80` (or your target `BOARD_DISP_HOR_RES × BOARD_DISP_VER_RES`)
-   - **Color Depth:** `16 bit (RGB565)`
-   - **Build Output Path:** `open_fw/src/ui/eez/` (or replace `src/ui/ui_screens.c`)
-2. **Keep hardware & app logic decoupled:**
+1. Open **`open_fw/cassini.eez-project`** in [EEZ Studio](https://www.envox.eu/studio/studio-introduction/).
+2. Edit any of the 16 screens (`home`, `rec`, `rec_err`, `saved`, `files`, `files_empty`, `player`, `player_tr`, `delete_confirm`, `settings`, `about`, `usb`, `bt`, `charge`, `power`, `off`), adjust styles/colors in the Dark theme, or tweak widget positions visually at `160×80`.
+3. Click **Build** in EEZ Studio — it writes directly to **`open_fw/src/ui/eez/`** (`ui.c`, `screens.c`, `styles.c`, `images.c`, and headers).
+4. **Keep hardware & app logic decoupled:**
    - Leave `ui_port.c` (display flush, tick, keypad `indev`) and `openfw_ui.h` (`ui_model_t`) untouched.
-   - Bind EEZ-generated widget handles (`objects.*` from EEZ's `screens.h`) inside `ui_render_screen()` so firmware state (`ui_model_t`) updates EEZ-designed screens cleanly, and host visual tests (`make -C open_fw test-host`) continue rendering PNG contact sheets in `< 1 s`.
-3. **Custom fonts:** Register `ui_font_sm`, `ui_font_md`, and `ui_font_lg` in EEZ Studio as external fonts (matching `LV_FONT_CUSTOM_DECLARE` in `lv_conf.h`), or let EEZ Studio generate its own LVGL 9 font files directly.
+   - `open_fw/src/ui/ui_screens.c` is a thin, layout-free data binder that maps `ui_model_t` onto EEZ's generated `objects.*` widget handles.
+   - Rebuild and verify instantly on host with `make -C open_fw all test-host`.

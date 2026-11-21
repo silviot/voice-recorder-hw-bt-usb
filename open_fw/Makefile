@@ -28,7 +28,7 @@ LVGL_INC := -I$(LVGL_DIR) -DLV_CONF_INCLUDE_SIMPLE=1
 CFLAGS   := --target=thumbv7em-none-eabi -mcpu=cortex-m4 -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb \
             -Os -Wall -Wextra -ffreestanding -fno-builtin -fno-stack-protector \
             -ffunction-sections -fdata-sections \
-            -Iinclude -Isrc/ui $(LVGL_INC) -I$(BUILD_DIR)
+            -Iinclude -Isrc/ui -Isrc/ui/eez $(LVGL_INC) -I$(BUILD_DIR)
 ifeq ($(DEV_EXP),1)
 CFLAGS   += -DOPENFW_ENABLE_USB_EXP=1 -DOPENFW_UNATTENDED_DEV=1
 else ifeq ($(UNATTENDED_DEV),1)
@@ -41,7 +41,7 @@ LVGL_CFLAGS := --target=thumbv7em-none-eabi -mcpu=cortex-m4 -mfpu=fpv4-sp-d16 -m
                -Wno-unused-parameter -Wno-sign-compare \
                -Iinclude $(LVGL_INC)
 
-HOST_CFLAGS := -O2 -Wall -Wextra -Werror -Iinclude -Isrc/ui $(LVGL_INC)
+HOST_CFLAGS := -O2 -Wall -Wextra -Werror -Iinclude -Isrc/ui -Isrc/ui/eez $(LVGL_INC)
 LVGL_HOST_CFLAGS := -O2 -Wno-unused-parameter -Wno-sign-compare -Iinclude $(LVGL_INC)
 
 # Minimal LVGL v9.2 source set (core, display, SW draw, flex, built-in stdlib, enabled widgets)
@@ -73,9 +73,12 @@ LVGL_SRCS := \
 LVGL_OBJS      := $(patsubst $(LVGL_DIR)/%.c,$(BUILD_DIR)/lvgl_arm/%.o,$(LVGL_SRCS))
 LVGL_HOST_OBJS := $(patsubst $(LVGL_DIR)/%.c,$(BUILD_DIR)/lvgl_host/%.o,$(LVGL_SRCS))
 
+EEZ_SRCS  := src/ui/eez/ui.c src/ui/eez/screens.c src/ui/eez/styles.c src/ui/eez/images.c
+
 SRCS      := src/startup.c src/wdt_timer.c src/rtc.c src/uart.c src/pmu.c \
              src/keys.c src/lcd_st7735s.c src/ui_spectrogram.c \
              src/ui/ui_port.c src/ui/ui_theme.c src/ui/ui_fonts.c src/ui/ui_screens.c \
+             $(EEZ_SRCS) \
              src/sdio.c src/audio_dma.c src/audio_dac.c src/audio_dsp.c \
              src/usb_scsi.c src/usb_musb.c src/bt_rf.c src/bt_spp.c \
              src/xrec_proto.c src/bt_hci.c src/recorder.c src/player.c \
@@ -164,6 +167,7 @@ test-host: $(LVGL_DIR)/lvgl.h $(BUILD_DIR)/liblvgl_host.a tests/test_core.c src/
 	$(HOST_CC) $(HOST_CFLAGS) -DOPENFW_HOST_MMIO tests/test_ui_render.c \
 		src/lcd_st7735s.c src/ui_spectrogram.c \
 		src/ui/ui_port.c src/ui/ui_theme.c src/ui/ui_fonts.c src/ui/ui_screens.c \
+		$(EEZ_SRCS) \
 		$(BUILD_DIR)/liblvgl_host.a \
 		-lm -o $(BUILD_DIR)/test_ui_render
 	$(BUILD_DIR)/test_ui_render $(BUILD_DIR)/ui_all_screens.ppm
