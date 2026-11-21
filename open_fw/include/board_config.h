@@ -40,9 +40,9 @@
 #define BOARD_DISP_COLOR_DEPTH  16
 #endif
 
-/* Partial draw buffer height in scanlines (160 * 20 * 2 B = 6,400 B SRAM) */
+/* Full-screen draw buffer (160 * 80 * 2 B = 25.6 KiB SRAM): single-pass render, fastest animations */
 #ifndef BOARD_DISP_BUF_LINES
-#define BOARD_DISP_BUF_LINES    20
+#define BOARD_DISP_BUF_LINES    80
 #endif
 
 /* Compact UI mode for small strip displays (e.g., 160x80 / 128x64) */

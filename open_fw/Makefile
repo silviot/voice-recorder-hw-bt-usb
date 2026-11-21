@@ -36,7 +36,7 @@ CFLAGS   += -DOPENFW_UNATTENDED_DEV=1
 endif
 
 LVGL_CFLAGS := --target=thumbv7em-none-eabi -mcpu=cortex-m4 -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb \
-               -Os -ffreestanding -fno-builtin -fno-stack-protector \
+               -O2 -ffreestanding -fno-builtin -fno-stack-protector \
                -ffunction-sections -fdata-sections \
                -Wno-unused-parameter -Wno-sign-compare \
                -Iinclude $(LVGL_INC)
