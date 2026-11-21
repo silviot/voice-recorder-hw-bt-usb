@@ -1366,12 +1366,10 @@ int openfw_main(void)
         g_prev_fault_code = 0u;
     }
 
-    /* Arm WDT before early RTC/RTWI init so a bus hang still recovers */
-    wdt_start_reset(32u, 0u);
-    wdt_feed();
     systick_init(96000000u); /* Boosted in .ram_boot: PLL0 192 MHz / 2 */
     rtc_ensure_running();
     pmu_unattended_init();
+    wdt_start_reset(32u, 0u);
     wdt_feed();
 
     /* Emit early UART0 banner before keys_init() switches PD0 to SARADC */

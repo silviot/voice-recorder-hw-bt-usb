@@ -54,10 +54,10 @@ void wdt_start_reset(uint32_t timeout_sec, uint8_t pmu_reg20_cur)
     openfw_mmio_wr32(WDT_CFG_ADDR, 0u);
     openfw_mmio_set32(WDT_EN_ADDR, 1u);
     openfw_mmio_wr32(WDT_MODE_ADDR, WDT_MODE_HW_RESET);
+    openfw_mmio_wr32(WDT_CFG_ADDR, timeout_bits | 1u);
     if (ctrl1 != 0u) {
         openfw_mmio_wr32(WDT_CTRL1_ADDR, ctrl1);
     }
-    openfw_mmio_wr32(WDT_CFG_ADDR, timeout_bits | 1u);
 }
 
 void wdt_feed(void)

@@ -15,6 +15,7 @@ static uint16_t g_lcd_w     = LCD_WIDTH;
 static uint16_t g_lcd_h     = LCD_HEIGHT;
 static uint16_t g_lcd_x_off = 26u;
 static uint16_t g_lcd_y_off = 0u;
+static int      s_pwm_inited = 0;
 
 static inline void lcdc_wait_idle(void)
 {
@@ -105,8 +106,6 @@ static inline uint32_t pack_be16_pair(uint16_t p0, uint16_t p1)
 
 void lcd_backlight_set(uint8_t percent)
 {
-    static int s_pwm_inited = 0;
-
     if (percent > 100u) {
         percent = 100u;
     }
@@ -149,6 +148,7 @@ void lcd_backlight_set(uint8_t percent)
 void lcd_shutdown(void)
 {
     /* Hold PB17 low even after the PWM clock stops. */
+    s_pwm_inited = 0;
     gpio_write(GPIO_PORT_B, 17u, 0);
     gpio_set_mux(GPIO_PORT_B, 17u, 1u);
     st7735s_write_cmd(0x28u); /* DISPOFF */

@@ -34,7 +34,6 @@
 #define SDIO_INT_RE          (1u << 1)
 #define SDIO_INT_HLE         (1u << 12)
 #define SD_R1_ERR_MASK       0xFDF98008u
-#define SDIO_FIFO_DEPTH      16u
 
 #define SDIO_CMD_TIMEOUT_US  100000u
 #define SDIO_DAT_TIMEOUT_US  500000u
@@ -105,10 +104,10 @@ static int sdio_send_cmd(uint32_t cmd_word, uint32_t arg, int ignore_rcrc)
                      SDIO_INT_CMD_DONE | SDIO_INT_RE | SDIO_INT_RCRC |
                      SDIO_INT_RTO | SDIO_INT_DRTO | SDIO_INT_HLE);
 
-    if (st & (SDIO_INT_RE | SDIO_INT_RTO | SDIO_INT_DRTO | SDIO_INT_HLE)) {
+    if (st & (SDIO_INT_RTO | SDIO_INT_DRTO | SDIO_INT_HLE)) {
         return -1;
     }
-    if (!ignore_rcrc && (st & SDIO_INT_RCRC)) {
+    if (!ignore_rcrc && (st & (SDIO_INT_RE | SDIO_INT_RCRC))) {
         return -1;
     }
     return 0;
@@ -313,10 +312,8 @@ static int sdio_fifo_read_words(uint8_t *dst, uint32_t words, uint64_t t0, uint3
 {
     int aligned = (((uintptr_t)dst & 3u) == 0u);
     uint32_t *dst32 = (uint32_t *)(void *)dst;
-    uint32_t w = 0u;
-    while (w < words) {
-        uint32_t st;
-        while ((st = openfw_mmio_rd32(SDIO_STATUS_ADDR)) & SDIO_STAT_FIFO_EMP) {
+    for (uint32_t w = 0u; w < words; w++) {
+        while (openfw_mmio_rd32(SDIO_STATUS_ADDR) & SDIO_STAT_FIFO_EMP) {
             if (openfw_mmio_rd32(SDIO_RINTSTS_ADDR) & SDIO_INT_DATA_ERRS) {
                 openfw_mmio_wr32(SDIO_RINTSTS_ADDR, 0xFFFFFFFFu);
                 return -1;
@@ -326,28 +323,16 @@ static int sdio_fifo_read_words(uint8_t *dst, uint32_t words, uint64_t t0, uint3
                 return -1;
             }
         }
-        uint32_t burst = (st >> 17) & 0x1FFFu;
-        if (burst == 0u) {
-            burst = 1u;
-        }
-        if (burst > (words - w)) {
-            burst = words - w;
-        }
+        uint32_t word = openfw_mmio_rd32(SDIO_FIFO_ADDR);
         if (aligned) {
-            for (uint32_t i = 0u; i < burst; i++) {
-                dst32[w + i] = openfw_mmio_rd32(SDIO_FIFO_ADDR);
-            }
+            dst32[w] = word;
         } else {
-            for (uint32_t i = 0u; i < burst; i++) {
-                uint32_t word = openfw_mmio_rd32(SDIO_FIFO_ADDR);
-                uint32_t off  = (w + i) * 4u;
-                dst[off + 0u] = (uint8_t)(word);
-                dst[off + 1u] = (uint8_t)(word >> 8);
-                dst[off + 2u] = (uint8_t)(word >> 16);
-                dst[off + 3u] = (uint8_t)(word >> 24);
-            }
+            uint32_t off  = w * 4u;
+            dst[off + 0u] = (uint8_t)(word);
+            dst[off + 1u] = (uint8_t)(word >> 8);
+            dst[off + 2u] = (uint8_t)(word >> 16);
+            dst[off + 3u] = (uint8_t)(word >> 24);
         }
-        w += burst;
     }
     return 0;
 }
@@ -356,10 +341,8 @@ static int sdio_fifo_write_words(const uint8_t *src, uint32_t words, uint64_t t0
 {
     int aligned = (((uintptr_t)src & 3u) == 0u);
     const uint32_t *src32 = (const uint32_t *)(const void *)src;
-    uint32_t w = 0u;
-    while (w < words) {
-        uint32_t st;
-        while ((st = openfw_mmio_rd32(SDIO_STATUS_ADDR)) & SDIO_STAT_FIFO_FULL) {
+    for (uint32_t w = 0u; w < words; w++) {
+        while (openfw_mmio_rd32(SDIO_STATUS_ADDR) & SDIO_STAT_FIFO_FULL) {
             if (openfw_mmio_rd32(SDIO_RINTSTS_ADDR) & SDIO_INT_DATA_ERRS) {
                 openfw_mmio_wr32(SDIO_RINTSTS_ADDR, 0xFFFFFFFFu);
                 return -1;
@@ -369,26 +352,17 @@ static int sdio_fifo_write_words(const uint8_t *src, uint32_t words, uint64_t t0
                 return -1;
             }
         }
-        uint32_t used  = (st >> 17) & 0x1FFFu;
-        uint32_t burst = (used < SDIO_FIFO_DEPTH) ? (SDIO_FIFO_DEPTH - used) : 1u;
-        if (burst > (words - w)) {
-            burst = words - w;
-        }
+        uint32_t word;
         if (aligned) {
-            for (uint32_t i = 0u; i < burst; i++) {
-                openfw_mmio_wr32(SDIO_FIFO_ADDR, src32[w + i]);
-            }
+            word = src32[w];
         } else {
-            for (uint32_t i = 0u; i < burst; i++) {
-                uint32_t off  = (w + i) * 4u;
-                uint32_t word = (uint32_t)src[off + 0u]
-                              | ((uint32_t)src[off + 1u] << 8)
-                              | ((uint32_t)src[off + 2u] << 16)
-                              | ((uint32_t)src[off + 3u] << 24);
-                openfw_mmio_wr32(SDIO_FIFO_ADDR, word);
-            }
+            uint32_t off = w * 4u;
+            word = (uint32_t)src[off + 0u]
+                 | ((uint32_t)src[off + 1u] << 8)
+                 | ((uint32_t)src[off + 2u] << 16)
+                 | ((uint32_t)src[off + 3u] << 24);
         }
-        w += burst;
+        openfw_mmio_wr32(SDIO_FIFO_ADDR, word);
     }
     return 0;
 }
