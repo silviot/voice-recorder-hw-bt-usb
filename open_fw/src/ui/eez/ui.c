@@ -72,7 +72,7 @@ void loadScreen(enum ScreensEnum screenId) {
         lv_scr_load_anim_t anim = (d_next >= d_prev)
             ? LV_SCR_LOAD_ANIM_MOVE_LEFT
             : LV_SCR_LOAD_ANIM_MOVE_RIGHT;
-        lv_screen_load_anim(screen, anim, 150u, 0u, true);
+        lv_screen_load_anim(screen, anim, 110u, 0u, true);
     } else {
         lv_screen_load(screen);
     }

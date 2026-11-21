@@ -122,6 +122,14 @@ void ui_port_task_handler(void)
     lv_timer_handler();
 }
 
+int ui_port_is_animating(void)
+{
+    if (!s_port_inited) {
+        return 0;
+    }
+    return lv_anim_count_running() > 0u ? 1 : 0;
+}
+
 void ui_port_render_now(void)
 {
     if (!s_port_inited || !s_disp) {

@@ -1869,7 +1869,7 @@ int openfw_main(void)
             ui_port_task_handler();
         }
 
-        wfi_sleep_ms(16u);
+        wfi_sleep_ms(ui_port_is_animating() ? 2u : 16u);
     }
 
     return 0;

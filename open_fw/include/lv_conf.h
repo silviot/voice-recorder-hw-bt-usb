@@ -39,7 +39,7 @@
 /*====================
  * HAL / TIMING
  *====================*/
-#define LV_DEF_REFR_PERIOD              20      /* 50 Hz max refresh */
+#define LV_DEF_REFR_PERIOD              8       /* Fast refresh during animations */
 #define LV_DPI_DEF                      160
 
 /*====================

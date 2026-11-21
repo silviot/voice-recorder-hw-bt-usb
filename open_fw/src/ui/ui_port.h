@@ -23,6 +23,9 @@ lv_group_t   *ui_port_get_group(void);
 /* Run LVGL timers/animations/refresh (call periodically from main loop). */
 void ui_port_task_handler(void);
 
+/* Returns non-zero while an LVGL animation is actively running. */
+int ui_port_is_animating(void);
+
 /* Force an immediate synchronous display refresh (used by screen switches & tests). */
 void ui_port_render_now(void);
 
