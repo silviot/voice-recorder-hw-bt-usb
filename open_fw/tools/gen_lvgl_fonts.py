@@ -34,6 +34,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
 DEFAULT_REGULAR = [
+    "/usr/share/fonts/truetype/noto/NotoSans-Medium.ttf",
     "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
     "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -81,7 +82,7 @@ def pick_font(override: str | None, candidates: list[str]) -> str:
 
 def render_glyph(font: ImageFont.FreeTypeFont, sym_font: ImageFont.FreeTypeFont,
                  cp: int, px_size: int, ascent: int, line_height: int,
-                 digit_adv: int):
+                 digit_adv: int, gamma: float = 0.82):
     ch = chr(cp)
     use_font = sym_font if cp >= 0x2500 else font
     raw_adv = max(1, int(round(use_font.getlength(ch))))
@@ -109,11 +110,19 @@ def render_glyph(font: ImageFont.FreeTypeFont, sym_font: ImageFont.FreeTypeFont,
     ofs_y = ascent - y_bottom
 
     # Pack 4-bit nibbles continuously (MSB nibble first, padded to byte at end of glyph)
+    # Apply dark-background gamma boost (< 1.0) so light-on-dark stems stay crisp on TFT
     pixels = []
     for y in range(y0, y1):
         for x in range(x0, x1):
             v = img.getpixel((x, y))
-            pixels.append((v * 15 + 127) // 255)
+            if v == 0:
+                q = 0
+            elif v == 255:
+                q = 15
+            else:
+                boosted = (v / 255.0) ** gamma
+                q = min(15, max(1, int(round(boosted * 15.0))))
+            pixels.append(q)
 
     packed = bytearray()
     for i in range(0, len(pixels), 2):
@@ -124,7 +133,7 @@ def render_glyph(font: ImageFont.FreeTypeFont, sym_font: ImageFont.FreeTypeFont,
     return (gw, gh, ofs_x, ofs_y, adv, bytes(packed))
 
 
-def build_font(name: str, ttf_path: str, sym_path: str, px_size: int) -> str:
+def build_font(name: str, ttf_path: str, sym_path: str, px_size: int, gamma: float) -> str:
     font = ImageFont.truetype(ttf_path, px_size)
     sym_font = ImageFont.truetype(sym_path, max(8, px_size - 1))
     ascent, descent = font.getmetrics()
@@ -138,7 +147,7 @@ def build_font(name: str, ttf_path: str, sym_path: str, px_size: int) -> str:
     # Range 1: ASCII 0x20..0x7E (95 glyphs, gid 1..95)
     for cp in range(0x20, 0x7F):
         gw, gh, ox, oy, adv, data = render_glyph(
-            font, sym_font, cp, px_size, ascent, line_height, digit_adv
+            font, sym_font, cp, px_size, ascent, line_height, digit_adv, gamma
         )
         bidx = len(bitmap)
         bitmap.extend(data)
@@ -152,7 +161,7 @@ def build_font(name: str, ttf_path: str, sym_path: str, px_size: int) -> str:
 
     for cp in EXTRA_CODEPOINTS:
         gw, gh, ox, oy, adv, data = render_glyph(
-            font, sym_font, cp, px_size, ascent, line_height, digit_adv
+            font, sym_font, cp, px_size, ascent, line_height, digit_adv, gamma
         )
         bidx = len(bitmap)
         bitmap.extend(data)
@@ -250,9 +259,9 @@ def main() -> int:
         " */",
         '#include "lvgl.h"',
         "",
-        build_font("ui_font_sm", reg, sym, 11),
-        build_font("ui_font_md", reg, sym, 14),
-        build_font("ui_font_lg", bold, sym, 22),
+        build_font("ui_font_sm", reg, sym, 11, gamma=0.78),
+        build_font("ui_font_md", reg, sym, 14, gamma=0.82),
+        build_font("ui_font_lg", bold, sym, 22, gamma=0.88),
     ]
 
     out_path = Path(args.out)
