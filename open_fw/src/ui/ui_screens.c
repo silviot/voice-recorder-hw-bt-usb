@@ -803,6 +803,7 @@ void ui_render_screen(ui_screen_id_t scr, const ui_model_t *m)
     case SCREEN_ID_BT:             bind_bt(m); break;
     case SCREEN_ID_CHARGE:         bind_charge(m); break;
     case SCREEN_ID_POWER:
+        lv_label_set_text_static(objects.pwr_sub, m->power_hold_pct == 100u ? "Release to power off" : "Keep holding POWER");
         lv_bar_set_value(objects.pwr_hold_bar, (int32_t)m->power_hold_pct, LV_ANIM_OFF);
         break;
     case SCREEN_ID_OFF:

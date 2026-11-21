@@ -958,7 +958,12 @@ static void test_pmu_driver(void)
 
     /* Shutdown wins when the threshold or the PMU long event coincides with release. */
     assert(power_button_update(KEY_ONOFF_PRESS, 2000u, 0, &progress) == POWER_BUTTON_IDLE);
-    assert(power_button_update(KEY_ONOFF_RELEASE, 4000u, 0, &progress) == POWER_BUTTON_SHUTDOWN);
+    assert(power_button_update(0, 4000u, 0, &progress) == POWER_BUTTON_PROGRESS && progress == 100u);
+    assert(power_button_update(KEY_ONOFF_RELEASE, 4016u, 0, &progress) == POWER_BUTTON_SHUTDOWN);
+    assert(power_button_update(KEY_ONOFF_PRESS, 4500u, 0, &progress) == POWER_BUTTON_IDLE);
+    assert(power_button_update(KEY_ONOFF_LONG, 4550u, 0, &progress) == POWER_BUTTON_PROGRESS);
+    assert(power_button_update(0, 4600u, 0, &progress) == POWER_BUTTON_PROGRESS && progress == 100u);
+    assert(power_button_update(KEY_ONOFF_RELEASE, 4650u, 0, &progress) == POWER_BUTTON_SHUTDOWN);
     assert(power_button_update(tap | KEY_ONOFF_LONG, 5000u, 1, &progress) == POWER_BUTTON_SHUTDOWN);
 
     /* Unattended always-on PMU init + charge management */

@@ -1119,6 +1119,12 @@ int openfw_main(void)
     uart0_put_u32(SYSCTL_CPU_ID);
     uart0_puts(" VBAT_MV=");
     uart0_put_u32(pmu_read_vbat_mv());
+    uart0_puts(" PMU_PON=");
+    uart0_put_hex(pmu_read_reg(0x27u));
+    uart0_puts("/");
+    uart0_put_hex(pmu_read_reg(0x28u));
+    uart0_puts(" PMU_POFF=");
+    uart0_put_hex(pmu_read_reg(0x29u));
     uart0_puts(" STRIKE=");
     uart0_put_u32(boot_strikes + 1u);
     uart0_puts("\n");

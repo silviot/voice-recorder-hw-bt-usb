@@ -114,12 +114,13 @@ uint8_t key_onoff_poll(void)
 power_button_action_t power_button_update(uint8_t events, uint32_t now, int screen_off,
                                           uint8_t *progress)
 {
-    static int down, woke_screen;
+    static int down, woke_screen, shutdown_armed;
     static uint32_t pressed_at;
     int wake = 0;
     if (events & KEY_ONOFF_PRESS) {
         down = 1;
         pressed_at = now;
+        shutdown_armed = 0;
         woke_screen = screen_off;
         wake = screen_off;
     }
@@ -128,8 +129,16 @@ power_button_action_t power_button_update(uint8_t events, uint32_t now, int scre
     }
     uint32_t held = now - pressed_at;
     if ((events & KEY_ONOFF_LONG) || held >= 2000u) {
-        down = 0;
-        return POWER_BUTTON_SHUTDOWN;
+        shutdown_armed = 1;
+    }
+    /* ON/OFF is a wake source. Finish the gesture before cutting the rails. */
+    if (shutdown_armed) {
+        if (events & KEY_ONOFF_RELEASE) {
+            down = 0;
+            return POWER_BUTTON_SHUTDOWN;
+        }
+        *progress = 100u;
+        return POWER_BUTTON_PROGRESS;
     }
     if (events & KEY_ONOFF_RELEASE) {
         down = 0;
@@ -148,6 +157,8 @@ power_button_action_t power_button_update(uint8_t events, uint32_t now, int scre
 
 void pmu_soft_poweroff(void)
 {
+    /* No code will service the reset watchdog once the CPU enters WFI. */
+    wdt_stop();
     pmu_write_reg(0x20u, 0x2Fu); /* wake: KEY_ONOFF + VBUS */
     pmu_write_reg(0x22u, 0x00u);
     pmu_write_reg(0x24u, (uint8_t)((pmu_read_reg(0x24u) & ~0x3Fu) | 0x04u)); /* 1s on, 8s force-rst */
