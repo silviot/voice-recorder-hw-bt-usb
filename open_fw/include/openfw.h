@@ -115,6 +115,13 @@ int             pmu_is_vbus_present(void);
 void            key_onoff_init(void);
 int             key_onoff_pressed(int *out_long_press);
 uint8_t         key_onoff_poll(void);
+typedef enum {
+    POWER_BUTTON_IDLE, POWER_BUTTON_WAKE, POWER_BUTTON_SLEEP,
+    POWER_BUTTON_PROGRESS, POWER_BUTTON_CANCEL, POWER_BUTTON_SHUTDOWN
+} power_button_action_t;
+
+power_button_action_t power_button_update(uint8_t events, uint32_t now, int screen_off,
+                                          uint8_t *progress);
 void            pmu_soft_poweroff(void) __attribute__((noreturn));
 void            pmu_unattended_init(void);
 void            pmu_poll_charge_manage(void);

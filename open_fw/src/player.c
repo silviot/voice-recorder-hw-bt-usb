@@ -454,6 +454,7 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
         }
 
         uint32_t now = millis();
+        int show_player = ui_poll_power_button(UI_SCR_PLAYER, m, now);
         if (toast_until != 0u && (int32_t)(now - toast_until) >= 0) {
             toast_until     = 0u;
             m->toast_msg[0] = '\0';
@@ -711,7 +712,9 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
             if (has_cwx) {
                 populate_transcript_lines(m, &cwx, pos_ms);
             }
-            ui_render_screen(UI_SCR_PLAYER, m);
+            if (show_player) {
+                ui_render_screen(UI_SCR_PLAYER, m);
+            }
         }
 
         if (!keys_event_pending() &&

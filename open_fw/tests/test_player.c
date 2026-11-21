@@ -131,6 +131,12 @@ int exfat_read_file(const exfat_vol_t *vol, const exfat_entry_t *ent,
     advance(1);
     return 0;
 }
+int ui_poll_power_button(ui_screen_id_t screen, ui_model_t *m, uint32_t now)
+{
+    (void)screen; (void)m; (void)now;
+    return 1;
+}
+
 void ui_render_screen(ui_screen_id_t screen, const ui_model_t *m)
 {
     assert(screen == UI_SCR_PLAYER);

@@ -279,6 +279,7 @@ typedef struct {
 } ui_model_t;
 
 void ui_settings_defaults(ui_settings_t *cfg);
+int ui_poll_power_button(ui_screen_id_t screen, ui_model_t *model, uint32_t now);
 void ui_render_screen(ui_screen_id_t scr, const ui_model_t *m);
 void ui_rec_update_live(const ui_model_t *m);
 

@@ -113,6 +113,53 @@ static void backlight_sleep_now(void)
     ui_render_screen(UI_SCR_OFF, &g_ui);
 }
 
+int ui_poll_power_button(ui_screen_id_t screen, ui_model_t *model, uint32_t now)
+{
+    /* USB and audio service loops can run many times in a millisecond.
+     * The PMU latches edges until acknowledged. */
+    static uint32_t last_poll;
+    if (now - last_poll >= 16u) {
+        last_poll = now;
+        uint8_t progress = 0;
+        power_button_action_t action = power_button_update(key_onoff_poll(), now,
+                                                           g_screen_off, &progress);
+        switch (action) {
+        case POWER_BUTTON_SLEEP:
+            backlight_sleep_now();
+            break;
+        case POWER_BUTTON_WAKE:
+        case POWER_BUTTON_CANCEL:
+            backlight_wake(now);
+            g_ui_screen = screen;
+            ui_render_screen(screen, model);
+            break;
+        case POWER_BUTTON_PROGRESS:
+            if (g_ui_screen != UI_SCR_POWER || progress != model->power_hold_pct) {
+                backlight_wake(now);
+                model->power_hold_pct = progress;
+                g_ui_screen = UI_SCR_POWER;
+                ui_render_screen(UI_SCR_POWER, model);
+            }
+            break;
+        case POWER_BUTTON_SHUTDOWN:
+            if (screen == UI_SCR_USB) {
+                usb_msc_stop();
+            } else if (screen == UI_SCR_BT) {
+                bt_xrec_stop();
+            } else if (screen == UI_SCR_PLAYER) {
+                audio_dac_stop();
+            }
+            (void)recorder_stop();
+            (void)sd_flush(&g_sd_card);
+            backlight_apply(0u);
+            pmu_soft_poweroff();
+        case POWER_BUTTON_IDLE:
+            break;
+        }
+    }
+    return !g_screen_off && g_ui_screen != UI_SCR_POWER;
+}
+
 static void backlight_update(void)
 {
     if (g_screen_off) {
@@ -548,7 +595,6 @@ static int run_usb_msc_mode(int auto_mode)
 
     uint32_t last_render = 0u;
     keys_flush_events();
-    (void)key_onoff_poll();
     while (1) {
         wdt_feed();
         for (int burst = 0; burst < 32; burst++) {
@@ -556,6 +602,7 @@ static int run_usb_msc_mode(int auto_mode)
         }
 
         uint32_t now = millis();
+        int show_usb = ui_poll_power_button(UI_SCR_USB, &g_ui, now);
 
         key_event_t kev;
         while (keys_pop_event(&kev)) {
@@ -654,7 +701,7 @@ static int run_usb_msc_mode(int auto_mode)
                 last_render = now;
                 pmu_poll_charge_manage();
                 refresh_telemetry();
-                if (!g_screen_off) {
+                if (show_usb && !g_screen_off) {
                     ui_render_screen(UI_SCR_USB, &g_ui);
                 }
             }
@@ -664,7 +711,6 @@ static int run_usb_msc_mode(int auto_mode)
     usb_msc_stop();
     (void)sd_flush(&g_sd_card);
     wait_key_release(KEY_BACK);
-    (void)key_onoff_poll();
     backlight_wake(millis());
 
     /* Remount exFAT because USB host may have written or deleted files */
@@ -699,7 +745,6 @@ static void run_bt_xrec_mode(void)
     int      exit_armed  = 0;
 
     keys_flush_events();
-    (void)key_onoff_poll();
     while (1) {
         wdt_feed();
         bt_xrec_poll();
@@ -734,6 +779,7 @@ static void run_bt_xrec_mode(void)
         }
 
         uint32_t now = millis();
+        int show_bt = ui_poll_power_button(UI_SCR_BT, &g_ui, now);
         if ((uint32_t)(now - last_ui) >= 150u || last_ui == 0u) {
             last_ui = now;
             pmu_poll_charge_manage();
@@ -778,7 +824,7 @@ static void run_bt_xrec_mode(void)
             }
 
             refresh_telemetry();
-            if (!g_screen_off) {
+            if (show_bt && !g_screen_off) {
                 ui_render_screen(UI_SCR_BT, &g_ui);
             }
         }
@@ -790,7 +836,6 @@ static void run_bt_xrec_mode(void)
     bt_xrec_stop();
     g_ui.toast_msg[0] = '\0';
     wait_key_release(KEY_BACK);
-    (void)key_onoff_poll();
     backlight_wake(millis());
     reload_files_and_sd_stats();
 }
@@ -1191,8 +1236,6 @@ int openfw_main(void)
     uint32_t enter_press_ms          = 0u;
     int      enter_long_fired        = 0;
     int      del_armed               = 0;
-    uint32_t pwr_press_ms            = 0u;
-    int      prev_onoff              = 0;
     key_id_t prev_key                = KEY_NONE;
     int      swallow_until_release   = 0;
     int      dirty                   = 1;
@@ -1213,50 +1256,11 @@ int openfw_main(void)
             clear_boot_strikes_once();
         }
 
-        /* 1. Power button (short press = screen off/wake; 2s hold unplugged = power off) */
-        uint8_t onoff_ev   = key_onoff_poll();
-        int     onoff_long = (onoff_ev & KEY_ONOFF_LONG) ? 1 : 0;
-        if (onoff_ev & KEY_ONOFF_PRESS) {
-            prev_onoff = 1;
-            if (g_screen_off) {
-                backlight_wake(now_ms);
-                dirty        = 1;
-                pwr_press_ms = 0u; /* Wake press swallowed */
-            } else {
-                pwr_press_ms = now_ms ? now_ms : 1u;
-            }
-        }
-        if (onoff_ev & KEY_ONOFF_RELEASE) {
-            prev_onoff = 0;
-            if (pwr_press_ms != 0u) {
-                uint32_t held = (uint32_t)(now_ms - pwr_press_ms);
-                pwr_press_ms = 0u;
-                if (held < 300u) {
-                    backlight_sleep_now();
-                } else {
-                    /* Cancelled power off hold */
-                    g_ui_screen = (uint32_t)scr;
-                    dirty = 1;
-                }
-            }
-        } else if (prev_onoff && pwr_press_ms != 0u) {
-            uint32_t held = (uint32_t)(now_ms - pwr_press_ms);
-            if (!pmu_is_vbus_present() && (held >= 300u || onoff_long)) {
-                uint32_t pct = (held >= 2000u || onoff_long) ? 100u : ((held * 100u) / 2000u);
-                g_ui.power_hold_pct = (uint8_t)pct;
-                g_ui_screen = UI_SCR_POWER;
-                backlight_wake(now_ms);
-                ui_render_screen(UI_SCR_POWER, &g_ui);
-                if (held >= 2000u || onoff_long) {
-                    (void)recorder_stop();
-                    rec_active = 0;
-                    mdelay(150u);
-                    pmu_soft_poweroff();
-                }
-                recorder_poll();
-                wfi_sleep_ms(25u);
-                continue;
-            }
+        ui_poll_power_button(scr, &g_ui, now_ms);
+        if (g_ui_screen == UI_SCR_POWER) {
+            recorder_poll();
+            wfi_sleep_ms(16u);
+            continue;
         }
 
         /* 2. Record slide switch (overrides any screen immediately) */
@@ -1472,7 +1476,6 @@ int openfw_main(void)
                 usb_suppress_until_unpl = (manual && pmu_is_vbus_present()) ? 1 : 0;
                 g_ui_screen = (uint32_t)scr;
                 keys_flush_events();
-                (void)key_onoff_poll();
                 prev_key    = KEY_NONE;
                 dirty       = 1;
                 continue;
@@ -1797,7 +1800,6 @@ int openfw_main(void)
 
                 if (modal_done) {
                     keys_flush_events();
-                    (void)key_onoff_poll();
                     prev_key = KEY_NONE;
                     break;
                 }

@@ -942,6 +942,25 @@ static void test_pmu_driver(void)
     g_soc.pmu_regs[0x31u] = 0x10u;
     assert(key_onoff_poll() == KEY_ONOFF_RELEASE);
 
+    uint8_t progress = 0u;
+    /* A tap can arrive as one read. A tap that woke the display stays awake. */
+    uint8_t tap = KEY_ONOFF_PRESS | KEY_ONOFF_RELEASE;
+    assert(power_button_update(tap, 0, 0, &progress) == POWER_BUTTON_SLEEP);
+    assert(power_button_update(tap, 1, 1, &progress) == POWER_BUTTON_WAKE);
+
+    /* Start asleep, cross the millisecond counter rollover, then release early. */
+    uint32_t start = UINT32_MAX - 100u;
+    assert(power_button_update(KEY_ONOFF_PRESS, start, 1, &progress) == POWER_BUTTON_WAKE);
+    assert(power_button_update(0, start + 300u, 0, &progress) == POWER_BUTTON_PROGRESS);
+    assert(progress == 15u);
+    assert(power_button_update(KEY_ONOFF_RELEASE, start + 1999u, 0, &progress) == POWER_BUTTON_CANCEL);
+    assert(power_button_update(0, start + 2000u, 0, &progress) == POWER_BUTTON_IDLE);
+
+    /* Shutdown wins when the threshold or the PMU long event coincides with release. */
+    assert(power_button_update(KEY_ONOFF_PRESS, 2000u, 0, &progress) == POWER_BUTTON_IDLE);
+    assert(power_button_update(KEY_ONOFF_RELEASE, 4000u, 0, &progress) == POWER_BUTTON_SHUTDOWN);
+    assert(power_button_update(tap | KEY_ONOFF_LONG, 5000u, 1, &progress) == POWER_BUTTON_SHUTDOWN);
+
     /* Unattended always-on PMU init + charge management */
     g_soc.pmu_regs[0x00u] = 0xCFu;
     g_soc.pmu_regs[0x17u] = 0x01u;

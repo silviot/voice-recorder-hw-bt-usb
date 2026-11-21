@@ -111,6 +111,41 @@ uint8_t key_onoff_poll(void)
     return ev;
 }
 
+power_button_action_t power_button_update(uint8_t events, uint32_t now, int screen_off,
+                                          uint8_t *progress)
+{
+    static int down, woke_screen;
+    static uint32_t pressed_at;
+    int wake = 0;
+    if (events & KEY_ONOFF_PRESS) {
+        down = 1;
+        pressed_at = now;
+        woke_screen = screen_off;
+        wake = screen_off;
+    }
+    if (!down) {
+        return POWER_BUTTON_IDLE;
+    }
+    uint32_t held = now - pressed_at;
+    if ((events & KEY_ONOFF_LONG) || held >= 2000u) {
+        down = 0;
+        return POWER_BUTTON_SHUTDOWN;
+    }
+    if (events & KEY_ONOFF_RELEASE) {
+        down = 0;
+        if (held >= 300u) {
+            return POWER_BUTTON_CANCEL;
+        }
+        if (!woke_screen) {
+            return POWER_BUTTON_SLEEP;
+        }
+    } else if (held >= 300u) {
+        *progress = (uint8_t)(held / 20u);
+        return POWER_BUTTON_PROGRESS;
+    }
+    return wake ? POWER_BUTTON_WAKE : POWER_BUTTON_IDLE;
+}
+
 void pmu_soft_poweroff(void)
 {
     pmu_write_reg(0x20u, 0x2Fu); /* wake: KEY_ONOFF + VBUS */
