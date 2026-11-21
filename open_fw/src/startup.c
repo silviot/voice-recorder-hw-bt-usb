@@ -372,3 +372,83 @@ void __aeabi_memclr8(void *dst, uint32_t n)
 {
     __aeabi_memset(dst, n, 0);
 }
+
+/* Bare-metal 64-bit integer division helpers (ARM EABI: q in r0:r1, r in r2:r3) */
+static uint64_t udivmod64(uint64_t num, uint64_t den, uint64_t *rem_out)
+{
+    uint64_t q = 0ull;
+    uint64_t r = 0ull;
+    if (den == 0ull) {
+        if (rem_out) *rem_out = 0ull;
+        return 0ull;
+    }
+    for (int i = 63; i >= 0; i--) {
+        r = (r << 1) | ((num >> i) & 1ull);
+        if (r >= den) {
+            r -= den;
+            q |= (1ull << i);
+        }
+    }
+    if (rem_out) *rem_out = r;
+    return q;
+}
+
+typedef struct {
+    uint64_t q;
+    uint64_t r;
+} aeabi_uldiv_t;
+
+__attribute__((used))
+static void aeabi_uldivmod_c(uint64_t num, uint64_t den, aeabi_uldiv_t *out)
+{
+    out->q = udivmod64(num, den, &out->r);
+}
+
+__attribute__((used))
+static void aeabi_ldivmod_c(int64_t num, int64_t den, aeabi_uldiv_t *out)
+{
+    int neg_q = (num < 0) ^ (den < 0);
+    int neg_r = (num < 0);
+    uint64_t un = (num < 0) ? (uint64_t)(-(num + 1)) + 1ull : (uint64_t)num;
+    uint64_t ud = (den < 0) ? (uint64_t)(-(den + 1)) + 1ull : (uint64_t)den;
+    uint64_t r = 0ull;
+    uint64_t q = udivmod64(un, ud, &r);
+    out->q = neg_q ? (uint64_t)(-(int64_t)q) : q;
+    out->r = neg_r ? (uint64_t)(-(int64_t)r) : r;
+}
+
+__attribute__((naked))
+void __aeabi_uldivmod(void)
+{
+    __asm__ volatile (
+        "push {lr}\n"
+        "sub sp, sp, #24\n"
+        "add r12, sp, #8\n"
+        "str r12, [sp, #0]\n"
+        "bl aeabi_uldivmod_c\n"
+        "ldr r0, [sp, #8]\n"
+        "ldr r1, [sp, #12]\n"
+        "ldr r2, [sp, #16]\n"
+        "ldr r3, [sp, #20]\n"
+        "add sp, sp, #24\n"
+        "pop {pc}\n"
+    );
+}
+
+__attribute__((naked))
+void __aeabi_ldivmod(void)
+{
+    __asm__ volatile (
+        "push {lr}\n"
+        "sub sp, sp, #24\n"
+        "add r12, sp, #8\n"
+        "str r12, [sp, #0]\n"
+        "bl aeabi_ldivmod_c\n"
+        "ldr r0, [sp, #8]\n"
+        "ldr r1, [sp, #12]\n"
+        "ldr r2, [sp, #16]\n"
+        "ldr r3, [sp, #20]\n"
+        "add sp, sp, #24\n"
+        "pop {pc}\n"
+    );
+}

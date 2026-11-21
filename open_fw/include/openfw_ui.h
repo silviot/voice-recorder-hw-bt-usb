@@ -66,14 +66,8 @@ typedef enum {
     UI_ICON_MIC,
 } ui_icon_t;
 
-void ui_draw_icon(int16_t x, int16_t y, int16_t size, ui_icon_t icon,
-                  uint16_t fg, uint16_t bg);
-
-void ui_draw_battery(int16_t x, int16_t y, uint8_t pct, int charging,
-                     uint16_t outline_col, uint16_t bg);
-
 /* =========================================================================
- * Shared Chrome & Formatting Helpers (ui_icons.c)
+ * Shared Chrome & Formatting Helpers (src/ui/ui_theme.c)
  * ========================================================================= */
 typedef struct {
     uint16_t    bg_col;
@@ -99,14 +93,6 @@ typedef struct {
     const char *key;            /* drawn in UI_COL_TEXT (NULL if icon-only) */
     const char *action;         /* drawn in UI_COL_DIM */
 } ui_hint_t;
-
-void ui_draw_status_bar(const ui_status_bar_t *sb);
-void ui_draw_footer_hints(int16_t baseline_y, const ui_hint_t *hints, int count, uint16_t bg);
-void ui_draw_toast(const char *msg, uint16_t pill_col, uint16_t text_col, uint16_t bg);
-void ui_draw_hbar(int16_t x, int16_t y, int16_t w, int16_t h,
-                  uint8_t pct, uint8_t peak_pct, uint16_t bg);
-void ui_draw_vmeter(int16_t x, int16_t y, int16_t w, int16_t h,
-                    uint8_t pct, uint8_t peak_pct, int clip_latch, uint16_t bg);
 
 void ui_format_duration(char *dst, int dst_len, uint32_t secs);
 void ui_format_clock(char *dst, int dst_len, uint8_t hour, uint8_t minute);
@@ -294,6 +280,7 @@ typedef struct {
 
 void ui_settings_defaults(ui_settings_t *cfg);
 void ui_render_screen(ui_screen_id_t scr, const ui_model_t *m);
+void ui_rec_update_live(const ui_model_t *m);
 
 /* =========================================================================
  * Persistent Settings & Last-Played Resume State (/cassini/settings.bin)

@@ -8,6 +8,7 @@ dumps/
 *.mp3
 
 # Compiled binaries and build artifacts
+open_fw/third_party/lvgl/
 tools/smtlink_dump
 tools/fwhelper
 *.o

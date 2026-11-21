@@ -164,8 +164,6 @@ static inline uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b)
 void     lcd_backlight_set(uint8_t percent);
 void     lcd_init(void);
 void     lcd_set_rotation(int landscape);
-void     lcd_fb_begin(void);
-void     lcd_fb_flush(void);
 uint16_t lcd_get_width(void);
 uint16_t lcd_get_height(void);
 void     lcd_set_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1);
@@ -179,46 +177,6 @@ void     lcd_draw_char_2x(uint16_t x, uint16_t y, char c, uint16_t fg, uint16_t 
 void     lcd_draw_str_2x(uint16_t x, uint16_t y, const char *s, uint16_t fg, uint16_t bg);
 void     lcd_draw_u32(uint16_t x, uint16_t y, uint32_t v, uint16_t fg, uint16_t bg);
 void     lcd_draw_hex(uint16_t x, uint16_t y, uint32_t v, uint8_t digits, uint16_t fg, uint16_t bg);
-
-/* 4-bit (16-level) Anti-Aliased Proportional Fonts & UI Primitives (aa_fonts.c, lcd_st7735s.c) */
-typedef struct {
-    uint8_t  w;
-    uint8_t  h;
-    int8_t   x_off;
-    int8_t   y_off;
-    uint8_t  x_adv;
-    uint16_t data_off;
-} aa_glyph_t;
-
-typedef struct {
-    uint8_t           first_char;
-    uint8_t           last_char;
-    uint8_t           line_height;
-    uint8_t           ascent;
-    const aa_glyph_t *glyphs;
-    const uint8_t    *bitmap_data;
-} aa_font_t;
-
-extern const aa_font_t g_font_ui_sm; /* 11px Regular: metadata, badges, hints */
-extern const aa_font_t g_font_ui_md; /* 14px Regular: filenames, lists, menus */
-extern const aa_font_t g_font_ui_lg; /* 22px Bold:    timers, primary headers */
-
-uint16_t lcd_blend_rgb565(uint16_t fg, uint16_t bg, uint8_t alpha4);
-uint16_t lcd_measure_str_aa(const char *s, const aa_font_t *font);
-void     lcd_draw_str_aa(int16_t x, int16_t y, const char *s,
-                         const aa_font_t *font, uint16_t fg, uint16_t bg);
-void     lcd_draw_str_aa_bl(int16_t x, int16_t baseline_y, const char *s,
-                            const aa_font_t *font, uint16_t fg, uint16_t bg);
-void     lcd_draw_str_aa_trunc(int16_t x, int16_t y, const char *s,
-                               const aa_font_t *font, uint16_t max_w,
-                               uint16_t fg, uint16_t bg);
-void     lcd_fill_circle_aa(int16_t cx, int16_t cy, int16_t r, uint16_t fg, uint16_t bg);
-void     lcd_fill_rrect_aa(int16_t x, int16_t y, int16_t w, int16_t h, int16_t r,
-                           uint16_t fg, uint16_t bg);
-void     lcd_fill_tri_aa(int16_t x0, int16_t y0, int16_t x1, int16_t y1,
-                         int16_t x2, int16_t y2, uint16_t fg, uint16_t bg);
-void     lcd_draw_line_aa(int16_t x0, int16_t y0, int16_t x1, int16_t y1,
-                          uint8_t width_px, uint16_t fg, uint16_t bg);
 
 /* 1-Bit SDIO / microSD Block Driver (sdio.c) */
 typedef struct {

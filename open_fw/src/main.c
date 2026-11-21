@@ -22,6 +22,7 @@
 #include "sl6801_regs.h"
 #include "openfw.h"
 #include "openfw_ui.h"
+#include "ui/ui_port.h"
 #include "openfw_exp.h"
 #include "openfw_wav.h"
 #include "openfw_player.h"
@@ -1412,14 +1413,8 @@ int openfw_main(void)
                     g_ui.rec_vor_wait = (uint8_t)vor_wait;
                     dirty = 1;
                 } else if (!g_screen_off && !dirty && scr == UI_SCR_REC && g_ui.sd_ok && !g_ui.rec_stopped) {
-                    /* Fast 20 Hz partial update: spectrogram + L/R vertical meters */
-                    ui_spec_blit(&g_spec, 2, 42);
-                    ui_draw_vmeter(148, 42, 4, 24, g_ui.rec_vu_l, g_ui.rec_peak_l, g_ui.rec_clip_l, UI_COL_BG);
-                    ui_draw_vmeter(153, 42, 4, 24,
-                                   (g_ui.cfg.channels == 1u) ? g_ui.rec_vu_l : g_ui.rec_vu_r,
-                                   (g_ui.cfg.channels == 1u) ? g_ui.rec_peak_l : g_ui.rec_peak_r,
-                                   (g_ui.cfg.channels == 1u) ? g_ui.rec_clip_l : g_ui.rec_clip_r,
-                                   UI_COL_BG);
+                    /* Fast 20 Hz partial update: spectrogram + L/R vertical meters via LVGL */
+                    ui_rec_update_live(&g_ui);
                 }
             }
         } else {
@@ -1869,9 +1864,12 @@ int openfw_main(void)
         if (dirty && !g_screen_off) {
             ui_render_screen(scr, &g_ui);
             dirty = 0;
+        } else if (!g_screen_off) {
+            /* Keep LVGL timers & animations ticking smoothly (~60 Hz) */
+            ui_port_task_handler();
         }
 
-        wfi_sleep_ms(25u);
+        wfi_sleep_ms(16u);
     }
 
     return 0;
