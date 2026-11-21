@@ -813,13 +813,6 @@ void ui_render_screen(ui_screen_id_t scr, const ui_model_t *m)
     }
 
     ui_toast_update(m->toast_msg, m->toast_col);
-#ifdef OPENFW_HOST_MMIO
     ui_port_render_now();
-#else
-    if (ui_port_is_animating()) {
-        ui_port_task_handler();
-    } else {
-        ui_port_render_now();
-    }
-#endif
+    if (ui_port_is_animating()) ui_port_task_handler();
 }

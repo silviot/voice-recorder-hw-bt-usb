@@ -1,4 +1,5 @@
 #include "ui.h"
+#include "ui_port.h"
 #include "images.h"
 
 static int16_t currentScreen = -1;
@@ -10,7 +11,6 @@ static lv_obj_t *getLvglObjectFromIndex(int32_t index) {
     return ((lv_obj_t **)&objects)[index];
 }
 
-#ifndef OPENFW_HOST_MMIO
 static int screen_depth(enum ScreensEnum id) {
     switch (id) {
     case SCREEN_ID_HOME:
@@ -27,7 +27,6 @@ static int screen_depth(enum ScreensEnum id) {
         return -1; /* Instant: REC, PLAYER, USB, BT, CHARGE, POWER, OFF */
     }
 }
-#endif
 
 void loadScreen(enum ScreensEnum screenId) {
     int16_t nextScreen = (int16_t)(screenId - 1);
@@ -39,7 +38,8 @@ void loadScreen(enum ScreensEnum screenId) {
         ? (enum ScreensEnum)(currentScreen + 1)
         : (enum ScreensEnum)0;
 
-#ifdef OPENFW_HOST_MMIO
+    int prev_depth = screen_depth(prevId);
+    int next_depth = screen_depth(screenId);
     if (currentScreen >= 0) {
         delete_screen_by_id(prevId);
     }
@@ -48,35 +48,8 @@ void loadScreen(enum ScreensEnum screenId) {
     lv_obj_t *screen = getLvglObjectFromIndex(currentScreen);
     if (screen) {
         lv_screen_load(screen);
+        ui_port_set_reveal(prev_depth >= 0 && next_depth >= 0, next_depth >= prev_depth);
     }
-#else
-    int d_prev = (prevId != 0) ? screen_depth(prevId) : -1;
-    int d_next = screen_depth(screenId);
-    int animate = (prevId != 0 && d_prev >= 0 && d_next >= 0);
-
-    if (currentScreen >= 0 && !animate) {
-        delete_screen_by_id(prevId);
-    } else if (currentScreen >= 0) {
-        /* Detach old screen handle; LVGL auto_del frees the old tree after slide */
-        ((lv_obj_t **)&objects)[currentScreen] = 0;
-    }
-
-    currentScreen = nextScreen;
-    create_screen_by_id(screenId);
-    lv_obj_t *screen = getLvglObjectFromIndex(currentScreen);
-    if (!screen) {
-        return;
-    }
-
-    if (animate) {
-        lv_scr_load_anim_t anim = (d_next >= d_prev)
-            ? LV_SCR_LOAD_ANIM_OVER_LEFT
-            : LV_SCR_LOAD_ANIM_OVER_RIGHT;
-        lv_screen_load_anim(screen, anim, 180u, 0u, true);
-    } else {
-        lv_screen_load(screen);
-    }
-#endif
 }
 
 void ui_init(void) {

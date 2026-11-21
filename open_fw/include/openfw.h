@@ -168,6 +168,8 @@ uint16_t lcd_get_width(void);
 uint16_t lcd_get_height(void);
 void     lcd_set_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1);
 void     lcd_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t color);
+void     lcd_blit_rgb565_stride(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
+                                const uint16_t *pixels, uint16_t stride);
 void     lcd_blit_rgb565(uint16_t x, uint16_t y, uint16_t w, uint16_t h, const uint16_t *pixels);
 void     lcd_blit_rgb565_alpha(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
                                const uint16_t *pixels, uint8_t alpha);

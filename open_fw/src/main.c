@@ -113,14 +113,13 @@ static void backlight_sleep_now(void)
     ui_render_screen(UI_SCR_OFF, &g_ui);
 }
 
-static void backlight_update(uint32_t now_ms)
+static void backlight_update(void)
 {
     if (g_screen_off) {
         backlight_apply(0u);
         return;
     }
 #if OPENFW_UNATTENDED_DEV
-    (void)now_ms;
     backlight_apply(user_bl_pct());
 #else
     uint8_t idx = g_ui.cfg.screen_off_idx;
@@ -129,7 +128,8 @@ static void backlight_update(uint32_t now_ms)
         backlight_apply(user_bl_pct());
         return;
     }
-    uint32_t idle_ms = (uint32_t)(now_ms - g_last_activity_ms);
+    /* A queued key may have arrived after the main loop sampled its clock. */
+    uint32_t idle_ms = millis() - g_last_activity_ms;
     if (idle_ms >= off_ms) {
         backlight_sleep_now();
     } else if (off_ms >= 20000u && idle_ms >= (off_ms / 2u)) {
@@ -645,7 +645,7 @@ static int run_usb_msc_mode(int auto_mode)
                 wr_blink_until = now + 250u;
                 backlight_wake(now);
             }
-            backlight_update(now);
+            backlight_update();
 
             g_ui.usb_read_act  = ((int32_t)(now - rd_blink_until) < 0) ? 1u : 0u;
             g_ui.usb_write_act = ((int32_t)(now - wr_blink_until) < 0) ? 1u : 0u;
@@ -753,7 +753,7 @@ static void run_bt_xrec_mode(void)
                 prev_spp = st.spp_open;
                 backlight_wake(now);
             }
-            backlight_update(now);
+            backlight_update();
 
             if (st.xrec_auth && st.tx_acl_pkts > 0u) {
                 g_ui.bt_state = 2u;
@@ -1484,7 +1484,7 @@ int openfw_main(void)
             key_event_t kev;
             int         have       = keys_pop_event(&kev);
             key_id_t    key        = have ? (kev.pressed ? kev.key : KEY_NONE) : keys_state((uint32_t *)0);
-            uint32_t    t          = have ? kev.t_ms : now_ms;
+            uint32_t    t          = have ? kev.t_ms : millis();
             int         modal_done = 0;
 
             if (g_screen_off) {
@@ -1859,7 +1859,7 @@ int openfw_main(void)
             }
         }
 
-        backlight_update(now_ms);
+        backlight_update();
 
         if (dirty && !g_screen_off) {
             ui_render_screen(scr, &g_ui);

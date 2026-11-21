@@ -8,6 +8,7 @@
  *
  * SPDX-License-Identifier: MIT
  */
+#include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,9 +17,11 @@
 #include "sl6801_regs.h"
 #include "openfw.h"
 #include "openfw_ui.h"
+#include "ui_port.h"
 
 /* Minimal host MMIO mock for LCDC (0x40095000) + ROM/GPIO stubs */
 static uint16_t g_fb[80][160];
+static uint32_t g_written_pixels;
 static uint8_t  g_cmd = 0u;
 static uint8_t  g_params[8];
 static int      g_nparam = 0;
@@ -42,6 +45,7 @@ static void mock_put_byte(uint8_t b)
             int lx = (int)g_cx - 1;
             int ly = (int)g_cy - 26;
             if (lx >= 0 && lx < 160 && ly >= 0 && ly < 80) {
+                g_written_pixels++;
                 g_fb[ly][lx] = rgb565_val;
             }
             g_cx++;
@@ -100,6 +104,9 @@ void openfw_mmio_wr32(uint32_t addr, uint32_t val)
     }
 }
 
+static uint32_t s_now = 1000u;
+uint32_t millis(void) { return s_now; }
+
 void mdelay(uint32_t ms) { (void)ms; }
 void rom_clk_enable(uint32_t clk_id) { (void)clk_id; }
 void rom_clk_div(uint32_t clk_id, uint32_t div) { (void)clk_id; (void)div; }
@@ -119,6 +126,10 @@ static uint16_t g_shots[NUM_SCREENS][80][160];
 
 static void capture_shot(int idx)
 {
+    for (int frame = 0; frame < 14; frame++) {
+        s_now += 16u;
+        ui_port_task_handler();
+    }
     memcpy(g_shots[idx], g_fb, sizeof(g_fb));
 }
 
@@ -281,6 +292,42 @@ int main(int argc, char **argv)
     m.power_hold_pct = 60;
     ui_render_screen(UI_SCR_POWER, &m);
     capture_shot(13);
+
+    /* Drive the production reveal on a 60 Hz clock in both directions. */
+    ui_render_screen(UI_SCR_HOME, &m);
+    for (int forward = 1; forward >= 0; forward--) {
+        int incoming = forward ? 4 : 0;
+        int outgoing = forward ? 0 : 4;
+        uint32_t start = g_written_pixels;
+        ui_render_screen(forward ? UI_SCR_FILES : UI_SCR_HOME, &m);
+        unsigned updates = 0;
+        for (int frame = 0; frame < 14; frame++) {
+            uint32_t before = g_written_pixels;
+            s_now += 16u;
+            ui_port_task_handler();
+            uint32_t written = g_written_pixels - start;
+            assert(written <= 160u * 80u && written % 80u == 0);
+            int cols = (int)(written / 80u);
+            for (int y = 0; y < 80; y++) {
+                for (int x = 0; x < 160; x++) {
+                    int shown = forward ? x >= 160 - cols : x < cols;
+                    assert(g_fb[y][x] == g_shots[shown ? incoming : outgoing][y][x]);
+                }
+            }
+            if (g_written_pixels > before) updates++;
+        }
+        assert(g_written_pixels - start == 160u * 80u && updates >= 8);
+    }
+
+    /* Interrupt an in-flight reveal with an instant screen. */
+    ui_render_screen(UI_SCR_FILES, &m);
+    s_now += 80u;
+    ui_port_task_handler();
+    ui_render_screen(UI_SCR_POWER, &m);
+    assert(memcmp(g_fb, g_shots[13], sizeof(g_fb)) == 0);
+    s_now += 200u;
+    ui_port_task_handler();
+    assert(memcmp(g_fb, g_shots[13], sizeof(g_fb)) == 0);
 
     /* Write 2-column x 7-row contact sheet at 2x scale (660 x 1168) */
     const int scale = 2;

@@ -23,6 +23,9 @@ lv_group_t   *ui_port_get_group(void);
 /* Run LVGL timers/animations/refresh (call periodically from main loop). */
 void ui_port_task_handler(void);
 
+/* Reveal the newly loaded navigation screen from the specified edge. */
+void ui_port_set_reveal(bool enabled, bool from_right);
+
 /* Returns non-zero while an LVGL animation is actively running. */
 int ui_port_is_animating(void);
 

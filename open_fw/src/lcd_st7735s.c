@@ -262,20 +262,23 @@ void lcd_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t colo
 
 void lcd_blit_rgb565(uint16_t x, uint16_t y, uint16_t w, uint16_t h, const uint16_t *pixels)
 {
-    if (w == 0u || h == 0u || !pixels) {
-        return;
-    }
+    lcd_blit_rgb565_stride(x, y, w, h, pixels, w);
+}
+
+void lcd_blit_rgb565_stride(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
+                            const uint16_t *pixels, uint16_t stride)
+{
+    if (w == 0u || h == 0u || !pixels) return;
     lcd_set_window(x, y, (uint16_t)(x + w - 1u), (uint16_t)(y + h - 1u));
-    uint32_t total = (uint32_t)w * (uint32_t)h;
-    uint32_t i = 0u;
-    while ((i + 2u) <= total) {
-        st7735s_write_data(pack_be16_pair(pixels[i], pixels[i + 1u]), 4u);
-        i += 2u;
-    }
-    if (i < total) {
-        uint16_t p = pixels[i];
-        uint32_t be = ((uint32_t)(p >> 8)) | (((uint32_t)(p & 0xFFu)) << 8);
-        st7735s_write_data(be, 2u);
+    for (uint16_t row = 0; row < h; row++) {
+        const uint16_t *line = pixels + (uint32_t)row * stride;
+        uint32_t i = 0;
+        for (; i + 1u < w; i += 2u) {
+            st7735s_write_data(pack_be16_pair(line[i], line[i + 1u]), 4u);
+        }
+        if (i < w) {
+            st7735s_write_data(pack_be16_pair(line[i], 0u), 2u);
+        }
     }
 }
 
