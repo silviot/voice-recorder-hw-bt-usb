@@ -66,7 +66,6 @@ LVGL_SRCS := \
 	$(wildcard $(LVGL_DIR)/src/tick/*.c) \
 	$(wildcard $(LVGL_DIR)/src/themes/*.c) \
 	$(wildcard $(LVGL_DIR)/src/widgets/bar/*.c) \
-	$(wildcard $(LVGL_DIR)/src/widgets/button/*.c) \
 	$(wildcard $(LVGL_DIR)/src/widgets/image/*.c) \
 	$(wildcard $(LVGL_DIR)/src/widgets/label/*.c)
 

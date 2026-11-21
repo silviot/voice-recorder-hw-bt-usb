@@ -39,7 +39,7 @@
 /*====================
  * HAL / TIMING
  *====================*/
-#define LV_DEF_REFR_PERIOD              8       /* Fast refresh during animations */
+#define LV_DEF_REFR_PERIOD              16      /* 60 Hz refresh cadence */
 #define LV_DPI_DEF                      160
 
 /*====================
@@ -92,8 +92,13 @@
 #define LV_USE_ASSERT_STYLE             0
 #define LV_USE_ASSERT_MEM_INTEGRITY     0
 #define LV_USE_ASSERT_OBJ               0
+#if defined(OPENFW_HOST_MMIO) || (defined(__STDC_HOSTED__) && __STDC_HOSTED__ == 1)
+#define LV_ASSERT_HANDLER_INCLUDE       <stdlib.h>
+#define LV_ASSERT_HANDLER               abort();
+#else
 #define LV_ASSERT_HANDLER_INCLUDE       <stdint.h>
 #define LV_ASSERT_HANDLER               while(1) {}
+#endif
 
 /*====================
  * DEBUG / PROFILER
@@ -186,12 +191,12 @@
 /*====================
  * WIDGETS (enable only what a voice recorder UI needs)
  *====================*/
-#define LV_WIDGETS_HAS_DEFAULT_VALUE    1
+#define LV_WIDGETS_HAS_DEFAULT_VALUE    0
 
 #define LV_USE_ANIMIMG                  0
 #define LV_USE_ARC                      0
 #define LV_USE_BAR                      1
-#define LV_USE_BUTTON                   1
+#define LV_USE_BUTTON                   0
 #define LV_USE_BUTTONMATRIX             0
 #define LV_USE_CALENDAR                 0
 #define LV_USE_CANVAS                   0
@@ -231,7 +236,7 @@
 #define LV_USE_THEME_SIMPLE             0
 #define LV_USE_THEME_MONO               0
 
-#define LV_USE_FLEX                     1
+#define LV_USE_FLEX                     0
 #define LV_USE_GRID                     0
 
 /*====================

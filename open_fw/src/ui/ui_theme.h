@@ -1,9 +1,8 @@
 /*
- * Cassini OpenFW — LVGL Design Tokens, Reusable Styles & Chrome Components
+ * Cassini OpenFW — LVGL Design Tokens, Formatting Helpers & Toast Overlay
  *
- * Centralizes the 14-color dark-mode palette, typography, reusable LVGL
- * styles, top status bar, footer hint bar, vertical VU meter, and toast
- * overlay so all screens share a coherent visual language.
+ * Centralizes the 14-color dark-mode palette, date/time/byte formatters,
+ * icon glyphs, and the shared toast overlay rendered on lv_layer_top().
  *
  * SPDX-License-Identifier: MIT
  */
@@ -45,61 +44,8 @@ static inline lv_color_t ui_color_from_rgb565(uint16_t c)
     return lv_color_make(r, g, b);
 }
 
-/* =========================================================================
- * Shared LVGL Styles (initialized once by ui_theme_init())
- * ========================================================================= */
-extern lv_style_t g_st_screen;
-extern lv_style_t g_st_bar;
-extern lv_style_t g_st_tile;
-extern lv_style_t g_st_tile_focus;
-extern lv_style_t g_st_row;
-extern lv_style_t g_st_row_focus;
-extern lv_style_t g_st_pill;
-extern lv_style_t g_st_track;
-extern lv_style_t g_st_ind_cyan;
-extern lv_style_t g_st_ind_red;
-extern lv_style_t g_st_ind_green;
-extern lv_style_t g_st_ind_white;
-
-void ui_theme_init(void);
-
 /* Helper: reset an lv_obj_t to a clean zero-padding, zero-border container */
 lv_obj_t *ui_box_create(lv_obj_t *parent);
-
-/* =========================================================================
- * Reusable Status Bar Widget (13px height on 160x80)
- * ========================================================================= */
-typedef struct {
-    lv_obj_t *root;
-    lv_obj_t *left_icon;
-    lv_obj_t *left_lbl;
-    lv_obj_t *left_sub;
-    lv_obj_t *right_lbl;
-    lv_obj_t *hp_lbl;
-    lv_obj_t *batt_body;
-    lv_obj_t *batt_fill;
-    lv_obj_t *batt_nub;
-} ui_bar_widget_t;
-
-void ui_bar_create(lv_obj_t *parent, ui_bar_widget_t *bar);
-void ui_bar_update(ui_bar_widget_t *bar, const ui_status_bar_t *sb);
-
-/* =========================================================================
- * Reusable Footer Hint Bar (centered "KEY action · KEY action")
- * ========================================================================= */
-lv_obj_t *ui_footer_create(lv_obj_t *parent, lv_color_t bg);
-void      ui_footer_set_hints(lv_obj_t *footer, const ui_hint_t *hints, int count);
-
-/* =========================================================================
- * Reusable 8-Segment Vertical VU Meter (with peak hold & clip latch)
- * ========================================================================= */
-typedef struct {
-    lv_obj_t *root;
-    lv_obj_t *segs[8]; /* 0 = bottom, 7 = top */
-} ui_vmeter_widget_t;
-
-void ui_vmeter_create(lv_obj_t *parent, ui_vmeter_widget_t *vm, int32_t w, int32_t h);
-void ui_vmeter_update(ui_vmeter_widget_t *vm, uint8_t pct, uint8_t peak_pct, int clip_latch);
 
 /* =========================================================================
  * Reusable Toast Overlay (rendered on lv_layer_top())
@@ -107,9 +53,11 @@ void ui_vmeter_update(ui_vmeter_widget_t *vm, uint8_t pct, uint8_t peak_pct, int
 void ui_toast_update(const char *msg, uint16_t rgb565_col);
 
 /* =========================================================================
- * Shared Formatting Helpers
+ * Shared Formatting & Calendar Helpers
  * ========================================================================= */
 const char *ui_icon_glyph(ui_icon_t icon);
+const char *ui_weekday_name(uint16_t year, uint8_t month, uint8_t day);
+const char *ui_month_name(uint8_t month);
 void        ui_format_bytes_short(char *dst, int cap, uint64_t bytes);
 
 #endif /* OPENFW_UI_THEME_H */

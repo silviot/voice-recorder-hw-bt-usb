@@ -3,8 +3,8 @@
  *
  * Emulates the SL6801 8080 parallel LCDC (0x40095000) into a 160x80 RGB565
  * framebuffer, renders all 14 UI screens/sub-states using the exact firmware
- * C code (lcd_st7735s.c, aa_fonts.c, ui_icons.c, ui_spectrogram.c, ui_screens.c),
- * and writes a combined 3x contact sheet PPM for visual verification.
+ * C code (lcd_st7735s.c, ui_spectrogram.c, ui_screens.c, ui_theme.c, ui_port.c),
+ * and writes a combined 2x contact sheet PPM for visual verification.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include "board_config.h"
 #include "sl6801_regs.h"
 #include "openfw.h"
 #include "openfw_ui.h"
@@ -124,6 +125,21 @@ static void rgb565_to_rgb888(uint16_t c, uint8_t *r, uint8_t *g, uint8_t *b)
 
 #define NUM_SCREENS 14
 static uint16_t g_shots[NUM_SCREENS][80][160];
+static size_t   g_peak_heap_used = 0u;
+
+static void sample_heap(const char *tag)
+{
+    lv_mem_monitor_t mon;
+    lv_mem_monitor(&mon);
+    size_t used = mon.total_size - mon.free_size;
+    if (mon.max_used > g_peak_heap_used) {
+        g_peak_heap_used = mon.max_used;
+    }
+    if (used > g_peak_heap_used) {
+        g_peak_heap_used = used;
+    }
+    (void)tag;
+}
 
 static void capture_shot(int idx)
 {
@@ -131,6 +147,7 @@ static void capture_shot(int idx)
         s_now += 16u;
         ui_port_task_handler();
     }
+    sample_heap("shot");
     memcpy(g_shots[idx], g_fb, sizeof(g_fb));
 }
 
@@ -139,6 +156,20 @@ int main(int argc, char **argv)
     const char *out_ppm = (argc > 1) ? argv[1] : "/tmp/sl6801_openfw/ui_all_screens.ppm";
 
     lcd_set_rotation(1);
+
+    /* Sanity-check LCD bounds/NULL/digits guards */
+    lcd_draw_str(0u, 0u, NULL, UI_COL_TEXT, UI_COL_BG);
+    lcd_draw_str_2x(0u, 0u, NULL, UI_COL_TEXT, UI_COL_BG);
+    lcd_draw_hex(0u, 0u, 0xDEADBEEFu, 12u, UI_COL_TEXT, UI_COL_BG);
+    lcd_fill_rect(65530u, 65530u, 20u, 20u, UI_COL_BG);
+    {
+        uint16_t tmp_px[16];
+        for (int i = 0; i < 16; i++) tmp_px[i] = UI_COL_CYAN;
+        lcd_blit_rgb565_stride(158u, 78u, 4u, 4u, tmp_px, 4u);
+        lcd_blit_rgb565_alpha(158u, 78u, 4u, 4u, tmp_px, 255u);
+        lcd_blit_rgb565_alpha(158u, 78u, 4u, 4u, tmp_px, 0u);
+        lcd_blit_rgb565_alpha(158u, 78u, 4u, 4u, tmp_px, 128u);
+    }
 
     ui_spectrogram_t spec;
     ui_spec_reset(&spec);
@@ -237,6 +268,11 @@ int main(int argc, char **argv)
     ui_render_screen(UI_SCR_HOME, &m);
     assert(g_written_pixels == before);
 
+    /* Clamped out-of-range home_focus stays safe */
+    m.home_focus = 99;
+    ui_render_screen(UI_SCR_HOME, &m);
+    assert(lv_obj_get_scroll_x(footer) == 3 * page_width);
+
     /* Enter recording while the return animation is running. */
     m.home_focus = 1;
     ui_render_screen(UI_SCR_HOME, &m);
@@ -253,6 +289,19 @@ int main(int argc, char **argv)
     ui_render_screen(UI_SCR_REC, &m);
     capture_shot(1);
 
+    /* Unchanged UI_SCR_REC must write 0 pixels */
+    before = g_written_pixels;
+    ui_render_screen(UI_SCR_REC, &m);
+    assert(g_written_pixels == before);
+
+    /* Blinking REC dot must NOT redraw the footer or spectrogram */
+    m.rec_blink = 0;
+    before = g_written_pixels;
+    ui_render_screen(UI_SCR_REC, &m);
+    assert(g_written_pixels > before && g_written_pixels - before < 160u * 14u);
+    m.rec_blink = 1;
+    ui_render_screen(UI_SCR_REC, &m);
+
     /* 2: Recording VOR Wait */
     m.rec_vor_wait = 1;
     ui_render_screen(UI_SCR_REC, &m);
@@ -268,9 +317,23 @@ int main(int argc, char **argv)
     ui_render_screen(UI_SCR_SAVED, &m);
     capture_shot(3);
 
+    /* Unchanged UI_SCR_SAVED must write 0 pixels */
+    before = g_written_pixels;
+    ui_render_screen(UI_SCR_SAVED, &m);
+    assert(g_written_pixels == before);
+
     /* 4: Files list */
     ui_render_screen(UI_SCR_FILES, &m);
     capture_shot(4);
+    before = g_written_pixels;
+    ui_render_screen(UI_SCR_FILES, &m);
+    assert(g_written_pixels == before);
+
+    /* Negative file_scroll guard must not crash or read out of bounds */
+    m.file_scroll = -2;
+    ui_render_screen(UI_SCR_FILES, &m);
+    m.file_scroll = 0;
+    ui_render_screen(UI_SCR_FILES, &m);
 
     /* 5: Player (Time-first) */
     m.play_file           = demo_files[0];
@@ -299,6 +362,32 @@ int main(int argc, char **argv)
     strcpy(m.tr_next,          "slide the switch?");
     ui_render_screen(UI_SCR_PLAYER, &m);
     capture_shot(6);
+
+    /* Verify spoken (white) vs upcoming (muted) color distinction on current line */
+    {
+        int has_spoken_bright = 0, has_upcoming_muted = 0;
+        for (int y = 33; y < 49; y++) {
+            for (int x = 6; x < 100; x++) {
+                if (g_fb[y][x] == UI_COL_TEXT) has_spoken_bright = 1;
+            }
+            for (int x = 100; x < 158; x++) {
+                if (g_fb[y][x] == UI_COL_MUTE) has_upcoming_muted = 1;
+            }
+        }
+        assert(has_spoken_bright && has_upcoming_muted);
+    }
+
+    /* Verify LV_LABEL_LONG_DOT truncated label produces 0 redraw pixels when unchanged */
+    strcpy(m.tr_prev, "Very long transcript line overflowing 152px!!");
+    ui_render_screen(UI_SCR_PLAYER, &m);
+    {
+        const char *shown = lv_label_get_text(objects.ptr_prev);
+        size_t slen = strlen(shown);
+        assert(slen >= 3u && strcmp(shown + slen - 3u, "...") == 0);
+    }
+    before = g_written_pixels;
+    ui_render_screen(UI_SCR_PLAYER, &m);
+    assert(g_written_pixels == before);
     m.play_has_transcript = 0;
 
     /* 7: Delete? */
@@ -306,12 +395,23 @@ int main(int argc, char **argv)
     m.del_holding  = 1;
     ui_render_screen(UI_SCR_DELETE, &m);
     capture_shot(7);
+    before = g_written_pixels;
+    ui_render_screen(UI_SCR_DELETE, &m);
+    assert(g_written_pixels == before);
 
     /* 8: Settings */
     m.set_sel = 0;
     m.set_scroll = 0;
     ui_render_screen(UI_SCR_SETTINGS, &m);
     capture_shot(8);
+    before = g_written_pixels;
+    ui_render_screen(UI_SCR_SETTINGS, &m);
+    assert(g_written_pixels == before);
+
+    /* Negative set_scroll guard must not read out of bounds */
+    m.set_scroll = -1;
+    ui_render_screen(UI_SCR_SETTINGS, &m);
+    m.set_scroll = 0;
 
     /* 9: Settings Clock Edit */
     m.set_sel        = 6;
@@ -323,9 +423,13 @@ int main(int argc, char **argv)
     capture_shot(9);
     m.set_edit_clock = 0;
 
-    /* 10: About */
+    /* 10: About + verify about_title matches BOARD_FW_TITLE_STR */
     ui_render_screen(UI_SCR_ABOUT, &m);
     capture_shot(10);
+    assert(strcmp(lv_label_get_text(objects.about_title), BOARD_FW_TITLE_STR) == 0);
+    before = g_written_pixels;
+    ui_render_screen(UI_SCR_ABOUT, &m);
+    assert(g_written_pixels == before);
 
     /* 11: USB Disk */
     m.charging      = 1;
@@ -335,6 +439,9 @@ int main(int argc, char **argv)
     m.usb_rx_bytes  = 262144ull;   /* 256 KB */
     ui_render_screen(UI_SCR_USB, &m);
     capture_shot(11);
+    before = g_written_pixels;
+    ui_render_screen(UI_SCR_USB, &m);
+    assert(g_written_pixels == before);
 
     /* 12: Bluetooth Sync (sending) */
     m.charging = 0;
@@ -344,11 +451,51 @@ int main(int argc, char **argv)
     m.bt_pct   = 45;
     ui_render_screen(UI_SCR_BT, &m);
     capture_shot(12);
+    before = g_written_pixels;
+    ui_render_screen(UI_SCR_BT, &m);
+    assert(g_written_pixels == before);
 
-    /* 13: Power Off */
+    /* Exercise extra sub-screens for heap measurement */
+    ui_render_screen(UI_SCR_CHARGE, &m);
+    sample_heap("charge");
+    before = g_written_pixels;
+    ui_render_screen(UI_SCR_CHARGE, &m);
+    assert(g_written_pixels == before);
+
+    m.sd_ok = 0;
+    ui_render_screen(UI_SCR_REC, &m);
+    sample_heap("rec_err");
+    m.sd_ok = 1;
+
+    m.file_count = 0;
+    ui_render_screen(UI_SCR_FILES, &m);
+    sample_heap("files_empty");
+    m.file_count = 4;
+
+    /* Verify visible toast (including long truncated toast) produces 0 redraw pixels when unchanged */
+    strcpy(m.toast_msg, "Long warning toast clipped cleanly!!!");
+    m.toast_col = UI_COL_AMBER;
+    ui_render_screen(UI_SCR_HOME, &m);
+    capture_shot(0); /* wait for any transition, then re-test toast stability */
+    before = g_written_pixels;
+    ui_render_screen(UI_SCR_HOME, &m);
+    assert(g_written_pixels == before);
+    sample_heap("home_with_toast");
+
+    /* 13: Power Off — verify active toast is hidden on SCREEN_ID_POWER */
     m.power_hold_pct = 60;
     ui_render_screen(UI_SCR_POWER, &m);
     capture_shot(13);
+    /* Compare against rendering UI_SCR_POWER with no toast message */
+    m.toast_msg[0] = '\0';
+    m.toast_col    = 0u;
+    ui_render_screen(UI_SCR_POWER, &m);
+    assert(memcmp(g_fb, g_shots[13], sizeof(g_fb)) == 0);
+
+    /* Re-capture clean shot 0 (Home without toast) for contact sheet + reveal test */
+    m.home_focus = 1;
+    ui_render_screen(UI_SCR_HOME, &m);
+    capture_shot(0);
 
     /* Drive the production reveal on a 60 Hz clock in both directions. */
     ui_render_screen(UI_SCR_HOME, &m);
@@ -357,9 +504,10 @@ int main(int argc, char **argv)
         int outgoing = forward ? 0 : 4;
         uint32_t start = g_written_pixels;
         ui_render_screen(forward ? UI_SCR_FILES : UI_SCR_HOME, &m);
+        sample_heap(forward ? "home->files" : "files->home");
         unsigned updates = 0;
         for (int frame = 0; frame < 14; frame++) {
-            uint32_t before = g_written_pixels;
+            uint32_t prev_px = g_written_pixels;
             s_now += 16u;
             ui_port_task_handler();
             uint32_t written = g_written_pixels - start;
@@ -371,10 +519,17 @@ int main(int argc, char **argv)
                     assert(g_fb[y][x] == g_shots[shown ? incoming : outgoing][y][x]);
                 }
             }
-            if (g_written_pixels > before) updates++;
+            if (g_written_pixels > prev_px) updates++;
         }
         assert(g_written_pixels - start == 160u * 80u && updates >= 8);
     }
+
+    /* Measure worst-case two-screen peak heap during HOME <-> REC transition */
+    ui_render_screen(UI_SCR_HOME, &m);
+    ui_render_screen(UI_SCR_REC, &m);
+    sample_heap("home->rec");
+    ui_render_screen(UI_SCR_HOME, &m);
+    sample_heap("rec->home");
 
     /* Interrupt an in-flight reveal with an instant screen. */
     ui_render_screen(UI_SCR_FILES, &m);
@@ -386,7 +541,21 @@ int main(int argc, char **argv)
     ui_port_task_handler();
     assert(memcmp(g_fb, g_shots[13], sizeof(g_fb)) == 0);
 
-    /* Write 2-column x 7-row contact sheet at 2x scale (660 x 1168) */
+    /* Verify UI_SCR_OFF cleanly renders and reports final LVGL heap stats */
+    ui_render_screen(UI_SCR_OFF, &m);
+    sample_heap("off");
+    {
+        lv_mem_monitor_t mon;
+        lv_mem_monitor(&mon);
+        printf("LVGL heap (host 64-bit): peak=%zu B / total=%zu B (%u%%), end_used=%zu B\n",
+               g_peak_heap_used, mon.total_size,
+               (unsigned)((g_peak_heap_used * 100u) / mon.total_size),
+               mon.total_size - mon.free_size);
+        assert(g_peak_heap_used < mon.total_size);
+        assert(g_peak_heap_used <= (18u * 1024u));
+    }
+
+    /* Write 2-column x 7-row contact sheet at 2x scale (664 x 1184) */
     const int scale = 2;
     const int cols = 2, rows = 7;
     const int pad = 8;

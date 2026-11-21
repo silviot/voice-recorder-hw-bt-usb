@@ -67,33 +67,8 @@ typedef enum {
 } ui_icon_t;
 
 /* =========================================================================
- * Shared Chrome & Formatting Helpers (src/ui/ui_theme.c)
+ * Shared Formatting Helpers (src/ui/ui_theme.c)
  * ========================================================================= */
-typedef struct {
-    uint16_t    bg_col;
-    uint16_t    fg_col;
-    ui_icon_t   left_icon;
-    uint16_t    left_icon_col;
-    const char *left_text;
-    const char *left_sub;       /* optional secondary text after left_text (e.g. "1 / 6") */
-    uint16_t    left_sub_col;
-    const char *right_text;     /* optional badge text before battery when no_clock=1 */
-    uint16_t    right_text_col;
-    int         no_clock;
-    uint8_t     hour;
-    uint8_t     minute;
-    int         hp_plugged;
-    uint8_t     batt_pct;
-    int         charging;
-} ui_status_bar_t;
-
-typedef struct {
-    ui_icon_t   icon;           /* optional icon before key (UI_ICON_NONE if none) */
-    ui_icon_t   icon2;          /* optional second icon (e.g. left+right for Line) */
-    const char *key;            /* drawn in UI_COL_TEXT (NULL if icon-only) */
-    const char *action;         /* drawn in UI_COL_DIM */
-} ui_hint_t;
-
 void ui_format_duration(char *dst, int dst_len, uint32_t secs);
 void ui_format_clock(char *dst, int dst_len, uint8_t hour, uint8_t minute);
 void ui_format_free_time(char *dst, int dst_len, uint32_t free_secs);

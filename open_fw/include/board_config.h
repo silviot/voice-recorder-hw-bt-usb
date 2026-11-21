@@ -63,9 +63,11 @@
 
 /* =========================================================================
  * LVGL Memory Pool Budget (bytes, static SRAM via LV_STDLIB_BUILTIN)
+ * Peak across all 14 screens + transitions + toast is ~15.3 KiB on 64-bit
+ * host (~10 KiB on 32-bit Cortex-M4); 24 KiB leaves generous headroom.
  * ========================================================================= */
 #ifndef BOARD_LVGL_MEM_SIZE
-#define BOARD_LVGL_MEM_SIZE     (44u * 1024u)
+#define BOARD_LVGL_MEM_SIZE     (24u * 1024u)
 #endif
 
 #endif /* OPENFW_BOARD_CONFIG_H */
