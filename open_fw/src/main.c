@@ -142,6 +142,7 @@ int ui_poll_power_button(ui_screen_id_t screen, ui_model_t *model, uint32_t now)
             }
             break;
         case POWER_BUTTON_SHUTDOWN:
+            lcd_shutdown();
             if (screen == UI_SCR_USB) {
                 usb_msc_stop();
             } else if (screen == UI_SCR_BT) {
@@ -151,7 +152,6 @@ int ui_poll_power_button(ui_screen_id_t screen, ui_model_t *model, uint32_t now)
             }
             (void)recorder_stop();
             (void)sd_flush(&g_sd_card);
-            backlight_apply(0u);
             pmu_soft_poweroff();
         case POWER_BUTTON_IDLE:
             break;

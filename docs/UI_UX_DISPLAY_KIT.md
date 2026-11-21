@@ -49,7 +49,7 @@ All interactions use physical buttons + 1 hardware slide switch:
 | **BACK** | Front | Go back one level / Exit menu (long-press reserved only for power-user actions) |
 | **LEFT / RIGHT** | Front | Previous/Next file, or `-10s` / `+10s` seek during playback |
 | **VOL+ / VOL-** | Side or front | Adjust headphone volume during playback; scroll list items up/down |
-| **POWER (ON/OFF)** | Side | Short press: wake / sleep screen; hold for 2 s, then release to power off on battery or USB power |
+| **POWER (ON/OFF)** | Side | Short press: wake / sleep screen; hold for 2 s to power off. On USB, the display sleeps while charging. Hold POWER again to start, or unplug to finish powering off |
 
 ---
 

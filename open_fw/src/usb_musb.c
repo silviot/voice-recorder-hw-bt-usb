@@ -853,6 +853,7 @@ void usb_msc_poll(void)
         } else if (mode == 3u) {
             pmu_reboot_to_sd_ota();
         } else if (mode == 4u) {
+            lcd_shutdown();
             pmu_soft_poweroff();
         } else {
             system_reboot();

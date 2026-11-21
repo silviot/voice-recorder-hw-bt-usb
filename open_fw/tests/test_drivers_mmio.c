@@ -966,6 +966,11 @@ static void test_pmu_driver(void)
     assert(power_button_update(KEY_ONOFF_RELEASE, 4650u, 0, &progress) == POWER_BUTTON_SHUTDOWN);
     assert(power_button_update(tap | KEY_ONOFF_LONG, 5000u, 1, &progress) == POWER_BUTTON_SHUTDOWN);
 
+    /* A missing release after the full progress screen still completes shutdown. */
+    assert(power_button_update(KEY_ONOFF_PRESS, 6000u, 0, &progress) == POWER_BUTTON_IDLE);
+    assert(power_button_update(0, 8000u, 0, &progress) == POWER_BUTTON_PROGRESS);
+    assert(power_button_update(0, 9000u, 0, &progress) == POWER_BUTTON_SHUTDOWN);
+
     /* Unattended always-on PMU init + charge management */
     g_soc.pmu_regs[0x00u] = 0xCFu;
     g_soc.pmu_regs[0x17u] = 0x01u;
@@ -1165,6 +1170,8 @@ static void test_lcd_driver(void)
     assert(g_soc.st_fb[10][120] == gold && g_soc.st_fb[13][123] == gold);
     lcd_set_rotation(0);
     assert(g_soc.st_madctl == 0xC8u && lcd_get_width() == 80u && lcd_get_height() == 160u);
+    lcd_shutdown();
+    assert(g_soc.lcdc_cmd_reg == 0x10u);
     printf("[OK] lcd_st7735s + PWM3 + rotation MMIO (%u fg px)\n", fg_pixels);
 }
 

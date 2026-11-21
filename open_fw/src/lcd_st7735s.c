@@ -94,6 +94,16 @@ void lcd_backlight_set(uint8_t percent)
     openfw_mmio_wr32(PWM3_PERIOD_DUTY_ADDR, (48000u << 16) | ((uint32_t)percent * 480u));
 }
 
+void lcd_shutdown(void)
+{
+    /* Hold PB17 low even after the PWM clock stops. */
+    gpio_write(GPIO_PORT_B, 17u, 0);
+    gpio_set_mux(GPIO_PORT_B, 17u, 1u);
+    st7735s_write_cmd(0x28u); /* DISPOFF */
+    st7735s_write_cmd(0x10u); /* SLPIN */
+    mdelay(5u);
+}
+
 void lcd_init(void)
 {
     static const uint8_t init_b1[] = { 0x05u, 0x3Au, 0x3Au };

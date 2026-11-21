@@ -115,7 +115,7 @@ power_button_action_t power_button_update(uint8_t events, uint32_t now, int scre
                                           uint8_t *progress)
 {
     static int down, woke_screen, shutdown_armed;
-    static uint32_t pressed_at;
+    static uint32_t pressed_at, armed_at;
     int wake = 0;
     if (events & KEY_ONOFF_PRESS) {
         down = 1;
@@ -128,12 +128,13 @@ power_button_action_t power_button_update(uint8_t events, uint32_t now, int scre
         return POWER_BUTTON_IDLE;
     }
     uint32_t held = now - pressed_at;
-    if ((events & KEY_ONOFF_LONG) || held >= 2000u) {
+    if (!shutdown_armed && ((events & KEY_ONOFF_LONG) || held >= 2000u)) {
         shutdown_armed = 1;
+        armed_at = now;
     }
-    /* ON/OFF is a wake source. Finish the gesture before cutting the rails. */
+    /* Prefer release, but a lost PMU edge must not strand the shutdown UI. */
     if (shutdown_armed) {
-        if (events & KEY_ONOFF_RELEASE) {
+        if ((events & KEY_ONOFF_RELEASE) || now - armed_at >= 1000u) {
             down = 0;
             return POWER_BUTTON_SHUTDOWN;
         }
@@ -155,8 +156,50 @@ power_button_action_t power_button_update(uint8_t events, uint32_t now, int scre
     return wake ? POWER_BUTTON_WAKE : POWER_BUTTON_IDLE;
 }
 
+/* The HW_76 wakes straight back up when its PMU cuts power with VBUS high.
+ * Keep the charger serviced with USB and the display off until unplug or
+ * a new power-key hold. The press that initiated shutdown cannot wake it. */
+static void wait_in_charging_standby(void)
+{
+    uint32_t last_vbus = millis();
+    uint32_t last_poll = last_vbus;
+    uint32_t pressed_at = 0u;
+    int new_press = 0;
+    (void)key_onoff_poll();
+    for (;;) {
+        OPENFW_WFI();
+        uint32_t now = millis();
+        if (now - last_poll < 50u) {
+            continue;
+        }
+        last_poll = now;
+        wdt_feed();
+        if (pmu_is_vbus_present()) {
+            last_vbus = now;
+            pmu_poll_charge_manage();
+        } else if (now - last_vbus >= 500u) {
+            return;
+        }
+
+        uint8_t events = key_onoff_poll();
+        if (events & KEY_ONOFF_PRESS) {
+            new_press = 1;
+            pressed_at = now;
+        }
+        if (new_press && ((events & KEY_ONOFF_LONG) || now - pressed_at >= 2000u)) {
+            system_reboot();
+        }
+        if (events & KEY_ONOFF_RELEASE) {
+            new_press = 0;
+        }
+    }
+}
+
 void pmu_soft_poweroff(void)
 {
+    if (pmu_is_vbus_present()) {
+        wait_in_charging_standby();
+    }
     /* No code will service the reset watchdog once the CPU enters WFI. */
     wdt_stop();
     pmu_write_reg(0x20u, 0x2Fu); /* wake: KEY_ONOFF + VBUS */
