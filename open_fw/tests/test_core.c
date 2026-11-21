@@ -99,7 +99,38 @@ static void test_crypto(void)
     memcpy(mac_bad, mac, 32u);
     mac_bad[31] ^= 0x01u;
     assert(openfw_ct_memeq(mac, mac_bad, 32u) == 0);
-    printf("  [PASS] crypto (CRC-16, SHA-256, HMAC-SHA256 vector, ct_memeq)\n");
+
+    /* SHA-256 FIPS 180-4 2-block vector + multi-block direct-block fast path (aligned vs unaligned vs chunked) */
+    static const char vec2[] = "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
+    static const uint8_t exp_vec2[32] = {
+        0x24, 0x8d, 0x6a, 0x61, 0xd2, 0x06, 0x38, 0xb8,
+        0xe5, 0xc0, 0x26, 0x93, 0x0c, 0x3e, 0x60, 0x39,
+        0xa3, 0x3c, 0xe4, 0x59, 0x64, 0xff, 0x21, 0x67,
+        0xf6, 0xec, 0xed, 0xd4, 0x19, 0xdb, 0x06, 0xc1,
+    };
+    uint8_t d1[32], d2[32], d3[32];
+    openfw_sha256((const uint8_t *)vec2, (uint32_t)(sizeof(vec2) - 1u), d1);
+    assert(openfw_ct_memeq(d1, exp_vec2, 32u) == 1);
+
+    uint8_t big[200] __attribute__((aligned(4)));
+    for (uint32_t i = 0u; i < sizeof(big); i++) {
+        big[i] = (uint8_t)((i * 37u + 13u) & 0xFFu);
+    }
+    openfw_sha256(big + 1u, 195u, d1); /* unaligned multi-block */
+    openfw_sha256_ctx_t sctx;
+    openfw_sha256_init(&sctx);
+    openfw_sha256_update(&sctx, big + 1u, 13u);
+    openfw_sha256_update(&sctx, big + 14u, 128u);
+    openfw_sha256_update(&sctx, big + 142u, 54u);
+    openfw_sha256_final(&sctx, d2);
+    assert(openfw_ct_memeq(d1, d2, 32u) == 1);
+
+    uint8_t aligned_copy[196] __attribute__((aligned(4)));
+    memcpy(aligned_copy, big + 1u, 195u);
+    openfw_sha256(aligned_copy, 195u, d3); /* aligned multi-block */
+    assert(openfw_ct_memeq(d1, d3, 32u) == 1);
+
+    printf("  [PASS] crypto (CRC-16, SHA-256 direct-block, HMAC-SHA256 vector, ct_memeq)\n");
 }
 
 static void test_wav(void)
@@ -846,6 +877,239 @@ static void test_exfat_replace_fault_injection(void)
     printf("  [PASS] exfat replace fault injection (shared-cluster delete guard + FAT-cycle bound)\n");
 }
 
+typedef struct {
+    uint8_t *buf;
+    uint32_t sectors;
+    uint32_t read_calls;
+    uint32_t write_calls;
+    uint32_t max_read_cnt;
+    uint32_t max_write_cnt;
+    uint32_t fail_lba; /* 0xFFFFFFFF = disabled */
+    int      fail_active;
+} stats_disk_t;
+
+static int stats_read_sectors(void *ctx, uint32_t lba, uint32_t count, void *buf)
+{
+    stats_disk_t *d = (stats_disk_t *)ctx;
+    if ((uint64_t)lba + (uint64_t)count > (uint64_t)d->sectors) return -1;
+    d->read_calls++;
+    if (count > d->max_read_cnt) d->max_read_cnt = count;
+    memcpy(buf, &d->buf[lba * 512u], count * 512u);
+    return 0;
+}
+
+static int stats_write_sectors(void *ctx, uint32_t lba, uint32_t count, const void *buf)
+{
+    stats_disk_t *d = (stats_disk_t *)ctx;
+    if ((uint64_t)lba + (uint64_t)count > (uint64_t)d->sectors) return -1;
+    if (d->fail_active && d->fail_lba >= lba && d->fail_lba < lba + count) {
+        return -1;
+    }
+    d->write_calls++;
+    if (count > d->max_write_cnt) d->max_write_cnt = count;
+    memcpy(&d->buf[lba * 512u], buf, count * 512u);
+    return 0;
+}
+
+static uint16_t test_entry_checksum(const uint8_t *ent, uint32_t total_ents)
+{
+    uint16_t sum = 0u;
+    for (uint32_t i = 0u; i < total_ents * 32u; i++) {
+        if (i == 2u || i == 3u) continue;
+        sum = (uint16_t)(((sum & 1u) ? 0x8000u : 0u) + (sum >> 1) + ent[i]);
+    }
+    return sum;
+}
+
+static void test_exfat_hardening_and_batching(void)
+{
+    /* 1. MBR multi-partition scan: partition 0 is 0x07 non-exFAT, partition 1 is 0x07 exFAT */
+    enum { SECS = 1024u };
+    uint8_t *disk = (uint8_t *)calloc(SECS, 512u);
+    assert(disk != NULL);
+    disk[510] = 0x55u;
+    disk[511] = 0xAAu;
+    /* Partition 0: NTFS type 0x07 at LBA 4 (not exFAT) */
+    disk[0x1BEu + 4u] = 0x07u;
+    put_le32(&disk[0x1BEu + 8u], 4u);
+    put_le32(&disk[0x1BEu + 12u], 8u);
+    memcpy(&disk[4u * 512u + 3u], "NTFS    ", 8u);
+    disk[4u * 512u + 510u] = 0x55u;
+    disk[4u * 512u + 511u] = 0xAAu;
+    /* Partition 1: exFAT type 0x07 at LBA 16, 4 KiB clusters (spc_shift = 3, 8 sectors/cluster) */
+    disk[0x1CEu + 4u] = 0x07u;
+    put_le32(&disk[0x1CEu + 8u], 16u);
+    put_le32(&disk[0x1CEu + 12u], SECS - 16u);
+    uint8_t *vbr = &disk[16u * 512u];
+    memcpy(vbr + 3u, "EXFAT   ", 8u);
+    put_le64(vbr + 0x40u, 16u);
+    put_le64(vbr + 0x48u, SECS - 16u);
+    put_le32(vbr + 0x50u, 16u); /* FAT @ LBA 32 */
+    put_le32(vbr + 0x54u, 8u);  /* FatLength = 8 sectors */
+    put_le32(vbr + 0x58u, 24u); /* Heap @ LBA 40 */
+    put_le32(vbr + 0x5Cu, 120u); /* 120 clusters x 4 KiB = 480 KiB */
+    put_le32(vbr + 0x60u, 2u);  /* Root dir cluster 2 */
+    vbr[0x6Cu] = 9u;
+    vbr[0x6Du] = 3u;            /* 8 sectors/cluster = 4 KiB */
+    vbr[0x6Eu] = 1u;            /* NumberOfFats = 1 */
+    vbr[510]   = 0x55u;
+    vbr[511]   = 0xAAu;
+
+    uint8_t *fat = &disk[32u * 512u];
+    put_le32(fat + 0u * 4u, 0xFFFFFFF8u);
+    put_le32(fat + 1u * 4u, 0xFFFFFFFFu);
+    put_le32(fat + 2u * 4u, 0xFFFFFFFFu); /* root */
+    put_le32(fat + 3u * 4u, 0xFFFFFFFFu); /* bitmap */
+    /* Cluster 4: PC-created NoFatChain=1 directory at slot 15 of root sector 0! */
+    /* Cluster 5: ValidDataLength test file (1024 B size, 300 B valid_data_len) */
+    put_le32(fat + 5u * 4u, 0xFFFFFFFFu);
+
+    uint8_t *root0 = &disk[40u * 512u];
+    root0[0] = 0x81u; /* Allocation Bitmap at cluster 3 */
+    put_le32(root0 + 20u, 3u);
+    put_le64(root0 + 24u, 16u);
+
+    /* Fill slots 1..14 with deleted markers (0x05) so PCDIR starts at slot 15 (spanning sectors 0 & 1) */
+    for (uint32_t sl = 1u; sl < 15u; sl++) {
+        root0[sl * 32u] = 0x05u;
+    }
+    uint8_t pcdir_raw[96];
+    memset(pcdir_raw, 0, sizeof(pcdir_raw));
+    write_exfat_entry_set(pcdir_raw, "PCDIR", EXFAT_ATTR_DIR, 1u, 4u, 4096u);
+    put_le16(pcdir_raw + 2u, test_entry_checksum(pcdir_raw, 3u));
+    memcpy(&root0[15u * 32u], pcdir_raw, 32u);        /* 0x85 at sector 0 slot 15 */
+    memcpy(&disk[41u * 512u], pcdir_raw + 32u, 64u);  /* 0xC0 + 0xC1 at sector 1 slots 0..1 */
+
+    /* ValidDataLength file at sector 1 slots 2..4 */
+    uint8_t vdl_raw[96];
+    memset(vdl_raw, 0, sizeof(vdl_raw));
+    write_exfat_entry_set(vdl_raw, "VDL.BIN", 0x0020u, 0u, 5u, 1024u);
+    put_le64(vdl_raw + 32u + 8u, 300u); /* ValidDataLength = 300 < DataLength = 1024 */
+    put_le16(vdl_raw + 2u, test_entry_checksum(vdl_raw, 3u));
+    memcpy(&disk[41u * 512u + 2u * 32u], vdl_raw, 96u);
+
+    /* Fill cluster 5 (LBA 40 + 3*8 = 64) with 0x5A for [0..300) and 0xAA for [300..1024) */
+    memset(&disk[64u * 512u], 0x5Au, 300u);
+    memset(&disk[64u * 512u + 300u], 0xAAu, 724u);
+
+    /* Bitmap at cluster 3 (LBA 48): clusters 2, 3, 4, 5 used -> bits 0..3 = 0x0F */
+    disk[48u * 512u] = 0x0Fu;
+
+    stats_disk_t sd = { disk, SECS, 0u, 0u, 0u, 0u, 0xFFFFFFFFu, 0 };
+    blkdev_t dev = { stats_read_sectors, stats_write_sectors, SECS, &sd };
+    exfat_vol_t vol;
+    assert(exfat_mount(&vol, &dev) == 0);
+    assert(vol.part_lba == 16u && vol.sectors_per_cluster == 8u);
+
+    /* 2. ValidDataLength zero-fill verification */
+    exfat_entry_t vdl_ent;
+    assert(exfat_find_path(&vol, "/VDL.BIN", &vdl_ent) == 0);
+    assert(vdl_ent.size == 1024u && vdl_ent.valid_data_len == 300u);
+    uint8_t vdl_buf[1024];
+    memset(vdl_buf, 0xFFu, sizeof(vdl_buf));
+    uint32_t nr = 0u;
+    assert(exfat_read_file(&vol, &vdl_ent, 0u, vdl_buf, sizeof(vdl_buf), &nr) == 0 && nr == 1024u);
+    for (uint32_t i = 0u; i < 300u; i++) assert(vdl_buf[i] == 0x5Au);
+    for (uint32_t i = 300u; i < 1024u; i++) assert(vdl_buf[i] == 0x00u);
+    memset(vdl_buf, 0xFFu, 200u);
+    assert(exfat_read_file(&vol, &vdl_ent, 400u, vdl_buf, 200u, &nr) == 0 && nr == 200u);
+    for (uint32_t i = 0u; i < 200u; i++) assert(vdl_buf[i] == 0x00u);
+
+    /* 3. Illegal exFAT filename rejection */
+    exfat_writer_t w;
+    assert(exfat_mkdir(&vol, ".") != 0);
+    assert(exfat_mkdir(&vol, "..") != 0);
+    assert(exfat_create_file(&vol, "/", "bad:name.wav", &w) != 0);
+    assert(exfat_create_file(&vol, "/", "a*b.wav", &w) != 0);
+    assert(exfat_create_file(&vol, "/", "\x01ctrl.wav", &w) != 0);
+
+    /* 4. Multi-sector batching in exfat_write() & exfat_read_file() + cached free_file_clusters() */
+    uint8_t big_wr[32u * 4096u]; /* 32 clusters = 128 KiB */
+    for (uint32_t i = 0u; i < sizeof(big_wr); i++) {
+        big_wr[i] = (uint8_t)((i * 19u + 3u) & 0xFFu);
+    }
+    assert(exfat_create_file(&vol, "/", "BATCH.BIN", &w) == 0);
+    sd.max_write_cnt = 0u;
+    assert(exfat_write(&w, big_wr, sizeof(big_wr)) == 0);
+    assert(exfat_close_file(&w) == 0);
+    assert(sd.max_write_cnt == 8u); /* Full 8-sector cluster written in ONE call! */
+
+    exfat_entry_t batch_ent;
+    assert(exfat_find_path(&vol, "/BATCH.BIN", &batch_ent) == 0 && batch_ent.size == sizeof(big_wr));
+    uint8_t big_rd[32u * 4096u];
+    sd.max_read_cnt = 0u;
+    assert(exfat_read_file(&vol, &batch_ent, 0u, big_rd, sizeof(big_rd), &nr) == 0 && nr == sizeof(big_rd));
+    assert(sd.max_read_cnt == 8u); /* Full 8-sector cluster read in ONE call! */
+    assert(memcmp(big_rd, big_wr, sizeof(big_wr)) == 0);
+
+    sd.write_calls = 0u;
+    assert(exfat_delete_file(&vol, "/", "BATCH.BIN") == 0);
+    /* Deleting 32 clusters should write dir sector + 1 bitmap sector + 1 FAT sector (3 writes total vs 65 uncached) */
+    assert(sd.write_calls <= 6u);
+
+    /* 5. Zero-byte write-error cleanup & mid-file cluster-boundary write-error rollback */
+    uint8_t bmp_before = disk[48u * 512u];
+    assert(exfat_create_file(&vol, "/", "ZEROERR.BIN", &w) == 0);
+    /* Next free cluster is 6 -> LBA 40 + (6-2)*8 = 72 */
+    sd.fail_lba    = 72u;
+    sd.fail_active = 1;
+    uint8_t sec_pat[512];
+    memset(sec_pat, 0xCCu, sizeof(sec_pat));
+    assert(exfat_write(&w, sec_pat, 512u) != 0);
+    assert(w.bytes_written == 0u && w.first_cluster == 0u && w.sec_buf_used == 0u);
+    sd.fail_active = 0;
+    assert(exfat_close_file(&w) == 0);
+    exfat_entry_t zent;
+    assert(exfat_find_path(&vol, "/ZEROERR.BIN", &zent) == 0);
+    assert(zent.size == 0u && zent.first_cluster == 0u);
+    assert(disk[48u * 512u] == bmp_before); /* No leaked cluster bit */
+    assert(get_le32(fat + 6u * 4u) == 0u);  /* FAT[6] cleaned up */
+
+    /* Mid-file cluster-boundary failure + partial flush error */
+    assert(exfat_create_file(&vol, "/", "MIDERR.BIN", &w) == 0);
+    uint8_t clus_buf[4096];
+    memset(clus_buf, 0x77u, sizeof(clus_buf));
+    assert(exfat_write(&w, clus_buf, 4096u) == 0); /* Writes cluster 6 cleanly */
+    assert(exfat_write(&w, clus_buf, 100u) == 0);  /* Buffers 100 B in sec_buf */
+    /* Fail sector 0 of cluster 7 (LBA 40 + (7-2)*8 = 80) when partial flush completes 512 B */
+    sd.fail_lba    = 80u;
+    sd.fail_active = 1;
+    assert(exfat_write(&w, clus_buf, 412u) != 0);
+    assert(w.sec_buf_used == 100u && w.bytes_written == 4196u);
+    assert(get_le32(fat + 6u * 4u) == 0xFFFFFFFFu); /* Cluster 6 EOF restored! */
+    assert(get_le32(fat + 7u * 4u) == 0u);          /* Cluster 7 freed! */
+    assert((disk[48u * 512u] & (1u << (7u - 2u))) == 0u);
+    /* Close while cluster 7 still fails -> drops 100 B tail, commits 4096 B cleanly */
+    assert(exfat_close_file(&w) != 0);
+    sd.fail_active = 0;
+    exfat_entry_t ment;
+    assert(exfat_find_path(&vol, "/MIDERR.BIN", &ment) == 0);
+    assert(ment.size == 4096u && ment.first_cluster == 6u);
+    assert(get_le32(fat + 6u * 4u) == 0xFFFFFFFFu && get_le32(fat + 7u * 4u) == 0u);
+
+    /* 6. Grow PC-created NoFatChain=1 directory whose parent entry starts at slot 15! */
+    for (int i = 0; i < 45; i++) {
+        char fn[20];
+        snprintf(fn, sizeof(fn), "F_%03d.TXT", i);
+        assert(exfat_create_file(&vol, "/PCDIR", fn, &w) == 0);
+        assert(exfat_write(&w, fn, (uint32_t)strlen(fn)) == 0);
+        assert(exfat_close_file(&w) == 0);
+    }
+    exfat_vol_t vol2;
+    assert(exfat_mount(&vol2, &dev) == 0);
+    exfat_entry_t pcdir_after;
+    assert(exfat_find_path(&vol2, "/PCDIR", &pcdir_after) == 0);
+    assert(pcdir_after.is_dir == 1u && pcdir_after.no_fat_chain == 0u && pcdir_after.size == 8192u);
+    exfat_entry_t f44;
+    assert(exfat_find_path(&vol2, "/PCDIR/F_044.TXT", &f44) == 0);
+    char fb[16] = { 0 };
+    assert(exfat_read_file(&vol2, &f44, 0u, fb, 16u, &nr) == 0 && nr == 9u);
+    assert(memcmp(fb, "F_044.TXT", 9u) == 0);
+
+    free(disk);
+    printf("  [PASS] exfat hardening (MBR multi-part, ValidDataLength, batching, write-err rollback, slot-15 NoFatChain grow, cached delete)\n");
+}
+
 static void build_cbw(uint8_t cbw[31], uint32_t tag, uint32_t data_len,
                       uint8_t flags, const uint8_t *cdb, uint8_t cdb_len)
 {
@@ -975,7 +1239,66 @@ static void test_usb_msc(void)
     scsi_xfer(&st, 9u, 0x80u, req_cdb, 6u, NULL, buf, 18u, &status, &res, &got);
     assert(status == 0u && got == 18u && buf[2] == 0x05u && buf[12] == 0x20u);
 
-    printf("  [PASS] usb_msc (SCSI INQUIRY, TUR, READCAP, WRITE10, READ10, SENSE)\n");
+    /* 9. READ(10) short 64B-multiple IN (blocks=1 -> 512 B, CBW data_len=1024 B): MUST emit trailing ZLP */
+    {
+        uint8_t cbw[31];
+        uint8_t rd1_cdb[10] = { 0x28u, 0u };
+        put_be32(&rd1_cdb[2], 10u);
+        put_be16(&rd1_cdb[7], 1u);
+        build_cbw(cbw, 10u, 1024u, 0x80u, rd1_cdb, 10u);
+        usb_msc_on_rx_packet(&st, cbw, 31u);
+        uint32_t data_bytes = 0u;
+        int saw_zlp = 0;
+        uint8_t pkt[64];
+        while (usb_msc_need_tx(&st)) {
+            uint8_t n = usb_msc_get_tx_packet(&st, pkt);
+            if (!usb_msc_need_tx(&st)) {
+                assert(n == 13u && pkt[12] == 0u && get_le32(&pkt[8]) == 512u);
+                break;
+            }
+            if (n == 0u) {
+                assert(data_bytes == 512u);
+                saw_zlp++;
+            } else {
+                data_bytes += n;
+            }
+        }
+        assert(data_bytes == 512u && saw_zlp == 1);
+    }
+
+    /* 10. WRITE(10) Ho > Do (blocks=1 -> 512 B, CBW data_len=1024 B): drains excess 512 B without deadlock */
+    {
+        uint8_t wr1_cdb[10] = { 0x2Au, 0u };
+        put_be32(&wr1_cdb[2], 14u);
+        put_be16(&wr1_cdb[7], 1u);
+        memset(&g_disk[15u * 512u], 0xEEu, 512u);
+        scsi_xfer(&st, 11u, 0x00u, wr1_cdb, 10u, wpat, NULL, 1024u, &status, &res, NULL);
+        assert(status == 0u && res == 512u);
+        assert(memcmp(&g_disk[14u * 512u], wpat, 512u) == 0);
+        assert(g_disk[15u * 512u] == 0xEEu); /* Second sector untouched */
+    }
+
+    /* 11. Zero-block READ(10)/WRITE(10) and TUR with data_len > 0 */
+    {
+        uint8_t rd0_cdb[10] = { 0x28u, 0u };
+        scsi_xfer(&st, 12u, 0x80u, rd0_cdb, 10u, NULL, buf, 64u, &status, &res, &got);
+        assert(status == 0u && res == 64u && got == 0u);
+        uint8_t wr0_cdb[10] = { 0x2Au, 0u };
+        scsi_xfer(&st, 13u, 0x00u, wr0_cdb, 10u, wpat, NULL, 64u, &status, &res, NULL);
+        assert(status == 0u && res == 64u);
+        scsi_xfer(&st, 14u, 0x80u, tur_cdb, 6u, NULL, buf, 8u, &status, &res, &got);
+        assert(status == 0u && res == 8u && got == 0u);
+    }
+
+    /* 12. Direction mismatch -> CSW Phase Error (2), short cb_len -> status 1 */
+    scsi_xfer(&st, 15u, 0x00u, rd_cdb, 10u, wpat, NULL, 512u, &status, &res, NULL);
+    assert(status == 2u);
+    scsi_xfer(&st, 16u, 0x80u, wr_cdb, 10u, NULL, buf, 512u, &status, &res, &got);
+    assert(status == 2u);
+    scsi_xfer(&st, 17u, 0x80u, rd_cdb, 6u, NULL, buf, 512u, &status, &res, &got);
+    assert(status == 1u && res == 512u);
+
+    printf("  [PASS] usb_msc (SCSI INQUIRY, TUR, READCAP, WRITE10, READ10, ZLP, Ho>Do, PhaseErr, SENSE)\n");
 }
 
 typedef struct {
@@ -1067,7 +1390,13 @@ static void test_usb_msc_async_pingpong(void)
     usb_msc_reset(&st);
     assert(m.abort_calls == 1 && m.active == 0);
 
-    printf("  [PASS] usb_msc async ping-pong (40-sector overlap, PIO fallback, reset abort)\n");
+    /* 4. Short CBW data_len <= buf_len (8192 B) must NOT launch wasted async prefetch */
+    m.start_calls = 0; m.wait_calls = 0; m.abort_calls = 0;
+    scsi_xfer(&st, 103u, 0x80u, rd_cdb, 10u, NULL, actual, 8192u, &status, &res, &got);
+    assert(status == 0u && res == 0u && got == 8192u);
+    assert(m.start_calls == 0);
+
+    printf("  [PASS] usb_msc async ping-pong (40-sector overlap, PIO fallback, reset abort, no wasted prefetch)\n");
 }
 
 typedef struct {
@@ -1140,6 +1469,19 @@ static void test_usb_msc_vendor_e0(void)
     vctx.resp_len = 20u;
     scsi_xfer(&st, 103u, 0x80u, v_in_cdb, 16u, NULL, buf, 64u, &status, &res, &got);
     assert(status == 0u && res == 44u && got == 20u);
+
+    /* Inline 64 B-multiple short IN (resp_len=64, cbw_data_len=128) MUST emit trailing ZLP */
+    vctx.resp_len = 64u;
+    {
+        uint8_t zcbw[31];
+        build_cbw(zcbw, 1035u, 128u, 0x80u, v_in_cdb, 16u);
+        usb_msc_on_rx_packet(&st, zcbw, 31u);
+        uint8_t p[64];
+        assert(usb_msc_get_tx_packet(&st, p) == 64u && usb_msc_need_tx(&st) == 1);
+        assert(usb_msc_get_tx_packet(&st, p) == 0u && usb_msc_need_tx(&st) == 1); /* ZLP */
+        assert(usb_msc_get_tx_packet(&st, p) == 13u && p[12] == 0u && get_le32(&p[8]) == 64u);
+        assert(usb_msc_need_tx(&st) == 0);
+    }
 
     uint8_t v_zero_cdb[16] = { 0xE0u, 0x05u };
     scsi_xfer(&st, 104u, 0x00u, v_zero_cdb, 16u, NULL, NULL, 0u, &status, &res, NULL);
@@ -1401,8 +1743,69 @@ static void run_exfat_img_test(const char *path)
     assert(memcmp(rep_buf, staged_msg, 17u) == 0);
     assert(exfat_delete_file(&vol4, "/record", "CKPT_TEST.wav") == 0);
 
+    /* Exercise cached multi-cluster deletion (16 clusters = 64 KiB) for fsck.exfat verification */
+    {
+        exfat_writer_t bw;
+        assert(exfat_create_file(&vol4, "/record", "BIGDEL.BIN", &bw) == 0);
+        for (int k = 0; k < 4; k++) {
+            assert(exfat_write(&bw, pcm, (uint32_t)sizeof(pcm)) == 0);
+        }
+        assert(exfat_close_file(&bw) == 0);
+        assert(exfat_delete_file(&vol4, "/record", "BIGDEL.BIN") == 0);
+    }
+
+    /* Simulate PC-created NoFatChain=1 directory (/pcdir) growing past 1 cluster -> fsck.exfat verified! */
+    {
+        assert(exfat_mkdir(&vol4, "pcdir") == 0);
+        exfat_entry_t pcdir_ent;
+        assert(exfat_find_path(&vol4, "/pcdir", &pcdir_ent) == 0 && pcdir_ent.is_dir);
+        /* Flip pcdir's root directory entry to NoFatChain=1 and clear its FAT entry (like Windows/macOS) */
+        uint8_t rsec[512];
+        uint32_t root_lba = vol4.heap_lba + ((vol4.root_dir_cluster - 2u) << vol4.spc_shift);
+        int patched = 0;
+        for (uint32_t s = 0u; s < vol4.sectors_per_cluster && !patched; s++) {
+            assert(file_read_sectors(fp, root_lba + s, 1u, rsec) == 0);
+            for (uint32_t sl = 0u; sl + 2u < 16u; sl++) {
+                uint8_t *e = &rsec[sl * 32u];
+                if (e[0] == 0x85u && e[32u] == 0xC0u && get_le32(e + 32u + 20u) == pcdir_ent.first_cluster) {
+                    e[32u + 1u] = 0x03u; /* AllocationPossible=1, NoFatChain=1 */
+                    put_le16(e + 2u, test_entry_checksum(e, 1u + (uint32_t)e[1]));
+                    assert(file_write_sectors(fp, root_lba + s, 1u, rsec) == 0);
+                    patched = 1;
+                    break;
+                }
+            }
+        }
+        assert(patched == 1);
+        uint32_t fsec_lba = vol4.fat_lba + (pcdir_ent.first_cluster >> 7);
+        assert(file_read_sectors(fp, fsec_lba, 1u, rsec) == 0);
+        put_le32(rsec + ((pcdir_ent.first_cluster & 127u) << 2), 0u);
+        assert(file_write_sectors(fp, fsec_lba, 1u, rsec) == 0);
+
+        /* Create 45 files inside /pcdir (> 42-file 1-cluster ceiling) */
+        for (int i = 0; i < 45; i++) {
+            char fn[20];
+            snprintf(fn, sizeof(fn), "PC_%03d.TXT", i);
+            exfat_writer_t pw;
+            assert(exfat_create_file(&vol4, "/pcdir", fn, &pw) == 0);
+            assert(exfat_write(&pw, fn, (uint32_t)strlen(fn)) == 0);
+            assert(exfat_close_file(&pw) == 0);
+        }
+        /* Clean up the 45 files to keep directory/file count tidy while leaving expanded /pcdir for fsck */
+        for (int i = 0; i < 45; i++) {
+            char fn[20];
+            snprintf(fn, sizeof(fn), "PC_%03d.TXT", i);
+            assert(exfat_delete_file(&vol4, "/pcdir", fn) == 0);
+        }
+        /* Also test zero-byte file close (FirstCluster == 0, DataLength == 0) */
+        exfat_writer_t zw;
+        assert(exfat_create_file(&vol4, "/pcdir", "EMPTY.TXT", &zw) == 0);
+        assert(exfat_close_file(&zw) == 0);
+        assert(exfat_delete_file(&vol4, "/pcdir", "EMPTY.TXT") == 0);
+    }
+
     fclose(fp);
-    printf("  [PASS] exfat-img (%s: 16,428 B multi-cluster WAV + checkpoint + atomic replace + settings.bin verified)\n", path);
+    printf("  [PASS] exfat-img (%s: 16,428 B multi-cluster WAV + checkpoint + atomic replace + NoFatChain grow + settings.bin verified)\n", path);
 }
 
 static uint8_t test_rfcomm_fcs(const uint8_t *data, uint32_t len)
@@ -2361,6 +2764,7 @@ int main(int argc, char **argv)
     test_exfat_remount_cache_invalidation();
     test_exfat_checkpoint_fault_injection();
     test_exfat_replace_fault_injection();
+    test_exfat_hardening_and_batching();
     test_usb_msc();
     test_usb_msc_async_pingpong();
     test_usb_msc_vendor_e0();

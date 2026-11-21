@@ -49,6 +49,7 @@ typedef struct {
 typedef struct {
     char     name[EXFAT_MAX_NAME];
     uint64_t size;
+    uint64_t valid_data_len;
     uint32_t first_cluster;
     uint16_t file_attr;
     uint8_t  no_fat_chain;

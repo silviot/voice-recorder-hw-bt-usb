@@ -34,6 +34,7 @@ static uint32_t        g_usb_reboot_deadline = 0u;
 static ep0_state_t     g_ep0_state      = EP0_IDLE;
 static const uint8_t  *g_ep0_tx_ptr     = 0;
 static uint16_t        g_ep0_tx_rem     = 0u;
+static uint8_t         g_ep0_zlp        = 0u;
 static uint8_t         g_pending_addr   = 0u;
 static uint8_t         g_set_addr_pend  = 0u;
 static uint8_t         g_usb_cfg        = 0u;
@@ -84,13 +85,21 @@ static void musb_fifo_read(uint8_t ep, uint8_t *dst, uint16_t len)
 {
     uint32_t addr = MUSB_FIFO_ADDR(ep);
     uint16_t i = 0u;
-    while ((i + 4u) <= len) {
-        uint32_t w = openfw_mmio_rd32(addr);
-        dst[i + 0u] = (uint8_t)(w);
-        dst[i + 1u] = (uint8_t)(w >> 8);
-        dst[i + 2u] = (uint8_t)(w >> 16);
-        dst[i + 3u] = (uint8_t)(w >> 24);
-        i = (uint16_t)(i + 4u);
+    if (((uintptr_t)dst & 3u) == 0u) {
+        uint32_t *d32 = (uint32_t *)(void *)dst;
+        while ((uint16_t)(i + 4u) <= len) {
+            *d32++ = openfw_mmio_rd32(addr);
+            i = (uint16_t)(i + 4u);
+        }
+    } else {
+        while ((uint16_t)(i + 4u) <= len) {
+            uint32_t w = openfw_mmio_rd32(addr);
+            dst[i + 0u] = (uint8_t)(w);
+            dst[i + 1u] = (uint8_t)(w >> 8);
+            dst[i + 2u] = (uint8_t)(w >> 16);
+            dst[i + 3u] = (uint8_t)(w >> 24);
+            i = (uint16_t)(i + 4u);
+        }
     }
     while (i < len) {
         dst[i++] = openfw_mmio_rd8(addr);
@@ -101,13 +110,21 @@ static void musb_fifo_write(uint8_t ep, const uint8_t *src, uint16_t len)
 {
     uint32_t addr = MUSB_FIFO_ADDR(ep);
     uint16_t i = 0u;
-    while ((i + 4u) <= len) {
-        uint32_t w = (uint32_t)src[i + 0u]
-                   | ((uint32_t)src[i + 1u] << 8)
-                   | ((uint32_t)src[i + 2u] << 16)
-                   | ((uint32_t)src[i + 3u] << 24);
-        openfw_mmio_wr32(addr, w);
-        i = (uint16_t)(i + 4u);
+    if (((uintptr_t)src & 3u) == 0u) {
+        const uint32_t *s32 = (const uint32_t *)(const void *)src;
+        while ((uint16_t)(i + 4u) <= len) {
+            openfw_mmio_wr32(addr, *s32++);
+            i = (uint16_t)(i + 4u);
+        }
+    } else {
+        while ((uint16_t)(i + 4u) <= len) {
+            uint32_t w = (uint32_t)src[i + 0u]
+                       | ((uint32_t)src[i + 1u] << 8)
+                       | ((uint32_t)src[i + 2u] << 16)
+                       | ((uint32_t)src[i + 3u] << 24);
+            openfw_mmio_wr32(addr, w);
+            i = (uint16_t)(i + 4u);
+        }
     }
     while (i < len) {
         openfw_mmio_wr8(addr, src[i++]);
@@ -151,16 +168,24 @@ static void ep0_send_next_chunk(void)
     }
     uint16_t csr_flags = 0x0002u; /* TxPktRdy */
     if (g_ep0_tx_rem == 0u) {
-        csr_flags |= 0x0008u;     /* DataEnd */
-        g_ep0_state = EP0_IDLE;
+        if (chunk == 64u && g_ep0_zlp) {
+            /* Short exact-64B-multiple descriptor: defer DataEnd until trailing ZLP */
+            g_ep0_zlp = 0u;
+        } else {
+            csr_flags |= 0x0008u; /* DataEnd */
+            g_ep0_state = EP0_IDLE;
+            g_ep0_zlp   = 0u;
+        }
     }
     openfw_mmio_wr16(MUSB_CSR0_ADDR, csr_flags);
 }
 
 static void ep0_start_in(const uint8_t *data, uint16_t data_len, uint16_t req_len)
 {
+    uint16_t xfer = (data_len < req_len) ? data_len : req_len;
     g_ep0_tx_ptr = data;
-    g_ep0_tx_rem = (data_len < req_len) ? data_len : req_len;
+    g_ep0_tx_rem = xfer;
+    g_ep0_zlp    = (xfer > 0u && xfer < req_len && (xfer & 63u) == 0u) ? 1u : 0u;
     g_ep0_state  = EP0_TX;
     openfw_mmio_wr16(MUSB_CSR0_ADDR, 0x0040u); /* ServicedRxPktRdy */
     ep0_send_next_chunk();
@@ -236,8 +261,14 @@ static void ep0_handle_setup(const uint8_t setup[8])
         break;
 
     case 0x09u: /* SET_CONFIGURATION */
+        if ((wValue & 0xFFu) > 1u) {
+            openfw_mmio_wr16(MUSB_CSR0_ADDR, 0x0060u); /* ServicedRxPktRdy | SendStall */
+            break;
+        }
         g_usb_cfg = (uint8_t)(wValue & 0xFFu);
-        musb_configure_ep1_msc();
+        if (g_usb_cfg == 1u) {
+            musb_configure_ep1_msc();
+        }
         usb_msc_reset(&g_msc);
         openfw_mmio_wr8(MUSB_INDEX_ADDR, 0u);
         openfw_mmio_wr16(MUSB_CSR0_ADDR, 0x0048u);
@@ -265,9 +296,15 @@ static void ep0_handle_setup(const uint8_t setup[8])
                     openfw_mmio_wr16(MUSB_RXCSR_ADDR, (uint16_t)((openfw_mmio_rd16(MUSB_RXCSR_ADDR) & ~0x0060u) | 0x0080u)); /* Clear SendStall + ClrDataTog */
                 }
                 openfw_mmio_wr8(MUSB_INDEX_ADDR, 0u);
+                openfw_mmio_wr16(MUSB_CSR0_ADDR, 0x0048u);
+                break;
+            }
+            if (ep == 0u) {
+                openfw_mmio_wr16(MUSB_CSR0_ADDR, 0x0048u);
+                break;
             }
         }
-        openfw_mmio_wr16(MUSB_CSR0_ADDR, 0x0048u);
+        openfw_mmio_wr16(MUSB_CSR0_ADDR, 0x0060u); /* ServicedRxPktRdy | SendStall */
         break;
 
     case 0x0Bu: /* SET_INTERFACE */
@@ -286,13 +323,18 @@ static void ep0_service(void)
     uint16_t csr = openfw_mmio_rd16(MUSB_CSR0_ADDR);
 
     if (csr & 0x0004u) { /* SentStall */
-        openfw_mmio_wr16(MUSB_CSR0_ADDR, (uint16_t)(csr & ~0x0004u));
-        g_ep0_state = EP0_IDLE;
+        openfw_mmio_wr16(MUSB_CSR0_ADDR, 0x0000u);
+        g_ep0_state  = EP0_IDLE;
+        g_ep0_tx_rem = 0u;
+        g_ep0_zlp    = 0u;
         return;
     }
     if (csr & 0x0010u) { /* SetupEnd */
         openfw_mmio_wr16(MUSB_CSR0_ADDR, 0x0080u); /* ServicedSetupEnd */
-        g_ep0_state = EP0_IDLE;
+        g_ep0_state     = EP0_IDLE;
+        g_ep0_tx_rem    = 0u;
+        g_ep0_zlp       = 0u;
+        g_set_addr_pend = 0u;
     }
 
     if (g_set_addr_pend) {
@@ -308,11 +350,11 @@ static void ep0_service(void)
     if (openfw_mmio_rd16(MUSB_CSR0_ADDR) & 0x0001u) { /* RxPktRdy */
         uint16_t cnt = openfw_mmio_rd16(MUSB_COUNT0_ADDR) & 0x007Fu;
         if (cnt == 8u) {
-            uint8_t setup[8];
+            uint8_t setup[8] __attribute__((aligned(4)));
             musb_fifo_read(0u, setup, 8u);
             ep0_handle_setup(setup);
         } else {
-            uint8_t junk[64];
+            uint8_t junk[64] __attribute__((aligned(4)));
             if (cnt > 64u) {
                 cnt = 64u;
             }
@@ -332,7 +374,13 @@ static void usb_phy_power_on(void)
     /* 2. Release CRU reset ID 0x23 (bank 1 bit 3) + 2 ms settle */
     openfw_mmio_set32(CRU_RST_SET1_ADDR,  1u << 3);
     openfw_mmio_set32(CRU_RST_STAT1_ADDR, 1u << 3);
-    while (!(openfw_mmio_rd32(CRU_RST_STAT1_ADDR) & (1u << 3))) {
+    {
+        uint64_t t0 = us_timer_now();
+        while (!(openfw_mmio_rd32(CRU_RST_STAT1_ADDR) & (1u << 3))) {
+            if ((uint32_t)(us_timer_now() - t0) >= 10000u) {
+                break;
+            }
+        }
     }
     mdelay(2u);
 
@@ -500,10 +548,18 @@ static int musb_vendor_scsi_cb(void *user, const uint8_t cdb[16],
         uint8_t  second  = io_buf[6];
         uint8_t  weekday = io_buf[7];
 
+        static const uint8_t k_dim[12] = { 31u, 28u, 31u, 30u, 31u, 30u, 31u, 31u, 30u, 31u, 30u, 31u };
         if (year < 2000u || year > 2099u ||
             month < 1u || month > 12u ||
-            day < 1u || day > 31u ||
+            weekday > 6u ||
             hour > 23u || minute > 59u || second > 59u) {
+            return -1;
+        }
+        uint8_t max_day = k_dim[month - 1u];
+        if (month == 2u && ((year % 4u) == 0u && ((year % 100u) != 0u || (year % 400u) == 0u))) {
+            max_day = 29u;
+        }
+        if (day < 1u || day > max_day) {
             return -1;
         }
 
@@ -695,6 +751,7 @@ int usb_msc_start(blkdev_t *dev)
     g_tx_bytes      = 0u;
     g_ep0_state     = EP0_IDLE;
     g_ep0_tx_rem    = 0u;
+    g_ep0_zlp       = 0u;
     g_set_addr_pend = 0u;
     g_pending_addr  = 0u;
     g_usb_cfg       = 0u;
@@ -801,6 +858,8 @@ void usb_msc_poll(void)
         openfw_mmio_wr8(MUSB_FADDR_ADDR, 0u);
         g_set_addr_pend = 0u;
         g_ep0_state     = EP0_IDLE;
+        g_ep0_tx_rem    = 0u;
+        g_ep0_zlp       = 0u;
         g_usb_cfg       = 0u;
         usb_msc_reset(&g_msc);
         musb_configure_ep1_msc();
@@ -810,12 +869,13 @@ void usb_msc_poll(void)
         ep0_service();
     }
 
-    /* EP1 Bulk OUT RX */
+    /* EP1 Bulk OUT RX (capped to 16 packets per poll so WRITE(10) cannot starve EP0/UI/WDT) */
     openfw_mmio_wr8(MUSB_INDEX_ADDR, 1u);
     if ((intr_rx & 0x0002u) || (openfw_mmio_rd16(MUSB_RXCSR_ADDR) & 0x0001u)) {
-        while (openfw_mmio_rd16(MUSB_RXCSR_ADDR) & 0x0001u) {
+        uint32_t rx_budget = 16u;
+        while (rx_budget-- > 0u && (openfw_mmio_rd16(MUSB_RXCSR_ADDR) & 0x0001u)) {
             uint16_t cnt = openfw_mmio_rd16(MUSB_RXCOUNT_ADDR) & 0x03FFu;
-            uint8_t  pkt[64];
+            uint8_t  pkt[64] __attribute__((aligned(4)));
             if (cnt > 64u) {
                 cnt = 64u;
             }
@@ -832,7 +892,7 @@ void usb_msc_poll(void)
     /* EP1 Bulk IN TX */
     openfw_mmio_wr8(MUSB_INDEX_ADDR, 1u);
     if (usb_msc_need_tx(&g_msc) && !(openfw_mmio_rd16(MUSB_TXCSR_ADDR) & 0x0001u)) {
-        uint8_t pkt[64];
+        uint8_t pkt[64] __attribute__((aligned(4)));
         uint8_t n = usb_msc_get_tx_packet(&g_msc, pkt);
         if (n > 0u) {
             musb_fifo_write(1u, pkt, n);

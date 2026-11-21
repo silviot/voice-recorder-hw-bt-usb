@@ -65,6 +65,7 @@ typedef struct {
     uint32_t            cur_lba;
     uint32_t            blocks_rem;
     uint32_t            data_rem;
+    uint32_t            out_drain_rem;
     uint16_t            sec_off;
     uint16_t            buf_len;
     uint16_t            inline_pos;

@@ -51,11 +51,18 @@ uint16_t openfw_crc16_ccitt_false(const uint8_t *buf, uint32_t len)
 static void sha256_compress(openfw_sha256_ctx_t *ctx, const uint8_t block[64])
 {
     uint32_t w[16];
-    for (uint32_t i = 0u; i < 16u; i++) {
-        w[i] = ((uint32_t)block[i * 4u] << 24)
-             | ((uint32_t)block[i * 4u + 1u] << 16)
-             | ((uint32_t)block[i * 4u + 2u] << 8)
-             | ((uint32_t)block[i * 4u + 3u]);
+    if (((uintptr_t)block & 3u) == 0u) {
+        const uint32_t *b32 = (const uint32_t *)(const void *)block;
+        for (uint32_t i = 0u; i < 16u; i++) {
+            w[i] = __builtin_bswap32(b32[i]);
+        }
+    } else {
+        for (uint32_t i = 0u; i < 16u; i++) {
+            w[i] = ((uint32_t)block[i * 4u] << 24)
+                 | ((uint32_t)block[i * 4u + 1u] << 16)
+                 | ((uint32_t)block[i * 4u + 2u] << 8)
+                 | ((uint32_t)block[i * 4u + 3u]);
+        }
     }
 
     uint32_t a = ctx->h[0], b = ctx->h[1], c = ctx->h[2], d = ctx->h[3];
@@ -86,6 +93,7 @@ static void sha256_compress(openfw_sha256_ctx_t *ctx, const uint8_t block[64])
 
     ctx->h[0] += a; ctx->h[1] += b; ctx->h[2] += c; ctx->h[3] += d;
     ctx->h[4] += e; ctx->h[5] += f; ctx->h[6] += g; ctx->h[7] += h;
+    zero_bytes((uint8_t *)w, (uint32_t)sizeof(w));
 }
 
 void openfw_sha256_init(openfw_sha256_ctx_t *ctx)
@@ -101,7 +109,7 @@ void openfw_sha256_init(openfw_sha256_ctx_t *ctx)
 void openfw_sha256_update(openfw_sha256_ctx_t *ctx, const uint8_t *data, uint32_t len)
 {
     ctx->total_len += (uint64_t)len;
-    while (len > 0u) {
+    if (ctx->buf_len > 0u) {
         uint32_t take = 64u - ctx->buf_len;
         if (take > len) {
             take = len;
@@ -111,12 +119,21 @@ void openfw_sha256_update(openfw_sha256_ctx_t *ctx, const uint8_t *data, uint32_
         }
         ctx->buf_len += take;
         data += take;
-        len -= take;
+        len  -= take;
         if (ctx->buf_len == 64u) {
             sha256_compress(ctx, ctx->buf);
             ctx->buf_len = 0u;
         }
     }
+    while (len >= 64u) {
+        sha256_compress(ctx, data);
+        data += 64u;
+        len  -= 64u;
+    }
+    for (uint32_t i = 0u; i < len; i++) {
+        ctx->buf[i] = data[i];
+    }
+    ctx->buf_len += len;
 }
 
 void openfw_sha256_final(openfw_sha256_ctx_t *ctx, uint8_t out[32])
@@ -186,6 +203,7 @@ void openfw_hmac_sha256(const uint8_t *key, uint32_t key_len,
     openfw_sha256_update(&ctx, inner, 32u);
     openfw_sha256_final(&ctx, out);
 
+    zero_bytes((uint8_t *)&ctx, (uint32_t)sizeof(ctx));
     zero_bytes(key_blk, sizeof(key_blk));
     zero_bytes(pad, sizeof(pad));
     zero_bytes(inner, sizeof(inner));
@@ -193,9 +211,9 @@ void openfw_hmac_sha256(const uint8_t *key, uint32_t key_len,
 
 int openfw_ct_memeq(const uint8_t *a, const uint8_t *b, uint32_t n)
 {
-    uint8_t diff = 0u;
+    volatile uint8_t diff = 0u;
     for (uint32_t i = 0u; i < n; i++) {
-        diff |= (uint8_t)(a[i] ^ b[i]);
+        diff = (uint8_t)(diff | (uint8_t)(a[i] ^ b[i]));
     }
     return diff == 0u;
 }

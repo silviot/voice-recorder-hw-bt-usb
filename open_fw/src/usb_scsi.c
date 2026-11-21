@@ -54,8 +54,19 @@ static inline void put_be32(uint8_t *p, uint32_t v)
 static void mem_zero(void *dst, uint32_t n)
 {
     uint8_t *d = (uint8_t *)dst;
-    for (uint32_t i = 0u; i < n; i++) {
-        d[i] = 0u;
+    while (n > 0u && (((uintptr_t)d & 3u) != 0u)) {
+        *d++ = 0u;
+        n--;
+    }
+    uint32_t *d32 = (uint32_t *)(void *)d;
+    while (n >= 4u) {
+        *d32++ = 0u;
+        n -= 4u;
+    }
+    d = (uint8_t *)d32;
+    while (n > 0u) {
+        *d++ = 0u;
+        n--;
     }
 }
 
@@ -63,8 +74,23 @@ static void mem_copy(void *dst, const void *src, uint32_t n)
 {
     uint8_t *d = (uint8_t *)dst;
     const uint8_t *s = (const uint8_t *)src;
-    for (uint32_t i = 0u; i < n; i++) {
-        d[i] = s[i];
+    if ((((uintptr_t)d ^ (uintptr_t)s) & 3u) == 0u) {
+        while (n > 0u && (((uintptr_t)d & 3u) != 0u)) {
+            *d++ = *s++;
+            n--;
+        }
+        uint32_t *d32 = (uint32_t *)(void *)d;
+        const uint32_t *s32 = (const uint32_t *)(const void *)s;
+        while (n >= 4u) {
+            *d32++ = *s32++;
+            n -= 4u;
+        }
+        d = (uint8_t *)d32;
+        s = (const uint8_t *)s32;
+    }
+    while (n > 0u) {
+        *d++ = *s++;
+        n--;
     }
 }
 
@@ -103,17 +129,42 @@ static void fail_cmd(usb_msc_state_t *st, uint32_t cbw_data_len, uint8_t cbw_fla
     }
 }
 
+static void finish_zero_data_ok(usb_msc_state_t *st, uint32_t data_len, uint8_t flags)
+{
+    st->csw_status    = 0u;
+    st->csw_residue   = data_len;
+    st->is_blk_xfer   = 0u;
+    st->out_drain_rem = 0u;
+    if (data_len == 0u) {
+        st->send_zlp = 0u;
+        st->phase    = MSC_PHASE_CSW;
+    } else if ((flags & 0x80u) != 0u) {
+        /* Host expects IN data (Hi > Dn): send ZLP before CSW */
+        st->send_zlp   = 1u;
+        st->data_rem   = 0u;
+        st->inline_pos = 0u;
+        st->inline_len = 0u;
+        st->phase      = MSC_PHASE_DATA_IN;
+    } else {
+        /* Host sends OUT data (Ho > Dn): drain OUT payload before CSW */
+        st->send_zlp = 0u;
+        st->data_rem = data_len;
+        st->phase    = MSC_PHASE_DATA_OUT;
+    }
+}
+
 static void start_inline_in(usb_msc_state_t *st, uint32_t cbw_data_len, uint32_t resp_len)
 {
     uint32_t xfer = (resp_len < cbw_data_len) ? resp_len : cbw_data_len;
-    st->csw_status  = 0u;
-    st->csw_residue = cbw_data_len - xfer;
-    st->is_blk_xfer = 0u;
-    st->inline_pos  = 0u;
-    st->inline_len  = (uint16_t)xfer;
-    st->data_rem    = xfer;
-    st->send_zlp    = (xfer == 0u && cbw_data_len > 0u) ? 1u : 0u;
-    st->phase       = (xfer > 0u || st->send_zlp) ? MSC_PHASE_DATA_IN : MSC_PHASE_CSW;
+    st->csw_status    = 0u;
+    st->csw_residue   = cbw_data_len - xfer;
+    st->is_blk_xfer   = 0u;
+    st->out_drain_rem = 0u;
+    st->inline_pos    = 0u;
+    st->inline_len    = (uint16_t)xfer;
+    st->data_rem      = xfer;
+    st->send_zlp      = (xfer < cbw_data_len && (xfer & 63u) == 0u) ? 1u : 0u;
+    st->phase         = (xfer > 0u || st->send_zlp) ? MSC_PHASE_DATA_IN : MSC_PHASE_CSW;
 }
 
 static uint32_t effective_sectors(const usb_msc_state_t *st)
@@ -159,6 +210,7 @@ static void handle_cbw(usb_msc_state_t *st, const uint8_t *pkt, uint8_t len)
     st->send_zlp      = 0u;
     st->is_blk_xfer   = 0u;
     st->is_vendor_out = 0u;
+    st->out_drain_rem = 0u;
 
     if (lun != 0u || cb_len == 0u || cb_len > 16u) {
         fail_cmd(st, data_len, flags, 1u, 0x05u, 0x24u, 0x00u);
@@ -173,15 +225,24 @@ static void handle_cbw(usb_msc_state_t *st, const uint8_t *pkt, uint8_t len)
 
     switch (op) {
     case 0x00u: /* TEST UNIT READY */
-        if (!st->dev || !st->dev->read_sectors || st->medium_ejected) {
+        if (cb_len < 6u) {
+            fail_cmd(st, data_len, flags, 1u, 0x05u, 0x24u, 0x00u);
+        } else if (!st->dev || !st->dev->read_sectors || st->medium_ejected) {
             fail_cmd(st, data_len, flags, 1u, 0x02u, 0x3Au, 0x00u);
         } else {
-            st->csw_residue = data_len;
-            st->phase       = MSC_PHASE_CSW;
+            finish_zero_data_ok(st, data_len, flags);
         }
         break;
 
     case 0x03u: /* REQUEST SENSE */ {
+        if (cb_len < 6u) {
+            fail_cmd(st, data_len, flags, 1u, 0x05u, 0x24u, 0x00u);
+            break;
+        }
+        if (data_len > 0u && (flags & 0x80u) == 0u) {
+            fail_cmd(st, data_len, flags, 2u, 0x05u, 0x24u, 0x00u);
+            break;
+        }
         uint32_t alloc = cb[4];
         if (alloc > 18u) {
             alloc = 18u;
@@ -198,6 +259,14 @@ static void handle_cbw(usb_msc_state_t *st, const uint8_t *pkt, uint8_t len)
     }
 
     case 0x12u: /* INQUIRY */ {
+        if (cb_len < 6u) {
+            fail_cmd(st, data_len, flags, 1u, 0x05u, 0x24u, 0x00u);
+            break;
+        }
+        if (data_len > 0u && (flags & 0x80u) == 0u) {
+            fail_cmd(st, data_len, flags, 2u, 0x05u, 0x24u, 0x00u);
+            break;
+        }
         if ((cb[1] & 0x01u) != 0u) {
             fail_cmd(st, data_len, flags, 1u, 0x05u, 0x24u, 0x00u);
             break;
@@ -223,6 +292,14 @@ static void handle_cbw(usb_msc_state_t *st, const uint8_t *pkt, uint8_t len)
     }
 
     case 0x1Au: /* MODE SENSE (6) */ {
+        if (cb_len < 6u) {
+            fail_cmd(st, data_len, flags, 1u, 0x05u, 0x24u, 0x00u);
+            break;
+        }
+        if (data_len > 0u && (flags & 0x80u) == 0u) {
+            fail_cmd(st, data_len, flags, 2u, 0x05u, 0x24u, 0x00u);
+            break;
+        }
         uint32_t alloc = cb[4];
         if (alloc > 4u) {
             alloc = 4u;
@@ -235,6 +312,14 @@ static void handle_cbw(usb_msc_state_t *st, const uint8_t *pkt, uint8_t len)
     }
 
     case 0x5Au: /* MODE SENSE (10) */ {
+        if (cb_len < 10u) {
+            fail_cmd(st, data_len, flags, 1u, 0x05u, 0x24u, 0x00u);
+            break;
+        }
+        if (data_len > 0u && (flags & 0x80u) == 0u) {
+            fail_cmd(st, data_len, flags, 2u, 0x05u, 0x24u, 0x00u);
+            break;
+        }
         uint32_t alloc = get_be16(cb + 7u);
         if (alloc > 8u) {
             alloc = 8u;
@@ -247,23 +332,44 @@ static void handle_cbw(usb_msc_state_t *st, const uint8_t *pkt, uint8_t len)
     }
 
     case 0x1Bu: /* START STOP UNIT */
+        if (cb_len < 6u) {
+            fail_cmd(st, data_len, flags, 1u, 0x05u, 0x24u, 0x00u);
+            break;
+        }
         if ((cb[4] & 0x03u) == 0x02u) {
             st->medium_ejected = 1u;
         } else if ((cb[4] & 0x01u) != 0u) {
             st->medium_ejected = 0u;
         }
-        st->csw_residue = data_len;
-        st->phase       = MSC_PHASE_CSW;
+        finish_zero_data_ok(st, data_len, flags);
         break;
 
     case 0x1Eu: /* PREVENT ALLOW MEDIUM REMOVAL */
+        if (cb_len < 6u) {
+            fail_cmd(st, data_len, flags, 1u, 0x05u, 0x24u, 0x00u);
+            break;
+        }
+        finish_zero_data_ok(st, data_len, flags);
+        break;
+
     case 0x2Fu: /* VERIFY (10) */
     case 0x35u: /* SYNCHRONIZE CACHE (10) */
-        st->csw_residue = data_len;
-        st->phase       = MSC_PHASE_CSW;
+        if (cb_len < 10u) {
+            fail_cmd(st, data_len, flags, 1u, 0x05u, 0x24u, 0x00u);
+            break;
+        }
+        finish_zero_data_ok(st, data_len, flags);
         break;
 
     case 0x23u: /* READ FORMAT CAPACITIES */ {
+        if (cb_len < 10u) {
+            fail_cmd(st, data_len, flags, 1u, 0x05u, 0x24u, 0x00u);
+            break;
+        }
+        if (data_len > 0u && (flags & 0x80u) == 0u) {
+            fail_cmd(st, data_len, flags, 2u, 0x05u, 0x24u, 0x00u);
+            break;
+        }
         uint32_t sectors = effective_sectors(st);
         if (sectors == 0u) {
             fail_cmd(st, data_len, flags, 1u, 0x02u, 0x3Au, 0x00u);
@@ -283,6 +389,14 @@ static void handle_cbw(usb_msc_state_t *st, const uint8_t *pkt, uint8_t len)
     }
 
     case 0x25u: /* READ CAPACITY (10) */ {
+        if (cb_len < 10u) {
+            fail_cmd(st, data_len, flags, 1u, 0x05u, 0x24u, 0x00u);
+            break;
+        }
+        if (data_len > 0u && (flags & 0x80u) == 0u) {
+            fail_cmd(st, data_len, flags, 2u, 0x05u, 0x24u, 0x00u);
+            break;
+        }
         uint32_t sectors = effective_sectors(st);
         if (sectors == 0u) {
             fail_cmd(st, data_len, flags, 1u, 0x02u, 0x3Au, 0x00u);
@@ -295,6 +409,14 @@ static void handle_cbw(usb_msc_state_t *st, const uint8_t *pkt, uint8_t len)
     }
 
     case 0x28u: /* READ (10) */ {
+        if (cb_len < 10u) {
+            fail_cmd(st, data_len, flags, 1u, 0x05u, 0x24u, 0x00u);
+            break;
+        }
+        if (data_len > 0u && (flags & 0x80u) == 0u) {
+            fail_cmd(st, data_len, flags, 2u, 0x05u, 0x24u, 0x00u);
+            break;
+        }
         uint32_t lba     = get_be32(cb + 2u);
         uint32_t blocks  = get_be16(cb + 7u);
         uint32_t sectors = effective_sectors(st);
@@ -309,8 +431,7 @@ static void handle_cbw(usb_msc_state_t *st, const uint8_t *pkt, uint8_t len)
         uint32_t byte_len = blocks * 512u;
         uint32_t xfer     = (byte_len < data_len) ? byte_len : data_len;
         if (xfer == 0u) {
-            st->csw_residue = data_len;
-            st->phase       = MSC_PHASE_CSW;
+            finish_zero_data_ok(st, data_len, flags);
             break;
         }
         st->is_blk_xfer = 1u;
@@ -320,11 +441,20 @@ static void handle_cbw(usb_msc_state_t *st, const uint8_t *pkt, uint8_t len)
         st->buf_len     = 0u; /* Load first chunk lazily in get_tx_packet */
         st->data_rem    = xfer;
         st->csw_residue = data_len - xfer;
+        st->send_zlp    = (xfer < data_len && (xfer & 63u) == 0u) ? 1u : 0u;
         st->phase       = MSC_PHASE_DATA_IN;
         break;
     }
 
     case 0x2Au: /* WRITE (10) */ {
+        if (cb_len < 10u) {
+            fail_cmd(st, data_len, flags, 1u, 0x05u, 0x24u, 0x00u);
+            break;
+        }
+        if (data_len > 0u && (flags & 0x80u) != 0u) {
+            fail_cmd(st, data_len, flags, 2u, 0x05u, 0x24u, 0x00u);
+            break;
+        }
         uint32_t lba     = get_be32(cb + 2u);
         uint32_t blocks  = get_be16(cb + 7u);
         uint32_t sectors = effective_sectors(st);
@@ -343,22 +473,26 @@ static void handle_cbw(usb_msc_state_t *st, const uint8_t *pkt, uint8_t len)
         uint32_t byte_len = blocks * 512u;
         uint32_t xfer     = (byte_len < data_len) ? byte_len : data_len;
         if (xfer == 0u) {
-            st->csw_residue = data_len;
-            st->phase       = MSC_PHASE_CSW;
+            finish_zero_data_ok(st, data_len, flags);
             break;
         }
-        st->is_blk_xfer = 1u;
-        st->cur_lba     = lba;
-        st->blocks_rem  = blocks;
-        st->sec_off     = 0u;
-        st->buf_len     = 0u;
-        st->data_rem    = xfer;
-        st->csw_residue = data_len - xfer;
-        st->phase       = MSC_PHASE_DATA_OUT;
+        st->is_blk_xfer   = 1u;
+        st->cur_lba       = lba;
+        st->blocks_rem    = blocks;
+        st->sec_off       = 0u;
+        st->buf_len       = 0u;
+        st->data_rem      = xfer;
+        st->out_drain_rem = data_len - xfer;
+        st->csw_residue   = data_len - xfer;
+        st->phase         = MSC_PHASE_DATA_OUT;
         break;
     }
 
     case 0xE0u: /* OpenFW Vendor Diagnostic / Control Command */ {
+        if (cb_len < 2u) {
+            fail_cmd(st, data_len, flags, 1u, 0x05u, 0x24u, 0x00u);
+            break;
+        }
         if (!st->vendor_cb) {
             fail_cmd(st, data_len, flags, 1u, 0x05u, 0x20u, 0x00u);
             break;
@@ -507,12 +641,19 @@ void usb_msc_on_rx_packet(usb_msc_state_t *st, const uint8_t *pkt, uint8_t len)
             uint32_t nsec = (uint32_t)(st->sec_off / 512u);
             if (st->csw_status == 0u &&
                 st->dev->write_sectors(st->dev->ctx, st->cur_lba, nsec, st->sec_buf) != 0) {
-                st->csw_status = 1u;
+                st->csw_status   = 1u;
+                st->csw_residue += nsec * 512u + st->data_rem;
                 set_sense(st, 0x03u, 0x0Cu, 0x00u); /* Medium write error */
             }
             st->cur_lba += nsec;
             st->blocks_rem = (st->blocks_rem > nsec) ? (st->blocks_rem - nsec) : 0u;
             st->sec_off = 0u;
+        }
+        if (st->data_rem == 0u && st->out_drain_rem > 0u) {
+            /* Ho > Do: switch to drain mode for excess host OUT bytes */
+            st->is_blk_xfer   = 0u;
+            st->data_rem      = st->out_drain_rem;
+            st->out_drain_rem = 0u;
         }
     }
 
@@ -550,9 +691,13 @@ uint8_t usb_msc_get_tx_packet(usb_msc_state_t *st, uint8_t out[64])
     }
 
     if (st->phase == MSC_PHASE_DATA_IN) {
-        if (st->send_zlp) {
-            st->send_zlp = 0u;
-            st->phase    = MSC_PHASE_CSW;
+        if (st->data_rem == 0u) {
+            if (st->send_zlp) {
+                st->send_zlp = 0u;
+                st->phase    = MSC_PHASE_CSW;
+                return 0u;
+            }
+            st->phase = MSC_PHASE_CSW;
             return 0u;
         }
 
@@ -562,9 +707,13 @@ uint8_t usb_msc_get_tx_packet(usb_msc_state_t *st, uint8_t out[64])
             if (n > 0u) {
                 mem_copy(out, &st->inline_buf[st->inline_pos], n);
                 st->inline_pos = (uint16_t)(st->inline_pos + n);
+                st->data_rem   = (st->data_rem > n) ? (st->data_rem - n) : 0u;
             }
             if (st->inline_pos >= st->inline_len) {
-                st->phase = MSC_PHASE_CSW;
+                st->data_rem = 0u;
+                if (!st->send_zlp) {
+                    st->phase = MSC_PHASE_CSW;
+                }
             }
             return n;
         }
@@ -579,7 +728,9 @@ uint8_t usb_msc_get_tx_packet(usb_msc_state_t *st, uint8_t out[64])
                 uint32_t nsec   = st->pp_prefetch_secs;
                 uint32_t nbytes = nsec * 512u;
                 uint8_t *dst    = &st->sec_buf[(uint32_t)st->pp_active * USB_MSC_PP_BYTES];
-                if (rc != 0 && st->csw_status == 0u) {
+                if (st->csw_status != 0u) {
+                    mem_zero(dst, nbytes);
+                } else if (rc != 0) {
                     /* Automatic synchronous PIO fallback on any IDMAC error/timeout */
                     if (st->dev->read_sectors(st->dev->ctx, st->pp_prefetch_lba, nsec, dst) != 0) {
                         mem_zero(dst, nbytes);
@@ -600,8 +751,9 @@ uint8_t usb_msc_get_tx_packet(usb_msc_state_t *st, uint8_t out[64])
                     nsec = 1u;
                 }
                 uint32_t nbytes = nsec * 512u;
-                if (st->csw_status == 0u &&
-                    st->dev->read_sectors(st->dev->ctx, st->cur_lba, nsec, st->sec_buf) != 0) {
+                if (st->csw_status != 0u) {
+                    mem_zero(st->sec_buf, nbytes);
+                } else if (st->dev->read_sectors(st->dev->ctx, st->cur_lba, nsec, st->sec_buf) != 0) {
                     mem_zero(st->sec_buf, nbytes);
                     st->csw_status = 1u;
                     set_sense(st, 0x03u, 0x11u, 0x00u); /* Medium read error */
@@ -612,8 +764,9 @@ uint8_t usb_msc_get_tx_packet(usb_msc_state_t *st, uint8_t out[64])
                 st->sec_off    = 0u;
             }
 
-            /* Overlap: start background IDMAC prefetch of next 8 KiB into the other half */
-            if (st->csw_status == 0u && st->blocks_rem >= 2u && st->async_read.read_start) {
+            /* Overlap: start background IDMAC prefetch only when host still needs bytes past this chunk */
+            if (st->csw_status == 0u && st->blocks_rem >= 2u &&
+                st->data_rem > (uint32_t)st->buf_len && st->async_read.read_start) {
                 uint32_t psec = (st->blocks_rem > USB_MSC_PP_SECTORS)
                               ? USB_MSC_PP_SECTORS : st->blocks_rem;
                 uint8_t *pbuf = &st->sec_buf[(uint32_t)(st->pp_active ^ 1u) * USB_MSC_PP_BYTES];
@@ -639,7 +792,9 @@ uint8_t usb_msc_get_tx_packet(usb_msc_state_t *st, uint8_t out[64])
         if (st->data_rem == 0u) {
             abort_prefetch(st);
             st->is_blk_xfer = 0u;
-            st->phase       = MSC_PHASE_CSW;
+            if (!st->send_zlp) {
+                st->phase = MSC_PHASE_CSW;
+            }
         }
         return (uint8_t)take;
     }

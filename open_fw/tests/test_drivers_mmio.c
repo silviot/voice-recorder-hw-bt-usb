@@ -136,10 +136,16 @@ static struct {
     int      sdio_app_cmd;
     int      sdio_acmd41_polls;
     int      sdio_selected;
+    uint32_t sdio_last_cmd13;
+    uint32_t sdio_cmd17_cnt;
+    uint32_t sdio_cmd18_cnt;
+    uint32_t sdio_cmd24_cnt;
+    uint32_t sdio_cmd25_cnt;
     uint8_t  *sd_sectors;
     uint32_t sd_num_sectors;
 
     /* USB PHY + Mentor MUSB OTG Core */
+    uint32_t musb_ep0_stalls;
     uint32_t cru_clk_src_gate;
     uint32_t cru_rst_set1;
     uint32_t cru_rst_stat1;
@@ -308,11 +314,13 @@ static void sdio_exec_cmd(uint32_t val)
         g_soc.sdio_resp[0] = 0x00000900u;
         break;
     case 13u: /* CMD13 SEND_STATUS */
+        g_soc.sdio_last_cmd13 = val;
         g_soc.sdio_resp[0] = 0x00000900u; /* READY_FOR_DATA | TRAN */
         break;
     case 17u: /* CMD17 READ_SINGLE_BLOCK */
     case 18u: /* CMD18 READ_MULTIPLE_BLOCK (finite or BYTCNT=0 open-ended) */
     {
+        if (cmd == 17u) g_soc.sdio_cmd17_cnt++; else g_soc.sdio_cmd18_cnt++;
         uint32_t lba = g_soc.sdio_arg;
         uint32_t blks = (cmd == 18u)
             ? ((g_soc.sdio_bytcnt == 0u) ? 0xFFFFFFFFu : (g_soc.sdio_bytcnt / 512u))
@@ -341,6 +349,7 @@ static void sdio_exec_cmd(uint32_t val)
     case 24u: /* CMD24 WRITE_BLOCK */
     case 25u: /* CMD25 WRITE_MULTIPLE_BLOCK */
     {
+        if (cmd == 24u) g_soc.sdio_cmd24_cnt++; else g_soc.sdio_cmd25_cnt++;
         uint32_t blks = (cmd == 25u) ? (g_soc.sdio_bytcnt / 512u) : 1u;
         assert(g_soc.sdio_selected);
         assert(blks >= 1u && g_soc.sdio_arg + blks <= g_soc.sd_num_sectors);
@@ -665,6 +674,9 @@ void openfw_mmio_wr16(uint32_t addr, uint16_t val)
     if (addr == MUSB_RXMAXP_ADDR)  { g_soc.musb_rxmaxp[ep] = val; return; }
     if (addr == MUSB_CSR0_ADDR) {
         if (ep == 0u) {
+            if (val & 0x0020u) {
+                g_soc.musb_ep0_stalls++;
+            }
             if (val & 0x0040u) {
                 g_soc.musb_txcsr[0] &= ~0x0001u;
                 g_soc.musb_rx_pos[0] = 0u;
@@ -1352,6 +1364,25 @@ static void test_sdio_exfat_and_usb_msc(const char *exfat_img_path)
     assert(sd_write_blocks(&card, 8000u, 8u, mb_wr) == 0);
     assert(sd_read_blocks(&card, 8000u, 8u, mb_rd) == 0);
     assert(memcmp(mb_rd, mb_wr, sizeof(mb_wr)) == 0);
+    /* Verify CMD13 cleared bit 13 (wait_prvdata_complete=0) */
+    assert((g_soc.sdio_last_cmd13 & 0xFFFFu) == 0x054Du);
+
+    /* Verify near_end clamps multi-block chunk before last 3 sectors instead of downgrading all */
+    static uint8_t tail_wr[14 * 512];
+    static uint8_t tail_rd[14 * 512];
+    for (uint32_t i = 0u; i < sizeof(tail_wr); i++) {
+        tail_wr[i] = (uint8_t)((i * 13u + 5u) & 0xFFu);
+    }
+    g_soc.sdio_cmd24_cnt = 0u;
+    g_soc.sdio_cmd25_cnt = 0u;
+    assert(sd_write_blocks(&card, 16370u, 14u, tail_wr) == 0);
+    assert(g_soc.sdio_cmd25_cnt == 1u && g_soc.sdio_cmd24_cnt == 3u);
+    g_soc.sdio_cmd17_cnt = 0u;
+    g_soc.sdio_cmd18_cnt = 0u;
+    assert(sd_read_blocks(&card, 16370u, 14u, tail_rd) == 0);
+    assert(g_soc.sdio_cmd18_cnt == 1u && g_soc.sdio_cmd17_cnt == 3u);
+    assert(memcmp(tail_rd, tail_wr, sizeof(tail_wr)) == 0);
+    assert(sd_read_blocks(&card, 16380u, 5u, tail_rd) != 0); /* Out of bounds rejected */
     assert(sd_flush(&card) == 0);
 
     /* Now exercise full USB PHY + MUSB enumeration + SCSI BOT R/W over SDIO */
@@ -1383,6 +1414,14 @@ static void test_sdio_exfat_and_usb_msc(const char *exfat_img_path)
 
     static const uint8_t set_cfg[8] = { 0x00u, 0x09u, 1u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u };
     host_feed_ep0_setup(set_cfg);
+    /* Invalid SET_CONFIGURATION(2) and unsupported CLEAR_FEATURE must STALL EP0 */
+    uint32_t stalls_before = g_soc.musb_ep0_stalls;
+    static const uint8_t bad_cfg[8] = { 0x00u, 0x09u, 2u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u };
+    host_feed_ep0_setup(bad_cfg);
+    assert(g_soc.musb_ep0_stalls == stalls_before + 1u);
+    static const uint8_t bad_clr[8] = { 0x02u, 0x01u, 0x01u, 0x00u, 0x81u, 0x00u, 0x00u, 0x00u };
+    host_feed_ep0_setup(bad_clr);
+    assert(g_soc.musb_ep0_stalls == stalls_before + 2u);
     static const uint8_t get_lun[8] = { 0xA1u, 0xFEu, 0x00u, 0x00u, 0x00u, 0x00u, 1u, 0x00u };
     host_feed_ep0_setup(get_lun);
     assert(g_soc.musb_tx_len[0] == 1u && g_soc.musb_tx_fifo[0][0] == 0u);
@@ -1502,6 +1541,14 @@ static void test_sdio_exfat_and_usb_msc(const char *exfat_img_path)
     uint8_t acfg_bad[4] = { 9u, 20u, 1u, 0u };
     assert(host_vendor_e0(169u, 0x0Bu, 0u, 0u, 0, acfg_bad, NULL, 4u) == 1u);
     usb_msc_set_audio_cfg_cb(NULL);
+
+    /* 0xE0 0x04 SET_RTC validation: reject invalid weekday=7 & non-leap Feb 29, accept leap Feb 29 */
+    uint8_t rtc_bad_wd[8]  = { 0xEAu, 0x07u, 11u, 19u, 12u, 0u, 0u, 7u };  /* 2026-11-19 wday=7 */
+    uint8_t rtc_bad_feb[8] = { 0xEAu, 0x07u, 2u, 29u, 12u, 0u, 0u, 6u };   /* 2026-02-29 invalid */
+    uint8_t rtc_ok_leap[8] = { 0xE8u, 0x07u, 2u, 29u, 12u, 0u, 0u, 3u };   /* 2024-02-29 valid */
+    assert(host_vendor_e0(170u, 0x04u, 0u, 0u, 0, rtc_bad_wd, NULL, 8u) == 1u);
+    assert(host_vendor_e0(171u, 0x04u, 0u, 0u, 0, rtc_bad_feb, NULL, 8u) == 1u);
+    assert(host_vendor_e0(172u, 0x04u, 0u, 0u, 0, rtc_ok_leap, NULL, 8u) == 0u);
 
     /* Deferred 0x08 REBOOT (mode=1 DFU): CSW PASS arrives before reboot triggers */
     assert(host_vendor_e0(17u, 0x08u, 1u, 0u, 0, NULL, NULL, 0u) == 0u);
