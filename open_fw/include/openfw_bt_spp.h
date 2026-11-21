@@ -16,9 +16,10 @@
 
 #include <stdint.h>
 
-#define BT_SPP_TX_Q_CAP   8u
-#define BT_SPP_TX_MAX_PDU 680u
-#define BT_SPP_RX_MAX_PDU 700u
+#define BT_SPP_TX_Q_CAP        10u
+#define BT_SPP_TX_CTRL_RESERVE 2u
+#define BT_SPP_TX_MAX_PDU      680u
+#define BT_SPP_RX_MAX_PDU      700u
 
 typedef void (*bt_spp_data_cb_t)(void *user, const uint8_t *data, uint16_t len);
 typedef void (*bt_spp_disc_cb_t)(void *user);
@@ -54,6 +55,7 @@ typedef struct {
     uint16_t rfcomm_mtu;
     uint8_t  peer_credits;
     uint8_t  local_credits;
+    uint8_t  local_credit_pending;
 
     /* TX ACL queue */
     uint8_t  tx_head;
@@ -73,9 +75,13 @@ void     bt_spp_set_disconnect_cb(bt_spp_t *spp, bt_spp_disc_cb_t cb, void *user
 void     bt_spp_reset_link(bt_spp_t *spp, uint16_t conhdl);
 void     bt_spp_on_acl_rx(bt_spp_t *spp, uint16_t conhdl, uint8_t pb_flag,
                           const uint8_t *payload, uint16_t len);
-int      bt_spp_is_open(const bt_spp_t *spp);
-int      bt_spp_send(bt_spp_t *spp, const uint8_t *data, uint16_t len);
-uint16_t bt_spp_pop_acl_tx(bt_spp_t *spp, uint16_t *out_conhdl,
-                           uint8_t *out_pdu, uint16_t max_len);
+int            bt_spp_is_open(const bt_spp_t *spp);
+uint16_t       bt_spp_get_mtu(const bt_spp_t *spp);
+int            bt_spp_send(bt_spp_t *spp, const uint8_t *data, uint16_t len);
+const uint8_t *bt_spp_peek_acl_tx(const bt_spp_t *spp, uint16_t *out_conhdl,
+                                  uint16_t *out_len);
+void           bt_spp_consume_acl_tx(bt_spp_t *spp);
+uint16_t       bt_spp_pop_acl_tx(bt_spp_t *spp, uint16_t *out_conhdl,
+                                 uint8_t *out_pdu, uint16_t max_len);
 
 #endif /* OPENFW_BT_SPP_H */

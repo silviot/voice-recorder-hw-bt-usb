@@ -51,11 +51,24 @@ static inline void wr_be32(uint8_t *p, uint32_t v)
     p[3] = (uint8_t)(v & 0xFFu);
 }
 
+typedef uint32_t __attribute__((may_alias)) spp_u32_t;
+
 static void mem_zero(void *dst, uint32_t n)
 {
     uint8_t *d = (uint8_t *)dst;
-    for (uint32_t i = 0u; i < n; i++) {
-        d[i] = 0u;
+    while (n > 0u && (((uintptr_t)d & 3u) != 0u)) {
+        *d++ = 0u;
+        n--;
+    }
+    spp_u32_t *dw = (spp_u32_t *)d;
+    while (n >= 4u) {
+        *dw++ = 0u;
+        n -= 4u;
+    }
+    d = (uint8_t *)dw;
+    while (n > 0u) {
+        *d++ = 0u;
+        n--;
     }
 }
 
@@ -63,8 +76,23 @@ static void mem_copy(void *dst, const void *src, uint32_t n)
 {
     uint8_t *d = (uint8_t *)dst;
     const uint8_t *s = (const uint8_t *)src;
-    for (uint32_t i = 0u; i < n; i++) {
-        d[i] = s[i];
+    if ((((uintptr_t)d ^ (uintptr_t)s) & 3u) == 0u) {
+        while (n > 0u && (((uintptr_t)d & 3u) != 0u)) {
+            *d++ = *s++;
+            n--;
+        }
+        spp_u32_t *dw = (spp_u32_t *)d;
+        const spp_u32_t *sw = (const spp_u32_t *)s;
+        while (n >= 4u) {
+            *dw++ = *sw++;
+            n -= 4u;
+        }
+        d = (uint8_t *)dw;
+        s = (const uint8_t *)sw;
+    }
+    while (n > 0u) {
+        *d++ = *s++;
+        n--;
     }
 }
 
@@ -100,12 +128,25 @@ static int queue_l2cap_pdu(bt_spp_t *spp, uint16_t remote_cid, const uint8_t *pa
 static void notify_rfcomm_closed(bt_spp_t *spp)
 {
     if (spp && spp->ch1_open) {
-        spp->ch1_open     = 0u;
-        spp->ch1_msc_sent = 0u;
+        spp->ch1_open             = 0u;
+        spp->ch1_msc_sent         = 0u;
+        spp->local_credit_pending = 0u;
         if (spp->on_disc) {
             spp->on_disc(spp->on_disc_user);
         }
     }
+}
+
+static void reset_rfcomm_state(bt_spp_t *spp)
+{
+    notify_rfcomm_closed(spp);
+    mem_zero(&spp->rfcomm, sizeof(spp->rfcomm));
+    spp->mux_open             = 0u;
+    spp->credit_flow          = 0u;
+    spp->rfcomm_mtu           = 660u;
+    spp->peer_credits         = 0u;
+    spp->local_credits        = 7u;
+    spp->local_credit_pending = 0u;
 }
 
 static uint8_t next_sig_id(bt_spp_t *spp)
@@ -164,6 +205,7 @@ static void handle_l2cap_sig(bt_spp_t *spp, const uint8_t *buf, uint16_t len)
                 uint16_t scid = rd_le16(&d[2]);
                 uint8_t  rsp[8];
                 if (psm == L2CAP_PSM_SDP) {
+                    mem_zero(&spp->sdp, sizeof(spp->sdp));
                     spp->sdp.psm        = psm;
                     spp->sdp.remote_cid = scid;
                     spp->sdp.local_cid  = L2CAP_CID_SDP;
@@ -175,6 +217,7 @@ static void handle_l2cap_sig(bt_spp_t *spp, const uint8_t *buf, uint16_t len)
                     send_l2cap_sig(spp, 0x03u, id, rsp, 8u);
                     send_l2cap_cfg_req(spp, scid);
                 } else if (psm == L2CAP_PSM_RFCOMM) {
+                    reset_rfcomm_state(spp);
                     spp->rfcomm.psm        = psm;
                     spp->rfcomm.remote_cid = scid;
                     spp->rfcomm.local_cid  = L2CAP_CID_RFCOMM;
@@ -259,10 +302,7 @@ static void handle_l2cap_sig(bt_spp_t *spp, const uint8_t *buf, uint16_t len)
                 if (dcid == L2CAP_CID_SDP) {
                     mem_zero(&spp->sdp, sizeof(spp->sdp));
                 } else if (dcid == L2CAP_CID_RFCOMM) {
-                    notify_rfcomm_closed(spp);
-                    mem_zero(&spp->rfcomm, sizeof(spp->rfcomm));
-                    spp->mux_open    = 0u;
-                    spp->credit_flow = 0u;
+                    reset_rfcomm_state(spp);
                 }
             }
             break;
@@ -529,6 +569,29 @@ static void rfcomm_send_msc(bt_spp_t *spp, uint8_t dlci)
     (void)rfcomm_send_uih(spp, 0u, 0u, 0u, msc, 4u);
 }
 
+static void rfcomm_try_grant_credits(bt_spp_t *spp)
+{
+    if (!spp || !spp->credit_flow || !spp->rfcomm.open || !spp->ch1_open) {
+        if (spp) {
+            spp->local_credit_pending = 0u;
+        }
+        return;
+    }
+    if (spp->local_credits <= 2u || spp->local_credit_pending) {
+        if (spp->local_credits >= 7u) {
+            spp->local_credit_pending = 0u;
+            return;
+        }
+        uint8_t grant = (uint8_t)(7u - spp->local_credits);
+        if (rfcomm_send_uih(spp, RFCOMM_CH1_DLCI, 1u, grant, 0, 0u) == 0) {
+            spp->local_credits        = 7u;
+            spp->local_credit_pending = 0u;
+        } else {
+            spp->local_credit_pending = 1u;
+        }
+    }
+}
+
 static void handle_rfcomm_mux(bt_spp_t *spp, const uint8_t *msg, uint16_t len)
 {
     if (len < 2u) {
@@ -552,24 +615,29 @@ static void handle_rfcomm_mux(bt_spp_t *spp, const uint8_t *msg, uint16_t len)
     rsp[0] = (uint8_t)(mtype & ~0x02u); /* Convert command -> response (C/R=0) */
 
     if ((mtype & 0xFCu) == 0x80u && mlen >= 8u) { /* PN (0x83 -> 0x81) */
-        uint16_t max_mtu = (spp->rfcomm_mtu >= 23u && spp->rfcomm_mtu <= 660u) ? spp->rfcomm_mtu : 660u;
-        uint16_t req_mtu = rd_le16(&rsp[6]);
-        if (req_mtu == 0u || req_mtu > max_mtu) {
-            req_mtu = max_mtu;
-            wr_le16(&rsp[6], max_mtu);
-        } else if (req_mtu < 23u) {
-            req_mtu = 23u;
-            wr_le16(&rsp[6], 23u);
-        }
-        spp->rfcomm_mtu = req_mtu;
-        if ((rsp[3] & 0xF0u) == 0xF0u) {
-            rsp[3] = (uint8_t)((rsp[3] & 0x0Fu) | 0xE0u); /* Grant credit-based flow */
-            spp->credit_flow   = 1u;
-            spp->peer_credits  = (uint8_t)(rsp[9] & 0x07u);
-            spp->local_credits = 7u;
-            rsp[9]             = 7u;
-        } else {
-            spp->credit_flow = 0u;
+        uint8_t pn_dlci = (uint8_t)(rsp[2] & 0x3Fu);
+        if (pn_dlci == RFCOMM_CH1_DLCI) {
+            uint16_t max_mtu = (spp->rfcomm_mtu >= 23u && spp->rfcomm_mtu <= 660u) ? spp->rfcomm_mtu : 660u;
+            uint16_t req_mtu = rd_le16(&rsp[6]);
+            if (req_mtu == 0u || req_mtu > max_mtu) {
+                req_mtu = max_mtu;
+                wr_le16(&rsp[6], max_mtu);
+            } else if (req_mtu < 23u) {
+                req_mtu = 23u;
+                wr_le16(&rsp[6], 23u);
+            }
+            spp->rfcomm_mtu = req_mtu;
+            if ((rsp[3] & 0xF0u) == 0xF0u) {
+                rsp[3] = (uint8_t)((rsp[3] & 0x0Fu) | 0xE0u); /* Grant credit-based flow */
+                spp->credit_flow          = 1u;
+                spp->peer_credits         = (uint8_t)(rsp[9] & 0x07u);
+                spp->local_credits        = 7u;
+                spp->local_credit_pending = 0u;
+                rsp[9]                    = 7u;
+            } else {
+                spp->credit_flow          = 0u;
+                spp->local_credit_pending = 0u;
+            }
         }
     }
     (void)rfcomm_send_uih(spp, 0u, 0u, 0u, rsp, (uint16_t)(mlen + 2u));
@@ -611,15 +679,18 @@ static void handle_rfcomm(bt_spp_t *spp, const uint8_t *buf, uint16_t len)
     }
 
     if (ftype == 0x2Fu) { /* SABM */
-        rfcomm_send_ctrl(spp, dlci, cr, 0x73u); /* UA */
         if (dlci == 0u) {
+            rfcomm_send_ctrl(spp, dlci, cr, 0x73u); /* UA */
             spp->mux_open = 1u;
         } else if (dlci == RFCOMM_CH1_DLCI) {
+            rfcomm_send_ctrl(spp, dlci, cr, 0x73u); /* UA */
             spp->ch1_open = 1u;
             if (!spp->ch1_msc_sent) {
                 spp->ch1_msc_sent = 1u;
                 rfcomm_send_msc(spp, dlci);
             }
+        } else {
+            rfcomm_send_ctrl(spp, dlci, cr, 0x1Fu); /* DM */
         }
         return;
     }
@@ -628,8 +699,12 @@ static void handle_rfcomm(bt_spp_t *spp, const uint8_t *buf, uint16_t len)
         rfcomm_send_ctrl(spp, dlci, cr, 0x73u);
         if (dlci == 0u) {
             notify_rfcomm_closed(spp);
-            spp->mux_open    = 0u;
-            spp->credit_flow = 0u;
+            spp->mux_open             = 0u;
+            spp->credit_flow          = 0u;
+            spp->rfcomm_mtu           = 660u;
+            spp->peer_credits         = 0u;
+            spp->local_credits        = 7u;
+            spp->local_credit_pending = 0u;
         } else if (dlci == RFCOMM_CH1_DLCI) {
             notify_rfcomm_closed(spp);
         }
@@ -637,7 +712,7 @@ static void handle_rfcomm(bt_spp_t *spp, const uint8_t *buf, uint16_t len)
     }
 
     if (ftype == 0xEFu) { /* UIH */
-        if (credit_byte && dlci == RFCOMM_CH1_DLCI) {
+        if (credit_byte && dlci == RFCOMM_CH1_DLCI && spp->ch1_open) {
             uint8_t  given = buf[hdr_len];
             uint16_t sum   = (uint16_t)spp->peer_credits + given;
             spp->peer_credits = (sum > 255u) ? 255u : (uint8_t)sum;
@@ -645,16 +720,12 @@ static void handle_rfcomm(bt_spp_t *spp, const uint8_t *buf, uint16_t len)
         const uint8_t *info = &buf[hdr_len + credit_byte];
         if (dlci == 0u) {
             handle_rfcomm_mux(spp, info, dlen);
-        } else if (dlci == RFCOMM_CH1_DLCI && dlen > 0u) {
+        } else if (dlci == RFCOMM_CH1_DLCI && spp->ch1_open && dlen > 0u) {
             if (spp->credit_flow) {
                 if (spp->local_credits > 0u) {
                     spp->local_credits--;
                 }
-                if (spp->local_credits <= 2u) {
-                    uint8_t grant = (uint8_t)(7u - spp->local_credits);
-                    spp->local_credits = 7u;
-                    (void)rfcomm_send_uih(spp, RFCOMM_CH1_DLCI, 1u, grant, 0, 0u);
-                }
+                rfcomm_try_grant_credits(spp);
             }
             if (spp->on_data) {
                 spp->on_data(spp->on_data_user, info, dlen);
@@ -728,6 +799,7 @@ void bt_spp_on_acl_rx(bt_spp_t *spp, uint16_t conhdl, uint8_t pb_flag,
 
     if (pb_flag == 0x02u || pb_flag == 0x00u) { /* L2CAP Start */
         if (len < 4u) {
+            spp->rx_expected = 0u;
             return;
         }
         uint16_t l2len = rd_le16(&payload[0]);
@@ -765,6 +837,11 @@ int bt_spp_is_open(const bt_spp_t *spp)
     return (spp && spp->rfcomm.open && spp->ch1_open) ? 1 : 0;
 }
 
+uint16_t bt_spp_get_mtu(const bt_spp_t *spp)
+{
+    return spp ? spp->rfcomm_mtu : 0u;
+}
+
 int bt_spp_send(bt_spp_t *spp, const uint8_t *data, uint16_t len)
 {
     if (!bt_spp_is_open(spp) || (!data && len > 0u) || spp->rfcomm_mtu == 0u) {
@@ -773,8 +850,14 @@ int bt_spp_send(bt_spp_t *spp, const uint8_t *data, uint16_t len)
     if (len == 0u) {
         return 0;
     }
+    if (spp->local_credit_pending) {
+        rfcomm_try_grant_credits(spp);
+    }
+    uint16_t data_cap = (BT_SPP_TX_Q_CAP > BT_SPP_TX_CTRL_RESERVE)
+                      ? (uint16_t)(BT_SPP_TX_Q_CAP - BT_SPP_TX_CTRL_RESERVE)
+                      : BT_SPP_TX_Q_CAP;
     uint16_t frames = (uint16_t)((len + spp->rfcomm_mtu - 1u) / spp->rfcomm_mtu);
-    if ((spp->credit_flow && frames > spp->peer_credits) || (spp->tx_count + frames) > BT_SPP_TX_Q_CAP) {
+    if ((spp->credit_flow && frames > spp->peer_credits) || (spp->tx_count + frames) > data_cap) {
         return -1;
     }
     uint16_t off = 0u;
@@ -792,21 +875,42 @@ int bt_spp_send(bt_spp_t *spp, const uint8_t *data, uint16_t len)
     return 0;
 }
 
-uint16_t bt_spp_pop_acl_tx(bt_spp_t *spp, uint16_t *out_conhdl,
-                           uint8_t *out_pdu, uint16_t max_len)
+const uint8_t *bt_spp_peek_acl_tx(const bt_spp_t *spp, uint16_t *out_conhdl,
+                                  uint16_t *out_len)
 {
-    if (!spp || spp->tx_count == 0u || !out_pdu) {
-        return 0u;
+    if (!spp || spp->tx_count == 0u) {
+        return 0;
     }
-    uint16_t len = spp->tx_lens[spp->tx_head];
-    if (len > max_len) {
-        return 0u;
-    }
-    mem_copy(out_pdu, spp->tx_pdus[spp->tx_head], len);
     if (out_conhdl) {
         *out_conhdl = spp->conhdl;
     }
+    if (out_len) {
+        *out_len = spp->tx_lens[spp->tx_head];
+    }
+    return spp->tx_pdus[spp->tx_head];
+}
+
+void bt_spp_consume_acl_tx(bt_spp_t *spp)
+{
+    if (!spp || spp->tx_count == 0u) {
+        return;
+    }
     spp->tx_head = (uint8_t)((spp->tx_head + 1u) % BT_SPP_TX_Q_CAP);
     spp->tx_count--;
+    if (spp->local_credit_pending) {
+        rfcomm_try_grant_credits(spp);
+    }
+}
+
+uint16_t bt_spp_pop_acl_tx(bt_spp_t *spp, uint16_t *out_conhdl,
+                           uint8_t *out_pdu, uint16_t max_len)
+{
+    uint16_t len = 0u;
+    const uint8_t *pdu = bt_spp_peek_acl_tx(spp, out_conhdl, &len);
+    if (!pdu || !out_pdu || len > max_len) {
+        return 0u;
+    }
+    mem_copy(out_pdu, pdu, len);
+    bt_spp_consume_acl_tx(spp);
     return len;
 }

@@ -57,6 +57,7 @@ typedef struct {
     void     (*on_dfu)(void *user);
     int      (*audio_cfg)(void *user, int set, uint8_t *dsp_profile,
                           uint8_t *gain, uint8_t *channels, uint8_t *vor);
+    uint16_t (*get_mtu)(void *user);
 } xrec_ops_t;
 
 typedef enum {
@@ -82,10 +83,14 @@ typedef struct {
     uint8_t        nonce[16];
 
     uint16_t       rx_len;
+    uint8_t        rx_overflow;
     char           rx_line[XREC_RX_LINE_MAX];
 
     /* Streaming +XREC:GETS state */
     uint8_t        gets_active;
+    uint8_t        gets_staged;
+    uint8_t        gets_staged_eof;
+    uint16_t       gets_staged_len;
     exfat_entry_t  gets_file;
     uint32_t       gets_offset;
     uint32_t       gets_rem;
@@ -106,7 +111,11 @@ typedef struct {
     uint16_t       put_len;
     uint16_t       put_got;
     uint16_t       put_crc;
-    uint8_t        put_buf[XREC_MAX_CHUNK];
+    /* PUT binary ingestion and GETS staged frame are mutually exclusive */
+    union {
+        uint8_t    put_buf[XREC_MAX_CHUNK];
+        uint8_t    gets_frame[12u + XREC_MAX_CHUNK];
+    } xfer;
 
     uint8_t        put_stream_mode;
     uint8_t        put_has_last;

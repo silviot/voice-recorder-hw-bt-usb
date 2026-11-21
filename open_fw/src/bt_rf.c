@@ -111,10 +111,21 @@ static uint32_t int_log2_q8(uint64_t v)
     return (msb << 8) + a + (((b - a) * rem) >> 4);
 }
 
+#define RF_POLL_TIMEOUT_ITERS 200000u
+
+static void rf_poll_clear32(uint32_t addr, uint32_t mask)
+{
+    for (uint32_t i = 0u; i < RF_POLL_TIMEOUT_ITERS; i++) {
+        if ((openfw_mmio_rd32(addr) & mask) == 0u) {
+            return;
+        }
+    }
+}
+
 static void rf_delay(uint32_t n)
 {
-    for (volatile uint32_t i = n * 200u; i != 0u; i--) {
-        OPENFW_NOP();
+    if (n > 0u) {
+        udelay(n * 20u);
     }
 }
 
@@ -133,8 +144,7 @@ static uint32_t rf_lut_read_raw(uint32_t addr)
     openfw_mmio_rmw32(RF_LUT_CTRL_ADDR, 0x1FFu, addr & 0x1FFu);
     openfw_mmio_clr32(RF_LUT_CTRL_ADDR, (1u << 11));
     openfw_mmio_set32(RF_LUT_CTRL_ADDR, (1u << 16));
-    while (openfw_mmio_rd32(RF_LUT_CTRL_ADDR) & (1u << 16)) {
-    }
+    rf_poll_clear32(RF_LUT_CTRL_ADDR, (1u << 16));
     return openfw_mmio_rd32(RF_LUT_DATA_ADDR);
 }
 
@@ -144,8 +154,7 @@ static void rf_lut_write_raw(uint32_t addr, uint32_t val)
     openfw_mmio_rmw32(RF_LUT_CTRL_ADDR, 0x1FFu, addr & 0x1FFu);
     openfw_mmio_set32(RF_LUT_CTRL_ADDR, (1u << 11));
     openfw_mmio_set32(RF_LUT_CTRL_ADDR, (1u << 16));
-    while (openfw_mmio_rd32(RF_LUT_CTRL_ADDR) & (1u << 16)) {
-    }
+    rf_poll_clear32(RF_LUT_CTRL_ADDR, (1u << 16));
 }
 
 static uint32_t rf_lut_read_field(uint32_t id, uint32_t idx)
@@ -286,13 +295,12 @@ static void rf_synth_en(void)
 
 static void rf_vco_cal_step(int16_t n_int, uint32_t n_frac)
 {
-    rf_lut_write_field(25u, 0u, n_frac);
-    rf_lut_write_field(24u, 0u, (uint32_t)n_int);
+    /* Fields 24 (bits [29:21]) and 25 (bits [20:0]) share LUT entry 0x9E */
+    rf_lut_write_raw(0x9Eu, (((uint32_t)n_int & 0x1FFu) << 21) | (n_frac & 0x1FFFFFu));
     openfw_mmio_set32(RF_ANA_BASE + 0xC0u, (1u << 9));
     openfw_mmio_clr32(RF_ANA_BASE + 0xC0u, 0x7Fu);
     openfw_mmio_set32(RF_ANA_BASE + 0xC0u, (1u << 8));
-    while (openfw_mmio_rd32(RF_ANA_BASE + 0xC0u) & (1u << 8)) {
-    }
+    rf_poll_clear32(RF_ANA_BASE + 0xC0u, (1u << 8));
     openfw_mmio_set32(RF_ANA_BASE + 0xB4u, 0x1u);
     rf_delay(1u);
     openfw_mmio_clr32(RF_ANA_BASE + 0xB4u, 0x1u);
@@ -329,8 +337,7 @@ static void rf_synth_tune_mhz(uint32_t freq_mhz)
     openfw_mmio_set32(RF_ANA_BASE + 0xC0u, (1u << 9));
     openfw_mmio_rmw32(RF_ANA_BASE + 0xC0u, 0x7Fu, (freq_mhz - 0x960u) & 0x7Fu);
     openfw_mmio_set32(RF_ANA_BASE + 0xC0u, (1u << 8));
-    while (openfw_mmio_rd32(RF_ANA_BASE + 0xC0u) & (1u << 8)) {
-    }
+    rf_poll_clear32(RF_ANA_BASE + 0xC0u, (1u << 8));
     openfw_mmio_set32(RF_ANA_BASE + 0xB4u, 0x1u);
     rf_delay(1u);
     openfw_mmio_clr32(RF_ANA_BASE + 0xB4u, 0x1u);
@@ -350,12 +357,10 @@ static void rf_tx_tone_start(uint32_t step, uint32_t em_off)
     openfw_mmio_set32(RF_ANA_BASE + 0x00u, (1u << 14));
     rf_lut_write_field(6u, 0u, (uint32_t)(-32));
     openfw_mmio_set32(RF_ANA_BASE + 0xACu, 0x100u);
-    while (openfw_mmio_rd32(RF_ANA_BASE + 0xACu) & 0x100u) {
-    }
+    rf_poll_clear32(RF_ANA_BASE + 0xACu, 0x100u);
     rf_lut_write_field(3u, 0u, 1u);
     openfw_mmio_set32(RF_ANA_BASE + 0xACu, 0x100u);
-    while (openfw_mmio_rd32(RF_ANA_BASE + 0xACu) & 0x100u) {
-    }
+    rf_poll_clear32(RF_ANA_BASE + 0xACu, 0x100u);
     openfw_mmio_rmw32(RF_ANA_BASE + 0x0Cu, 0x7FFF0000u, (em_off << 16) & 0x7FFF0000u);
     openfw_mmio_rmw32(RF_ANA_BASE + 0x0Cu, 0xFFFFu, 0x0FFCu);
     openfw_mmio_set32(RF_ANA_BASE + 0x0Cu, (1u << 31));
@@ -374,28 +379,27 @@ static void rf_tx_cal_cfg(void)
     rf_lut_write_field(5u, 0u, 1u);
     rf_lut_write_field(4u, 0u, 1u);
     openfw_mmio_set32(RF_ANA_BASE + 0xACu, 0x100u);
-    while (openfw_mmio_rd32(RF_ANA_BASE + 0xACu) & 0x100u) {
-    }
+    rf_poll_clear32(RF_ANA_BASE + 0xACu, 0x100u);
     rf_lut_write_field(9u, 0u, 1u);
     rf_lut_write_field(8u, 0u, 1u);
     rf_lut_write_field(11u, 0u, 1u);
     rf_lut_write_field(10u, 0u, 1u);
     openfw_mmio_set32(RF_ANA_BASE + 0xACu, 0x100u);
-    while (openfw_mmio_rd32(RF_ANA_BASE + 0xACu) & 0x100u) {
-    }
+    rf_poll_clear32(RF_ANA_BASE + 0xACu, 0x100u);
     rf_lut_write_field(6u, 0u, 0x20u);
     openfw_mmio_set32(RF_ANA_BASE + 0xACu, 0x100u);
+    rf_poll_clear32(RF_ANA_BASE + 0xACu, 0x100u);
     rf_lut_write_field(0u, 0u, 0x73u);
     openfw_mmio_set32(RF_ANA_BASE + 0xACu, 0x100u);
+    rf_poll_clear32(RF_ANA_BASE + 0xACu, 0x100u);
     rf_lut_write_field(3u, 0u, 7u);
     openfw_mmio_set32(RF_ANA_BASE + 0xACu, 0x100u);
-    while (openfw_mmio_rd32(RF_ANA_BASE + 0xACu) & 0x100u) {
-    }
+    rf_poll_clear32(RF_ANA_BASE + 0xACu, 0x100u);
 }
 
 static uint32_t dft_bin_mag_sq(uint32_t bin, const int16_t x[128])
 {
-    int64_t re = 0, im = 0;
+    int32_t  re = 0, im = 0;
     uint32_t ph = 0u;
     for (uint32_t n = 0u; n < 128u; n++) {
         uint32_t idx = ph << 3;
@@ -403,9 +407,9 @@ static uint32_t dft_bin_mag_sq(uint32_t bin, const int16_t x[128])
         im -= (int32_t)x[n] * (int32_t)trig_sin1024(idx);
         ph = (ph + bin) & 127u;
     }
-    int32_t r = (int32_t)(re >> 14);
-    int32_t i = (int32_t)(im >> 14);
-    return (uint32_t)(r * r + i * i);
+    int32_t r = re >> 14;
+    int32_t i = im >> 14;
+    return (uint32_t)(r * r) + (uint32_t)(i * i);
 }
 
 static uint32_t measure_rx_tone_log2_q8(uint32_t bin)
@@ -414,13 +418,12 @@ static uint32_t measure_rx_tone_log2_q8(uint32_t bin)
     openfw_mmio_clr32(RF_ANA_BASE + 0x10u, 0x7FFF0000u);
     openfw_mmio_rmw32(RF_ANA_BASE + 0x10u, 0x7FFFu, 0x1FCu);
     openfw_mmio_set32(RF_ANA_BASE + 0x10u, 0x80008000u);
-    while (openfw_mmio_rd32(RF_ANA_BASE + 0x10u) & (1u << 31)) {
-    }
+    rf_poll_clear32(RF_ANA_BASE + 0x10u, (1u << 31));
     rf_delay(1u);
 
     for (uint32_t n = 0u; n < 128u; n++) {
-        int16_t iv = (int16_t)openfw_mmio_rd16(RWBT_EM_BASE + 4u * n);
-        int16_t qv = (int16_t)openfw_mmio_rd16(RWBT_EM_BASE + 4u * n + 2u);
+        int16_t iv = (int16_t)(openfw_mmio_rd16(RWBT_EM_BASE + 4u * n) & 0x0FFFu);
+        int16_t qv = (int16_t)(openfw_mmio_rd16(RWBT_EM_BASE + 4u * n + 2u) & 0x0FFFu);
         if (iv & 0x800) {
             iv |= (int16_t)0xF000;
         }
@@ -489,19 +492,16 @@ static uint32_t bt_rf_cal_10a4(uint32_t trim)
     rf_lut_write_field(14u, 0u, 0u);
     rf_lut_write_field(15u, 0u, 0u);
     openfw_mmio_set32(RF_ANA_BASE + 0x80u, 0x10000u);
-    while (openfw_mmio_rd32(RF_ANA_BASE + 0x80u) & 0x10000u) {
-    }
+    rf_poll_clear32(RF_ANA_BASE + 0x80u, 0x10000u);
     rf_lut_write_field(23u, 0u, 0u);
     rf_lut_write_field(22u, 0u, 0u);
     openfw_mmio_set32(RF_ANA_BASE + 0x80u, 0x10000u);
-    while (openfw_mmio_rd32(RF_ANA_BASE + 0x80u) & 0x10000u) {
-    }
+    rf_poll_clear32(RF_ANA_BASE + 0x80u, 0x10000u);
     rf_lut_write_field(12u, 0u, 0u);
     rf_lut_write_field(13u, 0u, 6u);
     rf_lut_write_field(16u, 0u, 0u);
     openfw_mmio_set32(RF_ANA_BASE + 0x80u, 0x10000u);
-    while (openfw_mmio_rd32(RF_ANA_BASE + 0x80u) & 0x10000u) {
-    }
+    rf_poll_clear32(RF_ANA_BASE + 0x80u, 0x10000u);
     openfw_mmio_rmw32(RF_ANA_BASE + 0x88u, 0xF0003F00u, 0x60002D00u);
     openfw_mmio_rmw32(RF_ANA_BASE + 0x84u, 0xF0000000u, 0x60000000u);
     rf_delay(1u);
@@ -537,7 +537,7 @@ static void bt_rf_init_internal(uint32_t freq_drift, uint32_t vco_cal_10a4,
     openfw_mmio_set32(RF_BB_CTRL_ADDR, (1u << 26));
     openfw_mmio_clr32(RF_ANA_BASE + 0x20u, (1u << 0));
     openfw_mmio_set32(RF_ANA_BASE + 0x84u, (1u << 19));
-    openfw_mmio_set32(RF_ANA_BASE + 0x40u, (1u << 5) | ((trim & 0xFu) << 16));
+    openfw_mmio_rmw32(RF_ANA_BASE + 0x40u, 0xF0000u | (1u << 5), (1u << 5) | ((trim & 0xFu) << 16));
     openfw_mmio_set32(RF_ANA_BASE + 0xACu, (1u << 16));
     openfw_mmio_rmw32(RF_LUT_CTRL_ADDR, 0xFFF00000u, 0x04000000u);
 
@@ -560,8 +560,7 @@ static void bt_rf_init_internal(uint32_t freq_drift, uint32_t vco_cal_10a4,
 
     openfw_mmio_rmw32(RF_ANA_BASE + 0xC0u, 0x7Fu, 0x00000229u);
     openfw_mmio_set32(RF_ANA_BASE + 0xC0u, (1u << 8));
-    while (openfw_mmio_rd32(RF_ANA_BASE + 0xC0u) & (1u << 8)) {
-    }
+    rf_poll_clear32(RF_ANA_BASE + 0xC0u, (1u << 8));
     openfw_mmio_clr32(RF_ANA_BASE + 0xC0u, (1u << 9));
     openfw_mmio_rmw32(RF_ANA_BASE + 0xE4u, 0x3FE00000u, 0x00E00000u);
     openfw_mmio_rmw32(AON_CLK_CFG_ADDR, 0x00000FF0u,
@@ -571,13 +570,11 @@ static void bt_rf_init_internal(uint32_t freq_drift, uint32_t vco_cal_10a4,
 
     openfw_mmio_rmw32(RF_ANA_BASE + 0x80u, 0x7F00u, 0x00021A00u);
     openfw_mmio_set32(RF_ANA_BASE + 0x80u, (1u << 16));
-    while (openfw_mmio_rd32(RF_ANA_BASE + 0x80u) & (1u << 16)) {
-    }
+    rf_poll_clear32(RF_ANA_BASE + 0x80u, (1u << 16));
     openfw_mmio_clr32(RF_ANA_BASE + 0x80u, (1u << 17));
     openfw_mmio_rmw32(RF_ANA_BASE + 0xACu, 0x1Fu, 0x00000212u);
     openfw_mmio_set32(RF_ANA_BASE + 0xACu, (1u << 8));
-    while (openfw_mmio_rd32(RF_ANA_BASE + 0xACu) & (1u << 8)) {
-    }
+    rf_poll_clear32(RF_ANA_BASE + 0xACu, (1u << 8));
     openfw_mmio_clr32(RF_ANA_BASE + 0xACu, (1u << 9));
 
     openfw_mmio_clr32(RF_ANA_BASE + 0x40u, 0x00007F00u);
@@ -599,7 +596,7 @@ void bt_modem_init(uint32_t clk6_hz)
 {
     uint32_t div = (clk6_hz <= 16000000u) ? 1u : 2u;
     uint32_t mhz = (clk6_hz / 1000000u) / div;
-    openfw_mmio_rmw32(RF_BB_CTRL_ADDR, 0x073F0000u, ((div - 1u) << 24) | (mhz << 16));
+    openfw_mmio_rmw32(RF_BB_CTRL_ADDR, 0x073F0000u, ((div - 1u) << 24) | ((mhz & 0x3Fu) << 16));
 
     openfw_mmio_wr32(RF_BB_BASE + 0x298u, 0x2D2B2927u);
     openfw_mmio_wr32(RF_BB_BASE + 0x29Cu, 0x3533312Fu);

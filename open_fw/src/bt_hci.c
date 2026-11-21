@@ -117,11 +117,44 @@ struct ke_task_desc {
 /* ============================================================================
  * Bare-Metal Memory Helpers (no libc calls)
  * ============================================================================ */
+typedef uint32_t __attribute__((may_alias)) bt_u32_t;
+
 static void bt_memzero(void *dst, uint32_t n)
 {
-    volatile uint8_t *d = (volatile uint8_t *)dst;
-    for (uint32_t i = 0u; i < n; i++) {
-        d[i] = 0u;
+    uintptr_t addr = (uintptr_t)dst;
+    if (addr >= EM_BASE_ADDR && addr < (EM_BASE_ADDR + EM_SIZE_BYTES)) {
+        volatile uint8_t *d = (volatile uint8_t *)dst;
+        while (n > 0u && (((uintptr_t)d & 3u) != 0u)) {
+            *d++ = 0u;
+            n--;
+        }
+        volatile uint32_t *dw = (volatile uint32_t *)d;
+        while (n >= 4u) {
+            *dw++ = 0u;
+            n -= 4u;
+        }
+        d = (volatile uint8_t *)dw;
+        while (n > 0u) {
+            *d++ = 0u;
+            n--;
+        }
+        return;
+    }
+
+    uint8_t *d = (uint8_t *)dst;
+    while (n > 0u && (((uintptr_t)d & 3u) != 0u)) {
+        *d++ = 0u;
+        n--;
+    }
+    bt_u32_t *dw = (bt_u32_t *)d;
+    while (n >= 4u) {
+        *dw++ = 0u;
+        n -= 4u;
+    }
+    d = (uint8_t *)dw;
+    while (n > 0u) {
+        *d++ = 0u;
+        n--;
     }
 }
 
@@ -129,8 +162,47 @@ static void bt_memcpy(void *dst, const void *src, uint32_t n)
 {
     uint8_t *d = (uint8_t *)dst;
     const uint8_t *s = (const uint8_t *)src;
-    for (uint32_t i = 0u; i < n; i++) {
-        d[i] = s[i];
+    if ((((uintptr_t)d ^ (uintptr_t)s) & 3u) == 0u) {
+        while (n > 0u && (((uintptr_t)d & 3u) != 0u)) {
+            *d++ = *s++;
+            n--;
+        }
+        bt_u32_t *dw = (bt_u32_t *)d;
+        const bt_u32_t *sw = (const bt_u32_t *)s;
+        while (n >= 4u) {
+            *dw++ = *sw++;
+            n -= 4u;
+        }
+        d = (uint8_t *)dw;
+        s = (const uint8_t *)sw;
+    }
+    while (n > 0u) {
+        *d++ = *s++;
+        n--;
+    }
+}
+
+static void bt_memcpy_to_em(void *dst, const void *src, uint32_t n)
+{
+    volatile uint8_t *d = (volatile uint8_t *)dst;
+    const uint8_t *s = (const uint8_t *)src;
+    if ((((uintptr_t)d ^ (uintptr_t)s) & 3u) == 0u) {
+        while (n > 0u && (((uintptr_t)d & 3u) != 0u)) {
+            *d++ = *s++;
+            n--;
+        }
+        volatile uint32_t *dw = (volatile uint32_t *)d;
+        const bt_u32_t *sw = (const bt_u32_t *)s;
+        while (n >= 4u) {
+            *dw++ = *sw++;
+            n -= 4u;
+        }
+        d = (volatile uint8_t *)dw;
+        s = (const uint8_t *)sw;
+    }
+    while (n > 0u) {
+        *d++ = *s++;
+        n--;
     }
 }
 
@@ -245,6 +317,10 @@ static void bt_heap_init(void)
 
 static void *bt_malloc(uint32_t size, uint8_t type)
 {
+    const uint32_t heap_bytes = (uint32_t)(BT_HEAP_WORDS * sizeof(uint32_t));
+    if (size > heap_bytes - (uint32_t)sizeof(bt_blk_hdr_t) - 7u) {
+        return 0;
+    }
     uint32_t aligned = ((size + 7u) & ~7u) + (uint32_t)sizeof(bt_blk_hdr_t);
     if (aligned < 16u) {
         aligned = 16u;
@@ -418,9 +494,13 @@ static uint8_t rf_txpwr_inc(uint8_t link_id)
     uint8_t cur     = cs[0x14];
     if (cur < max_pwr) {
         uint8_t nxt = (uint8_t)(cur + 1u);
-        if ((nxt & 1u) != 0u || nxt == max_pwr) {
-            cs[0x14] = nxt;
+        if ((nxt & 1u) == 0u && nxt < max_pwr) {
+            nxt = (uint8_t)(cur + 2u);
+            if (nxt > max_pwr) {
+                nxt = max_pwr;
+            }
         }
+        cs[0x14] = nxt;
         return 0u;
     }
     return 1u;
@@ -471,81 +551,122 @@ static void openfw_hci_tx_done_cb(uint8_t status)
 static void openfw_hci_tx_start(uint8_t type, uint8_t *buf, uint16_t len)
 {
     buf[-1] = type;
-    HCI_TL_ENV->tx_state = 0u;
     HCI_TL_ENV->ext_if->write(buf - 1, (uint32_t)len + 1u, openfw_hci_tx_done_cb);
 }
 
 static void openfw_hci_tx_next(void)
 {
     struct hci_tl_env_tag *env = HCI_TL_ENV;
-    struct ke_msg *msg = (struct ke_msg *)env->evt_queue.first;
-    if (msg != 0) {
-        env->tx_curr_type = HCI_EVT_MSG_TYPE;
-        openfw_hci_tx_start(HCI_EVT_MSG_TYPE, msg->param + msg->hci_hdr_offset, msg->hci_len);
-        return;
-    }
-    uint16_t max_frag = env->host_acl_data_pkt_len;
-    if (env->acl_tx_rem_len != 0u) {
-        env->acl_tx_hdr = (uint16_t)((env->acl_tx_hdr & 0x3FFFu) | 0x1000u);
-    } else {
-        msg = (struct ke_msg *)env->acl_queue.first;
-        if (!msg) {
+    uint8_t  tx_type = 0u;
+    uint8_t *tx_buf  = 0;
+    uint16_t tx_len  = 0u;
+
+    for (;;) {
+        struct ke_msg *bad_acl = 0;
+
+        bt_irq_lock();
+        if (env->tx_state != 1u) {
+            bt_irq_unlock();
             return;
         }
-        struct hci_acl_data_pkt *rx = (struct hci_acl_data_pkt *)msg->param;
-        if (!rx->buf_ptr) {
-            return;
+        struct ke_msg *msg = (struct ke_msg *)env->evt_queue.first;
+        if (msg != 0) {
+            env->tx_curr_type = HCI_EVT_MSG_TYPE;
+            env->tx_state     = 0u;
+            tx_type           = HCI_EVT_MSG_TYPE;
+            tx_buf            = msg->param + msg->hci_hdr_offset;
+            tx_len            = msg->hci_len;
+            bt_irq_unlock();
+            break;
         }
-        env->acl_tx_hdr      = (uint16_t)((rx->conhdl & 0x0FFFu) | ((uint16_t)rx->pb_bc_flag << 12));
-        env->acl_tx_frag_ptr = rx->buf_ptr;
-        env->acl_tx_rem_len  = rx->length;
+
+        uint16_t max_frag = env->host_acl_data_pkt_len;
+        if (max_frag == 0u) {
+            max_frag = 0xFFFFu;
+        }
+        if (env->acl_tx_rem_len != 0u) {
+            env->acl_tx_hdr = (uint16_t)((env->acl_tx_hdr & 0xCFFFu) | 0x1000u);
+        } else {
+            msg = (struct ke_msg *)env->acl_queue.first;
+            if (!msg) {
+                bt_irq_unlock();
+                return;
+            }
+            struct hci_acl_data_pkt *rx = (struct hci_acl_data_pkt *)msg->param;
+            if (!rx->buf_ptr) {
+                bad_acl = (struct ke_msg *)rom_co_list_pop_front(&env->acl_queue);
+                bt_irq_unlock();
+                if (bad_acl) {
+                    rom_ke_msg_free(bad_acl);
+                }
+                continue;
+            }
+            env->acl_tx_hdr      = (uint16_t)((rx->conhdl & 0x0FFFu) | ((uint16_t)(rx->pb_bc_flag & 0x0Fu) << 12));
+            env->acl_tx_frag_ptr = rx->buf_ptr;
+            env->acl_tx_rem_len  = rx->length;
+        }
+        uint16_t frag = env->acl_tx_rem_len;
+        if (frag > max_frag) {
+            env->acl_tx_rem_len = (uint16_t)(frag - max_frag);
+            frag = max_frag;
+        } else {
+            env->acl_tx_rem_len = 0u;
+        }
+        uint8_t *p = env->acl_tx_frag_ptr;
+        env->acl_tx_frag_ptr = p + frag;
+        p[-4] = (uint8_t)(env->acl_tx_hdr & 0xFFu);
+        p[-3] = (uint8_t)(env->acl_tx_hdr >> 8);
+        p[-2] = (uint8_t)(frag & 0xFFu);
+        p[-1] = (uint8_t)(frag >> 8);
+        env->tx_curr_type = HCI_ACL_MSG_TYPE;
+        env->tx_state     = 0u;
+        tx_type           = HCI_ACL_MSG_TYPE;
+        tx_buf            = p - 4;
+        tx_len            = (uint16_t)(frag + 4u);
+        bt_irq_unlock();
+        break;
     }
-    uint16_t frag = env->acl_tx_rem_len;
-    if (frag > max_frag) {
-        env->acl_tx_rem_len = (uint16_t)(frag - max_frag);
-        frag = max_frag;
-    } else {
-        env->acl_tx_rem_len = 0u;
-    }
-    uint8_t *p = env->acl_tx_frag_ptr;
-    env->acl_tx_frag_ptr = p + frag;
-    p[-4] = (uint8_t)(env->acl_tx_hdr & 0xFFu);
-    p[-3] = (uint8_t)(env->acl_tx_hdr >> 8);
-    p[-2] = (uint8_t)(frag & 0xFFu);
-    p[-1] = (uint8_t)(frag >> 8);
-    env->tx_curr_type = HCI_ACL_MSG_TYPE;
-    openfw_hci_tx_start(HCI_ACL_MSG_TYPE, p - 4, (uint16_t)(frag + 4u));
+
+    openfw_hci_tx_start(tx_type, tx_buf, tx_len);
 }
 
 static void openfw_hci_tx_kick(void)
 {
-    if (HCI_TL_ENV->tx_state == 1u) {
-        openfw_hci_tx_next();
-    }
+    openfw_hci_tx_next();
 }
 
 static void openfw_hci_tx_evt_cb(void)
 {
     rom_ke_event_clear(5u);
+    struct ke_msg *evt_to_free = 0;
+    struct ke_msg *acl_to_free = 0;
+    uint8_t       *em_to_free  = 0;
+
     bt_irq_lock();
     struct hci_tl_env_tag *env = HCI_TL_ENV;
     uint8_t type  = env->tx_curr_type;
     env->tx_state = 1u;
     if (type == HCI_EVT_MSG_TYPE) {
-        struct ke_msg *msg = (struct ke_msg *)rom_co_list_pop_front(&env->evt_queue);
-        if (msg) {
-            rom_ke_msg_free(msg);
-        }
+        evt_to_free = (struct ke_msg *)rom_co_list_pop_front(&env->evt_queue);
     } else if (env->acl_tx_rem_len == 0u) {
-        struct ke_msg *msg = (struct ke_msg *)rom_co_list_pop_front(&env->acl_queue);
-        if (msg) {
-            struct hci_acl_data_pkt *rx = (struct hci_acl_data_pkt *)msg->param;
-            rom_em_buf_rx_free(rx->buf_ptr);
-            rom_ke_msg_free(msg);
+        acl_to_free = (struct ke_msg *)rom_co_list_pop_front(&env->acl_queue);
+        if (acl_to_free) {
+            struct hci_acl_data_pkt *rx = (struct hci_acl_data_pkt *)acl_to_free->param;
+            em_to_free = rx->buf_ptr;
         }
     }
-    openfw_hci_tx_next();
     bt_irq_unlock();
+
+    if (evt_to_free) {
+        rom_ke_msg_free(evt_to_free);
+    }
+    if (acl_to_free) {
+        if (em_to_free) {
+            rom_em_buf_rx_free(em_to_free);
+        }
+        rom_ke_msg_free(acl_to_free);
+    }
+    openfw_hci_tx_next();
 }
 
 static uint16_t pack_cmd_cmp(uint8_t *msg, uint16_t opcode, uint8_t plen)
@@ -607,7 +728,9 @@ static int openfw_hci_default_handler(uint16_t msgid, void const *param,
     if (msgid == LC_HCI_ACL_DATA_RX) {
         msg[0x04] = HCI_ACL_MSG_TYPE;
         msg[0x05] = (uint8_t)(int8_t)-4;
+        bt_irq_lock();
         rom_co_list_push_back(HCI_ACL_Q, msg);
+        bt_irq_unlock();
         openfw_hci_tx_kick();
         return KE_MSG_NO_FREE;
     }
@@ -633,6 +756,8 @@ static int openfw_hci_default_handler(uint16_t msgid, void const *param,
 
     case 0xE0C9u:
     case 0xE43Bu: hdr_off = -5; hci_len = pack_cmd_status(msg, 0x0409u); break;
+    case 0xE0CAu:
+    case 0xE43Cu: hdr_off = -5; hci_len = pack_cmd_status(msg, 0x040Au); break;
     case 0xE43Au: hdr_off = -5; hci_len = pack_cmd_status(msg, 0x0406u); break;
 
     case 0xE0D2u:
@@ -690,12 +815,18 @@ static int openfw_hci_default_handler(uint16_t msgid, void const *param,
         break;
     }
     case 0xE462u: {
-        uint8_t n = p[0];
+        uint16_t param_len = ((const struct ke_msg *)msg)->param_len;
+        uint16_t max_n     = (param_len >= 2u) ? (uint16_t)((param_len - 2u) / 4u) : 0u;
+        uint8_t  n         = p[0];
+        if (n > max_n) {
+            n = (uint8_t)max_n;
+        }
+        if (n > 63u) {
+            n = 63u;
+        }
+        p[0] = n;
         if (n > 0u) {
-            uint16_t conhdl = rd_le16_unaligned(p + 2);
-            uint16_t nb     = rd_le16_unaligned(p + 4);
-            p[1] = (uint8_t)conhdl; p[2] = (uint8_t)(conhdl >> 8);
-            p[3] = (uint8_t)nb;     p[4] = (uint8_t)(nb >> 8);
+            bt_memmove(p + 1, p + 2, (uint32_t)n * 4u);
         }
         hci_len = pack_std_evt(msg, 0x13u, (uint8_t)(1u + 4u * n));
         break;
@@ -724,7 +855,9 @@ static int openfw_hci_default_handler(uint16_t msgid, void const *param,
     msg[0x04] = HCI_EVT_MSG_TYPE;
     msg[0x05] = (uint8_t)hdr_off;
     *(uint16_t *)(msg + 0x06) = hci_len;
+    bt_irq_lock();
     rom_co_list_push_back(HCI_EVT_Q, msg);
+    bt_irq_unlock();
     openfw_hci_tx_kick();
     return KE_MSG_NO_FREE;
 }
@@ -760,6 +893,7 @@ static const struct hci_cmd_map g_openfw_cmd_tbl[] = {
     { 0x0405u, 0xE004u,  14u },
     { 0x0406u, 0xE400u,   4u },
     { 0x0409u, 0xE006u,   7u },
+    { 0x040Au, 0xE007u,   7u },
     { 0x040Bu, 0xE008u,  22u },
     { 0x040Cu, 0xE009u,   6u },
     { 0x040Du, 0xE00Au,  23u },
@@ -772,13 +906,11 @@ static const struct hci_cmd_map g_openfw_cmd_tbl[] = {
 static int openfw_hci_send_cmd(uint16_t opcode, uint8_t param_len, const uint8_t *param)
 {
     struct hci_tl_env_tag *env = HCI_TL_ENV;
-    if (opcode != 0x0C35u) {
-        if (env->nb_h2c_cmd_pkts == 0u) {
-            return 0;
-        }
-        env->nb_h2c_cmd_pkts--;
+    if (opcode != 0x0C35u && env->nb_h2c_cmd_pkts == 0u) {
+        return 0;
     }
     if (opcode == 0x0C03u) {
+        env->nb_h2c_cmd_pkts--;
         rom_hci_cmd_cmp_evt_send(0xE07Au, TASK_HCI, TASK_LM, 0u);
         return 1;
     }
@@ -789,6 +921,9 @@ static int openfw_hci_send_cmd(uint16_t opcode, uint8_t param_len, const uint8_t
         uint16_t msg_id  = g_openfw_cmd_tbl[i].msg_id;
         uint16_t dest_id = (uint16_t)(msg_id >> 10);
         if (param_len == 0u && g_openfw_cmd_tbl[i].min_len == 0u) {
+            if (opcode != 0x0C35u) {
+                env->nb_h2c_cmd_pkts--;
+            }
             rom_ke_msg_send_basic(msg_id, dest_id, TASK_HCI);
             return 1;
         }
@@ -811,6 +946,9 @@ static int openfw_hci_send_cmd(uint16_t opcode, uint8_t param_len, const uint8_t
             }
             ((struct ke_msg *)(buf - 0x10))->dest_id = lc_task;
         }
+        if (opcode != 0x0C35u) {
+            env->nb_h2c_cmd_pkts--;
+        }
         rom_ke_msg_send(buf);
         return 1;
     }
@@ -820,8 +958,8 @@ static int openfw_hci_send_cmd(uint16_t opcode, uint8_t param_len, const uint8_t
 static int openfw_hci_send_acl(uint16_t conhdl, uint8_t pb_bc_flag, uint16_t len, const uint8_t *data)
 {
     uint16_t hdl = (uint16_t)(conhdl & 0x0FFFu);
-    if (len > 0x03FDu) {
-        len = 0x03FDu;
+    if (len > 0x03FDu || (len > 0u && !data)) {
+        return 0;
     }
     if (pb_bc_flag <= 3u && rom_hci_conhdl_type(hdl) != 1u) {
         return 0;
@@ -830,15 +968,18 @@ static int openfw_hci_send_acl(uint16_t conhdl, uint8_t pb_bc_flag, uint16_t len
     if (dest_id == 0xFFu) {
         return 0;
     }
-    uint8_t *em_buf = rom_em_buf_tx_alloc();
-    if (!em_buf) {
-        return 0;
-    }
-    bt_memcpy(em_buf, data, len);
     struct hci_acl_data_pkt *msg =
         (struct hci_acl_data_pkt *)rom_ke_msg_alloc(0xE426u, dest_id, TASK_HCI, (uint16_t)sizeof(*msg));
     if (!msg) {
         return 0;
+    }
+    uint8_t *em_buf = rom_em_buf_tx_alloc();
+    if (!em_buf) {
+        rom_ke_msg_free((struct ke_msg *)((uint8_t *)msg - 0x10));
+        return 0;
+    }
+    if (len > 0u) {
+        bt_memcpy_to_em(em_buf, data, len);
     }
     msg->conhdl     = hdl;
     msg->pb_bc_flag = pb_bc_flag;
@@ -1268,17 +1409,14 @@ static char               g_dev_name[16];
 static uint16_t           g_conhdl = 0u;
 static uint8_t            g_acl_connected = 0u;
 static uint32_t           g_pair_deadline_ms = 0u;
+static uint8_t            g_pair_deadline_set = 0u;
+static uint8_t            g_scan_discoverable = 0u;
 static uint8_t            g_pending_reboot_mode = 0u; /* 0=none, 1=reboot, 2=sd_ota, 3=dfu */
 static uint32_t           g_reboot_deadline_ms = 0u;
 static uint32_t           g_rx_acl_pkts = 0u;
 static uint32_t           g_tx_acl_pkts = 0u;
 static bt_link_key_slot_t g_key_cache[4];
 static uint8_t            g_key_next = 0u;
-
-/* 1-PDU staging slot so transient EM TX buffer pressure never drops an ACL frame */
-static uint16_t           g_pending_tx_len = 0u;
-static uint16_t           g_pending_tx_hdl = 0u;
-static uint8_t            g_pending_tx_pdu[BT_SPP_TX_MAX_PDU];
 
 static int mem_eq6(const uint8_t a[6], const uint8_t b[6])
 {
@@ -1300,35 +1438,46 @@ static const bt_link_key_slot_t *find_link_key(const uint8_t bd[6])
     return 0;
 }
 
-static void save_link_keys_to_sd(void)
+static void save_root_file_atomic(const char *tmp_name, const char *final_name,
+                                  const void *data, uint32_t len)
 {
     if (!g_sd_mounted || !g_vol) {
         return;
-    }
-    exfat_entry_t existing;
-    if (exfat_find_path(g_vol, "/bt_keys.bin", &existing) == 0 && !existing.is_dir) {
-        (void)exfat_delete_file(g_vol, "/", "bt_keys.bin");
     }
     rtc_datetime_t dt;
     rtc_get(&dt);
     exfat_set_timestamp(g_vol, rtc_to_dos_timestamp(&dt));
 
+    (void)exfat_delete_file(g_vol, "/", tmp_name);
     exfat_writer_t w;
-    if (exfat_create_file(g_vol, "/", "bt_keys.bin", &w) == 0) {
-        uint8_t blob[96];
-        blob[0] = 'B';
-        blob[1] = 'L';
-        blob[2] = 'K';
-        blob[3] = '1';
-        for (uint32_t i = 0u; i < 4u; i++) {
-            uint32_t off = 4u + i * 23u;
-            blob[off] = g_key_cache[i].valid ? 1u : 0u;
-            bt_memcpy(&blob[off + 1u], g_key_cache[i].bd, 6u);
-            bt_memcpy(&blob[off + 7u], g_key_cache[i].key, 16u);
+    if (exfat_create_file(g_vol, "/", tmp_name, &w) == 0) {
+        int wrc = exfat_write(&w, data, len);
+        int crc = exfat_close_file(&w);
+        if (wrc == 0 && crc == 0 &&
+            exfat_replace_file(g_vol, "/", tmp_name, final_name) == 0) {
+            return;
         }
-        (void)exfat_write(&w, blob, (uint32_t)sizeof(blob));
-        (void)exfat_close_file(&w);
+        (void)exfat_delete_file(g_vol, "/", tmp_name);
     }
+}
+
+static void save_link_keys_to_sd(void)
+{
+    if (!g_sd_mounted || !g_vol) {
+        return;
+    }
+    uint8_t blob[96];
+    blob[0] = 'B';
+    blob[1] = 'L';
+    blob[2] = 'K';
+    blob[3] = '1';
+    for (uint32_t i = 0u; i < 4u; i++) {
+        uint32_t off = 4u + i * 23u;
+        blob[off] = g_key_cache[i].valid ? 1u : 0u;
+        bt_memcpy(&blob[off + 1u], g_key_cache[i].bd, 6u);
+        bt_memcpy(&blob[off + 7u], g_key_cache[i].key, 16u);
+    }
+    save_root_file_atomic(".bt_keys.tmp", "bt_keys.bin", blob, (uint32_t)sizeof(blob));
 }
 
 static void load_link_keys_from_sd(void)
@@ -1407,7 +1556,9 @@ static void hci_advance_init(uint16_t opcode)
         (void)openfw_hci_send_cmd(0x0C56u, 1u, &ssp);
     } else if (opcode == 0x0C56u && g_hci_stage == HCI_ST_WAIT_SSP) {
         g_hci_stage = HCI_ST_WAIT_SCAN;
-        hci_send_scan_enable(0x02u); /* Page Scan only until user opens 60s pairing */
+        uint8_t scan_mode = g_xrec.pair_active ? 0x03u : 0x02u;
+        g_scan_discoverable = g_xrec.pair_active ? 1u : 0u;
+        hci_send_scan_enable(scan_mode);
     } else if (opcode == 0x0C1Au && g_hci_stage == HCI_ST_WAIT_SCAN) {
         g_hci_stage = HCI_ST_READY;
         openfw_log_puts("BT HCI READY\n");
@@ -1474,9 +1625,8 @@ static void handle_hci_event(const uint8_t *evt, uint32_t len)
             openfw_log_hex(evt[5]);
             openfw_log_putc('\n');
             if (!g_acl_connected || hdl == g_conhdl) {
-                g_acl_connected  = 0u;
-                g_conhdl         = 0u;
-                g_pending_tx_len = 0u;
+                g_acl_connected = 0u;
+                g_conhdl        = 0u;
                 bt_spp_reset_link(&g_spp, 0u);
                 xrec_on_disconnect(&g_xrec);
             }
@@ -1652,32 +1802,22 @@ static void xrec_cb_on_bound_key(void *user, const uint8_t key[32])
 {
     (void)user;
     openfw_log_puts("BT XREC PAIRED\n");
-    g_pair_deadline_ms = 0u;
-    if (g_hci_stage == HCI_ST_READY) {
+    g_pair_deadline_set = 0u;
+    g_pair_deadline_ms  = 0u;
+    if (g_hci_stage == HCI_ST_READY && g_scan_discoverable) {
+        g_scan_discoverable = 0u;
         hci_send_scan_enable(0x02u); /* Disable Inquiry Scan once paired */
     }
     if (!g_sd_mounted || !g_vol) {
         return;
     }
-    exfat_entry_t existing;
-    if (exfat_find_path(g_vol, "/cassini.key", &existing) == 0 && !existing.is_dir) {
-        (void)exfat_delete_file(g_vol, "/", "cassini.key");
-    }
-    rtc_datetime_t dt;
-    rtc_get(&dt);
-    exfat_set_timestamp(g_vol, rtc_to_dos_timestamp(&dt));
-
-    exfat_writer_t w;
-    if (exfat_create_file(g_vol, "/", "cassini.key", &w) == 0) {
-        uint8_t blob[36];
-        blob[0] = 'C';
-        blob[1] = 'S';
-        blob[2] = 'K';
-        blob[3] = '5';
-        bt_memcpy(&blob[4], key, 32u);
-        (void)exfat_write(&w, blob, (uint32_t)sizeof(blob));
-        (void)exfat_close_file(&w);
-    }
+    uint8_t blob[36];
+    blob[0] = 'C';
+    blob[1] = 'S';
+    blob[2] = 'K';
+    blob[3] = '5';
+    bt_memcpy(&blob[4], key, 32u);
+    save_root_file_atomic(".cassini.tmp", "cassini.key", blob, (uint32_t)sizeof(blob));
 }
 
 static void xrec_cb_on_reboot(void *user)
@@ -1785,6 +1925,12 @@ static int xrec_cb_audio_cfg(void *user, int set, uint8_t *dsp_profile,
     return 0;
 }
 
+static uint16_t xrec_cb_get_mtu(void *user)
+{
+    (void)user;
+    return bt_spp_get_mtu(&g_spp);
+}
+
 static int xrec_cb_rec_start(void *user, const char *opt_name, char *out_name, uint32_t out_max)
 {
     (void)user;
@@ -1890,19 +2036,21 @@ int bt_xrec_start(exfat_vol_t *vol, int sd_mounted)
         xrec_cb_reset_log,
         xrec_cb_on_dfu,
         xrec_cb_audio_cfg,
+        xrec_cb_get_mtu,
     };
 
-    g_vol              = vol;
-    g_sd_mounted       = sd_mounted;
-    g_conhdl           = 0u;
-    g_acl_connected    = 0u;
-    g_pair_deadline_ms = 0u;
+    g_vol                 = vol;
+    g_sd_mounted          = sd_mounted;
+    g_conhdl              = 0u;
+    g_acl_connected       = 0u;
+    g_pair_deadline_ms    = 0u;
+    g_pair_deadline_set   = 0u;
+    g_scan_discoverable   = 0u;
     g_pending_reboot_mode = 0u;
     g_reboot_deadline_ms  = 0u;
-    g_rx_acl_pkts      = 0u;
-    g_tx_acl_pkts      = 0u;
-    g_pending_tx_len   = 0u;
-    g_prng_state      ^= (uint32_t)us_timer_now() ^ pmu_read_vbat_mv();
+    g_rx_acl_pkts         = 0u;
+    g_tx_acl_pkts         = 0u;
+    g_prng_state         ^= (uint32_t)us_timer_now() ^ pmu_read_vbat_mv();
 
     derive_local_bd_addr_and_name();
     openfw_log_puts("BT start: ");
@@ -1939,8 +2087,10 @@ void bt_xrec_open_pairing(uint32_t duration_ms)
     }
 
     xrec_open_pairing(&g_xrec, pin);
-    g_pair_deadline_ms = millis() + (duration_ms ? duration_ms : 60000u);
+    g_pair_deadline_ms  = millis() + (duration_ms ? duration_ms : 60000u);
+    g_pair_deadline_set = 1u;
     if (g_hci_stage == HCI_ST_READY) {
+        g_scan_discoverable = 1u;
         hci_send_scan_enable(0x03u); /* Inquiry Scan + Page Scan */
     }
 }
@@ -1954,38 +2104,38 @@ void bt_xrec_poll(void)
     bt_irq_bh_poll();
     bt_ke_event_schedule();
 
-    if (g_xrec.pair_active && g_pair_deadline_ms != 0u &&
+    if (g_xrec.pair_active && g_pair_deadline_set &&
         (int32_t)(millis() - g_pair_deadline_ms) >= 0) {
         xrec_close_pairing(&g_xrec);
-        g_pair_deadline_ms = 0u;
-        if (g_hci_stage == HCI_ST_READY) {
-            hci_send_scan_enable(0x02u);
-        }
+        g_pair_deadline_set = 0u;
+        g_pair_deadline_ms  = 0u;
+    }
+    if (!g_xrec.pair_active && g_scan_discoverable && g_hci_stage == HCI_ST_READY) {
+        g_scan_discoverable = 0u;
+        g_pair_deadline_set = 0u;
+        g_pair_deadline_ms  = 0u;
+        hci_send_scan_enable(0x02u);
     }
 
     xrec_poll(&g_xrec);
 
-    if (g_pending_tx_len > 0u) {
-        if (!openfw_hci_send_acl(g_pending_tx_hdl, 0x02u, g_pending_tx_len, g_pending_tx_pdu)) {
-            return;
-        }
-        g_tx_acl_pkts++;
-        g_pending_tx_len = 0u;
-    }
-
     uint16_t conhdl = 0u;
-    uint16_t plen;
-    while ((plen = bt_spp_pop_acl_tx(&g_spp, &conhdl, g_pending_tx_pdu,
-                                     (uint16_t)sizeof(g_pending_tx_pdu))) > 0u) {
-        if (!openfw_hci_send_acl(conhdl, 0x02u, plen, g_pending_tx_pdu)) {
-            g_pending_tx_hdl = conhdl;
-            g_pending_tx_len = plen;
+    uint16_t plen   = 0u;
+    const uint8_t *pdu;
+    int sent_any = 0;
+    while ((pdu = bt_spp_peek_acl_tx(&g_spp, &conhdl, &plen)) != 0) {
+        if (!openfw_hci_send_acl(conhdl, 0x02u, plen, pdu)) {
             break;
         }
+        bt_spp_consume_acl_tx(&g_spp);
         g_tx_acl_pkts++;
+        sent_any = 1;
+    }
+    if (sent_any) {
+        bt_ke_event_schedule();
     }
 
-    if (g_pending_reboot_mode != 0u && g_pending_tx_len == 0u &&
+    if (g_pending_reboot_mode != 0u && bt_spp_peek_acl_tx(&g_spp, 0, 0) == 0 &&
         (int32_t)(millis() - g_reboot_deadline_ms) >= 0) {
         uint8_t mode = g_pending_reboot_mode;
         g_pending_reboot_mode = 0u;
@@ -2015,8 +2165,9 @@ void bt_xrec_stop(void)
     g_hci_stage           = HCI_ST_IDLE;
     g_acl_connected       = 0u;
     g_conhdl              = 0u;
-    g_pending_tx_len      = 0u;
     g_pair_deadline_ms    = 0u;
+    g_pair_deadline_set   = 0u;
+    g_scan_discoverable   = 0u;
     g_pending_reboot_mode = 0u;
     g_reboot_deadline_ms  = 0u;
     xrec_close_pairing(&g_xrec);

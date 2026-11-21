@@ -6,11 +6,24 @@
 #include "openfw_xrec.h"
 #include "openfw_crypto.h"
 
+typedef uint32_t __attribute__((may_alias)) xrec_u32_t;
+
 static void mem_zero(void *dst, uint32_t n)
 {
     uint8_t *d = (uint8_t *)dst;
-    for (uint32_t i = 0u; i < n; i++) {
-        d[i] = 0u;
+    while (n > 0u && (((uintptr_t)d & 3u) != 0u)) {
+        *d++ = 0u;
+        n--;
+    }
+    xrec_u32_t *dw = (xrec_u32_t *)d;
+    while (n >= 4u) {
+        *dw++ = 0u;
+        n -= 4u;
+    }
+    d = (uint8_t *)dw;
+    while (n > 0u) {
+        *d++ = 0u;
+        n--;
     }
 }
 
@@ -18,8 +31,23 @@ static void mem_copy(void *dst, const void *src, uint32_t n)
 {
     uint8_t *d = (uint8_t *)dst;
     const uint8_t *s = (const uint8_t *)src;
-    for (uint32_t i = 0u; i < n; i++) {
-        d[i] = s[i];
+    if ((((uintptr_t)d ^ (uintptr_t)s) & 3u) == 0u) {
+        while (n > 0u && (((uintptr_t)d & 3u) != 0u)) {
+            *d++ = *s++;
+            n--;
+        }
+        xrec_u32_t *dw = (xrec_u32_t *)d;
+        const xrec_u32_t *sw = (const xrec_u32_t *)s;
+        while (n >= 4u) {
+            *dw++ = *sw++;
+            n -= 4u;
+        }
+        d = (uint8_t *)dw;
+        s = (const uint8_t *)sw;
+    }
+    while (n > 0u) {
+        *d++ = *s++;
+        n--;
     }
 }
 
@@ -64,7 +92,11 @@ static int parse_u32_step(const char **pp, uint32_t *out)
     }
     uint32_t v = 0u;
     while (*p >= '0' && *p <= '9') {
-        v = v * 10u + (uint32_t)(*p - '0');
+        uint32_t d = (uint32_t)(*p - '0');
+        if (v > (0xFFFFFFFFu - d) / 10u) {
+            return -1;
+        }
+        v = v * 10u + d;
         p++;
     }
     *pp  = p;
@@ -89,7 +121,11 @@ static int hex_nibble(char c)
 static int decode_hex(const char *s, uint8_t *out, uint32_t bytes_cnt)
 {
     for (uint32_t i = 0u; i < bytes_cnt; i++) {
-        int hi = hex_nibble(s[i * 2u]);
+        char c_hi = s[i * 2u];
+        if (c_hi == '\0') {
+            return -1;
+        }
+        int hi = hex_nibble(c_hi);
         int lo = hex_nibble(s[i * 2u + 1u]);
         if (hi < 0 || lo < 0) {
             return -1;
@@ -169,10 +205,17 @@ static int is_safe_filename(const char *s)
     }
     uint32_t n = 0u;
     while (s[n] != '\0') {
-        if (s[n] == '/' || s[n] == '\\' || (uint8_t)s[n] < 0x20u || n >= 79u) {
+        uint8_t ch = (uint8_t)s[n];
+        if (ch < 0x20u || ch == 0x7Fu ||
+            ch == '/' || ch == '\\' || ch == ':' || ch == '*' ||
+            ch == '?' || ch == '"'  || ch == '<' || ch == '>' || ch == '|' ||
+            n >= (EXFAT_MAX_NAME - 1u)) {
             return 0;
         }
         n++;
+    }
+    if (s[n - 1u] == '.' || s[n - 1u] == ' ') {
+        return 0;
     }
     return 1;
 }
@@ -180,6 +223,7 @@ static int is_safe_filename(const char *s)
 typedef struct {
     xrec_ctx_t *ctx;
     char        buf[512];
+    int         buf_cap;
     int         pos;
     uint32_t    seen_files;
     uint32_t    batch_files;
@@ -204,7 +248,7 @@ static int ls_flush(ls_ctx_t *lc)
 
 static int ls_append(ls_ctx_t *lc, const char *line, int len, int is_file_entry)
 {
-    if ((lc->pos + len) > (int)sizeof(lc->buf)) {
+    if (lc->pos > 0 && (lc->pos + len) > lc->buf_cap) {
         if (ls_flush(lc) != 0) {
             return -1;
         }
@@ -263,17 +307,28 @@ static void handle_pair(xrec_ctx_t *ctx, const char *args)
         send_err(ctx, "PAIRCLOSED");
         return;
     }
-    /* Expect <6-digit-pin>,<64-hex-key> */
-    int pin_ok = 1;
-    for (int i = 0; i < 6; i++) {
-        if (args[i] < '0' || args[i] > '9' || args[i] != ctx->pair_pin[i]) {
+    /* Expect <6-digit-pin>,<64-hex-key> without reading past NUL */
+    uint32_t alen = 0u;
+    while (args[alen] != '\0' && alen < 7u) {
+        alen++;
+    }
+    int pin_ok = (alen == 7u && args[6] == ',') ? 1 : 0;
+    if (pin_ok) {
+        uint8_t diff = 0u;
+        for (int i = 0; i < 6; i++) {
+            if (args[i] < '0' || args[i] > '9') {
+                pin_ok = 0;
+            }
+            diff |= (uint8_t)(args[i] ^ ctx->pair_pin[i]);
+        }
+        if (diff != 0u) {
             pin_ok = 0;
         }
     }
-    if (!pin_ok || args[6] != ',') {
+    if (!pin_ok) {
         ctx->pair_fails++;
         if (ctx->pair_fails >= 5u) {
-            ctx->pair_active = 0u;
+            xrec_close_pairing(ctx);
         }
         send_err(ctx, "PIN");
         return;
@@ -284,10 +339,10 @@ static void handle_pair(xrec_ctx_t *ctx, const char *args)
         return;
     }
     mem_copy(ctx->key, new_key, 32u);
-    ctx->bound       = 1u;
-    ctx->auth        = 1u;
-    ctx->pair_active = 0u;
-    ctx->pair_fails  = 0u;
+    ctx->bound      = 1u;
+    ctx->auth       = 1u;
+    ctx->pair_fails = 0u;
+    xrec_close_pairing(ctx);
     if (ctx->ops.on_bound_key) {
         ctx->ops.on_bound_key(ctx->user, ctx->key);
     }
@@ -422,6 +477,15 @@ static void handle_rtc(xrec_ctx_t *ctx, const char *args)
         send_err(ctx, "RTCRNG");
         return;
     }
+    static const uint8_t mdays[12] = { 31u, 28u, 31u, 30u, 31u, 30u, 31u, 31u, 30u, 31u, 30u, 31u };
+    uint32_t max_d = mdays[m - 1u];
+    if (m == 2u && (y % 4u == 0u) && ((y % 100u != 0u) || (y % 400u == 0u))) {
+        max_d = 29u;
+    }
+    if (d > max_d) {
+        send_err(ctx, "RTCRNG");
+        return;
+    }
     xrec_rtc_t rt = {
         (uint16_t)y, (uint8_t)m, (uint8_t)d,
         (uint8_t)hh, (uint8_t)mm, (uint8_t)ss, (uint8_t)wd
@@ -441,6 +505,13 @@ static void xrec_poll_ls(xrec_ctx_t *ctx)
     }
     ls_ctx_t lc;
     lc.ctx         = ctx;
+    lc.buf_cap     = (int)sizeof(lc.buf);
+    if (ctx->ops.get_mtu) {
+        uint16_t mtu = ctx->ops.get_mtu(ctx->user);
+        if (mtu >= 64u && (int)mtu < lc.buf_cap) {
+            lc.buf_cap = (int)mtu;
+        }
+    }
     lc.pos         = 0;
     lc.seen_files  = 0u;
     lc.batch_files = 0u;
@@ -471,6 +542,9 @@ static void handle_ls(xrec_ctx_t *ctx)
         send_err(ctx, "NOSD");
         return;
     }
+    /* Stop any active GETS stream so binary frames never interleave with LS text */
+    ctx->gets_active = 0u;
+    ctx->gets_staged = 0u;
     ctx->ls_active   = 1u;
     ctx->ls_sent_cnt = 0u;
     ctx->ls_has_dir  = 0u;
@@ -510,6 +584,18 @@ static void handle_get_common(xrec_ctx_t *ctx, const char *args, int is_stream)
         chunk = tot;
     }
 
+    if (ctx->ops.get_mtu) {
+        uint16_t mtu = ctx->ops.get_mtu(ctx->user);
+        if (mtu > 12u) {
+            uint32_t max_payload = (uint32_t)(mtu - 12u);
+            if (chunk > max_payload) {
+                chunk = max_payload;
+            }
+        } else if (mtu > 0u) {
+            chunk = 1u;
+        }
+    }
+
     if (!is_safe_filename(p)) {
         send_err(ctx, "NAME");
         return;
@@ -526,9 +612,12 @@ static void handle_get_common(xrec_ctx_t *ctx, const char *args, int is_stream)
         return;
     }
 
+    /* Stop any active LS stream so text lines never interleave with binary GETS frames */
+    ctx->ls_active      = 0u;
     ctx->gets_offset    = off;
     ctx->gets_rem       = tot;
     ctx->gets_chunk_max = (uint16_t)chunk;
+    ctx->gets_staged    = 0u;
     ctx->gets_active    = 1u;
     xrec_poll(ctx);
 }
@@ -629,7 +718,7 @@ static void handle_put_complete(xrec_ctx_t *ctx)
         return;
     }
 
-    uint16_t crc = openfw_crc16_ccitt_false(ctx->put_buf, ctx->put_len);
+    uint16_t crc = openfw_crc16_ccitt_false(ctx->xfer.put_buf, ctx->put_len);
     if (crc != ctx->put_crc) {
         send_err(ctx, "CRC");
         return;
@@ -640,7 +729,7 @@ static void handle_put_complete(xrec_ctx_t *ctx)
             send_err(ctx, "UNSUP");
             return;
         }
-        if (ctx->ops.exp_write(ctx->user, ctx->put_offset, ctx->put_buf, ctx->put_len) != 0) {
+        if (ctx->ops.exp_write(ctx->user, ctx->put_offset, ctx->xfer.put_buf, ctx->put_len) != 0) {
             send_err(ctx, "ARG");
             return;
         }
@@ -699,7 +788,14 @@ static void handle_put_complete(xrec_ctx_t *ctx)
         return;
     }
 
-    if (exfat_write(&ctx->put_writer, ctx->put_buf, ctx->put_len) != 0) {
+    if (ctx->put_written > (0xFFFFFFFFu - (uint32_t)ctx->put_len)) {
+        abort_staged_put(ctx);
+        send_err(ctx, "OFF");
+        return;
+    }
+
+    if (exfat_write(&ctx->put_writer, ctx->xfer.put_buf, ctx->put_len) != 0) {
+        abort_staged_put(ctx);
         send_err(ctx, "SDIO");
         return;
     }
@@ -916,28 +1012,28 @@ static void handle_log_cmd(xrec_ctx_t *ctx, const char *args)
         req = 512u;
     }
 
-    uint8_t frame[576];
-    uint8_t tmp[512];
+    /* Read log payload directly into &frame[64] and prepend header in-place (no tmp[512]) */
+    uint8_t frame[64u + 512u];
     uint32_t widx   = 0u;
-    uint32_t actual = ctx->ops.read_log(ctx->user, off, tmp, req, &widx);
+    uint32_t actual = ctx->ops.read_log(ctx->user, off, &frame[64], req, &widx);
     if (actual > 512u) {
         actual = 512u;
     }
 
-    int pos = 0;
-    append_str((char *)frame, &pos, (int)sizeof(frame), "+XREC:LOG,");
-    append_u32((char *)frame, &pos, (int)sizeof(frame), off);
-    append_str((char *)frame, &pos, (int)sizeof(frame), ",");
-    append_u32((char *)frame, &pos, (int)sizeof(frame), actual);
-    append_str((char *)frame, &pos, (int)sizeof(frame), ",");
-    append_u32((char *)frame, &pos, (int)sizeof(frame), widx);
-    append_str((char *)frame, &pos, (int)sizeof(frame), ":");
-    if (actual > 0u && (uint32_t)pos + actual <= sizeof(frame)) {
-        mem_copy(&frame[pos], tmp, actual);
-        pos += (int)actual;
-    }
+    char hdr[64];
+    int hlen = 0;
+    append_str(hdr, &hlen, (int)sizeof(hdr), "+XREC:LOG,");
+    append_u32(hdr, &hlen, (int)sizeof(hdr), off);
+    append_str(hdr, &hlen, (int)sizeof(hdr), ",");
+    append_u32(hdr, &hlen, (int)sizeof(hdr), actual);
+    append_str(hdr, &hlen, (int)sizeof(hdr), ",");
+    append_u32(hdr, &hlen, (int)sizeof(hdr), widx);
+    append_str(hdr, &hlen, (int)sizeof(hdr), ":");
+
+    uint8_t *start = &frame[64u - (uint32_t)hlen];
+    mem_copy(start, hdr, (uint32_t)hlen);
     if (ctx->ops.send) {
-        (void)ctx->ops.send(ctx->user, frame, (uint16_t)pos);
+        (void)ctx->ops.send(ctx->user, start, (uint16_t)((uint32_t)hlen + actual));
     }
 }
 
@@ -993,6 +1089,9 @@ static void try_start_put_header(xrec_ctx_t *ctx)
         return;
     }
 
+    /* PUT binary buffer shares union storage with GETS staged frame */
+    ctx->gets_active = 0u;
+    ctx->gets_staged = 0u;
     ctx->put_active  = 1u;
     ctx->put_auth_ok = ctx->auth;
     ctx->put_target  = target;
@@ -1118,6 +1217,7 @@ void xrec_close_pairing(xrec_ctx_t *ctx)
 {
     if (ctx) {
         ctx->pair_active = 0u;
+        mem_zero(ctx->pair_pin, sizeof(ctx->pair_pin));
     }
 }
 
@@ -1132,7 +1232,9 @@ void xrec_on_disconnect(xrec_ctx_t *ctx)
     ctx->auth               = 0u;
     ctx->chal_active        = 0u;
     ctx->rx_len             = 0u;
+    ctx->rx_overflow        = 0u;
     ctx->gets_active        = 0u;
+    ctx->gets_staged        = 0u;
     ctx->ls_active          = 0u;
     ctx->ls_has_dir         = 0u;
     ctx->ls_sent_cnt        = 0u;
@@ -1152,25 +1254,40 @@ void xrec_on_rx(xrec_ctx_t *ctx, const uint8_t *data, uint16_t len)
     if (!ctx || !data) {
         return;
     }
-    for (uint16_t i = 0u; i < len; i++) {
+    uint16_t i = 0u;
+    while (i < len) {
         if (ctx->put_active) {
-            ctx->put_buf[ctx->put_got++] = data[i];
+            uint16_t need  = (uint16_t)(ctx->put_len - ctx->put_got);
+            uint16_t avail = (uint16_t)(len - i);
+            uint16_t take  = (avail < need) ? avail : need;
+            mem_copy(&ctx->xfer.put_buf[ctx->put_got], &data[i], take);
+            ctx->put_got = (uint16_t)(ctx->put_got + take);
+            i            = (uint16_t)(i + take);
             if (ctx->put_got >= ctx->put_len) {
                 ctx->put_active = 0u;
                 handle_put_complete(ctx);
             }
             continue;
         }
-        char c = (char)data[i];
+        char c = (char)data[i++];
         if (c == '\n') {
             continue;
         }
         if (c == '\r') {
+            if (ctx->rx_overflow) {
+                ctx->rx_overflow = 0u;
+                ctx->rx_len      = 0u;
+                send_err(ctx, "LINE");
+                continue;
+            }
             ctx->rx_line[ctx->rx_len] = '\0';
             if (ctx->rx_len > 0u) {
                 process_line(ctx, ctx->rx_line);
             }
             ctx->rx_len = 0u;
+            continue;
+        }
+        if (ctx->rx_overflow) {
             continue;
         }
         if (c == ':' && ctx->rx_len >= 14u && str_starts_with(ctx->rx_line, "+XREC:PUT,")) {
@@ -1179,6 +1296,8 @@ void xrec_on_rx(xrec_ctx_t *ctx, const uint8_t *data, uint16_t len)
         }
         if (ctx->rx_len < (XREC_RX_LINE_MAX - 1u)) {
             ctx->rx_line[ctx->rx_len++] = c;
+        } else {
+            ctx->rx_overflow = 1u;
         }
     }
 }
@@ -1190,43 +1309,60 @@ void xrec_poll(xrec_ctx_t *ctx)
     }
     if (ctx->ls_active) {
         xrec_poll_ls(ctx);
+        return;
     }
-    if (!ctx->gets_active) {
+    if (!ctx->gets_active || ctx->put_active) {
         return;
     }
 
-    uint8_t frame[12u + XREC_MAX_CHUNK];
     while (ctx->gets_active && ctx->gets_rem > 0u) {
-        uint32_t want = (ctx->gets_rem < ctx->gets_chunk_max) ? ctx->gets_rem : ctx->gets_chunk_max;
-        uint32_t got  = 0u;
-        if (exfat_read_file(ctx->vol, &ctx->gets_file, (uint64_t)ctx->gets_offset,
-                            &frame[12], want, &got) != 0) {
-            ctx->gets_active = 0u;
-            send_err(ctx, "SDIO");
-            return;
+        if (!ctx->gets_staged) {
+            uint32_t want = (ctx->gets_rem < ctx->gets_chunk_max) ? ctx->gets_rem : ctx->gets_chunk_max;
+            uint32_t max_off_rem = 0xFFFFFFFFu - ctx->gets_offset;
+            if (want > max_off_rem) {
+                want = max_off_rem;
+            }
+            uint32_t got = 0u;
+            if (want > 0u &&
+                exfat_read_file(ctx->vol, &ctx->gets_file, (uint64_t)ctx->gets_offset,
+                                &ctx->xfer.gets_frame[12], want, &got) != 0) {
+                ctx->gets_active = 0u;
+                ctx->gets_staged = 0u;
+                send_err(ctx, "SDIO");
+                return;
+            }
+
+            uint16_t crc = openfw_crc16_ccitt_false(&ctx->xfer.gets_frame[12], got);
+            ctx->xfer.gets_frame[0]  = 'X';
+            ctx->xfer.gets_frame[1]  = 'R';
+            ctx->xfer.gets_frame[2]  = 'E';
+            ctx->xfer.gets_frame[3]  = 'C';
+            ctx->xfer.gets_frame[4]  = (uint8_t)(ctx->gets_offset);
+            ctx->xfer.gets_frame[5]  = (uint8_t)(ctx->gets_offset >> 8);
+            ctx->xfer.gets_frame[6]  = (uint8_t)(ctx->gets_offset >> 16);
+            ctx->xfer.gets_frame[7]  = (uint8_t)(ctx->gets_offset >> 24);
+            ctx->xfer.gets_frame[8]  = (uint8_t)(got);
+            ctx->xfer.gets_frame[9]  = (uint8_t)(got >> 8);
+            ctx->xfer.gets_frame[10] = (uint8_t)(crc);
+            ctx->xfer.gets_frame[11] = (uint8_t)(crc >> 8);
+
+            ctx->gets_staged     = 1u;
+            ctx->gets_staged_len = (uint16_t)got;
+            ctx->gets_staged_eof = (uint8_t)((got < want || got >= ctx->gets_rem ||
+                                              got >= max_off_rem) ? 1u : 0u);
         }
 
-        uint16_t crc = openfw_crc16_ccitt_false(&frame[12], got);
-        frame[0]  = 'X';
-        frame[1]  = 'R';
-        frame[2]  = 'E';
-        frame[3]  = 'C';
-        frame[4]  = (uint8_t)(ctx->gets_offset);
-        frame[5]  = (uint8_t)(ctx->gets_offset >> 8);
-        frame[6]  = (uint8_t)(ctx->gets_offset >> 16);
-        frame[7]  = (uint8_t)(ctx->gets_offset >> 24);
-        frame[8]  = (uint8_t)(got);
-        frame[9]  = (uint8_t)(got >> 8);
-        frame[10] = (uint8_t)(crc);
-        frame[11] = (uint8_t)(crc >> 8);
-
-        if (ctx->ops.send(ctx->user, frame, (uint16_t)(12u + got)) != 0) {
-            /* Transport busy/no credits: retry on next poll without advancing offset */
+        if (ctx->ops.send(ctx->user, ctx->xfer.gets_frame,
+                          (uint16_t)(12u + ctx->gets_staged_len)) != 0) {
+            /* Transport busy/no credits: retain staged frame and retry on next poll */
             return;
         }
-        ctx->gets_offset += got;
-        ctx->gets_rem    -= got;
-        if (got < want || ctx->gets_rem == 0u) {
+        uint32_t sent = ctx->gets_staged_len;
+        uint8_t  eof  = ctx->gets_staged_eof;
+        ctx->gets_staged  = 0u;
+        ctx->gets_offset += sent;
+        ctx->gets_rem    -= sent;
+        if (eof || ctx->gets_rem == 0u) {
             ctx->gets_active = 0u;
         }
     }

@@ -1523,6 +1523,12 @@ static int mock_xrec_send(void *user, const uint8_t *data, uint16_t len)
     return bt_spp_send(sp->spp, data, len);
 }
 
+static uint16_t mock_xrec_get_mtu(void *user)
+{
+    sim_phone_t *sp = (sim_phone_t *)user;
+    return bt_spp_get_mtu(sp->spp);
+}
+
 static void mock_xrec_get_stat(void *user, xrec_stat_t *out)
 {
     (void)user;
@@ -1686,6 +1692,27 @@ static void drain_acl_to_phone(bt_spp_t *spp, sim_phone_t *sp)
     }
 }
 
+typedef struct {
+    uint32_t read_calls;
+    int      fail_writes;
+} xrec_disk_stats_t;
+
+static int xrec_count_read_sectors(void *ctx, uint32_t lba, uint32_t count, void *buf)
+{
+    xrec_disk_stats_t *st = (xrec_disk_stats_t *)ctx;
+    st->read_calls++;
+    return mem_read_sectors(NULL, lba, count, buf);
+}
+
+static int xrec_count_write_sectors(void *ctx, uint32_t lba, uint32_t count, const void *buf)
+{
+    xrec_disk_stats_t *st = (xrec_disk_stats_t *)ctx;
+    if (st->fail_writes) {
+        return -1;
+    }
+    return mem_write_sectors(NULL, lba, count, buf);
+}
+
 static void test_bt_spp_and_xrec(void)
 {
     /* Prepare clean exFAT volume in g_disk with /record/REC_0001.wav + EXACT960.wav + 8 extra files */
@@ -1721,7 +1748,8 @@ static void test_bt_spp_and_xrec(void)
     put_le64(bmp_ent + 24u, 8u);
     g_disk[21u * 512u] = 0x03u;
 
-    blkdev_t dev = { mem_read_sectors, mem_write_sectors, MEM_DISK_SECTORS, NULL };
+    xrec_disk_stats_t dstats = { 0u, 0 };
+    blkdev_t dev = { xrec_count_read_sectors, xrec_count_write_sectors, MEM_DISK_SECTORS, &dstats };
     exfat_vol_t vol;
     assert(exfat_mount(&vol, &dev) == 0);
     assert(exfat_mkdir(&vol, "record") == 0);
@@ -1772,6 +1800,7 @@ static void test_bt_spp_and_xrec(void)
         NULL, NULL, mock_xrec_on_ota,
         mock_xrec_exp_write, mock_xrec_exp_run, mock_xrec_read_log,
         mock_xrec_reset_log, mock_xrec_on_dfu, mock_xrec_audio_cfg,
+        mock_xrec_get_mtu,
     };
     xrec_init(&xrec, &vol, &ops, &sp);
     bt_spp_init(&spp, mock_spp_data_cb, &xrec);
@@ -2106,7 +2135,213 @@ static void test_bt_spp_and_xrec(void)
     assert(exfat_read_file(&vol, &cas_ent, 0u, cas_rb, sizeof(cas_rb), &cas_nread) == 0);
     assert(cas_nread == 48u && memcmp(cas_rb, cas_data, 48u) == 0);
 
-    printf("  [PASS] bt_spp + xrec (L2CAP, SDP, RFCOMM credits/DISC, +XREC auth/LS/DEL/GET/GETS+EOF/PUT+OTA/EXP/RUN/LOG/CAS/DFU)\n");
+    /* 8. Edge-case hardening tests: overflow, short/odd pair/hex, calendar RTC, bad names, overlong line */
+    send_rfcomm_client_credits(&spp, 0x0041u, 2u, 20u);
+    sp.rx_len = 0u;
+    const char *c_ovf = "+XREC:GETS,4294967296,16,16,REC_0001.wav\r"
+                        "+XREC:RTC,2026,2,29,12,0,0,0\r"
+                        "+XREC:RTC,2026,4,31,12,0,0,0\r"
+                        "+XREC:RTC,2024,2,29,12,0,0,3\r"
+                        "+XREC:DEL,bad:name.wav\r"
+                        "+XREC:DEL,trail.\r"
+                        "+XREC:DEL,trail \r";
+    send_rfcomm_client_uih(&spp, 0x0041u, 2u, (const uint8_t *)c_ovf, (uint16_t)strlen(c_ovf));
+    drain_acl_to_phone(&spp, &sp);
+    sp.rx_stream[sp.rx_len] = '\0';
+    assert(strstr((const char *)sp.rx_stream, "+XREC:ERR,ARGS\r\n") != NULL);
+    assert(strstr((const char *)sp.rx_stream, "+XREC:ERR,RTCRNG\r\n+XREC:ERR,RTCRNG\r\n+XREC:OK,RTC\r\n") != NULL);
+    assert(strstr((const char *)sp.rx_stream, "+XREC:ERR,NAME\r\n+XREC:ERR,NAME\r\n+XREC:ERR,NAME\r\n") != NULL);
+
+    /* Short/odd PAIR & AUTH inputs (ASan checks no OOB reads past NUL) + PIN zeroed on close */
+    send_rfcomm_client_credits(&spp, 0x0041u, 2u, 20u);
+    sp.rx_len = 0u;
+    xrec_open_pairing(&xrec, "123456");
+    const char *c_short_pair = "+XREC:PAIR,12\r+XREC:PAIR,123456,\r+XREC:PAIR,123456,abc\r";
+    send_rfcomm_client_uih(&spp, 0x0041u, 2u, (const uint8_t *)c_short_pair, (uint16_t)strlen(c_short_pair));
+    drain_acl_to_phone(&spp, &sp);
+    sp.rx_stream[sp.rx_len] = '\0';
+    assert(strstr((const char *)sp.rx_stream, "+XREC:ERR,PIN\r\n+XREC:ERR,BADKEY\r\n+XREC:ERR,BADKEY\r\n") != NULL);
+    xrec_close_pairing(&xrec);
+    assert(xrec.pair_active == 0u && xrec.pair_pin[0] == '\0');
+
+    sp.rx_len = 0u;
+    const char *c_short_auth = "+XREC:CHAL\r+XREC:AUTH,abc\r+XREC:CHAL\r+XREC:AUTH,\r";
+    send_rfcomm_client_uih(&spp, 0x0041u, 2u, (const uint8_t *)c_short_auth, (uint16_t)strlen(c_short_auth));
+    drain_acl_to_phone(&spp, &sp);
+    sp.rx_stream[sp.rx_len] = '\0';
+    assert(strstr((const char *)sp.rx_stream, "+XREC:ERR,AUTH\r\n") != NULL);
+
+    /* Overlong rx_line (>= 192 chars) rejects with +XREC:ERR,LINE and recovers cleanly */
+    send_rfcomm_client_credits(&spp, 0x0041u, 2u, 10u);
+    sp.rx_len = 0u;
+    char long_line[256];
+    memcpy(long_line, "+XREC:PING,", 11u);
+    memset(long_line + 11u, 'A', 200u);
+    memcpy(long_line + 211u, ":+XREC:PUT,0,1,0,OTA:\r+XREC:PING\r", 33u);
+    send_rfcomm_client_uih(&spp, 0x0041u, 2u, (const uint8_t *)long_line, 244u);
+    drain_acl_to_phone(&spp, &sp);
+    sp.rx_stream[sp.rx_len] = '\0';
+    assert(strstr((const char *)sp.rx_stream, "+XREC:ERR,LINE\r\n") != NULL);
+    assert(strstr((const char *)sp.rx_stream, "+XREC:PONG,openfw_v5") != NULL);
+    assert(xrec.put_active == 0u);
+
+    /* 9. GETS busy-retry caches frame (zero extra SD reads), concurrent LS cancels GETS, PUT SDIO fail aborts */
+    while (spp.peer_credits > 1u) {
+        send_rfcomm_client_uih(&spp, 0x0041u, 2u, (const uint8_t *)c_ping, (uint16_t)strlen(c_ping));
+        drain_acl_to_phone(&spp, &sp);
+    }
+    assert(spp.peer_credits == 1u);
+    sp.rx_len = 0u;
+    const char *c_gets_cache = "+XREC:GETS,0,1024,256,REC_0001.wav\r";
+    send_rfcomm_client_uih(&spp, 0x0041u, 2u, (const uint8_t *)c_gets_cache, (uint16_t)strlen(c_gets_cache));
+    drain_acl_to_phone(&spp, &sp);
+    assert(sp.rx_len == 12u + 256u && xrec.gets_active == 1u && xrec.gets_staged == 1u);
+
+    /* Calling xrec_poll() 5 times while stalled at 0 credits must perform ZERO extra SD reads */
+    uint32_t reads_while_stalled = dstats.read_calls;
+    for (int retry = 0; retry < 5; retry++) {
+        xrec_poll(&xrec);
+    }
+    assert(dstats.read_calls == reads_while_stalled);
+
+    /* Grant 1 credit -> sends the cached 2nd frame without re-reading SD first */
+    send_rfcomm_client_credits(&spp, 0x0041u, 2u, 1u);
+    xrec_poll(&xrec);
+    drain_acl_to_phone(&spp, &sp);
+    assert(sp.rx_len == 2u * (12u + 256u) && xrec.gets_active == 1u);
+    assert(memcmp(&sp.rx_stream[12u + 256u + 12u], &wav_file[256], 256u) == 0);
+
+    /* Concurrent LS while GETS is still active stops GETS cleanly without interleaving */
+    send_rfcomm_client_credits(&spp, 0x0041u, 2u, 10u);
+    sp.rx_len = 0u;
+    send_rfcomm_client_uih(&spp, 0x0041u, 2u, (const uint8_t *)c_ls, (uint16_t)strlen(c_ls));
+    drain_acl_to_phone(&spp, &sp);
+    sp.rx_stream[sp.rx_len] = '\0';
+    assert(xrec.gets_active == 0u && xrec.gets_staged == 0u && xrec.ls_active == 0u);
+    assert(strstr((const char *)sp.rx_stream, "+XREC:END\r\n") != NULL);
+    assert(memcmp(sp.rx_stream, "+XREC:F,", 8u) == 0);
+
+    /* PUT exfat_write() failure aborts staged upload so subsequent PUTEND fails with NOPUT */
+    send_rfcomm_client_credits(&spp, 0x0041u, 2u, 10u);
+    sp.rx_len = 0u;
+    uint8_t big_chunk[600];
+    memset(big_chunk, 0xABu, sizeof(big_chunk));
+    uint16_t big_crc = openfw_crc16_ccitt_false(big_chunk, sizeof(big_chunk));
+    send_xrec_put_target(&spp, 0u, "CAS,fail.cwx", big_chunk, sizeof(big_chunk), big_crc);
+    drain_acl_to_phone(&spp, &sp);
+    sp.rx_stream[sp.rx_len] = '\0';
+    assert(strstr((const char *)sp.rx_stream, "+XREC:OK,PUT,0,600") != NULL);
+    assert(xrec.put_stream_mode == XREC_PUT_CAS);
+
+    sp.rx_len = 0u;
+    dstats.fail_writes = 1;
+    send_xrec_put_target(&spp, 600u, "CAS,fail.cwx", big_chunk, sizeof(big_chunk), big_crc);
+    dstats.fail_writes = 0;
+    send_rfcomm_client_uih(&spp, 0x0041u, 2u, (const uint8_t *)c_put_end, (uint16_t)strlen(c_put_end));
+    drain_acl_to_phone(&spp, &sp);
+    sp.rx_stream[sp.rx_len] = '\0';
+    assert(xrec.put_stream_mode == XREC_PUT_NONE);
+    assert(strstr((const char *)sp.rx_stream, "+XREC:ERR,SDIO\r\n+XREC:ERR,NOPUT\r\n") != NULL);
+
+    /* 10. bt_spp_peek_acl_tx / consume, control-slot reserve, RFCOMM credit deadlock recovery, DM on unknown DLCI */
+    send_rfcomm_client_credits(&spp, 0x0041u, 2u, 30u);
+    drain_acl_to_phone(&spp, &sp);
+    assert(spp.tx_count == 0u);
+    assert(bt_spp_peek_acl_tx(&spp, NULL, NULL) == NULL);
+
+    /* Unknown DLCI SABM (e.g. DLCI 6) -> must reply DM (0x1F) */
+    send_rfcomm_client_ctrl(&spp, 0x0041u, 6u, 0x3Fu);
+    uint16_t peek_hdl = 0u, peek_len = 0u;
+    const uint8_t *peek_p = bt_spp_peek_acl_tx(&spp, &peek_hdl, &peek_len);
+    assert(peek_p != NULL && peek_hdl == 0x0080u && peek_len == 8u);
+    assert(peek_p[4] == ((6u << 2) | 0x03u) && peek_p[5] == 0x1Fu); /* DM */
+    /* Second peek returns identical pointer without consuming */
+    assert(bt_spp_peek_acl_tx(&spp, NULL, NULL) == peek_p);
+    bt_spp_consume_acl_tx(&spp);
+    assert(spp.tx_count == 0u);
+
+    /* Fill data queue up to BT_SPP_TX_Q_CAP - BT_SPP_TX_CTRL_RESERVE -> data rejects, control succeeds */
+    const uint8_t tiny[4] = { 'T', 'E', 'S', 'T' };
+    for (uint8_t k = 0u; k < (BT_SPP_TX_Q_CAP - BT_SPP_TX_CTRL_RESERVE); k++) {
+        assert(bt_spp_send(&spp, tiny, 4u) == 0);
+    }
+    assert(spp.tx_count == (BT_SPP_TX_Q_CAP - BT_SPP_TX_CTRL_RESERVE));
+    assert(bt_spp_send(&spp, tiny, 4u) == -1); /* Data slots full; 2 control slots reserved */
+
+    /* Fill remaining 2 control slots with L2CAP Echo Requests so queue is 100% full (BT_SPP_TX_Q_CAP) */
+    uint8_t echo_req[4] = { 0x08u, 9u, 0u, 0u };
+    for (uint8_t k = 0u; k < BT_SPP_TX_CTRL_RESERVE; k++) {
+        echo_req[1] = (uint8_t)(10u + k);
+        send_l2cap_client(&spp, 0x0001u, echo_req, 4u);
+    }
+    assert(spp.tx_count == BT_SPP_TX_Q_CAP);
+
+    /* Drain local_credits to <= 2 while TX queue is 100% full: credit grant MUST defer (no false bump to 7) */
+    while (spp.local_credits > 3u) {
+        send_rfcomm_client_uih(&spp, 0x0041u, 2u, (const uint8_t *)"\n", 1u);
+    }
+    assert(spp.local_credits == 3u && spp.local_credit_pending == 0u);
+    send_rfcomm_client_uih(&spp, 0x0041u, 2u, (const uint8_t *)"\n", 1u);
+    assert(spp.local_credits == 2u && spp.local_credit_pending == 1u); /* Deferred, NOT stuck at 7! */
+
+    /* Consume 1 slot -> pending credit replenishment MUST enqueue immediately and restore local_credits = 7 */
+    bt_spp_consume_acl_tx(&spp);
+    assert(spp.local_credits == 7u && spp.local_credit_pending == 0u);
+    assert(spp.tx_count == BT_SPP_TX_Q_CAP);
+    drain_acl_to_phone(&spp, &sp);
+
+    /* 11. Small-MTU (48 B) GETS via L2CAP RFCOMM reconnect -> clamps payload to 36 B without deadlock */
+    sp.rx_len = 0u;
+    uint8_t conn_rf2[8] = { 0x02u, 20u, 4u, 0u, 0x03u, 0x00u, 0x02u, 0x01u };
+    send_l2cap_client(&spp, 0x0001u, conn_rf2, 8u);
+    assert(xrec.auth == 0u); /* Reconnect notified disconnect */
+    assert(spp.rfcomm.cfg_rx_done == 0u && spp.rfcomm.cfg_tx_done == 0u);
+    uint8_t cfg_rf_small[12] = { 0x04u, 21u, 8u, 0u, 0x41u, 0x00u, 0x00u, 0x00u, 0x01u, 0x02u, 0x35u, 0x00u }; /* L2CAP MTU 53 -> rfcomm_mtu=48 */
+    send_l2cap_client(&spp, 0x0001u, cfg_rf_small, 12u);
+    send_rfcomm_client_ctrl(&spp, 0x0041u, 0u, 0x3Fu); /* SABM DLCI 0 */
+    uint8_t pn_small[10] = { 0x83u, 0x11u, 0x02u, 0xF0u, 0x00u, 0x00u, 0x30u, 0x00u, 0x00u, 0x07u }; /* MTU 48, k=7 */
+    send_rfcomm_client_uih(&spp, 0x0041u, 0u, pn_small, sizeof(pn_small));
+    /* Pre-SABM UIH on DLCI 2 must be ignored because ch1_open == 0 */
+    send_rfcomm_client_uih(&spp, 0x0041u, 2u, (const uint8_t *)c_ping, (uint16_t)strlen(c_ping));
+    drain_acl_to_phone(&spp, &sp);
+    assert(bt_spp_is_open(&spp) == 0 && sp.rx_len == 0u);
+    assert(bt_spp_get_mtu(&spp) == 48u);
+
+    send_rfcomm_client_ctrl(&spp, 0x0041u, 2u, 0x3Fu); /* SABM DLCI 2 */
+    drain_acl_to_phone(&spp, &sp);
+    assert(bt_spp_is_open(&spp) == 1);
+
+    /* Re-authenticate & stream 120 B of REC_0001.wav requesting 480 B chunks over 48 B MTU */
+    sp.rx_len = 0u;
+    send_rfcomm_client_uih(&spp, 0x0041u, 2u, (const uint8_t *)c_chal, (uint16_t)strlen(c_chal));
+    send_rfcomm_client_uih(&spp, 0x0041u, 2u, (const uint8_t *)c_auth, (uint16_t)strlen(c_auth));
+    drain_acl_to_phone(&spp, &sp);
+    assert(xrec.auth == 1u);
+
+    send_rfcomm_client_credits(&spp, 0x0041u, 2u, 10u);
+    sp.rx_len = 0u;
+    const char *c_gets_small = "+XREC:GETS,0,120,480,REC_0001.wav\r";
+    send_rfcomm_client_uih(&spp, 0x0041u, 2u, (const uint8_t *)c_gets_small, (uint16_t)strlen(c_gets_small));
+    drain_acl_to_phone(&spp, &sp);
+    assert(xrec.gets_active == 0u);
+    assert(xrec.gets_chunk_max == 36u); /* 48 - 12 = 36 B payload per frame */
+    uint8_t sm_dl[120];
+    uint32_t sm_dpos = 0u, sm_ppos = 0u, sm_frames = 0u;
+    while (sm_ppos + 12u <= sp.rx_len) {
+        assert(memcmp(&sp.rx_stream[sm_ppos], "XREC", 4u) == 0);
+        uint16_t flen = (uint16_t)sp.rx_stream[sm_ppos + 8u] | ((uint16_t)sp.rx_stream[sm_ppos + 9u] << 8);
+        uint16_t fcrc = (uint16_t)sp.rx_stream[sm_ppos + 10u] | ((uint16_t)sp.rx_stream[sm_ppos + 11u] << 8);
+        assert(flen <= 36u);
+        assert(openfw_crc16_ccitt_false(&sp.rx_stream[sm_ppos + 12u], flen) == fcrc);
+        memcpy(&sm_dl[sm_dpos], &sp.rx_stream[sm_ppos + 12u], flen);
+        sm_dpos += flen;
+        sm_ppos += 12u + flen;
+        sm_frames++;
+    }
+    assert(sm_ppos == sp.rx_len && sm_dpos == 120u && sm_frames == 4u);
+    assert(memcmp(sm_dl, wav_file, 120u) == 0);
+
+    printf("  [PASS] bt_spp + xrec (L2CAP, SDP, RFCOMM credits/DISC/DM/peek, +XREC auth/LS/DEL/GET/GETS/small-MTU/PUT/OTA/EXP/LOG/CAS/DFU)\n");
 }
 
 int main(int argc, char **argv)
