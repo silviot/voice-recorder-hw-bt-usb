@@ -65,7 +65,7 @@
  * LVGL Memory Pool Budget (bytes, static SRAM via LV_STDLIB_BUILTIN)
  * ========================================================================= */
 #ifndef BOARD_LVGL_MEM_SIZE
-#define BOARD_LVGL_MEM_SIZE     (36u * 1024u)
+#define BOARD_LVGL_MEM_SIZE     (44u * 1024u)
 #endif
 
 #endif /* OPENFW_BOARD_CONFIG_H */
