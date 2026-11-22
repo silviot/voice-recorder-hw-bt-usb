@@ -1133,9 +1133,10 @@ static void scsi_xfer(usb_msc_state_t *st, uint32_t tag, uint8_t flags,
     usb_msc_on_rx_packet(st, cbw, 31u);
 
     if ((flags & 0x80u) == 0u && data_len > 0u) {
+        uint16_t mps  = (st->max_pkt >= 64u && st->max_pkt <= 512u) ? st->max_pkt : 64u;
         uint32_t sent = 0u;
         while (sent < data_len) {
-            uint8_t chunk = ((data_len - sent) > 64u) ? 64u : (uint8_t)(data_len - sent);
+            uint16_t chunk = ((data_len - sent) > mps) ? mps : (uint16_t)(data_len - sent);
             usb_msc_on_rx_packet(st, out_data + sent, chunk);
             sent += chunk;
         }
@@ -1145,8 +1146,8 @@ static void scsi_xfer(usb_msc_state_t *st, uint32_t tag, uint8_t flags,
     uint8_t csw[64];
     int got_csw = 0;
     while (usb_msc_need_tx(st)) {
-        uint8_t pkt[64];
-        uint8_t n = usb_msc_get_tx_packet(st, pkt);
+        uint8_t pkt[512];
+        uint16_t n = usb_msc_get_tx_packet(st, pkt);
         if (!usb_msc_need_tx(st)) {
             /* Last packet emitted was CSW */
             assert(n == 13u);
@@ -1249,9 +1250,9 @@ static void test_usb_msc(void)
         usb_msc_on_rx_packet(&st, cbw, 31u);
         uint32_t data_bytes = 0u;
         int saw_zlp = 0;
-        uint8_t pkt[64];
+        uint8_t pkt[512];
         while (usb_msc_need_tx(&st)) {
-            uint8_t n = usb_msc_get_tx_packet(&st, pkt);
+            uint16_t n = usb_msc_get_tx_packet(&st, pkt);
             if (!usb_msc_need_tx(&st)) {
                 assert(n == 13u && pkt[12] == 0u && get_le32(&pkt[8]) == 512u);
                 break;
@@ -1264,6 +1265,33 @@ static void test_usb_msc(void)
             }
         }
         assert(data_bytes == 512u && saw_zlp == 1);
+    }
+
+    /* 9b. High-Speed (512 B max_pkt) READ(10) + WRITE(10) + 512 B short-transfer ZLP */
+    {
+        usb_msc_set_max_packet(&st, 512u);
+        uint8_t hs_w[1024], hs_r[1024];
+        for (uint32_t i = 0u; i < sizeof(hs_w); i++) hs_w[i] = (uint8_t)(0x5Au ^ i);
+        uint8_t wr_cdb_hs[10] = { 0x2Au, 0u };
+        put_be32(&wr_cdb_hs[2], 12u);
+        put_be16(&wr_cdb_hs[7], 2u);
+        scsi_xfer(&st, 101u, 0x00u, wr_cdb_hs, 10u, hs_w, NULL, sizeof(hs_w), &status, &res, NULL);
+        assert(status == 0u && res == 0u);
+        uint8_t rd_cdb_hs[10] = { 0x28u, 0u };
+        put_be32(&rd_cdb_hs[2], 12u);
+        put_be16(&rd_cdb_hs[7], 2u);
+        scsi_xfer(&st, 102u, 0x80u, rd_cdb_hs, 10u, NULL, hs_r, sizeof(hs_r), &status, &res, &got);
+        assert(status == 0u && res == 0u && got == sizeof(hs_r));
+        assert(memcmp(hs_r, hs_w, sizeof(hs_w)) == 0);
+        /* Short 512 B IN on 1024 B CBW must emit a single 512 B packet + ZLP + CSW */
+        uint8_t cbw[31], p[512];
+        put_be16(&rd_cdb_hs[7], 1u);
+        build_cbw(cbw, 103u, 1024u, 0x80u, rd_cdb_hs, 10u);
+        usb_msc_on_rx_packet(&st, cbw, 31u);
+        assert(usb_msc_get_tx_packet(&st, p) == 512u && usb_msc_need_tx(&st) == 1);
+        assert(usb_msc_get_tx_packet(&st, p) == 0u && usb_msc_need_tx(&st) == 1); /* ZLP */
+        assert(usb_msc_get_tx_packet(&st, p) == 13u && p[12] == 0u && get_le32(&p[8]) == 512u);
+        usb_msc_set_max_packet(&st, 64u);
     }
 
     /* 10. WRITE(10) Ho > Do (blocks=1 -> 512 B, CBW data_len=1024 B): drains excess 512 B without deadlock */

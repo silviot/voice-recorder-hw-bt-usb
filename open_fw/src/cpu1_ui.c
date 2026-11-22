@@ -46,6 +46,8 @@ volatile uint32_t g_cpu1_alive        = 0u;
 volatile uint32_t g_cpu1_faulted      = 0u;
 volatile uint32_t g_cpu1_fault_pc     = 0u;
 volatile uint32_t g_cpu1_fault_cfsr   = 0u;
+volatile uint32_t g_cpu1_wfe_ok       = 0u;
+volatile uint32_t g_cpu1_wfe_wakes    = 0u;
 volatile uint32_t g_ui_last_render_us = 0u;
 volatile uint32_t g_ui_max_render_us  = 0u;
 volatile uint32_t g_ui_frames         = 0u;
@@ -67,12 +69,32 @@ static volatile uint32_t s_cpu1_reading_slot = 0xFFu; /* 0, 1, or 0xFF (idle) */
 static volatile uint32_t s_cpu1_animating    = 0u;
 static volatile uint32_t s_cpu1_stop_req     = 0u;
 static volatile uint32_t s_cpu1_stopped      = 0u;
+static volatile uint32_t s_mbox_probe_done   = 0u;
 static volatile uint8_t  s_spec_reset_pend   = 0u;
 static volatile uint8_t  s_spec_marker_pend  = 0u;
 static ui_spectrogram_t *volatile s_spec_ptr = NULL;
 static uint8_t           s_cpu1_active       = 0u;
 static uint32_t          s_last_seq          = 0u;
 static uint32_t          s_last_slot         = 0u;
+
+static inline void cpu1_mbox_drain_and_clear(void)
+{
+    while ((MBOX_CH_CNT(0u) & 7u) >= 2u) {
+        (void)MBOX_CH_DATA(0u);
+        (void)MBOX_CH_DATA(0u);
+    }
+    MBOX_CPU1_IRQ_STAT = 0x01u;
+    NVIC_ICPR(IRQ_IPC_MBOX_CPU1 >> 5) = (1u << (IRQ_IPC_MBOX_CPU1 & 31u));
+}
+
+static inline void cpu1_ring_mbox(void)
+{
+    if ((MBOX_CH_CNT(0u) & 7u) <= 2u) {
+        MBOX_CH_DATA(0u) = 1u;
+        MBOX_CH_DATA(0u) = 1u;
+        OPENFW_DSB();
+    }
+}
 
 static void cpu1_trampoline(void) __attribute__((naked, used));
 static void cpu1_entry_c(void) __attribute__((noreturn, used));
@@ -165,13 +187,32 @@ static void cpu1_entry_c(void)
     __asm__ volatile ("cpsid i" ::: "memory");
     SCB_VTOR  = (uint32_t)(uintptr_t)g_cpu1_isr_vector;
     SCB_SHCSR |= SCB_SHCSR_FAULTS_EN;
+    SCB_SCR   |= SCB_SCR_SEVONPEND;
     OPENFW_DSB();
     OPENFW_ISB();
 
     ui_port_init();
 
+    /* Prepare IPC Mailbox ch0 RX IRQ on CPU1 and run boot self-test for WFE wake */
+    MBOX_CPU1_IRQ_EN = (MBOX_CPU1_IRQ_EN & ~0x02u) | 0x01u;
+    cpu1_mbox_drain_and_clear();
+    OPENFW_DSB();
+
     g_cpu1_alive = 1u;
     OPENFW_DSB();
+
+    {
+        uint64_t t_mb = us_timer_now();
+        while ((MBOX_CH_CNT(0u) & 7u) < 2u && (us_timer_now() - t_mb) < 2000ull) {
+            OPENFW_NOP();
+        }
+        uint32_t irq_bit = (1u << (IRQ_IPC_MBOX_CPU1 & 31u));
+        uint32_t ispr    = NVIC_ISPR(IRQ_IPC_MBOX_CPU1 >> 5);
+        cpu1_mbox_drain_and_clear();
+        g_cpu1_wfe_ok     = (ispr & irq_bit) ? 1u : 0u;
+        s_mbox_probe_done = 1u;
+        OPENFW_DSB();
+    }
 
     uint32_t last_tick_ms = millis();
 
@@ -239,6 +280,18 @@ static void cpu1_entry_c(void)
             s_cpu1_reading_slot = 0xFFu;
             OPENFW_DSB();
             last_tick_ms = millis();
+            continue;
+        }
+
+        if (!s_cpu1_animating && g_cpu1_wfe_ok != 0u) {
+            /* True zero-power Cortex-M4 WFE sleep woken in <1 us by CPU0 IPC Mailbox ch0 */
+            cpu1_mbox_drain_and_clear();
+            OPENFW_DSB();
+            if ((s_req_word >> 1) != s_ack_seq || s_cpu1_stop_req != 0u) {
+                continue;
+            }
+            __asm__ volatile ("wfe" ::: "memory");
+            g_cpu1_wfe_wakes++;
             continue;
         }
 
@@ -336,6 +389,9 @@ static void cpu1_submit_slot(uint8_t kind, ui_screen_id_t scr, const ui_model_t 
     OPENFW_DSB();
     s_req_word = (seq << 1) | next;
     OPENFW_DSB();
+    if (g_cpu1_wfe_ok != 0u) {
+        cpu1_ring_mbox();
+    }
 }
 
 int cpu1_ui_start(void)
@@ -344,18 +400,33 @@ int cpu1_ui_start(void)
         return 1;
     }
 
+    /* Enable SL6801 Hardware IPC Mailbox (0x40070000) ch0 CPU0 -> CPU1 for WFE wakeups */
+    rom_rst_release(CRU_RST_IPC_MBOX);
+    rom_clk_enable(CRU_CLK_IPC_MBOX);
+    MBOX_CFG         = (MBOX_CFG & ~0x10u) | 0x01u;
+    MBOX_CPU0_IRQ_EN &= ~0x03u;
+    MBOX_CPU1_IRQ_EN = (MBOX_CPU1_IRQ_EN & ~0x02u) | 0x01u;
+    while ((MBOX_CH_CNT(0u) & 7u) >= 2u) {
+        (void)MBOX_CH_DATA(0u);
+        (void)MBOX_CH_DATA(0u);
+    }
+    MBOX_CPU0_IRQ_STAT = 0xFFFFFFFFu;
+    MBOX_CPU1_IRQ_STAT = 0xFFFFFFFFu;
+
     /* Reset all shared IPC state before releasing CPU1 (preserve lifetime stats) */
     rom_rst_hold(CRU_RST_CPU1);
     g_cpu1_alive        = 0u;
     g_cpu1_faulted      = 0u;
     g_cpu1_fault_pc     = 0u;
     g_cpu1_fault_cfsr   = 0u;
+    g_cpu1_wfe_ok       = 0u;
     s_req_word          = 0u;
     s_ack_seq           = 0u;
     s_cpu1_reading_slot = 0xFFu;
     s_cpu1_animating    = 0u;
     s_cpu1_stop_req     = 0u;
     s_cpu1_stopped      = 0u;
+    s_mbox_probe_done   = 0u;
     s_last_seq          = 0u;
     s_last_slot         = 0u;
 
@@ -378,6 +449,13 @@ int cpu1_ui_start(void)
     }
 
     if (g_cpu1_alive != 0u && g_cpu1_faulted == 0u) {
+        /* Trigger 2-word ch0 doorbell so CPU1 self-verifies NVIC IRQ 55 -> SEVONPEND WFE */
+        cpu1_ring_mbox();
+        uint64_t t_p = us_timer_now();
+        while (s_mbox_probe_done == 0u && g_cpu1_faulted == 0u &&
+               (us_timer_now() - t_p) < 5000ull) {
+            OPENFW_NOP();
+        }
         s_cpu1_active = 1u;
         return 1;
     }
@@ -393,6 +471,9 @@ void cpu1_ui_stop(void)
     if (s_cpu1_active) {
         s_cpu1_stop_req = 1u;
         OPENFW_DSB();
+        if (g_cpu1_wfe_ok != 0u) {
+            cpu1_ring_mbox();
+        }
         uint64_t t0 = us_timer_now();
         while (s_cpu1_stopped == 0u && (us_timer_now() - t0) < 50000ull) {
             OPENFW_NOP();

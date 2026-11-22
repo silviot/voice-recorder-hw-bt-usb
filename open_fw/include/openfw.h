@@ -43,6 +43,8 @@ extern volatile uint32_t g_cpu1_alive;
 extern volatile uint32_t g_cpu1_faulted;
 extern volatile uint32_t g_cpu1_fault_pc;
 extern volatile uint32_t g_cpu1_fault_cfsr;
+extern volatile uint32_t g_cpu1_wfe_ok;
+extern volatile uint32_t g_cpu1_wfe_wakes;
 extern volatile uint32_t g_ui_last_render_us;
 extern volatile uint32_t g_ui_max_render_us;
 extern volatile uint32_t g_ui_frames;

@@ -140,7 +140,7 @@ The chip has **two distinct hardware reset paths**. Standard Cortex-M **`SCB->AI
   - **`CMD_SL_RESET (0x83)`:** Unimplemented in BootROM `301a:2800` — falls through a NULL table pointer to vector `[0x18]` (UsageFault `0x0004C2CA: b .`) and **hangs the chip**.
   - **`SUBCMD_PING (0x86)`:** Stalls EP1.
 
-### 6.2 Critical USB PHY Wrapper Quirks (`0x40000000` & `0x40040300`)
+### 6.2 Critical USB PHY Wrapper & MUSB FIFO Quirks (`0x40000000`, `0x40040000` & `0x40040300`)
 1. **`SYSCTL_USB_CTRL (0x40000000)` bit 5 (`0x20`):** Hardware POR strap bit (`1`). Always **read-modify-write** `*(0x40000000) |= 0x41` (yielding `0x00000061`); never blind-write `0x41`.
 2. **`USB_PHY_CTRL (0x40040300)` bits `[7:4]` (analog bias control) & bit 12 (`0x1000`):** Bits `[7:4]` reset to `0b0001` (`0x10`, bit 4 = `1`), which is required by the USB PHY analog bias block. **NEVER** blind-write `0x00001000`; always RMW:
    ```c
@@ -148,6 +148,10 @@ The chip has **two distinct hardware reset paths**. Standard Cortex-M **`SCB->AI
        (*(volatile uint32_t *)0x40040300u & ~0x1F3u) | 0x1010u;
    ```
    Follow with a **50 ms settle delay** before configuring MUSB FIFOs and asserting `POWER.SOFTCONN`.
+3. **Mentor MUSB HDRC v1.8.4 Silicon Capabilities (Live-Verified):** `HWVERS = 0x0784`, `EPINFO = 0x33` (3 TX / 3 RX EPs), `RAMINFO = 0x4B` (`8 KiB` FIFO RAM, 4 DMA channels), `CONFIGDATA = 0x02` (fixed hardwired FIFOs, `DynFIFOSizing = 0`). Hardwired endpoint FIFO sizes (`MUSB+0x1F` per `INDEX`):
+   - **EP1 & EP3:** `0x66` (`64 B` TX / `64 B` RX).
+   - **EP2 (`0x82` / `0x02`):** `0xBB` (**`2048 B` TX / `2048 B` RX** — multi-packet hardware queuing!). Using EP2 for USB MSC improves sustained Full-Speed read throughput from `696 KB/s` to **`810 KB/s`**.
+   - **Full-Speed-only PHY:** Even with `TESTMODE.Force_FS = 0` and `POWER.HS_Enab = 1`, the on-chip USB PHY (`CRU_CLK_USB_48M`) does not chirp High-Speed (`POWER.HS_Mode` stays `0` on bus reset); stall `DEVICE_QUALIFIER` (`0x06`) when `!HS_Mode`.
 
 ---
 
@@ -170,6 +174,7 @@ Because SL6801 has no public datasheet and `DWT->CYCCNT` is unavailable, always 
 - **CPU1 parity:** Cortex-M4F CPU1 runs at full **96 MHz** with full XIP cache parity (`C1RAM ≈ C1XIP ≈ C0XIP`).
 - **LCDC clock mux (`rom_clk_set_src(0x3F)` @ `0x35B4`):** Only accepts `0x0A` (HOSC 24 MHz) or `0x08` (PLL0 tap); passing `CRU_CLK_SRC_PLL0` (`0x02`) is a no-op. At HOSC 24 MHz / 1, full 160×80 blit is `10.4 ms`.
 - **Dual-core bus contention:** Tight-polling `us_timer_now()` on CPU0 while CPU1 blits doubles LCD blit time (`10.6 ms → 19.8 ms`). Yield with `OPENFW_WFI()` inside `cpu1_ui_sync()` so CPU1 gets full AHB/XIP bandwidth.
+- **CPU1 true hardware `WFE` sleep via IPC Mailbox (`0x40070000`):** Cortex-M4 `SEV` on CPU0 does **not** cross to CPU1 `WFE` on SL6801 silicon. Instead, release `CRU_RST_IPC_MBOX (0x28)` + `CRU_CLK_IPC_MBOX (0x2E)`, configure channel 0 CPU0→CPU1 (`MBOX_CFG |= 0x01`, `MBOX_CPU1_IRQ_EN |= 0x01`), set `SCB->SCR |= SEVONPEND` on CPU1 (`cpsid i`, no ISR needed), and ring a 2-word doorbell to `MBOX_CH_DATA(0)` to assert CPU1 **NVIC IRQ `55`** (`0x37`, CPU0 is IRQ `54`). CPU1 halts completely in `WFE` when static and wakes in `< 1 µs` on UI updates.
 - **Host-to-silicon scaling:** Single-threaded LVGL software rasterization scales ~`208×` slower on 96 MHz Cortex-M4 than x86-64 host tests, making host timing useful for relative A/B deltas once calibrated against silicon.
 
 ---

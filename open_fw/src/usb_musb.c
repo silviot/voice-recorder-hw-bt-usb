@@ -31,6 +31,10 @@ static usb_audio_cfg_cb_t g_audio_cfg_cb    = 0;
 static uint8_t            g_usb_reboot_mode = 0u;
 static uint32_t        g_usb_reboot_deadline = 0u;
 
+/* EP2 has hardwired 2048 B TX + 2048 B RX FIFOs in SL6801 silicon (FIFOSIZE=0xBB),
+ * enabling USB 2.0 High-Speed (512 B quad-buffered bulk) with automatic FS (64 B) fallback. */
+#define MUSB_MSC_EP 2u
+
 static ep0_state_t     g_ep0_state      = EP0_IDLE;
 static const uint8_t  *g_ep0_tx_ptr     = 0;
 static uint16_t        g_ep0_tx_rem     = 0u;
@@ -38,7 +42,10 @@ static uint8_t         g_ep0_zlp        = 0u;
 static uint8_t         g_pending_addr   = 0u;
 static uint8_t         g_set_addr_pend  = 0u;
 static uint8_t         g_usb_cfg        = 0u;
+static uint8_t         g_usb_hs         = 0u;
+static uint16_t        g_usb_mps        = 64u;
 static uint8_t         g_ep0_reply[2];
+static uint8_t         g_usb_pkt[512] __attribute__((aligned(4)));
 
 static const uint8_t g_dev_desc[18] = {
     18u, 0x01u,             /* bLength, bDescriptorType = DEVICE */
@@ -52,15 +59,42 @@ static const uint8_t g_dev_desc[18] = {
     1u,                     /* bNumConfigurations */
 };
 
-static const uint8_t g_cfg_desc[32] = {
+static const uint8_t g_dev_qual_desc[10] = {
+    10u, 0x06u,             /* bLength, bDescriptorType = DEVICE_QUALIFIER */
+    0x00u, 0x02u,           /* bcdUSB = 2.00 */
+    0x00u, 0x00u, 0x00u,    /* Class/SubClass/Proto */
+    64u,                    /* bMaxPacketSize0 */
+    1u,                     /* bNumConfigurations */
+    0u,                     /* bReserved */
+};
+
+static const uint8_t g_cfg_desc_hs[32] = {
     /* Configuration Descriptor (9 B) */
     9u, 0x02u, 32u, 0u, 1u, 1u, 0u, 0x80u, 250u,
     /* Interface 0: MSC SCSI Bulk-Only Transport (9 B) */
     9u, 0x04u, 0u, 0u, 2u, 0x08u, 0x06u, 0x50u, 0u,
-    /* Endpoint 1 IN (Bulk, 64 B) (7 B) */
-    7u, 0x05u, 0x81u, 0x02u, 64u, 0u, 0u,
-    /* Endpoint 1 OUT (Bulk, 64 B) (7 B) */
-    7u, 0x05u, 0x01u, 0x02u, 64u, 0u, 0u,
+    /* Endpoint 2 IN (Bulk, 512 B High-Speed) (7 B) */
+    7u, 0x05u, 0x82u, 0x02u, 0x00u, 0x02u, 0u,
+    /* Endpoint 2 OUT (Bulk, 512 B High-Speed) (7 B) */
+    7u, 0x05u, 0x02u, 0x02u, 0x00u, 0x02u, 0u,
+};
+
+static const uint8_t g_cfg_desc_fs[32] = {
+    /* Configuration Descriptor (9 B) */
+    9u, 0x02u, 32u, 0u, 1u, 1u, 0u, 0x80u, 250u,
+    /* Interface 0: MSC SCSI Bulk-Only Transport (9 B) */
+    9u, 0x04u, 0u, 0u, 2u, 0x08u, 0x06u, 0x50u, 0u,
+    /* Endpoint 2 IN (Bulk, 64 B Full-Speed) (7 B) */
+    7u, 0x05u, 0x82u, 0x02u, 64u, 0u, 0u,
+    /* Endpoint 2 OUT (Bulk, 64 B Full-Speed) (7 B) */
+    7u, 0x05u, 0x02u, 0x02u, 64u, 0u, 0u,
+};
+
+static const uint8_t g_other_cfg_desc_fs[32] = {
+    9u, 0x07u, 32u, 0u, 1u, 1u, 0u, 0x80u, 250u,
+    9u, 0x04u, 0u, 0u, 2u, 0x08u, 0x06u, 0x50u, 0u,
+    7u, 0x05u, 0x82u, 0x02u, 64u, 0u, 0u,
+    7u, 0x05u, 0x02u, 0x02u, 64u, 0u, 0u,
 };
 
 static const uint8_t g_str0_lang[4] = { 4u, 0x03u, 0x09u, 0x04u };
@@ -149,13 +183,19 @@ static void musb_flush_ep(uint8_t ep)
     }
 }
 
-static void musb_configure_ep1_msc(void)
+static void musb_configure_ep_msc(void)
 {
-    openfw_mmio_wr8(MUSB_INDEX_ADDR,   1u);
-    openfw_mmio_wr16(MUSB_TXMAXP_ADDR, 64u);
+    uint16_t mps = g_usb_hs ? 512u : 64u;
+    g_usb_mps = mps;
+    usb_msc_set_max_packet(&g_msc, mps);
+
+    openfw_mmio_wr8(MUSB_INDEX_ADDR,   MUSB_MSC_EP);
+    openfw_mmio_wr16(MUSB_TXMAXP_ADDR, mps);
     openfw_mmio_wr16(MUSB_TXCSR_ADDR,  0x0048u); /* ClrDataTog | FlushFIFO */
-    openfw_mmio_wr16(MUSB_RXMAXP_ADDR, 64u);
+    openfw_mmio_wr16(MUSB_TXCSR_ADDR,  0x0048u); /* Double-flush multi-buffered FIFO */
+    openfw_mmio_wr16(MUSB_RXMAXP_ADDR, mps);
     openfw_mmio_wr16(MUSB_RXCSR_ADDR,  0x0090u); /* ClrDataTog | FlushFIFO */
+    openfw_mmio_wr16(MUSB_RXCSR_ADDR,  0x0090u);
 }
 
 static void ep0_send_next_chunk(void)
@@ -208,7 +248,7 @@ static void ep0_handle_setup(const uint8_t setup[8])
         }
         if (bReq == 0xFFu && bmReq == 0x21u && wLength == 0u) { /* BULK_ONLY_RESET */
             usb_msc_reset(&g_msc);
-            musb_configure_ep1_msc();
+            musb_configure_ep_msc();
             openfw_mmio_wr8(MUSB_INDEX_ADDR, 0u);
             openfw_mmio_wr16(MUSB_CSR0_ADDR, 0x0048u);
             return;
@@ -229,7 +269,17 @@ static void ep0_handle_setup(const uint8_t setup[8])
             return;
         }
         if (desc_type == 0x02u) {
-            ep0_start_in(g_cfg_desc, (uint16_t)sizeof(g_cfg_desc), wLength);
+            const uint8_t *cfg = g_usb_hs ? g_cfg_desc_hs : g_cfg_desc_fs;
+            ep0_start_in(cfg, (uint16_t)sizeof(g_cfg_desc_hs), wLength);
+            return;
+        }
+        if (desc_type == 0x06u && g_usb_hs) { /* DEVICE_QUALIFIER (HS only per USB 2.0 9.6.2) */
+            ep0_start_in(g_dev_qual_desc, (uint16_t)sizeof(g_dev_qual_desc), wLength);
+            return;
+        }
+        if (desc_type == 0x07u && g_usb_hs) { /* OTHER_SPEED_CONFIGURATION (HS only) */
+            const uint8_t *ocfg = g_other_cfg_desc_fs;
+            ep0_start_in(ocfg, (uint16_t)sizeof(g_other_cfg_desc_fs), wLength);
             return;
         }
         if (desc_type == 0x03u) {
@@ -267,7 +317,7 @@ static void ep0_handle_setup(const uint8_t setup[8])
         }
         g_usb_cfg = (uint8_t)(wValue & 0xFFu);
         if (g_usb_cfg == 1u) {
-            musb_configure_ep1_msc();
+            musb_configure_ep_msc();
         }
         usb_msc_reset(&g_msc);
         openfw_mmio_wr8(MUSB_INDEX_ADDR, 0u);
@@ -288,8 +338,8 @@ static void ep0_handle_setup(const uint8_t setup[8])
     case 0x01u: /* CLEAR_FEATURE */
         if ((bmReq & 0x1Fu) == 0x02u && wValue == 0u) {
             uint8_t ep = (uint8_t)(wIndex & 0x0Fu);
-            if (ep == 1u) {
-                openfw_mmio_wr8(MUSB_INDEX_ADDR, 1u);
+            if (ep == MUSB_MSC_EP) {
+                openfw_mmio_wr8(MUSB_INDEX_ADDR, MUSB_MSC_EP);
                 if (wIndex & 0x80u) {
                     openfw_mmio_wr16(MUSB_TXCSR_ADDR, (uint16_t)((openfw_mmio_rd16(MUSB_TXCSR_ADDR) & ~0x0030u) | 0x0040u)); /* Clear SendStall + ClrDataTog */
                 } else {
@@ -755,6 +805,8 @@ int usb_msc_start(blkdev_t *dev)
     g_set_addr_pend = 0u;
     g_pending_addr  = 0u;
     g_usb_cfg       = 0u;
+    g_usb_hs        = 0u;
+    g_usb_mps       = 64u;
     g_usb_reboot_mode     = 0u;
     g_usb_reboot_deadline = 0u;
 
@@ -766,8 +818,8 @@ int usb_msc_start(blkdev_t *dev)
     openfw_mmio_rmw32(USB_PHY_CTRL_ADDR, 0x1F3u, 0x1010u);
     mdelay(50u);
 
-    /* 6. Disconnect, flush EP0..3, clear pending flags, Force Full-Speed */
-    openfw_mmio_wr8(MUSB_POWER_ADDR, (uint8_t)(openfw_mmio_rd8(MUSB_POWER_ADDR) & ~0x40u));
+    /* 6. Disconnect, flush EP0..3, clear pending flags, enable USB 2.0 High-Speed negotiation */
+    openfw_mmio_wr8(MUSB_POWER_ADDR, (uint8_t)((openfw_mmio_rd8(MUSB_POWER_ADDR) & ~0x40u) | 0x20u)); /* SoftConn=0, HS_Enab=1 */
     for (uint8_t ep = 0u; ep < 4u; ep++) {
         musb_flush_ep(ep);
     }
@@ -775,17 +827,17 @@ int usb_msc_start(blkdev_t *dev)
     (void)openfw_mmio_rd8(MUSB_INTRUSB_ADDR);
     (void)openfw_mmio_rd16(MUSB_INTRRX_ADDR);
     (void)openfw_mmio_rd16(MUSB_INTRTX_ADDR);
-    openfw_mmio_wr8(MUSB_TESTMODE_ADDR, (uint8_t)(openfw_mmio_rd8(MUSB_TESTMODE_ADDR) | 0x20u)); /* Force_FS */
+    openfw_mmio_wr8(MUSB_TESTMODE_ADDR, (uint8_t)(openfw_mmio_rd8(MUSB_TESTMODE_ADDR) & ~0x20u)); /* Clear Force_FS */
 
-    /* 7. Polled MUSB interrupt masks */
-    openfw_mmio_wr8(MUSB_INTRUSBE_ADDR, 0x07u);   /* Suspend | Resume | Reset */
-    openfw_mmio_wr16(MUSB_INTRTXE_ADDR, 0x0003u); /* EP0 + EP1 TX */
-    openfw_mmio_wr16(MUSB_INTRRXE_ADDR, 0x0002u); /* EP1 RX */
-    musb_configure_ep1_msc();
+    /* 7. Polled MUSB interrupt masks (EP0 + EP2 Bulk MSC) */
+    openfw_mmio_wr8(MUSB_INTRUSBE_ADDR, 0x07u);                        /* Suspend | Resume | Reset */
+    openfw_mmio_wr16(MUSB_INTRTXE_ADDR, (uint16_t)(1u | (1u << MUSB_MSC_EP)));
+    openfw_mmio_wr16(MUSB_INTRRXE_ADDR, (uint16_t)(1u << MUSB_MSC_EP));
+    musb_configure_ep_msc();
 
-    /* 8. Assert D+ pull-up (SoftConn = 1) */
+    /* 8. Assert D+ pull-up (SoftConn = 1, HS_Enab = 1) */
     openfw_mmio_wr8(MUSB_FADDR_ADDR, 0u);
-    openfw_mmio_wr8(MUSB_POWER_ADDR, (uint8_t)(openfw_mmio_rd8(MUSB_POWER_ADDR) | 0x40u));
+    openfw_mmio_wr8(MUSB_POWER_ADDR, (uint8_t)(openfw_mmio_rd8(MUSB_POWER_ADDR) | 0x60u));
     mdelay(3u);
 
     g_usb_active = 1;
@@ -861,44 +913,46 @@ void usb_msc_poll(void)
         g_ep0_tx_rem    = 0u;
         g_ep0_zlp       = 0u;
         g_usb_cfg       = 0u;
+        g_usb_hs        = (openfw_mmio_rd8(MUSB_POWER_ADDR) & 0x10u) ? 1u : 0u;
         usb_msc_reset(&g_msc);
-        musb_configure_ep1_msc();
+        musb_configure_ep_msc();
+        openfw_log_puts("USB_RST HS=");
+        openfw_log_u32(g_usb_hs);
+        openfw_log_putc('\n');
     }
 
     if ((intr_tx & 0x0001u) || (openfw_mmio_wr8(MUSB_INDEX_ADDR, 0u), (openfw_mmio_rd16(MUSB_CSR0_ADDR) & 0x0015u) != 0u)) {
         ep0_service();
     }
 
-    /* EP1 Bulk OUT RX (capped to 16 packets per poll so WRITE(10) cannot starve EP0/UI/WDT) */
-    openfw_mmio_wr8(MUSB_INDEX_ADDR, 1u);
-    if ((intr_rx & 0x0002u) || (openfw_mmio_rd16(MUSB_RXCSR_ADDR) & 0x0001u)) {
+    /* Bulk OUT RX (capped to 16 packets per poll so WRITE(10) cannot starve EP0/UI/WDT) */
+    openfw_mmio_wr8(MUSB_INDEX_ADDR, MUSB_MSC_EP);
+    if ((intr_rx & (uint16_t)(1u << MUSB_MSC_EP)) || (openfw_mmio_rd16(MUSB_RXCSR_ADDR) & 0x0001u)) {
         uint32_t rx_budget = 16u;
         while (rx_budget-- > 0u && (openfw_mmio_rd16(MUSB_RXCSR_ADDR) & 0x0001u)) {
-            uint16_t cnt = openfw_mmio_rd16(MUSB_RXCOUNT_ADDR) & 0x03FFu;
-            uint8_t  pkt[64] __attribute__((aligned(4)));
-            if (cnt > 64u) {
-                cnt = 64u;
+            uint16_t cnt = openfw_mmio_rd16(MUSB_RXCOUNT_ADDR) & 0x1FFFu;
+            if (cnt > g_usb_mps) {
+                cnt = g_usb_mps;
             }
             if (cnt > 0u) {
-                musb_fifo_read(1u, pkt, cnt);
+                musb_fifo_read(MUSB_MSC_EP, g_usb_pkt, cnt);
             }
             openfw_mmio_wr16(MUSB_RXCSR_ADDR, (uint16_t)(openfw_mmio_rd16(MUSB_RXCSR_ADDR) & ~0x0001u)); /* Clear RxPktRdy */
-            usb_msc_on_rx_packet(&g_msc, pkt, (uint8_t)cnt);
+            usb_msc_on_rx_packet(&g_msc, g_usb_pkt, cnt);
             g_rx_pkts++;
             g_rx_bytes += (uint64_t)cnt;
         }
     }
 
-    /* EP1 Bulk IN TX (drain up to 16 packets while FIFO accepts, matching RX burst) */
-    openfw_mmio_wr8(MUSB_INDEX_ADDR, 1u);
+    /* Bulk IN TX (drain up to 32 packets to saturate EP2's 2048 B hardware FIFO) */
+    openfw_mmio_wr8(MUSB_INDEX_ADDR, MUSB_MSC_EP);
     {
-        uint32_t tx_budget = 16u;
+        uint32_t tx_budget = 32u;
         while (tx_budget-- > 0u && usb_msc_need_tx(&g_msc) &&
                !(openfw_mmio_rd16(MUSB_TXCSR_ADDR) & 0x0001u)) {
-            uint8_t pkt[64] __attribute__((aligned(4)));
-            uint8_t n = usb_msc_get_tx_packet(&g_msc, pkt);
+            uint16_t n = usb_msc_get_tx_packet(&g_msc, g_usb_pkt);
             if (n > 0u) {
-                musb_fifo_write(1u, pkt, n);
+                musb_fifo_write(MUSB_MSC_EP, g_usb_pkt, n);
             }
             openfw_mmio_wr16(MUSB_TXCSR_ADDR, (uint16_t)(openfw_mmio_rd16(MUSB_TXCSR_ADDR) | 0x0001u)); /* Set TxPktRdy */
             g_tx_pkts++;

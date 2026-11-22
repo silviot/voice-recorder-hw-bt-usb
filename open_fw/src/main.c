@@ -1422,19 +1422,22 @@ int openfw_main(void)
     copy_cstr(g_ui.bt_name, (int)sizeof(g_ui.bt_name), "HW_76");
     apply_cfg_to_recorder();
 
-    /* Overlap SD init + exFAT mount with ST7735S mandatory 120 ms SLPOUT wait */
+    /* Overlap SD init + exFAT mount + file/bitmap scan inside ST7735S mandatory 120 ms SLPOUT wait */
     uint64_t t_boot0    = us_timer_now();
     uint64_t t_slpout   = lcd_init_begin();
     uint32_t lcd_b_us   = (uint32_t)(t_slpout - t_boot0);
     uint32_t sd_us      = 0u;
     uint32_t mnt_us     = 0u;
     probe_microsd_mount_only(1, &sd_us, &mnt_us);
+    uint64_t t_scan0    = us_timer_now();
+    reload_files_and_sd_stats();
+    uint32_t scan_us    = (uint32_t)(us_timer_now() - t_scan0);
     uint64_t t_lcdf0    = us_timer_now();
     lcd_init_finish(t_slpout);
     uint32_t lcd_f_us   = (uint32_t)(us_timer_now() - t_lcdf0);
     lcd_set_rotation(1); /* Landscape 160x80 */
     g_cur_bl_pct = 255u;
-    /* Light the Cassini splash immediately before scanning WAV headers/bitmap */
+    /* Light the Cassini splash immediately before loading persisted state */
     uint64_t t_fill0 = us_timer_now();
     lcd_fill_rect(0u, 0u, 160u, 80u, UI_COL_BLACK);
     uint32_t fill_us = (uint32_t)(us_timer_now() - t_fill0);
@@ -1446,15 +1449,12 @@ int openfw_main(void)
                     CASSINI_SPLASH_80X40);
     backlight_apply(user_bl_pct());
 
-    uint64_t t_scan0 = us_timer_now();
-    reload_files_and_sd_stats();
     if (g_sd_mounted) {
         uart0_puts("SD: OK ");
         uart0_put_u32((uint32_t)g_ui.file_count);
         uart0_puts("f\n");
     }
     load_persisted_state();
-    uint32_t scan_us = (uint32_t)(us_timer_now() - t_scan0);
     openfw_log_puts("BOOT_US LCDB=");
     openfw_log_u32(lcd_b_us);
     openfw_log_puts(" SD=");
@@ -1482,6 +1482,8 @@ int openfw_main(void)
     g_cpu1_booted = cpu1_ok;
     openfw_log_puts("CPU1=");
     openfw_log_puts(cpu1_ok ? "ON" : "OFF");
+    openfw_log_puts(" WFE=");
+    openfw_log_u32(g_cpu1_wfe_ok);
     if (g_cpu1_faulted) {
         openfw_log_puts(" FAULT_PC=");
         openfw_log_hex(g_cpu1_fault_pc);
@@ -1539,6 +1541,8 @@ int openfw_main(void)
     openfw_log_u32(g_ui_last_blit_us);
     openfw_log_puts(" HEAP=");
     openfw_log_u32(g_ui_heap_used);
+    openfw_log_puts(" WFE_W=");
+    openfw_log_u32(g_cpu1_wfe_wakes);
     openfw_log_putc('\n');
     dirty = 0;
 

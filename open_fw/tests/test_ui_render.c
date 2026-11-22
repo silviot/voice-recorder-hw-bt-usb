@@ -472,11 +472,26 @@ int main(int argc, char **argv)
     sample_heap("files_empty");
     m.file_count = 4;
 
-    /* Verify visible toast (including long truncated toast) produces 0 redraw pixels when unchanged */
+    /* Verify visible toast (including long truncated toast) is a compact bottom pill
+     * (never a full-screen 160x160 default-sized circle) and produces 0 redraw pixels when unchanged */
     strcpy(m.toast_msg, "Long warning toast clipped cleanly!!!");
     m.toast_col = UI_COL_AMBER;
     ui_render_screen(UI_SCR_HOME, &m);
     capture_shot(0); /* wait for any transition, then re-test toast stability */
+    {
+        int top_amber = 0, bot_amber = 0;
+        for (int y = 0; y < 52; y++) {
+            for (int x = 0; x < 160; x++) {
+                if (g_fb[y][x] == UI_COL_AMBER) top_amber++;
+            }
+        }
+        for (int y = 56; y < 80; y++) {
+            for (int x = 0; x < 160; x++) {
+                if (g_fb[y][x] == UI_COL_AMBER) bot_amber++;
+            }
+        }
+        assert(top_amber == 0 && bot_amber > 100);
+    }
     before = g_written_pixels;
     ui_render_screen(UI_SCR_HOME, &m);
     assert(g_written_pixels == before);

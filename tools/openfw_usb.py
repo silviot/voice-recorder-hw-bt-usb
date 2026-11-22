@@ -368,6 +368,19 @@ class LibUsbCtypesBulkTransport(BulkOnlyTransport):
         lib.libusb_bulk_transfer.restype = ctypes.c_int
         lib.libusb_close.argtypes = [ctypes.c_void_p]
         lib.libusb_close.restype = None
+        lib.libusb_get_device.argtypes = [ctypes.c_void_p]
+        lib.libusb_get_device.restype = ctypes.c_void_p
+        lib.libusb_control_transfer.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ubyte,
+            ctypes.c_ubyte,
+            ctypes.c_uint16,
+            ctypes.c_uint16,
+            ctypes.c_void_p,
+            ctypes.c_uint16,
+            ctypes.c_uint,
+        ]
+        lib.libusb_control_transfer.restype = ctypes.c_int
 
         self.ctx = ctypes.c_void_p()
         if lib.libusb_init(ctypes.byref(self.ctx)) != 0:
@@ -398,6 +411,37 @@ class LibUsbCtypesBulkTransport(BulkOnlyTransport):
             lib.libusb_exit(self.ctx)
             raise PermissionError(f"libusb_claim_interface failed ({rc}); try sudo")
 
+        # Discover Bulk OUT / IN endpoints from active USB Configuration Descriptor (EP2 HS or EP1 legacy)
+        self.ep_out = 0x02
+        self.ep_in = 0x82
+        cfg_buf = (ctypes.c_ubyte * 64)()
+        got = lib.libusb_control_transfer(
+            self.handle, 0x80, 0x06, 0x0200, 0, ctypes.cast(cfg_buf, ctypes.c_void_p), 64, 1000
+        )
+        if got >= 9:
+            raw_cfg = bytes(cfg_buf[:got])
+            off = 0
+            found_out = None
+            found_in = None
+            while off + 2 <= len(raw_cfg):
+                blen = raw_cfg[off]
+                btype = raw_cfg[off + 1]
+                if blen < 2 or off + blen > len(raw_cfg):
+                    break
+                if btype == 0x05 and blen >= 7:
+                    addr = raw_cfg[off + 2]
+                    attr = raw_cfg[off + 3] & 0x03
+                    if attr == 0x02:  # Bulk
+                        if addr & 0x80:
+                            found_in = addr
+                        else:
+                            found_out = addr
+                off += blen
+            if found_out is not None:
+                self.ep_out = found_out
+            if found_in is not None:
+                self.ep_in = found_in
+
     def close(self) -> None:
         if getattr(self, "handle", None):
             self.lib.libusb_release_interface(self.handle, 0)
@@ -413,7 +457,7 @@ class LibUsbCtypesBulkTransport(BulkOnlyTransport):
         buf = (ctypes.c_ubyte * len(data)).from_buffer_copy(data)
         actual = ctypes.c_int(0)
         rc = self.lib.libusb_bulk_transfer(
-            self.handle, 0x01, ctypes.cast(buf, ctypes.c_void_p), len(data), ctypes.byref(actual), timeout_ms
+            self.handle, self.ep_out, ctypes.cast(buf, ctypes.c_void_p), len(data), ctypes.byref(actual), timeout_ms
         )
         if rc != 0 or actual.value != len(data):
             raise IOError(f"libusb bulk OUT failed: rc={rc} sent={actual.value}/{len(data)}")
@@ -422,7 +466,7 @@ class LibUsbCtypesBulkTransport(BulkOnlyTransport):
         buf = (ctypes.c_ubyte * n)()
         actual = ctypes.c_int(0)
         rc = self.lib.libusb_bulk_transfer(
-            self.handle, 0x81, ctypes.cast(buf, ctypes.c_void_p), n, ctypes.byref(actual), timeout_ms
+            self.handle, self.ep_in, ctypes.cast(buf, ctypes.c_void_p), n, ctypes.byref(actual), timeout_ms
         )
         if rc != 0:
             raise IOError(f"libusb bulk IN failed: rc={rc} got={actual.value}/{n}")

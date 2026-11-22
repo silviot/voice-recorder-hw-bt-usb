@@ -296,6 +296,7 @@ void ui_toast_update(const char *msg, uint16_t rgb565_col)
     if (!s_toast_pill) {
         lv_obj_t *top = lv_layer_top();
         s_toast_pill = ui_box_create(top);
+        lv_obj_set_size(s_toast_pill, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
         lv_obj_set_style_radius(s_toast_pill, LV_RADIUS_CIRCLE, 0);
         lv_obj_set_style_bg_opa(s_toast_pill, LV_OPA_COVER, 0);
         lv_obj_set_style_pad_hor(s_toast_pill, 8, 0);

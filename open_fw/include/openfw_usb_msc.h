@@ -60,6 +60,9 @@ typedef struct {
     uint16_t            pp_prefetch_secs;
     uint32_t            pp_prefetch_lba;
 
+    /* Bulk endpoint wMaxPacketSize (64 in Full-Speed, 512 in High-Speed; preserved across reset) */
+    uint16_t            max_pkt;
+
     /* Streaming / inline transfer state */
     uint8_t             is_blk_xfer;
     uint32_t            cur_lba;
@@ -74,12 +77,13 @@ typedef struct {
     uint8_t             sec_buf[USB_MSC_BUF_BYTES] __attribute__((aligned(4)));
 } usb_msc_state_t;
 
-void    usb_msc_init_state(usb_msc_state_t *st, blkdev_t *dev);
-void    usb_msc_set_vendor_cb(usb_msc_state_t *st, usb_msc_vendor_cb_t cb, void *user);
-void    usb_msc_set_async_read(usb_msc_state_t *st, const usb_msc_async_read_t *ops);
-void    usb_msc_reset(usb_msc_state_t *st);
-void    usb_msc_on_rx_packet(usb_msc_state_t *st, const uint8_t *pkt, uint8_t len);
-int     usb_msc_need_tx(const usb_msc_state_t *st);
-uint8_t usb_msc_get_tx_packet(usb_msc_state_t *st, uint8_t out[64]);
+void     usb_msc_init_state(usb_msc_state_t *st, blkdev_t *dev);
+void     usb_msc_set_vendor_cb(usb_msc_state_t *st, usb_msc_vendor_cb_t cb, void *user);
+void     usb_msc_set_async_read(usb_msc_state_t *st, const usb_msc_async_read_t *ops);
+void     usb_msc_set_max_packet(usb_msc_state_t *st, uint16_t max_pkt);
+void     usb_msc_reset(usb_msc_state_t *st);
+void     usb_msc_on_rx_packet(usb_msc_state_t *st, const uint8_t *pkt, uint16_t len);
+int      usb_msc_need_tx(const usb_msc_state_t *st);
+uint16_t usb_msc_get_tx_packet(usb_msc_state_t *st, uint8_t *out);
 
 #endif /* OPENFW_USB_MSC_H */

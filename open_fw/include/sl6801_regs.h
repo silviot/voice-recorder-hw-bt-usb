@@ -83,6 +83,7 @@ static inline void openfw_mmio_rmw32(uint32_t addr, uint32_t clear_mask, uint32_
 
 #define SCB_VTOR_ADDR       0xE000ED08u
 #define SCB_AIRCR_ADDR      0xE000ED0Cu
+#define SCB_SCR_ADDR        0xE000ED10u
 #define SCB_SHCSR_ADDR      0xE000ED24u
 #define SCB_CFSR_ADDR       0xE000ED28u
 #define SCB_HFSR_ADDR       0xE000ED2Cu
@@ -92,11 +93,13 @@ static inline void openfw_mmio_rmw32(uint32_t addr, uint32_t clear_mask, uint32_
 
 #define SCB_AIRCR_VECTKEY   0x05FA0000u
 #define SCB_AIRCR_SYSRESET  (1u << 2)
+#define SCB_SCR_SEVONPEND   (1u << 4)
 #define SCB_SHCSR_FAULTS_EN 0x00070000u /* MemManage | BusFault | UsageFault */
 #define SCB_CPACR_FPU_FULL  (0xFu << 20)
 
 #define NVIC_ISER_ADDR(n)   (0xE000E100u + 4u * (uint32_t)(n))
 #define NVIC_ICER_ADDR(n)   (0xE000E180u + 4u * (uint32_t)(n))
+#define NVIC_ISPR_ADDR(n)   (0xE000E200u + 4u * (uint32_t)(n))
 #define NVIC_ICPR_ADDR(n)   (0xE000E280u + 4u * (uint32_t)(n))
 
 #ifndef OPENFW_HOST_MMIO
@@ -107,6 +110,7 @@ static inline void openfw_mmio_rmw32(uint32_t addr, uint32_t clear_mask, uint32_
 
 #define SCB_VTOR            REG32(SCB_VTOR_ADDR)
 #define SCB_AIRCR           REG32(SCB_AIRCR_ADDR)
+#define SCB_SCR             REG32(SCB_SCR_ADDR)
 #define SCB_SHCSR           REG32(SCB_SHCSR_ADDR)
 #define SCB_CFSR            REG32(SCB_CFSR_ADDR)
 #define SCB_HFSR            REG32(SCB_HFSR_ADDR)
@@ -116,6 +120,7 @@ static inline void openfw_mmio_rmw32(uint32_t addr, uint32_t clear_mask, uint32_
 
 #define NVIC_ISER(n)        REG32(NVIC_ISER_ADDR(n))
 #define NVIC_ICER(n)        REG32(NVIC_ICER_ADDR(n))
+#define NVIC_ISPR(n)        REG32(NVIC_ISPR_ADDR(n))
 #define NVIC_ICPR(n)        REG32(NVIC_ICPR_ADDR(n))
 #endif
 
@@ -140,6 +145,8 @@ static inline void nvic_clear_pending(uint32_t irq)
 #define IRQ_USB_PHY         43u
 #define IRQ_SDIO            44u
 #define IRQ_RTC             47u
+#define IRQ_IPC_MBOX_CPU0   54u
+#define IRQ_IPC_MBOX_CPU1   55u
 #define DMAC_IRQ_BASE       60u /* CH0..CH7 = NVIC IRQ 60..67 */
 
 /* ============================================================================
@@ -273,6 +280,7 @@ static inline void nvic_clear_pending(uint32_t irq)
 #define CRU_CLK_AUDIO       0x13u
 #define CRU_CLK_PWM         0x27u
 #define CRU_CLK_NOR         0x2Bu
+#define CRU_CLK_IPC_MBOX    0x2Eu
 #define CRU_CLK_LCDC        0x3Fu
 
 #define CRU_RST_CPU1        0x00u
@@ -283,6 +291,7 @@ static inline void nvic_clear_pending(uint32_t irq)
 #define CRU_RST_USB         0x23u
 #define CRU_RST_SDIO        0x24u
 #define CRU_RST_AUDIO       0x25u
+#define CRU_RST_IPC_MBOX    0x28u
 #define CRU_RST_PWM         0x44u
 #define CRU_RST_XIP_BUS     0x5Au
 #define CRU_RST_LCDC        0x5Cu
@@ -679,7 +688,10 @@ static inline int gpio_read(uint32_t port, uint32_t pin)
  * IPC Mailbox, Spinlocks & CPU1 Boot Mailbox
  * ============================================================================ */
 
+#define MBOX_CFG            REG32(IPC_MBOX_BASE + 0x00u)
+#define MBOX_CPU0_IRQ_EN    REG32(IPC_MBOX_BASE + 0x20u)
 #define MBOX_CPU0_IRQ_STAT  REG32(IPC_MBOX_BASE + 0x24u)
+#define MBOX_CPU1_IRQ_EN    REG32(IPC_MBOX_BASE + 0x28u)
 #define MBOX_CPU1_IRQ_STAT  REG32(IPC_MBOX_BASE + 0x2Cu)
 #define MBOX_CH_CNT(ch)     REG32(IPC_MBOX_BASE + 0x44u + (uint32_t)(ch) * 0x20u)
 #define MBOX_CH_DATA(ch)    REG32(IPC_MBOX_BASE + 0x48u + (uint32_t)(ch) * 0x20u)

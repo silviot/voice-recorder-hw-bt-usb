@@ -153,9 +153,15 @@ static void finish_zero_data_ok(usb_msc_state_t *st, uint32_t data_len, uint8_t 
     }
 }
 
+static inline uint16_t eff_max_pkt(const usb_msc_state_t *st)
+{
+    return (st && st->max_pkt >= 64u && st->max_pkt <= 512u) ? st->max_pkt : 64u;
+}
+
 static void start_inline_in(usb_msc_state_t *st, uint32_t cbw_data_len, uint32_t resp_len)
 {
     uint32_t xfer = (resp_len < cbw_data_len) ? resp_len : cbw_data_len;
+    uint16_t mps  = eff_max_pkt(st);
     st->csw_status    = 0u;
     st->csw_residue   = cbw_data_len - xfer;
     st->is_blk_xfer   = 0u;
@@ -163,7 +169,7 @@ static void start_inline_in(usb_msc_state_t *st, uint32_t cbw_data_len, uint32_t
     st->inline_pos    = 0u;
     st->inline_len    = (uint16_t)xfer;
     st->data_rem      = xfer;
-    st->send_zlp      = (xfer < cbw_data_len && (xfer & 63u) == 0u) ? 1u : 0u;
+    st->send_zlp      = (xfer < cbw_data_len && (xfer % mps) == 0u) ? 1u : 0u;
     st->phase         = (xfer > 0u || st->send_zlp) ? MSC_PHASE_DATA_IN : MSC_PHASE_CSW;
 }
 
@@ -185,7 +191,7 @@ static void abort_prefetch(usb_msc_state_t *st)
     }
 }
 
-static void handle_cbw(usb_msc_state_t *st, const uint8_t *pkt, uint8_t len)
+static void handle_cbw(usb_msc_state_t *st, const uint8_t *pkt, uint16_t len)
 {
     abort_prefetch(st);
     if (len != 31u || get_le32(pkt) != CBW_SIGNATURE) {
@@ -441,7 +447,7 @@ static void handle_cbw(usb_msc_state_t *st, const uint8_t *pkt, uint8_t len)
         st->buf_len     = 0u; /* Load first chunk lazily in get_tx_packet */
         st->data_rem    = xfer;
         st->csw_residue = data_len - xfer;
-        st->send_zlp    = (xfer < data_len && (xfer & 63u) == 0u) ? 1u : 0u;
+        st->send_zlp    = (xfer < data_len && (xfer % eff_max_pkt(st)) == 0u) ? 1u : 0u;
         st->phase       = MSC_PHASE_DATA_IN;
         break;
     }
@@ -536,8 +542,17 @@ void usb_msc_init_state(usb_msc_state_t *st, blkdev_t *dev)
         return;
     }
     mem_zero(st, sizeof(*st));
-    st->dev   = dev;
-    st->phase = MSC_PHASE_IDLE;
+    st->dev     = dev;
+    st->max_pkt = 64u;
+    st->phase   = MSC_PHASE_IDLE;
+}
+
+void usb_msc_set_max_packet(usb_msc_state_t *st, uint16_t max_pkt)
+{
+    if (!st) {
+        return;
+    }
+    st->max_pkt = (max_pkt >= 64u && max_pkt <= 512u) ? max_pkt : 64u;
 }
 
 void usb_msc_set_vendor_cb(usb_msc_state_t *st, usb_msc_vendor_cb_t cb, void *user)
@@ -572,15 +587,17 @@ void usb_msc_reset(usb_msc_state_t *st)
     usb_msc_vendor_cb_t  vendor_cb   = st->vendor_cb;
     void                *vendor_user = st->vendor_user;
     usb_msc_async_read_t async_read  = st->async_read;
+    uint16_t             max_pkt     = eff_max_pkt(st);
     mem_zero(st, sizeof(*st));
     st->dev         = dev;
     st->vendor_cb   = vendor_cb;
     st->vendor_user = vendor_user;
     st->async_read  = async_read;
+    st->max_pkt     = max_pkt;
     st->phase       = MSC_PHASE_IDLE;
 }
 
-void usb_msc_on_rx_packet(usb_msc_state_t *st, const uint8_t *pkt, uint8_t len)
+void usb_msc_on_rx_packet(usb_msc_state_t *st, const uint8_t *pkt, uint16_t len)
 {
     if (!st || (!pkt && len > 0u)) {
         return;
@@ -684,11 +701,12 @@ int usb_msc_need_tx(const usb_msc_state_t *st)
     return (st->phase == MSC_PHASE_DATA_IN || st->phase == MSC_PHASE_CSW) ? 1 : 0;
 }
 
-uint8_t usb_msc_get_tx_packet(usb_msc_state_t *st, uint8_t out[64])
+uint16_t usb_msc_get_tx_packet(usb_msc_state_t *st, uint8_t *out)
 {
     if (!st || !out) {
         return 0u;
     }
+    uint16_t mps = eff_max_pkt(st);
 
     if (st->phase == MSC_PHASE_DATA_IN) {
         if (st->data_rem == 0u) {
@@ -703,7 +721,7 @@ uint8_t usb_msc_get_tx_packet(usb_msc_state_t *st, uint8_t out[64])
 
         if (!st->is_blk_xfer) {
             uint16_t rem = st->inline_len - st->inline_pos;
-            uint8_t  n   = (rem > 64u) ? 64u : (uint8_t)rem;
+            uint16_t n   = (rem > mps) ? mps : rem;
             if (n > 0u) {
                 mem_copy(out, &st->inline_buf[st->inline_pos], n);
                 st->inline_pos = (uint16_t)(st->inline_pos + n);
@@ -781,7 +799,7 @@ uint8_t usb_msc_get_tx_packet(usb_msc_state_t *st, uint8_t out[64])
         }
 
         uint16_t sec_rem = (uint16_t)(st->buf_len - st->sec_off);
-        uint32_t take    = (sec_rem < 64u) ? sec_rem : 64u;
+        uint32_t take    = (sec_rem < mps) ? sec_rem : (uint32_t)mps;
         if (take > st->data_rem) {
             take = st->data_rem;
         }
@@ -796,7 +814,7 @@ uint8_t usb_msc_get_tx_packet(usb_msc_state_t *st, uint8_t out[64])
                 st->phase = MSC_PHASE_CSW;
             }
         }
-        return (uint8_t)take;
+        return (uint16_t)take;
     }
 
     if (st->phase == MSC_PHASE_CSW) {

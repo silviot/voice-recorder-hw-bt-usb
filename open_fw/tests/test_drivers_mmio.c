@@ -1318,31 +1318,31 @@ static void host_feed_ep0_setup(const uint8_t setup[8])
     usb_msc_poll();
 }
 
-static void host_feed_ep1_out(const uint8_t *data, uint16_t len)
+static void host_feed_ep_out(const uint8_t *data, uint16_t len)
 {
-    assert(len <= sizeof(g_soc.musb_rx_fifo[1]));
-    memcpy(g_soc.musb_rx_fifo[1], data, len);
-    g_soc.musb_rx_pos[1]  = 0u;
-    g_soc.musb_rx_len[1]  = len;
-    g_soc.musb_rxcount[1] = len;
-    g_soc.musb_rxcsr[1]  |= 0x0001u; /* RxPktRdy */
-    g_soc.musb_intrrx    |= 0x0002u;
+    assert(len <= sizeof(g_soc.musb_rx_fifo[2]));
+    memcpy(g_soc.musb_rx_fifo[2], data, len);
+    g_soc.musb_rx_pos[2]  = 0u;
+    g_soc.musb_rx_len[2]  = len;
+    g_soc.musb_rxcount[2] = len;
+    g_soc.musb_rxcsr[2]  |= 0x0001u; /* RxPktRdy */
+    g_soc.musb_intrrx    |= (1u << 2);
     usb_msc_poll();
 }
 
-static uint16_t host_drain_ep1_in(uint8_t *out, uint16_t max_len)
+static uint16_t host_drain_ep_in(uint8_t *out, uint16_t max_len)
 {
     uint16_t total = 0u;
     for (int iter = 0; iter < 64; iter++) {
-        if (g_soc.musb_tx_len[1] > 0u) {
-            assert(total + g_soc.musb_tx_len[1] <= max_len);
-            memcpy(out + total, g_soc.musb_tx_fifo[1], g_soc.musb_tx_len[1]);
-            total = (uint16_t)(total + g_soc.musb_tx_len[1]);
-            g_soc.musb_tx_len[1] = 0u;
-            g_soc.musb_txcsr[1] &= ~0x0001u;
+        if (g_soc.musb_tx_len[2] > 0u) {
+            assert(total + g_soc.musb_tx_len[2] <= max_len);
+            memcpy(out + total, g_soc.musb_tx_fifo[2], g_soc.musb_tx_len[2]);
+            total = (uint16_t)(total + g_soc.musb_tx_len[2]);
+            g_soc.musb_tx_len[2] = 0u;
+            g_soc.musb_txcsr[2] &= ~0x0001u;
         }
         usb_msc_poll();
-        if (g_soc.musb_tx_len[1] == 0u) {
+        if (g_soc.musb_tx_len[2] == 0u) {
             break;
         }
     }
@@ -1379,12 +1379,12 @@ static uint8_t host_vendor_e0(uint32_t tag, uint8_t subcmd, uint32_t arg1, uint3
     cbw[16] = subcmd;
     host_put_le32(&cbw[17], arg1);
     host_put_le32(&cbw[21], arg2);
-    host_feed_ep1_out(cbw, 31u);
+    host_feed_ep_out(cbw, 31u);
     if (!is_in && len > 0u && out_data) {
-        host_feed_ep1_out(out_data, len);
+        host_feed_ep_out(out_data, len);
     }
     uint8_t rx[128];
-    uint16_t got = host_drain_ep1_in(rx, sizeof(rx));
+    uint16_t got = host_drain_ep_in(rx, sizeof(rx));
     uint16_t exp_data = (is_in && len > 0u) ? len : 0u;
     assert(got == (uint16_t)(exp_data + 13u));
     if (exp_data > 0u && in_data) {
@@ -1506,17 +1506,32 @@ static void test_sdio_exfat_and_usb_msc(const char *exfat_img_path)
     assert(usb_phy_det_poll_host() == 1);
 
     assert(usb_msc_start(&blk) == 0);
-    assert((g_soc.musb_power & 0x40u) != 0u);
-    assert((g_soc.musb_testmode & 0x20u) != 0u);
+    assert((g_soc.musb_power & 0x60u) == 0x60u); /* SoftConn | HS_Enab */
+    assert((g_soc.musb_testmode & 0x20u) == 0u); /* Force_FS cleared */
 
-    /* Bus Reset -> GET_DESCRIPTOR(DEVICE) -> SET_ADDRESS(5) -> SET_CONFIGURATION(1) -> GET_MAX_LUN */
+    /* Simulate USB 2.0 High-Speed Bus Reset (MUSB_POWER.HS_Mode = 0x10) */
+    g_soc.musb_power  |= 0x10u;
     g_soc.musb_intrusb = 0x04u;
     usb_msc_poll();
+    assert(g_soc.musb_txmaxp[2] == 512u && g_soc.musb_rxmaxp[2] == 512u);
 
     static const uint8_t get_dev[8] = { 0x80u, 0x06u, 0x00u, 0x01u, 0x00u, 0x00u, 18u, 0x00u };
     host_feed_ep0_setup(get_dev);
     assert(g_soc.musb_tx_len[0] == 18u);
     assert(g_soc.musb_tx_fifo[0][8] == 0x09u && g_soc.musb_tx_fifo[0][9] == 0x12u);
+
+    static const uint8_t get_cfg_desc[8] = { 0x80u, 0x06u, 0x00u, 0x02u, 0x00u, 0x00u, 32u, 0x00u };
+    host_feed_ep0_setup(get_cfg_desc);
+    assert(g_soc.musb_tx_len[0] == 32u);
+    assert(g_soc.musb_tx_fifo[0][20] == 0x82u && g_soc.musb_tx_fifo[0][22] == 0x00u && g_soc.musb_tx_fifo[0][23] == 0x02u);
+
+    static const uint8_t get_qual[8] = { 0x80u, 0x06u, 0x00u, 0x06u, 0x00u, 0x00u, 10u, 0x00u };
+    host_feed_ep0_setup(get_qual);
+    assert(g_soc.musb_tx_len[0] == 10u && g_soc.musb_tx_fifo[0][1] == 0x06u);
+
+    static const uint8_t get_other[8] = { 0x80u, 0x06u, 0x00u, 0x07u, 0x00u, 0x00u, 32u, 0x00u };
+    host_feed_ep0_setup(get_other);
+    assert(g_soc.musb_tx_len[0] == 32u && g_soc.musb_tx_fifo[0][1] == 0x07u && g_soc.musb_tx_fifo[0][22] == 64u);
 
     static const uint8_t set_addr[8] = { 0x00u, 0x05u, 5u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u };
     host_feed_ep0_setup(set_addr);
@@ -1533,7 +1548,7 @@ static void test_sdio_exfat_and_usb_msc(const char *exfat_img_path)
     static const uint8_t bad_cfg[8] = { 0x00u, 0x09u, 2u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u };
     host_feed_ep0_setup(bad_cfg);
     assert(g_soc.musb_ep0_stalls == stalls_before + 1u);
-    static const uint8_t bad_clr[8] = { 0x02u, 0x01u, 0x01u, 0x00u, 0x81u, 0x00u, 0x00u, 0x00u };
+    static const uint8_t bad_clr[8] = { 0x02u, 0x01u, 0x01u, 0x00u, 0x82u, 0x00u, 0x00u, 0x00u };
     host_feed_ep0_setup(bad_clr);
     assert(g_soc.musb_ep0_stalls == stalls_before + 2u);
     static const uint8_t get_lun[8] = { 0xA1u, 0xFEu, 0x00u, 0x00u, 0x00u, 0x00u, 1u, 0x00u };
@@ -1546,26 +1561,26 @@ static void test_sdio_exfat_and_usb_msc(const char *exfat_img_path)
         36u, 0u, 0u, 0u,         0x80u, 0u, 6u,
         0x12u, 0u, 0u, 0u, 36u, 0u,
     };
-    host_feed_ep1_out(cbw, 31u);
+    host_feed_ep_out(cbw, 31u);
     uint8_t in_buf[600];
-    uint16_t n_in = host_drain_ep1_in(in_buf, sizeof(in_buf));
+    uint16_t n_in = host_drain_ep_in(in_buf, sizeof(in_buf));
     assert(n_in == 36u + 13u);
     assert(memcmp(in_buf + 8, "Cassini ", 8) == 0);
     assert(in_buf[36 + 12] == 0u);
 
-    /* SCSI READ(10) LBA 0 (1 sector = 512 B + 13 B CSW) */
+    /* SCSI READ(10) LBA 0 (1 sector = single 512 B HS packet + 13 B CSW) */
     memset(cbw, 0, sizeof(cbw));
     memcpy(cbw, "USBC\x02\x00\x00\x00", 8);
     cbw[8]  = 0x00u; cbw[9] = 0x02u; /* 512 B */
     cbw[12] = 0x80u; cbw[14] = 10u;
     cbw[15] = 0x28u; cbw[23] = 1u;   /* LBA 0, 1 blk */
-    host_feed_ep1_out(cbw, 31u);
-    n_in = host_drain_ep1_in(in_buf, sizeof(in_buf));
+    host_feed_ep_out(cbw, 31u);
+    n_in = host_drain_ep_in(in_buf, sizeof(in_buf));
     assert(n_in == 512u + 13u);
     assert(memcmp(in_buf, sector_buf, 512u) == 0);
     assert(in_buf[512 + 12] == 0u);
 
-    /* SCSI WRITE(10) LBA 5000 (safely past exFAT mkfs) -> verifies real SD write */
+    /* SCSI WRITE(10) LBA 5000 (single 512 B HS packet) -> verifies real SD write */
     uint8_t wbuf[512];
     for (uint32_t i = 0u; i < 512u; i++) {
         wbuf[i] = (uint8_t)(0xA5u ^ i);
@@ -1580,13 +1595,24 @@ static void test_sdio_exfat_and_usb_msc(const char *exfat_img_path)
     cbw[19] = (uint8_t)(5000u >> 8);
     cbw[20] = (uint8_t)(5000u);
     cbw[23] = 1u;
-    host_feed_ep1_out(cbw, 31u);
-    for (uint32_t off = 0u; off < 512u; off += 64u) {
-        host_feed_ep1_out(wbuf + off, 64u);
-    }
-    n_in = host_drain_ep1_in(in_buf, sizeof(in_buf));
+    host_feed_ep_out(cbw, 31u);
+    host_feed_ep_out(wbuf, 512u);
+    n_in = host_drain_ep_in(in_buf, sizeof(in_buf));
     assert(n_in == 13u && in_buf[12] == 0u);
     assert(memcmp(&g_soc.sd_sectors[5000u * 512u], wbuf, 512u) == 0);
+
+    /* Verify clean Full-Speed fallback on Bus Reset without HS_Mode (0x10)
+     * and that DEVICE_QUALIFIER stalls in FS mode per USB 2.0 9.6.2 */
+    g_soc.musb_power  &= ~0x10u;
+    g_soc.musb_intrusb = 0x04u;
+    usb_msc_poll();
+    assert(g_soc.musb_txmaxp[2] == 64u && g_soc.musb_rxmaxp[2] == 64u);
+    host_feed_ep0_setup(get_cfg_desc);
+    assert(g_soc.musb_tx_len[0] == 32u && g_soc.musb_tx_fifo[0][22] == 64u);
+    uint32_t fs_stalls = g_soc.musb_ep0_stalls;
+    host_feed_ep0_setup(get_qual);
+    assert(g_soc.musb_ep0_stalls == fs_stalls + 1u);
+    host_feed_ep0_setup(set_cfg);
 
     uint32_t rx_p = 0u, tx_p = 0u;
     usb_msc_get_stats(&rx_p, &tx_p);
