@@ -799,13 +799,15 @@ static void test_wdt_timer(void)
 
     g_soc.aon_wdt_trim0 = 0x00001234u;
     g_soc.aon_wdt_trim1 = 0x0000005Au;
-    g_soc.aon_wdt_pmu_rst_cmd = 0xAF20u;
+    g_soc.aon_wdt_pmu_rst_cmd = 0u;
     wdt_start_reset(16u, 0x2Fu);
-    assert(g_soc.aon_wdt_pmu_rst_cmd == 0u);
+    assert(g_soc.aon_wdt_pmu_rst_cmd == 0xAF20u);
     assert(g_soc.wdt_en == 1u);
     assert(g_soc.wdt_mode == 0x2001u);
     assert(g_soc.wdt_cfg == 0x71u);
     assert(g_soc.wdt_ctrl1 == (((0x1234u << 8) & 0x01FFFF00u) | 0x5Au));
+    wdt_start_reset(16u, 0u);
+    assert(g_soc.aon_wdt_pmu_rst_cmd == 0u);
     wdt_stop();
     assert(g_soc.wdt_cfg == 0u);
 
@@ -814,6 +816,7 @@ static void test_wdt_timer(void)
     g_soc.wdt_en = 0u;
     g_soc.wdt_mode = 0u;
     g_soc.wdt_cfg = 0xF1u;
+    uint32_t feeds_before = g_soc.wdt_feeds;
     g_wfi_armed = 1;
     if (setjmp(g_wfi_jmp) == 0) {
         system_reboot();
@@ -824,6 +827,7 @@ static void test_wdt_timer(void)
     assert(g_soc.wdt_en == 1u);
     assert(g_soc.wdt_mode == 0x2001u);
     assert(g_soc.wdt_cfg == 0x01u);
+    assert(g_soc.wdt_feeds == feeds_before + 1u && g_soc.last_wdt_key == WDT_FEED_KEY);
     assert(g_soc.scb_aircr == (SCB_AIRCR_VECTKEY | SCB_AIRCR_SYSRESET));
     assert(g_soc.wfi_count == 1u);
     printf("[OK] wdt_timer + PMU reset MMIO\n");
@@ -1045,6 +1049,11 @@ static void test_pmu_driver(void)
     assert(g_soc.pmu_regs[0x23u] == 0x03u);
     assert(g_soc.pmu_regs[0x30u] == 0x00u);
     assert((g_soc.pmu_regs[0x17u] & 0x05u) == 0x04u);
+
+    /* If soft power-off cleared PMU[0x00][7:6], boot init must re-enable 8s rescue (0x80) */
+    g_soc.pmu_regs[0x00u] = 0x0Eu;
+    pmu_unattended_init();
+    assert(g_soc.pmu_regs[0x00u] == 0x88u);
 
     g_soc.pmu_regs[0x17u] = 0x00u;
     pmu_poll_charge_manage();

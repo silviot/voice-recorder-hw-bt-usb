@@ -31,14 +31,22 @@ void wdt_stop(void)
 
 void wdt_start_reset(uint32_t timeout_sec, uint8_t pmu_reg20_cur)
 {
-    (void)pmu_reg20_cur;
     uint32_t trim0 = openfw_mmio_rd32(AON_WDT_TRIM0_ADDR);
     uint32_t trim1 = openfw_mmio_rd32(AON_WDT_TRIM1_ADDR);
     uint32_t ctrl1 = ((trim0 << 8) & 0x01FFFF00u) | (trim1 & 0xFFu);
     uint32_t timeout_bits;
 
-    /* Use SoC-internal digital WDT reset so PMU rails & AON_BACKUP stay intact */
-    openfw_mmio_wr32(AON_WDT_PMU_RST_CMD_ADDR, 0u);
+    /* When pmu_reg20_cur != 0 (runtime 32 s WDT), program AON_WDT_PMU_RST_CMD
+     * to match stock 0x00CE842A (((PMU[0x20] | 0x80) << 8) | 0x20 = 0xAF20) so
+     * an unhandled hang triggers a full PMU cold rail reset instead of a
+     * digital-only reset that hangs in BootROM while PLL0 / Quad XIP are active.
+     * Passing 0 requests a digital-only reset (preserves AON_BACKUP). */
+    if (pmu_reg20_cur != 0u) {
+        uint32_t cmd = (((uint32_t)(pmu_reg20_cur | 0x80u)) << 8) | 0x20u;
+        openfw_mmio_wr32(AON_WDT_PMU_RST_CMD_ADDR, cmd);
+    } else {
+        openfw_mmio_wr32(AON_WDT_PMU_RST_CMD_ADDR, 0u);
+    }
 
     if (timeout_sec == 0u) {
         timeout_bits = 0u;
@@ -77,7 +85,9 @@ void system_reboot(void)
     OPENFW_DSB();
 
 #ifndef OPENFW_HOST_MMIO
-    /* Park CPU1 and restore 1-wire SPI NOR XIP so BootROM cold-reboots cleanly */
+    /* Park CPU1 and restore 1-wire SPI NOR XIP + 24 MHz HOSC clocks (matching
+     * HLKJ 0x008284D6) so BootROM cold-reboots cleanly after digital WDT reset.
+     * Note: CRU 0x400800A0[5:4] for NOR is 0b01 = HOSC24M (0b00 is PLL0 tap!). */
     rom_rst_hold(CRU_RST_CPU1);
     NOR_XIP_CFG = NOR_XIP_CFG_1WIRE;
     rom_gpio_config(0x0000279Bu);
@@ -88,17 +98,19 @@ void system_reboot(void)
     OPENFW_DSB();
     OPENFW_ISB();
 
-    /* Exact HLKJ 0x008284D6 clock/PLL teardown to HOSC from SRAM (Q14 verified) */
-    openfw_mmio_clr32(0x40080040u, 0x03u);
-    openfw_mmio_clr32(0x40080048u, 0x03u);
-    openfw_mmio_clr32(0x400800A0u, 0x30u);
-    for (volatile uint32_t i = 0u; i < 32u; i++) {
-        OPENFW_NOP();
-    }
-    openfw_mmio_clr32(0x40080030u, 0x70u);
-    openfw_mmio_clr32(0x40080010u, 0xC0000000u);
-    openfw_mmio_clr32(0x40080000u, 0xC0010000u);
-    openfw_mmio_clr32(0x400800FCu, 0x10u);
+    rom_clk_set_src(CRU_CLK_CPU, CRU_CLK_SRC_HOSC24M);
+    rom_clk_set_src(CRU_CLK_BUS6, CRU_CLK_SRC_HOSC24M);
+    rom_clk_set_src(CRU_CLK_NOR, CRU_CLK_SRC_HOSC24M);
+    rom_us_delay(5000u);
+    rom_clk_div(CRU_CLK_CPU, 1u);
+    rom_clk_div(CRU_CLK_BUS6, 1u);
+    rom_clk_div(CRU_CLK_NOR, 1u);
+    rom_clk_disable(0x29u);
+    rom_clk_disable(8u);
+    rom_clk_disable(9u);
+    rom_clk_disable(0x26u);
+    rom_clk_disable(CRU_CLK_APLL);
+    rom_clk_disable(CRU_CLK_PLL0);
 #endif
 
     /* Exact BootROM/HLKJ SoC digital WDT reset (preserves PMU rails & AON_BACKUP) */
@@ -108,6 +120,7 @@ void system_reboot(void)
     openfw_mmio_set32(WDT_EN_ADDR, 1u);
     openfw_mmio_wr32(WDT_MODE_ADDR, WDT_MODE_HW_RESET);
     openfw_mmio_wr32(WDT_CFG_ADDR, 0x01u);
+    openfw_mmio_wr32(WDT_FEED_ADDR, WDT_FEED_KEY); /* Reload counter to 0x01 timeout immediately */
 
 #ifdef OPENFW_HOST_MMIO
     /* Host MMIO test harness expects SCB_AIRCR write + WFI to observe reboot */

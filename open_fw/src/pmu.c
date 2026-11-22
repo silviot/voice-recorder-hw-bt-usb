@@ -199,6 +199,35 @@ power_button_action_t power_button_update(uint8_t events, uint32_t now, int scre
     return POWER_BUTTON_IDLE;
 }
 
+/* Universal SL6801 PMU cold rail reset (SL6801_HW76_HARDWARE.md §5.2):
+ * Drops and re-sequences all SoC rails cleanly (resets PLLs, CRU, USB PHY, XIP)
+ * while preserving sticky PMU flags (PMU[0x23], PMU[0x00]). */
+OPENFW_FASTFUNC __attribute__((noinline, noreturn))
+static void pmu_cold_reset(void)
+{
+#ifndef OPENFW_HOST_MMIO
+    cpu1_ui_stop();
+    uint32_t pm;
+    OPENFW_IRQ_SAVE(pm);
+    (void)pm;
+    pmu_write_reg(0x22u, 0x00u);
+    pmu_write_reg(0x20u, 0x2Fu);
+    uint8_t r1b = pmu_read_reg(0x1Bu);
+    pmu_write_reg(0x1Bu, (uint8_t)(r1b | 0x80u));
+    pmu_write_reg(0x1Bu, (uint8_t)(r1b & ~0x80u));
+    pmu_write_reg(0x20u, 0xAFu);
+    OPENFW_DSB();
+    while (1) {
+        OPENFW_NOP();
+    }
+#else
+    system_reboot();
+    while (1) {
+        OPENFW_WFI();
+    }
+#endif
+}
+
 /* The HW_76 wakes straight back up when its PMU cuts power with VBUS high.
  * Keep the charger serviced with USB and the display off until unplug,
  * Record slider activation (PB6), or a new Power button press. */
@@ -235,7 +264,7 @@ static void wait_in_charging_standby(void)
 #ifndef OPENFW_HOST_MMIO
             AON_BACKUP(7u) = OPENFW_BOOT_STRIKE_MAGIC;
 #endif
-            system_reboot();
+            pmu_cold_reset();
         }
         prev_rec = rec_now;
 
@@ -261,7 +290,7 @@ static void wait_in_charging_standby(void)
             AON_BACKUP(7u) = OPENFW_BOOT_STRIKE_MAGIC;
 #endif
             (void)key_onoff_poll();
-            system_reboot();
+            pmu_cold_reset();
         }
     }
 }
@@ -393,10 +422,16 @@ void pmu_soft_poweroff(void)
 void pmu_unattended_init(void)
 {
     /*
-     * Clear HSW / rail-hold bits [2:1] while preserving bit 0 (DFU sub-flag),
-     * bit 3 (0x08 rail/LDO power-hold on HW_76), and long-press rescue [7:6].
+     * Clear HSW / rail-hold bits [2:1] while preserving bit 0 (DFU sub-flag)
+     * and bit 3 (0x08 rail/LDO power-hold on HW_76). Re-enable hardware 8s
+     * long-press reset ([7:6] = 0b10 = 0x80, matching stock HAL_pmu_init
+     * 0x00CE8304) whenever soft power-off cleared [7:6] to 0.
      */
-    pmu_write_reg(0x00u, (uint8_t)(pmu_read_reg(0x00u) & ~0x06u));
+    uint8_t r00 = (uint8_t)(pmu_read_reg(0x00u) & ~0x06u);
+    if ((r00 & 0xC0u) == 0u) {
+        r00 |= 0x80u;
+    }
+    pmu_write_reg(0x00u, r00);
     /* Match HAL_pmu_init wakeup/reset mask (KEY_ONOFF + VBUS, bit 7=0) and clear stale DFU flags */
     pmu_write_reg(0x20u, 0x2Fu);
     pmu_write_reg(0x22u, 0x00u);
@@ -430,53 +465,18 @@ void pmu_poll_charge_manage(void)
 
 void pmu_reboot_to_usb_bootloader(void)
 {
-#ifndef OPENFW_HOST_MMIO
-    cpu1_ui_stop();
-#endif
     uint8_t r23 = pmu_read_reg(0x23u);
     uint8_t r00 = pmu_read_reg(0x00u);
     pmu_write_reg(0x23u, (uint8_t)(r23 | 0xC0u));
     pmu_write_reg(0x00u, (uint8_t)(r00 | 0x01u));
-#ifdef OPENFW_HOST_MMIO
-    system_reboot();
-    while (1) {
-        OPENFW_WFI();
-    }
-#else
-    /* Exact stock FIRM 0x00CEB8AE -> 0x0080CF9E PMU full-chip reset (PMU[0x20]=0xAF) */
-    uint32_t pm;
-    OPENFW_IRQ_SAVE(pm);
-    (void)pm;
-    pmu_write_reg(0x22u, 0x00u);
-    pmu_write_reg(0x20u, 0xAFu);
-    while (1) {
-        OPENFW_NOP();
-    }
-#endif
+    pmu_cold_reset();
 }
 
 void pmu_reboot_to_sd_ota(void)
 {
-#ifndef OPENFW_HOST_MMIO
-    cpu1_ui_stop();
-#endif
     uint8_t r23 = pmu_read_reg(0x23u);
     uint8_t r00 = pmu_read_reg(0x00u);
     pmu_write_reg(0x23u, (uint8_t)(r23 | 0xC0u));
     pmu_write_reg(0x00u, (uint8_t)(r00 & ~0x01u));
-#ifdef OPENFW_HOST_MMIO
-    system_reboot();
-    while (1) {
-        OPENFW_WFI();
-    }
-#else
-    uint32_t pm;
-    OPENFW_IRQ_SAVE(pm);
-    (void)pm;
-    pmu_write_reg(0x22u, 0x00u);
-    pmu_write_reg(0x20u, 0xAFu);
-    while (1) {
-        OPENFW_NOP();
-    }
-#endif
+    pmu_cold_reset();
 }

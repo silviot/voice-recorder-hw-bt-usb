@@ -76,6 +76,8 @@ static ui_spectrogram_t *volatile s_spec_ptr = NULL;
 static uint8_t           s_cpu1_active       = 0u;
 static uint32_t          s_last_seq          = 0u;
 static uint32_t          s_last_slot         = 0u;
+static uint32_t          s_stall_ack_seen    = 0u;
+static uint64_t          s_stall_since_us    = 0ull;
 
 static inline void cpu1_mbox_drain_and_clear(void)
 {
@@ -222,8 +224,9 @@ static void cpu1_entry_c(void)
             s_cpu1_reading_slot = 0xFFu;
             s_cpu1_stopped      = 1u;
             OPENFW_DSB();
+            /* Halt completely bus-silent (IRQs are masked) before CPU0 asserts reset */
             while (1) {
-                OPENFW_NOP();
+                __asm__ volatile ("wfi" ::: "memory");
             }
         }
 
@@ -315,8 +318,38 @@ static void cpu1_submit_slot(uint8_t kind, ui_screen_id_t scr, const ui_model_t 
                              const int16_t *spec_pcm, uint32_t spec_frames,
                              uint8_t spec_ch, int spec_vor_wait, int has_spec_pcm)
 {
+    uint64_t now_us = us_timer_now();
+    /* Guard against a stalled CPU1 (e.g. missed WFE wake): if prior work went
+     * unacknowledged for >250 ms, park CPU1 cleanly and fall back to CPU0. */
+    if (s_ack_seq == s_last_seq) {
+        s_stall_since_us = 0ull;
+    } else if (s_stall_since_us == 0ull || s_ack_seq != s_stall_ack_seen) {
+        s_stall_ack_seen = s_ack_seq;
+        s_stall_since_us = now_us;
+    } else if ((now_us - s_stall_since_us) > 250000ull) {
+        cpu1_ui_stop();
+        if (s_spec_reset_pend && m->spec) {
+            s_spec_reset_pend  = 0u;
+            s_spec_marker_pend = 0u;
+            ui_spec_reset(m->spec);
+        }
+        if (has_spec_pcm && m->spec) {
+            ui_spec_push_pcm(m->spec, spec_pcm, spec_frames, spec_ch, spec_vor_wait);
+        }
+        if (s_spec_marker_pend && m->spec) {
+            s_spec_marker_pend = 0u;
+            ui_spec_drop_marker(m->spec);
+        }
+        if (kind == CPU1_CMD_REC_LIVE) {
+            ui_rec_update_live_sync(m);
+        } else {
+            ui_render_screen_sync(scr, m);
+        }
+        return;
+    }
+
     uint32_t next = s_last_slot ^ 1u;
-    uint64_t t0   = us_timer_now();
+    uint64_t t0   = now_us;
     while (s_cpu1_reading_slot == next) {
         if (g_cpu1_faulted != 0u || (us_timer_now() - t0) > 100000ull) {
             cpu1_ui_stop();
@@ -429,6 +462,8 @@ int cpu1_ui_start(void)
     s_mbox_probe_done   = 0u;
     s_last_seq          = 0u;
     s_last_slot         = 0u;
+    s_stall_ack_seen    = 0u;
+    s_stall_since_us    = 0ull;
 
     CPU1_BOOT_TRAMP   = ((uint32_t)(uintptr_t)cpu1_trampoline) | 1u;
     CPU1_BOOT_SP      = (uint32_t)(uintptr_t)&g_cpu1_stack[CPU1_STACK_WORDS];
@@ -492,6 +527,11 @@ int cpu1_ui_is_active(void)
         cpu1_ui_stop();
     }
     return (int)s_cpu1_active;
+}
+
+int cpu1_ui_wfe_active(void)
+{
+    return (cpu1_ui_is_active() && g_cpu1_wfe_ok != 0u) ? 1 : 0;
 }
 
 void cpu1_ui_sync(uint32_t timeout_ms)
@@ -632,6 +672,7 @@ int ui_dispatch_is_animating(void)
 int cpu1_ui_start(void)                  { return 0; }
 void cpu1_ui_stop(void)                  { }
 int cpu1_ui_is_active(void)              { return 0; }
+int cpu1_ui_wfe_active(void)             { return 0; }
 void cpu1_ui_sync(uint32_t timeout_ms)   { (void)timeout_ms; }
 
 void ui_render_screen(ui_screen_id_t scr, const ui_model_t *m)

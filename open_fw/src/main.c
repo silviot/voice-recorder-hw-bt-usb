@@ -143,7 +143,11 @@ static void backlight_sleep_now(enum screen_sleep_state reason)
     backlight_apply(0u);
     ui_render_screen(UI_SCR_OFF, &g_ui);
     cpu1_ui_sync(60u);
-    cpu1_ui_stop();
+    /* When hardware IPC Mailbox WFE is active, CPU1 is already halted in
+     * zero-power WFE sleep; only park CPU1 in reset when WFE is unavailable. */
+    if (!cpu1_ui_wfe_active()) {
+        cpu1_ui_stop();
+    }
 }
 
 int ui_poll_power_button(ui_screen_id_t screen, ui_model_t *model, uint32_t now)
@@ -1369,7 +1373,7 @@ int openfw_main(void)
     uint8_t boot_pmu24 = pmu_read_reg(0x24u);
     uint8_t boot_pmu26 = pmu_read_reg(0x26u);
     pmu_unattended_init();
-    wdt_start_reset(32u, 0u);
+    wdt_start_reset(32u, 0x2Fu);
     wdt_feed();
 
     /* Emit early UART0 banner before keys_init() switches PD0 to SARADC */

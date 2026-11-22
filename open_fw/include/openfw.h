@@ -56,6 +56,7 @@ extern volatile uint32_t g_ui_heap_used;
 int  cpu1_ui_start(void);
 void cpu1_ui_stop(void);
 int  cpu1_ui_is_active(void);
+int  cpu1_ui_wfe_active(void);
 void cpu1_ui_sync(uint32_t timeout_ms);
 
 #define OPENFW_EXP_TIMEOUT_MS    15000u
