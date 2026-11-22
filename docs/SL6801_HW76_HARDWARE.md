@@ -9,9 +9,9 @@ This document is a clean-room hardware reference for the **Smartlink SL6801** vo
 | Subsystem | Specification |
 | :--- | :--- |
 | **SoC** | Smartlink **SL6801** |
-| **CPU Core** | ARM **Cortex-M4F** (`armv7e-m`) with hardware single-precision FPU (**`fpv4-sp-d16`**), running at **96 / 120 / 192 MHz** (HOSC on cold boot) |
+| **CPU Core** | Dual ARM **Cortex-M4F** (`armv7e-m`, CPU0 + CPU1 at full **96 MHz** with XIP cache parity) with hardware single-precision FPU (**`fpv4-sp-d16`**) |
 | **Internal Memory** | **384 KiB Mask ROM** (`0x00000000..0x0005FFFF`), **512 KiB SRAM** (`0x00800000..0x0087FFFF`) |
-| **Flash Storage** | **2 MiB SPI NOR** memory-mapped via XIP at `0x00C00000..0x00DFFFFF` |
+| **Flash Storage** | **2 MiB SPI NOR** memory-mapped via XIP at `0x00C00000..0x00DFFFFF` (supports **Quad I/O `0xEB` @ 48 MHz**) |
 | **External Storage** | microSD slot on 1-bit SDIO (`PD4` / `PD5` / `PD6`), exFAT / FAT32 |
 | **Audio Input** | **Dual differential analog microphones** (`AMIC1 + AMIC2`, `18 mm` spacing), 16-bit & 24/32-bit ADC up to 48 kHz |
 | **Audio Output** | Stereo DAC (`DAC0 + DAC1`) feeding both the 3.5 mm headphone jack (`PB11` active-low detect) and built-in front speaker via external PA enabled on **`PB30`** (internal pull-up ON / Hi-Z OFF) |
@@ -45,7 +45,8 @@ This document is a clean-room hardware reference for the **Smartlink SL6801** vo
 | `0x40011000` | **BT Modem** | Digital GFSK/EDR modem |
 | `0x40020000` | **BT Baseband (`RW-BT`)** | Classic BR/EDR link controller, NVIC IRQ `26` |
 | `0x40033000` | **BT Exchange Memory** | Shared descriptor/TX/RX buffer RAM for `RW-BT` |
-| `0x40040000` | **Mentor MUSB** | USB 2.0 controller (NVIC IRQs `41..43`) + USB PHY (`0x40040300..0x40040308`) |
+| `0x40040000` | **Mentor MUSB** | USB 2.0 HDRC v1.8.4 controller (NVIC IRQs `41..43`, EP2 has `2048 B` TX/RX FIFOs) + Full-Speed USB PHY (`0x40040300..0x40040308`) |
+| `0x40070000` | **IPC Mailbox** | CPU0↔CPU1 4-channel 2-word FIFO mailbox (`CRU_RST=0x28`, `CRU_CLK=0x2E`, CPU0 IRQ `54`, CPU1 IRQ `55`) |
 | `0x40080000` | **CRU** | Clock & Reset Unit (PLLs, clock muxes, peripheral reset controls) |
 | `0x40081000` | **GPIO** | Port muxes, direction, input/output registers |
 | `0x40082000` | **HW Timers** | 4-channel timer block (stride `0x20`, IRQs `8..11`); **1 MHz 64-bit monotonic timer** at `0x40082104` / `0x40082108` |
@@ -54,6 +55,7 @@ This document is a clean-room hardware reference for the **Smartlink SL6801** vo
 | `0x40085000` | **AON / RTC / PMU RTWI** | Pure-binary RTC (`+0x04/+0x08`, Alarm 1 `+0x20/+0x24` IRQ `47`), 32 kHz RC freq (`+0x84/+0x88`), PMU RTWI bridge (`+0x100..+0x110`, slave `0x30`), 16× 32-bit AON backup regs (`0x40085180..0x400851BC`) |
 | `0x40095000` | **LCDC** | DBI display controller (FIFO `0x40095030`) |
 | `0x40096000` | **KADC** | 10-channel key/resistor-ladder ADC |
+| `0x400A0010` | **Hardware Spinlocks** | Multi-core spinlock bank (`16 B` stride) |
 
 ---
 
@@ -175,7 +177,9 @@ Because SL6801 has no public datasheet and `DWT->CYCCNT` is unavailable, always 
 - **LCDC clock mux (`rom_clk_set_src(0x3F)` @ `0x35B4`):** Only accepts `0x0A` (HOSC 24 MHz) or `0x08` (PLL0 tap); passing `CRU_CLK_SRC_PLL0` (`0x02`) is a no-op. At HOSC 24 MHz / 1, full 160×80 blit is `10.4 ms`.
 - **Dual-core bus contention:** Tight-polling `us_timer_now()` on CPU0 while CPU1 blits doubles LCD blit time (`10.6 ms → 19.8 ms`). Yield with `OPENFW_WFI()` inside `cpu1_ui_sync()` so CPU1 gets full AHB/XIP bandwidth.
 - **CPU1 true hardware `WFE` sleep via IPC Mailbox (`0x40070000`):** Cortex-M4 `SEV` on CPU0 does **not** cross to CPU1 `WFE` on SL6801 silicon. Instead, release `CRU_RST_IPC_MBOX (0x28)` + `CRU_CLK_IPC_MBOX (0x2E)`, configure channel 0 CPU0→CPU1 (`MBOX_CFG |= 0x01`, `MBOX_CPU1_IRQ_EN |= 0x01`), set `SCB->SCR |= SEVONPEND` on CPU1 (`cpsid i`, no ISR needed), and ring a 2-word doorbell to `MBOX_CH_DATA(0)` to assert CPU1 **NVIC IRQ `55`** (`0x37`, CPU0 is IRQ `54`). CPU1 halts completely in `WFE` when static and wakes in `< 1 µs` on UI updates.
+- **SDIO / microSD (`0x40003000`) R1 write-status & bursts:** When polling `CMD13` (`SEND_STATUS`) after writes, check only true write-fatal R1 bits (`0x04380000`: `WP_VIOLATION | CARD_ECC_FAILED | CC_ERROR | ERROR`) rather than broad masks (`0xFDF98008`) that abort on sticky `OUT_OF_RANGE` / `ILLEGAL_COMMAND` flags from earlier probes. Always keep a `CMD25 → CMD24` fallback for cards with quirky multi-block stop behavior. Live 1-bit SDIO `CMD25` writes achieve ~`765 KB/s` (`16 KiB` in `21.4 ms`), and `CMD18` 4-sector bursts accelerate exFAT directory/bitmap scans.
 - **Host-to-silicon scaling:** Single-threaded LVGL software rasterization scales ~`208×` slower on 96 MHz Cortex-M4 than x86-64 host tests, making host timing useful for relative A/B deltas once calibrated against silicon.
+- **Full workflow & SRAM probe guide:** See [DEVELOPMENT_WORKFLOW.md](DEVELOPMENT_WORKFLOW.md) for the complete host-sanitization, `DEV_EXP=1` SRAM probing, stock disassembly, and benchmarking playbook.
 
 ---
 

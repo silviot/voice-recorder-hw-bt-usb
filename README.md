@@ -72,7 +72,7 @@ The standalone open-source firmware already boots and runs natively on the real 
 | :--- | :--- |
 | **[`open_fw/`](open_fw/)** | Standalone open-source firmware written from scratch in C (drivers, exFAT filesystem, audio recording/playback, anti-aliased UI, USB drive mode, and tests). |
 | **[`tools/`](tools/)** | Python utilities for syncing recordings over USB or Bluetooth, fixing the factory Linux USB bug, inspecting firmware images, and running live RAM experiments. |
-| **[`docs/`](docs/)** | Human-readable guides: **[Emulator Guide](docs/EMULATOR_GUIDE.md)**, **[Device Manual](docs/DEVICE_MANUAL.md)**, **[UI/UX Display Kit](docs/UI_UX_DISPLAY_KIT.md)**, **[Hardware Reference](docs/SL6801_HW76_HARDWARE.md)**, and **[Bluetooth Sync Protocol](docs/XREC_PROTOCOL.md)**. |
+| **[`docs/`](docs/)** | Human-readable guides: **[Emulator Guide](docs/EMULATOR_GUIDE.md)**, **[Device Manual](docs/DEVICE_MANUAL.md)**, **[UI/UX Display Kit](docs/UI_UX_DISPLAY_KIT.md)**, **[Hardware Reference](docs/SL6801_HW76_HARDWARE.md)**, **[Development & Profiling Playbook](docs/DEVELOPMENT_WORKFLOW.md)**, and **[Bluetooth Sync Protocol](docs/XREC_PROTOCOL.md)**. |
 | **[`fw_mod/`](fw_mod/)** | Optional add-on patches for the original factory firmware (adds encrypted Bluetooth file transfer and fixes the Linux USB bug). |
 | **[`firmware_analysis.md`](firmware_analysis.md)** | Deep technical reverse-engineering notes on the original factory firmware and chip internals. |
 

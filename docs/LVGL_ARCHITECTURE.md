@@ -28,10 +28,12 @@ open_fw/
     └── lvgl/                # Auto-fetched pinned LVGL v9.2.2 (gitignored)
 ```
 
-### Memory Footprint (SL6801 Cortex-M4F)
-- **Flash (`.text`):** ~233 KiB total firmware (out of 2 MiB XIP NOR)
-- **LVGL SRAM:** 6.4 KiB partial draw buffer (`160 × 20 × 2 B`) + 36 KiB built-in TLSF heap
-- **Single-active-screen lifecycle:** Only the active screen's widget tree exists in RAM at a time (~8–12 KiB peak heap), avoiding fragmentation and keeping >45 KiB SRAM free.
+### Memory & Dual-Core Architecture (SL6801 Cortex-M4F)
+- **Dedicated UI Core (`cpu1_ui.c`):** On SL6801 silicon, LVGL binding, software rasterization, animations, 20 Hz spectrogram FFTs, and `10.4 ms` ST7735S LCD blits run asynchronously on **CPU1 (96 MHz)** via a lock-free 2-slot double-buffered handoff. When the screen is static, CPU1 halts in hardware **`WFE` sleep** woken in `< 1 µs` via the SL6801 IPC Mailbox (`0x40070000`, IRQ `55` + `SEVONPEND`); when the screen turns off, CPU1 is parked in reset. On host tests or single-core QEMU, it automatically falls back to synchronous CPU0 rendering.
+- **Flash (`.text`):** ~269 KiB total firmware (out of 2 MiB Quad 48 MHz XIP NOR), with redundant EEZ default local styles deduplicated by `open_fw/tools/gen_eez_project.py`.
+- **LVGL SRAM:** Full-screen direct RGB565 draw buffer (`160 × 80 × 2 B = 25.6 KiB`, enabling zero-flicker column reveals and dirty-rect partial LCD flushes) + built-in TLSF heap (`LV_OBJ_STYLE_CACHE` enabled, ~`7.6 KiB` live on silicon / `~13.4 KiB` peak on 64-bit host).
+- **Cached Nav Screens (`src/ui/eez/ui.c`):** High-frequency navigation screens (`HOME`, `FILES`, `SETTINGS`) stay cached in LVGL RAM for instant switching, with a contiguous-heap guard (`10 KiB`) that evicts inactive cached screens cleanly before loading modal/heavy screens.
+- **`lv_layer_top()` Sizing Rule:** Because `LV_DPI_DEF = 160` in `lv_conf.h`, any manually created LVGL widget (`ui_box_create` / `lv_obj_create`) defaults to `160 × 160` px unless sized explicitly (`lv_obj_set_size(..., LV_SIZE_CONTENT, LV_SIZE_CONTENT)`). Always set explicit size on overlays such as `s_toast_pill`.
 
 ---
 
