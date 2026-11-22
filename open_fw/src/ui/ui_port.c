@@ -60,7 +60,7 @@ static void start_reveal(void)
     lv_anim_set_exec_cb(&anim, reveal_columns);
     lv_anim_set_deleted_cb(&anim, reveal_deleted);
     lv_anim_set_values(&anim, 0, BOARD_DISP_HOR_RES);
-    lv_anim_set_duration(&anim, 180u);
+    lv_anim_set_duration(&anim, 130u);
     lv_anim_set_path_cb(&anim, lv_anim_path_ease_in_out);
     if (!lv_anim_start(&anim)) reveal_columns(NULL, BOARD_DISP_HOR_RES);
 }

@@ -878,9 +878,13 @@ static int run_usb_msc_mode(int auto_mode)
     wait_key_release(KEY_BACK);
     backlight_wake(millis());
 
-    /* Remount exFAT because USB host may have written or deleted files */
+    /* Remount exFAT because USB host may have written or deleted files;
+     * if mount fails (e.g. card state changed), re-initialize SDIO cleanly. */
     if (g_sd_card.initialized) {
         g_sd_mounted = (exfat_mount(&g_exfat_vol, &g_sd_blkdev) == 0) ? 1 : 0;
+        if (!g_sd_mounted) {
+            probe_microsd_internal(0);
+        }
     }
     if (g_usb_cfg_dirty && g_sd_mounted) {
         g_usb_cfg_dirty = 0;
@@ -1041,17 +1045,10 @@ static void run_bt_xrec_mode(void)
 static void play_boot_animation(void)
 {
     /*
-     * 2.0-second Cassini boot animation on 160x80 landscape TFT:
-     *   - 0.00..0.64 s (frames  0..15): Smooth backlight ramp + logo fade-in & 6 px rise
-     *   - 0.64..1.52 s (frames 16..37): Warm Cassini-orange orbital sweep beneath logo
-     *   - 1.52..1.72 s (frames 38..42): Crisp hold at full brightness
-     *   - 1.72..2.00 s (frames 43..49): Clean fade-out to black
-     * Skips immediately if REC slide switch is ON or any button is pressed.
+     * Crisp ~0.6 s Cassini boot animation on 160x80 landscape TFT (logo and
+     * backlight are already lit right after lcd_init() for instant power-on
+     * feedback). Skips immediately if REC slide switch is ON or any button is pressed.
      */
-    static const uint8_t star_x[8] = { 14u, 26u, 134u, 146u, 18u, 142u, 32u, 128u };
-    static const uint8_t star_y[8] = { 12u, 52u,  14u,  48u, 68u,  66u,  8u,  32u };
-
-    const uint16_t logo_x   = (uint16_t)((160u - CASSINI_SPLASH_80X40_WIDTH) / 2u); /* 40 */
     const uint16_t bar_x    = 30u;
     const uint16_t bar_y    = 62u;
     const uint16_t bar_w    = 100u;
@@ -1060,85 +1057,24 @@ static void play_boot_animation(void)
     const uint16_t col_orb  = rgb565(232u, 120u, 64u); /* Cassini planet orange */
     const uint16_t col_moon = rgb565(255u, 212u, 168u); /* Warm peach moon glow */
 
-    lcd_set_rotation(1);
-    lcd_fill_rect(0u, 0u, 160u, 80u, col_bg);
-
-    uint16_t prev_logo_y = 20u;
-    uint32_t t_start     = millis();
-
-    for (uint32_t frame = 0u; frame < 50u; frame++) {
+    uint32_t t_start = millis();
+    for (uint32_t frame = 0u; frame < 15u; frame++) {
         wdt_feed();
         if (keys_read_rec_switch() || keys_state((uint32_t *)0) != KEY_NONE ||
             keys_event_pending()) {
             break;
         }
-
-        uint8_t  alpha  = 255u;
-        uint16_t logo_y = 14u;
-
-        if (frame < 16u) {
-            uint32_t inv = 15u - frame;
-            logo_y = (uint16_t)(14u + (6u * inv * inv) / 225u);
-            alpha  = (uint8_t)((frame * 255u) / 15u);
-            uint8_t bl = (uint8_t)(((uint32_t)user_bl_pct() * (frame + 1u)) / 16u);
-            if (bl < 5u) {
-                bl = 5u;
-            }
-            backlight_apply(bl);
-        } else if (frame >= 43u) {
-            uint32_t rem = 49u - frame;
-            alpha = (uint8_t)((rem * 255u) / 6u);
-        } else {
-            backlight_apply(user_bl_pct());
+        uint16_t fill_w = (uint16_t)(((frame + 1u) * bar_w) / 15u);
+        lcd_fill_rect(bar_x, (uint16_t)(bar_y + 1u), bar_w, 2u, col_trk);
+        if (fill_w > 0u) {
+            lcd_fill_rect(bar_x, (uint16_t)(bar_y + 1u), fill_w, 2u, col_orb);
         }
+        lcd_fill_rect(bar_x, bar_y, bar_w, 1u, col_bg);
+        lcd_fill_rect(bar_x, (uint16_t)(bar_y + 3u), bar_w, 1u, col_bg);
+        uint16_t dot_x = (uint16_t)(bar_x + ((fill_w >= 4u) ? (fill_w - 4u) : 0u));
+        lcd_fill_rect(dot_x, bar_y, 4u, 4u, col_moon);
 
-        if (logo_y < prev_logo_y) {
-            lcd_fill_rect(logo_x, (uint16_t)(logo_y + CASSINI_SPLASH_80X40_HEIGHT),
-                          CASSINI_SPLASH_80X40_WIDTH, (uint16_t)(prev_logo_y - logo_y), col_bg);
-        }
-        prev_logo_y = logo_y;
-
-        for (uint32_t s = 0u; s < 8u; s++) {
-            uint32_t ph = (frame + s * 5u) & 15u;
-            uint32_t lum = (ph < 8u) ? (40u + ph * 18u) : (40u + (15u - ph) * 18u);
-            lum = (lum * (uint32_t)alpha) >> 8;
-            uint16_t sc = rgb565((uint8_t)lum, (uint8_t)((lum * 220u) >> 8), (uint8_t)((lum * 190u) >> 8));
-            lcd_fill_rect(star_x[s], star_y[s], 2u, 2u, sc);
-        }
-
-        if (frame <= 16u || frame >= 43u) {
-            lcd_blit_rgb565_alpha(logo_x, logo_y,
-                                  CASSINI_SPLASH_80X40_WIDTH, CASSINI_SPLASH_80X40_HEIGHT,
-                                  CASSINI_SPLASH_80X40, alpha);
-        }
-
-        if (frame >= 16u) {
-            uint16_t fill_w = bar_w;
-            if (frame < 38u) {
-                uint32_t p = frame - 16u;
-                fill_w = (uint16_t)(((p + 1u) * bar_w) / 22u);
-            }
-            if (alpha < 255u) {
-                uint8_t r = (uint8_t)((232u * alpha) >> 8);
-                uint8_t g = (uint8_t)((120u * alpha) >> 8);
-                uint8_t b = (uint8_t)((64u  * alpha) >> 8);
-                lcd_fill_rect(bar_x, bar_y, bar_w, 4u, col_bg);
-                if (alpha > 16u) {
-                    lcd_fill_rect(bar_x, (uint16_t)(bar_y + 1u), bar_w, 2u, rgb565(r, g, b));
-                }
-            } else {
-                lcd_fill_rect(bar_x, (uint16_t)(bar_y + 1u), bar_w, 2u, col_trk);
-                if (fill_w > 0u) {
-                    lcd_fill_rect(bar_x, (uint16_t)(bar_y + 1u), fill_w, 2u, col_orb);
-                }
-                lcd_fill_rect(bar_x, bar_y, bar_w, 1u, col_bg);
-                lcd_fill_rect(bar_x, (uint16_t)(bar_y + 3u), bar_w, 1u, col_bg);
-                uint16_t dot_x = (uint16_t)(bar_x + ((fill_w >= 4u) ? (fill_w - 4u) : 0u));
-                lcd_fill_rect(dot_x, bar_y, 4u, 4u, col_moon);
-            }
-        }
-
-        uint32_t target_ms = t_start + (frame + 1u) * 40u;
+        uint32_t target_ms = t_start + (frame + 1u) * 35u;
         while ((int32_t)(millis() - target_ms) < 0) {
             wdt_feed();
             if (keys_read_rec_switch() || keys_state((uint32_t *)0) != KEY_NONE ||
@@ -1368,6 +1304,8 @@ int openfw_main(void)
 
     systick_init(96000000u); /* Boosted in .ram_boot: PLL0 192 MHz / 2 */
     rtc_ensure_running();
+    uint8_t boot_pmu24 = pmu_read_reg(0x24u);
+    uint8_t boot_pmu26 = pmu_read_reg(0x26u);
     pmu_unattended_init();
     wdt_start_reset(32u, 0u);
     wdt_feed();
@@ -1385,6 +1323,10 @@ int openfw_main(void)
     uart0_put_hex(pmu_read_reg(0x28u));
     uart0_puts(" PMU_POFF=");
     uart0_put_hex(pmu_read_reg(0x29u));
+    uart0_puts(" PMU_24=");
+    uart0_put_hex(boot_pmu24);
+    uart0_puts(" PMU_26=");
+    uart0_put_hex(boot_pmu26);
     uart0_puts(" STRIKE=");
     uart0_put_u32(boot_strikes + 1u);
     uart0_puts("\n");
@@ -1413,7 +1355,12 @@ int openfw_main(void)
     lcd_init();
     lcd_set_rotation(1); /* Landscape 160x80 */
     g_cur_bl_pct = 255u;
-    backlight_apply(0u); /* Backlight ramps up smoothly inside play_boot_animation() */
+    /* Light the Cassini splash immediately before SD probe so powering on gives instant visual feedback */
+    lcd_fill_rect(0u, 0u, 160u, 80u, UI_COL_BLACK);
+    lcd_blit_rgb565((uint16_t)((160u - CASSINI_SPLASH_80X40_WIDTH) / 2u), 14u,
+                    CASSINI_SPLASH_80X40_WIDTH, CASSINI_SPLASH_80X40_HEIGHT,
+                    CASSINI_SPLASH_80X40);
+    backlight_apply(user_bl_pct());
 
     probe_microsd_internal(1);
     load_persisted_state();
@@ -1663,7 +1610,11 @@ int openfw_main(void)
                 dirty = 1;
             }
 
-            if (!g_sd_card.initialized && (uint32_t)(now_ms - last_sd_probe) >= 2000u) {
+            if (!g_sd_card.initialized &&
+                !keys_event_pending() &&
+                keys_state((uint32_t *)0) == KEY_NONE &&
+                !ui_port_is_animating() &&
+                (uint32_t)(now_ms - last_sd_probe) >= 10000u) {
                 last_sd_probe = now_ms;
                 probe_microsd_internal(0);
                 if (g_sd_card.initialized) {
@@ -1768,7 +1719,9 @@ int openfw_main(void)
                                     dirty = 1;
                                 }
                             } else if (g_ui.home_focus == 1u) {
-                                reload_files_and_sd_stats();
+                                /* Use cached file list immediately (already refreshed on boot,
+                                 * recording stop, delete, USB exit, and BT exit) so Files opens
+                                 * without synchronous SD I/O lag. */
                                 scr         = UI_SCR_FILES;
                                 g_ui_screen = (uint32_t)scr;
                                 dirty       = 1;
@@ -2128,7 +2081,7 @@ int openfw_main(void)
             ui_port_task_handler();
         }
 
-        wfi_sleep_ms(ui_port_is_animating() ? 2u : 16u);
+        wfi_sleep_ms(ui_port_is_animating() ? 2u : 8u);
     }
 
     return 0;

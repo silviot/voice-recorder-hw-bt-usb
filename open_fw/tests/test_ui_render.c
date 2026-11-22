@@ -242,7 +242,7 @@ int main(int argc, char **argv)
         assert(g_written_pixels - start <= 160u * 27u);
         last_scroll = offset;
     }
-    assert(last_scroll == 0 && moving_frames >= 7);
+    assert(last_scroll == 0 && moving_frames >= 4);
     assert(!ui_port_is_animating());
     int32_t mid_x = lv_obj_get_x(objects.home_focus_mark);
     uint32_t before;

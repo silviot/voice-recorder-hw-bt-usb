@@ -979,9 +979,15 @@ static void test_pmu_driver(void)
     assert(power_button_update(tap, 0, 0, &progress) == POWER_BUTTON_SLEEP);
     assert(power_button_update(tap, 1, 1, &progress) == POWER_BUTTON_WAKE);
 
-    /* Start asleep, cross the millisecond counter rollover, then release early. */
+    /* Holding Power from screen-off wakes the display and never shuts back down. */
     uint32_t start = UINT32_MAX - 100u;
     assert(power_button_update(KEY_ONOFF_PRESS, start, 1, &progress) == POWER_BUTTON_WAKE);
+    assert(power_button_update(0, start + 300u, 0, &progress) == POWER_BUTTON_IDLE);
+    assert(power_button_update(KEY_ONOFF_LONG, start + 2000u, 0, &progress) == POWER_BUTTON_IDLE);
+    assert(power_button_update(0, start + 2100u, 0, &progress) == POWER_BUTTON_IDLE);
+
+    /* Start awake, cross the millisecond counter rollover, then release early. */
+    assert(power_button_update(KEY_ONOFF_PRESS, start, 0, &progress) == POWER_BUTTON_IDLE);
     assert(power_button_update(0, start + 300u, 0, &progress) == POWER_BUTTON_PROGRESS);
     assert(progress == 15u);
     assert(power_button_update(KEY_ONOFF_RELEASE, start + 1999u, 0, &progress) == POWER_BUTTON_CANCEL);
@@ -995,17 +1001,17 @@ static void test_pmu_driver(void)
     assert(power_button_update(KEY_ONOFF_LONG, 4550u, 0, &progress) == POWER_BUTTON_PROGRESS);
     assert(power_button_update(0, 4600u, 0, &progress) == POWER_BUTTON_PROGRESS && progress == 100u);
     assert(power_button_update(KEY_ONOFF_RELEASE, 4650u, 0, &progress) == POWER_BUTTON_SHUTDOWN);
-    assert(power_button_update(tap | KEY_ONOFF_LONG, 5000u, 1, &progress) == POWER_BUTTON_SHUTDOWN);
+    assert(power_button_update(tap | KEY_ONOFF_LONG, 5000u, 0, &progress) == POWER_BUTTON_SHUTDOWN);
 
-    /* A missing release after the full progress screen still completes shutdown. */
+    /* A missing release after the full progress screen still completes shutdown (400 ms grace). */
     assert(power_button_update(KEY_ONOFF_PRESS, 6000u, 0, &progress) == POWER_BUTTON_IDLE);
     assert(power_button_update(0, 8000u, 0, &progress) == POWER_BUTTON_PROGRESS);
-    assert(power_button_update(0, 9000u, 0, &progress) == POWER_BUTTON_SHUTDOWN);
+    assert(power_button_update(0, 8400u, 0, &progress) == POWER_BUTTON_SHUTDOWN);
 
     /* The PMU can report a long press before we observe any press edge. */
     assert(power_button_update(KEY_ONOFF_LONG, 10000u, 0, &progress) == POWER_BUTTON_PROGRESS);
-    assert(power_button_update(KEY_ONOFF_PRESS, 10500u, 0, &progress) == POWER_BUTTON_PROGRESS);
-    assert(power_button_update(0, 11000u, 0, &progress) == POWER_BUTTON_SHUTDOWN);
+    assert(power_button_update(KEY_ONOFF_PRESS, 10200u, 0, &progress) == POWER_BUTTON_PROGRESS);
+    assert(power_button_update(0, 10400u, 0, &progress) == POWER_BUTTON_SHUTDOWN);
 
     /* Delayed poll after button release (held >= 2000 ms without KEY_ONOFF_LONG) must NOT shutdown */
     assert(power_button_update(KEY_ONOFF_PRESS, 12000u, 0, &progress) == POWER_BUTTON_IDLE);
@@ -1472,8 +1478,8 @@ static void test_sdio_exfat_and_usb_msc(const char *exfat_img_path)
     assert(sd_write_blocks(&card, 8000u, 8u, mb_wr) == 0);
     assert(sd_read_blocks(&card, 8000u, 8u, mb_rd) == 0);
     assert(memcmp(mb_rd, mb_wr, sizeof(mb_wr)) == 0);
-    /* Verify CMD13 cleared bit 13 (wait_prvdata_complete=0) */
-    assert((g_soc.sdio_last_cmd13 & 0xFFFFu) == 0x054Du);
+    /* Verify CMD13 uses silicon-proven command word (0x254D) */
+    assert((g_soc.sdio_last_cmd13 & 0xFFFFu) == 0x254Du);
 
     /* Verify near_end clamps multi-block chunk before last 3 sectors instead of downgrading all */
     static uint8_t tail_wr[14 * 512];

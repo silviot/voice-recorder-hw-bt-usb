@@ -340,7 +340,7 @@ static void home_scroll_event(lv_event_t *event)
     if (lv_event_get_code(event) == LV_EVENT_SCROLL_BEGIN) {
         lv_anim_t *anim = lv_event_get_param(event);
         if (anim) {
-            lv_anim_set_duration(anim, 264u);
+            lv_anim_set_duration(anim, 130u);
             lv_anim_set_path_cb(anim, lv_anim_path_ease_in_out);
         }
         return;
@@ -1052,7 +1052,7 @@ void ui_render_screen(ui_screen_id_t scr, const ui_model_t *m)
     case SCREEN_ID_CHARGE:         bind_charge(m); break;
     case SCREEN_ID_POWER:
         set_changed_text_static(objects.pwr_sub,
-                                m->power_hold_pct == 100u ? "Release to power off" : "Keep holding POWER");
+                                m->power_hold_pct == 100u ? "Powering off..." : "Keep holding POWER");
         set_changed_bar_value(objects.pwr_hold_bar, (int32_t)m->power_hold_pct);
         ui_toast_update(NULL, 0u);
         ui_port_render_now();

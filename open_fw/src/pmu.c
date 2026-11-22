@@ -144,15 +144,25 @@ power_button_action_t power_button_update(uint8_t events, uint32_t now, int scre
     if (!down) {
         return POWER_BUTTON_IDLE;
     }
+    /* A press started while the display was black only wakes the screen and
+     * never shuts down — holding Power for 2s from a dark screen stays awake. */
+    if (woke_screen) {
+        if ((events & (KEY_ONOFF_RELEASE | KEY_ONOFF_LONG)) ||
+            (uint32_t)(now - pressed_at) >= 2500u) {
+            down = 0;
+            woke_screen = 0;
+        }
+        return wake ? POWER_BUTTON_WAKE : POWER_BUTTON_IDLE;
+    }
     /* A hardware PMU long-press arms shutdown immediately. */
     if (!shutdown_armed && (events & KEY_ONOFF_LONG)) {
         shutdown_armed = 1;
         armed_at = now;
     }
-    /* ON/OFF is a wake source: prefer release after arming, with a 1s fallback
+    /* ON/OFF is a wake source: prefer release after arming, with a 400 ms fallback
      * because SL6801 PMU SK (0x10) does not fire after LK (0x20). */
     if (shutdown_armed) {
-        if ((events & KEY_ONOFF_RELEASE) || (uint32_t)(now - armed_at) >= 1000u) {
+        if ((events & KEY_ONOFF_RELEASE) || (uint32_t)(now - armed_at) >= 400u) {
             down = 0;
             shutdown_armed = 0;
             return POWER_BUTTON_SHUTDOWN;
@@ -170,10 +180,7 @@ power_button_action_t power_button_update(uint8_t events, uint32_t now, int scre
         if (held >= 300u) {
             return POWER_BUTTON_CANCEL;
         }
-        if (!woke_screen) {
-            return POWER_BUTTON_SLEEP;
-        }
-        return wake ? POWER_BUTTON_WAKE : POWER_BUTTON_IDLE;
+        return POWER_BUTTON_SLEEP;
     }
     if (held >= 2000u) {
         shutdown_armed = 1;
@@ -189,7 +196,7 @@ power_button_action_t power_button_update(uint8_t events, uint32_t now, int scre
         }
         return POWER_BUTTON_PROGRESS;
     }
-    return wake ? POWER_BUTTON_WAKE : POWER_BUTTON_IDLE;
+    return POWER_BUTTON_IDLE;
 }
 
 /* The HW_76 wakes straight back up when its PMU cuts power with VBUS high.
@@ -221,14 +228,8 @@ static void wait_in_charging_standby(void)
             return;
         }
 
-        uint8_t events = key_onoff_poll();
-        /* Ignore residual shutdown button edges for the first 250 ms */
-        if ((uint32_t)(now - start) < 250u) {
-            prev_rec = keys_read_rec_switch();
-            continue;
-        }
-
-        /* Activating the Record slider switches the recorder back on immediately */
+        /* Activating the Record slider switches the recorder back on immediately,
+         * even if moved right after entering charging standby. */
         int rec_now = keys_read_rec_switch();
         if (rec_now && !prev_rec) {
 #ifndef OPENFW_HOST_MMIO
@@ -237,6 +238,12 @@ static void wait_in_charging_standby(void)
             system_reboot();
         }
         prev_rec = rec_now;
+
+        uint8_t events = key_onoff_poll();
+        /* Ignore residual shutdown button edges for the first 250 ms */
+        if ((uint32_t)(now - start) < 250u) {
+            continue;
+        }
 
         /* Any deliberate Power press (clean tap, >=500 ms hold, or LK) powers back on */
         int wake_now = 0;
@@ -338,18 +345,6 @@ void pmu_soft_poweroff(void)
 {
     if (pmu_is_vbus_present()) {
         wait_in_charging_standby();
-    } else {
-#ifndef OPENFW_HOST_MMIO
-        /* Display is already blanked by lcd_shutdown(); give the user up to
-         * 400 ms to lift their finger so ON/OFF does not immediately re-wake. */
-        for (int i = 0; i < 40; i++) {
-            wdt_feed();
-            if (key_onoff_poll() & KEY_ONOFF_RELEASE) {
-                break;
-            }
-            mdelay(10u);
-        }
-#endif
     }
     /* No code will service the reset watchdog once the CPU enters WFI. */
     wdt_stop();

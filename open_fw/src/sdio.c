@@ -22,7 +22,7 @@
 #define SD_CMD8_IF_COND     0x2548u
 #define SD_CMD9_SEND_CSD    0x25C9u
 #define SD_CMD12_STOP       0x454Cu
-#define SD_CMD13_STATUS     0x054Du /* wait_prvdata_complete=0 so CMD13 polls during busy */
+#define SD_CMD13_STATUS     0x254Du
 #define SD_CMD16_SETLEN     0x2550u
 #define SD_CMD17_READ1       0x2351u
 #define SD_CMD18_READ_MULTI  0x2352u
@@ -31,8 +31,6 @@
 #define SD_ACMD41_OPCOND     0x2569u
 #define SD_CMD55_APPCMD      0x2577u
 
-#define SDIO_INT_RE          (1u << 1)
-#define SDIO_INT_HLE         (1u << 12)
 #define SD_R1_ERR_MASK       0xFDF98008u
 
 #define SDIO_CMD_TIMEOUT_US  100000u
@@ -91,23 +89,20 @@ static int sdio_send_cmd(uint32_t cmd_word, uint32_t arg, int ignore_rcrc)
     openfw_mmio_wr32(SDIO_CMD_ADDR,     SDIO_CMD_START | (cmd_word & 0xFFFFu));
 
     uint64_t t0 = us_timer_now();
-    uint32_t st;
-    while (!((st = openfw_mmio_rd32(SDIO_RINTSTS_ADDR)) & (SDIO_INT_CMD_DONE | SDIO_INT_HLE))) {
+    while (!(openfw_mmio_rd32(SDIO_RINTSTS_ADDR) & SDIO_INT_CMD_DONE)) {
         if ((uint32_t)(us_timer_now() - t0) >= SDIO_CMD_TIMEOUT_US) {
             openfw_mmio_wr32(SDIO_RINTSTS_ADDR, 0xFFFFFFFFu);
             return -1;
         }
     }
 
-    st = openfw_mmio_rd32(SDIO_RINTSTS_ADDR);
-    openfw_mmio_wr32(SDIO_RINTSTS_ADDR,
-                     SDIO_INT_CMD_DONE | SDIO_INT_RE | SDIO_INT_RCRC |
-                     SDIO_INT_RTO | SDIO_INT_DRTO | SDIO_INT_HLE);
+    uint32_t st = openfw_mmio_rd32(SDIO_RINTSTS_ADDR);
+    openfw_mmio_wr32(SDIO_RINTSTS_ADDR, 0x00000344u);
 
-    if (st & (SDIO_INT_RTO | SDIO_INT_DRTO | SDIO_INT_HLE)) {
+    if (st & (SDIO_INT_RTO | SDIO_INT_DRTO)) {
         return -1;
     }
-    if (!ignore_rcrc && (st & (SDIO_INT_RE | SDIO_INT_RCRC))) {
+    if (!ignore_rcrc && (st & SDIO_INT_RCRC)) {
         return -1;
     }
     return 0;
@@ -369,13 +364,13 @@ static int sdio_fifo_write_words(const uint8_t *src, uint32_t words, uint64_t t0
 
 static int sdio_wait_dto(uint64_t t0, uint32_t timeout_us, uint32_t *out_st)
 {
-    uint32_t st;
-    while (!((st = openfw_mmio_rd32(SDIO_RINTSTS_ADDR)) & (SDIO_INT_DTO | SDIO_INT_DATA_ERRS))) {
+    while (!(openfw_mmio_rd32(SDIO_RINTSTS_ADDR) & SDIO_INT_DTO)) {
         if ((uint32_t)(us_timer_now() - t0) >= timeout_us) {
             openfw_mmio_wr32(SDIO_RINTSTS_ADDR, 0xFFFFFFFFu);
             return -1;
         }
     }
+    uint32_t st = openfw_mmio_rd32(SDIO_RINTSTS_ADDR);
     openfw_mmio_wr32(SDIO_RINTSTS_ADDR, 0xFFFFFFFFu);
     *out_st = st;
     return 0;
