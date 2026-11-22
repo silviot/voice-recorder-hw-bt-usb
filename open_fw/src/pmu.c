@@ -292,6 +292,13 @@ static void pmu_ram_write_reg(uint8_t reg, uint8_t val)
 OPENFW_RAMFUNC __attribute__((noinline, noreturn))
 static void pmu_soft_poweroff_ram(void)
 {
+#ifndef OPENFW_HOST_MMIO
+    rom_rst_hold(CRU_RST_CPU1);
+    NOR_XIP_CFG = NOR_XIP_CFG_1WIRE;
+    rom_gpio_config(0x0000279Bu);
+    rom_gpio_config(0x00002F9Bu);
+    OPENFW_DSB();
+#endif
     for (uint32_t c = 0x11u; c <= 0x20u; c++) {
         if (c != 0x15u) {
             rom_clk_disable(c);
@@ -343,6 +350,9 @@ static void pmu_soft_poweroff_ram(void)
 
 void pmu_soft_poweroff(void)
 {
+#ifndef OPENFW_HOST_MMIO
+    cpu1_ui_stop();
+#endif
     if (pmu_is_vbus_present()) {
         wait_in_charging_standby();
     }
@@ -420,6 +430,9 @@ void pmu_poll_charge_manage(void)
 
 void pmu_reboot_to_usb_bootloader(void)
 {
+#ifndef OPENFW_HOST_MMIO
+    cpu1_ui_stop();
+#endif
     uint8_t r23 = pmu_read_reg(0x23u);
     uint8_t r00 = pmu_read_reg(0x00u);
     pmu_write_reg(0x23u, (uint8_t)(r23 | 0xC0u));
@@ -444,6 +457,9 @@ void pmu_reboot_to_usb_bootloader(void)
 
 void pmu_reboot_to_sd_ota(void)
 {
+#ifndef OPENFW_HOST_MMIO
+    cpu1_ui_stop();
+#endif
     uint8_t r23 = pmu_read_reg(0x23u);
     uint8_t r00 = pmu_read_reg(0x00u);
     pmu_write_reg(0x23u, (uint8_t)(r23 | 0xC0u));

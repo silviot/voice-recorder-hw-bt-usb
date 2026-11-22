@@ -206,6 +206,7 @@ static inline void nvic_clear_pending(uint32_t irq)
 #endif
 #define NOR_XIP_CFG_1WIRE   0x02A09503u              /* 1-wire 0x03 read */
 #define NOR_XIP_CFG_DUAL    0x02A8993Bu              /* Fast Read Dual Output 0x3B */
+#define NOR_XIP_CFG_QUAD    0x02A6BDEBu              /* Fast Read Quad I/O 0xEB (4-wire) */
 
 #define US_TIMER_LO_ADDR    (US_TIMER_BASE + 0x04u)
 #define US_TIMER_HI_ADDR    (US_TIMER_BASE + 0x08u)
@@ -274,6 +275,7 @@ static inline void nvic_clear_pending(uint32_t irq)
 #define CRU_CLK_NOR         0x2Bu
 #define CRU_CLK_LCDC        0x3Fu
 
+#define CRU_RST_CPU1        0x00u
 #define CRU_RST_NOR         0x01u
 #define CRU_RST_CODEC_SRAM  0x20u
 #define CRU_RST_DMAC        0x21u

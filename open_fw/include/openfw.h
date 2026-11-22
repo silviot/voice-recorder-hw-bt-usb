@@ -26,9 +26,31 @@
 
 #ifdef OPENFW_HOST_MMIO
 #define OPENFW_RAMFUNC
+#define OPENFW_FASTFUNC
 #else
-#define OPENFW_RAMFUNC __attribute__((section(".ramtext")))
+#define OPENFW_RAMFUNC  __attribute__((section(".ramtext")))
+#define OPENFW_FASTFUNC __attribute__((section(".fast_ramtext")))
 #endif
+
+/* SPI NOR XIP mode detected at boot (startup.c) */
+#define OPENFW_XIP_MODE_1WIRE_24M 0u
+#define OPENFW_XIP_MODE_DUAL_48M  1u
+#define OPENFW_XIP_MODE_QUAD_48M  2u
+extern volatile uint8_t g_openfw_xip_mode;
+
+/* Dual-core CPU1 dedicated LVGL/LCD UI engine & latency telemetry (cpu1_ui.c) */
+extern volatile uint32_t g_cpu1_alive;
+extern volatile uint32_t g_cpu1_faulted;
+extern volatile uint32_t g_cpu1_fault_pc;
+extern volatile uint32_t g_cpu1_fault_cfsr;
+extern volatile uint32_t g_ui_last_render_us;
+extern volatile uint32_t g_ui_max_render_us;
+extern volatile uint32_t g_ui_frames;
+
+int  cpu1_ui_start(void);
+void cpu1_ui_stop(void);
+int  cpu1_ui_is_active(void);
+void cpu1_ui_sync(uint32_t timeout_ms);
 
 #define OPENFW_EXP_TIMEOUT_MS    15000u
 #define OPENFW_FAULT_MAGIC_MASK  0xFFFFF000u

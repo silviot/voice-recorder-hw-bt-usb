@@ -223,7 +223,7 @@ int main(int argc, char **argv)
     ui_render_screen(UI_SCR_HOME, &m);
     capture_shot(0);
 
-    /* Drive the real UI timers at 30 Hz. Only the footer and underline
+    /* Drive the real UI timers at 60 Hz. Only the footer and underline
      * should be flushed once the newly selected tiles have been painted. */
     lv_obj_t *footer = objects.home_details;
     int32_t page_width = lv_obj_get_width(footer);
@@ -234,7 +234,7 @@ int main(int argc, char **argv)
     unsigned moving_frames = 0;
     for (unsigned frame = 0; frame < 10; frame++) {
         uint32_t start = g_written_pixels;
-        s_now += 33u;
+        s_now += 16u;
         ui_port_task_handler();
         int32_t offset = lv_obj_get_scroll_x(footer);
         assert(offset <= last_scroll);
@@ -242,7 +242,7 @@ int main(int argc, char **argv)
         assert(g_written_pixels - start <= 160u * 27u);
         last_scroll = offset;
     }
-    assert(last_scroll == 0 && moving_frames >= 4);
+    assert(last_scroll == 0 && moving_frames >= 5);
     assert(!ui_port_is_animating());
     int32_t mid_x = lv_obj_get_x(objects.home_focus_mark);
     uint32_t before;
@@ -497,7 +497,7 @@ int main(int argc, char **argv)
     ui_render_screen(UI_SCR_HOME, &m);
     capture_shot(0);
 
-    /* Drive the production reveal on a 60 Hz clock in both directions. */
+    /* Drive the production reveal on a 125 Hz clock (LV_DEF_REFR_PERIOD=8) in both directions. */
     ui_render_screen(UI_SCR_HOME, &m);
     for (int forward = 1; forward >= 0; forward--) {
         int incoming = forward ? 4 : 0;
@@ -508,7 +508,7 @@ int main(int argc, char **argv)
         unsigned updates = 0;
         for (int frame = 0; frame < 14; frame++) {
             uint32_t prev_px = g_written_pixels;
-            s_now += 16u;
+            s_now += 8u;
             ui_port_task_handler();
             uint32_t written = g_written_pixels - start;
             assert(written <= 160u * 80u && written % 80u == 0);

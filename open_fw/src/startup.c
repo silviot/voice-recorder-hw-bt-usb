@@ -20,6 +20,16 @@ extern int openfw_main(void);
 
 volatile uint32_t g_systick_ms = 0;
 volatile uint8_t  g_openfw_boot_strike_counted = 0u;
+volatile uint8_t  g_openfw_xip_mode = OPENFW_XIP_MODE_1WIRE_24M;
+
+/* 64-byte XIP verification pattern spanning multiple cache lines in .rodata */
+__attribute__((section(".rodata"), used, aligned(16)))
+static const uint32_t k_xip_verify[16] = {
+    0x51584950u, 0x52594A51u, 0x535A4B52u, 0x545B4C53u,
+    0x555C4D54u, 0x565D4E55u, 0x575E4F56u, 0x585F5057u,
+    0x59605158u, 0x5A615259u, 0x5B62535Au, 0x5C63545Bu,
+    0x5D64555Cu, 0x5E65565Du, 0x5F66575Eu, 0x6067585Fu,
+};
 
 void _start(void);
 void reset_c_entry(void);
@@ -216,25 +226,36 @@ static void sys_clock_boost(uint32_t pll_hz, uint32_t clk6_hz)
     rom_clk_set_src(CRU_CLK_BUS6, CRU_CLK_SRC_PLL0);
 }
 
-/* Must run purely in SRAM (.ramtext) before jumping to XIP 0x00C0F430+ */
 __attribute__((section(".ramtext"), noinline))
-static void xip_enable_1wire(uint32_t pll_hz, uint32_t nor_hz)
+static void xip_cache_flush_ram(void)
 {
-    rom_rst_release(CRU_RST_XIP_BUS);
-    if (!rom_rst_is_released(CRU_RST_NOR)) {
-        rom_rst_release(CRU_RST_NOR);
-        for (volatile int i = 0; i < 2000; i++) {
+    uint32_t c = XIP_CACHE_CTRL1;
+    c &= ~(0x1FF00000u | 0x0Cu);
+    c |= (((0x800u >> 3) - 1u) << 20);
+    XIP_CACHE_CTRL1 = c;
+    XIP_CACHE_CTRL0 &= ~0x2u;
+    XIP_CACHE_CTRL0 = 0x1u;
+    XIP_CACHE_CTRL1 = (XIP_CACHE_CTRL1 & ~0x2u) | 0x1u;
+    __asm__ volatile ("dsb\nisb");
+}
+
+__attribute__((section(".ramtext"), noinline))
+static int xip_verify_ram(void)
+{
+    const volatile uint32_t *p = k_xip_verify;
+    uint32_t expected = 0x51584950u;
+    for (uint32_t i = 0u; i < 16u; i++) {
+        if (p[i] != expected) {
+            return 0;
         }
+        expected += 0x01010101u;
     }
+    return 1;
+}
 
-    /* PA0..PA3 mux=2 (SPI NOR SCK/CS/IO0/IO1); PA4/PA5 high (WP#/HOLD#) */
-    rom_gpio_config(0x00000110u);
-    rom_gpio_config(0x00000910u);
-    rom_gpio_config(0x00001110u);
-    rom_gpio_config(0x0000191Bu);
-    rom_gpio_config(0x0000279Bu);
-    rom_gpio_config(0x00002F9Bu);
-
+__attribute__((section(".ramtext"), noinline))
+static void xip_set_nor_clk(uint32_t pll_hz, uint32_t nor_hz)
+{
     uint32_t div = pll_hz / nor_hz;
     if (div < 2u) {
         div = 2u;
@@ -243,22 +264,62 @@ static void xip_enable_1wire(uint32_t pll_hz, uint32_t nor_hz)
     rom_clk_div(CRU_CLK_NOR, div);
     rom_clk_set_src(CRU_CLK_NOR, CRU_CLK_SRC_PLL0);
     rom_clk_enable(CRU_CLK_NOR);
+}
+
+/*
+ * Must run purely in SRAM (.ramtext) before jumping to XIP 0x00C0F430+.
+ * Attempts fastest verified SPI NOR XIP mode with brick-proof auto-fallback:
+ *   1. 4-wire Quad I/O (0xEB) @ 48 MHz (8x throughput vs 1W@24MHz)
+ *   2. 2-wire Dual Output (0x3B) @ 48 MHz (4x throughput)
+ *   3. 1-wire Read (0x03) @ 24 MHz (universal fallback)
+ */
+__attribute__((section(".ramtext"), noinline))
+static uint8_t xip_enable_best(uint32_t pll_hz)
+{
+    rom_rst_release(CRU_RST_XIP_BUS);
+    if (!rom_rst_is_released(CRU_RST_NOR)) {
+        rom_rst_release(CRU_RST_NOR);
+        for (volatile int i = 0; i < 2000; i++) {
+        }
+    }
+
+    /* Configure PA0..PA3 (SCK/CS/IO0/IO1) drive/pull, then switch PA0..PA5 to mux=2 (Quad) */
+    rom_gpio_config(0x00000110u);
+    rom_gpio_config(0x00000910u);
+    rom_gpio_config(0x00001110u);
+    rom_gpio_config(0x0000191Bu);
+    rom_gpio_config(0x0000211Bu);
+    rom_gpio_config(0x0000291Bu);
+    REG32(GPIOA_BASE) = (REG32(GPIOA_BASE) & 0xFF000000u) | 0x00222222u;
 
     NOR_CTRL = 0x00000001u;
-    NOR_XIP_CFG = NOR_XIP_CFG_1WIRE;
     XIP_BRIDGE_CTRL |= (1u << 8);
-    NOR_XIP_OFFSET = 0x00000040u; /* NOR_XIP_SIZE_CFG: 0x40 = 2 MiB (0x00 was 128 KiB!) */
+    NOR_XIP_OFFSET = 0x00000040u; /* 2 MiB XIP window */
 
-    /* Enable & flush XIP instruction cache (2048 KiB window, matches stock FIRM 0x00805498) */
-    uint32_t c = XIP_CACHE_CTRL1;
-    c &= ~(0x1FF00000u | 0x0Cu);
-    c |= (((0x800u >> 3) - 1u) << 20);
-    XIP_CACHE_CTRL1 = c;
-    XIP_CACHE_CTRL0 &= ~0x2u;
-    XIP_CACHE_CTRL0 = 0x1u;
-    XIP_CACHE_CTRL1 = (XIP_CACHE_CTRL1 & ~0x2u) | 0x1u;
+    /* Try 1: 4-wire Quad I/O @ 48 MHz */
+    xip_set_nor_clk(pll_hz, 48000000u);
+    NOR_XIP_CFG = NOR_XIP_CFG_QUAD;
+    xip_cache_flush_ram();
+    if (xip_verify_ram()) {
+        return OPENFW_XIP_MODE_QUAD_48M;
+    }
 
-    __asm__ volatile ("dsb\nisb");
+    /* Restore PA4/PA5 as WP#/HOLD# high for 2-wire / 1-wire modes */
+    rom_gpio_config(0x0000279Bu);
+    rom_gpio_config(0x00002F9Bu);
+
+    /* Try 2: 2-wire Dual Output (0x3B) @ 48 MHz */
+    NOR_XIP_CFG = NOR_XIP_CFG_DUAL;
+    xip_cache_flush_ram();
+    if (xip_verify_ram()) {
+        return OPENFW_XIP_MODE_DUAL_48M;
+    }
+
+    /* Fallback 3: rock-solid 1-wire 0x03 @ 24 MHz */
+    xip_set_nor_clk(pll_hz, 24000000u);
+    NOR_XIP_CFG = NOR_XIP_CFG_1WIRE;
+    xip_cache_flush_ram();
+    return OPENFW_XIP_MODE_1WIRE_24M;
 }
 
 __attribute__((section(".ramtext"), used, noreturn))
@@ -274,9 +335,9 @@ void reset_c_entry(void)
 
     /* Boost CPU to 96 MHz and map SPI NOR XIP at 0x00C0F430+ before XIP access */
     sys_clock_boost(192000000u, 32000000u);
-    xip_enable_1wire(192000000u, 24000000u);
+    uint8_t xip_mode = xip_enable_best(192000000u);
 
-    /* Copy initialized .data from XIP LMA (_sidata) to SRAM (_sdata.._edata) */
+    /* Copy initialized .data (including .fast_ramtext hot code) from XIP LMA to SRAM */
     const volatile uint32_t *src = &_sidata;
     for (volatile uint32_t *dst = &_sdata; dst < &_edata; dst++, src++) {
         *dst = *src;
@@ -286,6 +347,8 @@ void reset_c_entry(void)
     for (volatile uint32_t *dst = &_sbss; dst < &_ebss; dst++) {
         *dst = 0u;
     }
+
+    g_openfw_xip_mode = xip_mode;
 
     /* Ensure no stale SysTick or NVIC interrupts fire when IRQs are enabled */
     SYSTICK_CSR = 0u;
@@ -307,7 +370,8 @@ void reset_c_entry(void)
     }
 }
 
-/* Bare-metal ARM EABI memory helpers emitted by Clang for struct copies */
+/* Bare-metal ARM EABI memory helpers emitted by Clang for struct copies (zero-WS SRAM) */
+OPENFW_FASTFUNC
 void __aeabi_memcpy4(void *dst, const void *src, uint32_t n)
 {
     uint32_t *dw = (uint32_t *)dst;
@@ -323,6 +387,7 @@ void __aeabi_memcpy4(void *dst, const void *src, uint32_t n)
     }
 }
 
+OPENFW_FASTFUNC
 void __aeabi_memcpy(void *dst, const void *src, uint32_t n)
 {
     uint8_t *d = (uint8_t *)dst;
@@ -340,11 +405,13 @@ void __aeabi_memcpy(void *dst, const void *src, uint32_t n)
     }
 }
 
+OPENFW_FASTFUNC
 void __aeabi_memcpy8(void *dst, const void *src, uint32_t n)
 {
     __aeabi_memcpy4(dst, src, n);
 }
 
+OPENFW_FASTFUNC
 void __aeabi_memset4(void *dst, uint32_t n, int c)
 {
     uint8_t v = (uint8_t)c;
@@ -360,6 +427,7 @@ void __aeabi_memset4(void *dst, uint32_t n, int c)
     }
 }
 
+OPENFW_FASTFUNC
 void __aeabi_memset(void *dst, uint32_t n, int c)
 {
     uint8_t *d = (uint8_t *)dst;
@@ -371,21 +439,25 @@ void __aeabi_memset(void *dst, uint32_t n, int c)
     __aeabi_memset4(d, n, c);
 }
 
+OPENFW_FASTFUNC
 void __aeabi_memset8(void *dst, uint32_t n, int c)
 {
     __aeabi_memset4(dst, n, c);
 }
 
+OPENFW_FASTFUNC
 void __aeabi_memclr(void *dst, uint32_t n)
 {
     __aeabi_memset(dst, n, 0);
 }
 
+OPENFW_FASTFUNC
 void __aeabi_memclr4(void *dst, uint32_t n)
 {
     __aeabi_memset4(dst, n, 0);
 }
 
+OPENFW_FASTFUNC
 void __aeabi_memclr8(void *dst, uint32_t n)
 {
     __aeabi_memset4(dst, n, 0);

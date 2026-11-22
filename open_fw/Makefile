@@ -75,7 +75,7 @@ LVGL_HOST_OBJS := $(patsubst $(LVGL_DIR)/%.c,$(BUILD_DIR)/lvgl_host/%.o,$(LVGL_S
 EEZ_SRCS  := src/ui/eez/ui.c src/ui/eez/screens.c src/ui/eez/styles.c src/ui/eez/images.c
 
 SRCS      := src/startup.c src/wdt_timer.c src/rtc.c src/uart.c src/pmu.c \
-             src/keys.c src/lcd_st7735s.c src/ui_spectrogram.c \
+             src/keys.c src/lcd_st7735s.c src/cpu1_ui.c src/ui_spectrogram.c \
              src/ui/ui_port.c src/ui/ui_theme.c src/ui/ui_fonts.c src/ui/ui_screens.c \
              $(EEZ_SRCS) \
              src/sdio.c src/audio_dma.c src/audio_dac.c src/audio_dsp.c \
@@ -164,7 +164,7 @@ test-host: $(LVGL_DIR)/lvgl.h $(BUILD_DIR)/liblvgl_host.a tests/test_core.c src/
 		-o $(BUILD_DIR)/test_drivers_mmio
 	$(BUILD_DIR)/test_drivers_mmio $(BUILD_DIR)/test_exfat.img
 	$(HOST_CC) $(HOST_CFLAGS) -DOPENFW_HOST_MMIO tests/test_ui_render.c \
-		src/lcd_st7735s.c src/ui_spectrogram.c \
+		src/lcd_st7735s.c src/cpu1_ui.c src/ui_spectrogram.c \
 		src/ui/ui_port.c src/ui/ui_theme.c src/ui/ui_fonts.c src/ui/ui_screens.c \
 		$(EEZ_SRCS) \
 		$(BUILD_DIR)/liblvgl_host.a \

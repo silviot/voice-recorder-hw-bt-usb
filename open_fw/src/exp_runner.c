@@ -157,6 +157,10 @@ int openfw_exp_run(uint32_t entry_off, uint32_t arg, openfw_exp_result_t *out)
     g_exp_running     = 1u;
     rc = g_host_runner(&g_exp_api, entry_off, arg);
 #else
+    int restart_cpu1 = cpu1_ui_is_active();
+    if (restart_cpu1) {
+        cpu1_ui_stop();
+    }
     typedef uint32_t (*exp_entry_fn_t)(const openfw_exp_api_t *, uint32_t);
     uintptr_t fn_addr = ((uintptr_t)&g_exp_arena[entry_off & ~1u]) | 1u;
     g_exp_deadline_ms = t0 + OPENFW_EXP_TIMEOUT_MS;
@@ -164,6 +168,9 @@ int openfw_exp_run(uint32_t entry_off, uint32_t arg, openfw_exp_result_t *out)
     __asm__ volatile ("dsb\nisb" ::: "memory");
     exp_entry_fn_t fn = (exp_entry_fn_t)fn_addr;
     rc = fn(&g_exp_api, arg);
+    if (restart_cpu1) {
+        (void)cpu1_ui_start();
+    }
 #endif
 
     g_exp_running = 0u;

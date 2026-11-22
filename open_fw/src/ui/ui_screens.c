@@ -340,7 +340,7 @@ static void home_scroll_event(lv_event_t *event)
     if (lv_event_get_code(event) == LV_EVENT_SCROLL_BEGIN) {
         lv_anim_t *anim = lv_event_get_param(event);
         if (anim) {
-            lv_anim_set_duration(anim, 130u);
+            lv_anim_set_duration(anim, 90u);
             lv_anim_set_path_cb(anim, lv_anim_path_ease_in_out);
         }
         return;
@@ -571,7 +571,7 @@ static void bind_rec(const ui_model_t *m, bool entering)
     }
 }
 
-void ui_rec_update_live(const ui_model_t *m)
+void ui_rec_update_live_sync(const ui_model_t *m)
 {
     if (!m || s_active_eez_scr != SCREEN_ID_REC) return;
     if (m->spec && objects.rec_spec_img) {
@@ -1020,7 +1020,7 @@ static enum ScreensEnum map_eez_screen(ui_screen_id_t scr, const ui_model_t *m)
     }
 }
 
-void ui_render_screen(ui_screen_id_t scr, const ui_model_t *m)
+void ui_render_screen_sync(ui_screen_id_t scr, const ui_model_t *m)
 {
     if (!m) return;
     ui_port_init();

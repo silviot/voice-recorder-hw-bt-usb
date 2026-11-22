@@ -77,6 +77,17 @@ void system_reboot(void)
     OPENFW_DSB();
 
 #ifndef OPENFW_HOST_MMIO
+    /* Park CPU1 and restore 1-wire SPI NOR XIP so BootROM cold-reboots cleanly */
+    rom_rst_hold(CRU_RST_CPU1);
+    NOR_XIP_CFG = NOR_XIP_CFG_1WIRE;
+    rom_gpio_config(0x0000279Bu);
+    rom_gpio_config(0x00002F9Bu);
+    XIP_CACHE_CTRL0 &= ~0x2u;
+    XIP_CACHE_CTRL0 = 0x1u;
+    XIP_CACHE_CTRL1 = (XIP_CACHE_CTRL1 & ~0x2u) | 0x1u;
+    OPENFW_DSB();
+    OPENFW_ISB();
+
     /* Exact HLKJ 0x008284D6 clock/PLL teardown to HOSC from SRAM (Q14 verified) */
     openfw_mmio_clr32(0x40080040u, 0x03u);
     openfw_mmio_clr32(0x40080048u, 0x03u);

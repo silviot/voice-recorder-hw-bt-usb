@@ -38,13 +38,33 @@ SECTIONS
 
     /* Execute-in-Place code & read-only data mapped at 0x00C0F430 (flash 0x00F430) */
     .text 0x00C0F430 : {
-        *(.text .text.*)
+        *(EXCLUDE_FILE(
+            *lcd_st7735s.o
+            *ui_port.o
+            *ui_spectrogram.o
+            *lv_draw_sw_fill.o
+            *lv_draw_sw_letter.o
+            *lv_draw_sw_blend.o
+            *lv_draw_sw_blend_to_rgb565.o
+            *lv_font_fmt_txt.o
+        ) .text .text.*)
         *(.rodata .rodata.*)
         . = ALIGN(4);
     } > XIP
 
     .data : ALIGN(4) {
         _sdata = .;
+        /* Hot LCD/LVGL/UI code copied once at boot into zero-wait-state 96 MHz SRAM */
+        *(.fast_ramtext .fast_ramtext.*)
+        *lcd_st7735s.o(.text .text.*)
+        *ui_port.o(.text .text.*)
+        *ui_spectrogram.o(.text .text.*)
+        *lv_draw_sw_fill.o(.text .text.*)
+        *lv_draw_sw_letter.o(.text .text.*)
+        *lv_draw_sw_blend.o(.text .text.*)
+        *lv_draw_sw_blend_to_rgb565.o(.text .text.*)
+        *lv_font_fmt_txt.o(.text .text.*)
+        . = ALIGN(4);
         *(.data .data.*)
         . = ALIGN(4);
         _edata = .;

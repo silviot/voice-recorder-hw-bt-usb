@@ -147,6 +147,9 @@ void lcd_backlight_set(uint8_t percent)
 
 void lcd_shutdown(void)
 {
+#ifndef OPENFW_HOST_MMIO
+    cpu1_ui_stop();
+#endif
     /* Hold PB17 low even after the PWM clock stops. */
     s_pwm_inited = 0;
     gpio_write(GPIO_PORT_B, 17u, 0);

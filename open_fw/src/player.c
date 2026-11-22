@@ -493,7 +493,8 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
     /* Route audio to built-in speaker PA (PB30) when no 3.5 mm jack is inserted */
     audio_pa_set(!hp_in);
 
-    lcd_set_rotation(1); /* Landscape 160x80 */
+    /* Panel is already configured for 160x80 landscape at boot; avoid touching LCDC
+     * directly from CPU0 while CPU1 owns the display controller. */
 
     uint32_t dur_ms = (has_cwx && cwx.duration_ms > 0u) ? cwx.duration_ms : winfo.duration_ms;
     str_copy_cap(m->play_file.filename, (int)sizeof(m->play_file.filename), wav_name);
@@ -854,7 +855,6 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
 
     audio_dac_stop();
     m->play_file.resume_sec = eof_reached ? 0u : m->play_pos_sec;
-    lcd_set_rotation(1);
 
     while (keys_state((uint32_t *)0) == KEY_BACK) {
         wdt_feed();

@@ -1312,8 +1312,16 @@ int openfw_main(void)
 
     /* Emit early UART0 banner before keys_init() switches PD0 to SARADC */
     uart0_init_115200();
-    uart0_puts("\n=== Cassini OpenFW (SL6801 Layer 5d: RTC + exFAT + WAV + USB MSC + Classic BT +XREC) ===\n");
-    uart0_puts("CPU=96MHz XIP=0x00C0F430 CPU_ID=");
+    uart0_puts("\n=== Cassini OpenFW (SL6801 Dual-Core CPU1 + Quad XIP + SRAM FastPath) ===\n");
+    uart0_puts("CPU=96MHz XIP=");
+    if (g_openfw_xip_mode == OPENFW_XIP_MODE_QUAD_48M) {
+        uart0_puts("4W@48M");
+    } else if (g_openfw_xip_mode == OPENFW_XIP_MODE_DUAL_48M) {
+        uart0_puts("2W@48M");
+    } else {
+        uart0_puts("1W@24M");
+    }
+    uart0_puts(" CPU_ID=");
     uart0_put_u32(SYSCTL_CPU_ID);
     uart0_puts(" VBAT_MV=");
     uart0_put_u32(pmu_read_vbat_mv());
@@ -1375,6 +1383,17 @@ int openfw_main(void)
     }
     /* Discard any residual power-on button edges latched during boot */
     (void)key_onoff_poll();
+    /* Boot Cortex-M4F CPU1 as dedicated LVGL/LCD rendering core (auto-fallback on QEMU) */
+    int cpu1_ok = cpu1_ui_start();
+    openfw_log_puts("CPU1=");
+    openfw_log_puts(cpu1_ok ? "ON" : "OFF");
+    if (g_cpu1_faulted) {
+        openfw_log_puts(" FAULT_PC=");
+        openfw_log_hex(g_cpu1_fault_pc);
+        openfw_log_puts(" CFSR=");
+        openfw_log_hex(g_cpu1_fault_cfsr);
+    }
+    openfw_log_putc('\n');
     usb_msc_set_audio_cfg_cb(main_usb_audio_cfg_cb);
     openfw_exp_bind_fs(&g_exfat_vol, &g_sd_mounted);
     openfw_exp_init_api(&k_exp_api);
@@ -1414,6 +1433,16 @@ int openfw_main(void)
 
     refresh_telemetry();
     ui_render_screen(scr, &g_ui);
+    cpu1_ui_sync(200u);
+    openfw_log_puts("UI_FIRST_US=");
+    openfw_log_u32(g_ui_last_render_us);
+    openfw_log_puts(" FRAMES=");
+    openfw_log_u32(g_ui_frames);
+    if (g_cpu1_faulted) {
+        openfw_log_puts(" CPU1_FAULT=");
+        openfw_log_hex(g_cpu1_fault_pc);
+    }
+    openfw_log_putc('\n');
     dirty = 0;
 
     while (1) {
@@ -1444,6 +1473,7 @@ int openfw_main(void)
                 }
                 scr         = UI_SCR_REC;
                 g_ui_screen = (uint32_t)scr;
+                cpu1_ui_sync(20u);
                 ui_spec_reset(&g_spec);
                 g_ui.rec_sec            = 0u;
                 g_ui.rec_blink          = 1u;
@@ -1547,6 +1577,7 @@ int openfw_main(void)
                 uint8_t ch = g_ui.cfg.channels;
                 uint32_t nf = audio_dma_peek_pcm(pcm_peek, UI_SPEC_FFT_N, &ch);
                 int vor_wait = recorder_is_vor_waiting();
+                cpu1_ui_sync(10u);
                 ui_spec_push_pcm(&g_spec, (nf > 0u) ? pcm_peek : (const int16_t *)0, nf, ch, vor_wait);
 
                 uint8_t vl = 0u, vr = 0u;
@@ -1613,7 +1644,7 @@ int openfw_main(void)
             if (!g_sd_card.initialized &&
                 !keys_event_pending() &&
                 keys_state((uint32_t *)0) == KEY_NONE &&
-                !ui_port_is_animating() &&
+                !ui_dispatch_is_animating() &&
                 (uint32_t)(now_ms - last_sd_probe) >= 10000u) {
                 last_sd_probe = now_ms;
                 probe_microsd_internal(0);
@@ -1745,6 +1776,7 @@ int openfw_main(void)
                         if (key == KEY_BACK) {
                             backlight_sleep_now(SCREEN_MANUALLY_OFF);
                         } else if (key == KEY_ENTER && rec_active) {
+                            cpu1_ui_sync(10u);
                             ui_spec_drop_marker(&g_spec);
                             g_ui.rec_markers++;
                             dirty = 1;
@@ -1985,6 +2017,7 @@ int openfw_main(void)
                             (void)sd_flush(&g_sd_card);
                             ui_show_toast("Entering update mode", UI_COL_CYAN, t, 1000u);
                             ui_render_screen(UI_SCR_ABOUT, &g_ui);
+                            cpu1_ui_sync(100u);
                             mdelay(150u);
                             pmu_reboot_to_usb_bootloader();
                         }
@@ -2077,11 +2110,11 @@ int openfw_main(void)
             ui_render_screen(scr, &g_ui);
             dirty = 0;
         } else if (!g_screen_off) {
-            /* Keep LVGL timers & animations ticking smoothly (~60 Hz) */
-            ui_port_task_handler();
+            /* Keep LVGL timers & animations ticking (no-op when CPU1 drives UI) */
+            ui_dispatch_tick();
         }
 
-        wfi_sleep_ms(ui_port_is_animating() ? 2u : 8u);
+        wfi_sleep_ms(cpu1_ui_is_active() ? 16u : (ui_dispatch_is_animating() ? 2u : 8u));
     }
 
     return 0;
