@@ -23,8 +23,14 @@ static bool s_reveal_pending;
 static void blit_frame_area(int32_t left, int32_t top, int32_t width, int32_t height)
 {
     const uint16_t *pixels = &s_draw_buf[top * BOARD_DISP_HOR_RES + left];
+#ifndef OPENFW_HOST_MMIO
+    uint64_t t0 = us_timer_now();
+#endif
     lcd_blit_rgb565_stride((uint16_t)left, (uint16_t)top, (uint16_t)width, (uint16_t)height,
                            pixels, BOARD_DISP_HOR_RES);
+#ifndef OPENFW_HOST_MMIO
+    g_ui_last_blit_us += (uint32_t)(us_timer_now() - t0);
+#endif
 }
 
 static void reveal_columns(void *screen, int32_t cols)

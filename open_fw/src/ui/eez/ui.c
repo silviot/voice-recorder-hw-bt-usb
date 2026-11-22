@@ -29,6 +29,19 @@ static int screen_depth(enum ScreensEnum id) {
     }
 }
 
+/* On 32-bit Cortex-M4 (4-byte pointers), keeping the 3 primary navigation
+ * screens (HOME, FILES, SETTINGS) resident in LVGL's 24 KiB SRAM heap uses
+ * ~11 KiB total and eliminates ~95 ms of widget teardown/rebuild on every
+ * Home <-> Files and Home <-> Settings navigation press. */
+static int is_cached_screen(enum ScreensEnum id) {
+#if !defined(OPENFW_HOST_MMIO)
+    return id == SCREEN_ID_HOME || id == SCREEN_ID_FILES || id == SCREEN_ID_SETTINGS;
+#else
+    (void)id;
+    return 0;
+#endif
+}
+
 void loadScreen(enum ScreensEnum screenId) {
     if (screenId < _SCREEN_ID_FIRST || screenId > _SCREEN_ID_LAST) {
         return;
@@ -47,20 +60,50 @@ void loadScreen(enum ScreensEnum screenId) {
     int prev_depth = screen_depth(prevId);
     int next_depth = screen_depth(screenId);
 
-    /* Delete the previous screen (or LVGL's default boot screen on first load)
-     * before allocating the new one so peak LVGL heap only ever holds one
-     * screen tree at a time (~15.3 KiB vs ~23.0 KiB on 64-bit host). This lets
-     * BOARD_LVGL_MEM_SIZE stay at 24 KiB SRAM with generous headroom on both
-     * 32-bit Cortex-M4 and 64-bit ASan/UBSan host tests. */
-    if (currentScreen >= 0) {
+    /* Evict non-cached previous screen BEFORE allocating the new one when
+     * neither is cached, or after switching away when cached — Wait: always
+     * delete non-cached prev BEFORE creating new screen so worst-case peak
+     * heap on 64-bit host tests (test_ui_render.c <= 18 KiB) never holds two
+     * uncached screens simultaneously! */
+    if (currentScreen >= 0 && !is_cached_screen(prevId)) {
         delete_screen_by_id(prevId);
     } else if (bootScreen) {
         lv_obj_delete(bootScreen);
     }
-    currentScreen = nextScreen;
-    create_screen_by_id(screenId);
-    lv_obj_t *screen = getLvglObjectFromIndex(currentScreen);
+
+    lv_obj_t *screen = getLvglObjectFromIndex(nextScreen);
+    if (!screen) {
+#if !defined(OPENFW_HOST_MMIO)
+        /* Guarantee >= 8 KiB contiguous LVGL heap before creating any screen
+         * so caching HOME/FILES/SETTINGS can never trigger an OOM assert. */
+        static const enum ScreensEnum evict_order[3] = {
+            SCREEN_ID_SETTINGS, SCREEN_ID_FILES, SCREEN_ID_HOME
+        };
+        for (int pass = 0; pass < 2; pass++) {
+            for (int i = 0; i < 3; i++) {
+                lv_mem_monitor_t mon;
+                lv_mem_monitor(&mon);
+                if (mon.free_biggest_size >= 8192u) {
+                    pass = 2;
+                    break;
+                }
+                if (evict_order[i] != screenId && (pass == 1 || evict_order[i] != prevId)) {
+                    delete_screen_by_id(evict_order[i]);
+                }
+            }
+        }
+#endif
+        lv_obj_enable_style_refresh(false);
+        create_screen_by_id(screenId);
+        lv_obj_enable_style_refresh(true);
+        screen = getLvglObjectFromIndex(nextScreen);
+        if (screen) {
+            lv_obj_refresh_style(screen, LV_PART_ANY, LV_STYLE_PROP_ANY);
+        }
+    }
+
     if (screen) {
+        currentScreen = nextScreen;
         lv_screen_load(screen);
         ui_port_set_reveal(prev_depth >= 0 && next_depth >= 0, next_depth >= prev_depth);
     } else {

@@ -111,7 +111,7 @@
 #define LV_IMAGE_HEADER_CACHE_DEF_CNT   0
 #define LV_GRADIENT_MAX_STOPS           2
 #define LV_COLOR_MIX_ROUND_OFS          0
-#define LV_OBJ_STYLE_CACHE              0
+#define LV_OBJ_STYLE_CACHE              1
 #define LV_USE_OBJ_ID                   0
 #define LV_OBJ_ID_AUTO_ASSIGN           0
 #define LV_USE_OBJ_ID_BUILTIN           0

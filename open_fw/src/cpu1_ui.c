@@ -42,6 +42,10 @@ volatile uint32_t g_cpu1_fault_cfsr   = 0u;
 volatile uint32_t g_ui_last_render_us = 0u;
 volatile uint32_t g_ui_max_render_us  = 0u;
 volatile uint32_t g_ui_frames         = 0u;
+volatile uint32_t g_ui_last_load_us   = 0u;
+volatile uint32_t g_ui_last_draw_us   = 0u;
+volatile uint32_t g_ui_last_blit_us   = 0u;
+volatile uint32_t g_ui_heap_used      = 0u;
 
 #ifndef OPENFW_HOST_MMIO
 
@@ -65,8 +69,8 @@ static void cpu1_entry_c(void) __attribute__((noreturn, used));
 static void cpu1_fault_asm(void) __attribute__((naked, used));
 static void cpu1_fault_c(const uint32_t *frame, uint32_t ipsr) __attribute__((noreturn, used));
 
-__attribute__((aligned(512), used))
-static const uint32_t g_cpu1_isr_vector[16] = {
+__attribute__((section(".data"), aligned(512), used))
+static uint32_t g_cpu1_isr_vector[16] = {
     (uint32_t)(uintptr_t)&g_cpu1_stack[CPU1_STACK_WORDS], /*  0: Initial MSP */
     (uint32_t)(uintptr_t)cpu1_trampoline,                 /*  1: Reset */
     (uint32_t)(uintptr_t)cpu1_fault_asm,                  /*  2: NMI */
@@ -198,6 +202,11 @@ static void cpu1_entry_c(void)
                 g_ui_max_render_us = dt_us;
             }
             g_ui_frames++;
+            {
+                lv_mem_monitor_t mon;
+                lv_mem_monitor(&mon);
+                g_ui_heap_used = (uint32_t)(mon.total_size - mon.free_size);
+            }
             s_cpu1_animating = (uint32_t)ui_port_is_animating();
 
             OPENFW_DSB();
@@ -309,13 +318,13 @@ int cpu1_ui_start(void)
 
     rom_rst_release(CRU_RST_CPU1);
 
-    /* Wait up to 25 ms for CPU1 to initialize LVGL and assert g_cpu1_alive */
+    /* Wait up to 60 ms for CPU1 to initialize LVGL and assert g_cpu1_alive */
     uint64_t t0 = us_timer_now();
     while (g_cpu1_alive == 0u && g_cpu1_faulted == 0u) {
-        if ((us_timer_now() - t0) >= 25000ull) {
+        if ((us_timer_now() - t0) >= 60000ull) {
             break;
         }
-        OPENFW_NOP();
+        OPENFW_WFI();
     }
 
     if (g_cpu1_alive != 0u && g_cpu1_faulted == 0u) {
@@ -369,7 +378,8 @@ void cpu1_ui_sync(uint32_t timeout_ms)
         if ((us_timer_now() - t0) >= lim_us) {
             return;
         }
-        OPENFW_NOP();
+        /* Yield AHB/XIP/APB bus completely to CPU1 until next 1 ms SysTick */
+        OPENFW_WFI();
     }
 }
 

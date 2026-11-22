@@ -46,6 +46,10 @@ extern volatile uint32_t g_cpu1_fault_cfsr;
 extern volatile uint32_t g_ui_last_render_us;
 extern volatile uint32_t g_ui_max_render_us;
 extern volatile uint32_t g_ui_frames;
+extern volatile uint32_t g_ui_last_load_us;
+extern volatile uint32_t g_ui_last_draw_us;
+extern volatile uint32_t g_ui_last_blit_us;
+extern volatile uint32_t g_ui_heap_used;
 
 int  cpu1_ui_start(void);
 void cpu1_ui_stop(void);

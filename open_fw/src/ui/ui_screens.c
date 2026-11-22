@@ -426,15 +426,20 @@ static void bind_home(const ui_model_t *m, bool entering)
             set_changed_text_color(lbls[i], ink);
         }
 
+        static lv_obj_t *s_home_bound_view = NULL;
         lv_obj_t *view = objects.home_details;
         if (entering) {
-            lv_obj_set_scrollbar_mode(view, LV_SCROLLBAR_MODE_OFF);
-            lv_obj_add_event_cb(view, home_scroll_event, LV_EVENT_SCROLL_BEGIN, NULL);
-            lv_obj_add_event_cb(view, home_scroll_event, LV_EVENT_SCROLL, NULL);
-            /* Scroll offset zero already represents Last on a new screen. */
-            lv_obj_set_x(objects.home_focus_mark, lv_obj_get_style_x(tiles[0], LV_PART_MAIN) +
-                         (lv_obj_get_style_width(tiles[0], LV_PART_MAIN) -
-                          lv_obj_get_style_width(objects.home_focus_mark, LV_PART_MAIN)) / 2);
+            if (view != s_home_bound_view) {
+                s_home_bound_view = view;
+                lv_obj_set_scrollbar_mode(view, LV_SCROLLBAR_MODE_OFF);
+                lv_obj_add_event_cb(view, home_scroll_event, LV_EVENT_SCROLL_BEGIN, NULL);
+                lv_obj_add_event_cb(view, home_scroll_event, LV_EVENT_SCROLL, NULL);
+            }
+            int32_t first_x = lv_obj_get_style_x(tiles[0], LV_PART_MAIN);
+            int32_t stride  = lv_obj_get_style_x(tiles[1], LV_PART_MAIN) - first_x;
+            int32_t center  = (lv_obj_get_style_width(tiles[0], LV_PART_MAIN) -
+                               lv_obj_get_style_width(objects.home_focus_mark, LV_PART_MAIN)) / 2;
+            set_changed_x(objects.home_focus_mark, first_x + center + (int32_t)focus * stride);
         }
         lv_obj_scroll_to_x(view, focus * lv_obj_get_style_width(view, LV_PART_MAIN),
                            entering ? LV_ANIM_OFF : LV_ANIM_ON);
@@ -1024,6 +1029,10 @@ void ui_render_screen_sync(ui_screen_id_t scr, const ui_model_t *m)
 {
     if (!m) return;
     ui_port_init();
+#ifndef OPENFW_HOST_MMIO
+    uint64_t t_start = us_timer_now();
+    g_ui_last_blit_us = 0u;
+#endif
 
     enum ScreensEnum target = map_eez_screen(scr, m);
     bool entering = target != s_active_eez_scr;
@@ -1065,6 +1074,13 @@ void ui_render_screen_sync(ui_screen_id_t scr, const ui_model_t *m)
     }
 
     ui_toast_update(m->toast_msg, m->toast_col);
+#ifndef OPENFW_HOST_MMIO
+    uint64_t t_mid = us_timer_now();
+    g_ui_last_load_us = (uint32_t)(t_mid - t_start);
+#endif
     ui_port_render_now();
+#ifndef OPENFW_HOST_MMIO
+    g_ui_last_draw_us = (uint32_t)(us_timer_now() - t_mid);
+#endif
     if (ui_port_is_animating()) ui_port_task_handler();
 }

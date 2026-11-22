@@ -176,7 +176,7 @@ void lcd_init(void)
         0x0Au, 0x13u, 0x26u, 0x36u, 0x00u, 0x0Du, 0x0Eu, 0x10u,
     };
 
-    /* Release LCDC reset & clock at 24 MHz HOSC */
+    /* Release LCDC reset & clock at 24 MHz HOSC (10.6 ms full-screen, ~1.1 ms per reveal slice) */
     if (!rom_rst_is_released(CRU_RST_LCDC)) {
         rom_rst_release(CRU_RST_LCDC);
     }

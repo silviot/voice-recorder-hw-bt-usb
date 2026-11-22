@@ -1364,7 +1364,12 @@ int openfw_main(void)
     lcd_set_rotation(1); /* Landscape 160x80 */
     g_cur_bl_pct = 255u;
     /* Light the Cassini splash immediately before SD probe so powering on gives instant visual feedback */
+    uint64_t t_fill0 = us_timer_now();
     lcd_fill_rect(0u, 0u, 160u, 80u, UI_COL_BLACK);
+    uint32_t fill_us = (uint32_t)(us_timer_now() - t_fill0);
+    openfw_log_puts("LCD_FILL_US=");
+    openfw_log_u32(fill_us);
+    openfw_log_putc('\n');
     lcd_blit_rgb565((uint16_t)((160u - CASSINI_SPLASH_80X40_WIDTH) / 2u), 14u,
                     CASSINI_SPLASH_80X40_WIDTH, CASSINI_SPLASH_80X40_HEIGHT,
                     CASSINI_SPLASH_80X40);
@@ -1433,15 +1438,17 @@ int openfw_main(void)
 
     refresh_telemetry();
     ui_render_screen(scr, &g_ui);
-    cpu1_ui_sync(200u);
+    cpu1_ui_sync(250u);
     openfw_log_puts("UI_FIRST_US=");
     openfw_log_u32(g_ui_last_render_us);
-    openfw_log_puts(" FRAMES=");
-    openfw_log_u32(g_ui_frames);
-    if (g_cpu1_faulted) {
-        openfw_log_puts(" CPU1_FAULT=");
-        openfw_log_hex(g_cpu1_fault_pc);
-    }
+    openfw_log_puts(" LOAD=");
+    openfw_log_u32(g_ui_last_load_us);
+    openfw_log_puts(" DRAW=");
+    openfw_log_u32(g_ui_last_draw_us);
+    openfw_log_puts(" BLIT=");
+    openfw_log_u32(g_ui_last_blit_us);
+    openfw_log_puts(" HEAP=");
+    openfw_log_u32(g_ui_heap_used);
     openfw_log_putc('\n');
     dirty = 0;
 

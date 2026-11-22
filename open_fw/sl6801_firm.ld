@@ -46,7 +46,11 @@ SECTIONS
             *lv_draw_sw_letter.o
             *lv_draw_sw_blend.o
             *lv_draw_sw_blend_to_rgb565.o
+            *lv_draw_sw_border.o
+            *lv_draw_sw_mask_rect.o
             *lv_font_fmt_txt.o
+            *lv_style.o
+            *lv_tlsf.o
         ) .text .text.*)
         *(.rodata .rodata.*)
         . = ALIGN(4);
@@ -63,7 +67,11 @@ SECTIONS
         *lv_draw_sw_letter.o(.text .text.*)
         *lv_draw_sw_blend.o(.text .text.*)
         *lv_draw_sw_blend_to_rgb565.o(.text .text.*)
+        *lv_draw_sw_border.o(.text .text.*)
+        *lv_draw_sw_mask_rect.o(.text .text.*)
         *lv_font_fmt_txt.o(.text .text.*)
+        *lv_style.o(.text .text.*)
+        *lv_tlsf.o(.text .text.*)
         . = ALIGN(4);
         *(.data .data.*)
         . = ALIGN(4);
