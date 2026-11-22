@@ -257,6 +257,10 @@ void ui_settings_defaults(ui_settings_t *cfg);
 int ui_poll_power_button(ui_screen_id_t screen, ui_model_t *model, uint32_t now);
 void ui_render_screen(ui_screen_id_t scr, const ui_model_t *m);
 void ui_rec_update_live(const ui_model_t *m);
+void ui_rec_push_live(const ui_model_t *m, const int16_t *pcm, uint32_t frames,
+                      uint8_t channels, int vor_paused, int full_render);
+void ui_spec_reset_async(ui_spectrogram_t *sp);
+void ui_spec_drop_marker_async(ui_spectrogram_t *sp);
 void ui_render_screen_sync(ui_screen_id_t scr, const ui_model_t *m);
 void ui_rec_update_live_sync(const ui_model_t *m);
 void ui_dispatch_tick(void);

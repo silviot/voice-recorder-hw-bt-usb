@@ -157,6 +157,21 @@ The chip has **two distinct hardware reset paths**. Standard Cortex-M **`SCB->AI
 - **RTC:** Pure-binary counter in `0x40085004`/`0x40085008`, with Alarm 1 at `0x40085020`/`0x40085024` (NVIC IRQ `47`).
 - **Cortex-M4F Hardware FPU (`fpv4-sp-d16`):** Confirmed present and **live-verified on silicon** (single-precision VFPv4-SP hard-float works live; BootROM contains **5,544** VFP instructions, stock `FIRM` contains **5,788**, and Stage-1 `HLKJ` contains 18). Bare-metal firmware built with `-mfpu=fpv4-sp-d16 -mfloat-abi=hard` must enable `SCB->CPACR (0xE000ED88) |= 0x00F00000; __DSB(); __ISB();` in `Reset_Handler` before executing any VFP instructions.
 
+### 7.1 Closed-Loop On-Silicon Profiling Workflow
+
+Because SL6801 has no public datasheet and `DWT->CYCCNT` is unavailable, always measure real silicon timings rather than guessing from code or host benchmarks:
+
+1. **Instrument with `us_timer_now()` + `openfw_log_*()`:** Wrap candidate hot paths (boot stages, SDIO/exFAT calls, UI `LOAD`/`DRAW`/`BLIT`, LVGL heap, or error registers) with `us_timer_now()` (`0x40082104`/`0x40082108`) and log compact one-line key/value telemetry into the 4 KiB SRAM ring (`g_openfw_log`).
+2. **Verify on host first:** Run `make -C open_fw all update-up test-host-san` (0 warnings, ASan/UBSan + `fsck.exfat` clean).
+3. **Flash & read zero-wire telemetry over USB:** Run `python3 tools/dev_cycle.py flash` (warm DFU reboot, preserves `HLKJ` and `PSMP` NVRAM) followed by `python3 tools/dev_cycle.py diag` (reads `g_openfw_log` over vendor SCSI `0xE0` with zero UART wiring).
+4. **Act on the dominant term and re-measure:** Re-run the same telemetry after each change to confirm the win on real hardware.
+
+**Verified silicon baselines & pitfalls discovered with this method:**
+- **CPU1 parity:** Cortex-M4F CPU1 runs at full **96 MHz** with full XIP cache parity (`C1RAM ≈ C1XIP ≈ C0XIP`).
+- **LCDC clock mux (`rom_clk_set_src(0x3F)` @ `0x35B4`):** Only accepts `0x0A` (HOSC 24 MHz) or `0x08` (PLL0 tap); passing `CRU_CLK_SRC_PLL0` (`0x02`) is a no-op. At HOSC 24 MHz / 1, full 160×80 blit is `10.4 ms`.
+- **Dual-core bus contention:** Tight-polling `us_timer_now()` on CPU0 while CPU1 blits doubles LCD blit time (`10.6 ms → 19.8 ms`). Yield with `OPENFW_WFI()` inside `cpu1_ui_sync()` so CPU1 gets full AHB/XIP bandwidth.
+- **Host-to-silicon scaling:** Single-threaded LVGL software rasterization scales ~`208×` slower on 96 MHz Cortex-M4 than x86-64 host tests, making host timing useful for relative A/B deltas once calibrated against silicon.
+
 ---
 
 ## 8. Related Open-Source Projects & Online Documentation

@@ -111,9 +111,23 @@ static void format_rec_filename(uint32_t idx, char out[16])
     out[12] = '\0';
 }
 
+static void rec_log_err(const char *stage, uint32_t v)
+{
+#ifndef OPENFW_HOST_MMIO
+    openfw_log_puts("REC_ERR ");
+    openfw_log_puts(stage);
+    openfw_log_puts("=");
+    openfw_log_u32(v);
+    openfw_log_putc('\n');
+#else
+    (void)stage;
+    (void)v;
+#endif
+}
+
 static int open_next_wav_file(exfat_vol_t *vol)
 {
-    if (!vol || exfat_mkdir(vol, "record") != 0) {
+    if (!vol) {
         return -1;
     }
 
@@ -123,7 +137,11 @@ static int open_next_wav_file(exfat_vol_t *vol)
 
     exfat_entry_t rec_dir;
     if (exfat_find_path(vol, "/record", &rec_dir) != 0 || !rec_dir.is_dir) {
-        return -1;
+        if (exfat_mkdir(vol, "record") != 0 ||
+            exfat_find_path(vol, "/record", &rec_dir) != 0 || !rec_dir.is_dir) {
+            rec_log_err("mkdir", 0u);
+            return -1;
+        }
     }
 
     uint32_t max_idx = 0u;
@@ -133,37 +151,51 @@ static int open_next_wav_file(exfat_vol_t *vol)
     for (uint32_t tries = 0u; tries < 9999u; tries++) {
         uint32_t cand_idx = ((next_idx - 1u + tries) % 9999u) + 1u;
         char name[16];
-        char full[24];
         format_rec_filename(cand_idx, name);
-        const char *pfx = "/record/";
-        int p = 0;
-        for (int i = 0; pfx[i] != '\0'; i++) {
-            full[p++] = pfx[i];
-        }
-        for (int i = 0; name[i] != '\0'; i++) {
-            full[p++] = name[i];
-        }
-        full[p] = '\0';
 
-        exfat_entry_t existing;
-        if (exfat_find_path(vol, full, &existing) != 0) {
+        /* Fast path: when max_idx < 9999, next_idx = max_idx + 1 is guaranteed unused,
+         * so skip the redundant exfat_find_path() directory scan. */
+        if (tries == 0u && max_idx < 9999u) {
             if (exfat_create_file(vol, "/record", name, &g_writer) != 0) {
+                rec_log_err("create", cand_idx);
                 return -1;
             }
-            uint8_t hdr[44];
-            (void)wav_build_header(hdr, 16000u, (uint16_t)g_active_channels, 16u, 0u);
-            if (exfat_write(&g_writer, hdr, 44u) != 0) {
-                (void)exfat_close_file(&g_writer);
+        } else {
+            char full[24];
+            const char *pfx = "/record/";
+            int p = 0;
+            for (int i = 0; pfx[i] != '\0'; i++) {
+                full[p++] = pfx[i];
+            }
+            for (int i = 0; name[i] != '\0'; i++) {
+                full[p++] = name[i];
+            }
+            full[p] = '\0';
+
+            exfat_entry_t existing;
+            if (exfat_find_path(vol, full, &existing) == 0) {
+                continue;
+            }
+            if (exfat_create_file(vol, "/record", name, &g_writer) != 0) {
+                rec_log_err("create", cand_idx);
                 return -1;
             }
-            for (int i = 0; i < 16; i++) {
-                g_filename[i] = name[i];
-            }
-            g_pcm_bytes       = 0u;
-            g_last_ckpt_bytes = 0u;
-            g_rec_saving      = 1;
-            return 0;
         }
+
+        uint8_t hdr[44];
+        (void)wav_build_header(hdr, 16000u, (uint16_t)g_active_channels, 16u, 0u);
+        if (exfat_write(&g_writer, hdr, 44u) != 0) {
+            rec_log_err("hdr", cand_idx);
+            (void)exfat_close_file(&g_writer);
+            return -1;
+        }
+        for (int i = 0; i < 16; i++) {
+            g_filename[i] = name[i];
+        }
+        g_pcm_bytes       = 0u;
+        g_last_ckpt_bytes = 0u;
+        g_rec_saving      = 1;
+        return 0;
     }
     return -1;
 }
@@ -218,6 +250,7 @@ static void recorder_checkpoint_if_due(void)
     uint8_t hdr[44];
     (void)wav_build_header(hdr, 16000u, (uint16_t)g_active_channels, 16u, flushed_pcm);
     if (exfat_checkpoint_file(&g_writer, hdr, 44u) != 0) {
+        rec_log_err("ckpt", flushed_pcm);
         g_rec_error = 1;
     } else {
         g_last_ckpt_bytes = flushed_pcm;
@@ -244,6 +277,7 @@ static void rec_vor_emit_cb(void *user, const int16_t *pcm, size_t num_frames)
     }
 
     if (exfat_write(&g_writer, pcm, nbytes) != 0) {
+        rec_log_err("write", g_pcm_bytes);
         g_rec_error = 1;
         /* Best-effort commit of whatever was already flushed */
         (void)finalize_current_wav_file();
@@ -433,6 +467,11 @@ uint32_t recorder_get_seconds(void)
         return 0u;
     }
     return (audio_get_frames() * 128u) / 1000u;
+}
+
+uint32_t recorder_get_committed_bytes(void)
+{
+    return (g_pcm_bytes > 0u) ? (g_pcm_bytes + 44u) : 0u;
 }
 
 const char *recorder_get_filename(void)

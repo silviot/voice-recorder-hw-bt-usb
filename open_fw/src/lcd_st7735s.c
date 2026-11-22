@@ -159,23 +159,8 @@ void lcd_shutdown(void)
     mdelay(5u);
 }
 
-void lcd_init(void)
+uint64_t lcd_init_begin(void)
 {
-    static const uint8_t init_b1[] = { 0x05u, 0x3Au, 0x3Au };
-    static const uint8_t init_b3[] = { 0x05u, 0x3Au, 0x3Au, 0x05u, 0x3Au, 0x3Au };
-    static const uint8_t init_c0[] = { 0x62u, 0x02u, 0x04u };
-    static const uint8_t init_c2[] = { 0x0Du, 0x00u };
-    static const uint8_t init_c3[] = { 0x8Du, 0x2Au };
-    static const uint8_t init_c4[] = { 0x8Du, 0xEEu };
-    static const uint8_t init_e0[] = {
-        0x10u, 0x0Eu, 0x02u, 0x03u, 0x0Eu, 0x07u, 0x02u, 0x07u,
-        0x0Au, 0x12u, 0x27u, 0x37u, 0x00u, 0x0Du, 0x0Eu, 0x10u,
-    };
-    static const uint8_t init_e1[] = {
-        0x10u, 0x0Eu, 0x03u, 0x03u, 0x0Fu, 0x06u, 0x02u, 0x08u,
-        0x0Au, 0x13u, 0x26u, 0x36u, 0x00u, 0x0Du, 0x0Eu, 0x10u,
-    };
-
     /* Release LCDC reset & clock at 24 MHz HOSC (10.6 ms full-screen, ~1.1 ms per reveal slice) */
     if (!rom_rst_is_released(CRU_RST_LCDC)) {
         rom_rst_release(CRU_RST_LCDC);
@@ -210,9 +195,41 @@ void lcd_init(void)
     gpio_write(GPIO_PORT_B, 10u, 1);
     mdelay(120u);
 
-    /* ST7735S 80x160 IPS panel initialization */
+    /* ST7735S SLPOUT requires 120 ms before DISPON; caller may overlap SD init here */
     st7735s_write_cmd(0x11u); /* SLPOUT */
+#ifdef OPENFW_HOST_MMIO
+    return 0ull;
+#else
+    return us_timer_now();
+#endif
+}
+
+void lcd_init_finish(uint64_t t_slpout_us)
+{
+    static const uint8_t init_b1[] = { 0x05u, 0x3Au, 0x3Au };
+    static const uint8_t init_b3[] = { 0x05u, 0x3Au, 0x3Au, 0x05u, 0x3Au, 0x3Au };
+    static const uint8_t init_c0[] = { 0x62u, 0x02u, 0x04u };
+    static const uint8_t init_c2[] = { 0x0Du, 0x00u };
+    static const uint8_t init_c3[] = { 0x8Du, 0x2Au };
+    static const uint8_t init_c4[] = { 0x8Du, 0xEEu };
+    static const uint8_t init_e0[] = {
+        0x10u, 0x0Eu, 0x02u, 0x03u, 0x0Eu, 0x07u, 0x02u, 0x07u,
+        0x0Au, 0x12u, 0x27u, 0x37u, 0x00u, 0x0Du, 0x0Eu, 0x10u,
+    };
+    static const uint8_t init_e1[] = {
+        0x10u, 0x0Eu, 0x03u, 0x03u, 0x0Fu, 0x06u, 0x02u, 0x08u,
+        0x0Au, 0x13u, 0x26u, 0x36u, 0x00u, 0x0Du, 0x0Eu, 0x10u,
+    };
+
+#ifdef OPENFW_HOST_MMIO
+    (void)t_slpout_us;
     mdelay(120u);
+#else
+    uint64_t elapsed_us = us_timer_now() - t_slpout_us;
+    if (elapsed_us < 120000ull) {
+        mdelay((uint32_t)((120000ull - elapsed_us + 999ull) / 1000ull));
+    }
+#endif
 
     st7735s_write_cmd(0xB1u);
     st7735s_write_bytes(init_b1, sizeof(init_b1));
@@ -259,6 +276,11 @@ void lcd_init(void)
     }
     st7735s_write_cmd(0x29u); /* DISPON */
     mdelay(10u);
+}
+
+void lcd_init(void)
+{
+    lcd_init_finish(lcd_init_begin());
 }
 
 void lcd_set_rotation(int landscape)

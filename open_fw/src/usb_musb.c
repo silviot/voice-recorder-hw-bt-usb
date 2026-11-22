@@ -889,17 +889,21 @@ void usb_msc_poll(void)
         }
     }
 
-    /* EP1 Bulk IN TX */
+    /* EP1 Bulk IN TX (drain up to 16 packets while FIFO accepts, matching RX burst) */
     openfw_mmio_wr8(MUSB_INDEX_ADDR, 1u);
-    if (usb_msc_need_tx(&g_msc) && !(openfw_mmio_rd16(MUSB_TXCSR_ADDR) & 0x0001u)) {
-        uint8_t pkt[64] __attribute__((aligned(4)));
-        uint8_t n = usb_msc_get_tx_packet(&g_msc, pkt);
-        if (n > 0u) {
-            musb_fifo_write(1u, pkt, n);
+    {
+        uint32_t tx_budget = 16u;
+        while (tx_budget-- > 0u && usb_msc_need_tx(&g_msc) &&
+               !(openfw_mmio_rd16(MUSB_TXCSR_ADDR) & 0x0001u)) {
+            uint8_t pkt[64] __attribute__((aligned(4)));
+            uint8_t n = usb_msc_get_tx_packet(&g_msc, pkt);
+            if (n > 0u) {
+                musb_fifo_write(1u, pkt, n);
+            }
+            openfw_mmio_wr16(MUSB_TXCSR_ADDR, (uint16_t)(openfw_mmio_rd16(MUSB_TXCSR_ADDR) | 0x0001u)); /* Set TxPktRdy */
+            g_tx_pkts++;
+            g_tx_bytes += (uint64_t)n;
         }
-        openfw_mmio_wr16(MUSB_TXCSR_ADDR, (uint16_t)(openfw_mmio_rd16(MUSB_TXCSR_ADDR) | 0x0001u)); /* Set TxPktRdy */
-        g_tx_pkts++;
-        g_tx_bytes += (uint64_t)n;
     }
 
     if (g_usb_reboot_mode != 0u && !usb_msc_need_tx(&g_msc) &&

@@ -74,8 +74,9 @@ void loadScreen(enum ScreensEnum screenId) {
     lv_obj_t *screen = getLvglObjectFromIndex(nextScreen);
     if (!screen) {
 #if !defined(OPENFW_HOST_MMIO)
-        /* Guarantee >= 8 KiB contiguous LVGL heap before creating any screen
-         * so caching HOME/FILES/SETTINGS can never trigger an OOM assert. */
+        /* Guarantee >= 10 KiB contiguous LVGL heap before creating any screen
+         * so caching HOME/FILES/SETTINGS can never trigger an OOM assert even
+         * when creating 35-widget screens like REC. */
         static const enum ScreensEnum evict_order[3] = {
             SCREEN_ID_SETTINGS, SCREEN_ID_FILES, SCREEN_ID_HOME
         };
@@ -83,11 +84,14 @@ void loadScreen(enum ScreensEnum screenId) {
             for (int i = 0; i < 3; i++) {
                 lv_mem_monitor_t mon;
                 lv_mem_monitor(&mon);
-                if (mon.free_biggest_size >= 8192u) {
+                if (mon.free_biggest_size >= 10240u) {
                     pass = 2;
                     break;
                 }
                 if (evict_order[i] != screenId && (pass == 1 || evict_order[i] != prevId)) {
+                    if (evict_order[i] == prevId) {
+                        currentScreen = -1;
+                    }
                     delete_screen_by_id(evict_order[i]);
                 }
             }

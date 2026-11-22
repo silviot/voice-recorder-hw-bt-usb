@@ -81,12 +81,15 @@ static void audio_update_peak_if_needed(void)
     uint8_t ch   = g_channels;
     const int16_t *samples = g_pcm_buf[slot];
 
+    const uint32_t *w32 = (const uint32_t *)(const void *)samples;
     if (ch == 2u) {
-        int32_t min_l = samples[0], max_l = samples[0];
-        int32_t min_r = samples[1], max_r = samples[1];
+        uint32_t w0 = w32[0];
+        int32_t min_l = (int16_t)(w0 & 0xFFFFu), max_l = min_l;
+        int32_t min_r = (int16_t)(w0 >> 16),     max_r = min_r;
         for (uint32_t i = 1u; i < AUDIO_FRAMES_PER_SLOT; i++) {
-            int32_t sl = (int32_t)samples[i * 2u + 0u];
-            int32_t sr = (int32_t)samples[i * 2u + 1u];
+            uint32_t w  = w32[i];
+            int32_t  sl = (int16_t)(w & 0xFFFFu);
+            int32_t  sr = (int16_t)(w >> 16);
             if (sl < min_l) min_l = sl;
             if (sl > max_l) max_l = sl;
             if (sr < min_r) min_r = sr;
@@ -98,11 +101,19 @@ static void audio_update_peak_if_needed(void)
         g_peak_r_pct = pr;
         g_peak_pct   = (pl > pr) ? pl : pr;
     } else {
-        int32_t min_m = samples[0], max_m = samples[0];
-        for (uint32_t i = 1u; i < AUDIO_FRAMES_PER_SLOT; i++) {
-            int32_t sm = (int32_t)samples[i];
-            if (sm < min_m) min_m = sm;
-            if (sm > max_m) max_m = sm;
+        uint32_t w0 = w32[0];
+        int32_t s0 = (int16_t)(w0 & 0xFFFFu);
+        int32_t s1 = (int16_t)(w0 >> 16);
+        int32_t min_m = (s0 < s1) ? s0 : s1;
+        int32_t max_m = (s0 > s1) ? s0 : s1;
+        for (uint32_t i = 1u; i < (AUDIO_FRAMES_PER_SLOT >> 1); i++) {
+            uint32_t w = w32[i];
+            int32_t  a = (int16_t)(w & 0xFFFFu);
+            int32_t  b = (int16_t)(w >> 16);
+            if (a < min_m) min_m = a;
+            if (a > max_m) max_m = a;
+            if (b < min_m) min_m = b;
+            if (b > max_m) max_m = b;
         }
         uint8_t pm = ac_peak_to_pct(min_m, max_m);
         g_peak_l_pct = pm;

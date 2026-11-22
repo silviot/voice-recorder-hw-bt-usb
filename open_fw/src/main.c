@@ -88,6 +88,7 @@ enum screen_sleep_state {
 };
 static enum screen_sleep_state g_screen_off = SCREEN_AWAKE;
 static uint32_t         g_toast_until_ms   = 0u;
+static int              g_cpu1_booted      = 0;
 
 static void clear_boot_strikes_once(void)
 {
@@ -128,7 +129,11 @@ static void backlight_apply(uint8_t pct)
 static void backlight_wake(uint32_t now_ms)
 {
     g_last_activity_ms = now_ms;
+    int was_off        = (g_screen_off != SCREEN_AWAKE);
     g_screen_off       = SCREEN_AWAKE;
+    if (was_off && g_cpu1_booted && !cpu1_ui_is_active()) {
+        (void)cpu1_ui_start();
+    }
     backlight_apply(user_bl_pct());
 }
 
@@ -137,6 +142,8 @@ static void backlight_sleep_now(enum screen_sleep_state reason)
     g_screen_off = reason;
     backlight_apply(0u);
     ui_render_screen(UI_SCR_OFF, &g_ui);
+    cpu1_ui_sync(60u);
+    cpu1_ui_stop();
 }
 
 int ui_poll_power_button(ui_screen_id_t screen, ui_model_t *model, uint32_t now)
@@ -648,33 +655,88 @@ static void reload_files_and_sd_stats(void)
     refresh_telemetry();
 }
 
-static void probe_microsd_internal(int log_uart)
+static void probe_microsd_mount_only(int log_uart, uint32_t *out_sd_us, uint32_t *out_mnt_us)
 {
     g_sd_mounted = 0;
+    uint64_t t0 = us_timer_now();
     if (sd_init(&g_sd_card) != 0) {
+        if (out_sd_us) *out_sd_us = (uint32_t)(us_timer_now() - t0);
+        if (out_mnt_us) *out_mnt_us = 0u;
         if (log_uart) {
             uart0_puts("SD: NONE (sd_init failed)\n");
         }
-        reload_files_and_sd_stats();
         return;
     }
+    uint64_t t1 = us_timer_now();
+    if (out_sd_us) *out_sd_us = (uint32_t)(t1 - t0);
 
     g_sd_blkdev = sd_as_blkdev(&g_sd_card);
     if (exfat_mount(&g_exfat_vol, &g_sd_blkdev) != 0) {
+        if (out_mnt_us) *out_mnt_us = (uint32_t)(us_timer_now() - t1);
         if (log_uart) {
             uart0_puts("SD: RAW (card ready, no exFAT partition)\n");
         }
-        reload_files_and_sd_stats();
         return;
     }
-
+    if (out_mnt_us) *out_mnt_us = (uint32_t)(us_timer_now() - t1);
     g_sd_mounted = 1;
+}
+
+static void probe_microsd_internal(int log_uart)
+{
+    probe_microsd_mount_only(log_uart, 0, 0);
     reload_files_and_sd_stats();
-    if (log_uart) {
+    if (log_uart && g_sd_mounted) {
         uart0_puts("SD: OK ");
         uart0_put_u32((uint32_t)g_ui.file_count);
         uart0_puts("f\n");
     }
+}
+
+static void prepend_saved_recording_fast(const char *saved_name, uint32_t rec_s,
+                                         uint8_t rec_ch, uint32_t committed_bytes)
+{
+    /* Remove any pre-existing entry with the same name in /record */
+    int existing = -1;
+    for (int i = 0; i < g_ui.file_count; i++) {
+        if (str_eq_ci(g_file_dirs[i], "/record") && str_eq_ci(g_files[i].filename, saved_name)) {
+            existing = i;
+            break;
+        }
+    }
+    int shift_end = (existing >= 0) ? existing : g_ui.file_count;
+    if (shift_end >= MENU_MAX_FILES) {
+        shift_end = MENU_MAX_FILES - 1;
+    }
+    for (int i = shift_end; i > 0; i--) {
+        g_files[i] = g_files[i - 1];
+        copy_cstr(g_file_dirs[i], 12, g_file_dirs[i - 1]);
+    }
+    if (existing < 0 && g_ui.file_count < MENU_MAX_FILES) {
+        g_ui.file_count++;
+    }
+
+    ui_file_entry_t *f = &g_files[0];
+    copy_cstr(g_file_dirs[0], 12, "/record");
+    copy_cstr(f->filename, (int)sizeof(f->filename), saved_name);
+    f->dt             = g_ui.now;
+    f->duration_sec   = rec_s;
+    f->resume_sec     = 0u;
+    f->unplayed       = 1u;
+    f->has_transcript = 0u;
+    f->channels       = rec_ch ? rec_ch : 1u;
+
+    uint32_t used_mb = (committed_bytes + 0xFFFFFu) >> 20;
+    if (g_sd_free_mb > used_mb) {
+        g_sd_free_mb -= used_mb;
+    } else {
+        g_sd_free_mb = 0u;
+    }
+    g_ui.files     = g_files;
+    g_ui.last_file = *f;
+    copy_cstr(g_last_dir, (int)sizeof(g_last_dir), "/record");
+    g_ui.has_last  = 1;
+    refresh_telemetry();
 }
 
 static int main_usb_audio_cfg_cb(int set, uint8_t cfg[4], int16_t *rms_x10, uint16_t *clips)
@@ -1360,10 +1422,19 @@ int openfw_main(void)
     copy_cstr(g_ui.bt_name, (int)sizeof(g_ui.bt_name), "HW_76");
     apply_cfg_to_recorder();
 
-    lcd_init();
+    /* Overlap SD init + exFAT mount with ST7735S mandatory 120 ms SLPOUT wait */
+    uint64_t t_boot0    = us_timer_now();
+    uint64_t t_slpout   = lcd_init_begin();
+    uint32_t lcd_b_us   = (uint32_t)(t_slpout - t_boot0);
+    uint32_t sd_us      = 0u;
+    uint32_t mnt_us     = 0u;
+    probe_microsd_mount_only(1, &sd_us, &mnt_us);
+    uint64_t t_lcdf0    = us_timer_now();
+    lcd_init_finish(t_slpout);
+    uint32_t lcd_f_us   = (uint32_t)(us_timer_now() - t_lcdf0);
     lcd_set_rotation(1); /* Landscape 160x80 */
     g_cur_bl_pct = 255u;
-    /* Light the Cassini splash immediately before SD probe so powering on gives instant visual feedback */
+    /* Light the Cassini splash immediately before scanning WAV headers/bitmap */
     uint64_t t_fill0 = us_timer_now();
     lcd_fill_rect(0u, 0u, 160u, 80u, UI_COL_BLACK);
     uint32_t fill_us = (uint32_t)(us_timer_now() - t_fill0);
@@ -1375,8 +1446,26 @@ int openfw_main(void)
                     CASSINI_SPLASH_80X40);
     backlight_apply(user_bl_pct());
 
-    probe_microsd_internal(1);
+    uint64_t t_scan0 = us_timer_now();
+    reload_files_and_sd_stats();
+    if (g_sd_mounted) {
+        uart0_puts("SD: OK ");
+        uart0_put_u32((uint32_t)g_ui.file_count);
+        uart0_puts("f\n");
+    }
     load_persisted_state();
+    uint32_t scan_us = (uint32_t)(us_timer_now() - t_scan0);
+    openfw_log_puts("BOOT_US LCDB=");
+    openfw_log_u32(lcd_b_us);
+    openfw_log_puts(" SD=");
+    openfw_log_u32(sd_us);
+    openfw_log_puts(" MNT=");
+    openfw_log_u32(mnt_us);
+    openfw_log_puts(" LCDF=");
+    openfw_log_u32(lcd_f_us);
+    openfw_log_puts(" SCAN=");
+    openfw_log_u32(scan_us);
+    openfw_log_putc('\n');
 
     uart0_puts("Switching PD0 to SARADC key ladder & entering main loop...\n");
     keys_init();
@@ -1389,7 +1478,8 @@ int openfw_main(void)
     /* Discard any residual power-on button edges latched during boot */
     (void)key_onoff_poll();
     /* Boot Cortex-M4F CPU1 as dedicated LVGL/LCD rendering core (auto-fallback on QEMU) */
-    int cpu1_ok = cpu1_ui_start();
+    int cpu1_ok   = cpu1_ui_start();
+    g_cpu1_booted = cpu1_ok;
     openfw_log_puts("CPU1=");
     openfw_log_puts(cpu1_ok ? "ON" : "OFF");
     if (g_cpu1_faulted) {
@@ -1480,8 +1570,7 @@ int openfw_main(void)
                 }
                 scr         = UI_SCR_REC;
                 g_ui_screen = (uint32_t)scr;
-                cpu1_ui_sync(20u);
-                ui_spec_reset(&g_spec);
+                ui_spec_reset_async(&g_spec);
                 g_ui.rec_sec            = 0u;
                 g_ui.rec_blink          = 1u;
                 g_ui.rec_vor_wait       = 0u;
@@ -1531,30 +1620,21 @@ int openfw_main(void)
                     stop_rc    = recorder_stop();
                     rec_active = 0;
                 }
-                reload_files_and_sd_stats();
+                uint32_t committed_bytes = recorder_get_committed_bytes();
 
                 if (was_saving && stop_rc == 0 && saved_name[0] != '\0') {
+                    /* Incremental file list & free-space update avoids full SD rescan lag */
+                    prepend_saved_recording_fast(saved_name, rec_s, rec_ch, committed_bytes);
                     g_ui.saved_sec      = rec_s;
                     g_ui.saved_channels = rec_ch;
                     g_ui.saved_frac_pct = 100u;
                     g_ui.saved_dt       = g_ui.now;
                     copy_cstr(g_ui.saved_filename, (int)sizeof(g_ui.saved_filename), saved_name);
-                    int match_idx = -1;
-                    for (int i = 0; i < g_ui.file_count; i++) {
-                        if (str_eq_ci(g_files[i].filename, saved_name)) {
-                            match_idx = i;
-                            break;
-                        }
-                    }
-                    if (match_idx >= 0) {
-                        g_ui.last_file = g_files[match_idx];
-                        copy_cstr(g_last_dir, (int)sizeof(g_last_dir), g_file_dirs[match_idx]);
-                        g_ui.has_last = 1;
-                    }
                     save_persisted_state();
                     saved_start_ms = now_ms;
                     scr            = UI_SCR_SAVED;
                 } else {
+                    reload_files_and_sd_stats();
                     if (was_saving || recorder_has_error()) {
                         ui_show_toast("Save failed \xC2\xB7 card error", UI_COL_RED, now_ms, 2500u);
                     }
@@ -1572,20 +1652,18 @@ int openfw_main(void)
                 (void)recorder_stop();
                 rec_active       = 0;
                 g_ui.rec_stopped = 1u;
-                copy_cstr(g_ui.rec_stop_reason, (int)sizeof(g_ui.rec_stop_reason), "Card full / error");
+                copy_cstr(g_ui.rec_stop_reason, (int)sizeof(g_ui.rec_stop_reason), "Write error");
                 dirty            = 1;
             }
             prev_vbus   = vbus_present_cached(now_ms);
             usb_probing = 0;
 
-            if ((uint32_t)(now_ms - last_spec_ms) >= 50u) {
+            if (!g_screen_off && (uint32_t)(now_ms - last_spec_ms) >= 50u) {
                 last_spec_ms = now_ms;
                 int16_t pcm_peek[UI_SPEC_FFT_N * 2u];
                 uint8_t ch = g_ui.cfg.channels;
                 uint32_t nf = audio_dma_peek_pcm(pcm_peek, UI_SPEC_FFT_N, &ch);
                 int vor_wait = recorder_is_vor_waiting();
-                cpu1_ui_sync(10u);
-                ui_spec_push_pcm(&g_spec, (nf > 0u) ? pcm_peek : (const int16_t *)0, nf, ch, vor_wait);
 
                 uint8_t vl = 0u, vr = 0u;
                 audio_get_peak_lr_pct(&vl, &vr);
@@ -1632,9 +1710,12 @@ int openfw_main(void)
                     g_ui.rec_blink    = blk;
                     g_ui.rec_vor_wait = (uint8_t)vor_wait;
                     dirty = 1;
-                } else if (!g_screen_off && !dirty && scr == UI_SCR_REC && g_ui.sd_ok && !g_ui.rec_stopped) {
-                    /* Fast 20 Hz partial update: spectrogram + L/R vertical meters via LVGL */
-                    ui_rec_update_live(&g_ui);
+                }
+                if (scr == UI_SCR_REC && g_ui.sd_ok && !g_ui.rec_stopped) {
+                    /* Offload 128-pt FFT + spectrogram scroll + live meter/full blit to CPU1 */
+                    ui_rec_push_live(&g_ui, (nf > 0u) ? pcm_peek : (const int16_t *)0,
+                                     nf, ch, vor_wait, dirty);
+                    dirty = 0;
                 }
             }
         } else {
@@ -1783,8 +1864,7 @@ int openfw_main(void)
                         if (key == KEY_BACK) {
                             backlight_sleep_now(SCREEN_MANUALLY_OFF);
                         } else if (key == KEY_ENTER && rec_active) {
-                            cpu1_ui_sync(10u);
-                            ui_spec_drop_marker(&g_spec);
+                            ui_spec_drop_marker_async(&g_spec);
                             g_ui.rec_markers++;
                             dirty = 1;
                         } else if ((key == KEY_VOL_UP || key == KEY_VOL_DOWN) && rec_active) {

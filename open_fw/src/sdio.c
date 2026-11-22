@@ -31,11 +31,34 @@
 #define SD_ACMD41_OPCOND     0x2569u
 #define SD_CMD55_APPCMD      0x2577u
 
-#define SD_R1_ERR_MASK       0xFDF98008u
+/* Fatal write-programming R1 bits: WP_VIOLATION | CARD_ECC_FAILED | CC_ERROR | ERROR.
+ * Avoids aborting on sticky historical status bits (e.g. OUT_OF_RANGE from prior probes). */
+#define SD_R1_WRITE_ERR_MASK 0x04380000u
 
 #define SDIO_CMD_TIMEOUT_US  100000u
 #define SDIO_DAT_TIMEOUT_US  500000u
 #define SDIO_MAX_MULTI_BLKS  64u
+
+static void sdio_log_err(const char *tag, uint32_t a, uint32_t b)
+{
+#ifndef OPENFW_HOST_MMIO
+    static uint8_t s_err_logs = 0u;
+    if (s_err_logs >= 8u) {
+        return;
+    }
+    s_err_logs++;
+    openfw_log_puts(tag);
+    openfw_log_puts(" a=");
+    openfw_log_hex(a);
+    openfw_log_puts(" b=");
+    openfw_log_hex(b);
+    openfw_log_putc('\n');
+#else
+    (void)tag;
+    (void)a;
+    (void)b;
+#endif
+}
 
 static int sdio_read_one_sector(sd_card_t *card, uint32_t lba, uint8_t *dst);
 
@@ -156,6 +179,7 @@ int sd_init(sd_card_t *card)
     card->clk_div      = 0u;
     card->async_active = 0u;
     card->async_last_desc = 0u;
+    card->no_multi_write = 0u;
     card->async_t0_us  = 0u;
 
     /* 1-bit SDIO pins on Port D: PD5=CLK, PD4=CMD (PU), PD6=D0 (PU) */
@@ -281,11 +305,14 @@ static int sdio_wait_card_ready(sd_card_t *card)
     /* Wait for card programming completion (R1 bit 8 = READY_FOR_DATA, state != PRG) */
     uint64_t p0 = us_timer_now();
     uint32_t fast_polls = 0u;
+    uint32_t last_r1 = 0u;
     while (1) {
         wdt_feed();
         if (sdio_send_cmd(SD_CMD13_STATUS, (uint32_t)card->rca << 16, 0) == 0) {
             uint32_t r1 = openfw_mmio_rd32(SDIO_RESP0_ADDR);
-            if (r1 & SD_R1_ERR_MASK) {
+            last_r1 = r1;
+            if (r1 & SD_R1_WRITE_ERR_MASK) {
+                sdio_log_err("SD_R1_ERR", r1, openfw_mmio_rd32(SDIO_RINTSTS_ADDR));
                 return -1;
             }
             if ((r1 & (1u << 8)) && (((r1 >> 9) & 0xFu) != 7u)) {
@@ -293,6 +320,7 @@ static int sdio_wait_card_ready(sd_card_t *card)
             }
         }
         if ((uint32_t)(us_timer_now() - p0) >= SDIO_DAT_TIMEOUT_US) {
+            sdio_log_err("SD_RDY_TMO", last_r1, openfw_mmio_rd32(SDIO_RINTSTS_ADDR));
             return -1;
         }
         if (fast_polls < 16u) {
@@ -308,15 +336,20 @@ static int sdio_fifo_read_words(uint8_t *dst, uint32_t words, uint64_t t0, uint3
     int aligned = (((uintptr_t)dst & 3u) == 0u);
     uint32_t *dst32 = (uint32_t *)(void *)dst;
     for (uint32_t w = 0u; w < words; w++) {
+        uint32_t polls = 0u;
         while (openfw_mmio_rd32(SDIO_STATUS_ADDR) & SDIO_STAT_FIFO_EMP) {
-            if (openfw_mmio_rd32(SDIO_RINTSTS_ADDR) & SDIO_INT_DATA_ERRS) {
-                openfw_mmio_wr32(SDIO_RINTSTS_ADDR, 0xFFFFFFFFu);
-                return -1;
+            if ((polls & 31u) == 31u) {
+                uint32_t st = openfw_mmio_rd32(SDIO_RINTSTS_ADDR);
+                if (st & SDIO_INT_DATA_ERRS) {
+                    openfw_mmio_wr32(SDIO_RINTSTS_ADDR, 0xFFFFFFFFu);
+                    return -1;
+                }
+                if ((uint32_t)(us_timer_now() - t0) >= timeout_us) {
+                    openfw_mmio_wr32(SDIO_RINTSTS_ADDR, 0xFFFFFFFFu);
+                    return -1;
+                }
             }
-            if ((uint32_t)(us_timer_now() - t0) >= timeout_us) {
-                openfw_mmio_wr32(SDIO_RINTSTS_ADDR, 0xFFFFFFFFu);
-                return -1;
-            }
+            polls++;
         }
         uint32_t word = openfw_mmio_rd32(SDIO_FIFO_ADDR);
         if (aligned) {
@@ -337,15 +370,22 @@ static int sdio_fifo_write_words(const uint8_t *src, uint32_t words, uint64_t t0
     int aligned = (((uintptr_t)src & 3u) == 0u);
     const uint32_t *src32 = (const uint32_t *)(const void *)src;
     for (uint32_t w = 0u; w < words; w++) {
+        uint32_t polls = 0u;
         while (openfw_mmio_rd32(SDIO_STATUS_ADDR) & SDIO_STAT_FIFO_FULL) {
-            if (openfw_mmio_rd32(SDIO_RINTSTS_ADDR) & SDIO_INT_DATA_ERRS) {
-                openfw_mmio_wr32(SDIO_RINTSTS_ADDR, 0xFFFFFFFFu);
-                return -1;
+            if ((polls & 31u) == 31u) {
+                uint32_t st = openfw_mmio_rd32(SDIO_RINTSTS_ADDR);
+                if (st & SDIO_INT_DATA_ERRS) {
+                    sdio_log_err("SDW_FIFO_ERR", st, w);
+                    openfw_mmio_wr32(SDIO_RINTSTS_ADDR, 0xFFFFFFFFu);
+                    return -1;
+                }
+                if ((uint32_t)(us_timer_now() - t0) >= timeout_us) {
+                    sdio_log_err("SDW_FIFO_TMO", st, w);
+                    openfw_mmio_wr32(SDIO_RINTSTS_ADDR, 0xFFFFFFFFu);
+                    return -1;
+                }
             }
-            if ((uint32_t)(us_timer_now() - t0) >= timeout_us) {
-                openfw_mmio_wr32(SDIO_RINTSTS_ADDR, 0xFFFFFFFFu);
-                return -1;
-            }
+            polls++;
         }
         uint32_t word;
         if (aligned) {
@@ -666,6 +706,7 @@ static int sdio_write_multi(sd_card_t *card, uint32_t lba, uint32_t count, const
     openfw_mmio_wr32(SDIO_RINTSTS_ADDR, 0xFFFFFFFFu);
 
     if (sdio_send_cmd(SD_CMD25_WRITE_MULTI, arg, 0) != 0) {
+        sdio_log_err("SDW_CMD25", lba, count);
         return -1;
     }
 
@@ -681,6 +722,7 @@ static int sdio_write_multi(sd_card_t *card, uint32_t lba, uint32_t count, const
     int dto_rc = sdio_wait_dto(us_timer_now(), SDIO_DAT_TIMEOUT_US, &st);
     int stop_rc = sdio_send_cmd(SD_CMD12_STOP, 0u, 1);
     if (dto_rc != 0 || stop_rc != 0 || (st & SDIO_INT_DATA_ERRS)) {
+        sdio_log_err("SDW_MDTO", st, ((uint32_t)(dto_rc != 0) << 16) | (uint32_t)(stop_rc != 0));
         sdio_reset_fifo();
         return -1;
     }
@@ -755,14 +797,26 @@ int sd_write_blocks(sd_card_t *card, uint32_t lba, uint32_t count, const void *b
                 max_multi = safe_limit - cur_lba;
             }
         }
-        if (max_multi >= 2u) {
+        if (!card->no_multi_write && max_multi >= 2u) {
             uint32_t chunk = (max_multi > SDIO_MAX_MULTI_BLKS) ? SDIO_MAX_MULTI_BLKS : max_multi;
             if (sdio_write_multi(card, cur_lba, chunk, src + (done * 512u)) != 0) {
-                return -1;
+                /* Some cards / SL6801 dw_mmc revisions stall on CMD25+CMD12;
+                 * log once, latch single-block CMD24 mode, and retry cleanly. */
+                sdio_log_err("SDW_MFAIL", cur_lba, chunk);
+                card->no_multi_write = 1u;
+                sdio_reset_fifo();
+                (void)sdio_wait_card_ready(card);
+                for (uint32_t k = 0u; k < chunk; k++) {
+                    if (sdio_write_one_sector(card, cur_lba + k, src + ((done + k) * 512u)) != 0) {
+                        sdio_log_err("SDW_FB_FAIL", cur_lba + k, chunk);
+                        return -1;
+                    }
+                }
             }
             done += chunk;
         } else {
             if (sdio_write_one_sector(card, cur_lba, src + (done * 512u)) != 0) {
+                sdio_log_err("SDW_1_FAIL", cur_lba, 1u);
                 return -1;
             }
             done++;

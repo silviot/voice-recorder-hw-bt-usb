@@ -155,6 +155,21 @@ static uint32_t cluster_to_lba(const exfat_vol_t *vol, uint32_t cluster)
 
 static int fat_get_entry(const exfat_vol_t *vol, uint32_t cluster, uint32_t *out_val);
 
+static const uint8_t *fat_read_sector_cached(const exfat_vol_t *cvol, uint32_t lba)
+{
+    exfat_vol_t *vol = (exfat_vol_t *)(uintptr_t)cvol;
+    if (vol->fat_cache_valid && vol->fat_cache_lba == lba) {
+        return vol->fat_cache;
+    }
+    if (vol->dev->read_sectors(vol->dev->ctx, lba, 1u, vol->fat_cache) != 0) {
+        vol->fat_cache_valid = 0u;
+        return 0;
+    }
+    vol->fat_cache_lba   = lba;
+    vol->fat_cache_valid = 1u;
+    return vol->fat_cache;
+}
+
 static int next_cluster(const exfat_vol_t *vol, uint32_t cur, uint8_t no_fat_chain, uint32_t *out_next)
 {
     if (cur < 2u || (cur - 2u) >= vol->cluster_count) {
@@ -172,8 +187,8 @@ static int next_cluster(const exfat_vol_t *vol, uint32_t cur, uint8_t no_fat_cha
         return -1;
     }
 
-    uint8_t sec[512];
-    if (vol->dev->read_sectors(vol->dev->ctx, vol->fat_lba + fat_sec_off, 1u, sec) != 0) {
+    const uint8_t *sec = fat_read_sector_cached(vol, vol->fat_lba + fat_sec_off);
+    if (!sec) {
         return -1;
     }
     uint32_t val = le32(sec + fat_in_sec);
@@ -215,32 +230,40 @@ static int scan_root_bitmap(exfat_vol_t *vol, uint8_t active_fat)
 {
     uint32_t cls   = vol->root_dir_cluster;
     uint32_t steps = 0u;
-    uint8_t sec[512];
+    uint8_t buf[4u * 512u];
 
     while (cls >= 2u && (cls - 2u) < vol->cluster_count) {
         if (++steps > vol->cluster_count) {
             return -1; /* Corrupted FAT cycle */
         }
         uint32_t base_lba = cluster_to_lba(vol, cls);
-        for (uint32_t s = 0u; s < vol->sectors_per_cluster; s++) {
-            if (vol->dev->read_sectors(vol->dev->ctx, base_lba + s, 1u, sec) != 0) {
+        for (uint32_t s = 0u; s < vol->sectors_per_cluster; ) {
+            uint32_t chunk = vol->sectors_per_cluster - s;
+            if (chunk > 4u) {
+                chunk = 4u;
+            }
+            if (vol->dev->read_sectors(vol->dev->ctx, base_lba + s, chunk, buf) != 0) {
                 return -1;
             }
-            for (uint32_t idx = 0u; idx < 16u; idx++) {
-                const uint8_t *d = &sec[idx * 32u];
-                if (d[0] == 0x00u) {
-                    return 0;
-                }
-                if (d[0] == 0x81u && (d[1] & 1u) == active_fat) {
-                    uint32_t bmp_cls = le32(d + 20u);
-                    uint64_t bmp_len = le64(d + 24u);
-                    if (bmp_cls >= 2u && (bmp_cls - 2u) < vol->cluster_count) {
-                        vol->bitmap_cluster = bmp_cls;
-                        vol->bitmap_bytes   = (bmp_len > 0xFFFFFFFFu) ? 0xFFFFFFFFu : (uint32_t)bmp_len;
+            for (uint32_t cs = 0u; cs < chunk; cs++) {
+                const uint8_t *sec = &buf[cs * 512u];
+                for (uint32_t idx = 0u; idx < 16u; idx++) {
+                    const uint8_t *d = &sec[idx * 32u];
+                    if (d[0] == 0x00u) {
                         return 0;
+                    }
+                    if (d[0] == 0x81u && (d[1] & 1u) == active_fat) {
+                        uint32_t bmp_cls = le32(d + 20u);
+                        uint64_t bmp_len = le64(d + 24u);
+                        if (bmp_cls >= 2u && (bmp_cls - 2u) < vol->cluster_count) {
+                            vol->bitmap_cluster = bmp_cls;
+                            vol->bitmap_bytes   = (bmp_len > 0xFFFFFFFFu) ? 0xFFFFFFFFu : (uint32_t)bmp_len;
+                            return 0;
+                        }
                     }
                 }
             }
+            s += chunk;
         }
         uint32_t nxt = 0u;
         if (next_cluster(vol, cls, 0u, &nxt) != 0) {
@@ -404,19 +427,26 @@ static int list_dir_with_loc(const exfat_vol_t *vol, uint32_t dir_cluster, uint8
 
     uint32_t cls     = dir_cluster;
     uint32_t cls_idx = 0u;
-    uint8_t sec[512];
+    uint8_t buf[4u * 512u];
 
     while (cls >= 2u && (cls - 2u) < vol->cluster_count) {
         if (cls_idx >= vol->cluster_count) {
             return -1; /* Corrupted FAT cycle */
         }
         uint32_t base_lba = cluster_to_lba(vol, cls);
-        for (uint32_t s = 0u; s < vol->sectors_per_cluster; s++) {
-            uint32_t lba = base_lba + s;
-            if (vol->dev->read_sectors(vol->dev->ctx, lba, 1u, sec) != 0) {
+        for (uint32_t s_base = 0u; s_base < vol->sectors_per_cluster; ) {
+            uint32_t chunk = vol->sectors_per_cluster - s_base;
+            if (chunk > 4u) {
+                chunk = 4u;
+            }
+            if (vol->dev->read_sectors(vol->dev->ctx, base_lba + s_base, chunk, buf) != 0) {
                 return -1;
             }
-            for (uint32_t idx = 0u; idx < 16u; idx++) {
+            for (uint32_t cs = 0u; cs < chunk; cs++) {
+                uint32_t s   = s_base + cs;
+                uint32_t lba = base_lba + s;
+                const uint8_t *sec = &buf[cs * 512u];
+                for (uint32_t idx = 0u; idx < 16u; idx++) {
                 const uint8_t *d = &sec[idx * 32u];
                 uint8_t etype = d[0];
                 if (etype == 0x00u) {
@@ -482,6 +512,8 @@ static int list_dir_with_loc(const exfat_vol_t *vol, uint32_t dir_cluster, uint8
                     }
                 }
             }
+            }
+            s_base += chunk;
         }
         cls_idx++;
         if (no_fat_chain && cls_idx >= max_cls) {
@@ -761,32 +793,36 @@ static int fat_get_entry(const exfat_vol_t *vol, uint32_t cluster, uint32_t *out
         return -1;
     }
 
-    uint8_t sec[512];
-    if (vol->dev->read_sectors(vol->dev->ctx, vol->fat_lba + fat_sec_off, 1u, sec) != 0) {
+    const uint8_t *sec = fat_read_sector_cached(vol, vol->fat_lba + fat_sec_off);
+    if (!sec) {
         return -1;
     }
     *out_val = le32(sec + fat_in_sec);
     return 0;
 }
 
-static int fat_set_entry(const exfat_vol_t *vol, uint32_t cluster, uint32_t value)
+static int fat_set_entry(const exfat_vol_t *cvol, uint32_t cluster, uint32_t value)
 {
-    if (cluster < 2u || (cluster - 2u) >= vol->cluster_count) {
+    if (cluster < 2u || (cluster - 2u) >= cvol->cluster_count) {
         return -1;
     }
     uint32_t fat_sec_off = cluster >> 7;
     uint32_t fat_in_sec  = (cluster & 127u) << 2;
-    if (fat_sec_off >= vol->fat_sectors) {
+    if (fat_sec_off >= cvol->fat_sectors) {
         return -1;
     }
 
-    uint8_t sec[512];
-    uint32_t lba = vol->fat_lba + fat_sec_off;
-    if (vol->dev->read_sectors(vol->dev->ctx, lba, 1u, sec) != 0) {
+    uint32_t lba = cvol->fat_lba + fat_sec_off;
+    if (!fat_read_sector_cached(cvol, lba)) {
         return -1;
     }
-    put_le32(sec + fat_in_sec, value);
-    return vol->dev->write_sectors(vol->dev->ctx, lba, 1u, sec);
+    exfat_vol_t *vol = (exfat_vol_t *)(uintptr_t)cvol;
+    put_le32(vol->fat_cache + fat_in_sec, value);
+    if (vol->dev->write_sectors(vol->dev->ctx, lba, 1u, vol->fat_cache) != 0) {
+        vol->fat_cache_valid = 0u;
+        return -1;
+    }
+    return 0;
 }
 
 static int scan_bitmap_range(exfat_vol_t *vol, uint32_t start_byte, uint32_t end_byte,
@@ -807,74 +843,88 @@ static int scan_bitmap_range(exfat_vol_t *vol, uint32_t start_byte, uint32_t end
 
     uint32_t cur_byte = target_cidx << cls_shift;
     uint32_t s_start  = (start_byte & cls_mask) >> 9;
-    uint8_t  sec[512];
+    uint8_t  buf[4u * 512u];
 
     while (bmp_cls >= 2u && cur_byte < end_byte) {
         uint32_t base_lba = cluster_to_lba(vol, bmp_cls);
-        for (uint32_t s = s_start; s < vol->sectors_per_cluster && cur_byte < end_byte; s++) {
-            uint32_t sec_base = cur_byte + (s << 9);
-            if (sec_base >= end_byte) {
-                return 1;
+        for (uint32_t s_base = s_start; s_base < vol->sectors_per_cluster && cur_byte + (s_base << 9) < end_byte; ) {
+            uint32_t rem_bytes = end_byte - (cur_byte + (s_base << 9));
+            uint32_t need_secs = (rem_bytes + 511u) >> 9;
+            uint32_t chunk     = vol->sectors_per_cluster - s_base;
+            if (chunk > need_secs) {
+                chunk = need_secs;
             }
-            if (vol->dev->read_sectors(vol->dev->ctx, base_lba + s, 1u, sec) != 0) {
+            if (chunk > 4u) {
+                chunk = 4u;
+            }
+            if (vol->dev->read_sectors(vol->dev->ctx, base_lba + s_base, chunk, buf) != 0) {
                 return -1;
             }
-            uint32_t b_start = (start_byte > sec_base) ? (start_byte - sec_base) : 0u;
-            uint32_t b_end   = (end_byte - sec_base < 512u) ? (end_byte - sec_base) : 512u;
-            for (uint32_t b = b_start; b < b_end; b++) {
-                if (sec[b] == 0xFFu) {
-                    continue;
+            for (uint32_t cs = 0u; cs < chunk; cs++) {
+                uint32_t s        = s_base + cs;
+                uint32_t sec_base = cur_byte + (s << 9);
+                if (sec_base >= end_byte) {
+                    return 1;
                 }
-                for (uint32_t bit = 0u; bit < 8u; bit++) {
-                    if (sec[b] & (1u << bit)) {
+                uint8_t *sec     = &buf[cs * 512u];
+                uint32_t b_start = (start_byte > sec_base) ? (start_byte - sec_base) : 0u;
+                uint32_t b_end   = (end_byte - sec_base < 512u) ? (end_byte - sec_base) : 512u;
+                for (uint32_t b = b_start; b < b_end; b++) {
+                    if (sec[b] == 0xFFu) {
                         continue;
                     }
-                    uint32_t idx = ((sec_base + b) << 3) + bit;
-                    if (idx >= vol->cluster_count) {
-                        return 1;
-                    }
-                    uint32_t new_c = idx + 2u;
-                    sec[b] |= (uint8_t)(1u << bit);
-                    if (vol->dev->write_sectors(vol->dev->ctx, base_lba + s, 1u, sec) != 0) {
-                        return -1;
-                    }
-                    int fat_rc = 0;
-                    if (prev_cluster >= 2u && (prev_cluster >> 7) == (new_c >> 7)) {
-                        /* Coalesce both FAT updates into a single sector read + write */
-                        uint32_t fat_sec_off = new_c >> 7;
-                        if (fat_sec_off >= vol->fat_sectors) {
-                            fat_rc = -1;
-                        } else {
-                            uint32_t flba = vol->fat_lba + fat_sec_off;
-                            uint8_t  fsec[512];
-                            if (vol->dev->read_sectors(vol->dev->ctx, flba, 1u, fsec) != 0) {
+                    for (uint32_t bit = 0u; bit < 8u; bit++) {
+                        if (sec[b] & (1u << bit)) {
+                            continue;
+                        }
+                        uint32_t idx = ((sec_base + b) << 3) + bit;
+                        if (idx >= vol->cluster_count) {
+                            return 1;
+                        }
+                        uint32_t new_c = idx + 2u;
+                        sec[b] |= (uint8_t)(1u << bit);
+                        if (vol->dev->write_sectors(vol->dev->ctx, base_lba + s, 1u, sec) != 0) {
+                            return -1;
+                        }
+                        int fat_rc = 0;
+                        if (prev_cluster >= 2u && (prev_cluster >> 7) == (new_c >> 7)) {
+                            /* Coalesce both FAT updates into a single cached sector write */
+                            uint32_t fat_sec_off = new_c >> 7;
+                            if (fat_sec_off >= vol->fat_sectors) {
                                 fat_rc = -1;
                             } else {
-                                put_le32(fsec + ((new_c & 127u) << 2), 0xFFFFFFFFu);
-                                put_le32(fsec + ((prev_cluster & 127u) << 2), new_c);
-                                if (vol->dev->write_sectors(vol->dev->ctx, flba, 1u, fsec) != 0) {
+                                uint32_t flba = vol->fat_lba + fat_sec_off;
+                                if (!fat_read_sector_cached(vol, flba)) {
                                     fat_rc = -1;
+                                } else {
+                                    put_le32(vol->fat_cache + ((new_c & 127u) << 2), 0xFFFFFFFFu);
+                                    put_le32(vol->fat_cache + ((prev_cluster & 127u) << 2), new_c);
+                                    if (vol->dev->write_sectors(vol->dev->ctx, flba, 1u, vol->fat_cache) != 0) {
+                                        vol->fat_cache_valid = 0u;
+                                        fat_rc = -1;
+                                    }
                                 }
                             }
+                        } else {
+                            if (fat_set_entry(vol, new_c, 0xFFFFFFFFu) != 0) {
+                                fat_rc = -1;
+                            } else if (prev_cluster >= 2u && fat_set_entry(vol, prev_cluster, new_c) != 0) {
+                                (void)fat_set_entry(vol, new_c, 0u);
+                                fat_rc = -1;
+                            }
                         }
-                    } else {
-                        if (fat_set_entry(vol, new_c, 0xFFFFFFFFu) != 0) {
-                            fat_rc = -1;
-                        } else if (prev_cluster >= 2u && fat_set_entry(vol, prev_cluster, new_c) != 0) {
-                            (void)fat_set_entry(vol, new_c, 0u);
-                            fat_rc = -1;
+                        if (fat_rc != 0) {
+                            sec[b] &= (uint8_t)~(1u << bit);
+                            (void)vol->dev->write_sectors(vol->dev->ctx, base_lba + s, 1u, sec);
+                            return -1;
                         }
+                        vol->alloc_hint = idx + 1u;
+                        *out_cluster    = new_c;
+                        return 0;
                     }
-                    if (fat_rc != 0) {
-                        sec[b] &= (uint8_t)~(1u << bit);
-                        (void)vol->dev->write_sectors(vol->dev->ctx, base_lba + s, 1u, sec);
-                        return -1;
-                    }
-                    vol->alloc_hint = idx + 1u;
-                    *out_cluster    = new_c;
-                    return 0;
                 }
             }
+            s_base += chunk;
         }
         s_start  = 0u;
         cur_byte += vol->cluster_size;
@@ -1203,58 +1253,67 @@ static int dir_alloc_slots(exfat_vol_t *vol, uint32_t dir_cluster, uint8_t *dir_
     uint32_t cls_idx  = 0u;
     uint32_t pad_lba  = 0u;
     uint8_t  pad_slot = 0u;
-    uint8_t  sec[512];
+    uint8_t  buf[4u * 512u];
 
     while (cls >= 2u && (cls - 2u) < vol->cluster_count) {
         uint32_t base_lba = cluster_to_lba(vol, cls);
-        for (uint32_t s = 0u; s < vol->sectors_per_cluster; s++) {
-            uint32_t lba = base_lba + s;
-            if (vol->dev->read_sectors(vol->dev->ctx, lba, 1u, sec) != 0) {
+        for (uint32_t s_base = 0u; s_base < vol->sectors_per_cluster; ) {
+            uint32_t chunk = vol->sectors_per_cluster - s_base;
+            if (chunk > 4u) {
+                chunk = 4u;
+            }
+            if (vol->dev->read_sectors(vol->dev->ctx, base_lba + s_base, chunk, buf) != 0) {
                 return -1;
             }
-            uint32_t free_run   = 0u;
-            uint32_t run_start  = 0u;
-            for (uint32_t idx = 0u; idx < 16u; idx++) {
-                uint8_t etype = sec[idx * 32u];
-                if (etype == 0x00u) {
-                    if ((16u - idx) >= total_ents) {
-                        /* Allocation succeeded: flush deferred 0x05 tail padding if any */
-                        if (pad_lba != 0u) {
-                            if (vol->dev->read_sectors(vol->dev->ctx, pad_lba, 1u, sec) != 0) {
-                                return -1;
+            for (uint32_t cs = 0u; cs < chunk; cs++) {
+                uint32_t lba       = base_lba + s_base + cs;
+                uint8_t *sec       = &buf[cs * 512u];
+                uint32_t free_run  = 0u;
+                uint32_t run_start = 0u;
+                for (uint32_t idx = 0u; idx < 16u; idx++) {
+                    uint8_t etype = sec[idx * 32u];
+                    if (etype == 0x00u) {
+                        if ((16u - idx) >= total_ents) {
+                            /* Allocation succeeded: flush deferred 0x05 tail padding if any */
+                            if (pad_lba != 0u) {
+                                uint8_t psec[512];
+                                if (vol->dev->read_sectors(vol->dev->ctx, pad_lba, 1u, psec) != 0) {
+                                    return -1;
+                                }
+                                for (uint32_t k = pad_slot; k < 16u; k++) {
+                                    psec[k * 32u] = 0x05u;
+                                }
+                                if (vol->dev->write_sectors(vol->dev->ctx, pad_lba, 1u, psec) != 0) {
+                                    return -1;
+                                }
                             }
-                            for (uint32_t k = pad_slot; k < 16u; k++) {
-                                sec[k * 32u] = 0x05u;
-                            }
-                            if (vol->dev->write_sectors(vol->dev->ctx, pad_lba, 1u, sec) != 0) {
-                                return -1;
-                            }
+                            *out_lba  = lba;
+                            *out_slot = (uint8_t)idx;
+                            return 0;
                         }
-                        *out_lba  = lba;
-                        *out_slot = (uint8_t)idx;
-                        return 0;
+                        /* Defer 0x05 tail padding until a subsequent slot/cluster succeeds */
+                        if (pad_lba == 0u) {
+                            pad_lba  = lba;
+                            pad_slot = (uint8_t)idx;
+                        }
+                        break;
                     }
-                    /* Defer 0x05 tail padding until a subsequent slot/cluster succeeds */
-                    if (pad_lba == 0u) {
-                        pad_lba  = lba;
-                        pad_slot = (uint8_t)idx;
+                    if ((etype & 0x80u) == 0u) {
+                        if (free_run == 0u) {
+                            run_start = idx;
+                        }
+                        free_run++;
+                        if (free_run >= total_ents) {
+                            *out_lba  = lba;
+                            *out_slot = (uint8_t)run_start;
+                            return 0;
+                        }
+                    } else {
+                        free_run = 0u;
                     }
-                    break;
-                }
-                if ((etype & 0x80u) == 0u) {
-                    if (free_run == 0u) {
-                        run_start = idx;
-                    }
-                    free_run++;
-                    if (free_run >= total_ents) {
-                        *out_lba  = lba;
-                        *out_slot = (uint8_t)run_start;
-                        return 0;
-                    }
-                } else {
-                    free_run = 0u;
                 }
             }
+            s_base += chunk;
         }
 
         cls_idx++;
@@ -2008,6 +2067,7 @@ static int free_file_clusters(exfat_vol_t *vol, uint32_t first_cluster, uint64_t
     if (sec_wb_flush(vol, &fat_c) != 0) {
         rc = -1;
     }
+    vol->fat_cache_valid = 0u;
     return rc;
 }
 

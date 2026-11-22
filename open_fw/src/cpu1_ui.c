@@ -22,17 +22,24 @@
 #include "openfw_ui.h"
 #include "ui/ui_port.h"
 
-#define CPU1_CMD_RENDER   1u
-#define CPU1_CMD_REC_LIVE 2u
-#define CPU1_MAX_FILES    32u
+#define CPU1_CMD_RENDER        1u
+#define CPU1_CMD_REC_LIVE      2u
+#define CPU1_MAX_FILES         32u
 
 typedef struct {
     ui_screen_id_t  scr;
     uint8_t         kind;
     uint8_t         has_files;
+    uint8_t         has_spec_pcm;
+    uint8_t         spec_ch;
+    uint8_t         spec_vor_wait;
+    uint16_t        spec_frames;
     uint16_t        file_count_copied;
     ui_model_t      model;
-    ui_file_entry_t files[CPU1_MAX_FILES];
+    union {
+        ui_file_entry_t files[CPU1_MAX_FILES];
+        int16_t         spec_pcm[UI_SPEC_FFT_N * 2u];
+    } payload;
 } cpu1_ui_slot_t;
 
 volatile uint32_t g_cpu1_alive        = 0u;
@@ -60,6 +67,9 @@ static volatile uint32_t s_cpu1_reading_slot = 0xFFu; /* 0, 1, or 0xFF (idle) */
 static volatile uint32_t s_cpu1_animating    = 0u;
 static volatile uint32_t s_cpu1_stop_req     = 0u;
 static volatile uint32_t s_cpu1_stopped      = 0u;
+static volatile uint8_t  s_spec_reset_pend   = 0u;
+static volatile uint8_t  s_spec_marker_pend  = 0u;
+static ui_spectrogram_t *volatile s_spec_ptr = NULL;
 static uint8_t           s_cpu1_active       = 0u;
 static uint32_t          s_last_seq          = 0u;
 static uint32_t          s_last_slot         = 0u;
@@ -191,6 +201,21 @@ static void cpu1_entry_c(void)
 
             const cpu1_ui_slot_t *slot = &s_slots[idx];
             uint64_t t0 = us_timer_now();
+            ui_spectrogram_t *sp = slot->model.spec ? slot->model.spec : s_spec_ptr;
+            if (s_spec_reset_pend && sp) {
+                s_spec_reset_pend  = 0u;
+                s_spec_marker_pend = 0u;
+                ui_spec_reset(sp);
+            }
+            if (slot->has_spec_pcm && sp) {
+                ui_spec_push_pcm(sp,
+                                 (slot->spec_frames > 0u) ? slot->payload.spec_pcm : (const int16_t *)0,
+                                 slot->spec_frames, slot->spec_ch, (int)slot->spec_vor_wait);
+            }
+            if (s_spec_marker_pend && sp) {
+                s_spec_marker_pend = 0u;
+                ui_spec_drop_marker(sp);
+            }
             if (slot->kind == CPU1_CMD_REC_LIVE) {
                 ui_rec_update_live_sync(&slot->model);
             } else {
@@ -217,27 +242,43 @@ static void cpu1_entry_c(void)
             continue;
         }
 
-        uint32_t now_ms = millis();
-        if (now_ms != last_tick_ms) {
+        uint32_t now_ms   = millis();
+        uint32_t tick_gap = s_cpu1_animating ? 1u : 100u;
+        if ((uint32_t)(now_ms - last_tick_ms) >= tick_gap) {
             last_tick_ms = now_ms;
             ui_port_task_handler();
             s_cpu1_animating = (uint32_t)ui_port_is_animating();
         } else {
-            /* Keep SRAM bus light for CPU0 audio/SDIO/USB while polling at <5 us latency */
-            for (volatile uint32_t d = 0u; d < 64u; d++) {
+            /* Keep SRAM bus nearly idle when static (~10 us wake latency) and light during anims */
+            uint32_t nops = s_cpu1_animating ? 64u : 1024u;
+            for (volatile uint32_t d = 0u; d < nops; d++) {
                 OPENFW_NOP();
             }
         }
     }
 }
 
-static void cpu1_submit_slot(uint8_t kind, ui_screen_id_t scr, const ui_model_t *m)
+static void cpu1_submit_slot(uint8_t kind, ui_screen_id_t scr, const ui_model_t *m,
+                             const int16_t *spec_pcm, uint32_t spec_frames,
+                             uint8_t spec_ch, int spec_vor_wait, int has_spec_pcm)
 {
     uint32_t next = s_last_slot ^ 1u;
     uint64_t t0   = us_timer_now();
     while (s_cpu1_reading_slot == next) {
         if (g_cpu1_faulted != 0u || (us_timer_now() - t0) > 100000ull) {
             cpu1_ui_stop();
+            if (s_spec_reset_pend && m->spec) {
+                s_spec_reset_pend  = 0u;
+                s_spec_marker_pend = 0u;
+                ui_spec_reset(m->spec);
+            }
+            if (has_spec_pcm && m->spec) {
+                ui_spec_push_pcm(m->spec, spec_pcm, spec_frames, spec_ch, spec_vor_wait);
+            }
+            if (s_spec_marker_pend && m->spec) {
+                s_spec_marker_pend = 0u;
+                ui_spec_drop_marker(m->spec);
+            }
             if (kind == CPU1_CMD_REC_LIVE) {
                 ui_rec_update_live_sync(m);
             } else {
@@ -249,9 +290,13 @@ static void cpu1_submit_slot(uint8_t kind, ui_screen_id_t scr, const ui_model_t 
     }
 
     cpu1_ui_slot_t *slot = &s_slots[next];
-    slot->scr   = scr;
-    slot->kind  = kind;
-    slot->model = *m;
+    slot->scr          = scr;
+    slot->kind         = kind;
+    slot->has_spec_pcm = (uint8_t)(has_spec_pcm ? 1u : 0u);
+    slot->spec_ch      = spec_ch;
+    slot->spec_vor_wait = (uint8_t)(spec_vor_wait ? 1u : 0u);
+    slot->spec_frames  = 0u;
+    slot->model        = *m;
 
     if (kind == CPU1_CMD_RENDER &&
         (scr == UI_SCR_FILES || scr == UI_SCR_DELETE) &&
@@ -261,16 +306,24 @@ static void cpu1_submit_slot(uint8_t kind, ui_screen_id_t scr, const ui_model_t 
             n = CPU1_MAX_FILES;
         }
         for (uint32_t i = 0u; i < n; i++) {
-            slot->files[i] = m->files[i];
+            slot->payload.files[i] = m->files[i];
         }
         slot->has_files         = 1u;
         slot->file_count_copied = (uint16_t)n;
-        slot->model.files       = slot->files;
+        slot->model.files       = slot->payload.files;
         slot->model.file_count  = (int)n;
     } else {
         slot->has_files         = 0u;
         slot->file_count_copied = 0u;
         slot->model.files       = NULL;
+        if (has_spec_pcm && spec_pcm != NULL && spec_frames > 0u) {
+            uint32_t nf = (spec_frames > UI_SPEC_FFT_N) ? UI_SPEC_FFT_N : spec_frames;
+            uint32_t ns = nf * ((spec_ch >= 2u) ? 2u : 1u);
+            for (uint32_t i = 0u; i < ns; i++) {
+                slot->payload.spec_pcm[i] = spec_pcm[i];
+            }
+            slot->spec_frames = (uint16_t)nf;
+        }
     }
 
     uint32_t seq = (s_last_seq + 1u) & 0x7FFFFFFFu;
@@ -291,15 +344,12 @@ int cpu1_ui_start(void)
         return 1;
     }
 
-    /* Reset all shared IPC state before releasing CPU1 */
+    /* Reset all shared IPC state before releasing CPU1 (preserve lifetime stats) */
     rom_rst_hold(CRU_RST_CPU1);
     g_cpu1_alive        = 0u;
     g_cpu1_faulted      = 0u;
     g_cpu1_fault_pc     = 0u;
     g_cpu1_fault_cfsr   = 0u;
-    g_ui_last_render_us = 0u;
-    g_ui_max_render_us  = 0u;
-    g_ui_frames         = 0u;
     s_req_word          = 0u;
     s_ack_seq           = 0u;
     s_cpu1_reading_slot = 0xFFu;
@@ -383,14 +433,52 @@ void cpu1_ui_sync(uint32_t timeout_ms)
     }
 }
 
+void ui_spec_reset_async(ui_spectrogram_t *sp)
+{
+    if (!sp) {
+        return;
+    }
+    if (cpu1_ui_is_active()) {
+        s_spec_ptr         = sp;
+        s_spec_marker_pend = 0u;
+        s_spec_reset_pend  = 1u;
+        OPENFW_DSB();
+        return;
+    }
+    ui_spec_reset(sp);
+}
+
+void ui_spec_drop_marker_async(ui_spectrogram_t *sp)
+{
+    if (!sp) {
+        return;
+    }
+    if (cpu1_ui_is_active()) {
+        s_spec_ptr         = sp;
+        s_spec_marker_pend = 1u;
+        OPENFW_DSB();
+        return;
+    }
+    ui_spec_drop_marker(sp);
+}
+
 void ui_render_screen(ui_screen_id_t scr, const ui_model_t *m)
 {
     if (!m) {
         return;
     }
     if (cpu1_ui_is_active()) {
-        cpu1_submit_slot(CPU1_CMD_RENDER, scr, m);
+        cpu1_submit_slot(CPU1_CMD_RENDER, scr, m, NULL, 0u, 0u, 0, 0);
         return;
+    }
+    if (s_spec_reset_pend && m->spec) {
+        s_spec_reset_pend  = 0u;
+        s_spec_marker_pend = 0u;
+        ui_spec_reset(m->spec);
+    }
+    if (s_spec_marker_pend && m->spec) {
+        s_spec_marker_pend = 0u;
+        ui_spec_drop_marker(m->spec);
     }
     uint64_t t0 = us_timer_now();
     ui_render_screen_sync(scr, m);
@@ -411,11 +499,35 @@ void ui_rec_update_live(const ui_model_t *m)
         /* Only post 20 Hz live meter/spec updates when CPU1 is idle so we never
          * overwrite a pending full-screen switch. */
         if (s_ack_seq == (s_req_word >> 1) && s_cpu1_reading_slot == 0xFFu) {
-            cpu1_submit_slot(CPU1_CMD_REC_LIVE, UI_SCR_REC, m);
+            cpu1_submit_slot(CPU1_CMD_REC_LIVE, UI_SCR_REC, m, NULL, 0u, 0u, 0, 0);
         }
         return;
     }
     ui_rec_update_live_sync(m);
+}
+
+void ui_rec_push_live(const ui_model_t *m, const int16_t *pcm, uint32_t frames,
+                      uint8_t channels, int vor_paused, int full_render)
+{
+    if (!m) {
+        return;
+    }
+    if (cpu1_ui_is_active()) {
+        if (full_render) {
+            cpu1_submit_slot(CPU1_CMD_RENDER, UI_SCR_REC, m, pcm, frames, channels, vor_paused, 1);
+        } else if (s_ack_seq == (s_req_word >> 1) && s_cpu1_reading_slot == 0xFFu) {
+            cpu1_submit_slot(CPU1_CMD_REC_LIVE, UI_SCR_REC, m, pcm, frames, channels, vor_paused, 1);
+        }
+        return;
+    }
+    if (m->spec) {
+        ui_spec_push_pcm(m->spec, pcm, frames, channels, vor_paused);
+    }
+    if (full_render) {
+        ui_render_screen_sync(UI_SCR_REC, m);
+    } else {
+        ui_rec_update_live_sync(m);
+    }
 }
 
 void ui_dispatch_tick(void)
@@ -450,6 +562,29 @@ void ui_render_screen(ui_screen_id_t scr, const ui_model_t *m)
 void ui_rec_update_live(const ui_model_t *m)
 {
     ui_rec_update_live_sync(m);
+}
+
+void ui_rec_push_live(const ui_model_t *m, const int16_t *pcm, uint32_t frames,
+                      uint8_t channels, int vor_paused, int full_render)
+{
+    if (m && m->spec) {
+        ui_spec_push_pcm(m->spec, pcm, frames, channels, vor_paused);
+    }
+    if (full_render) {
+        ui_render_screen_sync(UI_SCR_REC, m);
+    } else {
+        ui_rec_update_live_sync(m);
+    }
+}
+
+void ui_spec_reset_async(ui_spectrogram_t *sp)
+{
+    ui_spec_reset(sp);
+}
+
+void ui_spec_drop_marker_async(ui_spectrogram_t *sp)
+{
+    ui_spec_drop_marker(sp);
 }
 
 void ui_dispatch_tick(void)

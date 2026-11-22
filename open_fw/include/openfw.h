@@ -196,6 +196,8 @@ static inline uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b)
 
 void     lcd_backlight_set(uint8_t percent);
 void     lcd_init(void);
+uint64_t lcd_init_begin(void);
+void     lcd_init_finish(uint64_t t_slpout_us);
 void     lcd_shutdown(void);
 void     lcd_set_rotation(int landscape);
 uint16_t lcd_get_width(void);
@@ -223,6 +225,7 @@ typedef struct {
     uint8_t  clk_div;
     uint8_t  async_active;
     uint8_t  async_last_desc;
+    uint8_t  no_multi_write;
     uint32_t async_t0_us;
 } sd_card_t;
 
@@ -281,6 +284,7 @@ int                 recorder_is_saving(void);
 int                 recorder_has_error(void);
 int                 recorder_is_vor_waiting(void);
 uint32_t            recorder_get_seconds(void);
+uint32_t            recorder_get_committed_bytes(void);
 const char         *recorder_get_filename(void);
 
 /* USB Mass Storage Full-Speed MUSB & PHY Plug Detect (usb_musb.c) */

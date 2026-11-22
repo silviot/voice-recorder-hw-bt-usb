@@ -727,7 +727,8 @@ def emit_eez_c_files(pages: list[dict], out_dir: Path) -> None:
         "#ifdef __cplusplus\n}\n#endif\n\n#endif /*EEZ_LVGL_UI_GUI_H*/\n",
         encoding="utf-8",
     )
-    (out_dir / "ui.c").write_text(UI_C_TEMPLATE, encoding="utf-8")
+    if not (out_dir / "ui.c").exists():
+        (out_dir / "ui.c").write_text(UI_C_TEMPLATE, encoding="utf-8")
 
     # 2. styles.h & styles.c
     sh_lines = [
@@ -824,6 +825,15 @@ def emit_eez_c_files(pages: list[dict], out_dir: Path) -> None:
         "objects_t objects;", "",
     ]
 
+    style_defaults = {
+        name: dict(defn.get("MAIN", {}).get("DEFAULT", {}))
+        for name, defn in STYLES
+    }
+    zero_props = {
+        "border_width": 0, "pad_top": 0, "pad_bottom": 0,
+        "pad_left": 0, "pad_right": 0, "radius": 0, "bg_opa": 0,
+    }
+
     def emit_widget(w: dict, parent_var: str, lines: list[str], depth: int = 1) -> None:
         ind = "    " * depth
         wtype = w["type"]
@@ -853,8 +863,15 @@ def emit_eez_c_files(pages: list[dict], out_dir: Path) -> None:
         lines.append(f"{ind2}lv_obj_set_size(obj, {w['width']}, {w['height']});")
 
         st_name = w["style"]["useStyle"]
+        eff: dict = {}
+        if wtype in ("LVGLPanelWidget", "LVGLBarWidget"):
+            eff.update(zero_props)
+        elif wtype == "LVGLLabelWidget":
+            eff["text_align"] = "LEFT"
+            eff["text_color"] = COL["text"]
         if st_name and st_name != "default":
             lines.append(f"{ind2}add_style_{st_name}(obj);")
+            eff.update(style_defaults.get(st_name, {}))
 
         if wtype == "LVGLLabelWidget":
             font = w.get("_font", "ui_font_sm")
@@ -865,6 +882,8 @@ def emit_eez_c_files(pages: list[dict], out_dir: Path) -> None:
 
         ldef = w.get("localStyles", {}).get("definition", {}).get("MAIN", {}).get("DEFAULT", {})
         for prop, val in ldef.items():
+            if eff.get(prop) == val:
+                continue
             if prop == "bg_color":
                 lines.append(f"{ind2}lv_obj_set_style_bg_color(obj, lv_color_hex({hex_to_u32(val)}), LV_PART_MAIN | LV_STATE_DEFAULT);")
             elif prop == "border_color":
@@ -895,7 +914,8 @@ def emit_eez_c_files(pages: list[dict], out_dir: Path) -> None:
         scr_c.append("    lv_obj_remove_style_all(obj);")
         scr_c.append("    lv_obj_remove_flag(obj, LV_OBJ_FLAG_SCROLLABLE);")
         scr_c.append("    add_style_st_screen(obj);")
-        scr_c.append(f"    lv_obj_set_style_bg_color(obj, lv_color_hex({hex_to_u32(bg)}), LV_PART_MAIN | LV_STATE_DEFAULT);")
+        if bg != COL["bg"]:
+            scr_c.append(f"    lv_obj_set_style_bg_color(obj, lv_color_hex({hex_to_u32(bg)}), LV_PART_MAIN | LV_STATE_DEFAULT);")
         scr_c.append(f"    objects.{n} = obj;")
         scr_c.append("    lv_obj_set_pos(obj, 0, 0);")
         scr_c.append("    lv_obj_set_size(obj, 160, 80);")
