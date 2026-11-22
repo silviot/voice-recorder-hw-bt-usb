@@ -33,6 +33,7 @@
 
 typedef struct {
     uint64_t size;
+    uint64_t valid_data_len;
     uint32_t first_cluster;
     uint8_t  no_fat_chain;
 } wav_loc_t;
@@ -378,6 +379,12 @@ static void save_persisted_state(void)
                           g_ui.has_last);
 }
 
+static rtc_datetime_t file_datetime(const exfat_entry_t *entry)
+{
+    rtc_datetime_t created = rtc_from_dos_timestamp(entry->created_timestamp);
+    return created.year ? created : rtc_from_dos_timestamp(entry->modified_timestamp);
+}
+
 static void fill_wav_metadata(const exfat_entry_t *entry, ui_file_entry_t *dst)
 {
     dst->channels     = 1u;
@@ -434,7 +441,7 @@ static void load_persisted_state(void)
             exfat_entry_t ent;
             if (exfat_find_path(&g_exfat_vol, full, &ent) == 0 && !ent.is_dir) {
                 copy_cstr(g_ui.last_file.filename, (int)sizeof(g_ui.last_file.filename), last_name);
-                g_ui.last_file.dt             = g_ui.now;
+                g_ui.last_file.dt             = file_datetime(&ent);
                 fill_wav_metadata(&ent, &g_ui.last_file);
                 g_ui.last_file.resume_sec     = (last_resume < g_ui.last_file.duration_sec) ? last_resume : 0u;
                 g_ui.last_file.unplayed       = 0u;
@@ -532,13 +539,14 @@ static int menu_collect_cb(const exfat_entry_t *entry, void *user)
     ui_file_entry_t *dst = &ctx->items[idx];
     copy_cstr(ctx->dirs[idx], 12, ctx->dir_path);
     copy_cstr(dst->filename, (int)sizeof(dst->filename), entry->name);
-    dst->dt             = g_ui.now;
+    dst->dt             = file_datetime(entry);
     dst->resume_sec     = 0u;
     dst->unplayed       = 1u;
     dst->has_transcript = 0u;
     dst->channels       = 1u;
     dst->duration_sec   = (entry->size > 44u) ? ((uint32_t)(entry->size - 44u) / 32000u) : 0u;
 
+    ctx->locs[idx].valid_data_len = entry->valid_data_len;
     ctx->locs[idx].size          = entry->size;
     ctx->locs[idx].first_cluster = entry->first_cluster;
     ctx->locs[idx].no_fat_chain  = entry->no_fat_chain;
@@ -603,13 +611,12 @@ static void reload_files_and_sd_stats(void)
     /* Read 512 B WAV headers & match .cwx transcripts only for the selected files */
     for (int i = 0; i < ctx.count; i++) {
         wdt_feed();
-        exfat_entry_t wav_ent;
-        wav_ent.name[0]       = '\0';
-        wav_ent.size          = locs[i].size;
-        wav_ent.first_cluster = locs[i].first_cluster;
-        wav_ent.file_attr     = 0u;
-        wav_ent.no_fat_chain  = locs[i].no_fat_chain;
-        wav_ent.is_dir        = 0u;
+        exfat_entry_t wav_ent = {
+            .size = locs[i].size,
+            .valid_data_len = locs[i].valid_data_len,
+            .first_cluster = locs[i].first_cluster,
+            .no_fat_chain = locs[i].no_fat_chain
+        };
         fill_wav_metadata(&wav_ent, &g_files[i]);
 
         int has_cwx = 0;
@@ -723,7 +730,7 @@ static void prepend_saved_recording_fast(const char *saved_name, uint32_t rec_s,
     ui_file_entry_t *f = &g_files[0];
     copy_cstr(g_file_dirs[0], 12, "/record");
     copy_cstr(f->filename, (int)sizeof(f->filename), saved_name);
-    f->dt             = g_ui.now;
+    f->dt             = rtc_from_dos_timestamp(recorder_get_created_timestamp());
     f->duration_sec   = rec_s;
     f->resume_sec     = 0u;
     f->unplayed       = 1u;
@@ -1636,7 +1643,7 @@ int openfw_main(void)
                     g_ui.saved_sec      = rec_s;
                     g_ui.saved_channels = rec_ch;
                     g_ui.saved_frac_pct = 100u;
-                    g_ui.saved_dt       = g_ui.now;
+                    g_ui.saved_dt       = g_files[0].dt;
                     copy_cstr(g_ui.saved_filename, (int)sizeof(g_ui.saved_filename), saved_name);
                     save_persisted_state();
                     saved_start_ms = now_ms;

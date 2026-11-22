@@ -56,6 +56,19 @@ void rtc_get(rtc_datetime_t *dt)
     dt->second  = (uint8_t)(t & 0x3Fu);
 }
 
+static uint8_t rtc_weekday(uint32_t year, uint32_t month, uint32_t day)
+{
+    /* Kim Larsen weekday (0 = Mon .. 6 = Sun) */
+    uint32_t yw = year;
+    uint32_t mw = month;
+    if (mw <= 2u) {
+        mw += 12u;
+        yw -= 1u;
+    }
+    return (day + 2u * mw + (3u * (mw + 1u)) / 5u +
+                     yw + yw / 4u - yw / 100u + yw / 400u) % 7u;
+}
+
 void rtc_set(const rtc_datetime_t *dt)
 {
     if (!dt) {
@@ -73,15 +86,7 @@ void rtc_set(const rtc_datetime_t *dt)
     uint32_t is_leap = ((y_full % 4u == 0u && y_full % 100u != 0u) ||
                         (y_full % 400u == 0u)) ? 1u : 0u;
 
-    /* Kim Larsen weekday (0 = Mon .. 6 = Sun) */
-    uint32_t yw = y_full;
-    uint32_t mw = m_val;
-    if (mw <= 2u) {
-        mw += 12u;
-        yw -= 1u;
-    }
-    uint32_t wday = (d_val + 2u * mw + (3u * (mw + 1u)) / 5u +
-                     yw + yw / 4u - yw / 100u + yw / 400u) % 7u;
+    uint32_t wday = rtc_weekday(y_full, m_val, d_val);
 
     /* Halt RTC counter across TIME + DATE writes for atomic update */
     uint32_t ctrl = openfw_mmio_rd32(AON_RTC_CTRL_ADDR);
@@ -116,6 +121,32 @@ uint32_t rtc_to_dos_timestamp(const rtc_datetime_t *dt)
          | ((uint32_t)dt->hour << 11)
          | ((uint32_t)dt->minute << 5)
          | ((uint32_t)dt->second >> 1);
+}
+
+/* File timestamps store local civil time with two-second resolution. */
+rtc_datetime_t rtc_from_dos_timestamp(uint32_t stamp)
+{
+    rtc_datetime_t dt = {
+        .year   = 1980u + (stamp >> 25),
+        .month  = (stamp >> 21) & 15u,
+        .day    = (stamp >> 16) & 31u,
+        .hour   = (stamp >> 11) & 31u,
+        .minute = (stamp >> 5) & 63u,
+        .second = (stamp & 31u) * 2u
+    };
+    static const uint8_t month_days[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+    if (dt.month < 1 || dt.month > 12 || dt.hour > 23 || dt.minute > 59 || dt.second > 59) {
+        return (rtc_datetime_t){0};
+    }
+    unsigned days = month_days[dt.month - 1];
+    if (dt.month == 2 && dt.year % 4 == 0 && (dt.year % 100 != 0 || dt.year % 400 == 0)) {
+        days++;
+    }
+    if (dt.day < 1 || dt.day > days) {
+        return (rtc_datetime_t){0};
+    }
+    dt.weekday = rtc_weekday(dt.year, dt.month, dt.day);
+    return dt;
 }
 
 void rtc_set_alarm0_seconds(uint32_t seconds)

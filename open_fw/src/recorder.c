@@ -44,6 +44,7 @@ static uint32_t            g_pcm_bytes       = 0u;
 static uint32_t            g_last_ckpt_bytes = 0u;
 static uint32_t            g_prev_split_sec  = 0u;
 static uint32_t            g_last_overruns   = 0u;
+static uint32_t            g_created_timestamp;
 static char                g_filename[16];
 
 static uint32_t parse_rec_index(const char *name)
@@ -192,6 +193,7 @@ static int open_next_wav_file(exfat_vol_t *vol)
         for (int i = 0; i < 16; i++) {
             g_filename[i] = name[i];
         }
+        g_created_timestamp = vol->default_timestamp;
         g_pcm_bytes       = 0u;
         g_last_ckpt_bytes = 0u;
         g_rec_saving      = 1;
@@ -472,6 +474,11 @@ uint32_t recorder_get_seconds(void)
 uint32_t recorder_get_committed_bytes(void)
 {
     return (g_pcm_bytes > 0u) ? (g_pcm_bytes + 44u) : 0u;
+}
+
+uint32_t recorder_get_created_timestamp(void)
+{
+    return g_created_timestamp;
 }
 
 const char *recorder_get_filename(void)

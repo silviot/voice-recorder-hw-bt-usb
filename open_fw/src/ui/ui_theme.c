@@ -165,7 +165,10 @@ void ui_format_date_label(char *dst, int dst_len,
 {
     fmt_buf_t fb;
     fmt_init(&fb, dst, dst_len);
-    if (!rec) return;
+    if (!rec || !rec->year) {
+        fmt_puts(&fb, "Date unknown");
+        return;
+    }
 
     uint8_t m  = (rec->month >= 1u && rec->month <= 12u) ? rec->month : 1u;
     uint8_t d  = (rec->day >= 1u && rec->day <= 31u) ? rec->day : 1u;

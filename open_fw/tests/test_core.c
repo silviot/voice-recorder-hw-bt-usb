@@ -544,6 +544,7 @@ static void test_exfat_write(void)
     assert(exfat_patch_header(&w, hdr, 44u) == 0);
     assert(exfat_close_file(&w) == 0);
 
+    exfat_set_timestamp(&vol, 0x5D748420u); /* Next day */
     /* Also create 6 more files to force 0x05 sector-boundary wrapping and cluster expansion */
     for (int fidx = 2; fidx <= 7; fidx++) {
         char fname[16];
@@ -592,6 +593,9 @@ static void test_exfat_write(void)
 
     exfat_entry_t seventh;
     assert(exfat_find_path(&vol2, "/record/REC_0007.wav", &seventh) == 0);
+    assert(wav_ent.created_timestamp == 0x5D738420u);
+    assert(seventh.created_timestamp == 0x5D748420u);
+    assert(seventh.modified_timestamp == 0x5D748420u);
     uint8_t buf7[16];
     assert(exfat_read_file(&vol2, &seventh, 0u, buf7, 10u, &nread) == 0);
     assert(nread == 10u && memcmp(buf7, "FILE_0007!", 10u) == 0);

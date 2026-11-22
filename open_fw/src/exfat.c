@@ -468,6 +468,8 @@ static int list_dir_with_loc(const exfat_vol_t *vol, uint32_t dir_cluster, uint8
                     prim_loc.lba     = lba;
                     prim_loc.slot    = (uint8_t)idx;
                     prim_loc.sec_cnt = d[1];
+                    cur_ent.created_timestamp  = le32(d + 8u);
+                    cur_ent.modified_timestamp = le32(d + 12u);
                     cur_ent.file_attr      = le16(d + 4u);
                     cur_ent.is_dir         = (uint8_t)((cur_ent.file_attr & EXFAT_ATTR_DIR) != 0u);
                     cur_ent.size           = 0u;
@@ -571,7 +573,7 @@ static int find_path_with_loc(const exfat_vol_t *vol, const char *path, exfat_en
         return -1;
     }
 
-    exfat_entry_t cur;
+    exfat_entry_t cur = {0};
     cur.name[0]        = '/';
     cur.name[1]        = '\0';
     cur.size           = 0u;

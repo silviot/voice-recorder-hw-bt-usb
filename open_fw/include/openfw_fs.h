@@ -57,6 +57,8 @@ typedef struct {
     uint16_t file_attr;
     uint8_t  no_fat_chain;
     uint8_t  is_dir;
+    uint32_t created_timestamp;
+    uint32_t modified_timestamp;
 } exfat_entry_t;
 
 typedef struct {

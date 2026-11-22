@@ -903,6 +903,13 @@ static void test_rtc_driver(void)
     uint32_t dos = rtc_to_dos_timestamp(&got);
     assert(((dos >> 25) + 1980u) == 2026u && ((dos >> 21) & 0xFu) == 11u && ((dos >> 16) & 0x1Fu) == 19u);
 
+    rtc_datetime_t file_dt = rtc_from_dos_timestamp(dos);
+    assert(file_dt.year == got.year && file_dt.month == got.month && file_dt.day == got.day);
+    assert(file_dt.hour == got.hour && file_dt.minute == got.minute && file_dt.second == got.second);
+    assert(file_dt.weekday == got.weekday);
+    assert(rtc_from_dos_timestamp(0).year == 0);
+    assert(rtc_from_dos_timestamp((46u << 25) | (2u << 21) | (30u << 16)).year == 0);
+
     /* rtc_to_dos_timestamp year clamp (>2107 clamps to 127 = 2107 instead of wrapping) */
     rtc_datetime_t future = { 2120u, 6u, 15u, 0u, 12u, 0u, 0u };
     uint32_t dos_hi = rtc_to_dos_timestamp(&future);

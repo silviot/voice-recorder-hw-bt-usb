@@ -96,6 +96,7 @@ void     rtc_read_raw(uint32_t *date_reg, uint32_t *time_reg);
 void     rtc_ensure_running(void);
 void     rtc_get(rtc_datetime_t *dt);
 void     rtc_set(const rtc_datetime_t *dt);
+rtc_datetime_t rtc_from_dos_timestamp(uint32_t stamp);
 uint32_t rtc_to_dos_timestamp(const rtc_datetime_t *dt);
 void     rtc_set_alarm0_seconds(uint32_t seconds);
 
@@ -288,6 +289,7 @@ int                 recorder_has_error(void);
 int                 recorder_is_vor_waiting(void);
 uint32_t            recorder_get_seconds(void);
 uint32_t            recorder_get_committed_bytes(void);
+uint32_t            recorder_get_created_timestamp(void);
 const char         *recorder_get_filename(void);
 
 /* USB Mass Storage Full-Speed MUSB & PHY Plug Detect (usb_musb.c) */
