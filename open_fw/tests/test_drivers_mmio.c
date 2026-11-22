@@ -1275,8 +1275,19 @@ static void test_exp_runner_guards(const char *exfat_img_path)
 static void test_lcd_driver(void)
 {
     soc_reset();
+    gpio_write(GPIO_PORT_B, 17u, 1);
     lcd_backlight_set(75u);
     assert(g_soc.pwm3_period_duty == ((48000u << 16) | (75u * 480u)));
+
+    lcd_backlight_set(0u);
+    assert((g_soc.gpio_out[GPIO_PORT_B] & (1u << 17)) == 0u);
+    assert(((g_soc.gpio_mux[GPIO_PORT_B][2] >> 4) & 0xFu) == 1u);
+    assert((g_soc.pwm3_ctrl & 0x3Fu) == 0u);
+
+    lcd_backlight_set(35u);
+    assert(((g_soc.gpio_mux[GPIO_PORT_B][2] >> 4) & 0xFu) == 5u);
+    assert((g_soc.pwm3_ctrl & 0x3Fu) == 0x3Fu);
+    assert(g_soc.pwm3_period_duty == ((48000u << 16) | (35u * 480u)));
 
     lcd_init();
     assert((g_soc.gpio_lcd_pad_en & 0x0000FFD0u) == 0x0000FFD0u);

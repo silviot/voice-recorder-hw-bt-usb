@@ -110,28 +110,25 @@ void lcd_backlight_set(uint8_t percent)
         percent = 100u;
     }
 
-    if (!s_pwm_inited || !rom_rst_is_released(CRU_RST_PWM)) {
+    if (percent == 0u) {
+        /* Preload the output latch before disconnecting PWM from the pad. */
+        gpio_write(GPIO_PORT_B, 17u, 0);
+        gpio_set_mux(GPIO_PORT_B, 17u, 1u);
+        if (s_pwm_inited && rom_rst_is_released(CRU_RST_PWM)) {
+            openfw_mmio_clr32(PWM3_CTRL_ADDR, 0x3Fu);
+        }
+        s_pwm_inited = 0;
+        return;
+    }
+
+    int connect_pwm = !s_pwm_inited || !rom_rst_is_released(CRU_RST_PWM);
+    if (connect_pwm) {
         if (!rom_rst_is_released(CRU_RST_PWM)) {
             rom_rst_release(CRU_RST_PWM);
         }
         rom_clk_set_src(CRU_CLK_PWM, CRU_CLK_SRC_HOSC24M);
         rom_clk_enable(CRU_CLK_PWM);
-
-        /* PB17 = ALT5 (pwm_ch3) */
-        gpio_set_mux(GPIO_PORT_B, 17u, 5u);
         openfw_mmio_wr32(PWM3_CTRL_ADDR, 0x40u);
-        s_pwm_inited = 1;
-    }
-
-    if (percent == 0u) {
-        for (uint32_t i = 0u; i < LCDC_POLL_LIMIT; i++) {
-            if ((openfw_mmio_rd32(PWM3_CTRL_ADDR) & (1u << 28)) == 0u) {
-                break;
-            }
-        }
-        openfw_mmio_wr32(PWM3_PERIOD_DUTY_ADDR, (48000u << 16));
-        openfw_mmio_clr32(PWM3_CTRL_ADDR, 0x3Fu);
-        return;
     }
 
     if ((openfw_mmio_rd32(PWM3_CTRL_ADDR) & 0x3Fu) != 0x3Fu) {
@@ -143,6 +140,10 @@ void lcd_backlight_set(uint8_t percent)
         }
     }
     openfw_mmio_wr32(PWM3_PERIOD_DUTY_ADDR, (48000u << 16) | ((uint32_t)percent * 480u));
+    if (connect_pwm) {
+        gpio_set_mux(GPIO_PORT_B, 17u, 5u);
+        s_pwm_inited = 1;
+    }
 }
 
 void lcd_shutdown(void)
@@ -150,10 +151,7 @@ void lcd_shutdown(void)
 #ifndef OPENFW_HOST_MMIO
     cpu1_ui_stop();
 #endif
-    /* Hold PB17 low even after the PWM clock stops. */
-    s_pwm_inited = 0;
-    gpio_write(GPIO_PORT_B, 17u, 0);
-    gpio_set_mux(GPIO_PORT_B, 17u, 1u);
+    lcd_backlight_set(0u);
     st7735s_write_cmd(0x28u); /* DISPOFF */
     st7735s_write_cmd(0x10u); /* SLPIN */
     mdelay(5u);
