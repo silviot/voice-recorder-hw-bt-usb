@@ -206,18 +206,25 @@ typedef struct {
     /* Player */
     ui_file_entry_t play_file;
     uint32_t       play_pos_sec;
-    uint8_t        play_state;      /* 0=Playing, 1=Paused, 2=End */
-    uint8_t        play_vol_hi;     /* 1 for 1.5s after VOL+/- */
+    uint32_t       play_pos_ms;      /* millisecond playback position for smooth progress */
+    uint32_t       play_dur_ms;      /* millisecond duration for smooth progress */
+    uint8_t        play_state;       /* 0=Playing, 1=Paused, 2=End */
+    int8_t         play_scrub_speed; /* 0=normal, +/-2..5 during audible scrub */
+    uint8_t        play_vol_hi;      /* 1 for 1.5s after VOL+/- */
     uint8_t        play_vu_l;
     uint8_t        play_vu_r;
     int            play_has_transcript;
-    uint8_t        play_has_prev;   /* set by caller: a previous file exists */
-    uint8_t        play_has_next;   /* set by caller: a next file exists */
-    char           tr_prev[48];
-    char           tr_curr_spoken[48];
-    char           tr_curr_upcoming[48];
-    char           tr_next[48];
-    uint8_t        tr_speaker;      /* 0..3 => S1..S4 */
+    uint8_t        play_has_prev;    /* set by caller: a previous file exists */
+    uint8_t        play_has_next;    /* set by caller: a next file exists */
+    cwx_tr_slot_t  tr_lines[CWX_TR_VIEW_LINES]; /* [0]=above, [1..4]=visible, [5]=below */
+    int8_t         tr_active_slot;   /* 1..4 active row in tr_lines[], or -1 */
+    int32_t        tr_top_line_id;   /* monotonic line_id of tr_lines[1] (drives scroll anim) */
+    uint8_t        tr_spoken_len;    /* spoken prefix bytes in active line */
+    uint8_t        tr_word_start;    /* active word byte offset in active line */
+    uint8_t        tr_word_len;      /* active word byte len (0 = silence/no pill) */
+    uint8_t        tr_speaker;       /* active speaker index */
+    uint16_t       tr_speaker_color; /* active speaker RGB565 color (0 = palette fallback) */
+    char           tr_speaker_name[20]; /* active speaker label */
 
     /* Delete confirmation */
     uint8_t        del_hold_pct;    /* 0..100 */

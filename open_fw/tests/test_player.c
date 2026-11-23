@@ -193,6 +193,8 @@ void ui_render_screen(ui_screen_id_t screen, const ui_model_t *m)
     ended = m->play_state == 2;
     advance(strict ? 150u : 45u);
 }
+void ui_dispatch_tick(void) { }
+int  ui_dispatch_is_animating(void) { return 0; }
 void ui_settings_defaults(ui_settings_t *cfg) { cfg->spk_vol = 18; }
 void openfw_mmio_wfi(void) { advance(1); }
 uint32_t millis(void) { return now_ms; }

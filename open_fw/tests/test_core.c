@@ -333,7 +333,111 @@ static void test_cwx_engine(void)
     assert(n > 0 && active >= 0 && active < n && strcmp(win[active].text, "done!") == 0);
     assert(win[active].speaker_idx == 1u);
 
-    printf("  [PASS] cwx_engine (header, speakers, seek table, next_word, read_window)\n");
+    /* Test deterministic transcript line paginator (zero-reflow wrapping, turn breaks, clamping) */
+    {
+        static uint8_t cwx2_img[2048];
+        memset(cwx2_img, 0, sizeof(cwx2_img));
+        const char *wtexts[] = {
+            "Systems,", "ACS", "one,", "we", "just", "had", "transition", "to",
+            "high", "rate", "mode,", "and,", "uh,", "we", "are", "in", "the", "atmosphere.",
+            "We", "have", "loss", "of", "signal", "at", "station.",
+            "Go", "ahead.",
+        };
+        const uint8_t wspk[] = {
+            0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,
+            1,1,1,1,1,1,1,
+            2,2,
+        };
+        uint32_t nw = (uint32_t)(sizeof(wtexts) / sizeof(wtexts[0]));
+        uint32_t s_off = CWX_HEADER_SIZE;
+        uint32_t k_off = s_off + 3u * CWX_SPEAKER_SIZE;
+        uint32_t w_off = k_off + 12u * CWX_SEEK_SIZE;
+        uint32_t wp    = w_off;
+        uint32_t w_rel[32], w_end[32];
+        for (uint32_t i = 0u; i < nw; i++) {
+            uint32_t st = 200u + i * 350u + (wspk[i] == 1u ? 1500u : (wspk[i] == 2u ? 2500u : 0u));
+            uint32_t en = st + 260u;
+            uint8_t flg = (i == 0u || wspk[i] != wspk[i - 1u]) ? CWX_FLAG_TURN_START : 0u;
+            w_rel[i] = wp - w_off;
+            w_end[i] = en;
+            append_cwx_word(cwx2_img, &wp, st, en, wspk[i], flg, wtexts[i]);
+        }
+        memcpy(&cwx2_img[0], "CWX1", 4u);
+        put_le16(&cwx2_img[4], 1u);
+        put_le16(&cwx2_img[6], 3u);
+        put_le32(&cwx2_img[8], 12000u);
+        put_le32(&cwx2_img[12], nw);
+        put_le32(&cwx2_img[16], s_off);
+        put_le32(&cwx2_img[20], k_off);
+        put_le32(&cwx2_img[24], 12u);
+        put_le32(&cwx2_img[28], w_off);
+        memcpy(&cwx2_img[32], "Pager Test", 10u);
+        put_le16(&cwx2_img[s_off + 0u], 0x465Fu);  memcpy(&cwx2_img[s_off + 4u], "ACS 1", 5u);
+        put_le16(&cwx2_img[s_off + 24u], 0xFD84u); memcpy(&cwx2_img[s_off + 28u], "Control", 7u);
+        put_le16(&cwx2_img[s_off + 48u], 0xFBD9u); memcpy(&cwx2_img[s_off + 52u], "Earl", 4u);
+        uint32_t scan = 0u;
+        for (uint32_t sec = 0u; sec < 12u; sec++) {
+            while (scan < nw && w_end[scan] < sec * 1000u) scan++;
+            put_le32(&cwx2_img[k_off + sec * 8u + 0u], (scan < nw) ? w_rel[scan] : (wp - w_off));
+            put_le32(&cwx2_img[k_off + sec * 8u + 4u], scan);
+        }
+
+        mem_cwx_src_t src2 = { cwx2_img, wp };
+        cwx_stream_t cwx2;
+        assert(cwx_open(&cwx2, mem_cwx_read, &src2, wp) == 0);
+        cwx_tr_pager_t pager;
+        cwx_tr_pager_init(&pager, &cwx2, CWX_TR_MAX_LINE_W);
+        cwx_tr_view_t v;
+
+        /* Before first word (t=50ms): clamped at top, 4 visible rows populated, no word pill */
+        assert(cwx_tr_pager_update(&pager, 50u, 0, &v) == 1);
+        assert(v.top_line_id == 0 && v.active_slot == 1 && v.spoken_len == 0u && v.word_len == 0u);
+        assert(strcmp(v.speaker_name, "ACS 1") == 0);
+        for (int s = 1; s <= 4; s++) {
+            assert(v.lines[s].line_id >= 0 && v.lines[s].text[0] != '\0');
+            assert(cwx_measure_md_px(v.lines[s].text, (uint32_t)strlen(v.lines[s].text)) <= CWX_TR_MAX_LINE_W);
+        }
+
+        /* First word active (t=250ms): "Systems," highlighted on line 0 */
+        assert(cwx_tr_pager_update(&pager, 250u, 0, &v) == 1);
+        assert(v.active_slot == 1 && v.word_start == 0u && v.word_len == 8u);
+        char line0_saved[CWX_TR_LINE_CAP];
+        strcpy(line0_saved, v.lines[1].text);
+
+        /* Advance word-by-word across whole transcript: verify zero reflow & monotonic scroll */
+        int32_t prev_top = v.top_line_id;
+        for (uint32_t t = 250u; t <= 12000u; t += 100u) {
+            assert(cwx_tr_pager_update(&pager, t, 0, &v) == 1);
+            assert(v.top_line_id >= prev_top);
+            assert(v.top_line_id - prev_top <= 1); /* smooth single-line increments */
+            prev_top = v.top_line_id;
+            for (int s = 1; s <= 4; s++) {
+                if (v.lines[s].line_id == 0) {
+                    assert(strcmp(v.lines[s].text, line0_saved) == 0);
+                }
+                if (v.lines[s].line_id >= 0) {
+                    assert(cwx_measure_md_px(v.lines[s].text, (uint32_t)strlen(v.lines[s].text)) <= CWX_TR_MAX_LINE_W);
+                }
+            }
+        }
+
+        /* At EOF (t=12600ms, >320ms past last word end 12060ms):
+         * all 4 visible rows remain filled, active_slot clamped to bottom row */
+        assert(cwx_tr_pager_update(&pager, 12600u, 0, &v) == 1);
+        assert(v.active_slot == 4);
+        assert(strcmp(v.speaker_name, "Earl") == 0);
+        assert(v.lines[4].turn_start == 1u && strcmp(v.lines[4].text, "Go ahead.") == 0);
+        /* Silence >320ms after last word hides pill while playing, keeps it while paused */
+        assert(v.word_len == 0u);
+        assert(cwx_tr_pager_update(&pager, 12600u, 1, &v) == 1);
+        assert(v.word_len > 0u);
+
+        /* Rewind to start works cleanly */
+        assert(cwx_tr_pager_update(&pager, 250u, 0, &v) == 1);
+        assert(v.active_slot == 1 && strcmp(v.lines[1].text, line0_saved) == 0);
+    }
+
+    printf("  [PASS] cwx_engine (header, speakers, seek table, next_word, read_window, tr_pager)\n");
 }
 
 #define MEM_DISK_SECTORS 128u

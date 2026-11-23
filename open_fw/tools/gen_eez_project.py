@@ -367,18 +367,60 @@ def build_pages() -> list[dict]:
         w_label("pl_ft", "player_footer", 0, 67, 160, 12, "\u25c0 5s \u00b7 OK Pause \u00b7 \u25b6 10s", "ui_font_sm", COL["dim"], "CENTER"),
     ]))
 
-    # 8. Player (Transcript)
+    # 8. Player (Full-Height Smooth-Scrolling Transcript — zero wasted footer!)
+    ptr_track_children = [
+        w_panel("ptr_wp", "ptr_word_pill", 4, 35, 36, 15, "default",
+                bg=COL["pill"], bg_opa=255, radius=3),
+    ]
+    for i in range(6):
+        ptr_track_children.append(
+            w_panel(f"ptr_b{i}", f"ptr_bar_{i}", 1, i * 16 + 4, 2, 12, "default",
+                    bg=COL["off"], bg_opa=255, radius=1)
+        )
+        ptr_track_children.append(
+            w_label(f"ptr_l{i}", f"ptr_line_{i}", 6, i * 16, 152, 20, "",
+                    "ui_font_md", COL["text"], "LEFT", "CLIP")
+        )
+    ptr_track_children.append(
+        w_label("ptr_cu", "ptr_curr_upcoming", 6, 32, 152, 20, "",
+                "ui_font_md", COL["dim"], "LEFT", "CLIP")
+    )
     pages.append(make_page("player_tr", COL["bg"], [
-        make_status_bar("ptr", "05:49", "14:32"),
-        w_bar("ptr_pb", "ptr_prog", 0, 13, 160, 2, "st_prog_cyan", 0, 100, 25),
-        w_panel("ptr_b1", "ptr_bar_prev", 0, 18, 2, 14, "default", bg=COL["off"], bg_opa=255),
-        w_label("ptr_p", "ptr_prev", 6, 17, 152, 16, "Previous line", "ui_font_md", COL["faint"], "LEFT", "DOT"),
-        w_panel("ptr_b2", "ptr_bar_curr", 0, 34, 2, 14, "default", bg=COL["cyan"], bg_opa=255),
-        w_label("ptr_cs", "ptr_curr_spoken", 6, 33, 152, 16, "Current spoken", "ui_font_md", COL["text"], "LEFT", "DOT"),
-        w_panel("ptr_b3", "ptr_bar_next", 0, 50, 2, 14, "default", bg=COL["off"], bg_opa=255),
-        w_label("ptr_n", "ptr_next", 6, 49, 152, 16, "Next line", "ui_font_md", COL["faint"], "LEFT", "DOT"),
-        w_panel("ptr_fb", "ptr_foot_box", 0, 67, 160, 13, "st_bar", bg=COL["bar"], bg_opa=255,
-                children=[w_label("ptr_ft", "ptr_footer", 0, 1, 160, 11, "\u25c0\u25b6 Line \u00b7 OK Pause \u00b7 \u00b1 Vol", "ui_font_sm", COL["dim"], "CENTER")]),
+        w_panel(
+            "ptr_bar", "ptr_bar", 0, 0, 160, 13, "st_bar",
+            bg=COL["bar"], bg_opa=255, radius=0,
+            children=[
+                w_label("ptr_bar_ic", "ptr_bar_ic", 2, -2, 10, 15, "\u25b6", "ui_font_sm", COL["cyan"]),
+                w_label("ptr_bar_l", "ptr_bar_l", 12, -2, 38, 15, "00:00", "ui_font_sm", COL["text"]),
+                w_panel("ptr_spk_dot", "ptr_spk_dot", 43, 4, 5, 5, "default",
+                        bg=COL["cyan"], bg_opa=255, radius=9999),
+                w_label("ptr_bar_sub", "ptr_bar_sub", 50, -2, 89, 15, "", "ui_font_sm", COL["cyan"], "LEFT", "DOT"),
+                w_panel("ptr_vp", "ptr_vol_pill", 88, 1, 50, 11, "st_pill",
+                        bg=COL["cyan"], bg_opa=255, radius=5,
+                        children=[
+                            w_label("ptr_vl", "ptr_vol_lbl", 0, -2, 50, 13, "HP 5.8",
+                                    "ui_font_sm", COL["black"], "CENTER"),
+                        ]),
+                w_panel(
+                    "ptr_batt", "ptr_batt", 142, 3, 14, 7, "default",
+                    bg=COL["bar"], bg_opa=0, radius=1, border_w=1, border_col=COL["dim"],
+                    children=[
+                        w_panel("ptr_batt_fill", "ptr_batt_fill", 1, 1, 10, 3, "default",
+                                bg=COL["green"], bg_opa=255, radius=0),
+                    ],
+                ),
+                w_panel("ptr_batt_nub", "ptr_batt_nub", 156, 5, 2, 3, "default",
+                        bg=COL["dim"], bg_opa=255, radius=0),
+            ],
+        ),
+        w_bar("ptr_pb", "ptr_prog", 0, 13, 160, 2, "st_prog_cyan", 0, 1000, 250),
+        w_panel("ptr_vp_clip", "ptr_viewport", 0, 16, 160, 64, "default",
+                bg=COL["bg"], bg_opa=255, radius=0,
+                children=[
+                    w_panel("ptr_trk", "ptr_track", 0, -19, 160, 104, "default",
+                            bg=COL["bg"], bg_opa=0, radius=0,
+                            children=ptr_track_children),
+                ]),
     ]))
 
     # 9. Delete Confirmation

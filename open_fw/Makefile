@@ -165,7 +165,7 @@ test-host: $(LVGL_DIR)/lvgl.h $(BUILD_DIR)/liblvgl_host.a tests/test_core.c src/
 		-o $(BUILD_DIR)/test_drivers_mmio
 	$(BUILD_DIR)/test_drivers_mmio $(BUILD_DIR)/test_exfat.img
 	$(HOST_CC) $(HOST_CFLAGS) -DOPENFW_HOST_MMIO tests/test_ui_render.c \
-		src/lcd_st7735s.c src/cpu1_ui.c src/ui_spectrogram.c \
+		src/lcd_st7735s.c src/cpu1_ui.c src/ui_spectrogram.c src/cwx.c \
 		src/ui/ui_port.c src/ui/ui_theme.c src/ui/ui_fonts.c src/ui/ui_screens.c \
 		$(EEZ_SRCS) \
 		$(BUILD_DIR)/liblvgl_host.a \

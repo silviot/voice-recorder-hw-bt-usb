@@ -353,3 +353,347 @@ uint16_t cwx_speaker_color(const cwx_stream_t *s, uint8_t speaker_idx)
     }
     return s->speakers[speaker_idx].color_rgb565;
 }
+
+/* =========================================================================
+ * Streaming Deterministic Transcript Line Paginator (160x80 Teleprompter)
+ * ========================================================================= */
+
+/* Exact integer pixel advances for ui_font_md (Noto Sans Medium 14px, U+0020..U+007E).
+ * Verified glyph-for-glyph against ui_font_md in test_ui_render.c. */
+static const uint8_t k_font_md_adv[95] = {
+     4u,  4u,  6u,  9u,  8u, 12u, 10u,  3u,  4u,  4u,  8u,  8u,  4u,  5u,  4u,  5u,
+     8u,  8u,  8u,  8u,  8u,  8u,  8u,  8u,  8u,  8u,  4u,  4u,  8u,  8u,  8u,  6u,
+    13u,  9u,  9u,  9u, 10u,  8u,  7u, 10u, 10u,  5u,  4u,  9u,  8u, 13u, 11u, 11u,
+     9u, 11u,  9u,  8u,  8u, 10u,  9u, 13u,  9u,  8u,  8u,  5u,  5u,  5u,  8u,  6u,
+     4u,  8u,  9u,  7u,  9u,  8u,  5u,  9u,  9u,  4u,  4u,  8u,  4u, 13u,  9u,  9u,
+     9u,  9u,  6u,  7u,  5u,  9u,  7u, 11u,  8u,  7u,  7u,  5u,  8u,  5u,  8u,
+};
+
+uint32_t cwx_measure_md_px(const char *s, uint32_t len)
+{
+    if (!s || len == 0u) {
+        return 0u;
+    }
+    uint32_t w = 0u;
+    uint32_t i = 0u;
+    while (i < len && s[i] != '\0') {
+        uint8_t c = (uint8_t)s[i];
+        if (c >= 0x20u && c <= 0x7Eu) {
+            w += k_font_md_adv[c - 0x20u];
+            i++;
+        } else if (c < 0x80u) {
+            i++;
+        } else {
+            /* Step over multi-byte UTF-8 sequence as one glyph (~9px fallback) */
+            uint32_t step = 1u;
+            if ((c & 0xE0u) == 0xC0u)      step = 2u;
+            else if ((c & 0xF0u) == 0xE0u) step = 3u;
+            else if ((c & 0xF8u) == 0xF0u) step = 4u;
+            w += 9u;
+            i = (i + step <= len) ? (i + step) : len;
+        }
+    }
+    return w;
+}
+
+static void cwx_str_copy_cap(char *dst, uint32_t cap, const char *src)
+{
+    if (!dst || cap == 0u) return;
+    uint32_t i = 0u;
+    while (src && src[i] != '\0' && (i + 1u) < cap) {
+        dst[i] = src[i];
+        i++;
+    }
+    dst[i] = '\0';
+}
+
+static int tr_pull_word(cwx_tr_pager_t *p, cwx_word_t *out)
+{
+    if (p->has_pending) {
+        *out           = p->pending_word;
+        p->has_pending = 0;
+        return 1;
+    }
+    if (p->at_eof || !p->cwx) {
+        return 0;
+    }
+    int rc = cwx_next_word(p->cwx, out);
+    if (rc <= 0) {
+        p->at_eof = 1u;
+        return 0;
+    }
+    return 1;
+}
+
+static int tr_wrap_next_line(cwx_tr_pager_t *p, cwx_tr_line_t *ln)
+{
+    cwx_word_t w;
+    if (!tr_pull_word(p, &w)) {
+        return 0;
+    }
+
+    mem_zero(ln, sizeof(*ln));
+    ln->line_id        = p->next_line_id++;
+    ln->first_word_idx = w.word_idx;
+    ln->start_ms       = w.start_ms;
+    ln->end_ms         = w.end_ms;
+    ln->speaker_idx    = w.speaker_idx;
+    ln->speaker_color  = cwx_speaker_color(p->cwx, w.speaker_idx);
+    ln->turn_start     = ((w.flags & CWX_FLAG_TURN_START) != 0u ||
+                          !p->has_prev_word ||
+                          w.speaker_idx != p->prev_word_spk) ? 1u : 0u;
+
+    uint32_t cur_px = 0u;
+    const uint32_t sp_px = k_font_md_adv[0]; /* ' ' = 4 px */
+
+    for (;;) {
+        uint32_t wlen = (uint32_t)w.text_len;
+        uint32_t wpx  = cwx_measure_md_px(w.text, wlen);
+        uint32_t need_sp = (ln->word_count > 0u) ? 1u : 0u;
+
+        if (ln->word_count > 0u) {
+            int spk_break = ((w.flags & CWX_FLAG_TURN_START) != 0u ||
+                             w.speaker_idx != ln->speaker_idx);
+            if (spk_break ||
+                ln->word_count >= CWX_TR_MAX_WPL ||
+                (uint32_t)ln->text_len + need_sp + wlen >= CWX_TR_LINE_CAP ||
+                cur_px + (need_sp ? sp_px : 0u) + wpx > (uint32_t)p->max_w_px) {
+                p->pending_word = w;
+                p->has_pending  = 1;
+                break;
+            }
+        }
+
+        if (need_sp) {
+            ln->text[ln->text_len++] = ' ';
+            cur_px += sp_px;
+        }
+        uint8_t off = ln->text_len;
+        uint32_t copy_n = wlen;
+        if (off + copy_n >= CWX_TR_LINE_CAP) {
+            copy_n = (CWX_TR_LINE_CAP - 1u) - off;
+        }
+        if (copy_n > 0u) {
+            mem_copy(&ln->text[off], w.text, copy_n);
+            ln->text_len = (uint8_t)(off + copy_n);
+        }
+        ln->text[ln->text_len] = '\0';
+
+        cwx_tr_wspan_t *ws = &ln->words[ln->word_count++];
+        ws->start_ms = w.start_ms;
+        ws->end_ms   = w.end_ms;
+        ws->char_off = off;
+        ws->char_len = (uint8_t)copy_n;
+
+        if (w.end_ms > ln->end_ms) {
+            ln->end_ms = w.end_ms;
+        }
+        cur_px += wpx;
+        p->prev_word_spk = w.speaker_idx;
+        p->has_prev_word = 1u;
+
+        if (!tr_pull_word(p, &w)) {
+            break;
+        }
+    }
+    return 1;
+}
+
+static void tr_push_line(cwx_tr_pager_t *p, const cwx_tr_line_t *ln)
+{
+    if (p->count == CWX_TR_BUF_LINES) {
+        for (uint32_t i = 1u; i < CWX_TR_BUF_LINES; i++) {
+            p->lines[i - 1u] = p->lines[i];
+        }
+        p->lines[CWX_TR_BUF_LINES - 1u] = *ln;
+    } else {
+        p->lines[p->count++] = *ln;
+    }
+}
+
+static int tr_find_active(const cwx_tr_pager_t *p, uint32_t pos_ms, int *out_line, int *out_word)
+{
+    int best_l = -1;
+    int best_w = -1;
+
+    for (uint32_t li = 0u; li < p->count; li++) {
+        const cwx_tr_line_t *ln = &p->lines[li];
+        for (uint8_t wi = 0u; wi < ln->word_count; wi++) {
+            const cwx_tr_wspan_t *ws = &ln->words[wi];
+            if (ws->start_ms <= pos_ms && pos_ms < ws->end_ms) {
+                *out_line = (int)li;
+                *out_word = (int)wi;
+                return 1; /* exact speaking match */
+            }
+            if (ws->start_ms <= pos_ms) {
+                best_l = (int)li;
+                best_w = (int)wi;
+            }
+        }
+    }
+
+    if (best_l >= 0) {
+        *out_line = best_l;
+        *out_word = best_w;
+        return 0; /* latest spoken word before pos_ms */
+    }
+    *out_line = 0;
+    *out_word = -1; /* pos_ms precedes first word */
+    return -1;
+}
+
+static int tr_reanchor(cwx_tr_pager_t *p, uint32_t pos_ms)
+{
+    if (!p || !p->cwx) return -1;
+
+    p->count         = 0u;
+    p->at_eof        = 0u;
+    p->has_pending   = 0;
+    p->has_prev_word = 0u;
+    p->prev_word_spk = 0u;
+
+    /* For short transcripts or near start of file, wrap cleanly from word 0 for
+     * exact global line IDs; otherwise anchor 12 s before pos_ms. */
+    uint32_t seek_ms = (pos_ms <= 20000u || p->cwx->word_count <= 320u)
+                     ? 0u
+                     : (pos_ms - 12000u);
+    if (cwx_seek_ms(p->cwx, seek_ms) != 0) {
+        return -1;
+    }
+
+    /* Advance next_line_id by a large jump on reanchor so UI snaps cleanly
+     * instead of animating across unrelated seek targets. */
+    if (p->initialized) {
+        p->next_line_id += 1000;
+    } else {
+        p->next_line_id = 0;
+    }
+
+    cwx_tr_line_t ln;
+    while (tr_wrap_next_line(p, &ln)) {
+        tr_push_line(p, &ln);
+        int act_l = 0, act_w = -1;
+        tr_find_active(p, pos_ms, &act_l, &act_w);
+        /* Keep reading until we have 4 lookahead lines past active (or >= 6 lines total) */
+        if (p->count >= 6u && (int)p->count - 1 - act_l >= 4 && ln.start_ms >= pos_ms) {
+            break;
+        }
+    }
+
+    p->initialized = 1u;
+    return 0;
+}
+
+void cwx_tr_pager_init(cwx_tr_pager_t *p, cwx_stream_t *cwx, uint16_t max_w_px)
+{
+    if (!p) return;
+    mem_zero(p, sizeof(*p));
+    p->cwx      = cwx;
+    p->max_w_px = (max_w_px >= 40u) ? max_w_px : (uint16_t)CWX_TR_MAX_LINE_W;
+}
+
+int cwx_tr_pager_update(cwx_tr_pager_t *p, uint32_t pos_ms, int paused, cwx_tr_view_t *out)
+{
+    if (!p || !p->cwx || !out) {
+        return -1;
+    }
+    mem_zero(out, sizeof(*out));
+    for (uint32_t i = 0u; i < CWX_TR_VIEW_LINES; i++) {
+        out->lines[i].line_id = -1;
+    }
+    out->active_slot = -1;
+    out->top_line_id = -1;
+
+    if (p->cwx->word_count == 0u) {
+        return 0;
+    }
+
+    int need_reanchor = !p->initialized || (p->count == 0u);
+    if (!need_reanchor) {
+        if (pos_ms < p->lines[0].start_ms && p->lines[0].first_word_idx > 0u) {
+            need_reanchor = 1;
+        } else if (!p->at_eof && pos_ms > p->lines[p->count - 1u].end_ms + 8000u) {
+            need_reanchor = 1;
+        }
+    }
+
+    if (need_reanchor) {
+        if (tr_reanchor(p, pos_ms) != 0) {
+            return -1;
+        }
+    }
+
+    if (p->count == 0u) {
+        return 0;
+    }
+
+    /* Pull additional lookahead lines smoothly during forward playback */
+    int act_l = 0, act_w = -1;
+    tr_find_active(p, pos_ms, &act_l, &act_w);
+    while (!p->at_eof && ((int)p->count - 1 - act_l) < 4) {
+        cwx_tr_line_t ln;
+        if (!tr_wrap_next_line(p, &ln)) {
+            break;
+        }
+        tr_push_line(p, &ln);
+        tr_find_active(p, pos_ms, &act_l, &act_w);
+    }
+
+    /* Choose top visible line index (maps to out->lines[1]):
+     *  - Row 0 = previous line, Row 1 = active line, Rows 2..3 = next 2 lines
+     *  - Clamped at start (act_l == 0 -> top = 0) and end (at_eof -> fill all 4 rows) */
+    int top_i = (act_l > 0) ? (act_l - 1) : 0;
+    if (p->at_eof) {
+        int max_top = ((int)p->count > 4) ? ((int)p->count - 4) : 0;
+        if (top_i > max_top) {
+            top_i = max_top;
+        }
+    } else if (top_i > (int)p->count - 1) {
+        top_i = (int)p->count - 1;
+    }
+    if (top_i < 0) top_i = 0;
+
+    /* Copy 6-slot window: [0]=above, [1..4]=visible rows, [5]=below */
+    for (uint32_t s = 0u; s < CWX_TR_VIEW_LINES; s++) {
+        int idx = top_i - 1 + (int)s;
+        if (idx >= 0 && idx < (int)p->count) {
+            const cwx_tr_line_t *src = &p->lines[idx];
+            out->lines[s].line_id       = src->line_id;
+            out->lines[s].speaker_color = src->speaker_color;
+            out->lines[s].speaker_idx   = src->speaker_idx;
+            out->lines[s].turn_start    = src->turn_start;
+            cwx_str_copy_cap(out->lines[s].text, CWX_TR_LINE_CAP, src->text);
+        }
+    }
+
+    out->top_line_id = out->lines[1].line_id;
+    int slot = act_l - top_i + 1;
+    if (slot < 1) slot = 1;
+    if (slot > 4) slot = 4;
+    out->active_slot = (int8_t)slot;
+
+    const cwx_tr_line_t *aln = &p->lines[act_l];
+    out->speaker_idx   = aln->speaker_idx;
+    out->speaker_color = aln->speaker_color;
+    cwx_str_copy_cap(out->speaker_name, (uint32_t)sizeof(out->speaker_name),
+                     cwx_speaker_label(p->cwx, aln->speaker_idx));
+
+    if (act_w >= 0 && act_w < (int)aln->word_count) {
+        const cwx_tr_wspan_t *ws = &aln->words[act_w];
+        out->spoken_len = (uint8_t)(ws->char_off + ws->char_len);
+        /* Keep word pill lit during active word and brief inter-word gaps (<= 320 ms),
+         * or while paused so user sees exact resume position; hide during longer silences. */
+        int speaking = (pos_ms >= ws->start_ms && pos_ms <= ws->end_ms + 320u) ? 1 : 0;
+        if (speaking || paused) {
+            out->word_start = ws->char_off;
+            out->word_len   = ws->char_len;
+        }
+    } else {
+        /* Before first word: show entire first line as upcoming */
+        out->spoken_len = 0u;
+        out->word_start = 0u;
+        out->word_len   = 0u;
+    }
+
+    return 1;
+}

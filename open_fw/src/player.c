@@ -25,7 +25,8 @@ static int16_t  g_mono_tx[PLAYER_DAC_CHUNK_FRAMES * 2u] __attribute__((aligned(4
 
 /* Retain the continuation of the previous grain for waveform matching. */
 #define SCRUB_OVERLAP_MAX 256u
-static int16_t g_scrub_tail[2u * SCRUB_OVERLAP_MAX];
+static int16_t        g_scrub_tail[2u * SCRUB_OVERLAP_MAX];
+static cwx_tr_pager_t g_tr_pager;
 
 typedef struct {
     exfat_vol_t   *vol;
@@ -137,86 +138,50 @@ static uint8_t vbat_mv_to_pct(uint32_t mv)
     return (uint8_t)(((mv - 3400u) * 100u) / (4180u - 3400u));
 }
 
-static void append_word_cap(char *dst, int cap, const char *w, int wlen)
+static uint32_t populate_transcript_lines(ui_model_t *m, cwx_tr_pager_t *pager,
+                                          uint32_t pos_ms, int paused)
 {
-    int len = 0;
-    while (len < cap - 1 && dst[len] != '\0') {
-        len++;
-    }
-    if (len > 0 && len < cap - 1) {
-        dst[len++] = ' ';
-    }
-    for (int i = 0; i < wlen && len < cap - 1; i++) {
-        dst[len++] = w[i];
-    }
-    dst[len] = '\0';
-}
+    cwx_tr_view_t view;
+    int rc = cwx_tr_pager_update(pager, pos_ms, paused, &view);
 
-static void populate_transcript_lines(ui_model_t *m, cwx_stream_t *cwx, uint32_t pos_ms)
-{
-    m->tr_prev[0]          = '\0';
-    m->tr_curr_spoken[0]   = '\0';
-    m->tr_curr_upcoming[0] = '\0';
-    m->tr_next[0]          = '\0';
-    m->tr_speaker          = 0u;
-
-    cwx_word_t words[18];
-    int active_idx = -1;
-    int nwords = cwx_read_window(cwx, pos_ms, words, 18u, &active_idx);
-    if (nwords <= 0) {
-        str_copy_cap(m->tr_curr_spoken, (int)sizeof(m->tr_curr_spoken),
-                     cwx->title[0] ? cwx->title : m->play_file.filename);
-        return;
+    for (uint32_t i = 0u; i < CWX_TR_VIEW_LINES; i++) {
+        m->tr_lines[i] = view.lines[i];
     }
+    m->tr_active_slot   = view.active_slot;
+    m->tr_top_line_id   = view.top_line_id;
+    m->tr_spoken_len    = view.spoken_len;
+    m->tr_word_start    = view.word_start;
+    m->tr_word_len      = view.word_len;
+    m->tr_speaker       = view.speaker_idx;
+    m->tr_speaker_color = view.speaker_color;
+    str_copy_cap(m->tr_speaker_name, (int)sizeof(m->tr_speaker_name), view.speaker_name);
 
-    if (active_idx < 0) {
-        active_idx = 0;
-    } else if (active_idx >= nwords) {
-        active_idx = nwords - 1;
-    }
-    m->tr_speaker = words[active_idx].speaker_idx;
-
-    /* Partition words into prev (up to 4 before curr), curr (around active_idx), next */
-    int curr_start = (active_idx >= 2) ? (active_idx - 2) : 0;
-    int prev_start = (curr_start >= 4) ? (curr_start - 4) : 0;
-    int curr_end   = curr_start;
-
-    for (int i = prev_start; i < curr_start; i++) {
-        append_word_cap(m->tr_prev, (int)sizeof(m->tr_prev), words[i].text, (int)words[i].text_len);
+    if (rc <= 0) {
+        const char *fallback = (pager && pager->cwx && pager->cwx->title[0])
+                             ? pager->cwx->title
+                             : m->play_file.filename;
+        m->tr_lines[1].line_id       = 0;
+        m->tr_lines[1].speaker_idx   = 0u;
+        m->tr_lines[1].speaker_color = 0u;
+        m->tr_lines[1].turn_start    = 1u;
+        str_copy_cap(m->tr_lines[1].text, (int)sizeof(m->tr_lines[1].text), fallback);
+        uint8_t flen = 0u;
+        while (m->tr_lines[1].text[flen] != '\0') flen++;
+        m->tr_active_slot = 1;
+        m->tr_top_line_id = 0;
+        m->tr_spoken_len  = flen;
+        m->tr_word_start  = 0u;
+        m->tr_word_len    = 0u;
     }
 
-    /* Fill current line up to ~20 chars so it fits cleanly in 152px of 14px AA font */
-    int cur_chars = 0;
-    for (int i = curr_start; i < nwords; i++) {
-        int wl = (int)words[i].text_len;
-        if (i > active_idx && cur_chars + wl + 1 > 22) {
-            break;
-        }
-        if (i <= active_idx) {
-            append_word_cap(m->tr_curr_spoken, (int)sizeof(m->tr_curr_spoken), words[i].text, wl);
-        } else if (m->tr_curr_spoken[0] != '\0' && m->tr_curr_upcoming[0] == '\0') {
-            int pos = 0;
-            int cap = (int)sizeof(m->tr_curr_upcoming);
-            if (pos < cap - 1) {
-                m->tr_curr_upcoming[pos++] = ' ';
-            }
-            for (int k = 0; k < wl && pos < cap - 1; k++) {
-                m->tr_curr_upcoming[pos++] = words[i].text[k];
-            }
-            m->tr_curr_upcoming[pos] = '\0';
-        } else {
-            append_word_cap(m->tr_curr_upcoming, (int)sizeof(m->tr_curr_upcoming), words[i].text, wl);
-        }
-        cur_chars += wl + 1;
-        curr_end = i + 1;
-        if (cur_chars >= 22 && i >= active_idx) {
-            break;
-        }
-    }
-
-    for (int i = curr_end; i < nwords && i < curr_end + 5; i++) {
-        append_word_cap(m->tr_next, (int)sizeof(m->tr_next), words[i].text, (int)words[i].text_len);
-    }
+    /* Compact state signature to avoid redundant redraws between word/line transitions */
+    uint32_t sig = (uint32_t)m->tr_top_line_id * 16777619u;
+    sig ^= (uint32_t)(uint8_t)m->tr_active_slot;  sig *= 16777619u;
+    sig ^= (uint32_t)m->tr_spoken_len;            sig *= 16777619u;
+    sig ^= (uint32_t)m->tr_word_start << 8;       sig *= 16777619u;
+    sig ^= (uint32_t)m->tr_word_len << 16;        sig *= 16777619u;
+    sig ^= (uint32_t)m->tr_speaker << 24;         sig *= 16777619u;
+    return sig;
 }
 
 void player_keys_init(player_keys_t *s, key_id_t initial, uint32_t now_ms)
@@ -668,6 +633,7 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
         cwx_ent.size <= 0xFFFFFFFFu &&
         cwx_open(&cwx, exfat_cwx_read_cb, &cwx_io, (uint32_t)cwx_ent.size) == 0) {
         has_cwx = 1;
+        cwx_tr_pager_init(&g_tr_pager, &cwx, CWX_TR_MAX_LINE_W);
     }
 
     int hp_in = keys_read_hp_detect();
@@ -713,12 +679,15 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
     scrub_t  scrub         = {0};
     int      paused        = 0;
     int      eof_reached   = 0;
-    uint32_t telemetry_ms  = millis() - 1000u;
-    uint32_t last_ui_ms    = 0u;
-    uint32_t last_vol_ms   = 0u;
-    uint32_t toast_until   = 0u;
-    int      ui_dirty      = 1;
-    int      ret_code      = 0;
+    uint32_t telemetry_ms    = millis() - 1000u;
+    uint32_t last_ui_ms      = 0u;
+    uint32_t last_tr_poll_ms = 0u;
+    uint32_t last_anim_ms    = 0u;
+    uint32_t last_tr_sig     = 0u;
+    uint32_t last_vol_ms     = 0u;
+    uint32_t toast_until     = 0u;
+    int      ui_dirty        = 1;
+    int      ret_code        = 0;
 
 
     while (1) {
@@ -1018,6 +987,31 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
             }
         }
 
+        /* Drive smooth LVGL animations on single-core / WASM / QEMU (no-op on dual-core CPU1) */
+        if (show_player && ui_dispatch_is_animating() && (uint32_t)(now - last_anim_ms) >= 8u) {
+            last_anim_ms = now;
+            ui_dispatch_tick();
+        }
+
+        /* Fast zero-I/O transcript word tracking (~33 Hz from RAM pager cache) */
+        int tr_populated = 0;
+        uint32_t tr_pos_ms = 0u;
+        if (has_cwx && !ui_dirty && (uint32_t)(now - last_tr_poll_ms) >= 30u) {
+            last_tr_poll_ms = now;
+            uint32_t heard = eof_reached ? played_frames : player_heard_frames(played_frames, skip_frames);
+            if (scrub.speed) heard = scrub_heard(&scrub, winfo.total_samples);
+            tr_pos_ms = frames_to_ms(heard, winfo.sample_rate);
+            if (tr_pos_ms > dur_ms && dur_ms > 0u) {
+                tr_pos_ms = dur_ms;
+            }
+            uint32_t sig = populate_transcript_lines(m, &g_tr_pager, tr_pos_ms, paused && !scrub.speed);
+            tr_populated = 1;
+            if (sig != last_tr_sig) {
+                last_tr_sig = sig;
+                ui_dirty    = 1;
+            }
+        }
+
         if (ui_dirty || (uint32_t)(now - last_ui_ms) >= 120u) {
             last_ui_ms = now;
             ui_dirty   = 0;
@@ -1032,20 +1026,29 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
             }
             m->hp_plugged = hp_in;
 
-            uint32_t heard  = eof_reached ? played_frames : player_heard_frames(played_frames, skip_frames);
-            if (scrub.speed) heard = scrub_heard(&scrub, winfo.total_samples);
-            uint32_t pos_ms = frames_to_ms(heard, winfo.sample_rate);
-            if (pos_ms > dur_ms && dur_ms > 0u) {
-                pos_ms = dur_ms;
+            uint32_t pos_ms;
+            if (tr_populated) {
+                pos_ms = tr_pos_ms;
+            } else {
+                uint32_t heard  = eof_reached ? played_frames : player_heard_frames(played_frames, skip_frames);
+                if (scrub.speed) heard = scrub_heard(&scrub, winfo.total_samples);
+                pos_ms = frames_to_ms(heard, winfo.sample_rate);
+                if (pos_ms > dur_ms && dur_ms > 0u) {
+                    pos_ms = dur_ms;
+                }
             }
-            m->play_pos_sec = pos_ms / 1000u;
-            m->play_state   = scrub.speed ? 0u : eof_reached ? 2u : (paused ? 1u : 0u);
-            m->play_vol_hi  = (last_vol_ms != 0u && (uint32_t)(now - last_vol_ms) < 1500u) ? 1u : 0u;
-            m->play_vu_l    = (paused || eof_reached) ? 0u : peak_l_pct;
-            m->play_vu_r    = (paused || eof_reached) ? 0u : peak_r_pct;
+            m->play_pos_sec     = pos_ms / 1000u;
+            m->play_pos_ms      = pos_ms;
+            m->play_dur_ms      = dur_ms;
+            m->play_state       = scrub.speed ? 0u : eof_reached ? 2u : (paused ? 1u : 0u);
+            m->play_scrub_speed = (int8_t)scrub.speed;
+            m->play_vol_hi      = (last_vol_ms != 0u && (uint32_t)(now - last_vol_ms) < 1500u) ? 1u : 0u;
+            m->play_vu_l        = (paused || eof_reached) ? 0u : peak_l_pct;
+            m->play_vu_r        = (paused || eof_reached) ? 0u : peak_r_pct;
 
-            if (has_cwx) {
-                populate_transcript_lines(m, &cwx, pos_ms);
+            if (has_cwx && !tr_populated) {
+                last_tr_sig     = populate_transcript_lines(m, &g_tr_pager, pos_ms, paused && !scrub.speed);
+                last_tr_poll_ms = now;
             }
             if (show_player) {
                 ui_render_screen(UI_SCR_PLAYER, m);

@@ -20,7 +20,38 @@ static lv_image_dsc_t          s_spec_dsc;
 static enum ScreensEnum        s_active_eez_scr = (enum ScreensEnum)0;
 static const ui_spectrogram_t *s_last_spec_ptr  = NULL;
 static uint32_t                s_last_spec_sig  = 0u;
-static lv_obj_t               *s_ptr_curr_upcoming = NULL;
+
+#define TR_ROW_H         16
+#define TR_TRACK_REST_Y  (-19)
+
+static int32_t s_tr_top_line_id   = -1;
+static int32_t s_tr_active_line   = -1;
+static int32_t s_tr_pill_target_x = -1;
+static int32_t s_tr_pill_target_y = -1;
+static int32_t s_tr_pill_target_w = -1;
+static int     s_tr_pill_visible  = 0;
+
+static void anim_set_x_cb(void *obj, int32_t v) { lv_obj_set_x((lv_obj_t *)obj, v); }
+static void anim_set_y_cb(void *obj, int32_t v) { lv_obj_set_y((lv_obj_t *)obj, v); }
+static void anim_set_w_cb(void *obj, int32_t v) { lv_obj_set_width((lv_obj_t *)obj, v); }
+
+static void start_ease_out_anim(lv_obj_t *obj, lv_anim_exec_xcb_t cb,
+                                int32_t from, int32_t to, uint32_t dur_ms)
+{
+    lv_anim_delete(obj, cb);
+    if (from == to) {
+        cb(obj, to);
+        return;
+    }
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, obj);
+    lv_anim_set_exec_cb(&a, cb);
+    lv_anim_set_values(&a, from, to);
+    lv_anim_set_duration(&a, dur_ms);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    lv_anim_start(&a);
+}
 
 /* =========================================================================
  * Common Formatting & Helpers
@@ -134,6 +165,14 @@ static void set_changed_bg_color(lv_obj_t *obj, lv_color_t color)
     if (!obj) return;
     if (!lv_color_eq(lv_obj_get_style_bg_color(obj, LV_PART_MAIN), color)) {
         lv_obj_set_style_bg_color(obj, color, 0);
+    }
+}
+
+static void set_changed_ind_bg_color(lv_obj_t *obj, lv_color_t color)
+{
+    if (!obj) return;
+    if (!lv_color_eq(lv_obj_get_style_bg_color(obj, LV_PART_INDICATOR), color)) {
+        lv_obj_set_style_bg_color(obj, color, LV_PART_INDICATOR);
     }
 }
 
@@ -696,71 +735,307 @@ static void bind_files(const ui_model_t *m)
     bind_scrollbar(objects.files_scroll_thumb, m->file_count, m->file_scroll, 3, 50);
 }
 
-static void ptr_upcoming_deleted_cb(lv_event_t *e)
+static lv_color_t tr_speaker_lv_color(uint8_t idx, uint16_t rgb565)
 {
-    (void)e;
-    s_ptr_curr_upcoming = NULL;
+    static const uint32_t fallback[4] = { UI_HEX_CYAN, UI_HEX_AMBER, UI_HEX_GREEN, UI_HEX_PINK };
+    if (rgb565 != 0u && rgb565 != 0xFFFFu) {
+        return ui_color_from_rgb565(rgb565);
+    }
+    return lv_color_hex(fallback[idx & 3u]);
 }
 
-static void bind_player(const ui_model_t *m)
+static void format_vol_label(char *dst, size_t cap, int hp_plugged, uint8_t vol)
+{
+    uint32_t tenths = ((uint32_t)vol * 100u + 15u) / 31u;
+    if (tenths % 10u != 0u) {
+        lv_snprintf(dst, cap, "%s %u.%u", hp_plugged ? "HP" : "SPK",
+                    (unsigned)(tenths / 10u), (unsigned)(tenths % 10u));
+    } else {
+        lv_snprintf(dst, cap, "%s %u", hp_plugged ? "HP" : "SPK", (unsigned)(tenths / 10u));
+    }
+}
+
+static void bind_player_tr(const ui_model_t *m, bool entering)
+{
+    uint32_t dur = m->play_file.duration_sec ? m->play_file.duration_sec : 1u;
+    uint32_t pos = (m->play_pos_sec <= dur) ? m->play_pos_sec : dur;
+
+    /* 1. Compact Top Status Bar: icon + elapsed time + speaker/vol/scrub + battery */
+    ui_icon_t ic;
+    uint32_t  ic_hex;
+    if (m->play_scrub_speed != 0) {
+        ic     = (m->play_scrub_speed > 0) ? UI_ICON_RIGHT : UI_ICON_LEFT;
+        ic_hex = UI_HEX_AMBER;
+    } else if (m->play_state == 0u) {
+        ic     = UI_ICON_PLAY;
+        ic_hex = UI_HEX_CYAN;
+    } else if (m->play_state == 1u) {
+        ic     = UI_ICON_PAUSE;
+        ic_hex = UI_HEX_AMBER;
+    } else {
+        ic     = UI_ICON_STOP;
+        ic_hex = UI_HEX_DIM;
+    }
+    set_changed_text(objects.ptr_bar_ic, ui_icon_glyph(ic));
+    set_changed_text_color(objects.ptr_bar_ic, lv_color_hex(ic_hex));
+
+    char pos_s[12];
+    ui_format_duration(pos_s, (int)sizeof(pos_s), pos);
+    set_changed_text(objects.ptr_bar_l, pos_s);
+    set_changed_text_color(objects.ptr_bar_l,
+                           lv_color_hex((m->play_state == 2u) ? UI_HEX_MUTE : UI_HEX_TEXT));
+
+    int32_t dot_x = (pos >= 3600u) ? 51 : 43;
+    if (m->play_vol_hi) {
+        char vbuf[16];
+        uint8_t vol = m->hp_plugged ? m->cfg.hp_vol : m->cfg.spk_vol;
+        format_vol_label(vbuf, sizeof(vbuf), m->hp_plugged, vol);
+        set_hidden(objects.ptr_spk_dot, true);
+        set_hidden(objects.ptr_bar_sub, true);
+        set_hidden(objects.ptr_vol_pill, false);
+        set_changed_text(objects.ptr_vol_lbl, vbuf);
+    } else if (m->play_scrub_speed != 0) {
+        char sbuf[16];
+        int spd = (m->play_scrub_speed < 0) ? -m->play_scrub_speed : m->play_scrub_speed;
+        lv_snprintf(sbuf, sizeof(sbuf), "%s %d\xC3\x97",
+                    (m->play_scrub_speed > 0) ? "\xE2\x96\xB6\xE2\x96\xB6" : "\xE2\x97\x80\xE2\x97\x80",
+                    spd);
+        set_hidden(objects.ptr_vol_pill, true);
+        set_hidden(objects.ptr_spk_dot, true);
+        set_hidden(objects.ptr_bar_sub, false);
+        set_changed_x(objects.ptr_bar_sub, dot_x);
+        set_changed_width(objects.ptr_bar_sub, 139 - dot_x);
+        set_changed_text(objects.ptr_bar_sub, sbuf);
+        set_changed_text_color(objects.ptr_bar_sub, lv_color_hex(UI_HEX_AMBER));
+    } else {
+        set_hidden(objects.ptr_vol_pill, true);
+        if (m->tr_speaker_name[0] != '\0') {
+            lv_color_t spk_col = tr_speaker_lv_color(m->tr_speaker, m->tr_speaker_color);
+            set_hidden(objects.ptr_spk_dot, false);
+            set_changed_x(objects.ptr_spk_dot, dot_x);
+            set_changed_bg_color(objects.ptr_spk_dot, spk_col);
+            set_hidden(objects.ptr_bar_sub, false);
+            set_changed_x(objects.ptr_bar_sub, dot_x + 7);
+            set_changed_width(objects.ptr_bar_sub, 139 - (dot_x + 7));
+            set_changed_text(objects.ptr_bar_sub, m->tr_speaker_name);
+            set_changed_text_color(objects.ptr_bar_sub, spk_col);
+        } else {
+            char tmp[12], dur_s[16];
+            ui_format_duration(tmp, (int)sizeof(tmp), dur);
+            lv_snprintf(dur_s, sizeof(dur_s), "/ %s", tmp);
+            set_hidden(objects.ptr_spk_dot, true);
+            set_hidden(objects.ptr_bar_sub, false);
+            set_changed_x(objects.ptr_bar_sub, dot_x);
+            set_changed_width(objects.ptr_bar_sub, 139 - dot_x);
+            set_changed_text(objects.ptr_bar_sub, dur_s);
+            set_changed_text_color(objects.ptr_bar_sub, lv_color_hex(UI_HEX_DIM));
+        }
+    }
+
+    uint8_t pct = (m->batt_pct > 100u) ? 100u : m->batt_pct;
+    int32_t fw  = (int32_t)((10u * pct + 50u) / 100u);
+    if (pct > 0u && fw < 1) fw = 1;
+    lv_color_t bcol = m->charging ? lv_color_hex(UI_HEX_GREEN) :
+                      (pct <= 15u ? lv_color_hex(UI_HEX_RED) :
+                       (pct <= 30u ? lv_color_hex(UI_HEX_AMBER) : lv_color_hex(UI_HEX_TEXT)));
+    if (objects.ptr_batt_fill) {
+        set_changed_width(objects.ptr_batt_fill, fw);
+        set_changed_bg_color(objects.ptr_batt_fill, bcol);
+    }
+
+    /* 2. Full-width 2px smooth progress bar (0..1000) */
+    int32_t prog_val;
+    if (m->play_dur_ms > 0u) {
+        uint32_t pms = (m->play_pos_ms <= m->play_dur_ms) ? m->play_pos_ms : m->play_dur_ms;
+        prog_val = (int32_t)(((uint64_t)pms * 1000ull) / (uint64_t)m->play_dur_ms);
+    } else {
+        prog_val = (int32_t)((pos * 1000u) / dur);
+    }
+    set_changed_bar_value(objects.ptr_prog, prog_val);
+    set_changed_ind_bg_color(objects.ptr_prog,
+                             lv_color_hex((m->play_scrub_speed != 0 || m->play_state == 1u)
+                                              ? UI_HEX_AMBER
+                                              : (m->play_state == 2u ? UI_HEX_MUTE : UI_HEX_CYAN)));
+
+    /* 3. Smooth vertical scroll animation on ptr_track */
+    if (entering) {
+        s_tr_top_line_id   = m->tr_top_line_id;
+        s_tr_active_line   = -1;
+        s_tr_pill_target_x = -1;
+        s_tr_pill_target_y = -1;
+        s_tr_pill_target_w = -1;
+        s_tr_pill_visible  = 0;
+        lv_anim_delete(objects.ptr_track, anim_set_y_cb);
+        lv_anim_delete(objects.ptr_word_pill, NULL);
+        set_changed_y(objects.ptr_track, TR_TRACK_REST_Y);
+    }
+
+    int scrolled = 0;
+    if (!entering && m->tr_top_line_id != s_tr_top_line_id) {
+        int32_t delta = (s_tr_top_line_id >= 0 && m->tr_top_line_id >= 0)
+                      ? (m->tr_top_line_id - s_tr_top_line_id)
+                      : 0;
+        if (delta == 1 || delta == -1) {
+            int32_t cur_y   = lv_obj_get_style_y(objects.ptr_track, LV_PART_MAIN);
+            int32_t start_y = cur_y + delta * TR_ROW_H;
+            if (start_y > TR_TRACK_REST_Y + 24) start_y = TR_TRACK_REST_Y + 24;
+            if (start_y < TR_TRACK_REST_Y - 24) start_y = TR_TRACK_REST_Y - 24;
+            lv_obj_set_y(objects.ptr_track, start_y);
+            start_ease_out_anim(objects.ptr_track, anim_set_y_cb,
+                                start_y, TR_TRACK_REST_Y, 190u);
+            scrolled = 1;
+        } else {
+            lv_anim_delete(objects.ptr_track, anim_set_y_cb);
+            set_changed_y(objects.ptr_track, TR_TRACK_REST_Y);
+        }
+        s_tr_top_line_id = m->tr_top_line_id;
+    }
+
+    /* 4. Bind 6-slot scrolling transcript rows (4 visible + 1 above + 1 below) */
+    lv_obj_t *bars[CWX_TR_VIEW_LINES] = {
+        objects.ptr_bar_0, objects.ptr_bar_1, objects.ptr_bar_2,
+        objects.ptr_bar_3, objects.ptr_bar_4, objects.ptr_bar_5,
+    };
+    lv_obj_t *lines[CWX_TR_VIEW_LINES] = {
+        objects.ptr_line_0, objects.ptr_line_1, objects.ptr_line_2,
+        objects.ptr_line_3, objects.ptr_line_4, objects.ptr_line_5,
+    };
+
+    lv_color_t bg_col = lv_color_hex(UI_HEX_BG);
+    int have_active_upcoming = 0;
+
+    for (int i = 0; i < (int)CWX_TR_VIEW_LINES; i++) {
+        const cwx_tr_slot_t *sl = &m->tr_lines[i];
+        if (sl->line_id < 0 || sl->text[0] == '\0') {
+            set_hidden(bars[i], true);
+            set_hidden(lines[i], true);
+            continue;
+        }
+
+        int is_active = (i == (int)m->tr_active_slot);
+        set_hidden(bars[i], false);
+        set_hidden(lines[i], false);
+
+        lv_color_t spk_col = tr_speaker_lv_color(sl->speaker_idx, sl->speaker_color);
+        lv_color_t bar_col = is_active ? spk_col : lv_color_mix(spk_col, bg_col, 130u);
+        set_changed_bg_color(bars[i], bar_col);
+
+        /* Continuous vertical speaker stripe within a turn; clean gap at turn start */
+        int same_prev = (!sl->turn_start && i > 0 &&
+                         m->tr_lines[i - 1].line_id >= 0 &&
+                         m->tr_lines[i - 1].speaker_idx == sl->speaker_idx);
+        set_changed_y(bars[i], i * TR_ROW_H + (same_prev ? 1 : 4));
+        set_changed_height(bars[i], same_prev ? 15 : 12);
+
+        if (is_active) {
+            size_t tlen  = lv_strlen(sl->text);
+            size_t split = (m->tr_spoken_len <= tlen) ? (size_t)m->tr_spoken_len : tlen;
+            char spoken_buf[CWX_TR_LINE_CAP];
+            if (split > 0u) {
+                lv_memcpy(spoken_buf, sl->text, split);
+            }
+            spoken_buf[split] = '\0';
+
+            set_changed_text(lines[i], spoken_buf);
+            set_changed_text_color(lines[i], lv_color_hex(UI_HEX_TEXT));
+
+            if (split < tlen && objects.ptr_curr_upcoming) {
+                int32_t spoken_w = (split > 0u)
+                    ? lv_text_get_width(spoken_buf, (uint32_t)split, &ui_font_md, 0)
+                    : 0;
+                if (spoken_w < 152) {
+                    set_changed_x(objects.ptr_curr_upcoming, 6 + spoken_w);
+                    set_changed_y(objects.ptr_curr_upcoming, i * TR_ROW_H);
+                    set_changed_width(objects.ptr_curr_upcoming, 152 - spoken_w);
+                    set_changed_text(objects.ptr_curr_upcoming, sl->text + split);
+                    set_hidden(objects.ptr_curr_upcoming, false);
+                    have_active_upcoming = 1;
+                }
+            }
+        } else {
+            uint32_t lcol = (m->tr_active_slot >= 1 && i == (int)m->tr_active_slot + 1)
+                          ? UI_HEX_DIM
+                          : UI_HEX_MUTE;
+            set_changed_text(lines[i], sl->text);
+            set_changed_text_color(lines[i], lv_color_hex(lcol));
+        }
+    }
+
+    if (!have_active_upcoming && objects.ptr_curr_upcoming) {
+        set_hidden(objects.ptr_curr_upcoming, true);
+    }
+
+    /* 5. Gliding speaker-tinted highlight pill behind the active word */
+    int aslot = (int)m->tr_active_slot;
+    if (objects.ptr_word_pill && aslot >= 1 && aslot <= 4 &&
+        m->tr_lines[aslot].line_id >= 0 && m->tr_word_len > 0u) {
+        const cwx_tr_slot_t *asl = &m->tr_lines[aslot];
+        size_t tlen = lv_strlen(asl->text);
+        size_t ws   = (m->tr_word_start < tlen) ? (size_t)m->tr_word_start : tlen;
+        size_t wl   = m->tr_word_len;
+        if (ws + wl > tlen) wl = tlen - ws;
+
+        if (wl > 0u) {
+            int32_t wx = (ws > 0u)
+                       ? lv_text_get_width(asl->text, (uint32_t)ws, &ui_font_md, 0)
+                       : 0;
+            int32_t ww = lv_text_get_width(asl->text + ws, (uint32_t)wl, &ui_font_md, 0);
+            int32_t tx = 6 + wx - 2;
+            if (tx < 4) tx = 4;
+            int32_t tw = ww + 4;
+            if (tx + tw > 159) tw = 159 - tx;
+            if (tw < 6) tw = 6;
+            int32_t ty = aslot * TR_ROW_H + 3;
+
+            lv_color_t spk_col  = tr_speaker_lv_color(asl->speaker_idx, asl->speaker_color);
+            lv_color_t pill_col = lv_color_mix(spk_col, bg_col, 104u);
+            set_changed_bg_color(objects.ptr_word_pill, pill_col);
+
+            int32_t line_diff = (s_tr_active_line >= 0) ? (asl->line_id - s_tr_active_line) : 99;
+            int snap = entering || !s_tr_pill_visible || scrolled ||
+                       (line_diff > 1 || line_diff < -1);
+            if (snap) {
+                lv_anim_delete(objects.ptr_word_pill, NULL);
+                set_changed_x(objects.ptr_word_pill, tx);
+                set_changed_y(objects.ptr_word_pill, ty);
+                set_changed_width(objects.ptr_word_pill, tw);
+            } else if (tx != s_tr_pill_target_x || ty != s_tr_pill_target_y || tw != s_tr_pill_target_w) {
+                int32_t cur_x = lv_obj_get_style_x(objects.ptr_word_pill, LV_PART_MAIN);
+                int32_t cur_y = lv_obj_get_style_y(objects.ptr_word_pill, LV_PART_MAIN);
+                int32_t cur_w = lv_obj_get_style_width(objects.ptr_word_pill, LV_PART_MAIN);
+                uint32_t dur_ms = (ty != cur_y) ? 120u : 85u;
+                start_ease_out_anim(objects.ptr_word_pill, anim_set_x_cb, cur_x, tx, dur_ms);
+                start_ease_out_anim(objects.ptr_word_pill, anim_set_w_cb, cur_w, tw, dur_ms);
+                if (ty != cur_y) {
+                    start_ease_out_anim(objects.ptr_word_pill, anim_set_y_cb, cur_y, ty, dur_ms);
+                }
+            }
+            set_hidden(objects.ptr_word_pill, false);
+            s_tr_pill_target_x = tx;
+            s_tr_pill_target_y = ty;
+            s_tr_pill_target_w = tw;
+            s_tr_pill_visible  = 1;
+            s_tr_active_line   = asl->line_id;
+        } else {
+            lv_anim_delete(objects.ptr_word_pill, NULL);
+            set_hidden(objects.ptr_word_pill, true);
+            s_tr_pill_visible = 0;
+        }
+    } else if (objects.ptr_word_pill) {
+        lv_anim_delete(objects.ptr_word_pill, NULL);
+        set_hidden(objects.ptr_word_pill, true);
+        s_tr_pill_visible = 0;
+    }
+}
+
+static void bind_player(const ui_model_t *m, bool entering)
 {
     uint32_t dur = m->play_file.duration_sec ? m->play_file.duration_sec : 1u;
     uint32_t pos = (m->play_pos_sec <= dur) ? m->play_pos_sec : dur;
     int32_t  pct = (int32_t)((pos * 100u) / dur);
 
     if (m->play_has_transcript) {
-        char pos_s[12], tmp[12], dur_s[16];
-        ui_format_duration(pos_s, (int)sizeof(pos_s), pos);
-        ui_format_duration(tmp, (int)sizeof(tmp), dur);
-        lv_snprintf(dur_s, sizeof(dur_s), "/ %s", tmp);
-        bind_status_bar(objects.ptr_bar, objects.ptr_bar_ic, objects.ptr_bar_l, objects.ptr_bar_sub,
-                        objects.ptr_bar_r, objects.ptr_bar_hp, objects.ptr_batt,
-                        objects.ptr_batt_fill, objects.ptr_batt_nub,
-                        m, UI_COL_BAR, UI_COL_TEXT,
-                        (m->play_state == 0u) ? UI_ICON_PLAY : UI_ICON_PAUSE,
-                        (m->play_state == 0u) ? UI_COL_CYAN : UI_COL_AMBER,
-                        pos_s, dur_s, NULL, 0);
-        set_changed_bar_value(objects.ptr_prog, pct);
-        static const uint32_t spk_cols[4] = { UI_HEX_CYAN, UI_HEX_AMBER, UI_HEX_GREEN, UI_HEX_PINK };
-        set_changed_bg_color(objects.ptr_bar_curr, lv_color_hex(spk_cols[m->tr_speaker & 3u]));
-        set_changed_text(objects.ptr_prev, m->tr_prev);
-
-        /* Spoken words render white in ptr_curr_spoken; upcoming words render muted next to it. */
-        if (!s_ptr_curr_upcoming && objects.player_tr) {
-            s_ptr_curr_upcoming = lv_label_create(objects.player_tr);
-            lv_obj_set_pos(s_ptr_curr_upcoming, 6, 33);
-            lv_obj_set_size(s_ptr_curr_upcoming, 152, 16);
-            lv_obj_set_style_text_font(s_ptr_curr_upcoming, &ui_font_md, 0);
-            lv_label_set_long_mode(s_ptr_curr_upcoming, LV_LABEL_LONG_DOT);
-            lv_obj_set_style_text_color(s_ptr_curr_upcoming, lv_color_hex(UI_HEX_MUTE), 0);
-            lv_obj_set_style_text_align(s_ptr_curr_upcoming, LV_TEXT_ALIGN_LEFT, 0);
-            lv_obj_add_event_cb(s_ptr_curr_upcoming, ptr_upcoming_deleted_cb, LV_EVENT_DELETE, NULL);
-        }
-
-        set_changed_text(objects.ptr_curr_spoken, m->tr_curr_spoken);
-        if (s_ptr_curr_upcoming) {
-            if (m->tr_curr_upcoming[0] != '\0') {
-                int32_t spoken_w = lv_text_get_width(m->tr_curr_spoken,
-                                                     (uint32_t)lv_strlen(m->tr_curr_spoken),
-                                                     &ui_font_md, 0);
-                if (spoken_w < 152) {
-                    set_changed_x(s_ptr_curr_upcoming, 6 + spoken_w);
-                    set_changed_width(s_ptr_curr_upcoming, 152 - spoken_w);
-                    set_changed_text(s_ptr_curr_upcoming, m->tr_curr_upcoming);
-                    set_hidden(s_ptr_curr_upcoming, false);
-                } else {
-                    set_hidden(s_ptr_curr_upcoming, true);
-                }
-            } else {
-                set_hidden(s_ptr_curr_upcoming, true);
-            }
-        }
-
-        set_changed_text(objects.ptr_next, m->tr_next);
-        set_changed_text(objects.ptr_footer,
-                          (m->play_state == 0u)
-                              ? "\xE2\x97\x80\xE2\x96\xB6 Line \xC2\xB7 OK Pause \xC2\xB7 \xC2\xB1 Vol"
-                              : "\xE2\x97\x80\xE2\x96\xB6 Line \xC2\xB7 OK Play \xC2\xB7 \xC2\xB1 Vol");
+        bind_player_tr(m, entering);
         return;
     }
 
@@ -1052,7 +1327,7 @@ void ui_render_screen_sync(ui_screen_id_t scr, const ui_model_t *m)
                         m, UI_COL_BAR, UI_COL_TEXT, UI_ICON_NONE, UI_COL_TEXT, "Files", NULL, NULL, 0);
         break;
     case SCREEN_ID_PLAYER:
-    case SCREEN_ID_PLAYER_TR:      bind_player(m); break;
+    case SCREEN_ID_PLAYER_TR:      bind_player(m, entering); break;
     case SCREEN_ID_DELETE_CONFIRM: bind_delete(m); break;
     case SCREEN_ID_SETTINGS:       bind_settings(m); break;
     case SCREEN_ID_ABOUT:          bind_about(m); break;

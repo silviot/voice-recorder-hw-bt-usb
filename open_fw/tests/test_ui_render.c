@@ -351,43 +351,116 @@ int main(int argc, char **argv)
     ui_render_screen(UI_SCR_PLAYER, &m);
     assert(g_written_pixels > player_pixels && g_written_pixels - player_pixels < 160u * 10u);
 
-    /* 6: Player (Transcript mode) */
+    /* 6: Player (Full-Height Smooth-Scrolling Transcript mode) */
+    /* First verify cwx_measure_md_px matches ui_font_md glyph-for-glyph for all ASCII 0x20..0x7E */
+    for (int cp = 0x20; cp <= 0x7E; cp++) {
+        char ch[2] = { (char)cp, '\0' };
+        uint32_t cwx_w  = cwx_measure_md_px(ch, 1u);
+        int32_t  lvgl_w = lv_text_get_width(ch, 1u, &ui_font_md, 0);
+        assert((int32_t)cwx_w == lvgl_w);
+    }
+
     m.play_has_transcript = 1;
-    m.play_pos_sec        = 349;
+    m.play_pos_sec        = 28;
+    m.play_pos_ms         = 28400u;
+    m.play_dur_ms         = 64783u;
     m.play_file           = demo_files[1];
-    m.tr_speaker          = 0;
-    strcpy(m.tr_prev,          "Great. And recording");
-    strcpy(m.tr_curr_spoken,   "starts the moment ");
-    strcpy(m.tr_curr_upcoming, "you");
-    strcpy(m.tr_next,          "slide the switch?");
+    m.play_file.duration_sec = 65u;
+    m.play_state          = 0u;
+    m.play_scrub_speed    = 0;
+    m.play_vol_hi         = 0u;
+    m.tr_speaker          = 3u;
+    m.tr_speaker_color    = 0xFC15u; /* Coral/Pink (Earl Maize) */
+    strcpy(m.tr_speaker_name, "Earl Maize");
+    memset(m.tr_lines, 0, sizeof(m.tr_lines));
+    m.tr_lines[0] = (cwx_tr_slot_t){ 0, 0x7792u, 2u, 1u, "Okay, we call loss of" };
+    m.tr_lines[1] = (cwx_tr_slot_t){ 1, 0xFC15u, 3u, 1u, "left, but just heard" };
+    m.tr_lines[2] = (cwx_tr_slot_t){ 2, 0xFC15u, 3u, 0u, "the signal from the" };
+    m.tr_lines[3] = (cwx_tr_slot_t){ 3, 0xFC15u, 3u, 0u, "spacecraft is gone," };
+    m.tr_lines[4] = (cwx_tr_slot_t){ 4, 0xFC15u, 3u, 0u, "and within the next" };
+    m.tr_lines[5] = (cwx_tr_slot_t){ 5, 0xFC15u, 3u, 0u, "forty-five seconds," };
+    m.tr_top_line_id = 1;
+    m.tr_active_slot = 2; /* Row 1 = "the signal from the" */
+    m.tr_spoken_len  = 10u; /* "the signal" */
+    m.tr_word_start  = 4u;  /* "signal" */
+    m.tr_word_len    = 6u;
     ui_render_screen(UI_SCR_PLAYER, &m);
     capture_shot(6);
 
-    /* Verify spoken (white) vs upcoming (muted) color distinction on current line */
+    /* Verify spoken (white) vs upcoming (dim) color distinction on active line (Row 1: y=32..47)
+     * and full 4-line utilization reaching the bottom of the screen (y=64..79) */
     {
-        int has_spoken_bright = 0, has_upcoming_muted = 0;
-        for (int y = 33; y < 49; y++) {
-            for (int x = 6; x < 100; x++) {
+        int has_spoken_bright = 0, has_upcoming_dim = 0, has_row3_ink = 0;
+        for (int y = 32; y < 48; y++) {
+            for (int x = 6; x < 75; x++) {
                 if (g_fb[y][x] == UI_COL_TEXT) has_spoken_bright = 1;
             }
-            for (int x = 100; x < 158; x++) {
-                if (g_fb[y][x] == UI_COL_MUTE) has_upcoming_muted = 1;
+            for (int x = 75; x < 158; x++) {
+                if (g_fb[y][x] == UI_COL_DIM) has_upcoming_dim = 1;
             }
         }
-        assert(has_spoken_bright && has_upcoming_muted);
+        for (int y = 65; y < 79; y++) {
+            for (int x = 6; x < 150; x++) {
+                if (g_fb[y][x] != UI_COL_BG) has_row3_ink = 1;
+            }
+        }
+        assert(has_spoken_bright && has_upcoming_dim && has_row3_ink);
     }
 
-    /* Verify LV_LABEL_LONG_DOT truncated label produces 0 redraw pixels when unchanged */
-    strcpy(m.tr_prev, "Very long transcript line overflowing 152px!!");
-    ui_render_screen(UI_SCR_PLAYER, &m);
-    {
-        const char *shown = lv_label_get_text(objects.ptr_prev);
-        size_t slen = strlen(shown);
-        assert(slen >= 3u && strcmp(shown + slen - 3u, "...") == 0);
-    }
+    /* Unchanged transcript state produces 0 redraw pixels */
     before = g_written_pixels;
     ui_render_screen(UI_SCR_PLAYER, &m);
     assert(g_written_pixels == before);
+
+    /* Advance active word on same line -> smooth horizontal pill glide animation */
+    int32_t pill_x0 = lv_obj_get_style_x(objects.ptr_word_pill, LV_PART_MAIN);
+    m.tr_spoken_len = 15u; /* "the signal from" */
+    m.tr_word_start = 11u; /* "from" */
+    m.tr_word_len   = 4u;
+    ui_render_screen(UI_SCR_PLAYER, &m);
+    assert(ui_port_is_animating());
+    for (int f = 0; f < 10; f++) {
+        s_now += 16u;
+        ui_port_task_handler();
+    }
+    assert(!ui_port_is_animating());
+    assert(lv_obj_get_style_x(objects.ptr_word_pill, LV_PART_MAIN) > pill_x0 + 20);
+
+    /* Advance top_line_id by +1 -> smooth vertical upward scroll animation on ptr_track */
+    m.tr_lines[0] = (cwx_tr_slot_t){ 1, 0xFC15u, 3u, 1u, "left, but just heard" };
+    m.tr_lines[1] = (cwx_tr_slot_t){ 2, 0xFC15u, 3u, 0u, "the signal from the" };
+    m.tr_lines[2] = (cwx_tr_slot_t){ 3, 0xFC15u, 3u, 0u, "spacecraft is gone," };
+    m.tr_lines[3] = (cwx_tr_slot_t){ 4, 0xFC15u, 3u, 0u, "and within the next" };
+    m.tr_lines[4] = (cwx_tr_slot_t){ 5, 0xFC15u, 3u, 0u, "forty-five seconds," };
+    m.tr_lines[5] = (cwx_tr_slot_t){ 6, 0xFC15u, 3u, 0u, "so will be the" };
+    m.tr_top_line_id = 2;
+    m.tr_active_slot = 2;
+    m.tr_spoken_len  = 10u; /* "spacecraft" */
+    m.tr_word_start  = 0u;
+    m.tr_word_len    = 10u;
+    ui_render_screen(UI_SCR_PLAYER, &m);
+    assert(ui_port_is_animating());
+    int32_t trk_y_prev = lv_obj_get_style_y(objects.ptr_track, LV_PART_MAIN);
+    assert(trk_y_prev > -19);
+    for (int f = 0; f < 16; f++) {
+        s_now += 16u;
+        ui_port_task_handler();
+        int32_t trk_y_now = lv_obj_get_style_y(objects.ptr_track, LV_PART_MAIN);
+        assert(trk_y_now <= trk_y_prev);
+        trk_y_prev = trk_y_now;
+    }
+    assert(!ui_port_is_animating() && trk_y_prev == -19);
+
+    /* Exercise volume pill + scrub badge + silence pause in transcript mode */
+    m.play_vol_hi = 1u;
+    ui_render_screen(UI_SCR_PLAYER, &m);
+    assert(!lv_obj_has_flag(objects.ptr_vol_pill, LV_OBJ_FLAG_HIDDEN));
+    m.play_vol_hi      = 0u;
+    m.play_scrub_speed = 3;
+    m.tr_word_len      = 0u; /* silence hides pill */
+    ui_render_screen(UI_SCR_PLAYER, &m);
+    assert(lv_obj_has_flag(objects.ptr_word_pill, LV_OBJ_FLAG_HIDDEN));
+    m.play_scrub_speed    = 0;
     m.play_has_transcript = 0;
 
     /* 7: Delete? */
