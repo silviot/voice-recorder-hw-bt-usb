@@ -5,6 +5,7 @@ dumps/
 *.fw
 *.rom
 *.wav
+!web_emu/samples/cassini-final-moments.wav
 *.mp3
 
 # Compiled binaries and build artifacts

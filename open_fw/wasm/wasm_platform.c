@@ -109,13 +109,16 @@ volatile uint8_t  g_openfw_boot_strike_counted = 0u;
 volatile uint8_t  g_openfw_xip_mode            = OPENFW_XIP_MODE_QUAD_48M;
 
 /* ============================================================================
- * Virtual 64 MiB microSD Card (131072 x 512 B sectors — zero-init BSS in WASM)
+ * Virtual 32 MiB microSD Card (65536 x 512 B sectors — zero-init BSS in WASM)
  * ============================================================================ */
-#define WASM_SD_SECTORS  131072u
+#define WASM_SD_SECTORS  65536u
 #define WASM_SD_BYTES    (WASM_SD_SECTORS * 512u)
 
-static uint8_t g_sd_img[WASM_SD_BYTES];
-static int     g_sd_formatted = 0;
+static uint8_t        g_sd_img[WASM_SD_BYTES];
+static int            g_sd_formatted = 0;
+static exfat_vol_t    g_seed_vol;
+static exfat_writer_t g_seed_writer;
+static int            g_seed_open = 0;
 
 /* Scratch transfer buffer for JS file listing / WAV download */
 static uint8_t g_xfer_buf[65536];
@@ -480,15 +483,17 @@ static uint32_t current_dac_sample_rate(void)
 
 static void pump_audio_dmac(void)
 {
-    /* CH0: DAC playback completion */
-    if (g_soc.dmac_ch0_active && g_soc.us_time >= g_soc.dmac_ch0_done_us) {
+    uint64_t wall_us = (uint64_t)g_systick_ms * 1000ULL;
+
+    /* CH0: DAC playback completion (paced strictly to wall clock) */
+    if (g_soc.dmac_ch0_active && wall_us >= g_soc.dmac_ch0_done_us) {
         g_soc.dmac_ch0_active = 0u;
         g_soc.dmac_regs[0][0x24u >> 2] |= DMAC_IRQ_TC;
         DMAC_CH0_IRQHandler();
     }
 
     /* CH1: ADC microphone capture completion (2048 frames = 128 ms @ 16 kHz) */
-    if (g_soc.dmac_ch1_active && g_soc.us_time >= g_soc.dmac_ch1_done_us) {
+    if (g_soc.dmac_ch1_active && wall_us >= g_soc.dmac_ch1_done_us) {
         g_soc.dmac_ch1_active = 0u;
         int16_t *dst = (int16_t *)g_soc.dmac_buf[1];
         uint32_t len_bytes = g_soc.dmac_len[1];
@@ -745,6 +750,7 @@ void openfw_mmio_wr32(uint32_t addr, uint32_t val)
         g_soc.dmac_regs[ch][off >> 2] = val;
         if (off == 0x00u) {
             if ((val & DMAC_CTL_CH_EN) && !(prev & DMAC_CTL_CH_EN)) {
+                uint64_t wall_us = (uint64_t)g_systick_ms * 1000ULL;
                 if (ch == 0u) {
                     uint32_t len_b  = g_soc.dmac_len[0];
                     uint32_t frames = len_b / 4u; /* 16-bit stereo */
@@ -752,14 +758,14 @@ void openfw_mmio_wr32(uint32_t addr, uint32_t val)
                     if (frames > 0u && g_soc.dmac_buf[0]) {
                         host_dac_push((const int16_t *)g_soc.dmac_buf[0], frames, rate);
                         g_soc.dmac_ch0_active  = 1u;
-                        g_soc.dmac_ch0_done_us = g_soc.us_time + ((uint64_t)frames * 1000000ULL) / rate;
+                        g_soc.dmac_ch0_done_us = wall_us + ((uint64_t)frames * 1000000ULL) / rate;
                     }
                 } else if (ch == 1u) {
                     uint32_t len_b    = g_soc.dmac_len[1];
                     uint32_t channels = (len_b >= 8192u) ? 2u : 1u;
                     uint32_t frames   = (len_b > 0u) ? (len_b / (channels * 2u)) : 2048u;
                     g_soc.dmac_ch1_active  = 1u;
-                    g_soc.dmac_ch1_done_us = g_soc.us_time + ((uint64_t)frames * 1000000ULL) / 16000ULL;
+                    g_soc.dmac_ch1_done_us = wall_us + ((uint64_t)frames * 1000000ULL) / 16000ULL;
                 }
             } else if (!(val & DMAC_CTL_CH_EN)) {
                 if (ch == 0u) {
@@ -833,8 +839,8 @@ void openfw_mmio_wr8(uint32_t addr, uint8_t val)
 
 void openfw_mmio_nop(void)
 {
-    g_soc.us_time += 250ULL;
-    if (g_soc.us_time >= (uint64_t)(g_soc.last_tick_ms + 4u) * 1000ULL) {
+    g_soc.us_time += 50ULL;
+    if (g_soc.us_time >= (uint64_t)(g_soc.last_tick_ms + 8u) * 1000ULL) {
         uint32_t now_ms = host_yield(1u);
         sync_time_ms(now_ms);
     }
@@ -977,12 +983,12 @@ static void wasm_format_exfat(void)
     memset(g_sd_img, 0, sizeof(g_sd_img));
 
     const uint32_t part_lba    = 64u;
-    const uint32_t part_secs   = WASM_SD_SECTORS - part_lba; /* 131008 */
+    const uint32_t part_secs   = WASM_SD_SECTORS - part_lba; /* 65472 */
     const uint32_t fat_off     = 24u;
-    const uint32_t fat_len     = 136u; /* 68 KiB = 17408 FAT entries */
-    const uint32_t heap_off    = 192u;
+    const uint32_t fat_len     = 72u;  /* 36 KiB = 9216 FAT entries */
+    const uint32_t heap_off    = 128u;
     const uint32_t spc         = 8u;   /* 4096 B cluster */
-    const uint32_t clus_cnt    = (part_secs - heap_off) / spc; /* 16352 */
+    const uint32_t clus_cnt    = (part_secs - heap_off) / spc; /* 8168 */
 
     /* 1. MBR (LBA 0) */
     uint8_t *mbr = &g_sd_img[0];
@@ -1473,6 +1479,68 @@ __attribute__((export_name("wasm_sd_size")))
 uint32_t wasm_sd_size(void)
 {
     return WASM_SD_BYTES;
+}
+
+static blkdev_t g_seed_bd;
+
+__attribute__((export_name("wasm_sd_format_empty")))
+void wasm_sd_format_empty(void)
+{
+    uint32_t ymd_hms[6] = { 2026u, 11u, 23u, 12u, 0u, 0u };
+    host_get_wall_clock(ymd_hms);
+    rtc_datetime_t dt;
+    dt.year    = (uint16_t)ymd_hms[0];
+    dt.month   = (uint8_t)ymd_hms[1];
+    dt.day     = (uint8_t)ymd_hms[2];
+    dt.hour    = (uint8_t)ymd_hms[3];
+    dt.minute  = (uint8_t)ymd_hms[4];
+    dt.second  = (uint8_t)ymd_hms[5];
+    dt.weekday = 0u;
+    rtc_set(&dt);
+
+    wasm_format_exfat();
+    g_seed_bd.read_sectors  = ram_sd_read;
+    g_seed_bd.write_sectors = ram_sd_write;
+    g_seed_bd.total_sectors = WASM_SD_SECTORS;
+    g_seed_bd.ctx           = (void *)0;
+    if (exfat_mount(&g_seed_vol, &g_seed_bd) == 0) {
+        exfat_set_timestamp(&g_seed_vol, rtc_to_dos_timestamp(&dt));
+        (void)exfat_mkdir(&g_seed_vol, "/record");
+    }
+    g_sd_formatted = 1;
+    g_seed_open    = 0;
+}
+
+__attribute__((export_name("wasm_seed_file_begin")))
+int wasm_seed_file_begin(uint32_t name_len)
+{
+    if (!g_sd_formatted || name_len == 0u || name_len > 30u) return -1;
+    char name[32];
+    memcpy(name, g_xfer_buf, name_len);
+    name[name_len] = '\0';
+    if (exfat_create_file(&g_seed_vol, "/record", name, &g_seed_writer) != 0) {
+        g_seed_open = 0;
+        return -1;
+    }
+    g_seed_open = 1;
+    return 0;
+}
+
+__attribute__((export_name("wasm_seed_file_write")))
+int wasm_seed_file_write(uint32_t len)
+{
+    if (!g_seed_open || len > sizeof(g_xfer_buf)) return -1;
+    if (len == 0u) return 0;
+    return exfat_write(&g_seed_writer, g_xfer_buf, len);
+}
+
+__attribute__((export_name("wasm_seed_file_end")))
+int wasm_seed_file_end(void)
+{
+    if (!g_seed_open) return -1;
+    int rc = exfat_close_file(&g_seed_writer);
+    g_seed_open = 0;
+    return rc;
 }
 
 __attribute__((export_name("wasm_boot")))

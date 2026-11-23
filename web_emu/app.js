@@ -1,6 +1,10 @@
 /*
  * Cassini OpenFW Browser Emulator — Main Thread UI, Canvas & Web Audio Controller
  *
+ * Uses zero-allocation SharedArrayBuffer ring buffers for both browser microphone
+ * capture (DMAC CH1) and stereo speaker playback (DMAC CH0) to avoid Web Audio
+ * node/buffer churn and GC pressure during long sessions.
+ *
  * SPDX-License-Identifier: MIT
  */
 "use strict";
@@ -21,13 +25,19 @@ const CTRL_SPEAKER_PA  = 12;
 const CTRL_FB_VER      = 13;
 const CTRL_MIC_WR      = 14;
 const CTRL_MIC_RD      = 15;
+const CTRL_DAC_WR      = 16;
+const CTRL_DAC_RD      = 17;
+const CTRL_DAC_RATE    = 18;
 
 const FB_OFFSET_BYTES  = 256;
 const FB_PIXELS        = 160 * 80;
 const MIC_OFFSET_BYTES = FB_OFFSET_BYTES + FB_PIXELS * 2;
 const MIC_RING_SAMPLES = 32768;
 const MIC_RING_MASK    = MIC_RING_SAMPLES - 1;
-const SAB_TOTAL_BYTES  = MIC_OFFSET_BYTES + MIC_RING_SAMPLES * 2;
+const DAC_OFFSET_BYTES = MIC_OFFSET_BYTES + MIC_RING_SAMPLES * 2;
+const DAC_RING_FRAMES  = 32768;
+const DAC_RING_MASK    = DAC_RING_FRAMES - 1;
+const SAB_TOTAL_BYTES  = DAC_OFFSET_BYTES + DAC_RING_FRAMES * 4;
 
 const $ = (id) => document.getElementById(id);
 
@@ -43,28 +53,130 @@ let worker      = null;
 let ctrl        = null;
 let sabFb       = null;
 let sabMic      = null;
+let sabDac      = null;
 let lastFbVer   = -1;
 let lastBl      = -1;
 let keyMask     = 0;
 
-// Web Audio API playback state
-let audioCtx      = null;
-let nextPlayAt    = 0;
-let audioMuted    = false;
-let activeSources = new Set();
+// Persistent zero-allocation Web Audio playback node
+let audioCtx    = null;
+let dacNode     = null;
+let audioMuted  = false;
+let dacFrac     = 0;
+let dacPrevL    = 0;
+let dacPrevR    = 0;
+let dacCurL     = 0;
+let dacCurR     = 0;
+let dacHaveCur  = false;
 
 // Live browser microphone state (default input source)
-let micStream     = null;
-let micNode       = null;
-let micSource     = null;
-let micZeroGain   = null;
-let micStarting   = false;
-let micWanted     = true;
+let micStream   = null;
+let micNode     = null;
+let micSource   = null;
+let micZeroGain = null;
+let micStarting = false;
+let micWanted   = true;
+
+function initDacNode() {
+  if (!audioCtx || dacNode) return;
+  dacNode = audioCtx.createScriptProcessor(2048, 0, 2);
+  const inv = 1 / 32768;
+
+  dacNode.onaudioprocess = (e) => {
+    const outL = e.outputBuffer.getChannelData(0);
+    const outR = e.outputBuffer.getChannelData(1);
+    if (!ctrl || !sabDac) {
+      outL.fill(0);
+      outR.fill(0);
+      return;
+    }
+
+    let rd = Atomics.load(ctrl, CTRL_DAC_RD) >>> 0;
+    const wr = Atomics.load(ctrl, CTRL_DAC_WR) >>> 0;
+    let avail = (wr - rd) >>> 0;
+    if (avail > DAC_RING_FRAMES) {
+      rd = wr;
+      avail = 0;
+    }
+
+    const rate = Atomics.load(ctrl, CTRL_DAC_RATE);
+    if (audioMuted || rate <= 0 || avail === 0) {
+      if (audioMuted && avail > 0) {
+        Atomics.store(ctrl, CTRL_DAC_RD, wr | 0);
+      }
+      outL.fill(0);
+      outR.fill(0);
+      dacFrac = 0;
+      dacPrevL = 0;
+      dacPrevR = 0;
+      dacCurL = 0;
+      dacCurR = 0;
+      dacHaveCur = false;
+      return;
+    }
+
+    // Keep playback latency tight if the browser paused callbacks (e.g. background tab)
+    const maxLag = rate > 8000 ? rate : 16000;
+    if (avail > maxLag) {
+      const keep = rate >> 2;
+      rd = (wr - keep) >>> 0;
+      avail = keep;
+      dacHaveCur = false;
+      dacFrac = 0;
+    }
+
+    if (!dacHaveCur && avail > 0) {
+      const idx0 = (rd & DAC_RING_MASK) << 1;
+      dacCurL = sabDac[idx0] * inv;
+      dacCurR = sabDac[idx0 + 1] * inv;
+      dacPrevL = dacCurL;
+      dacPrevR = dacCurR;
+      rd = (rd + 1) >>> 0;
+      avail--;
+      dacHaveCur = true;
+    }
+
+    const step = rate / audioCtx.sampleRate;
+    const n = outL.length;
+    for (let i = 0; i < n; i++) {
+      dacFrac += step;
+      while (dacFrac >= 1) {
+        dacFrac -= 1;
+        if (avail > 0) {
+          dacPrevL = dacCurL;
+          dacPrevR = dacCurR;
+          const idx = (rd & DAC_RING_MASK) << 1;
+          dacCurL = sabDac[idx] * inv;
+          dacCurR = sabDac[idx + 1] * inv;
+          rd = (rd + 1) >>> 0;
+          avail--;
+        } else {
+          dacPrevL = 0;
+          dacPrevR = 0;
+          dacCurL = 0;
+          dacCurR = 0;
+          dacHaveCur = false;
+          dacFrac = 0;
+          break;
+        }
+      }
+      outL[i] = dacPrevL + (dacCurL - dacPrevL) * dacFrac;
+      outR[i] = dacPrevR + (dacCurR - dacPrevR) * dacFrac;
+    }
+
+    Atomics.store(ctrl, CTRL_DAC_RD, rd | 0);
+  };
+
+  dacNode.connect(audioCtx.destination);
+}
 
 function ensureAudioCtx() {
   if (!audioCtx) {
     const AC = window.AudioContext || window.webkitAudioContext;
-    if (AC) audioCtx = new AC();
+    if (AC) {
+      audioCtx = new AC();
+      initDacNode();
+    }
   }
   if (audioCtx && audioCtx.state === "suspended") {
     audioCtx.resume().catch(() => {});
@@ -72,43 +184,6 @@ function ensureAudioCtx() {
   if (micWanted && !micStream && !micStarting && $("audio-src").value === "mic") {
     enableBrowserMic(true);
   }
-}
-
-function flushAudioPlayback() {
-  for (const src of activeSources) {
-    try { src.stop(); } catch (_) {}
-  }
-  activeSources.clear();
-  nextPlayAt = 0;
-}
-
-function scheduleAudioChunk(leftBuf, rightBuf, sampleRate) {
-  if (audioMuted) return;
-  if (!audioCtx) ensureAudioCtx();
-  if (!audioCtx) return;
-  if (audioCtx.state === "suspended") {
-    audioCtx.resume().catch(() => {});
-  }
-  const left = new Float32Array(leftBuf);
-  const right = new Float32Array(rightBuf);
-  if (left.length === 0) return;
-
-  const buf = audioCtx.createBuffer(2, left.length, sampleRate);
-  buf.copyToChannel(left, 0);
-  buf.copyToChannel(right, 1);
-
-  const src = audioCtx.createBufferSource();
-  src.buffer = buf;
-  src.connect(audioCtx.destination);
-  activeSources.add(src);
-  src.onended = () => activeSources.delete(src);
-
-  const now = audioCtx.currentTime;
-  if (nextPlayAt < now + 0.01 || nextPlayAt > now + 0.60) {
-    nextPlayAt = now + 0.03;
-  }
-  src.start(nextPlayAt);
-  nextPlayAt += buf.duration;
 }
 
 function wakeWorker() {
@@ -127,6 +202,21 @@ function setKeyBit(bit, down) {
   }
   const btn = document.querySelector(`[data-key-bit="${bit}"]`);
   if (btn) btn.classList.toggle("active", down);
+}
+
+function releaseAllKeys() {
+  if (keyMask !== 0) {
+    keyMask = 0;
+    if (ctrl) {
+      Atomics.store(ctrl, CTRL_KEY_MASK, 0);
+      wakeWorker();
+    }
+    document.querySelectorAll("[data-key-bit].active").forEach((b) => b.classList.remove("active"));
+  }
+  const pwrBtn = $("btn-power");
+  if (pwrBtn && pwrBtn.classList.contains("active")) {
+    setPowerButton(false);
+  }
 }
 
 function setPowerButton(down) {
@@ -191,7 +281,7 @@ async function enableBrowserMic(enable) {
   micWanted = enable;
   if (!enable) {
     micStarting = false;
-    if (micNode) { micNode.disconnect(); micNode = null; }
+    if (micNode) { micNode.onaudioprocess = null; micNode.disconnect(); micNode = null; }
     if (micZeroGain) { micZeroGain.disconnect(); micZeroGain = null; }
     if (micSource) { micSource.disconnect(); micSource = null; }
     if (micStream) { micStream.getTracks().forEach((t) => t.stop()); micStream = null; }
@@ -211,7 +301,10 @@ async function enableBrowserMic(enable) {
   micStarting = true;
   if (!audioCtx) {
     const AC = window.AudioContext || window.webkitAudioContext;
-    if (AC) audioCtx = new AC();
+    if (AC) {
+      audioCtx = new AC();
+      initDacNode();
+    }
   }
   if (audioCtx && audioCtx.state === "suspended") {
     audioCtx.resume().catch(() => {});
@@ -294,7 +387,6 @@ function renderLoop() {
         r = (r * scale) | 0;
         g = (g * scale) | 0;
         b = (b * scale) | 0;
-        // Little-endian ABGR for Uint32Array view over ImageData
         rgba32[i] = (0xff << 24) | (b << 16) | (g << 8) | r;
       }
       ctx.putImageData(imgData, 0, 0);
@@ -306,10 +398,10 @@ function renderLoop() {
 function bindControls() {
   document.addEventListener("pointerdown", ensureAudioCtx, { passive: true });
 
-  // Tactile buttons (pointer down/up supports hold-OK delete, hold-NEXT 2x-5x scrub, etc.)
+  // Tactile buttons (blur on press so Space/Enter never double-trigger a focused HTML button)
   document.querySelectorAll("[data-key-bit]").forEach((btn) => {
     const bit = parseInt(btn.dataset.keyBit, 10);
-    const down = (e) => { e.preventDefault(); btn.setPointerCapture?.(e.pointerId); setKeyBit(bit, true); };
+    const down = (e) => { e.preventDefault(); btn.blur(); btn.setPointerCapture?.(e.pointerId); setKeyBit(bit, true); };
     const up   = (e) => { e.preventDefault(); setKeyBit(bit, false); };
     btn.addEventListener("pointerdown", down);
     btn.addEventListener("pointerup", up);
@@ -317,18 +409,20 @@ function bindControls() {
   });
 
   const pwrBtn = $("btn-power");
-  pwrBtn.addEventListener("pointerdown", (e) => { e.preventDefault(); pwrBtn.setPointerCapture?.(e.pointerId); setPowerButton(true); });
+  pwrBtn.addEventListener("pointerdown", (e) => { e.preventDefault(); pwrBtn.blur(); pwrBtn.setPointerCapture?.(e.pointerId); setPowerButton(true); });
   pwrBtn.addEventListener("pointerup", (e) => { e.preventDefault(); setPowerButton(false); });
   pwrBtn.addEventListener("pointercancel", () => setPowerButton(false));
 
-  $("rec-switch").addEventListener("change", (e) => setRecSwitch(e.target.checked));
+  $("rec-switch").addEventListener("change", (e) => { e.target.blur(); setRecSwitch(e.target.checked); });
 
   $("hp-toggle").addEventListener("change", (e) => {
+    e.target.blur();
     ensureAudioCtx();
     if (ctrl) { Atomics.store(ctrl, CTRL_HP_PLUG, e.target.checked ? 1 : 0); wakeWorker(); }
   });
 
   $("usb-toggle").addEventListener("change", (e) => {
+    e.target.blur();
     ensureAudioCtx();
     if (ctrl) { Atomics.store(ctrl, CTRL_VBUS, e.target.checked ? 1 : 0); wakeWorker(); }
   });
@@ -339,30 +433,39 @@ function bindControls() {
     if (ctrl) { Atomics.store(ctrl, CTRL_VBAT_MV, mv); wakeWorker(); }
   });
 
-  $("audio-src").addEventListener("change", (e) => enableBrowserMic(e.target.value === "mic"));
+  $("audio-src").addEventListener("change", (e) => { e.target.blur(); enableBrowserMic(e.target.value === "mic"); });
 
   $("mute-toggle").addEventListener("change", (e) => {
+    e.target.blur();
     audioMuted = e.target.checked;
     if (!audioMuted) ensureAudioCtx();
   });
 
-  $("btn-refresh-sd").addEventListener("click", requestFileList);
-  $("btn-reboot").addEventListener("click", () => {
+  $("btn-refresh-sd").addEventListener("click", (e) => { e.target.blur(); requestFileList(); });
+  $("btn-reboot").addEventListener("click", (e) => {
+    e.target.blur();
     if (!ctrl) return;
     setRecSwitch(false);
     Atomics.store(ctrl, CTRL_CMD, 3);
     wakeWorker();
   });
-  $("btn-wipe-sd").addEventListener("click", () => {
+  $("btn-wipe-sd").addEventListener("click", (e) => {
+    e.target.blur();
     if (!ctrl) return;
     setRecSwitch(false);
     Atomics.store(ctrl, CTRL_CMD, 4);
     wakeWorker();
     setTimeout(requestFileList, 800);
   });
-  $("btn-clear-log").addEventListener("click", () => { logEl.textContent = ""; });
+  $("btn-clear-log").addEventListener("click", (e) => { e.target.blur(); logEl.textContent = ""; });
 
-  // Keyboard shortcuts
+  // Keyboard shortcuts:
+  //   ArrowLeft / ArrowRight     -> Prev / Next
+  //   ArrowUp / ArrowDown (+ / -) -> VOL+ / VOL-
+  //   B / Delete / Backspace / Esc -> Back
+  //   Enter / O                  -> OK / Play
+  //   P / Space                  -> Power
+  //   R                          -> Record slide switch
   const keyMap = {
     ArrowLeft: 0,
     ArrowRight: 1,
@@ -371,20 +474,28 @@ function bindControls() {
     "=": 2,
     ArrowDown: 3,
     "-": 3,
-    Escape: 4,
+    b: 4,
+    B: 4,
+    Delete: 4,
     Backspace: 4,
+    Escape: 4,
     Enter: 5,
-    " ": 5,
+    o: 5,
+    O: 5,
   };
 
+  const isPowerKey = (key) => key === "p" || key === "P" || key === " ";
+
   window.addEventListener("keydown", (e) => {
-    if (e.target.tagName === "INPUT" || e.target.tagName === "SELECT") return;
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    if (e.target.tagName === "SELECT" || (e.target.tagName === "INPUT" && e.target.type === "range")) return;
+
     if (e.key === "r" || e.key === "R") {
       if (!e.repeat) setRecSwitch(!$("rec-switch").checked);
       e.preventDefault();
       return;
     }
-    if (e.key === "p" || e.key === "P") {
+    if (isPowerKey(e.key)) {
       if (!e.repeat) setPowerButton(true);
       e.preventDefault();
       return;
@@ -396,13 +507,27 @@ function bindControls() {
   });
 
   window.addEventListener("keyup", (e) => {
-    if (e.key === "p" || e.key === "P") {
+    if (isPowerKey(e.key)) {
       setPowerButton(false);
+      e.preventDefault();
       return;
     }
     if (e.key in keyMap) {
       setKeyBit(keyMap[e.key], false);
+      e.preventDefault();
     }
+  });
+
+  window.addEventListener("blur", releaseAllKeys);
+
+  window.addEventListener("beforeunload", () => {
+    if (worker) { worker.terminate(); worker = null; }
+    if (dacNode) { dacNode.onaudioprocess = null; dacNode.disconnect(); dacNode = null; }
+    if (micNode) { micNode.onaudioprocess = null; micNode.disconnect(); micNode = null; }
+    if (micZeroGain) { micZeroGain.disconnect(); micZeroGain = null; }
+    if (micSource) { micSource.disconnect(); micSource = null; }
+    if (micStream) { micStream.getTracks().forEach((t) => t.stop()); micStream = null; }
+    if (audioCtx) { audioCtx.close().catch(() => {}); audioCtx = null; }
   });
 }
 
@@ -433,6 +558,7 @@ async function start() {
   ctrl   = new Int32Array(sab, 0, 32);
   sabFb  = new Uint16Array(sab, FB_OFFSET_BYTES, FB_PIXELS);
   sabMic = new Int16Array(sab, MIC_OFFSET_BYTES, MIC_RING_SAMPLES);
+  sabDac = new Int16Array(sab, DAC_OFFSET_BYTES, DAC_RING_FRAMES * 2);
   Atomics.store(ctrl, CTRL_VBAT_MV, 4020);
 
   worker = new Worker("./worker.js");
@@ -447,10 +573,6 @@ async function start() {
       if (msg.text.includes("Saved") || msg.text.includes("SD: OK")) {
         setTimeout(requestFileList, 250);
       }
-    } else if (msg.type === "audio") {
-      scheduleAudioChunk(msg.left, msg.right, msg.sampleRate);
-    } else if (msg.type === "audioFlush") {
-      flushAudioPlayback();
     } else if (msg.type === "files") {
       renderFiles(msg.files);
     } else if (msg.type === "fileData") {
