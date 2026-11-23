@@ -1,8 +1,9 @@
 /*
  * Cassini OpenFW — 160x80 Landscape Anti-Aliased UI Contract
  *
- * Implements the 14-color RGB565 palette, drawn AA vector icons, live 128-pt
- * FFT Mel spectrogram, shared status/footer/toast chrome, and all 11 UI screens.
+ * Defines the RGB565 palette, UI icon identifiers, live 128-pt FFT Mel
+ * spectrogram, shared formatting helpers, and the hardware-agnostic UI
+ * state model (ui_model_t) bound onto LVGL v9 / EEZ Studio screens.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -40,7 +41,7 @@
 #define UI_BAR_H        13
 
 /* =========================================================================
- * Drawn AA Vector Icons (ui_icons.c)
+ * UI Icon Identifiers (mapped to glyphs/widgets in ui_theme.c / EEZ Studio)
  * ========================================================================= */
 typedef enum {
     UI_ICON_NONE = 0,

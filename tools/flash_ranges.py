@@ -4,7 +4,7 @@ Clean-room chunked partial flasher & CRC-16 verifier for Smartlink SL6801 BootRO
 
 Inspired by anton-veretenenko/smartlink_flash's range diffing, sector alignment,
 and USB retry/verify workflow, built on this project's documented BootROM 0xC0
-vendor SCSI protocol (see firmware_analysis.md Section 3.3).
+vendor SCSI protocol (see docs/FIRMWARE_ANALYSIS.md Section 3.3).
 
 Safety defaults:
   - Targets BootROM USB DFU PID 0x2800 ONLY (never XIP Card Reader 0x2801).

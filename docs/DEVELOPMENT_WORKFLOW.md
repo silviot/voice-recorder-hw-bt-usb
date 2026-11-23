@@ -9,10 +9,12 @@ Because the **Smartlink SL6801** has no public vendor datasheet and `DWT->CYCCNT
 Never flash untested code. Every change must pass the full zero-warning ARM build, host ASan + UBSan test suite, `fsck.exfat` filesystem check, and Python tool self-tests:
 
 ```bash
-make -C open_fw all update-up test-host-san \
+make -C open_fw all test-host-san \
   && python3 tools/openfw_usb.py --self-test \
   && python3 tools/dev_cycle.py --self-test
 ```
+
+*(If you also have your local `dumps/firmware_2M.bin` dump present, include `update-up` in the `make` command to pack the full 2 MiB flash image and `update_openfw.up` OTA bundle.)*
 
 What this catches in seconds on x86-64:
 - **Memory & UB bugs:** `-Wall -Wextra -Werror -fsanitize=undefined,address` across `test_core`, `test_drivers_mmio`, `test_ui_render`, `test_audio_dsp`, `test_player`, and `test_audio_bt_mmio`.
@@ -28,8 +30,8 @@ What this catches in seconds on x86-64:
 ### Memory Budget Checks
 Inspect ELF section sizes after any significant change:
 ```bash
-llvm-size -A /tmp/sl6801_openfw/open_fw.elf | grep -E "ram_boot|\.text|\.data|\.bss|Total"
-llvm-nm -n /tmp/sl6801_openfw/open_fw.elf | grep -E "_ebss|_sdata|_edata"
+size -A /tmp/sl6801_openfw/open_fw.elf | grep -E "ram_boot|\.text|\.data|\.bss|Total"
+nm -n /tmp/sl6801_openfw/open_fw.elf | grep -E "_ebss|_sdata|_edata"
 ```
 Keep hard margins on:
 - **`.ram_boot`:** `<= 4,096 B` (loaded into early SRAM by `HLKJ`).

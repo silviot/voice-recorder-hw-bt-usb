@@ -1,76 +1,82 @@
-# Cassini OpenFW — UI/UX Display Capability Kit (`160×80` Anti-Aliased)
+# Cassini OpenFW — `160×80` Display System & UI/UX Guide
 
-This document gives the UI/UX design team an accurate reference of what is visually and technically possible on the voice recorder's `0.96"` TFT display, along with hardware-faithful anti-aliased mockups.
+This document describes the display hardware, typography, 14-color dark-mode palette, physical control model, and design guidelines for **`open_fw`**'s **`0.96"` (`160×80`)** LVGL v9.2.2 + EEZ Studio UI.
 
-![4-Bit Anti-Aliased UI Showcase](assets/ux_showcase_sheet.png)
+![Cassini OpenFW 160x80 UI Showcase](assets/openfw_ui_showcase.png)
+
+*(Rendered directly by the real compiled `open_fw` LVGL v9.2.2 + EEZ Studio + ST7735S driver code via `make -C open_fw test-host`.)*
 
 ---
 
 ## 1. Display Hardware & Rendering Capabilities
 
 | Property | Specification |
-| --- | --- |
-| **Panel** | `0.96"` IPS/TFT (`ST7735S`), **160 × 80 px** (landscape) or **80 × 160 px** (portrait) |
+| :--- | :--- |
+| **Panel** | `0.96"` TFT (`ST7735S`), **`160 × 80` px** landscape (`MADCTL = 0xA8`, `X_OFF = 1`, `Y_OFF = 26`) |
 | **Color depth** | **16-bit RGB565** (`65,536` colors) |
-| **Interface & speed** | 8-bit 8080 parallel bus — full-screen text + UI updates render in **< 4 ms** (`> 60 fps` capable) |
-| **Text rendering** | **4-bit (16-level) grayscale anti-aliased proportional fonts** blended in RGB565 |
-| **Shape primitives** | Anti-aliased circles (`lcd_fill_circle_aa`), rounded pills/cards/bars (`lcd_fill_rrect_aa`), triangles/icons, alpha-blended RGB565 sprites (`lcd_blit_rgb565_alpha`), and 60 fps animations |
-| **Backlight** | PWM dimmed `0–100%` (can dim smoothly before screen sleep) |
-| **Flash budget** | ~**1.8 MiB free** in 2 MiB NOR Flash — plenty of room for custom fonts, crisp icons, and animations |
+| **UI framework** | **LVGL v9.2.2** (`LV_STDLIB_BUILTIN`) authored visually in **EEZ Studio** ([`open_fw/cassini.eez-project`](../open_fw/cassini.eez-project)) |
+| **Rendering core** | Dedicated **CPU1 (96 MHz)** with full-screen `25.6 KiB` RGB565 direct buffer, zero-wait-state SRAM draw loops, and `10.4 ms` full-frame parallel 8080 LCD blits |
+| **Text rendering** | **4-bit (16-level) grayscale anti-aliased** Noto Sans fonts with tabular digits (`0..9`) and crisp Unicode UI symbols |
+| **Backlight** | PWM channel 3 (`0–100%`), driven low when blanked |
+| **Flash budget** | ~`272 KiB` total `.text` out of **2 MiB Quad 48 MHz XIP NOR** |
 
 > **Why 4-bit grayscale AA (not ClearType subpixel AA)?**
 > In landscape (`160×80`), the panel's R/G/B subpixel stripes are stacked vertically rather than horizontally, so horizontal RGB subpixel AA causes color fringing. 4-bit (16-level) grayscale AA gives crisp, fringe-free edges in both orientations.
 
 ---
 
-## 2. Built-in Typography System (`open_fw/src/aa_fonts.c`)
+## 2. Built-in Typography System (`open_fw/src/ui/ui_fonts.c`)
 
-Three full-ASCII (`32..126`) Noto Sans anti-aliased fonts are already built into firmware (**14.6 KiB total Flash** — custom TTF fonts can be swapped in at build time via `open_fw/tools/gen_aa_fonts.py`):
+Three 4-bit anti-aliased LVGL v9 fonts (~`14.8 KiB` combined glyph bitmaps) are generated from system Noto Sans TTFs via [`open_fw/tools/gen_lvgl_fonts.py`](../open_fw/tools/gen_lvgl_fonts.py):
 
-| Token | Font & Size | Line Height | Approx. Chars / `160 px` | Best Used For | Flash Size |
-| --- | --- | --- | --- | --- | --- |
-| `g_font_ui_lg` | Noto Sans Bold **22 px** | ~28 px | ~10–12 chars | Hero timers (`01:24`), primary state (`Ready`, `REC`) | 8.1 KiB |
-| `g_font_ui_md` | Noto Sans Regular **14 px** | ~19 px | ~18–21 chars | Filenames (`Meeting_04.wav`), list items, menu options | 3.8 KiB |
-| `g_font_ui_sm` | Noto Sans Regular **11 px** | ~15 px | ~24–28 chars | Metadata (`16kHz`, `14h 20m free`), badges, button hints | 2.6 KiB |
+| LVGL Symbol | Font & Size | Approx. Chars / `160 px` | Best Used For | Bitmap Size |
+| :--- | :--- | :---: | :--- | :---: |
+| `ui_font_lg` | Noto Sans Bold **22 px** | ~10–12 chars | Hero timers (`13:21`, `02:00`), device name (`HW_76`), primary status | `8.7 KiB` |
+| `ui_font_md` | Noto Sans Medium **14 px** | ~18–21 chars | File rows (`Today 14:32`), settings rows, transcript captions | `3.7 KiB` |
+| `ui_font_sm` | Noto Sans Medium **11 px** | ~24–28 chars | Top status bar, durations, badges, bottom hint bar | `2.3 KiB` |
 
-- **Automatic ellipsis truncation:** `lcd_draw_str_aa_trunc()` measures proportional pixel widths and cleanly appends `...` so long filenames never collide with right-aligned durations or badges.
-- **Right/center alignment:** `lcd_measure_str_aa()` returns exact pixel width for any string.
-
----
-
-## 3. Physical Controls (No Touchscreen)
-
-All interactions use physical buttons + 1 hardware slide switch:
-
-| Control | Physical Location | Recommended UX Role |
-| --- | --- | --- |
-| **REC Slide Switch** | Side (2-position hardware latch) | **Slide UP = Instant Record** (even from idle/playback); **Slide DOWN = Save & Stop** |
-| **OK / ENTER** | Front center | Confirm / Play / Pause / Open Files |
-| **BACK** | Front | Go back one level / Exit menu (long-press reserved only for power-user actions) |
-| **LEFT / RIGHT** | Front | Previous/Next file, or `-10s` / `+10s` seek during playback |
-| **VOL+ / VOL-** | Side or front | Adjust headphone volume during playback; scroll list items up/down |
-| **POWER (ON/OFF)** | Side | Short press: wake / sleep screen; hold for 2 s to power off. On USB, the display sleeps while charging. Hold POWER again to start, or unplug to finish powering off |
+- **Tabular numerals:** Digits `0..9` share a uniform advance width so live recording and playback timers never jitter horizontally.
+- **Included UI symbols:** `±`, `·`, `×`, `…`, `−`, `■`, `▲`, `▶`, `▼`, `◀`, `●`, `✓`.
+- **Automatic truncation:** LVGL `LV_LABEL_LONG_DOT` handles clean ellipsis truncation on long names.
 
 ---
 
-## 4. Pixel-Accurate Anti-Aliased Examples
+## 3. Dark-Mode Color Palette (`open_fw/include/openfw_ui.h`)
 
-Every mockup below is rendered at exact **`160 × 80`** hardware resolution using the **exact 4-bit alpha & RGB565 blending math** used on the device (exported at 3× zoom for easy inspection):
+| Token | Hex | RGB565 | Role |
+| :--- | :---: | :---: | :--- |
+| `UI_COL_BG` | `#070B14` | `0x0042` | Global dark canvas |
+| `UI_COL_BAR` | `#111827` | `0x10C4` | Top status bar, transcript footer |
+| `UI_COL_TILE` | `#131B2B` | `0x10C5` | Unfocused tiles & subtle pills |
+| `UI_COL_PILL` | `#1F4E8C` | `0x1A71` | Focused tile / active selection pill |
+| `UI_COL_TEXT` | `#FFFFFF` | `0xFFFF` | Primary text & active labels |
+| `UI_COL_DIM` | `#9CB0CE` | `0x9D99` | Secondary labels & footer hints |
+| `UI_COL_CYAN` | `#42C8FF` | `0x465F` | Playback accent, values, Speaker 1 |
+| `UI_COL_RED` | `#FF3B3B` | `0xF9C7` | Active recording, delete guard, overload |
+| `UI_COL_AMBER` | `#FFB020` | `0xFD84` | Paused, VOR standby, warnings, Speaker 2 |
+| `UI_COL_GREEN` | `#3DDC84` | `0x3EF0` | Saved, charging, healthy VU level, Speaker 3 |
+| `UI_COL_PINK` | `#FF7AC8` | `0xFBD9` | Speaker 4 in synced CWX transcripts |
 
-| Screen | Preview | Key Techniques Shown |
-| --- | --- | --- |
-| **1. Home / Ready** | [ux_01_home.png](assets/ux_01_home.png) | Top status bar (free time + battery), `22 px` bold status, file count, rounded bottom hint pill |
-| **2. Active Recording** | [ux_02_recording.png](assets/ux_02_recording.png) | AA red dot + `22 px` bold timer, `REC` pill badge, live stereo L/R rounded VU bars with red peak-hold markers |
-| **3. File Browser** | [ux_03_files.png](assets/ux_03_files.png) | Full-width AA rounded selection pill, right-aligned durations, automatic `...` truncation, slim scrollbar |
-| **4. Playback** | [ux_04_playback.png](assets/ux_04_playback.png) | AA play triangle icon, big elapsed timer + muted total duration, rounded progress bar with AA scrubber dot, volume pill |
-| **5. Typography & Primitives** | [ux_05_typography_kit.png](assets/ux_05_typography_kit.png) | All 3 AA font sizes, rounded status pills, AA circles/dots |
+---
+
+## 4. Physical Controls (No Touchscreen)
+
+All interactions use physical buttons + 1 hardware slide switch (`1 kHz` IRQ SARADC debouncer in `open_fw/src/keys.c`):
+
+| Control | Physical Input | UX Role in `open_fw` |
+| :--- | :--- | :--- |
+| **REC Slide Switch** | Side latch (`PB6`) | **Slide UP = Instant Record** (even from idle/playback); **Slide DOWN = Save & Stop** |
+| **OK / PLAY** | Front (`PD0` ladder) | Confirm / Play / Pause / Drop spectrogram marker while recording / Hold to delete in Files |
+| **BACK** | Front (`PD0` ladder) | Return one level / Stop sync / Hold to eject USB disk |
+| **PREV / NEXT** | Side/front (`PD0` ladder) | Navigate tiles & lists; during playback: tap to skip, double-tap for prev/next file, hold for audible pitch-preserving `2×–5×` scrub |
+| **VOL+ / VOL-** | Side (`PD0` ladder) | Adjust headphone/speaker volume (32-step log dB curve); adjust values in Settings |
+| **POWER (ON/OFF)** | Side (`PMU 0x31`) | Short press: wake / blank screen; hold 2 s: power off (or charging standby while on USB) |
 
 ---
 
 ## 5. Practical Design Guidelines for `0.96"` (`160×80`)
 
-1. **Dark-mode first:** Deep dark backgrounds (`#0A0F1A` / `#000000`) with high-contrast bright text (`#FFFFFF`, `#9CB0CE`) maximize legibility on a tiny backlit TFT and hide bezel edges.
-2. **2–3 elements per screen max:** Treat each screen like a smartwatch glance — one hero element (`22 px` timer or active row), one supporting line (`14 px`), and one subtle status/hint bar (`11 px`).
-3. **Avoid `1 px` dim borders & dense tables:** Use filled rounded pills (`#162136` / `#20447A`) for hierarchy and focus states instead of thin wireframe boxes.
-4. **Design directly on a `160 × 80` px canvas (1×) in Figma:** Use `11 px`, `14 px`, and `22 px` (or any custom TTF sizes you prefer) — we can test any new screen in our QEMU emulator (`make -C open_fw test-qemu`) or live on the hardware in seconds.
-5. **Fast iteration loop:** Once designs are ready, we prototype them in the desktop emulator first (instant PNG screenshots) and live-preview directly in device SRAM with zero flashing.
+1. **Dark-mode first:** Deep navy-black (`#070B14`) with crisp white/cyan/amber accents maximizes legibility on a tiny backlit TFT and blends with the bezel.
+2. **Smartwatch glance density:** Keep 2–3 information zones per screen — a compact `13 px` top status bar, one hero focus zone (`22 px` timer, spectrogram, or 3-row list), and a subtle `13 px` footer hint.
+3. **Filled pills over wireframe boxes:** Use rounded solid pills (`UI_COL_PILL` / `UI_COL_TILE`) for focus states rather than dim `1 px` borders.
+4. **Edit visually in EEZ Studio, verify in `< 0.5 s` on host:** Open [`open_fw/cassini.eez-project`](../open_fw/cassini.eez-project), rebuild into `open_fw/src/ui/eez/`, and run `make -C open_fw test-host` to render all 14 screens to `/tmp/sl6801_openfw/ui_all_screens.ppm` and verify heap & pixel budgets. See **[LVGL_ARCHITECTURE.md](LVGL_ARCHITECTURE.md)** and **[EMULATOR_GUIDE.md](EMULATOR_GUIDE.md)** for full workflows.

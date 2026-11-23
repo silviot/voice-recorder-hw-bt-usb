@@ -169,7 +169,7 @@ Because SL6801 has no public datasheet and `DWT->CYCCNT` is unavailable, always 
 
 1. **Instrument with `us_timer_now()` + `openfw_log_*()`:** Wrap candidate hot paths (boot stages, SDIO/exFAT calls, UI `LOAD`/`DRAW`/`BLIT`, LVGL heap, or error registers) with `us_timer_now()` (`0x40082104`/`0x40082108`) and log compact one-line key/value telemetry into the 4 KiB SRAM ring (`g_openfw_log`).
 2. **Verify on host first:** Run `make -C open_fw all update-up test-host-san` (0 warnings, ASan/UBSan + `fsck.exfat` clean).
-3. **Flash & read zero-wire telemetry over USB:** Run `python3 tools/dev_cycle.py flash` (warm DFU reboot, preserves `HLKJ` and `PSMP` NVRAM) followed by `python3 tools/dev_cycle.py diag` (reads `g_openfw_log` over vendor SCSI `0xE0` with zero UART wiring).
+3. **Flash & read zero-wire telemetry over USB:** Run `python3 tools/dev_cycle.py flash` (warm DFU reboot, preserves `HLKJ` and `PSMP` NVRAM) followed by `python3 tools/dev_cycle.py log` (reads `g_openfw_log` over vendor SCSI `0xE0` with zero UART wiring).
 4. **Act on the dominant term and re-measure:** Re-run the same telemetry after each change to confirm the win on real hardware.
 
 **Verified silicon baselines & pitfalls discovered with this method:**

@@ -1,6 +1,6 @@
 # Firmware analysis scripts
 
-One-off scripts used to produce the findings in [`firmware_analysis.md`](../../firmware_analysis.md)
+One-off scripts used to produce the findings in [`docs/FIRMWARE_ANALYSIS.md`](../../docs/FIRMWARE_ANALYSIS.md)
 for the Smartlink SL6801 dual-core (BootROM / bootloader / FIRM) images in `dumps/`.
 They are kept as-is from the original analysis session — exploratory, no CLI
 arguments, each prints a sectioned report to stdout.
@@ -44,5 +44,5 @@ Run from the **repo root**, e.g. `python3 tools/fw_analysis/analyze_fw.py`.
 
 These scripts read your **own** dumps and print device-specific values
 (Bluetooth MAC, serial, pairing slots) verbatim. The public
-`firmware_analysis.md` redacts those values; keep local output to yourself if
+`docs/FIRMWARE_ANALYSIS.md` redacts those values; keep local output to yourself if
 you care about that.

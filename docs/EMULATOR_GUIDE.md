@@ -8,7 +8,7 @@ You can build, test, and visually inspect **Cassini OpenFW (`open_fw`)** — and
 
 | Workflow | Speed | What It Runs | Best For |
 | :--- | :--- | :--- | :--- |
-| **Host Visual UI Renderer (`test_ui_render`)** | `< 0.5 s` | Real C UI code (`lcd_st7735s.c`, `aa_fonts.c`, `ui_icons.c`, `ui_spectrogram.c`, `ui_screens.c`) compiled natively against a software ST7735S framebuffer | Rapid pixel-level UI layout & typography iteration (renders all 14 screens to a contact sheet in one shot) |
+| **Host Visual UI Renderer (`test_ui_render`)** | `< 0.5 s` | Real C UI code (`lcd_st7735s.c`, `cpu1_ui.c`, `ui_spectrogram.c`, `src/ui/*`, `src/ui/eez/*` + LVGL v9.2.2) compiled natively against a software ST7735S framebuffer | Rapid pixel-level UI layout & typography iteration (renders all 14 screens/sub-states to a contact sheet in one shot) |
 | **Headless ARM QEMU (`open_fw/tools/run_qemu.py`)** | `~4 s` | Real ARM Cortex-M4F Thumb-2 `open_fw` binary (`firmware_2M_openfw.bin`) on emulated SL6801 CPU, LCDC, SDIO/exFAT, SARADC keys, and PMU | Full end-to-end firmware verification, boot animation & `160×80` landscape screenshots, automated CI checks |
 | **Interactive Browser Emulator (`smartlink-sl6801-emulator` `./gui`)** | Real-time | Real ARM Cortex-M4F firmware with clickable on-screen buttons, keyboard shortcuts, and live `160×80` display | Interacting with the firmware as a user (navigating tiles, menus, settings, and testing button flows) |
 
@@ -31,13 +31,13 @@ The built emulator binary is placed at `/tmp/sl6801-emu/work/build/qemu-system-a
 
 ## 3. Fast UI Iteration: Host Visual Renderer (`< 0.5 s`)
 
-Every time you edit fonts, icons, colors, or screen layouts in `open_fw/src/ui_*.c`, run:
+Every time you edit fonts, styles, or screen layouts in `open_fw/cassini.eez-project` / `open_fw/src/ui/`, run:
 
 ```bash
 make -C open_fw test-host
 ```
 
-This compiles and executes all 5 host test suites, including `test_ui_render`, which renders **all 14 UI screens and sub-states** into a 2× zoomed contact sheet at:
+This compiles and executes all 6 host test suites (`test_core`, `test_drivers_mmio`, `test_ui_render`, `test_audio_dsp`, `test_player`, and `test_audio_bt_mmio`), including `test_ui_render`, which renders **all 14 UI screens and sub-states** into a 2× zoomed contact sheet at:
 
 ```text
 /tmp/sl6801_openfw/ui_all_screens.ppm

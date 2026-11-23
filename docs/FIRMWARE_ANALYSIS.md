@@ -1,17 +1,17 @@
 # Smartlink SL6801 (`HW_76` / `pen133_2.0.65`) — Firmware Disassembly & USB/Bluetooth Interaction Reference
 
-This document synthesizes a clean-room binary and Thumb-2 disassembly analysis of the dumped flash image ([dumps/firmware_2M.bin](dumps/firmware_2M.bin)), internal mask ROM dump ([dumps/bootrom_64K.bin](dumps/bootrom_64K.bin)), and SD volume backup (`dumps/sdcard_backup/`), focused on **making sense of the firmware architecture** and **interacting with the device over USB and Bluetooth**.
+This document synthesizes a clean-room binary and Thumb-2 disassembly analysis of the dumped flash image ([dumps/firmware_2M.bin](../dumps/firmware_2M.bin)), internal mask ROM dump ([dumps/bootrom_64K.bin](../dumps/bootrom_64K.bin)), and SD volume backup (`dumps/sdcard_backup/`), focused on **making sense of the firmware architecture** and **interacting with the device over USB and Bluetooth**.
 
 > [!NOTE]
 > Device-specific identifiers (the unit's Bluetooth MAC, factory serial string, and paired-device MAC addresses) are redacted in this public repository (`XX:XX:XX:XX:XX:xx`). Read the live values from your own dump's `PSMP` partition (see §2) or via `bluetoothctl`.
 
-> The exploratory one-off scripts that produced this analysis (PSMP parser, `llvm-objdump` ELF-wrapper disassemblers, string/xref scanners) are preserved in [`tools/fw_analysis/`](tools/fw_analysis/).
+> The exploratory one-off scripts that produced this analysis (PSMP parser, `llvm-objdump` ELF-wrapper disassemblers, string/xref scanners) are preserved in [`tools/fw_analysis/`](../tools/fw_analysis/).
 
 ---
 
 ## 1. Dual-Core SoC, Boot ROM & Complete Memory Map
 
-Disassembling the Boot ROM reset vector (`0x00000040` in [bootrom_64K.bin](dumps/bootrom_64K.bin)) and the `FIRM` startup code (`0x00804C40` / `0x0080555C` in [firmware_2M.bin](dumps/firmware_2M.bin)) reveals several previously undocumented architectural details of the **Smartlink SL6801**:
+Disassembling the Boot ROM reset vector (`0x00000040` in [bootrom_64K.bin](../dumps/bootrom_64K.bin)) and the `FIRM` startup code (`0x00804C40` / `0x0080555C` in [firmware_2M.bin](../dumps/firmware_2M.bin)) reveals several previously undocumented architectural details of the **Smartlink SL6801**:
 
 1. **Hardware Dual-Core Dispatch (`0x4000000C`):**
    * At reset (`0x00000068`), the Boot ROM reads `*(uint32_t *)0x4000000C` (`CPU_ID`):
@@ -19,7 +19,7 @@ Disassembling the Boot ROM reset vector (`0x00000040` in [bootrom_64K.bin](dumps
      * **`CPU1` (`!= 0`):** Bluetooth Baseband/Controller (`btc`) & DSP co-processor. Reads the entry pointer from mailbox `*(uint32_t *)0x30000600` (CPU1 SRAM `0x30000000`) and branches directly to it (`bx r0`).
 2. **True Internal Mask ROM Size (`384 KB`, not `64 KB`):**
    * `FIRM` contains **273 distinct `BL`/`B.W` targets** into ROM (`< 0x00100000`), of which **148 lie above `0x00010000`** (clustering up to `0x0004C2CB` for exception vectors and **`0x0005B800`** for the Boot ROM `.data` load image).
-   * [bootrom_64K.bin](dumps/bootrom_64K.bin) (`0x00000000..0x0000FFFF`) captures the reset startup, libc helpers (`rom_printf` `0x2B0`, `strlen` `0xAA2`, `strcmp` `0xAB2`, `memcpy` `0xB2A`, `memset` `0xBAA`, `memcmp` `0xC54`, `atoi` `0xD1E`), **the entire USB Device + USB Host Mass Storage stack (`0x4E00..0x8500`)**, and FreeRTOS kernel primitives (`SVC_Handler` `0xB4F4`, `SysTick_Handler` `0xB5A8`).
+   * [bootrom_64K.bin](../dumps/bootrom_64K.bin) (`0x00000000..0x0000FFFF`) captures the reset startup, libc helpers (`rom_printf` `0x2B0`, `strlen` `0xAA2`, `strcmp` `0xAB2`, `memcpy` `0xB2A`, `memset` `0xBAA`, `memcmp` `0xC54`, `atoi` `0xD1E`), **the entire USB Device + USB Host Mass Storage stack (`0x4E00..0x8500`)**, and FreeRTOS kernel primitives (`SVC_Handler` `0xB4F4`, `SysTick_Handler` `0xB5A8`).
 
 > [!TIP]
 > You can dump the full **384 KB** mask ROM (`0x00000000..0x0005FFFF`) in normal Card Reader mode without opening the device:
@@ -124,8 +124,8 @@ Disassembling `FIRM`'s SCSI CDB interceptor (`0x812AD8`), `HAL_sd_disk_read` (`0
 3. **Bug #1 — Off-by-one on post-incremented `r5` (`0x8161FA`):** When reading `LBA = 122,101,756` (`total_sectors - 4`, `count = 1`), entry keeps `read_mode = 1` (open-ended `CMD18`, card stays in `DATA` streaming state), then `0x816244` increments `r5` to `122,101,757`. At exit (`0x8161FA`), `cmp (total_sectors - 3), r5` is equal, so `bhi 0x8162cc` is NOT taken and `0x81620E` **erroneously sets `skip_cmd12` (`[r4+0xd0] = 1`)** while the card is still actively streaming!
 4. **Bug #2 — Illegal `CMD18` in `DATA` state (`0x815C22`):** On the immediately following read at **`LBA = 122,101,757`** (`total_sectors - 3`), entry switches `read_mode = 2` and calls `sd_read_blocks(r4, cache_buf, 122101757, 3)`. Because `122,101,757 == next_expected_lba` (`[r4+0x98]`), `0x815C1E` skips the `CMD12` stop check and falls directly into `0x815B38`, **issuing a new `CMD18` (`AUTO_CMD12`) to an SD card still in `DATA` state without sending `CMD12` first** — wedging the SDIO bus until Linux's 15-second `usb-storage` timeout resets the port.
 5. **Two Ways to Fix It:**
-   * **Host-side (no flashing):** [50-smartlink-sl6801.rules](50-smartlink-sl6801.rules) + `-1 cluster` shrink in [fix_exfat_boundary.py](tools/fix_exfat_boundary.py) keeps `udevd` and `fwupd` below `total_sectors - 256`.
-   * **Direct Firmware Patch (`--patch sdio-end-of-disk` in [tools/patch_firmware.py](tools/patch_firmware.py)):** Two `llvm-objdump`-verified hunks (34 bytes total in `.ramtext`):
+   * **Host-side (no flashing):** [50-smartlink-sl6801.rules](../50-smartlink-sl6801.rules) + `-1 cluster` shrink in [fix_exfat_boundary.py](../tools/fix_exfat_boundary.py) keeps `udevd` and `fwupd` below `total_sectors - 256`.
+   * **Direct Firmware Patch (`--patch sdio-end-of-disk` in [tools/patch_firmware.py](../tools/patch_firmware.py)):** Two `llvm-objdump`-verified hunks (34 bytes total in `.ramtext`):
      * **Hunk 1 (`0x815C22`, flash `0x042452`, 6 B):** On sequential reads, only continue streaming if `read_mode == 1`; otherwise branch to `0x815C4C` so `CMD12` is sent before issuing finite `CMD18`.
      * **Hunk 2 (`0x8161F0`, flash `0x042A20`, 28 B):** Check `[r4+0x38] == 2` (actual mode switch) instead of post-incremented `r5 >= total_sectors - 3`, and verify `[r4+0x98] >= r5` before setting `skip_cmd12 = 1` (preventing cache-hit corruption too). Fixes Linux USB on **any** SD card without shrinking partitions!
 
@@ -158,7 +158,7 @@ All vendor commands use standard 31-byte USB MSC CBW (`USBC`, `0x43425355`) with
 
 ### 3.4 Three Ways to Interact via USB from Linux
 1. **Standard Filesystem Access (Recordings, Music, Media DB, `0:\update.up`):**
-   * With [50-smartlink-sl6801.rules](50-smartlink-sl6801.rules) and the `-1 cluster` exFAT boundary shrink applied, mount `/dev/sdX1` normally to pull WAV recordings from `record/`, manage audio/video/ebooks, or inspect `DBROOT/db_wave.db`.
+   * With [50-smartlink-sl6801.rules](../50-smartlink-sl6801.rules) and the `-1 cluster` exFAT boundary shrink applied, mount `/dev/sdX1` normally to pull WAV recordings from `record/`, manage audio/video/ebooks, or inspect `DBROOT/db_wave.db`.
 2. **Direct Vendor `0xC0` USB Tooling (`libusb` / Python `pyusb`):**
    * Detaching `usb-storage` via `libusb` lets a host script read `PSMP` NVRAM (`read_flash 0x1FC000 16K`) in <50 ms (e.g., to inspect battery voltage, paired BT link keys, or recording settings) or invoke firmware functions in `FIRM` (such as reading/setting `/dev/rtc` via `0xD15070` so recordings always have accurate timestamps!).
 3. **Custom XIP App / USB Command Extension:**
@@ -306,7 +306,7 @@ ced470: 00d2         lsls   r2, r2, #0x3     @ r2 = wBitsPerSample (16)
 ced472: 930a         str    r3, [sp, #0x28]  @ nAvgBytesPerSec
 ced474: f8ad 202e    strh.w r2, [sp, #0x2e]  @ wBitsPerSample
 ```
-Because `nAvgBytesPerSec == nBlockAlign * nSamplesPerSec`, this can be fixed cleanly in-place (exact same 20 bytes at flash `0x0ED464..0x0ED477`, followed by recomputing partition CRC-16 at `0x00D01C` — automated by [tools/patch_firmware.py](tools/patch_firmware.py) `--patch wav-blockalign`):
+Because `nAvgBytesPerSec == nBlockAlign * nSamplesPerSec`, this can be fixed cleanly in-place (exact same 20 bytes at flash `0x0ED464..0x0ED477`, followed by recomputing partition CRC-16 at `0x00D01C` — automated by [tools/patch_firmware.py](../tools/patch_firmware.py) `--patch wav-blockalign`):
 ```armasm
 ced464: 7bd2         ldrb   r2, [r2, #0xf]   @ r2 = bytesPerSample
 ced466: 4353         muls   r3, r2, r3       @ r3 = bytesPerSample * nChannels (nBlockAlign = 4!)
@@ -341,7 +341,7 @@ Both `/dev/rtc` (`read`/`write` require `len >= 10`) and FatFs `get_fattime` (`0
 * **`HAL_rtc_get(rtc_time_t *out)`:** `0x0080D4E4` (in `.ramtext`, pure lock-free MMIO read via `*(uint32_t *)0x81A430`)
 * **`HAL_rtc_set(const rtc_time_t *in)`:** `0x00CE88D4` → `0x00CE898C` (pure lock-free MMIO write; automatically computes leap-year bit 24)
 * **Cached RAM copy:** `0x00821216` (refreshed every 1000 ms by `sync_rtc` timer `0xD15030`)
-* **Zero-flash USB RTC Sync ([tools/usb_rtc_sync.py](tools/usb_rtc_sync.py)):** In normal `301a:2801` Card Reader mode, `usb_rtc_sync.py` writes a 20–28 byte Thumb-2 stub into the unused upper half of Boot ROM's 512-byte USB MSC data buffer (`0x00800E80`) via `0xC0` `WRITERAM` (`0x09`) and executes it via `RUNRAM` (`0x0A`), setting `*(uint16_t *)0x00800DEE = 10` on reads to return the live `rtc_time_t` from `0x00800DF0` without modifying flash.
+* **Zero-flash USB RTC Sync ([tools/usb_rtc_sync.py](../tools/usb_rtc_sync.py)):** In normal `301a:2801` Card Reader mode, `usb_rtc_sync.py` writes a 20–28 byte Thumb-2 stub into the unused upper half of Boot ROM's 512-byte USB MSC data buffer (`0x00800E80`) via `0xC0` `WRITERAM` (`0x09`) and executes it via `RUNRAM` (`0x0A`), setting `*(uint16_t *)0x00800DEE = 10` on reads to return the live `rtc_time_t` from `0x00800DF0` without modifying flash.
 
 ---
 
@@ -461,7 +461,7 @@ Verified against `dumps/sdcard_backup/DBROOT/{db_wave.db,db_content.db}` and `FI
 * **`bt_info` (PSMP key `12`, 1 B, SRAM `0x0081BA04`):** Stores BT power/connection state (`0` = Off, `1` = On/Disconnected, `2` = Connected), **not** music/phone mode. Both power-off (`0x00CEEB08`) and USB `Charge & Transfer` (`0x00CFB7FC`) call `bt_close_stack()` (`0x00D66E3C`), whose `stack_close` callback (`0x00CF5F60`) writes `bt_info = 0` — causing `pstr_bt_nv_read` (`0x00CF0EA0`) to skip `bt_open_stack()` on the next boot.
 * **`profile` (PSMP key `9`, 4 B, SRAM `0x0081B80C`):** Stores **`music mode` (`0x0200`) vs `phone mode` (`0x0400`)**, loaded at boot by `bt_subsystem_init` (`0x00CEA0F8`, defaults to `0x400` `phone mode` and persists across reboots).
 * **USB Charging (`Charge & Play`):** VBUS plug-in does **not** close Bluetooth; selecting `Charge & Play` (`pstr_select_usb_mode(2)` at `0x00CFB7C8`) or letting the USB prompt time out keeps Bluetooth 100% active while charging.
-* **Verified Boot & Security Patches (in [tools/patch_firmware.py](tools/patch_firmware.py)):**
+* **Verified Boot & Security Patches (in [tools/patch_firmware.py](../tools/patch_firmware.py)):**
   * **`--patch bt-autoboot`** (`0x00CFBD8A` / flash `0x0FBD8A`, 4 B): `1f f0 a3 ff` (`bl soft_timer_reset("pstr")`) → `78 f0 41 f9` (`bl 0x00D74010` `bt_autoboot_post_welcome`) — calls `bt_open_stack()` strictly *after* `ViewTask` dismisses the `"welcome"` splash screen. *(Note: patching `0x00CF0EC6` fires before `pstr_start_view()` and hangs on `"welcome"`, and `0x400` in `0x00CEA132` forces Music/A2DP mode rather than Phone/HFP mode.)*
   * **`--patch bt-invisible-boot`** (`0x00D5D47A` / flash `0x15D47A`, 4 B): `40 f2 01 13` → `40 f2 01 03` (`page_en=1, inq_en=0`) — boots connectable-only so paired phones reconnect immediately while nearby scans cannot discover `HW_76`.
   * **`--patch bt-pair-menu`** (`0x00CFFA56` / flash `0x0FFA56`, 4 B): `03 f0 85 f9` (`bl page_bt_menu_create`) → `74 f0 e3 fa` (`bl 0x00D74020` `bt_pair_menu_hook`) — opens a 60-second physical-presence pairing window, enables discoverability via `USER_EVT_SET_DISCOVERABLE (0x8004)`, and renders a yellow `PIN: XXXXXX` LVGL banner on the Bluetooth menu LCD.
@@ -575,7 +575,7 @@ Scanning all literal-pool loads and `MOVT` instructions across `bootrom_384K.bin
 
 ## 18. Verified CPU PLL, SPI NOR XIP, 1-Bit SDIO & Audio ADC + DMAC Architecture
 
-Verified via Thumb-2 disassembly (`FIRM` and BootROM `0x000000..0x05FFFF`) for clean-room bare-metal implementation in [open_fw](open_fw/):
+Verified via Thumb-2 disassembly (`FIRM` and BootROM `0x000000..0x05FFFF`) for clean-room bare-metal implementation in [open_fw](../open_fw/):
 
 ### 18.1 CPU PLL0 (`CRU = 0x40080000`) & SPI NOR XIP (`0x30000000..0x30000804`)
 * **PLL0 Frequency:** `f_PLL0 = 48 MHz * M / N` (`CRU+0x00`: `[3:0]=N`, `[15:8]=M`, `[28]=LOCK`, `[16]=OUT_EN`, `[31:30]=0x3`); `AON+0xD8` bit 2 supplies PLL0 analog power.
@@ -595,7 +595,7 @@ Verified via Thumb-2 disassembly (`FIRM` and BootROM `0x000000..0x05FFFF`) for c
 
 ## 19. Verified Mentor MUSB USB (`0x40040000`) & Mask ROM `RW-BT` HCI (`0x020000..0x0467FF`)
 
-Verified via Thumb-2 disassembly (`FIRM` and BootROM `0x000000..0x05FFFF`) for Layer 4/5 in [open_fw](open_fw/):
+Verified via Thumb-2 disassembly (`FIRM` and BootROM `0x000000..0x05FFFF`) for Layer 4/5 in [open_fw](../open_fw/):
 
 ### 19.1 Mentor MUSB USB 2.0 OTG Controller (`0x40040000`) & PHY Wrapper (`+0x300`)
 * **Clocks, Reset & Pads:** Uses `PLL0`/`PLL2` `192 MHz` 48 MHz tap (`CRU+0x30 |= (1<<6)`, clk ID `0x09`), CRU reset ID `0x23` (`CRU+0x74`/`0x64` bit 3 + 2 ms delay), USB clk ID `0x12` (`CRU+0x84 |= 1`), `SYSCTL+0x00 |= (1<<0) | (1<<6)`, and `PB22`/`PB23` configured to `mux=15` (Analog DP/DM).
@@ -612,7 +612,7 @@ Verified via Thumb-2 disassembly (`FIRM` and BootROM `0x000000..0x05FFFF`) for L
 
 ## 20. Verified BT RF LUTs, Mask ROM Hook Tables, USB VBUS/PHY Detect & Binary `AON_RTC`
 
-Verified via Thumb-2 disassembly (`FIRM` and BootROM `0x000000..0x05FFFF`) for Layer 5 in [open_fw](open_fw/):
+Verified via Thumb-2 disassembly (`FIRM` and BootROM `0x000000..0x05FFFF`) for Layer 5 in [open_fw](../open_fw/):
 
 ### 20.1 BT RF/Modem Calibration, eFuse Trim & Mask ROM Hook Tables
 * **BT Modem Table (`0x00C48844`):** 27-byte progression `0x2D + 2*i` (`i = 0..26`); runtime init (`0x00D54D38`) subtracts `6` from each byte (`0x27 + 2*i`) and packs bytes `0..25` into `0x40010298..0x400102B0`.
@@ -634,7 +634,7 @@ Verified via Thumb-2 disassembly (`FIRM` and BootROM `0x000000..0x05FFFF`) for L
 
 ## 21. Verified RF Calibration Algorithms, Clean-Room `RW-BT` ROM Init & H4 HCI Internals
 
-Verified via Thumb-2 disassembly (`FIRM` and BootROM `0x000000..0x05FFFF`) for Layer 5b in [open_fw](open_fw/):
+Verified via Thumb-2 disassembly (`FIRM` and BootROM `0x000000..0x05FFFF`) for Layer 5b in [open_fw](../open_fw/):
 
 ### 21.1 BR/EDR-Only Silicon Confirmation
 * **No BLE Hardware / Controller:** SL6801 Mask ROM (`0x020000..0x0467FF`) and baseband MMIO (`0x40020000..0x40020190`) implement **Classic Bluetooth BR/EDR (`RW-BT`) only** — no `LE` (`OGF=0x08`, `LLM`, `LLC`) exists in ROM or silicon.
@@ -651,7 +651,7 @@ Verified via Thumb-2 disassembly (`FIRM` and BootROM `0x000000..0x05FFFF`) for L
 
 ## 22. OpenFW Layer 5c: Clean-Room Classic BT L2CAP/SDP/RFCOMM, `+XREC v5`, and exFAT Delete/Stat
 
-Implemented and host-verified in [open_fw](open_fw/):
+Implemented and host-verified in [open_fw](../open_fw/):
 
 * **exFAT Maintenance (`exfat.c`, `openfw_fs.h`):** Added `exfat_stat_fs()` (reading the `0x81` Allocation Bitmap without 64-bit division helpers) and `exfat_delete_file()` (clearing directory entry sets `0x85`/`0xC0`/`0xC1` across sector/cluster boundaries, clearing the bitmap bits, and unlinking FAT chains). Validated against `/usr/sbin/fsck.exfat -n` (`clean. directories 2, files 1`).
 * **Classic BR/EDR L2CAP + SDP + RFCOMM (`bt_spp.c`, `openfw_bt_spp.h`):** Allocation-free server with ACL L2CAP reassembly, signaling (`CID 0x0001`), strict SDP `ServiceSearchPattern` matching advertising SPP (`UUID 0x1101`) on RFCOMM Channel 1 (`"Cassini"`, `80`-byte attribute record), RFCOMM MUX (`DLCI 0`/`2`) with credit-based flow negotiation, direct TX queueing, and disconnect notifications to drop authentication state on link teardown.
@@ -662,7 +662,7 @@ Implemented and host-verified in [open_fw](open_fw/):
 
 ## 23. OpenFW Layer 5d: Clean-Room `RW-BT` HCI Controller, IRQ 26 ISR & On-Device Classic BT `+XREC` Mode
 
-Implemented and verified in [open_fw](open_fw/):
+Implemented and verified in [open_fw](../open_fw/):
 
 * **`TASK_HCI` (`0x3C`), `RWBT` IRQ 26 & Active-Link Hooks (`bt_hci.c`, `startup.c`, `sl6801_rom.h`):**
   * `.ramtext` `RWBT_IRQHandler` at vector slot `42` (NVIC IRQ `26`) acknowledges `RWBT_INTSTAT` (`0x40020010` / `0x40020018`) and accumulates flags into a bottom-half `bt_irq_bh_poll()` dispatching BootROM `rwbt_cscnt_isr` (`0x0002F3A5`), `rwbt_rx_isr` (`0x0002F389`), and `ke_event_set(1)` (`0x00030DC1`).
@@ -675,24 +675,24 @@ Implemented and verified in [open_fw](open_fw/):
 
 ## 24. Host MMIO Driver Harness, SRAM Log Ring, Headless QEMU Boot Verification & Partial Flash Tooling
 
-Implemented and verified in [open_fw](open_fw/) and [tools/flash_ranges.py](tools/flash_ranges.py):
+Implemented and verified in [open_fw](../open_fw/) and [tools/flash_ranges.py](../tools/flash_ranges.py):
 
 * **Host MMIO Driver Portability Layer & Virtual SoC Tests (`sl6801_regs.h`, `sl6801_rom.h`, `test_drivers_mmio.c`):**
-  * Added `*_ADDR` MMIO register address constants and an `#ifdef OPENFW_HOST_MMIO` / `#else` portability layer (`openfw_mmio_{rd,wr}{8,16,32}`, `set32`/`clr32`/`rmw32`, `OPENFW_NOP`/`OPENFW_DSB`/`OPENFW_WFI`) in [sl6801_regs.h](open_fw/include/sl6801_regs.h) and host `rom_*` externs in [sl6801_rom.h](open_fw/include/sl6801_rom.h), converting all 8 bare-metal hardware drivers (`wdt_timer.c`, `uart.c`, `rtc.c`, `pmu.c`, `keys.c`, `sdio.c`, `lcd_st7735s.c`, `usb_musb.c`).
-  * Built [test_drivers_mmio.c](open_fw/tests/test_drivers_mmio.c) natively under `-O2 -Wall -Wextra -Werror -DOPENFW_HOST_MMIO` and integrated it into `make -C open_fw test-host`, exercising virtualized PPB/US_TIMER rollover, WDT feeding, UART0 + `g_openfw_log`, AON RTC rollover & Kim Larsen weekday/leap-year logic, PMU RTWI + reboot vectors, SARADC key decoding + PB6 slide switch, ST7735S RGB565 panel + PWM3 backlight, 1-bit SDIO + exFAT read/write, and Mentor MUSB EP0/EP1 SCSI BOT end-to-end (`7/7` MMIO suites passed alongside `test_core` + `exfat-img` + `fsck.exfat -n` clean).
+  * Added `*_ADDR` MMIO register address constants and an `#ifdef OPENFW_HOST_MMIO` / `#else` portability layer (`openfw_mmio_{rd,wr}{8,16,32}`, `set32`/`clr32`/`rmw32`, `OPENFW_NOP`/`OPENFW_DSB`/`OPENFW_WFI`) in [sl6801_regs.h](../open_fw/include/sl6801_regs.h) and host `rom_*` externs in [sl6801_rom.h](../open_fw/include/sl6801_rom.h), converting all 8 bare-metal hardware drivers (`wdt_timer.c`, `uart.c`, `rtc.c`, `pmu.c`, `keys.c`, `sdio.c`, `lcd_st7735s.c`, `usb_musb.c`).
+  * Built [test_drivers_mmio.c](../open_fw/tests/test_drivers_mmio.c) natively under `-O2 -Wall -Wextra -Werror -DOPENFW_HOST_MMIO` and integrated it into `make -C open_fw test-host`, exercising virtualized PPB/US_TIMER rollover, WDT feeding, UART0 + `g_openfw_log`, AON RTC rollover & Kim Larsen weekday/leap-year logic, PMU RTWI + reboot vectors, SARADC key decoding + PB6 slide switch, ST7735S RGB565 panel + PWM3 backlight, 1-bit SDIO + exFAT read/write, and Mentor MUSB EP0/EP1 SCSI BOT end-to-end (`7/7` MMIO suites passed alongside `test_core` + `exfat-img` + `fsck.exfat -n` clean).
 * **Zero-Wire SRAM Debug Log Ring (`uart.c`, `openfw.h`):**
-  * Added `g_openfw_log` (`openfw_log_t`, magic `0x474C464Fu` `'OFLG'`, `4096`-byte circular buffer, monotonic `write_idx`, `dropped_bytes`) in [uart.c](open_fw/src/uart.c) / [openfw.h](open_fw/include/openfw.h), plus a `50000`-poll `UART0_TX_WAIT_MAX` bound so stalled TX FIFOs never hang early boot and dropped hardware bytes are recorded while preserving the SRAM log.
+  * Added `g_openfw_log` (`openfw_log_t`, magic `0x474C464Fu` `'OFLG'`, `4096`-byte circular buffer, monotonic `write_idx`, `dropped_bytes`) in [uart.c](../open_fw/src/uart.c) / [openfw.h](../open_fw/include/openfw.h), plus a `50000`-poll `UART0_TX_WAIT_MAX` bound so stalled TX FIFOs never hang early boot and dropped hardware bytes are recorded while preserving the SRAM log.
 * **Headless Cortex-M4F QEMU SL6801 Verification (`qemu_boot_stub.S`, `run_qemu.py`, `make -C open_fw test-qemu`):**
-  * Added [qemu_boot_stub.S](open_fw/tools/qemu_boot_stub.S) (synthetic `0x10000000` reset vector copying 4 KiB `.ram_boot` from XIP `0x00C0E430` to SRAM `0x00804C00`) and [run_qemu.py](open_fw/tools/run_qemu.py) (built-in pure-Python ELF32 symbol resolver, GDB RSP client, and stdlib RGB24 PNG exporter) wired to `make -C open_fw test-qemu` against `smartlink-sl6801`.
+  * Added [qemu_boot_stub.S](../open_fw/tools/qemu_boot_stub.S) (synthetic `0x10000000` reset vector copying 4 KiB `.ram_boot` from XIP `0x00C0E430` to SRAM `0x00804C00`) and [run_qemu.py](../open_fw/tools/run_qemu.py) (built-in pure-Python ELF32 symbol resolver, GDB RSP client, and stdlib RGB24 PNG exporter) wired to `make -C open_fw test-qemu` against `smartlink-sl6801`.
   * Observed full QEMU Cortex-M4F boot into `open_fw` XIP main loop: `PC=0x00c0f51c`, `g_systick_ms=499`, `g_openfw_log` (`magic=0x474c464f`, `write_idx=206`, `dropped=0`) + UART0 banner (`CPU=96MHz XIP=0x00C0F430 CPU_ID=0 VBAT_MV=4075`, `SD: OK 0f`), SDIO/exFAT mounted (`sd_init=1 sdhc=1 rca=0x0001 sectors=262144 mounted=1`), and active ST7735S `80x160 @ 0x50000000` framebuffer rendered (`nonblack=2465/12800`, `unique_colors=155`).
 * **Clean-Room Chunked Partial SPI NOR Flasher (`tools/flash_ranges.py`):**
-  * Implemented [tools/flash_ranges.py](tools/flash_ranges.py) targeting BootROM USB DFU PID `0x301a:2800` only (`0x81 INIT`, `0x00 READID`, `0x03 ERASE4K`, `0x02 WRITEPAGE`, `0x07 READ`, `0x82 CRC`, `0x86 PING`) with `--diff` 4 KiB sector coalescing, `--range`, `--chunk`, `--retries`, hardware CRC-16 + byte readback `--verify`, default `--dry-run` safety guard, and `--self-test` (`PASSED`). Dry-run diff against stock `firmware_2M.bin` coalesced to `1` range (`0x00D000..0x174000`, `359` sectors, `1,470,464 B`).
+  * Implemented [tools/flash_ranges.py](../tools/flash_ranges.py) targeting BootROM USB DFU PID `0x301a:2800` only (`0x81 INIT`, `0x00 READID`, `0x03 ERASE4K`, `0x02 WRITEPAGE`, `0x07 READ`, `0x82 CRC`, `0x86 PING`) with `--diff` 4 KiB sector coalescing, `--range`, `--chunk`, `--retries`, hardware CRC-16 + byte readback `--verify`, default `--dry-run` safety guard, and `--self-test` (`PASSED`). Dry-run diff against stock `firmware_2M.bin` coalesced to `1` range (`0x00D000..0x174000`, `359` sectors, `1,470,464 B`).
 
 ---
 
 ## 25. Stage-0 BootROM / Audio DAC Hardware Findings & OpenFW Layer 5e (Two-Way OTA, `0xE0` USB, Power/UI & CI)
 
-Verified via BootROM/stock disassembly (`dumps/bootrom_384K.bin`, `dumps/firmware_2M.bin`) and implemented in [open_fw](open_fw/):
+Verified via BootROM/stock disassembly (`dumps/bootrom_384K.bin`, `dumps/firmware_2M.bin`) and implemented in [open_fw](../open_fw/):
 
 ### 25.1 Stage-0 BootROM `HLKJ` Loader & GPIO ID Decoder
 * **`HLKJ` Stage-1 SPI NOR Loader (`0x04CC74`, `0x04CCB8`):**
@@ -709,13 +709,13 @@ Verified via BootROM/stock disassembly (`dumps/bootrom_384K.bin`, `dumps/firmwar
   * `/dev/exti` (`open=0x00D3AC55`, `read=0x00D3AC3D`) samples GPIO ID `0x15800` (`PB11`) and feeds `earphoone_exist` inside `writer.pcm` (`0x00D3DE40` / `0x00D3DEE6`). Audio codec init/control (`0x00D4D78C`, `0x00D4DB0C`) also configures `PB10` (`0x15000`), `PB11` (`0x15800`), `PB14` (`0x17000`), `PB15` (`0x17800`), `PB19` (`0x19800`), and `PB20` (`0x1A000`).
 
 ### 25.3 OpenFW Layer 5e Additions (Core Features, MMIO Tests, Tooling & CI)
-* **Two-Way Wireless BT `+XREC v5` Remote Control & OTA ([xrec_proto.c](open_fw/src/xrec_proto.c), [bt_hci.c](open_fw/src/bt_hci.c), [openfw_xrec.h](open_fw/include/openfw_xrec.h)):**
-  * Wired `+XREC:RECSTART` / `+XREC:RECSTOP` to `recorder_start()` / `recorder_stop()` and added binary `+XREC:PUT,<off>,<len>,<crc>,OTA:<bytes>` streaming to `0:/update.up` (with CRC-16 verification + idempotent retry handling) plus `+XREC:OTA` triggering `pmu_reboot_to_sd_ota()` after ACL TX drains (`250 ms`), keeping OpenFW two-way compatible with [tools/bt_sync.py](tools/bt_sync.py) `--ota`.
+* **Two-Way Wireless BT `+XREC v5` Remote Control & OTA ([xrec_proto.c](../open_fw/src/xrec_proto.c), [bt_hci.c](../open_fw/src/bt_hci.c), [openfw_xrec.h](../open_fw/include/openfw_xrec.h)):**
+  * Wired `+XREC:RECSTART` / `+XREC:RECSTOP` to `recorder_start()` / `recorder_stop()` and added binary `+XREC:PUT,<off>,<len>,<crc>,OTA:<bytes>` streaming to `0:/update.up` (with CRC-16 verification + idempotent retry handling) plus `+XREC:OTA` triggering `pmu_reboot_to_sd_ota()` after ACL TX drains (`250 ms`), keeping OpenFW two-way compatible with [tools/bt_sync.py](../tools/bt_sync.py) `--ota`.
   * Persists Classic BT link keys across reboots in 96-byte `"BLK1"` `0:/bt_keys.bin` alongside `0:/cassini.key`.
-* **Power Management, Recording Safety & On-Device UI ([main.c](open_fw/src/main.c), [recorder.c](open_fw/src/recorder.c)):**
+* **Power Management, Recording Safety & On-Device UI ([main.c](../open_fw/src/main.c), [recorder.c](../open_fw/src/recorder.c)):**
   * Added `wfi_sleep_ms(25u)` SysTick `wfi` idle sleep, PWM3 backlight auto-dim (`15%` @ 15s, `0%` @ 30s with wake on key/switch/USB/BT), low-VBAT recording guard (`< 3450 mV` auto-stop & flush, `< 3550 mV` amber/red indicator), 2s silent SD hot-plug re-probe when idle, `PB6` switch support in BT mode, configurable `recorder_set_gain()`, and `KEY_LEFT` `FILES` / `SETTINGS` menu.
-* **Vendor SCSI `0xE0` Diagnostics & Host Tools ([usb_scsi.c](open_fw/src/usb_scsi.c), [usb_musb.c](open_fw/src/usb_musb.c), [tools/openfw_usb.py](tools/openfw_usb.py)):**
-  * Added `usb_msc_set_vendor_cb()` and SCSI `0xE0` subcommands (`0x01 GET_INFO`, `0x02 READ_LOG`, `0x03 GET_RTC`, `0x04 SET_RTC`), clean-room client [tools/openfw_usb.py](tools/openfw_usb.py) (with `--self-test`), `1209:0001` redirect in [tools/usb_rtc_sync.py](tools/usb_rtc_sync.py), and `Cassini_`/`HW_` auto-discovery in [tools/bt_sync.py](tools/bt_sync.py).
+* **Vendor SCSI `0xE0` Diagnostics & Host Tools ([usb_scsi.c](../open_fw/src/usb_scsi.c), [usb_musb.c](../open_fw/src/usb_musb.c), [tools/openfw_usb.py](../tools/openfw_usb.py)):**
+  * Added `usb_msc_set_vendor_cb()` and SCSI `0xE0` subcommands (`0x01 GET_INFO`, `0x02 READ_LOG`, `0x03 GET_RTC`, `0x04 SET_RTC`), clean-room client [tools/openfw_usb.py](../tools/openfw_usb.py) (with `--self-test`), `1209:0001` redirect in [tools/usb_rtc_sync.py](../tools/usb_rtc_sync.py), and `Cassini_`/`HW_` auto-discovery in [tools/bt_sync.py](../tools/bt_sync.py).
 * **Audio/Recorder/`bt_rf` MMIO Suite, Deterministic Packing, QEMU & CI:**
-  * Added `OPENFW_HOST_MMIO` + `OPENFW_IRQ_SAVE`/`RESTORE` + `OPENFW_HOST_DMAC_BUF` for [audio_dma.c](open_fw/src/audio_dma.c) and [bt_rf.c](open_fw/src/bt_rf.c) in [sl6801_regs.h](open_fw/include/sl6801_regs.h) and native [test_audio_bt_mmio.c](open_fw/tests/test_audio_bt_mmio.c) (checked with `fsck.exfat -n`), deterministic `pack_firm.py` (`--timestamp` / `SOURCE_DATE_EPOCH`, default `0`), [sl6801_qemu_openfw.patch](open_fw/tools/sl6801_qemu_openfw.patch) + [setup_qemu.sh](open_fw/tools/setup_qemu.sh), SysTick + `KEY_ENTER -> USB MSC` QEMU assertions in [run_qemu.py](open_fw/tools/run_qemu.py), and GitHub Actions workflow [.github/workflows/ci.yml](.github/workflows/ci.yml).
+  * Added `OPENFW_HOST_MMIO` + `OPENFW_IRQ_SAVE`/`RESTORE` + `OPENFW_HOST_DMAC_BUF` for [audio_dma.c](../open_fw/src/audio_dma.c) and [bt_rf.c](../open_fw/src/bt_rf.c) in [sl6801_regs.h](../open_fw/include/sl6801_regs.h) and native [test_audio_bt_mmio.c](../open_fw/tests/test_audio_bt_mmio.c) (checked with `fsck.exfat -n`), deterministic `pack_firm.py` (`--timestamp` / `SOURCE_DATE_EPOCH`, default `0`), [sl6801_qemu_openfw.patch](../open_fw/tools/sl6801_qemu_openfw.patch) + [setup_qemu.sh](../open_fw/tools/setup_qemu.sh), SysTick + `KEY_ENTER -> USB MSC` QEMU assertions in [run_qemu.py](../open_fw/tools/run_qemu.py), and GitHub Actions workflow [.github/workflows/ci.yml](../.github/workflows/ci.yml).
 

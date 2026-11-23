@@ -9,7 +9,6 @@ Automates the hands-free workflow across OpenFW (1209:0001) and BootROM DFU (301
   - flash         : (optional build) switch to DFU, flash 0x00D000..end_off, reboot & verify
   - exp <src.c>   : compile, upload, run SRAM experiment, print result + log (auto-recovers on crash)
   - log [--reset] : read or reset g_openfw_log
-  - watch-answers : list /tmp/firmware-binary-analysis-answers/*.md with timestamps & sizes
   - --self-test   : offline verification of safe flash range bounds & USB sysfs detection
 
 SPDX-License-Identifier: MIT
@@ -18,7 +17,6 @@ SPDX-License-Identifier: MIT
 from __future__ import annotations
 
 import argparse
-import datetime
 import os
 from pathlib import Path
 import subprocess
@@ -31,7 +29,6 @@ TOOLS_DIR = REPO_ROOT / "tools"
 OPENFW_DIR = REPO_ROOT / "open_fw"
 FIRM_BIN = Path(os.environ.get("OPENFW_FIRM_BIN", "/tmp/sl6801_openfw/open_fw_firm.bin"))
 IMAGE_2M = REPO_ROOT / "dumps" / "firmware_2M_openfw.bin"
-ANSWERS_DIR = Path("/tmp/firmware-binary-analysis-answers")
 
 PARTITION_TABLE_OFF = 0x00D000
 FIRM_PART_OFF = 0x00E000
@@ -333,19 +330,6 @@ def cmd_log(args: argparse.Namespace) -> int:
         client.close()
 
 
-def cmd_watch_answers(_args: argparse.Namespace) -> int:
-    if not ANSWERS_DIR.is_dir():
-        print(f"Missing answers dir: {ANSWERS_DIR}")
-        return 1
-    files = sorted(ANSWERS_DIR.glob("*.md"))
-    for p in files:
-        st = p.stat()
-        ts = datetime.datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
-        print(f"{ts}  {st.st_size:7d} B  {p.name}")
-    print(f"Total: {len(files)} answer file(s) in {ANSWERS_DIR}")
-    return 0
-
-
 def run_self_test() -> int:
     """Offline test for safe flash range math, bounds checks, and USB sysfs scanning."""
     start, length = compute_openfw_flash_range(82000)
@@ -410,8 +394,6 @@ def main() -> int:
     p_log = sub.add_parser("log", help="Read or clear g_openfw_log")
     p_log.add_argument("--reset", action="store_true")
 
-    sub.add_parser("watch-answers", help="List analysis answer files")
-
     args = ap.parse_args()
     if args.self_test:
         return run_self_test()
@@ -423,7 +405,6 @@ def main() -> int:
         "flash": cmd_flash,
         "exp": cmd_exp,
         "log": cmd_log,
-        "watch-answers": cmd_watch_answers,
     }
     fn = dispatch.get(args.cmd)
     if fn is None:

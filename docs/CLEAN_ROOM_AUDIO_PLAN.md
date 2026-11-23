@@ -26,14 +26,14 @@
 ```text
 open_fw/
 ├── include/
-│   └── audio_dsp.h          # Public API, profile enum, config & state structs
+│   └── audio_dsp.h          # Public API, profile enum, config & state structs + VOR
 ├── src/
-│   ├── audio_dsp.c          # Clean-room biquads, soft limiter, compressor, stats
-│   ├── audio_dma.c          # (Phase 2) Extend AMIC1 mono -> selectable AMIC1+AMIC2 stereo / 24-bit
-│   ├── recorder.c           # Wire audio_dsp_process_i16() between audio_pop_frame() & exfat_write()
-│   └── xrec_proto.c         # (Phase 3) Expose DSP profile & PGA gain over +XREC
+│   ├── audio_dsp.c          # Clean-room biquads, soft limiter, compressor, VOR, stats
+│   ├── audio_dma.c          # Dual-mic AMIC1+AMIC2 stereo / mono capture via DMAC CH1
+│   ├── recorder.c           # Wires audio_dsp_process_i16() + VOR between audio_pop_frame() & exfat_write()
+│   └── xrec_proto.c         # Exposes DSP profile & PGA gain over +XREC
 └── tests/
-    └── test_audio_dsp.c     # Host unit tests (frequency response, DC, limiter ceiling, clipping)
+    └── test_audio_dsp.c     # Host unit tests (frequency response, DC, limiter, stereo link, VOR)
 ```
 
 ---
@@ -145,31 +145,31 @@ void audio_dsp_process_i16(audio_dsp_t *dsp, int16_t *pcm, size_t num_frames);
 
 ---
 
-## 8. Phased Implementation Roadmap
+## 8. Implementation Status & Roadmap
 
-### Phase 1 — Core Clean-Room DSP Module + Host Unit Tests *(Immediate)*
-- [ ] Add `open_fw/include/audio_dsp.h` and `open_fw/src/audio_dsp.c` implementing `ASR_RAW`, `VOICE_CLARITY`, and `BYPASS`.
-- [ ] Fix `DMAC_IRQ_TC` to bit 1 (`0x00080002u`) in `sl6801_regs.h`, `audio_dma.c`, and `audio_dac.c` to eliminate the 16-byte/4-frame tail gap on every 128 ms buffer.
-- [ ] Add `open_fw/tests/test_audio_dsp.c` and hook into `open_fw/Makefile` host test target:
+### Phase 1 — Core Clean-Room DSP Module + Host Unit Tests *(Complete)*
+- [x] Add `open_fw/include/audio_dsp.h` and `open_fw/src/audio_dsp.c` implementing `ASR_RAW`, `VOICE_CLARITY`, and `BYPASS`.
+- [x] Fix `DMAC_IRQ_TC` to bit 1 (`0x00080002u`) in `sl6801_regs.h`, `audio_dma.c`, and `audio_dac.c` to eliminate the 16-byte/4-frame tail gap on every 128 ms buffer.
+- [x] Add `open_fw/tests/test_audio_dsp.c` and hook into `open_fw/Makefile` host test target:
   - Test 1: DC step input → settles to `0` under `ASR_RAW` and `VOICE_CLARITY`.
   - Test 2: Sine frequency sweep (`30 Hz`, `75 Hz`, `350 Hz`, `1 kHz`, `2.2 kHz`, `5 kHz`) → verify gain within `±0.5 dB` of analytical Butterworth / RBJ shelf curves.
   - Test 3: Overdriven `+6 dB` burst → verify limiter holds peak `<= 32767` with zero wrap-around and smooth release.
   - Test 4: Stereo phase-link test → verify identical gain reduction on L and R channels.
 - [x] Wire `audio_dsp_init()` in `recorder_start()` and `audio_dsp_process_i16()` in `recorder_poll()` (`open_fw/src/recorder.c`), defaulting to `AUDIO_DSP_VOICE_CLARITY`.
 
-### Phase 2 — True Dual-Mic Stereo Capture (`AMIC1 + AMIC2`) in `audio_dma.c`
+### Phase 2 — True Dual-Mic Stereo Capture (`AMIC1 + AMIC2`) in `audio_dma.c` *(Complete)*
 - [x] Verify `AMIC2` analog GPIO mux pins (`PB14/PB15`), `CODEC_ADC_CH_MUX = 0x000D0D00`, and `ADC_CH1/2_CTRL = 0x09` (`0x40009250`/`0x40009280`) — **live-verified on silicon**.
-- [ ] Keep stereo mode in `audio_dma.c` (`4096` samples = `8192` bytes per 128 ms slot, `32 KiB` total ring buffer) with `DMAC_CH_IRQ_EN = 0x00080002u` verified gap-free in `BYPASS` mode.
+- [x] Keep stereo mode in `audio_dma.c` (`4096` samples = `8192` bytes per 128 ms slot, `32 KiB` total ring buffer) with `DMAC_CH_IRQ_EN = 0x00080002u` verified gap-free in `BYPASS` mode.
 - [x] Update `audio_dac.c` volume control to the 32-entry logarithmic dB Q15 curve.
 - [ ] Optional: add 24-bit-in-32-bit capture mode if extra dynamic range is needed (avoids PGA tuning altogether).
 
-### Phase 3 — Runtime Control & Host ASR Pipeline
+### Phase 3 — Runtime Control & Host ASR Pipeline *(Complete)*
 - [x] Expose `+XREC:DSP=<0|1|2>` and `+XREC:GAIN=<0..31>`. The recorder menu saves changes from Bluetooth mode to `/cassini/settings.bin` when the SD card is mounted. Gain sets the analog PGA immediately. Profile changes apply to the next recording.
-- [ ] Add host helper script (`tools/asr_prep.py` or pipeline doc) implementing the two downstream recipes:
-  - **Parakeet (`parakeet-tdt-0.6b-v2`/`v3`):** stereo-to-mono sum (or MVDR if SNR < 0 dB) → Silero VAD → 16 kHz mono WAV → Parakeet.
-  - **Whistle (Cactus 55M):** stereo-to-mono sum/beamform → `150–7000 Hz` bandpass → Silero VAD (pause-aligned chunks `≤ 30 s`) → Whistle + keyword biasing list.
+- [x] Add host helper script (`tools/asr_prep.py` with `--self-test`) implementing the two downstream recipes:
+  - **Parakeet (`parakeet-tdt-0.6b-v2`/`v3`):** stereo-to-mono sum → clean-room / Silero VAD → 16 kHz mono WAV + JSON manifest.
+  - **Whistle (Cactus 55M):** stereo-to-mono sum → `150–7000 Hz` bandpass → pause-aligned chunks `≤ 30 s` + JSON manifest + keyword list.
 
 ### Phase 4 — Optional Advanced Features
-- [ ] **Clean-room VOR (Voice-Operated Recording):** 200 ms pre-roll ring + energy/ZCR hysteresis gate with `500 ms` hangover (opt-in only).
+- [x] **Clean-room VOR (Voice-Operated Recording):** 200 ms pre-roll ring + stereo RMS/ZCR hysteresis gate with `500 ms` hangover and 5 ms fade-in/out (opt-in via Settings).
 - [ ] **Optional `VOICE_CLARITY` light noise suppression:** 256-pt real FFT Wiener suppressor (`-12 dB` floor) or simple `18 mm` broadside beamformer.
 - [ ] **Hardware A/B WER Benchmark:** Record the same noisy & quiet speech passages on SL6801 under `BYPASS`, `ASR_RAW`, `VOICE_CLARITY`, and stock firmware, and compare WER directly on Parakeet and Whistle.
