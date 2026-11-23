@@ -30,7 +30,7 @@ python3 web_emu/serve.py --open
 Features included in the browser emulator:
 - Real `160×80` ST7735S RGB565 display + PWM3 backlight dimming + clickable/keyboard-mapped physical buttons (`R` REC slide switch, `←`/`→`, `↑`/`↓`, `Enter`, `Esc`, `P` Power).
 - Real 16 kHz stereo Web Audio API playback (including pitch-preserving `2×–5×` hold-scrubbing and `PB30` speaker PA / `PB11` headphone jack toggles).
-- Live browser microphone recording (or built-in synthetic voice/formant generator) into a real in-memory **16 MiB exFAT** microSD card with preloaded demo recordings (including synced `.cwx` captions) and 1-click `.wav` download.
+- Live browser microphone recording (or built-in synthetic voice/formant generator) into a real in-memory **64 MiB exFAT** microSD card with preloaded demo recordings (including synced `.cwx` captions) and 1-click `.wav` download.
 - Works on static HTTPS hosts (such as GitHub Pages) via `web_emu/coi-serviceworker.js`.
 
 ---

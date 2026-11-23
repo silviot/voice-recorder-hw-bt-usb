@@ -62,6 +62,9 @@ void uart0_init_115200(void)
 void openfw_log_putc(char c)
 {
     log_ring_push(c);
+#ifdef OPENFW_WASM
+    openfw_mmio_wr32(UART0_DATA_ADDR, (uint32_t)(uint8_t)c);
+#endif
 }
 
 void openfw_log_puts(const char *s)
@@ -113,7 +116,7 @@ void openfw_log_hex(uint32_t v)
 
 void uart0_putc(char c)
 {
-    openfw_log_putc(c);
+    log_ring_push(c);
     if (c == '\n') {
         uart0_tx_raw((uint8_t)'\r');
     }

@@ -1647,9 +1647,16 @@ int openfw_main(void)
             recorder_poll();
             if (recorder_has_error()) {
                 (void)recorder_stop();
+                g_ui.rec_sec     = recorder_get_seconds();
                 rec_active       = 0;
                 g_ui.rec_stopped = 1u;
-                copy_cstr(g_ui.rec_stop_reason, (int)sizeof(g_ui.rec_stop_reason), "Write error");
+                uint32_t fmb = 1u, tmb = 0u;
+                const char *reason = "Write error";
+                if (g_sd_mounted && exfat_stat_fs(&g_exfat_vol, &fmb, &tmb) == 0 && fmb == 0u) {
+                    reason = "Storage full";
+                }
+                copy_cstr(g_ui.rec_stop_reason, (int)sizeof(g_ui.rec_stop_reason), reason);
+                backlight_wake(now_ms);
                 dirty            = 1;
             }
             prev_vbus   = vbus_present_cached(now_ms);

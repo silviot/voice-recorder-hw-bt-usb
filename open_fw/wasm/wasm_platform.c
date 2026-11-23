@@ -109,9 +109,9 @@ volatile uint8_t  g_openfw_boot_strike_counted = 0u;
 volatile uint8_t  g_openfw_xip_mode            = OPENFW_XIP_MODE_QUAD_48M;
 
 /* ============================================================================
- * Virtual 16 MiB microSD Card (32768 x 512 B sectors — zero-init BSS in WASM)
+ * Virtual 64 MiB microSD Card (131072 x 512 B sectors — zero-init BSS in WASM)
  * ============================================================================ */
-#define WASM_SD_SECTORS  32768u
+#define WASM_SD_SECTORS  131072u
 #define WASM_SD_BYTES    (WASM_SD_SECTORS * 512u)
 
 static uint8_t g_sd_img[WASM_SD_BYTES];
@@ -517,7 +517,10 @@ static void sync_time_ms(uint32_t now_ms)
     }
     for (uint32_t i = 1u; i <= delta; i++) {
         g_systick_ms = g_soc.last_tick_ms + i;
-        g_soc.us_time = (uint64_t)g_systick_ms * 1000ULL;
+        uint64_t step_us = (uint64_t)g_systick_ms * 1000ULL;
+        if (step_us > g_soc.us_time) {
+            g_soc.us_time = step_us;
+        }
         keys_scan_tick(g_systick_ms);
         pump_audio_dmac();
         if ((uint32_t)(g_systick_ms - g_soc.rtc_last_sec_ms) >= 1000u) {
@@ -547,7 +550,7 @@ uint32_t openfw_mmio_rd32(uint32_t addr)
 
     if (addr == US_TIMER_HI_ADDR)   return (uint32_t)(g_soc.us_time >> 32);
     if (addr == US_TIMER_LO_ADDR) {
-        g_soc.us_time += 25ULL;
+        g_soc.us_time += 1ULL;
         return (uint32_t)(g_soc.us_time & 0xFFFFFFFFu);
     }
 
@@ -974,12 +977,12 @@ static void wasm_format_exfat(void)
     memset(g_sd_img, 0, sizeof(g_sd_img));
 
     const uint32_t part_lba    = 64u;
-    const uint32_t part_secs   = WASM_SD_SECTORS - part_lba; /* 32704 */
+    const uint32_t part_secs   = WASM_SD_SECTORS - part_lba; /* 131008 */
     const uint32_t fat_off     = 24u;
-    const uint32_t fat_len     = 40u;  /* 20 KiB = 5120 FAT entries */
-    const uint32_t heap_off    = 64u;
+    const uint32_t fat_len     = 136u; /* 68 KiB = 17408 FAT entries */
+    const uint32_t heap_off    = 192u;
     const uint32_t spc         = 8u;   /* 4096 B cluster */
-    const uint32_t clus_cnt    = (part_secs - heap_off) / spc; /* 4080 */
+    const uint32_t clus_cnt    = (part_secs - heap_off) / spc; /* 16352 */
 
     /* 1. MBR (LBA 0) */
     uint8_t *mbr = &g_sd_img[0];

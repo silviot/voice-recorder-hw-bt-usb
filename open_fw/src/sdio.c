@@ -41,7 +41,7 @@
 
 static void sdio_log_err(const char *tag, uint32_t a, uint32_t b)
 {
-#ifndef OPENFW_HOST_MMIO
+#if !defined(OPENFW_HOST_MMIO) || defined(OPENFW_WASM)
     static uint8_t s_err_logs = 0u;
     if (s_err_logs >= 8u) {
         return;

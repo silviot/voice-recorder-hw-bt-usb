@@ -114,7 +114,7 @@ static void format_rec_filename(uint32_t idx, char out[16])
 
 static void rec_log_err(const char *stage, uint32_t v)
 {
-#ifndef OPENFW_HOST_MMIO
+#if !defined(OPENFW_HOST_MMIO) || defined(OPENFW_WASM)
     openfw_log_puts("REC_ERR ");
     openfw_log_puts(stage);
     openfw_log_puts("=");
