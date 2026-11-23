@@ -126,9 +126,19 @@ make -C open_fw test-host-san
 python3 tools/test_tools.py
 ```
 
-### 2. Preview & Develop in the Desktop Emulator
+### 2. Try `open_fw` Live in Your Browser (WebAssembly Emulator)
 
-You can inspect every UI screen in `< 0.5 s` via `test_ui_render` (`/tmp/sl6801_openfw/ui_all_screens.ppm`) or boot the real ARM binary inside QEMU with clickable buttons. See **[docs/EMULATOR_GUIDE.md](docs/EMULATOR_GUIDE.md)**.
+No hardware, Boot ROM dump, or QEMU install required — the real C firmware + LVGL v9.2.2 + exFAT + Audio DSP/Player compiles directly to WebAssembly (`web_emu/openfw.wasm`) with live Web Audio playback and microphone recording:
+
+```bash
+# Optional: rebuild web_emu/openfw.wasm from C source (requires clang + wasm-ld)
+make -C open_fw wasm
+
+# Launch local server (sets COOP/COEP headers) and open http://127.0.0.1:8080/
+python3 web_emu/serve.py --open
+```
+
+For the native host UI renderer and full ARM QEMU emulator, see **[docs/EMULATOR_GUIDE.md](docs/EMULATOR_GUIDE.md)**.
 
 ### 3. Flash `open_fw` to Your SL6801 Device
 
@@ -162,7 +172,8 @@ python3 tools/usb_sync.py --dest ~/Recordings/HW_76
 
 | Path | Description |
 | :--- | :--- |
-| **[`open_fw/`](open_fw/)** | Standalone open-source firmware in C99 + LVGL v9.2.2 (drivers, dual-core UI, exFAT, audio DSP/recorder/player, USB MSC, BT stack, host tests, SRAM probes, QEMU scripts). See **[open_fw/README.md](open_fw/README.md)**. |
+| **[`open_fw/`](open_fw/)** | Standalone open-source firmware in C99 + LVGL v9.2.2 (drivers, dual-core UI, exFAT, audio DSP/recorder/player, USB MSC, BT stack, host tests, SRAM probes, WASM SoC, QEMU scripts). See **[open_fw/README.md](open_fw/README.md)**. |
+| **[`web_emu/`](web_emu/)** | Interactive browser emulator running the real compiled `open_fw` firmware in WebAssembly (`openfw.wasm`) with live Web Audio playback, mic recording, and virtual exFAT microSD. |
 | **[`tools/`](tools/)** | Python host tools: flashing & dev cycle (`dev_cycle.py`, `flash_ranges.py`), USB telemetry & sync (`openfw_usb.py`, `usb_sync.py`), ASR prep (`asr_prep.py`), Cassini meeting converter (`cassini_to_device.py`), and legacy stock-FW helpers. See **[tools/README.md](tools/README.md)**. |
 | **[`docs/`](docs/)** | Complete technical documentation (indexed below). |
 | **[`fw_mod/`](fw_mod/)** | Optional / legacy XIP binary patches for the original stock `pen133_2.0.65` firmware. See **[fw_mod/README.md](fw_mod/README.md)**. |

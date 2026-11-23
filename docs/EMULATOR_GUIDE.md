@@ -4,13 +4,34 @@ You can build, test, and visually inspect **Cassini OpenFW (`open_fw`)** — and
 
 ---
 
-## 1. Three Ways to Preview & Test
+## 1. Four Ways to Preview & Test
 
 | Workflow | Speed | What It Runs | Best For |
 | :--- | :--- | :--- | :--- |
+| **Browser WebAssembly Emulator (`web_emu/`)** | Instant (60 fps) | Real `open_fw` C firmware + LVGL v9.2.2 + exFAT + Audio DSP/Player compiled to `wasm32` (`openfw.wasm`) with Web Audio playback & live browser mic | Interactive testing with zero hardware, zero Boot ROM dumps, and real audio I/O (`python3 web_emu/serve.py --open`) |
 | **Host Visual UI Renderer (`test_ui_render`)** | `< 0.5 s` | Real C UI code (`lcd_st7735s.c`, `cpu1_ui.c`, `ui_spectrogram.c`, `src/ui/*`, `src/ui/eez/*` + LVGL v9.2.2) compiled natively against a software ST7735S framebuffer | Rapid pixel-level UI layout & typography iteration (renders all 14 screens/sub-states to a contact sheet in one shot) |
-| **Headless ARM QEMU (`open_fw/tools/run_qemu.py`)** | `~4 s` | Real ARM Cortex-M4F Thumb-2 `open_fw` binary (`firmware_2M_openfw.bin`) on emulated SL6801 CPU, LCDC, SDIO/exFAT, SARADC keys, and PMU | Full end-to-end firmware verification, boot animation & `160×80` landscape screenshots, automated CI checks |
-| **Interactive Browser Emulator (`smartlink-sl6801-emulator` `./gui`)** | Real-time | Real ARM Cortex-M4F firmware with clickable on-screen buttons, keyboard shortcuts, and live `160×80` display | Interacting with the firmware as a user (navigating tiles, menus, settings, and testing button flows) |
+| **Headless ARM QEMU (`open_fw/tools/run_qemu.py`)** | `~4 s` | Real ARM Cortex-M4F Thumb-2 `open_fw` binary (`firmware_2M_openfw.bin`) on emulated SL6801 CPU, LCDC, SDIO/exFAT, SARADC keys, and PMU | Full end-to-end ARM binary verification, boot animation & `160×80` landscape screenshots |
+| **Interactive ARM QEMU Browser GUI (`smartlink-sl6801-emulator` `./gui`)** | Real-time | Real ARM Cortex-M4F binary inside QEMU with clickable on-screen buttons and live `160×80` display | Testing ARM-level startup/XIP behavior interactively |
+
+---
+
+## 1b. Browser WebAssembly Emulator (Zero Hardware / Zero Dumps)
+
+`open_fw`'s `OPENFW_HOST_MMIO` hardware abstraction compiles the entire freestanding C firmware + LVGL v9.2.2 directly to `web_emu/openfw.wasm` (`open_fw/wasm/wasm_platform.c`), running inside a Web Worker with `SharedArrayBuffer` + `Atomics.wait`:
+
+```bash
+# Rebuild web_emu/openfw.wasm after C/UI edits (requires clang + wasm-ld)
+make -C open_fw wasm
+
+# Start local COOP/COEP dev server at http://127.0.0.1:8080/
+python3 web_emu/serve.py --open
+```
+
+Features included in the browser emulator:
+- Real `160×80` ST7735S RGB565 display + PWM3 backlight dimming + clickable/keyboard-mapped physical buttons (`R` REC slide switch, `←`/`→`, `↑`/`↓`, `Enter`, `Esc`, `P` Power).
+- Real 16 kHz stereo Web Audio API playback (including pitch-preserving `2×–5×` hold-scrubbing and `PB30` speaker PA / `PB11` headphone jack toggles).
+- Live browser microphone recording (or built-in synthetic voice/formant generator) into a real in-memory **16 MiB exFAT** microSD card with preloaded demo recordings (including synced `.cwx` captions) and 1-click `.wav` download.
+- Works on static HTTPS hosts (such as GitHub Pages) via `web_emu/coi-serviceworker.js`.
 
 ---
 

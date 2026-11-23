@@ -11,6 +11,7 @@
 CLANG    ?= clang
 HOST_CC  ?= cc
 LLD      ?= $(shell which ld.lld 2>/dev/null || find /usr/lib "$${ANDROID_HOME:-$$HOME/Android/Sdk}/ndk" -maxdepth 8 \( -type f -o -type l \) -executable -name ld.lld 2>/dev/null | head -n 1)
+WASM_LD  ?= $(shell which wasm-ld 2>/dev/null || find /usr/lib "$${ANDROID_HOME:-$$HOME/Android/Sdk}/ndk" -maxdepth 8 \( -type f -o -type l \) -executable -name wasm-ld 2>/dev/null | head -n 1)
 OBJCOPY  ?= $(shell which llvm-objcopy 2>/dev/null || find /usr/lib "$${ANDROID_HOME:-$$HOME/Android/Sdk}/ndk" -maxdepth 8 \( -type f -o -type l \) -executable -name llvm-objcopy 2>/dev/null | head -n 1)
 AR       ?= $(shell which llvm-ar 2>/dev/null || which ar 2>/dev/null)
 
@@ -91,7 +92,7 @@ STOCK_DUMP  := ../dumps/firmware_2M.bin
 OUT_BIN     := ../dumps/firmware_2M_openfw.bin
 OUT_UP      := ../dumps/update_openfw.up
 
-.PHONY: all test-host test-host-san test-qemu qemu-stub update-up clean force-config fetch-lvgl
+.PHONY: all test-host test-host-san test-qemu qemu-stub update-up wasm clean force-config fetch-lvgl
 
 CONFIG_STAMP := $(BUILD_DIR)/.config
 
@@ -207,5 +208,37 @@ $(BUILD_DIR)/qemu_boot_stub.bin: tools/qemu_boot_stub.S | $(BUILD_DIR)
 test-qemu: all update-up $(BUILD_DIR)/qemu_boot_stub.bin
 	python3 tools/run_qemu.py --elf $(BUILD_DIR)/open_fw.elf --stub $(BUILD_DIR)/qemu_boot_stub.bin --flash $(OUT_BIN)
 
+WASM_BUILD_DIR := $(BUILD_DIR)_wasm
+WASM_OUT       := ../web_emu/openfw.wasm
+WASM_CFLAGS    := --target=wasm32 -Os -Wall -Wextra -ffreestanding -fno-builtin \
+                  -fno-stack-protector -DOPENFW_HOST_MMIO -DOPENFW_WASM=1 \
+                  -Iinclude -Isrc/ui -Isrc/ui/eez $(LVGL_INC) -I$(BUILD_DIR)
+WASM_LVGL_CFLAGS := --target=wasm32 -O2 -ffreestanding -fno-builtin -fno-stack-protector \
+                    -DOPENFW_WASM=1 -Wno-unused-parameter -Wno-sign-compare -Iinclude $(LVGL_INC)
+WASM_SRCS      := $(filter-out src/startup.c src/bt_hci.c,$(SRCS)) wasm/wasm_platform.c
+WASM_OBJS      := $(patsubst %.c,$(WASM_BUILD_DIR)/%.o,$(WASM_SRCS))
+WASM_LVGL_OBJS := $(patsubst $(LVGL_DIR)/%.c,$(WASM_BUILD_DIR)/lvgl/%.o,$(LVGL_SRCS))
+
+$(WASM_BUILD_DIR)/lvgl/%.o: $(LVGL_DIR)/%.c include/lv_conf.h include/board_config.h
+	@mkdir -p $(dir $@)
+	$(CLANG) $(WASM_LVGL_CFLAGS) -c $< -o $@
+
+$(WASM_BUILD_DIR)/src/main.o: src/main.c $(SPLASH_HDR) include/sl6801_regs.h include/openfw.h include/openfw_ui.h include/openfw_exp.h include/openfw_player.h include/board_config.h src/ui/ui_port.h
+	@mkdir -p $(dir $@)
+	$(CLANG) $(WASM_CFLAGS) -c $< -o $@
+
+$(WASM_BUILD_DIR)/%.o: %.c include/sl6801_regs.h include/sl6801_rom.h include/openfw.h include/openfw_ui.h include/audio_dsp.h include/openfw_exp.h include/openfw_crypto.h include/openfw_wav.h include/openfw_cwx.h include/openfw_player.h include/openfw_fs.h include/openfw_usb_msc.h include/openfw_bt_spp.h include/openfw_xrec.h include/board_config.h include/lv_conf.h
+	@mkdir -p $(dir $@)
+	$(CLANG) $(WASM_CFLAGS) -c $< -o $@
+
+$(WASM_OUT): $(LVGL_DIR)/lvgl.h $(WASM_OBJS) $(WASM_LVGL_OBJS)
+	@test -n "$(WASM_LD)" || (echo "Error: wasm-ld not found (set WASM_LD=/path/to/wasm-ld)" >&2; exit 1)
+	@mkdir -p $(dir $@)
+	$(WASM_LD) --no-entry --gc-sections --allow-undefined --stack-first -z stack-size=65536 \
+		--export-dynamic $(WASM_OBJS) $(WASM_LVGL_OBJS) -o $@
+	@ls -lh $@
+
+wasm: $(WASM_OUT)
+
 clean:
-	rm -rf $(BUILD_DIR)
+	rm -rf $(BUILD_DIR) $(WASM_BUILD_DIR)

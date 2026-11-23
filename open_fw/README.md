@@ -54,6 +54,10 @@ make -C open_fw all update-up
 # Boot and verify in SL6801 QEMU emulator (see ../docs/EMULATOR_GUIDE.md)
 make -C open_fw test-qemu
 
+# Build the interactive browser WebAssembly emulator (../web_emu/openfw.wasm)
+make -C open_fw wasm
+python3 web_emu/serve.py --open
+
 # Build with SRAM experiment runner enabled for hardware probing (see ../docs/DEVELOPMENT_WORKFLOW.md)
 make -C open_fw DEV_EXP=1 all update-up
 ```

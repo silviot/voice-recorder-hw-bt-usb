@@ -96,7 +96,7 @@ static int              g_cpu1_booted      = 0;
 static void clear_boot_strikes_once(void)
 {
     if (!g_boot_strikes_cleared) {
-        AON_BACKUP(7u) = OPENFW_BOOT_STRIKE_MAGIC;
+        openfw_mmio_wr32(AON_BACKUP_ADDR(7u), OPENFW_BOOT_STRIKE_MAGIC);
         g_openfw_boot_strike_counted = 0u;
         g_boot_strikes_cleared = 1;
     }
@@ -110,7 +110,7 @@ static void wfi_sleep_ms(uint32_t ms)
         if (keys_event_pending()) {
             break;
         }
-        __asm__ volatile ("wfi");
+        OPENFW_WFI();
     }
     wdt_feed();
 }
@@ -925,6 +925,9 @@ static int run_usb_msc_mode(int auto_mode)
                 }
             }
         }
+#ifdef OPENFW_HOST_MMIO
+        OPENFW_WFI();
+#endif
     }
 
     keys_ignore_held();
@@ -1329,25 +1332,25 @@ int openfw_main(void)
 {
     wdt_feed();
     /* 3-strike boot-loop guard using AON_BACKUP(7) */
-    uint32_t b7 = AON_BACKUP(7u);
+    uint32_t b7 = openfw_mmio_rd32(AON_BACKUP_ADDR(7u));
     uint32_t boot_strikes = ((b7 & 0xFFFF0000u) == OPENFW_BOOT_STRIKE_MAGIC) ? (b7 & 0xFFFFu) : 0u;
     if (boot_strikes >= OPENFW_BOOT_MAX_STRIKES) {
-        AON_BACKUP(7u) = 0u;
+        openfw_mmio_wr32(AON_BACKUP_ADDR(7u), 0u);
         pmu_reboot_to_usb_bootloader();
     }
-    AON_BACKUP(7u) = OPENFW_BOOT_STRIKE_MAGIC | ((boot_strikes + 1u) & 0xFFFFu);
+    openfw_mmio_wr32(AON_BACKUP_ADDR(7u), OPENFW_BOOT_STRIKE_MAGIC | ((boot_strikes + 1u) & 0xFFFFu));
     g_openfw_boot_strike_counted = 1u;
 
-    uint32_t prev_f0     = AON_BACKUP(0u);
-    uint32_t prev_pc     = AON_BACKUP(1u);
-    uint32_t prev_lr     = AON_BACKUP(2u);
-    uint32_t prev_cfsr   = AON_BACKUP(3u);
-    uint32_t prev_bfar   = AON_BACKUP(4u);
-    uint32_t prev_in_exp = AON_BACKUP(5u);
+    uint32_t prev_f0     = openfw_mmio_rd32(AON_BACKUP_ADDR(0u));
+    uint32_t prev_pc     = openfw_mmio_rd32(AON_BACKUP_ADDR(1u));
+    uint32_t prev_lr     = openfw_mmio_rd32(AON_BACKUP_ADDR(2u));
+    uint32_t prev_cfsr   = openfw_mmio_rd32(AON_BACKUP_ADDR(3u));
+    uint32_t prev_bfar   = openfw_mmio_rd32(AON_BACKUP_ADDR(4u));
+    uint32_t prev_in_exp = openfw_mmio_rd32(AON_BACKUP_ADDR(5u));
     int has_prev_fault = ((prev_f0 & OPENFW_FAULT_MAGIC_MASK) == OPENFW_FAULT_MAGIC_BASE) ? 1 : 0;
     if (has_prev_fault) {
         g_prev_fault_code = prev_f0;
-        AON_BACKUP(0u)    = 0u;
+        openfw_mmio_wr32(AON_BACKUP_ADDR(0u), 0u);
     } else {
         g_prev_fault_code = 0u;
     }
@@ -1372,7 +1375,7 @@ int openfw_main(void)
         uart0_puts("1W@24M");
     }
     uart0_puts(" CPU_ID=");
-    uart0_put_u32(SYSCTL_CPU_ID);
+    uart0_put_u32(openfw_mmio_rd32(SYSCTL_CPU_ID_ADDR));
     uart0_puts(" VBAT_MV=");
     uart0_put_u32(pmu_read_vbat_mv());
     uart0_puts(" PMU_PON=");

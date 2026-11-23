@@ -92,7 +92,7 @@
 #define LV_USE_ASSERT_STYLE             0
 #define LV_USE_ASSERT_MEM_INTEGRITY     0
 #define LV_USE_ASSERT_OBJ               0
-#if defined(OPENFW_HOST_MMIO) || (defined(__STDC_HOSTED__) && __STDC_HOSTED__ == 1)
+#if !defined(OPENFW_WASM) && (defined(OPENFW_HOST_MMIO) || (defined(__STDC_HOSTED__) && __STDC_HOSTED__ == 1))
 #define LV_ASSERT_HANDLER_INCLUDE       <stdlib.h>
 #define LV_ASSERT_HANDLER               abort();
 #else

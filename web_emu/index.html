@@ -1,0 +1,443 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Cassini OpenFW — SL6801 Browser Emulator</title>
+  <style>
+    :root {
+      --bg: #0b0f17;
+      --panel: #131a27;
+      --panel-hi: #1b2538;
+      --border: #26334d;
+      --text: #e6eefb;
+      --dim: #8da2c0;
+      --accent: #42c8ff;
+      --red: #ff3b3b;
+      --green: #3ddc84;
+      --amber: #ffb020;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+      background: radial-gradient(circle at top, #131d30 0%, var(--bg) 65%);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 20px 16px 36px;
+    }
+    header {
+      width: 100%;
+      max-width: 1040px;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 18px;
+    }
+    h1 {
+      margin: 0;
+      font-size: 1.2rem;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+    }
+    .subtitle {
+      font-size: 0.84rem;
+      color: var(--dim);
+      margin-top: 2px;
+    }
+    .badge {
+      font-size: 0.78rem;
+      padding: 5px 11px;
+      border-radius: 999px;
+      background: var(--panel-hi);
+      border: 1px solid var(--border);
+      color: var(--dim);
+      font-weight: 600;
+    }
+    .badge.ok { color: var(--green); border-color: rgba(61, 220, 132, 0.35); background: rgba(61, 220, 132, 0.1); }
+    .badge.err { color: var(--red); border-color: rgba(255, 59, 59, 0.4); background: rgba(255, 59, 59, 0.12); }
+
+    main {
+      width: 100%;
+      max-width: 1040px;
+      display: grid;
+      grid-template-columns: minmax(0, 1.35fr) minmax(290px, 0.9fr);
+      gap: 20px;
+      align-items: start;
+    }
+    @media (max-width: 860px) {
+      main { grid-template-columns: 1fr; }
+    }
+
+    /* Pocket Voice Recorder Chassis */
+    .device-shell {
+      background: linear-gradient(160deg, #252c3b 0%, #151923 60%, #10131b 100%);
+      border: 1px solid #354159;
+      border-radius: 26px;
+      padding: 22px 24px 24px;
+      box-shadow: 0 24px 60px rgba(0, 0, 0, 0.55), inset 0 1px 0 rgba(255, 255, 255, 0.08);
+    }
+    .device-top-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 14px;
+      gap: 12px;
+    }
+    .brand {
+      font-size: 0.78rem;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      color: #8294b3;
+      font-weight: 700;
+    }
+    .rec-slider-wrap {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      background: rgba(0, 0, 0, 0.35);
+      border: 1px solid #2e3a52;
+      padding: 6px 12px;
+      border-radius: 999px;
+    }
+    .rec-led {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: #3a1d21;
+      box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.8);
+      transition: background 0.15s, box-shadow 0.15s;
+    }
+    .rec-led.on {
+      background: var(--red);
+      box-shadow: 0 0 10px var(--red);
+    }
+    .switch {
+      position: relative;
+      display: inline-block;
+      width: 44px;
+      height: 22px;
+    }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .slider {
+      position: absolute;
+      cursor: pointer;
+      inset: 0;
+      background: #273248;
+      border-radius: 999px;
+      transition: 0.18s;
+      border: 1px solid #3b4a68;
+    }
+    .slider:before {
+      position: absolute;
+      content: "";
+      height: 16px;
+      width: 16px;
+      left: 2px;
+      bottom: 2px;
+      background: #d7e2f5;
+      border-radius: 50%;
+      transition: 0.18s;
+    }
+    input:checked + .slider {
+      background: #7c1c23;
+      border-color: var(--red);
+    }
+    input:checked + .slider:before {
+      transform: translateX(22px);
+      background: #fff;
+    }
+    #rec-label {
+      font-size: 0.75rem;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      min-width: 52px;
+    }
+
+    /* Display Bezel */
+    .bezel {
+      position: relative;
+      background: #04060a;
+      border-radius: 14px;
+      padding: 14px;
+      border: 2px solid #0b0e14;
+      box-shadow: inset 0 2px 12px rgba(0, 0, 0, 0.9), 0 1px 0 rgba(255, 255, 255, 0.06);
+      display: flex;
+      justify-content: center;
+      align-items: center;
+    }
+    canvas#lcd {
+      width: 100%;
+      max-width: 560px;
+      aspect-ratio: 2 / 1;
+      image-rendering: pixelated;
+      image-rendering: crisp-edges;
+      border-radius: 4px;
+      background: #000;
+      display: block;
+    }
+    #lcd-off-overlay {
+      position: absolute;
+      inset: 14px;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      background: rgba(0, 0, 0, 0.72);
+      color: var(--dim);
+      font-size: 0.9rem;
+      border-radius: 4px;
+      pointer-events: none;
+    }
+    #lcd-off-overlay.visible { display: flex; }
+
+    /* Tactile Buttons */
+    .controls-grid {
+      margin-top: 18px;
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 10px;
+    }
+    .hw-btn {
+      appearance: none;
+      background: linear-gradient(180deg, #273247 0%, #1c2435 100%);
+      color: var(--text);
+      border: 1px solid #394865;
+      border-radius: 12px;
+      padding: 11px 8px;
+      font-size: 0.85rem;
+      font-weight: 600;
+      cursor: pointer;
+      user-select: none;
+      touch-action: manipulation;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 2px;
+      box-shadow: 0 3px 0 #0e131e;
+      transition: transform 0.05s, box-shadow 0.05s, background 0.1s;
+    }
+    .hw-btn kbd {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.68rem;
+      color: var(--dim);
+      font-weight: 500;
+    }
+    .hw-btn:hover { background: linear-gradient(180deg, #2f3d57 0%, #222c40 100%); }
+    .hw-btn.active, .hw-btn:active {
+      transform: translateY(2px);
+      box-shadow: 0 1px 0 #0e131e;
+      background: #1f4e8c;
+      border-color: var(--accent);
+    }
+    .hw-btn.primary { border-color: rgba(66, 200, 255, 0.5); }
+    .hw-btn.power { border-color: rgba(255, 176, 32, 0.45); }
+
+    .hints {
+      margin-top: 14px;
+      font-size: 0.78rem;
+      color: var(--dim);
+      line-height: 1.5;
+    }
+
+    /* Right Hardware Bench */
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 14px 16px;
+      margin-bottom: 14px;
+    }
+    .card h2 {
+      margin: 0 0 10px;
+      font-size: 0.85rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--dim);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .prop-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 6px 0;
+      font-size: 0.85rem;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    }
+    .prop-row:last-child { border-bottom: none; }
+    select, input[type="range"] {
+      background: var(--panel-hi);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 4px 8px;
+      font-size: 0.82rem;
+    }
+    .pill-ind {
+      font-size: 0.75rem;
+      padding: 2px 8px;
+      border-radius: 6px;
+      background: var(--panel-hi);
+      color: var(--dim);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    .pill-ind.on { color: var(--green); background: rgba(61, 220, 132, 0.14); }
+    .btn-mini {
+      background: var(--panel-hi);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      padding: 4px 9px;
+      font-size: 0.75rem;
+      cursor: pointer;
+    }
+    .btn-mini:hover { border-color: var(--accent); color: var(--accent); }
+    .file-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 5px 0;
+      font-size: 0.8rem;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    }
+    .file-row:last-child { border-bottom: none; }
+    .file-name {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .file-meta { color: var(--dim); font-size: 0.75rem; }
+    .muted { color: var(--dim); font-size: 0.78rem; }
+
+    pre#uart-log {
+      margin: 0;
+      height: 150px;
+      overflow: auto;
+      background: #080c13;
+      border: 1px solid #1e283c;
+      border-radius: 10px;
+      padding: 8px 10px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.72rem;
+      line-height: 1.45;
+      color: #a9c2e0;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .btn-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Cassini OpenFW — SL6801 Browser Emulator</h1>
+      <div class="subtitle">Real C firmware + LVGL v9.2.2 + exFAT + DSP/Player compiled directly to WebAssembly</div>
+    </div>
+    <div id="emu-status" class="badge">Booting openfw.wasm…</div>
+  </header>
+
+  <main>
+    <section class="device-shell">
+      <div class="device-top-row">
+        <div class="brand">SL6801 · HW_76</div>
+        <div class="rec-slider-wrap" title="Hardware PB6 Record Slide Switch (Key: R)">
+          <span id="rec-led" class="rec-led"></span>
+          <label class="switch">
+            <input id="rec-switch" type="checkbox" />
+            <span class="slider"></span>
+          </label>
+          <span id="rec-label">STOP</span>
+        </div>
+      </div>
+
+      <div class="bezel">
+        <canvas id="lcd" width="160" height="80"></canvas>
+        <div id="lcd-off-overlay">Powered Off — Press Power or slide REC</div>
+      </div>
+
+      <div class="controls-grid">
+        <button class="hw-btn" data-key-bit="0" type="button">◀ Prev <kbd>←</kbd></button>
+        <button class="hw-btn primary" data-key-bit="5" type="button">OK / Play <kbd>Enter</kbd></button>
+        <button class="hw-btn" data-key-bit="1" type="button">Next ▶ <kbd>→</kbd></button>
+        <button class="hw-btn" data-key-bit="4" type="button">Back <kbd>Esc</kbd></button>
+
+        <button class="hw-btn" data-key-bit="2" type="button">VOL + <kbd>↑</kbd></button>
+        <button class="hw-btn" data-key-bit="3" type="button">VOL − <kbd>↓</kbd></button>
+        <button class="hw-btn power" id="btn-power" type="button">Power <kbd>P</kbd></button>
+        <button class="hw-btn" id="btn-reboot" type="button">Reboot <kbd>Keep SD</kbd></button>
+      </div>
+
+      <div class="hints">
+        <strong>Try it:</strong> Press <strong>OK</strong> to open <em>Files</em> and play <code>REC_0002.wav</code> with live synced captions (hold <strong>Next / Prev</strong> to scrub audibly at 2×–5×!), or flip the <strong>REC</strong> switch (<code>R</code>) to record with the live 128-pt FFT Mel spectrogram. Hold <strong>Power</strong> (<code>P</code>) for 2 s to power off.
+      </div>
+    </section>
+
+    <aside>
+      <div class="card">
+        <h2>Virtual Hardware</h2>
+        <div class="prop-row">
+          <label for="audio-src">Mic Input (DMAC CH1)</label>
+          <select id="audio-src">
+            <option value="mic" selected>Live Browser Mic</option>
+            <option value="synth">Simulated Voice</option>
+          </select>
+        </div>
+        <div id="mic-status" class="muted" style="padding-bottom:6px;">Uses browser microphone on first interaction (auto-fallback if denied)</div>
+        <div class="prop-row">
+          <label for="hp-toggle">3.5 mm Headphones (PB11)</label>
+          <input id="hp-toggle" type="checkbox" />
+        </div>
+        <div class="prop-row">
+          <label for="usb-toggle">USB-C Cable (VBUS)</label>
+          <input id="usb-toggle" type="checkbox" />
+        </div>
+        <div class="prop-row">
+          <label for="vbat-slider">Battery (<span id="vbat-val">4.02 V</span>)</label>
+          <input id="vbat-slider" type="range" min="3400" max="4200" step="20" value="4020" />
+        </div>
+        <div class="prop-row">
+          <label for="mute-toggle">Mute Browser Audio</label>
+          <input id="mute-toggle" type="checkbox" />
+        </div>
+        <div class="prop-row">
+          <span>Backlight (PWM3)</span>
+          <span id="ind-bl" class="pill-ind">0%</span>
+        </div>
+        <div class="prop-row">
+          <span>Speaker PA (PB30)</span>
+          <span id="ind-pa" class="pill-ind">OFF</span>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>
+          <span>Virtual microSD (exFAT)</span>
+          <span>
+            <button id="btn-refresh-sd" class="btn-mini" type="button">Refresh</button>
+            <button id="btn-wipe-sd" class="btn-mini" type="button">Reset SD</button>
+          </span>
+        </h2>
+        <div id="sd-files" class="muted">Mounting exFAT volume…</div>
+      </div>
+
+      <div class="card">
+        <h2>
+          <span>UART0 / Telemetry Log</span>
+          <button id="btn-clear-log" class="btn-mini" type="button">Clear</button>
+        </h2>
+        <pre id="uart-log"></pre>
+      </div>
+    </aside>
+  </main>
+
+  <script src="./app.js"></script>
+</body>
+</html>
