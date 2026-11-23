@@ -30,6 +30,8 @@
 
 #define MENU_MAX_FILES 32
 #define MENU_MAX_CWX   64
+#define LIST_SCROLL_DELAY_MS  400u
+#define LIST_SCROLL_REPEAT_MS 100u
 
 typedef struct {
     uint64_t size;
@@ -454,15 +456,6 @@ static void load_persisted_state(void)
     refresh_telemetry();
 }
 
-static void wait_key_release(key_id_t target)
-{
-    while (keys_state((uint32_t *)0) == target) {
-        keys_flush_events();
-        wfi_sleep_ms(20u);
-    }
-    keys_flush_events();
-}
-
 static uint64_t hash_dir_stem_ci(const char *dir, const char *name)
 {
     uint64_t h = 14695981039346656037ULL;
@@ -785,6 +778,7 @@ static int main_usb_audio_cfg_cb(int set, uint8_t cfg[4], int16_t *rms_x10, uint
 
 static int run_usb_msc_mode(int auto_mode)
 {
+    keys_flush_events();
     g_ui_screen        = UI_SCR_USB;
     g_ui.usb_read_act  = 0u;
     g_ui.usb_write_act = 0u;
@@ -798,6 +792,7 @@ static int run_usb_msc_mode(int auto_mode)
 
     blkdev_t *msc_dev = g_sd_card.initialized ? &g_sd_blkdev : &g_null_blkdev;
     if (usb_msc_start(msc_dev) != 0) {
+        keys_ignore_held();
         return 0;
     }
     if (g_sd_card.initialized) {
@@ -819,11 +814,10 @@ static int run_usb_msc_mode(int auto_mode)
     uint32_t rd_blink_until  = 0u;
     uint32_t wr_blink_until  = 0u;
     uint32_t back_press_ms   = 0u;
-    int      exit_armed      = 0;
+    int      back_down       = 0;
     int      manual_exit     = 0;
 
     uint32_t last_render = 0u;
-    keys_flush_events();
     while (1) {
         wdt_feed();
         for (int burst = 0; burst < 32; burst++) {
@@ -834,37 +828,24 @@ static int run_usb_msc_mode(int auto_mode)
         while (keys_pop_event(&kev)) {
             if (kev.pressed) {
                 backlight_wake(kev.t_ms);
-                if (exit_armed && kev.key == KEY_BACK) {
-                    back_press_ms = kev.t_ms ? kev.t_ms : 1u;
+            }
+            if (kev.key == KEY_BACK) {
+                if (kev.pressed) {
+                    back_down = 1;
+                    back_press_ms = kev.t_ms;
                 } else {
-                    back_press_ms = 0u;
-                }
-            } else {
-                if (kev.key == KEY_BACK) {
-                    back_press_ms = 0u;
-                }
-                if (keys_state((uint32_t *)0) == KEY_NONE) {
-                    exit_armed = 1;
+                    manual_exit = back_down && (uint32_t)(kev.t_ms - back_press_ms) >= 600u;
+                    back_down = 0;
+                    if (manual_exit) break;
                 }
             }
         }
-        uint32_t st_since = 0u;
-        key_id_t st_k = keys_state(&st_since);
         uint32_t now = millis();
         int show_usb = ui_poll_power_button(UI_SCR_USB, &g_ui, now);
-        if (st_k == KEY_NONE) {
-            exit_armed    = 1;
-            back_press_ms = 0u;
-        } else if (exit_armed && st_k == KEY_BACK) {
-            if (back_press_ms == 0u) {
-                back_press_ms = st_since ? st_since : (now ? now : 1u);
-            }
-            if ((int32_t)(now - back_press_ms) >= 600) {
-                manual_exit = 1;
-                break;
-            }
-        } else {
-            back_press_ms = 0u;
+        if (keys_state(NULL) != KEY_BACK && !keys_event_pending()) back_down = 0;
+        if (manual_exit || (back_down && (uint32_t)(now - back_press_ms) >= 600u)) {
+            manual_exit = 1;
+            break;
         }
 
         if ((uint32_t)(now - last_ui) >= 100u) {
@@ -946,9 +927,9 @@ static int run_usb_msc_mode(int auto_mode)
         }
     }
 
+    keys_ignore_held();
     usb_msc_stop();
     (void)sd_flush(&g_sd_card);
-    wait_key_release(KEY_BACK);
     backlight_wake(millis());
 
     /* Remount exFAT because USB host may have written or deleted files;
@@ -989,11 +970,10 @@ static void run_bt_xrec_mode(void)
     uint32_t prev_tx     = 0u;
     uint8_t  prev_acl    = 0u;
     uint8_t  prev_spp    = 0u;
-    int      exit_armed  = 0;
 
     uint32_t iter_rx     = 0u;
     uint32_t iter_tx     = 0u;
-    keys_flush_events();
+    /* Home consumed the opening ENTER edge. Keep subsequent queued taps. */
     while (1) {
         wdt_feed();
         bt_xrec_poll();
@@ -1022,21 +1002,16 @@ static void run_bt_xrec_mode(void)
         while (keys_pop_event(&kev)) {
             if (kev.pressed) {
                 backlight_wake(kev.t_ms);
-                if (exit_armed && kev.key == KEY_BACK) {
+                if (kev.key == KEY_BACK) {
                     bt_exit = 1;
                     break;
-                } else if (exit_armed && kev.key == KEY_ENTER) {
+                } else if (kev.key == KEY_ENTER) {
                     bt_xrec_open_pairing(60000u);
                 }
-            } else if (keys_state((uint32_t *)0) == KEY_NONE) {
-                exit_armed = 1;
             }
         }
         if (bt_exit) {
             break;
-        }
-        if (!exit_armed && keys_state((uint32_t *)0) == KEY_NONE) {
-            exit_armed = 1;
         }
 
         uint32_t now = millis();
@@ -1105,12 +1080,12 @@ static void run_bt_xrec_mode(void)
         }
     }
 
+    keys_ignore_held();
     if (recorder_is_saving()) {
         (void)recorder_stop();
     }
     bt_xrec_stop();
     g_ui.toast_msg[0] = '\0';
-    wait_key_release(KEY_BACK);
     backlight_wake(millis());
     reload_files_and_sd_stats();
 }
@@ -1214,6 +1189,7 @@ static void play_file_at_index(int start_idx)
         g_ui.play_has_prev = (idx > 0) ? 1u : 0u;
         g_ui.play_has_next = (idx + 1 < g_ui.file_count) ? 1u : 0u;
         int rc = openfw_play_file_ui(&g_exfat_vol, g_file_dirs[idx], g_files[idx].filename, &g_ui);
+        keys_ignore_held();
         g_files[idx].unplayed   = 0u;
         g_files[idx].resume_sec = g_ui.play_file.resume_sec;
         g_ui.last_file          = g_files[idx];
@@ -1256,6 +1232,7 @@ static void play_named_file(const char *dir, ui_file_entry_t *entry)
     g_ui.play_has_prev = 0u;
     g_ui.play_has_next = 0u;
     (void)openfw_play_file_ui(&g_exfat_vol, dir, entry->filename, &g_ui);
+    keys_ignore_held();
     entry->resume_sec = g_ui.play_file.resume_sec;
     save_persisted_state();
 }
@@ -1532,6 +1509,8 @@ int openfw_main(void)
     int      del_armed               = 0;
     int      about_armed             = 0;
     key_id_t prev_key                = KEY_NONE;
+    key_id_t scroll_repeat_key         = KEY_NONE;
+    uint32_t scroll_repeat_at          = 0u;
     int      swallow_until_release   = 0;
     int      dirty                   = 1;
 
@@ -1791,7 +1770,6 @@ int openfw_main(void)
                 int manual = run_usb_msc_mode(1);
                 usb_suppress_until_unpl = (manual && pmu_is_vbus_present()) ? 1 : 0;
                 g_ui_screen = (uint32_t)scr;
-                keys_flush_events();
                 prev_key    = KEY_NONE;
                 dirty       = 1;
                 continue;
@@ -1806,6 +1784,10 @@ int openfw_main(void)
             uint32_t    t          = have ? kev.t_ms : millis();
             int         modal_done = 0;
 
+            int browsing = scr == UI_SCR_FILES || (scr == UI_SCR_SETTINGS && !g_ui.set_edit_clock);
+            if (!browsing || key != scroll_repeat_key || g_screen_off) {
+                scroll_repeat_key = KEY_NONE;
+            }
             if (g_screen_off) {
                 if (key != KEY_NONE && prev_key == KEY_NONE) {
                     backlight_wake(t);
@@ -1824,6 +1806,15 @@ int openfw_main(void)
                 }
 
                 int rising = (key != KEY_NONE && key != prev_key) ? 1 : 0;
+                int repeat = 0;
+                if (browsing && rising && (key == KEY_LEFT || key == KEY_RIGHT)) {
+                    scroll_repeat_key = key;
+                    scroll_repeat_at = t + LIST_SCROLL_DELAY_MS;
+                } else if (!have && key != KEY_NONE && key == scroll_repeat_key &&
+                           (int32_t)(t - scroll_repeat_at) >= 0) {
+                    repeat = 1;
+                    scroll_repeat_at = t + LIST_SCROLL_REPEAT_MS;
+                }
                 ui_screen_id_t scr_before = scr;
 
                 switch (scr) {
@@ -1923,7 +1914,7 @@ int openfw_main(void)
                     break;
 
                 case UI_SCR_FILES:
-                    if (rising) {
+                    if (rising || repeat) {
                         if (key == KEY_BACK) {
                             scr         = UI_SCR_HOME;
                             g_ui_screen = (uint32_t)scr;
@@ -1948,17 +1939,17 @@ int openfw_main(void)
                             enter_press_ms   = t ? t : 1u;
                             enter_long_fired = 0;
                         }
-                    } else if (key == KEY_ENTER && enter_press_ms != 0u && !enter_long_fired) {
-                        if ((uint32_t)(t - enter_press_ms) >= 600u) {
-                            enter_long_fired = 1;
-                            enter_press_ms   = 0u;
-                            del_armed        = 0;
-                            g_ui.del_hold_pct = 0u;
-                            g_ui.del_holding  = 0u;
-                            scr               = UI_SCR_DELETE;
-                            g_ui_screen       = (uint32_t)scr;
-                            dirty             = 1;
-                        }
+                    } else if (enter_press_ms != 0u && !enter_long_fired &&
+                               (key == KEY_ENTER || prev_key == KEY_ENTER) &&
+                               (uint32_t)(t - enter_press_ms) >= 600u) {
+                        enter_long_fired = 1;
+                        enter_press_ms   = 0u;
+                        del_armed        = key == KEY_NONE;
+                        g_ui.del_hold_pct = 0u;
+                        g_ui.del_holding  = 0u;
+                        scr               = UI_SCR_DELETE;
+                        g_ui_screen       = (uint32_t)scr;
+                        dirty             = 1;
                     } else if (key != KEY_ENTER && prev_key == KEY_ENTER && enter_press_ms != 0u && !enter_long_fired) {
                         enter_press_ms = 0u;
                         if (g_ui.file_count > 0) {
@@ -1999,10 +1990,10 @@ int openfw_main(void)
                                 enter_press_ms    = 0u;
                                 g_ui.del_holding  = 0u;
                                 g_ui.del_hold_pct = 0u;
+                                keys_ignore_held();
                                 delete_selected_file(t);
                                 scr         = UI_SCR_FILES;
                                 g_ui_screen = (uint32_t)scr;
-                                wait_key_release(KEY_ENTER);
                                 dirty       = 1;
                                 modal_done  = 1;
                             }
@@ -2011,7 +2002,7 @@ int openfw_main(void)
                     break;
 
                 case UI_SCR_SETTINGS:
-                    if (rising) {
+                    if (rising || repeat) {
                         if (g_ui.set_edit_clock != 0u) {
                             if (key == KEY_BACK) {
                                 g_ui.set_edit_clock = 0u;
@@ -2138,7 +2129,6 @@ int openfw_main(void)
                 }
 
                 if (modal_done) {
-                    keys_flush_events();
                     prev_key = KEY_NONE;
                     break;
                 }

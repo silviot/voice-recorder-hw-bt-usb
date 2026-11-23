@@ -186,7 +186,8 @@ void        keys_scan_tick(uint32_t now_ms);
 int         keys_peek_event(key_event_t *out);
 int         keys_pop_event(key_event_t *out);
 int         keys_event_pending(void);
-void        keys_flush_events(void);
+key_id_t    keys_flush_events(void); /* held key at the queue boundary */
+void        keys_ignore_held(void); /* start a screen transition, suppress the exiting press */
 key_id_t    keys_state(uint32_t *since_ms);
 
 /* ST7735S 80x160 / 160x80 8080 Parallel LCD + PWM3 Backlight (lcd_st7735s.c) */

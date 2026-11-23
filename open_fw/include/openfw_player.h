@@ -21,14 +21,15 @@
  *   LEFT/RIGHT    double tap: previous / next file
  *                 single tap: one seek step (sent once the double-tap window
  *                 has passed without a second tap)
- *                 hold: seek steps, repeated while held
+ *                 hold: audible, pitch-preserving seek from 2x through 5x
  * A key already held when the player starts is ignored until it is released,
  * so the OK press that opened the player does not trigger anything.
  */
 #define PLAYER_KEY_DEBOUNCE_MS      30u
 #define PLAYER_KEY_DOUBLE_TAP_MS   350u  /* release -> second press */
 #define PLAYER_KEY_HOLD_MS         500u  /* press -> first hold seek step */
-#define PLAYER_KEY_SCRUB_MS        250u  /* hold seek repeat period */
+#define PLAYER_SCRUB_STEP_MS       500u  /* time at each speed before accelerating */
+#define PLAYER_SCRUB_MAX_RATE        5u
 #define PLAYER_KEY_REPEAT_DELAY_MS 400u  /* VOL press -> first repeat */
 #define PLAYER_KEY_REPEAT_MS       100u  /* VOL repeat period */
 
@@ -40,7 +41,7 @@ typedef enum {
     PLAYER_ACT_VOL_DOWN,
     PLAYER_ACT_SEEK_BACK,   /* single tap */
     PLAYER_ACT_SEEK_FWD,
-    PLAYER_ACT_SCRUB_BACK,  /* one step of a hold */
+    PLAYER_ACT_SCRUB_BACK,  /* start audible 2x scrub */
     PLAYER_ACT_SCRUB_FWD,
     PLAYER_ACT_PREV_FILE,   /* double tap */
     PLAYER_ACT_NEXT_FILE,

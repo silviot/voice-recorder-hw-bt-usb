@@ -1202,7 +1202,24 @@ static void test_keys_driver(void)
     g_soc.saradc_ch1_data = 2850u;          /* fresh KEY_ENTER press works */
     for (int i = 0; i < 8; i++) keys_scan_tick(t++);
     assert(keys_pop_event(&ev) == 1 && ev.key == KEY_ENTER && ev.pressed == 1u);
-    assert(keys_state(NULL) == KEY_ENTER);
+    assert(keys_flush_events() == KEY_ENTER);
+    g_soc.saradc_ch1_data = 4095u;
+    for (int i = 0; i < 8; i++) keys_scan_tick(t++);
+    assert(keys_pop_event(&ev) && ev.key == KEY_ENTER && !ev.pressed);
+
+    /* Mode exit hides the held key during cleanup. A direct switch to
+     * another key and its release remain queued for the returning menu. */
+    g_soc.saradc_ch1_data = 2550u;
+    for (int i = 0; i < 8; i++) keys_scan_tick(t++);
+    keys_ignore_held();
+    assert(keys_state(NULL) == KEY_NONE && !keys_event_pending());
+    g_soc.saradc_ch1_data = 2850u;
+    for (int i = 0; i < 8; i++) keys_scan_tick(t++);
+    g_soc.saradc_ch1_data = 4095u;
+    for (int i = 0; i < 8; i++) keys_scan_tick(t++);
+    assert(keys_pop_event(&ev) && ev.key == KEY_ENTER && ev.pressed);
+    assert(keys_pop_event(&ev) && ev.key == KEY_ENTER && !ev.pressed);
+    assert(!keys_event_pending());
 
     printf("[OK] keys SARADC + PB6/PB11 + 1kHz scanner/debounce/SPSC MMIO\n");
 }

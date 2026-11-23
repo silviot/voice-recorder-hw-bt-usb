@@ -188,10 +188,10 @@ void keys_scan_tick(uint32_t now_ms)
         g_key_cand_count   = 0u;
 
         if (g_key_resync_ignore) {
-            if (raw == KEY_NONE) {
-                g_key_resync_ignore = 0u;
-            }
-            return;
+            /* The old key belongs to the previous input context. A direct
+             * transition to another debounced key is a fresh press. */
+            old = KEY_NONE;
+            g_key_resync_ignore = 0u;
         }
 
         if (old != KEY_NONE) {
@@ -241,14 +241,26 @@ int keys_pop_event(key_event_t *out)
     return 1;
 }
 
-void keys_flush_events(void)
+static key_id_t keys_reset_queue(int ignore_held)
 {
     uint32_t pm;
     OPENFW_IRQ_SAVE(pm);
     g_key_q_tail        = g_key_q_head;
     g_key_overflow      = 0u;
-    g_key_resync_ignore = 0u;
+    key_id_t held = g_key_stable;
+    g_key_resync_ignore = ignore_held && held != KEY_NONE;
     OPENFW_IRQ_RESTORE(pm);
+    return held;
+}
+
+key_id_t keys_flush_events(void)
+{
+    return keys_reset_queue(0);
+}
+
+void keys_ignore_held(void)
+{
+    (void)keys_reset_queue(1);
 }
 
 key_id_t keys_state(uint32_t *since_ms)

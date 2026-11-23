@@ -13,7 +13,7 @@
 #define PLAYER_DAC_CHUNK_FRAMES 1024u
 
 /*
- * Static playback buffers (16 KiB total, zero net SRAM growth):
+ * Main playback buffers (16 KiB total):
  *   g_file_buf : 4096 B raw SD read buffer (used directly for 16-bit PCM)
  *   g_dec_pcm  : 8192 B (4096 samples) IMA-ADPCM decode buffer: fits
  *                block_align=2048 for both mono (4089) and stereo (2041) frames
@@ -22,6 +22,10 @@
 static uint8_t  g_file_buf[4096] __attribute__((aligned(4)));
 static int16_t  g_dec_pcm[4096]  __attribute__((aligned(4)));
 static int16_t  g_mono_tx[PLAYER_DAC_CHUNK_FRAMES * 2u] __attribute__((aligned(4)));
+
+/* Retain the continuation of the previous grain for waveform matching. */
+#define SCRUB_OVERLAP_MAX 256u
+static int16_t g_scrub_tail[2u * SCRUB_OVERLAP_MAX];
 
 typedef struct {
     exfat_vol_t   *vol;
@@ -255,9 +259,8 @@ player_action_t player_keys_tick(player_keys_t *s, uint32_t now_ms)
         s->next_repeat = now_ms + PLAYER_KEY_REPEAT_MS;
         return (s->held == KEY_VOL_UP) ? PLAYER_ACT_VOL_UP : PLAYER_ACT_VOL_DOWN;
     }
-    if (is_seek_key(s->held) && time_reached(now_ms, s->next_repeat)) {
+    if (is_seek_key(s->held) && !s->hold_active && time_reached(now_ms, s->next_repeat)) {
         s->hold_active = 1u;
-        s->next_repeat = now_ms + PLAYER_KEY_SCRUB_MS;
         return (s->held == KEY_RIGHT) ? PLAYER_ACT_SCRUB_FWD : PLAYER_ACT_SCRUB_BACK;
     }
     return PLAYER_ACT_NONE;
@@ -298,12 +301,9 @@ player_action_t player_keys_edge(player_keys_t *s, key_id_t key, uint32_t now_ms
     }
 
     if (key != KEY_NONE && s->tap_key != KEY_NONE) {
-        /* Another key pressed while a tap waits: settle the tap first and
-         * make the new key wait for a fresh press. */
-        key_id_t k = s->tap_key;
-        s->tap_key = KEY_NONE;
-        s->ignore  = 1u;
-        return (k == KEY_RIGHT) ? PLAYER_ACT_SEEK_FWD : PLAYER_ACT_SEEK_BACK;
+        /* Deliver the new control immediately. A different key rules out a
+         * double tap, so the next tick can settle the pending seek. */
+        s->tap_deadline = now_ms;
     }
 
     switch (key) {
@@ -378,6 +378,191 @@ static void player_seek_to_frame(const wav_stream_info_t *winfo, uint64_t target
     *data_off = (uint32_t)off64;
 }
 
+/* Both directions use the normal PCM/IMA staging buffers. Read a group of
+ * complete codec blocks, decode forwards, then walk the PCM in either direction. */
+typedef struct {
+    int speed;               /* signed source frames per output frame */
+    uint32_t submitted;
+    uint32_t rate_start[PLAYER_SCRUB_MAX_RATE - 2u]; /* frames submitted before each increase */
+    int64_t next;            /* source boundary after the last submitted sample */
+    uint32_t cache_start;
+    uint32_t cache_frames;
+    uint32_t pending_pos;
+    uint32_t pending_count;
+    uint32_t overlap;
+    int finished;
+} scrub_t;
+
+static uint32_t scrub_heard(const scrub_t *s, uint32_t total)
+{
+    uint32_t queued = audio_dac_queued_frames();
+    uint32_t rate = (uint32_t)(s->speed > 0 ? s->speed : -s->speed);
+    int64_t distance = 2 * (int64_t)queued;
+    for (uint32_t step = 0; step < rate - 2u; step++) {
+        uint32_t frames = s->submitted - s->rate_start[step];
+        distance += frames < queued ? frames : queued;
+    }
+    int64_t pos = s->next + (s->speed > 0 ? -distance : distance);
+    if (pos < 0) return 0;
+    if (pos > total) return total;
+    return (uint32_t)pos;
+}
+
+static uint32_t decode_blocks(const wav_stream_info_t *w, uint32_t bytes)
+{
+    uint32_t decoded = 0;
+    uint32_t capacity = (sizeof(g_dec_pcm) / sizeof(g_dec_pcm[0])) / w->channels;
+    for (uint32_t off = 0; off < bytes; off += w->block_align) {
+        uint32_t len = bytes - off;
+        if (len > w->block_align) len = w->block_align;
+        int n = wav_decode_ima_adpcm_block(g_file_buf + off, len, w->channels,
+                                           g_dec_pcm + decoded * w->channels, capacity - decoded);
+        if (n <= 0) return 0;
+        decoded += (uint32_t)n;
+    }
+    return decoded;
+}
+
+static int scrub_load(scrub_t *s, exfat_vol_t *vol, const exfat_entry_t *file,
+                      const wav_stream_info_t *w, uint32_t frame)
+{
+    uint32_t blocks = sizeof(g_file_buf) / w->block_align;
+    if (w->format_tag == WAV_FMT_IMA_ADPCM) {
+        uint32_t fit = (sizeof(g_dec_pcm) / sizeof(g_dec_pcm[0])) /
+                       (w->samples_per_block * (uint32_t)w->channels);
+        if (blocks > fit) blocks = fit;
+    }
+    uint32_t span = blocks * w->samples_per_block;
+    s->cache_start = frame - frame % span;
+    uint64_t off = (uint64_t)(s->cache_start / w->samples_per_block) * w->block_align;
+    if (off >= w->data_bytes) return 0;
+    uint32_t len = w->data_bytes - (uint32_t)off;
+    if (len > blocks * w->block_align) len = blocks * w->block_align;
+    uint32_t got = 0;
+    if (exfat_read_file(vol, file, w->data_offset + off, g_file_buf, len, &got) || got != len)
+        return 0;
+    s->cache_frames = w->format_tag == WAV_FMT_PCM ? len / w->block_align : decode_blocks(w, len);
+    return frame - s->cache_start < s->cache_frames;
+}
+
+/* Copy at the original sample rate, preserving stereo pairs in reverse. */
+static int scrub_copy(scrub_t *s, exfat_vol_t *vol, const exfat_entry_t *file,
+                      const wav_stream_info_t *w, const int16_t *pcm,
+                      int64_t frame, int direction, int16_t *out, uint32_t count)
+{
+    while (count) {
+        uint32_t index = (uint32_t)frame - s->cache_start;
+        if (index >= s->cache_frames) {
+            if (!scrub_load(s, vol, file, w, (uint32_t)frame)) return 0;
+            index = (uint32_t)frame - s->cache_start;
+        }
+        uint32_t run = direction > 0 ? s->cache_frames - index : index + 1u;
+        if (run > count) run = count;
+        for (uint32_t n = 0; n < run; n++) {
+            const int16_t *sample = pcm + index * w->channels;
+            *out++ = sample[0];
+            *out++ = sample[w->channels - 1];
+            index += direction;
+        }
+        frame += (int32_t)run * direction;
+        count -= run;
+    }
+    return 1;
+}
+
+/* Search a short window for the best match to both channels of the old tail.
+ * Sparse comparisons bound CPU time; the splice itself is sample-accurate. */
+static uint32_t scrub_match(uint32_t search, uint32_t overlap)
+{
+    uint32_t best = 0, best_error = UINT32_MAX;
+    uint32_t stride = 1u + overlap / 32u;
+    for (uint32_t shift = 0; shift <= search; shift++) {
+        uint32_t error = 0;
+        for (uint32_t i = 0; i < overlap; i += stride) {
+            for (unsigned ch = 0; ch < 2; ch++) {
+                int diff = g_mono_tx[2u * (i + shift) + ch] - g_scrub_tail[2u * i + ch];
+                error += (uint32_t)(diff < 0 ? -diff : diff);
+            }
+            if (error >= best_error) break;
+        }
+        if (error < best_error) {
+            best_error = error;
+            best = shift;
+        }
+    }
+    return best;
+}
+
+/* Waveform-similarity overlap-add: advance the file clock at seek speed, but play
+ * contiguous audio at 1x inside each grain. Align then crossfade the joins. */
+static int scrub_grain(scrub_t *s, exfat_vol_t *vol, const exfat_entry_t *file,
+                       const wav_stream_info_t *w, const int16_t *pcm)
+{
+    int direction = s->speed > 0 ? 1 : -1;
+    int64_t frame = s->next - (direction < 0);
+    if (frame < 0 || frame >= w->total_samples) return 0;
+    uint32_t available = direction > 0 ? w->total_samples - (uint32_t)frame : (uint32_t)frame + 1u;
+    uint32_t hop = w->sample_rate / 32u;
+    if (hop > PLAYER_DAC_CHUNK_FRAMES) hop = PLAYER_DAC_CHUNK_FRAMES;
+    uint32_t rate = (uint32_t)(direction * s->speed);
+    uint32_t output_left = 1u + (available - 1u) / rate;
+    if (hop > output_left) hop = output_left;
+    uint32_t blend = s->overlap < hop ? s->overlap : hop;
+    uint32_t shift = 0;
+    if (blend) {
+        uint32_t search = w->sample_rate / 80u;
+        if (search > PLAYER_DAC_CHUNK_FRAMES - blend) search = PLAYER_DAC_CHUNK_FRAMES - blend;
+        if (search > available - hop) search = available - hop;
+        if (!scrub_copy(s, vol, file, w, pcm, frame, direction, g_mono_tx, search + blend)) return 0;
+        shift = scrub_match(search, blend);
+    }
+    frame += direction * (int32_t)shift;
+    if (!scrub_copy(s, vol, file, w, pcm, frame, direction, g_mono_tx, hop)) return 0;
+    for (uint32_t i = 0; i < blend; i++) {
+        for (unsigned ch = 0; ch < 2; ch++) {
+            uint32_t k = 2u * i + ch;
+            int32_t delta = (int32_t)g_mono_tx[k] - g_scrub_tail[k];
+            g_mono_tx[k] = (int16_t)(g_scrub_tail[k] + delta * (int32_t)(i + 1u) / (int32_t)blend);
+        }
+    }
+    uint32_t tail = w->sample_rate / 160u;
+    if (tail > SCRUB_OVERLAP_MAX) tail = SCRUB_OVERLAP_MAX;
+    if (tail > available - shift - hop) tail = available - shift - hop;
+    if (!scrub_copy(s, vol, file, w, pcm, frame + direction * (int32_t)hop, direction,
+                    g_scrub_tail, tail)) return 0;
+    s->overlap = tail;
+    s->pending_count = hop;
+    s->pending_pos = 0;
+    return 1;
+}
+
+static void scrub_queue(scrub_t *s, exfat_vol_t *vol, const exfat_entry_t *file,
+                        const wav_stream_info_t *w, const int16_t *pcm, uint32_t held_ms)
+{
+    for (unsigned slot = 0; slot < AUDIO_DAC_QUEUE_SLOTS; slot++) {
+        if (!s->pending_count) {
+            int direction = s->speed > 0 ? 1 : -1;
+            unsigned rate = (unsigned)(direction * s->speed);
+            while (rate < PLAYER_SCRUB_MAX_RATE &&
+                   held_ms >= PLAYER_KEY_HOLD_MS + (rate - 1u) * PLAYER_SCRUB_STEP_MS) {
+                s->rate_start[rate - 2u] = s->submitted;
+                rate++;
+            }
+            s->speed = direction * (int)rate;
+        }
+        if (!s->pending_count && (s->finished || !scrub_grain(s, vol, file, w, pcm))) {
+            s->finished = 1; /* End of this directional pass, or SD read error. */
+            break;
+        }
+        int sent = audio_dac_write_stereo(g_mono_tx + 2 * s->pending_pos, s->pending_count);
+        if (sent <= 0) break;
+        s->pending_pos += (uint32_t)sent;
+        s->pending_count -= (uint32_t)sent;
+        s->submitted += (uint32_t)sent;
+        s->next += (int64_t)sent * s->speed;
+    }
+}
+
 static void player_pause_rewind(const wav_stream_info_t *winfo,
                                 uint32_t *data_off,
                                 uint32_t *played_frames,
@@ -399,6 +584,9 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
     if (!vol || !wav_name || wav_name[0] == '\0') {
         return 0;
     }
+
+    player_keys_t keys;
+    player_keys_init(&keys, keys_flush_events(), millis());
 
     ui_model_t local_m;
     if (!m) {
@@ -522,6 +710,7 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
     uint32_t skip_frames   = 0u;
     uint8_t  peak_l_pct    = 0u;
     uint8_t  peak_r_pct    = 0u;
+    scrub_t  scrub         = {0};
     int      paused        = 0;
     int      eof_reached   = 0;
     uint32_t telemetry_ms  = millis() - 1000u;
@@ -530,9 +719,7 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
     uint32_t toast_until   = 0u;
     int      ui_dirty      = 1;
     int      ret_code      = 0;
-    keys_flush_events();
-    player_keys_t keys;
-    player_keys_init(&keys, keys_state((uint32_t *)0), millis());
+
 
     while (1) {
         wdt_feed();
@@ -548,7 +735,44 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
             m->toast_msg[0] = '\0';
             ui_dirty        = 1;
         }
+        player_action_t act = PLAYER_ACT_NONE;
+        key_event_t ev;
+        while (keys_peek_event(&ev)) {
+            act = player_keys_tick(&keys, ev.t_ms);
+            if (act != PLAYER_ACT_NONE) {
+                break;
+            }
+            if (!keys_pop_event(&ev)) break;
+            act = player_keys_edge(&keys, ev.pressed ? ev.key : KEY_NONE, ev.t_ms);
+            if (act != PLAYER_ACT_NONE) {
+                break;
+            }
+        }
+        if (act == PLAYER_ACT_NONE) {
+            /* Queue overflow suppresses the physical key until release. Cancel
+             * any stale hold before it can generate another timed action. */
+            key_id_t stable = keys_state(NULL);
+            if (stable != keys.held && !keys_event_pending()) {
+                player_keys_init(&keys, stable, now);
+            }
+            act = player_keys_tick(&keys, now);
+        }
         int cur_hp = keys_read_hp_detect();
+        int unplug = hp_in && !cur_hp;
+        if (scrub.speed && (!keys.hold_active || unplug ||
+                            (!keys_event_pending() && keys_state(NULL) != keys.held))) {
+            uint32_t heard = scrub_heard(&scrub, winfo.total_samples);
+            audio_dac_flush();
+            scrub.speed = 0;
+            player_seek_to_frame(&winfo, heard, &data_off, &played_frames);
+            skip_frames = heard - played_frames;
+            buf_pos = buf_frames = 0;
+            eof_reached = heard == winfo.total_samples;
+            if (eof_reached) played_frames = heard;
+            audio_dac_set_mute(paused || eof_reached);
+            audio_pa_set(!paused && !eof_reached && !hp_in && !unplug);
+            ui_dirty = 1;
+        }
         if (cur_hp != hp_in) {
             int was_hp = hp_in;
             hp_in  = cur_hp;
@@ -570,22 +794,6 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
             ui_dirty = 1;
         }
 
-        player_action_t act = PLAYER_ACT_NONE;
-        key_event_t ev;
-        while (keys_peek_event(&ev)) {
-            act = player_keys_tick(&keys, ev.t_ms);
-            if (act != PLAYER_ACT_NONE) {
-                break;
-            }
-            keys_pop_event(&ev);
-            act = player_keys_edge(&keys, ev.pressed ? ev.key : KEY_NONE, ev.t_ms);
-            if (act != PLAYER_ACT_NONE) {
-                break;
-            }
-        }
-        if (act == PLAYER_ACT_NONE) {
-            act = player_keys_tick(&keys, now);
-        }
         int file_dir = 0; /* -1: previous file, +1: next file */
         if (act == PLAYER_ACT_BACK) {
             ret_code = 0;
@@ -628,13 +836,18 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
             ui_dirty    = 1;
         } else if (act == PLAYER_ACT_PREV_FILE || act == PLAYER_ACT_NEXT_FILE) {
             file_dir = (act == PLAYER_ACT_NEXT_FILE) ? 1 : -1;
-        } else if (act == PLAYER_ACT_SEEK_BACK || act == PLAYER_ACT_SEEK_FWD ||
-                   act == PLAYER_ACT_SCRUB_BACK || act == PLAYER_ACT_SCRUB_FWD) {
-            int fwd = (act == PLAYER_ACT_SEEK_FWD || act == PLAYER_ACT_SCRUB_FWD);
-            int tap = (act == PLAYER_ACT_SEEK_BACK || act == PLAYER_ACT_SEEK_FWD);
+        } else if ((act == PLAYER_ACT_SCRUB_BACK || act == PLAYER_ACT_SCRUB_FWD) && !unplug) {
+            uint32_t heard = eof_reached ? played_frames : player_heard_frames(played_frames, skip_frames);
+            audio_dac_flush();
+            scrub = (scrub_t){ .speed = act == PLAYER_ACT_SCRUB_FWD ? 2 : -2, .next = heard };
+            audio_dac_set_mute(0);
+            audio_pa_set(!hp_in);
+            ui_dirty = 1;
+        } else if (act == PLAYER_ACT_SEEK_BACK || act == PLAYER_ACT_SEEK_FWD) {
+            int fwd = act == PLAYER_ACT_SEEK_FWD;
             /* A tap keeps the old meaning in "Track" skip mode and at the end of
              * the file; a hold always seeks. */
-            if (tap && ((eof_reached && fwd) || (!has_cwx && m->cfg.skip_mode == UI_SKIP_TRACK))) {
+            if ((eof_reached && fwd) || (!has_cwx && m->cfg.skip_mode == UI_SKIP_TRACK)) {
                 file_dir = fwd ? 1 : -1;
             } else {
                 int32_t step_s;
@@ -672,7 +885,9 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
         }
 
         /* Refill PCM decode staging buffer & fill the DAC queue before doing display work */
-        if (!paused && !eof_reached) {
+        if (scrub.speed) {
+            scrub_queue(&scrub, vol, &wav_ent, &winfo, pcm_buf, millis() - keys.held_since);
+        } else if (!paused && !eof_reached) {
             for (unsigned iter = 0; iter < AUDIO_DAC_QUEUE_SLOTS; iter++) {
                 if (buf_pos >= buf_frames) {
                     if (data_off >= winfo.data_bytes || played_frames >= winfo.total_samples) {
@@ -686,11 +901,9 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
                     }
                     uint32_t rem = winfo.data_bytes - data_off;
                     uint32_t chunk;
-                    uint32_t frames_cap = 0u;
                     if (winfo.format_tag == WAV_FMT_IMA_ADPCM) {
-                        frames_cap = (uint32_t)(sizeof(g_dec_pcm) / sizeof(g_dec_pcm[0])) / winfo.channels;
-                        uint32_t frames_per_block = 1u + ((uint32_t)(winfo.block_align - 4u * winfo.channels) * 2u) / winfo.channels;
-                        uint32_t blocks = frames_cap / frames_per_block;
+                        uint32_t frames_cap = (uint32_t)(sizeof(g_dec_pcm) / sizeof(g_dec_pcm[0])) / winfo.channels;
+                        uint32_t blocks = frames_cap / winfo.samples_per_block;
                         chunk = blocks * (uint32_t)winfo.block_align;
                         if (chunk > sizeof(g_file_buf)) chunk = (uint32_t)sizeof(g_file_buf);
                     } else {
@@ -737,16 +950,8 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
 
                     uint32_t decoded_frames = 0u;
                     if (winfo.format_tag == WAV_FMT_IMA_ADPCM) {
-                        for (uint32_t off = 0u; off < chunk; off += winfo.block_align) {
-                            int n = wav_decode_ima_adpcm_block(g_file_buf + off, winfo.block_align,
-                                            winfo.channels, g_dec_pcm + decoded_frames * winfo.channels,
-                                            frames_cap - decoded_frames);
-                            if (n <= 0) {
-                                data_off = winfo.data_bytes;
-                                break;
-                            }
-                            decoded_frames += (uint32_t)n;
-                        }
+                        decoded_frames = decode_blocks(&winfo, chunk);
+                        if (!decoded_frames) data_off = winfo.data_bytes;
                     } else {
                         decoded_frames = chunk / (uint32_t)winfo.block_align;
                     }
@@ -828,12 +1033,13 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
             m->hp_plugged = hp_in;
 
             uint32_t heard  = eof_reached ? played_frames : player_heard_frames(played_frames, skip_frames);
+            if (scrub.speed) heard = scrub_heard(&scrub, winfo.total_samples);
             uint32_t pos_ms = frames_to_ms(heard, winfo.sample_rate);
             if (pos_ms > dur_ms && dur_ms > 0u) {
                 pos_ms = dur_ms;
             }
             m->play_pos_sec = pos_ms / 1000u;
-            m->play_state   = eof_reached ? 2u : (paused ? 1u : 0u);
+            m->play_state   = scrub.speed ? 0u : eof_reached ? 2u : (paused ? 1u : 0u);
             m->play_vol_hi  = (last_vol_ms != 0u && (uint32_t)(now - last_vol_ms) < 1500u) ? 1u : 0u;
             m->play_vu_l    = (paused || eof_reached) ? 0u : peak_l_pct;
             m->play_vu_r    = (paused || eof_reached) ? 0u : peak_r_pct;
@@ -847,20 +1053,20 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
         }
 
         if (!keys_event_pending() &&
-            (paused || eof_reached || (audio_dac_is_busy() &&
+            (scrub.speed || paused || eof_reached || (audio_dac_is_busy() &&
             (buf_pos < buf_frames || data_off >= winfo.data_bytes || played_frames >= winfo.total_samples)))) {
             OPENFW_WFI();
         }
     }
 
+    if (scrub.speed) {
+        uint32_t heard = scrub_heard(&scrub, winfo.total_samples);
+        m->play_pos_sec = frames_to_ms(heard, winfo.sample_rate) / 1000u;
+        eof_reached = heard == winfo.total_samples;
+    }
     audio_dac_stop();
     m->play_file.resume_sec = eof_reached ? 0u : m->play_pos_sec;
 
-    while (keys_state((uint32_t *)0) == KEY_BACK) {
-        wdt_feed();
-        mdelay(20u);
-    }
-    keys_flush_events();
     return ret_code;
 }
 
