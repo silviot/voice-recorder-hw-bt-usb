@@ -181,10 +181,12 @@ int exfat_read_file(const exfat_vol_t *vol, const exfat_entry_t *ent,
     advance(1);
     return 0;
 }
+static int (*screen_awake_script)(unsigned ms);
+
 int ui_poll_power_button(ui_screen_id_t screen, ui_model_t *m, uint32_t now)
 {
-    (void)screen; (void)m; (void)now;
-    return 1;
+    (void)screen; (void)m;
+    return screen_awake_script ? screen_awake_script(now) : 1;
 }
 
 void ui_render_screen(ui_screen_id_t screen, const ui_model_t *m)
@@ -425,6 +427,25 @@ static key_id_t lost_release_then_back(unsigned ms)
     return KEY_NONE;
 }
 
+static int screen_off_mid_playback(unsigned ms)
+{
+    return (ms < 100u || ms >= 1500u) ? 1 : 0;
+}
+
+static key_id_t keys_while_screen_off(unsigned ms)
+{
+    /* All buttons pressed while screen is off (100..1500 ms) must be no-ops. */
+    if (ms >= 200 && ms < 300) return KEY_VOL_UP;
+    if (ms >= 400 && ms < 500) return KEY_ENTER;
+    if (ms >= 600 && ms < 700) return KEY_RIGHT;
+    if (ms >= 800 && ms < 900) return KEY_BACK;
+    /* Key held across the screen wake at 1500 ms must stay ignored until release. */
+    if (ms >= 1400 && ms < 1700) return KEY_VOL_UP;
+    /* Fresh BACK press after wake exits normally. */
+    if (ms >= 1900 && ms < 2000) return KEY_BACK;
+    return KEY_NONE;
+}
+
 static unsigned ended_at_ms;
 
 static void reset_run(key_id_t (*script)(unsigned))
@@ -435,6 +456,7 @@ static void reset_run(key_id_t (*script)(unsigned))
     strict = 0;
     track_pcm = 0;
     key_script = script;
+    screen_awake_script = NULL;
     stub_keys_reset();
 }
 
@@ -689,6 +711,18 @@ static void test_scripted_keys(void)
     assert(m.cfg.spk_vol == 19 && vol_calls == 1);
     assert(now_ms < 1200);
     drop_volume_release = 0;
+
+    /* While screen is off, all non-power buttons (and keys held across wake) are no-ops. */
+    memset(&m, 0, sizeof(m));
+    m.cfg.spk_vol = 18;
+    m.play_has_next = 1;
+    reset_run(keys_while_screen_off);
+    screen_awake_script = screen_off_mid_playback;
+    assert(openfw_play_file_ui(&vol, "/record", "test.wav", &m) == 0);
+    assert(m.cfg.spk_vol == 18 && vol_calls == 0);
+    assert(flush_calls == 0);
+    assert(now_ms >= 1900);
+    screen_awake_script = NULL;
 
     key_script = NULL;
     stub_keys_reset();

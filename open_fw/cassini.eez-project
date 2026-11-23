@@ -11983,7 +11983,7 @@
             }
           },
           "identifier": "usb_tx_lbl",
-          "text": "\u25b2 14.1 MB",
+          "text": "\u25bc 14.1 MB",
           "textType": "literal",
           "longMode": "CLIP",
           "recolor": false
@@ -12030,7 +12030,7 @@
             }
           },
           "identifier": "usb_rx_lbl",
-          "text": "\u25bc 256 KB",
+          "text": "\u25b2 256 KB",
           "textType": "literal",
           "longMode": "CLIP",
           "recolor": false

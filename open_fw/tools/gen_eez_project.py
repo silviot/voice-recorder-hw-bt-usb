@@ -471,8 +471,8 @@ def build_pages() -> list[dict]:
         w_panel("usb_bg", "usb_badge", 4, 18, 30, 26, "st_tile", bg=COL["tile"], bg_opa=255, radius=6,
                 children=[w_label("usb_bl", "usb_badge_lbl", 0, 7, 30, 12, "USB", "ui_font_sm", COL["cyan"], "CENTER")]),
         w_label("usb_t", "usb_title", 40, 15, 116, 26, "USB disk", "ui_font_lg", COL["text"]),
-        w_label("usb_tx", "usb_tx_lbl", 40, 43, 58, 12, "\u25b2 14.1 MB", "ui_font_sm", COL["cyan"]),
-        w_label("usb_rx", "usb_rx_lbl", 100, 43, 58, 12, "\u25bc 256 KB", "ui_font_sm", COL["amber"]),
+        w_label("usb_tx", "usb_tx_lbl", 40, 43, 58, 12, "\u25bc 14.1 MB", "ui_font_sm", COL["cyan"]),
+        w_label("usb_rx", "usb_rx_lbl", 100, 43, 58, 12, "\u25b2 256 KB", "ui_font_sm", COL["amber"]),
         w_label("usb_bp", "usb_batt_lbl", 4, 67, 44, 12, "+ 72%", "ui_font_sm", COL["green"]),
         w_label("usb_ej", "usb_eject_lbl", 52, 67, 104, 12, "Hold BACK Eject", "ui_font_sm", COL["dim"], "RIGHT"),
     ]))

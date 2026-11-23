@@ -705,26 +705,32 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
             ui_dirty        = 1;
         }
         player_action_t act = PLAYER_ACT_NONE;
-        key_event_t ev;
-        while (keys_peek_event(&ev)) {
-            act = player_keys_tick(&keys, ev.t_ms);
-            if (act != PLAYER_ACT_NONE) {
-                break;
+        if (!show_player) {
+            /* Screen is off (or power-off hold active): button presses are no-ops. */
+            key_id_t held_now = keys_flush_events();
+            player_keys_init(&keys, held_now, now);
+        } else {
+            key_event_t ev;
+            while (keys_peek_event(&ev)) {
+                act = player_keys_tick(&keys, ev.t_ms);
+                if (act != PLAYER_ACT_NONE) {
+                    break;
+                }
+                if (!keys_pop_event(&ev)) break;
+                act = player_keys_edge(&keys, ev.pressed ? ev.key : KEY_NONE, ev.t_ms);
+                if (act != PLAYER_ACT_NONE) {
+                    break;
+                }
             }
-            if (!keys_pop_event(&ev)) break;
-            act = player_keys_edge(&keys, ev.pressed ? ev.key : KEY_NONE, ev.t_ms);
-            if (act != PLAYER_ACT_NONE) {
-                break;
+            if (act == PLAYER_ACT_NONE) {
+                /* Queue overflow suppresses the physical key until release. Cancel
+                 * any stale hold before it can generate another timed action. */
+                key_id_t stable = keys_state(NULL);
+                if (stable != keys.held && !keys_event_pending()) {
+                    player_keys_init(&keys, stable, now);
+                }
+                act = player_keys_tick(&keys, now);
             }
-        }
-        if (act == PLAYER_ACT_NONE) {
-            /* Queue overflow suppresses the physical key until release. Cancel
-             * any stale hold before it can generate another timed action. */
-            key_id_t stable = keys_state(NULL);
-            if (stable != keys.held && !keys_event_pending()) {
-                player_keys_init(&keys, stable, now);
-            }
-            act = player_keys_tick(&keys, now);
         }
         int cur_hp = keys_read_hp_detect();
         int unplug = hp_in && !cur_hp;

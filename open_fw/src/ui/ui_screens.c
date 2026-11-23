@@ -1226,8 +1226,10 @@ static void bind_usb(const ui_model_t *m)
     char tx_s[16], rx_s[16], tx_f[24], rx_f[24], bp[12];
     ui_format_bytes_short(tx_s, (int)sizeof(tx_s), m->usb_tx_bytes);
     ui_format_bytes_short(rx_s, (int)sizeof(rx_s), m->usb_rx_bytes);
-    lv_snprintf(tx_f, sizeof(tx_f), "\xE2\x96\xB2 %s", tx_s);
-    lv_snprintf(rx_f, sizeof(rx_f), "\xE2\x96\xBC %s", rx_s);
+    /* Physical USB port is at the bottom: TX (device -> host) points down,
+     * RX (host -> device) points up into the device. */
+    lv_snprintf(tx_f, sizeof(tx_f), "\xE2\x96\xBC %s", tx_s);
+    lv_snprintf(rx_f, sizeof(rx_f), "\xE2\x96\xB2 %s", rx_s);
     lv_snprintf(bp, sizeof(bp), "+ %u%%", (unsigned)m->batt_pct);
     set_changed_text(objects.usb_tx_lbl, tx_f);
     set_changed_text_color(objects.usb_tx_lbl, lv_color_hex(m->usb_read_act ? UI_HEX_CYAN : UI_HEX_DIM));

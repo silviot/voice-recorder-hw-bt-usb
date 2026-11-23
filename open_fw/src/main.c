@@ -134,8 +134,11 @@ static void backlight_wake(uint32_t now_ms)
     g_last_activity_ms = now_ms;
     int was_off        = (g_screen_off != SCREEN_AWAKE);
     g_screen_off       = SCREEN_AWAKE;
-    if (was_off && g_cpu1_booted && !cpu1_ui_is_active()) {
-        (void)cpu1_ui_start();
+    if (was_off) {
+        keys_ignore_held();
+        if (g_cpu1_booted && !cpu1_ui_is_active()) {
+            (void)cpu1_ui_start();
+        }
     }
     backlight_apply(user_bl_pct());
 }
@@ -143,6 +146,7 @@ static void backlight_wake(uint32_t now_ms)
 static void backlight_sleep_now(enum screen_sleep_state reason)
 {
     g_screen_off = reason;
+    keys_ignore_held();
     backlight_apply(0u);
     ui_render_screen(UI_SCR_OFF, &g_ui);
     cpu1_ui_sync(60u);
@@ -824,28 +828,35 @@ static int run_usb_msc_mode(int auto_mode)
             usb_msc_poll();
         }
 
-        key_event_t kev;
-        while (keys_pop_event(&kev)) {
-            if (kev.pressed) {
-                backlight_wake(kev.t_ms);
-            }
-            if (kev.key == KEY_BACK) {
-                if (kev.pressed) {
-                    back_down = 1;
-                    back_press_ms = kev.t_ms;
-                } else {
-                    manual_exit = back_down && (uint32_t)(kev.t_ms - back_press_ms) >= 600u;
-                    back_down = 0;
-                    if (manual_exit) break;
-                }
-            }
-        }
         uint32_t now = millis();
         int show_usb = ui_poll_power_button(UI_SCR_USB, &g_ui, now);
-        if (keys_state(NULL) != KEY_BACK && !keys_event_pending()) back_down = 0;
-        if (manual_exit || (back_down && (uint32_t)(now - back_press_ms) >= 600u)) {
-            manual_exit = 1;
-            break;
+        key_event_t kev;
+        if (!show_usb) {
+            while (keys_pop_event(&kev)) {
+                /* Screen is off (or power-off hold active): button presses are no-ops. */
+            }
+            back_down = 0;
+        } else {
+            while (keys_pop_event(&kev)) {
+                if (kev.pressed) {
+                    backlight_wake(kev.t_ms);
+                }
+                if (kev.key == KEY_BACK) {
+                    if (kev.pressed) {
+                        back_down = 1;
+                        back_press_ms = kev.t_ms;
+                    } else {
+                        manual_exit = back_down && (uint32_t)(kev.t_ms - back_press_ms) >= 600u;
+                        back_down = 0;
+                        if (manual_exit) break;
+                    }
+                }
+            }
+            if (keys_state(NULL) != KEY_BACK && !keys_event_pending()) back_down = 0;
+            if (manual_exit || (back_down && (uint32_t)(now - back_press_ms) >= 600u)) {
+                manual_exit = 1;
+                break;
+            }
         }
 
         if ((uint32_t)(now - last_ui) >= 100u) {
@@ -1000,25 +1011,30 @@ static void run_bt_xrec_mode(void)
             break;
         }
 
+        uint32_t now = millis();
+        int show_bt = ui_poll_power_button(UI_SCR_BT, &g_ui, now);
         int bt_exit = 0;
         key_event_t kev;
-        while (keys_pop_event(&kev)) {
-            if (kev.pressed) {
-                backlight_wake(kev.t_ms);
-                if (kev.key == KEY_BACK) {
-                    bt_exit = 1;
-                    break;
-                } else if (kev.key == KEY_ENTER) {
-                    bt_xrec_open_pairing(60000u);
+        if (!show_bt) {
+            while (keys_pop_event(&kev)) {
+                /* Screen is off (or power-off hold active): button presses are no-ops. */
+            }
+        } else {
+            while (keys_pop_event(&kev)) {
+                if (kev.pressed) {
+                    backlight_wake(kev.t_ms);
+                    if (kev.key == KEY_BACK) {
+                        bt_exit = 1;
+                        break;
+                    } else if (kev.key == KEY_ENTER) {
+                        bt_xrec_open_pairing(60000u);
+                    }
                 }
             }
         }
         if (bt_exit) {
             break;
         }
-
-        uint32_t now = millis();
-        int show_bt = ui_poll_power_button(UI_SCR_BT, &g_ui, now);
         if ((uint32_t)(now - last_ui) >= 150u || last_ui == 0u) {
             last_ui = now;
             pmu_poll_charge_manage();
@@ -1799,12 +1815,14 @@ int openfw_main(void)
                 scroll_repeat_key = KEY_NONE;
             }
             if (g_screen_off) {
-                if (key != KEY_NONE && prev_key == KEY_NONE) {
-                    backlight_wake(t);
-                    swallow_until_release = 1;
-                    dirty = 1;
-                }
-                prev_key = key;
+                /* Screen is off: only the power button wakes the display; all other
+                 * buttons are no-ops and any key held across wake stays ignored. */
+                enter_press_ms        = 0u;
+                enter_long_fired      = 0;
+                g_ui.del_holding      = 0u;
+                g_ui.del_hold_pct     = 0u;
+                swallow_until_release = (key != KEY_NONE) ? 1 : 0;
+                prev_key              = key;
             } else if (swallow_until_release) {
                 if (key == KEY_NONE) {
                     swallow_until_release = 0;

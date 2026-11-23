@@ -2988,7 +2988,7 @@ void create_screen_usb(void) {
             lv_obj_set_pos(obj, 40, 43);
             lv_obj_set_size(obj, 58, 12);
             lv_obj_set_style_text_font(obj, &ui_font_sm, LV_PART_MAIN | LV_STATE_DEFAULT);
-            lv_label_set_text(obj, "\xE2\x96\xB2 14.1 MB");
+            lv_label_set_text(obj, "\xE2\x96\xBC 14.1 MB");
             lv_obj_set_style_text_color(obj, lv_color_hex(0x42C8FFu), LV_PART_MAIN | LV_STATE_DEFAULT);
         }
         {
@@ -2997,7 +2997,7 @@ void create_screen_usb(void) {
             lv_obj_set_pos(obj, 100, 43);
             lv_obj_set_size(obj, 58, 12);
             lv_obj_set_style_text_font(obj, &ui_font_sm, LV_PART_MAIN | LV_STATE_DEFAULT);
-            lv_label_set_text(obj, "\xE2\x96\xBC 256 KB");
+            lv_label_set_text(obj, "\xE2\x96\xB2 256 KB");
             lv_obj_set_style_text_color(obj, lv_color_hex(0xFFB020u), LV_PART_MAIN | LV_STATE_DEFAULT);
         }
         {

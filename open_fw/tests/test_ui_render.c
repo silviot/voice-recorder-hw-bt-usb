@@ -512,6 +512,8 @@ int main(int argc, char **argv)
     m.usb_rx_bytes  = 262144ull;   /* 256 KB */
     ui_render_screen(UI_SCR_USB, &m);
     capture_shot(11);
+    assert(strcmp(lv_label_get_text(objects.usb_tx_lbl), "\xE2\x96\xBC 14.1 MB") == 0);
+    assert(strcmp(lv_label_get_text(objects.usb_rx_lbl), "\xE2\x96\xB2 256 KB") == 0);
     before = g_written_pixels;
     ui_render_screen(UI_SCR_USB, &m);
     assert(g_written_pixels == before);
