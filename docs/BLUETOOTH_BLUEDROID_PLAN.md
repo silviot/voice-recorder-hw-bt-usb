@@ -1,9 +1,9 @@
-# Bluetooth Classic for open_fw — Integration Plan (v4, for joint review)
+# Bluetooth Classic for open_fw — Integration Plan (v5, for joint review)
 
 Branch `feat/freertos-bluedroid` (worktree `../voice-recorder-hw-bt-usb-bt`). Hardware: Smartlink SL6801 `HW_76`
 (dual Cortex-M4F @ 96 MHz, 512 KB SRAM, 2 MB SPI NOR XIP, **BR/EDR-only** RivieraWaves `RW-BT` controller in mask ROM,
 no BLE). This document is the single source of truth: it is reviewed by Codex and agy until both agree, then executed.
-v3 addressed every round-1 blocking item, v4 every round-2 item (§11 traceability).
+v3 addressed round 1, v4 round 2, v5 round 3 (§11 traceability).
 
 ## 0. Goals, non-goals
 
@@ -98,7 +98,7 @@ SRAM (RTOS build): main `.bss` ends ≈`0x84EA18` (~5.5 KB left — nothing new 
 | FreeRTOS idle + timer static stacks/TCBs | ~2.2 KB | currently main `.bss` → move to RTOS region |
 | App task stack | 16 KB | heap (measure; trim only after silicon watermark) |
 | BT stacks: hciT 2 + BTU 4.25 + BTC 3 + bt_ctrl 2 + bt_dlv 1.5 | ~12.75 KB | heap; host + silicon watermarks |
-| bt_ctrl rings: ACL RX 4 × (1021+5) + event RX 8 × 260 + cmd TX 2 × 259 + ACL TX 2 × 1026 | ~8.8 KB | static in `.bt_bss`, capacity asserted in bytes |
+| bt_ctrl rings: ACL RX 4 × (1021+5) + event RX 8 × 260 + unified TX 3 × 1026 (any packet type) | ~9.2 KB | static in `.bt_bss`, capacity asserted in bytes |
 | OSI objects, HCI cmd/ACL buffers, config cache | 8–20 KB | heap |
 | SPP mode RFCOMM queues + XREC RX stream buffer | 4–20 KB | heap |
 | A2DP mode encoded frames + PCM ring (100 ms @48 kHz) | ~26 KB | heap |
@@ -138,26 +138,31 @@ Acceptance budget per mode: minimum free heap under traffic ≥ 8 KB and largest
   - *Optional*: `REJECT` with correctly sized Command Complete / Command Status, status `0x01`.
   - Feature masking (no sniff, role switch, SC, unverified EDR types) reduces but does not prove absence of optional
     commands, hence the REJECT class. No opcode is silently consumed.
-- **ACL credit window (sized to physical storage)**: patch/config overrides upstream `L2CAP_HOST_FC_ACL_BUFS`
-  (default 100) and the `0C33` host ACL length (default `L2CAP_MTU_SIZE` 1691) to **4 packets × 1021 B** (the
-  controller ACL length); a static assert ties the ring byte capacity to these values.
+- **ACL credit window (sized to physical storage)**: config overrides upstream `L2CAP_HOST_FC_ACL_BUFS` (default 100)
+  to 4, and a documented patch at `controller.c`'s `make_host_buffer_size()` call passes a dedicated 1021 B constant
+  instead of `L2CAP_MTU_SIZE` (1691, which keeps L2CAP reassembly unchanged): **4 packets × 1021 B**; a static assert ties the ring byte capacity to these values.
 - **RX path (backpressure never reaches the ROM owner):** `bt_ctrl` copies each complete H4 packet into a bounded ring
-  before completing the ROM `eif_write` callback (copy-before-ack). An ACL host credit is **consumed before** the ROM
-  fragment is accepted; with zero credits the ACL fragment stays in the controller (EM) and the ROM callback is
-  deferred. Events have their own ring with reserved slots for CC/CS/NOCP and remain serviceable at zero ACL credit.
+  before completing the ROM `eif_write` callback (copy-before-ack). The RX dispatcher (rewrite of today's
+  `bt_hci.c` path, which checks `tx_state` first and advances the ACL fragment pointer before writing) is ordered:
+  (1) events first, always; (2) only then ACL, and the ACL branch checks for a host credit **before** mutating any
+  fragment state or marking the transport busy — with zero credits ACL is simply not selected (data stays in EM) and
+  events keep flowing; (3) a credit return (`0C35` from the host) kicks the dispatcher. Events have their own ring with
+  reserved slots for CC/CS/NOCP. Test: event delivery with zero credits and an empty ACL ring; credit return resumes ACL.
   Whether the ROM's `eif_write` stream lets events overtake a deferred ACL fragment is an Exp 1 stage-C question; if it
   does not, ACL-ring saturation is handled as a controlled link disconnect, not assumed impossible.
   `bt_dlv` delivers to the host callback and is the only context that may block in Bluedroid's queues; it checks the
   session id before each delivery and holds no lock across the callback. The host callback (`hci_hal_h4.c`) allocates
   a second copy and asserts on failure: per-mode heap budgets reserve `window × (len + header)` for it, and a host test
   injects allocation failure at that site (documented patch to fail soft if the assert is reachable).
-- **TX admission (driver `send()` returns void)**: hciT is the only caller of `check_send_available()`/`send()` and
-  may call the check and then not send (`hci_layer.c` loop exit, `packet_fragmenter.c` bounce). So
-  `check_send_available()` is a **pure, side-effect-free capacity query** (free slot in the relevant TX ring);
-  only `bt_ctrl` frees slots, so a true result stays true until hciT's next `send()`, which copies and cannot fail
-  (assert). `notify_host_send_available()` (unbounded post + mutex) is never called from `bt_ctrl`: bt_ctrl sets a
-  flag/notifies `bt_dlv`, which calls it. Tests: empty queue, zero command credits, full host work queue, teardown with
-  a pending send-available.
+- **TX admission (driver `send()` returns void)**: `check_send_available(void)` carries no packet type and hciT picks
+  a command, ACL packet or pending fragment only after it returns true; it may also not send at all (`hci_layer.c`
+  loop exit, `packet_fragmenter.c` bounce). So TX uses **one unified ring whose slots fit any H4 packet** (≤ 1026 B),
+  and `check_send_available()` is a **pure, side-effect-free query** "unified ring has a free slot". Only hciT fills
+  and only `bt_ctrl` frees, so a true result stays true until hciT's next `send()`, which copies and cannot fail
+  (assert). Command credit / ACL credit gating happens inside `bt_ctrl` when draining the ring to the ROM, never in the
+  check. `notify_host_send_available()` (unbounded post + mutex) is never called from `bt_ctrl`: it notifies `bt_dlv`,
+  which calls it. Tests: empty queue, zero command credits, zero ACL credits with a queued command (command must still
+  go out), full host work queue, teardown with a pending send-available.
 - **Reset**: real controller reset inside `bt_ctrl`, then synthesized CC; same path on re-enable.
 - **Disable/teardown order**: Bluedroid disable + profile close completions run with transport alive → callbacks
   quiesced (session id bumped, late callbacks rejected) → admission closed → controller stopped, reset completion
@@ -184,8 +189,9 @@ Acceptance budget per mode: minimum free heap under traffic ≥ 8 KB and largest
   4. Seed file on SD is mixed in as additional input but earns **no** entropy credit (removable/replayable).
   5. Candidate sources (ADC LSBs, SARADC/KADC noise, RSSI/I-Q, clock jitter) get credit only after Exp 2 measures them
      across cold starts and quiet inputs.
-- **Store**: `nvs_*` surface used by `osi/config.c` served from an in-RAM KV cache loaded by the app **before**
-  `esp_bluedroid_enable()`; `nvs_commit()` posts an asynchronous flush to the app (atomic exFAT staged replace, CRC).
+- **Store**: `nvs_*` surface used by `osi/config.c` served from an in-RAM KV cache that the app finishes loading
+  **before `esp_bluedroid_init()`** (with SMP enabled, `btc_init_bluetooth()` → `btc_config_init()` already reads the
+  store and silently falls back to an empty config). Test: cold boot with an existing bond reconnects without pairing; `nvs_commit()` posts an asynchronous flush to the app (atomic exFAT staged replace, CRC).
   No SD → RAM-only bonds for the session. Link keys never logged. Trust model documented: keys on MSC-visible media are
   readable/replaceable by anyone with physical access; CRC only detects corruption.
 - `esp_timer`/`osi_alarm` → FreeRTOS timers + `us_timer_now()`. Patch (documented) so timer callbacks that post to
@@ -288,7 +294,7 @@ telemetry: heap/stack watermarks, largest free block, IRQ-26 latency and multipl
 
 ## 9. Open questions for reviewers (round 3)
 
-1. Do the v4 changes resolve the round-2 blockers (SysTick start, link roots, TX admission, ACL window)?
+1. Do the v5 changes resolve the round-3 blockers (unified TX ring, RX dispatcher ordering, store load before init)?
 2. Any remaining blocker to starting steps 1–3?
 
 ## 10. Live log
@@ -296,7 +302,9 @@ telemetry: heap/stack watermarks, largest free block, IRQ-26 latency and multipl
 - 2026-11-24: FreeRTOS port + QEMU self-test (10/10). Bluedroid vendored, Phase 1 GO. Codex architecture review and HCI
   matrix integrated. `main` (i18n, 18 languages) merged. Plan v2 reviewed: Codex and agy both CHANGES_REQUIRED.
   Plan v3 written. Round 2: agy APPROVE_WITH_CHANGES, Codex CHANGES_REQUIRED (4 items). Plan v4 written.
-  Step-1 RTOS hygiene started in parallel (priorities, task-wait, SysTick in port hook, `.rtos_static`, reap test).
+  Step-1 RTOS hygiene committed (`1d3e5db`: priorities, `OPENFW_TASK_WAIT()`, SysTick in port hook, `.rtos_static`,
+  T_REAP; QEMU 11/11; default image byte-identical). Round 3: agy APPROVE_WITH_CHANGES, Codex CHANGES_REQUIRED
+  (3 precise items). Plan v5 written.
 
 ## 11. Round-1 traceability
 
@@ -324,3 +332,8 @@ telemetry: heap/stack watermarks, largest free block, IRQ-26 latency and multipl
 | agy NB3 (target region) | `.bt_data`/`.bt_bss` at start of `RTOS_HEAP` |
 | Codex NB (IPR units; card swap; WDT before phone test) | §3 IPR bytes; step 6 gate |
 | agy A1/A3 (ROM C2H support; NOR UID safety, LAA bits) | Exp 1 stage C question; identity paragraph |
+| **Round 3** | |
+| Codex N1 / agy N1 (`check_send_available` has no packet type) | unified any-type TX ring; credit gating at drain |
+| Codex N2 (events stall behind deferred ACL) | RX dispatcher order: events first, credit check before fragment mutation, kick on credit return |
+| Codex N3 (bonds read at `esp_bluedroid_init`) | cache loaded before init; cold-boot bond test |
+| agy NB (0C33 call site; header comment) | `controller.c` patch with 1021 B constant; comment fixed in `1d3e5db` |
