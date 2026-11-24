@@ -1184,23 +1184,25 @@ static void format_setting_val(const ui_model_t *m, int idx, char *val, int vcap
     case 7: lv_snprintf(val, (size_t)vcap, "%s", skip_mode_name(m->cfg.skip_mode)); break;
     case 8: lv_snprintf(val, (size_t)vcap, "%s", ui_lang_native_name(m->cfg.lang)); break;
     case 9: lv_snprintf(val, (size_t)vcap, "%s", ui_tr(m->vbus_present ? UI_STR_CONNECT : UI_STR_UNPLUGGED)); *adj = 0; break;
+    case UI_SET_HSPROBE: lv_snprintf(val, (size_t)vcap, "%s", "OK"); *adj = 0; break; /* TODO(i18n) */
     default: lv_snprintf(val, (size_t)vcap, "%s", BOARD_FW_VERSION_STR); *adj = 0; break;
     }
 }
 
 static void bind_settings(const ui_model_t *m)
 {
-    static const ui_str_id_t label_ids[11] = {
+    static const ui_str_id_t label_ids[UI_SET_COUNT] = {
         UI_STR_SET_MIC_GAIN, UI_STR_SET_SOUND, UI_STR_SET_MICS, UI_STR_SET_VOR,
         UI_STR_SET_BRIGHTNESS, UI_STR_SET_SCREEN_OFF, UI_STR_SET_CLOCK,
-        UI_STR_SET_SKIP, UI_STR_SET_LANGUAGE, UI_STR_SET_USB_DISK, UI_STR_SET_ABOUT
+        UI_STR_SET_SKIP, UI_STR_SET_LANGUAGE, UI_STR_SET_USB_DISK, UI_STR_SET_ABOUT,
+        UI_STR_SET_HSPROBE
     };
     int sel_disp = m->set_sel;
     if (sel_disp < 0) sel_disp = 0;
-    if (sel_disp > 10) sel_disp = 10;
+    if (sel_disp > UI_SET_COUNT - 1) sel_disp = UI_SET_COUNT - 1;
 
     char sub[12];
-    lv_snprintf(sub, sizeof(sub), "%d / 11", sel_disp + 1);
+    lv_snprintf(sub, sizeof(sub), "%d / %d", sel_disp + 1, UI_SET_COUNT);
     bind_status_bar(objects.set_bar, objects.set_bar_ic, objects.set_bar_l, objects.set_bar_sub,
                     objects.set_bar_r, objects.set_bar_hp, objects.set_batt,
                     objects.set_batt_fill, objects.set_batt_nub,
@@ -1212,7 +1214,7 @@ static void bind_settings(const ui_model_t *m)
 
     for (int r = 0; r < 3; r++) {
         int idx = m->set_scroll + r;
-        if (idx < 0 || idx >= 11) { set_hidden(rows[r], true); continue; }
+        if (idx < 0 || idx >= UI_SET_COUNT) { set_hidden(rows[r], true); continue; }
         set_hidden(rows[r], false);
         int sel = (idx == m->set_sel);
         set_changed_bg_opa(rows[r], sel ? LV_OPA_COVER : LV_OPA_TRANSP);
@@ -1258,7 +1260,7 @@ static void bind_settings(const ui_model_t *m)
         set_changed_x(vals[r], vx);
         set_changed_width(vals[r], vw);
     }
-    bind_scrollbar(objects.set_scroll_thumb, 11, m->set_scroll, 3, 50);
+    bind_scrollbar(objects.set_scroll_thumb, UI_SET_COUNT, m->set_scroll, 3, 50);
 
     if (m->set_edit_clock != 0u) {
         set_hidden(objects.set_foot_vu_box, true);
@@ -1284,6 +1286,7 @@ static void bind_settings(const ui_model_t *m)
         case 7: desc = ui_tr(UI_STR_DESC_SKIP); break;
         case 8: desc = ui_tr(UI_STR_DESC_LANGUAGE); break;
         case 9: desc = ui_tr(m->vbus_present ? UI_STR_DESC_USB_MOUNT : UI_STR_DESC_USB_PLUG); break;
+        case UI_SET_HSPROBE: desc = ui_tr(UI_STR_DESC_HSPROBE); break;
         default: break;
         }
         set_changed_text(objects.set_foot_desc, desc);
@@ -1297,6 +1300,10 @@ static void bind_about(const ui_model_t *m)
                     objects.about_batt_fill, objects.about_batt_nub,
                     m, UI_COL_BAR, UI_COL_TEXT, UI_ICON_NONE, UI_COL_TEXT, ui_tr(UI_STR_SET_ABOUT), NULL, NULL, 0);
     set_changed_text(objects.about_title, BOARD_FW_TITLE_STR);
+    set_changed_text_color(objects.about_title, lv_color_hex(UI_HEX_TEXT));
+    if (lv_label_get_long_mode(objects.about_storage) != LV_LABEL_LONG_WRAP) {
+        lv_label_set_long_mode(objects.about_storage, LV_LABEL_LONG_WRAP);
+    }
     uint32_t gb10 = (m->sd_total_mb * 10u) / 1024u;
     char st[52], bt[52];
     lv_snprintf(st, sizeof(st), ui_tr(UI_STR_ABOUT_STORAGE_FMT),
@@ -1306,6 +1313,35 @@ static void bind_about(const ui_model_t *m)
     set_changed_text(objects.about_storage, st);
     set_changed_text(objects.about_batt_lbl, bt);
     set_changed_text(objects.about_footer, ui_tr(UI_STR_ABOUT_FOOTER));
+}
+
+/* Headset button probe: reuses the About screen objects (title, 2 text rows, footer). */
+static void bind_hsprobe(const ui_model_t *m)
+{
+    char sub[8];
+    lv_snprintf(sub, sizeof(sub), "%us", (unsigned)m->hsp_secs_left);
+    bind_status_bar(objects.about_bar, objects.about_bar_ic, objects.about_bar_l, objects.about_bar_sub,
+                    objects.about_bar_r, objects.about_bar_hp, objects.about_batt,
+                    objects.about_batt_fill, objects.about_batt_nub,
+                    m, UI_COL_BAR, UI_COL_TEXT, UI_ICON_NONE, UI_COL_TEXT, ui_tr(UI_STR_SET_HSPROBE), sub, NULL, 0);
+    char t1[48], t2[48];
+    if (m->hsp_prompt != 0u) {
+        lv_snprintf(t1, sizeof(t1), ui_tr(UI_STR_HSP_PRESS_FMT), (unsigned)m->hsp_prompt);
+        set_changed_text_color(objects.about_title, lv_color_hex(UI_HEX_AMBER));
+    } else {
+        lv_snprintf(t1, sizeof(t1), ui_tr(UI_STR_HSP_WAIT_FMT), (unsigned)m->hsp_secs_left);
+        set_changed_text_color(objects.about_title, lv_color_hex(UI_HEX_TEXT));
+    }
+    set_changed_text(objects.about_title, t1);
+    if (lv_label_get_long_mode(objects.about_storage) != LV_LABEL_LONG_SCROLL_CIRCULAR) {
+        lv_label_set_long_mode(objects.about_storage, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    }
+    set_changed_text(objects.about_storage, ui_tr(UI_STR_HSP_HINT));
+    /* TODO(i18n): plug state words */
+    const char *plug = (m->hsp_plug > 0) ? "YES" : (m->hsp_plug == 0 ? "no" : "?");
+    lv_snprintf(t2, sizeof(t2), ui_tr(UI_STR_HSP_PLUG_FMT), plug, (unsigned)m->hsp_phase);
+    set_changed_text(objects.about_batt_lbl, t2);
+    set_changed_text(objects.about_footer, ui_tr(UI_STR_HSP_FOOTER));
 }
 
 static void bind_usb(const ui_model_t *m)
@@ -1393,6 +1429,7 @@ static enum ScreensEnum map_eez_screen(ui_screen_id_t scr, const ui_model_t *m)
     case UI_SCR_BT:       return SCREEN_ID_BT;
     case UI_SCR_CHARGE:   return SCREEN_ID_CHARGE;
     case UI_SCR_POWER:    return SCREEN_ID_POWER;
+    case UI_SCR_HSPROBE:  return SCREEN_ID_ABOUT;
     case UI_SCR_OFF:
     default:              return SCREEN_ID_OFF;
     }
@@ -1431,7 +1468,10 @@ void ui_render_screen_sync(ui_screen_id_t scr, const ui_model_t *m)
     case SCREEN_ID_PLAYER_TR:      bind_player(m, entering); break;
     case SCREEN_ID_DELETE_CONFIRM: bind_delete(m); break;
     case SCREEN_ID_SETTINGS:       bind_settings(m); break;
-    case SCREEN_ID_ABOUT:          bind_about(m); break;
+    case SCREEN_ID_ABOUT:
+        if (scr == UI_SCR_HSPROBE) bind_hsprobe(m);
+        else bind_about(m);
+        break;
     case SCREEN_ID_USB:            bind_usb(m); break;
     case SCREEN_ID_BT:             bind_bt(m); break;
     case SCREEN_ID_CHARGE:         bind_charge(m); break;

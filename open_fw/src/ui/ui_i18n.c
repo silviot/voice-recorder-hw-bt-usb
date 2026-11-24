@@ -203,6 +203,19 @@ static const char *const k_strings[UI_LANG_COUNT][UI_STR_COUNT] = {
         [UI_STR_TOAST_HP_PAUSED]   = "Headphones out · paused",
         [UI_STR_TOAST_END_LIST]    = "End of list",
         [UI_STR_TOAST_START_LIST]  = "Start of list",
+
+        /* TODO(i18n): headset probe strings are English-only; every other
+         * language table falls back to these via ui_tr_lang(). */
+        [UI_STR_SET_HSPROBE]       = "Headset button test",
+        [UI_STR_DESC_HSPROBE]      = "Diagnostic · saves HSPROBE.LOG",
+        [UI_STR_HSP_HINT]          = "Plug headset, press its button 5x",
+        [UI_STR_HSP_PRESS_FMT]     = "PRESS button now %u/5",
+        [UI_STR_HSP_WAIT_FMT]      = "Wait · %u s left",
+        [UI_STR_HSP_PLUG_FMT]      = "Plug %s · phase %u/3",
+        [UI_STR_HSP_FOOTER]        = "BACK Stop & save",
+        [UI_STR_HSP_SAVED]         = "Saved HSPROBE.LOG",
+        [UI_STR_HSP_NO_SD]         = "No SD card · not saved",
+        [UI_STR_HSP_BUSY]          = "Stop recording first",
     },
 
     /* =====================================================================

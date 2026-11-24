@@ -18,6 +18,7 @@ static volatile uint8_t  g_key_overflow      = 0u;
 static volatile uint8_t  g_key_resync_ignore = 0u;
 static volatile uint8_t  g_keys_scan_en      = 0u;
 static volatile uint8_t  g_keys_exp_paused   = 0u;
+static volatile uint8_t  g_keys_ext_paused   = 0u; /* keys_pause_scan() (headset probe) */
 static volatile key_id_t g_key_stable        = KEY_NONE;
 static volatile uint32_t g_key_stable_since  = 0u;
 static key_id_t          g_key_cand          = KEY_NONE;
@@ -160,7 +161,7 @@ void keys_scan_tick(uint32_t now_ms)
     if (!g_keys_scan_en) {
         return;
     }
-    if (g_exp_running != 0u) {
+    if (g_exp_running != 0u || g_keys_ext_paused != 0u) {
         g_keys_exp_paused = 1u;
         return;
     }
@@ -293,6 +294,16 @@ key_id_t keys_state(uint32_t *since_ms)
         *since_ms = sc;
     }
     return st;
+}
+
+/* Pause/resume debounced scanning (e.g. while a diagnostic reconfigures the
+ * SARADC). Resuming resyncs exactly like the end of an SRAM experiment: the
+ * key held at that moment is ignored until released. */
+void keys_pause_scan(int pause)
+{
+    keys_barrier();
+    g_keys_ext_paused = pause ? 1u : 0u;
+    keys_barrier();
 }
 
 uint16_t keys_read_adc(void)

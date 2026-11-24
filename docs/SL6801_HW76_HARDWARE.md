@@ -79,6 +79,13 @@ All 6 tactile buttons share a single analog resistor ladder on **`PD0`**:
 | **Back** | `2176 .. 2559` |
 | **Play / OK / M** | `2560 .. 2959` |
 
+**KADC/SARADC register layout** (decoded from the stock `FIRM` KADC init at `0x00D510B8`): `+0x00` CTRL (`0x80180000` base config, **bit n = channel n enable**, n = 0..9), `+0x04` START (`0xA800` = continuous scan), `+0x0C` IE, `+0x10` per-channel 4-bit fields for ch0..7, `+0x18` for ch8..9, then a **0x10 stride per channel**: THR at `+0x20 + 0x10*n`, DATA (`[11:0]`) at `+0x24 + 0x10*n` (ch1 = `+0x30`/`+0x34`, the key ladder). Which pads feed ch0, ch2..9 is not known.
+
+### 3.3 Headset Button Probe (Settings > Headset button test)
+Whether the jack's 4th (mic/button) contact is wired to anything readable is still unknown. The diagnostic in [hsprobe.c](../open_fw/src/hsprobe.c) runs for 30 s, prompts the user five times ("PRESS button now n/5" at 5, 12, 16, 23, 27 s), and writes `/HSPROBE.LOG` to the card. It samples every 10 ms: PB11, all 10 KADC channels (all enables set), GPIO A..D input registers (noisy pins get masked automatically). Phase A (0-10 s) keeps the codec idle. Phase B (10-20 s) runs a codec capture with MICBIAS on and steps ADC ch2's input mux through 0..15 (1.25 s each). Phase C (20-30 s) is phase B with PB11 switched to analog mux 15. Every register it touches is restored, and the log ends with a `CHK ... RESULT=PASS|DIFF` self-check, per-channel `SUM` lines, a `HINT candidates=` line and `END`.
+
+How to read the log: a wired button line shows up as a KADC channel (other than K1, the key ladder) with `D`/`U` edges at the prompt times, roughly 4-5 in total. If those edges appear only in phases B/C, the line needs MICBIAS. A `G<port>` bit that toggles at the prompts, or `AE` codec events at the prompts that do not follow one mux value, also count. Edges that only appear with PB11 analog (phase C), or `P` changes at the prompts, point at the jack-detect switch, not a button line. If nothing correlates with the prompts, while the plug state reads `YES` and the user pressed, there is no readable button line on this board through these paths.
+
 ---
 
 ## 4. Audio Subsystem

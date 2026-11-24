@@ -113,6 +113,7 @@ typedef enum {
     UI_SCR_CHARGE,
     UI_SCR_POWER,
     UI_SCR_OFF,
+    UI_SCR_HSPROBE,     /* Headset button probe (diagnostic, reuses the About layout) */
 } ui_screen_id_t;
 
 typedef enum {
@@ -234,7 +235,7 @@ typedef struct {
     uint8_t        del_holding;
 
     /* Settings */
-    int            set_sel;         /* 0..9 */
+    int            set_sel;         /* 0..UI_SET_COUNT-1 */
     int            set_scroll;
     uint8_t        set_edit_clock;  /* 0=no, 1=hour, 2=min */
     uint8_t        set_edit_h;
@@ -262,7 +263,16 @@ typedef struct {
     /* Active Toast overlay */
     char           toast_msg[40];
     uint16_t       toast_col;       /* UI_COL_AMBER / UI_COL_CYAN / UI_COL_GREEN */
+
+    /* Headset button probe (Settings > Headset button test) */
+    uint8_t        hsp_secs_left;
+    uint8_t        hsp_phase;       /* 1..3 */
+    uint8_t        hsp_prompt;      /* 0 or 1..5 while "press now" is shown */
+    int8_t         hsp_plug;        /* 1 plugged, 0 not, -1 unknown (PB11 analog) */
 } ui_model_t;
+
+#define UI_SET_COUNT 12      /* Settings rows (last = Headset button test) */
+#define UI_SET_HSPROBE 11
 
 void ui_settings_defaults(ui_settings_t *cfg);
 int ui_poll_power_button(ui_screen_id_t screen, ui_model_t *model, uint32_t now);
