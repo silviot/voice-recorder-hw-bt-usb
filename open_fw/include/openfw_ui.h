@@ -205,6 +205,10 @@ typedef struct {
     int            file_sel;
     int            file_scroll;
     char           files_title[24];
+    /* In-screen navigation (e.g. folder enter/leave): bump nav_seq via
+     * ui_model_nav() and the next render pushes the page in nav_dir. */
+    uint8_t        nav_seq;
+    uint8_t        nav_dir;         /* UI_NAV_FORWARD / UI_NAV_BACK */
 
     /* Player */
     ui_file_entry_t play_file;
@@ -263,6 +267,17 @@ typedef struct {
     char           toast_msg[40];
     uint16_t       toast_col;       /* UI_COL_AMBER / UI_COL_CYAN / UI_COL_GREEN */
 } ui_model_t;
+
+/* Same values as ui_transition_t (src/ui/ui_port.h). */
+#define UI_NAV_FORWARD 1u
+#define UI_NAV_BACK    2u
+
+/* Request a push transition for the next render of the same screen. */
+static inline void ui_model_nav(ui_model_t *m, uint8_t dir)
+{
+    m->nav_dir = dir;
+    m->nav_seq++;
+}
 
 void ui_settings_defaults(ui_settings_t *cfg);
 int ui_poll_power_button(ui_screen_id_t screen, ui_model_t *model, uint32_t now);
