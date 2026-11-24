@@ -9,8 +9,9 @@
 #include "openfw_rtos.h"
 #include "sl6801_regs.h"
 #include "bt_ctrl_rtos.h"
+#include "bt_cpu_guard.h"
 
-#define BT_CTRL_STACK_WORDS  512u   /* 2 KiB (plan §4); ROM frame depth unknown: watermark logged (Exp 1) */
+#define BT_CTRL_STACK_WORDS  BT_CTRL_RTOS_CTRL_STACK_WORDS   /* probe image: 4 KiB (see bt_ctrl_rtos.h) */
 #define BT_DLV_STACK_WORDS   384u   /* 1.5 KiB (plan §4) */
 #define RTOS_STATIC __attribute__((section(".rtos_static"), aligned(8)))
 
@@ -25,6 +26,8 @@ static volatile uint8_t s_bt_stop;
 static volatile uint8_t s_in_run, s_hung;
 static volatile uint32_t s_run_t0;
 static bt_ctrl_rtos_stats_t s_st;
+static bt_cpu_guard_t s_cg;
+static volatile uint8_t s_cg_armed, s_cg_tripped;
 
 
 static inline uint32_t now32(void)
@@ -97,9 +100,9 @@ static void bt_ctrl_task(void *arg)
         s_run_t0 = t0;
         s_in_run = 1u;
         more = bt_ctrl_run();
-        s_in_run = 0u;
         uint32_t dt = now32() - t0;
         taskENTER_CRITICAL();
+        s_in_run = 0u;               /* with the total update: the CPU guard never sees this run counted 0 times */
         s_st.ctrl_runs++;
         s_st.ctrl_run_total_us += dt;
         if (more) {
@@ -154,6 +157,13 @@ void bt_ctrl_rtos_hard_stop(void)
     nvic_disable_irq(IRQ_BT);
 }
 
+static void demote(void)
+{
+    s_hung = 1u;
+    bt_ctrl_rtos_hard_stop();
+    vTaskPrioritySet(s_ctrl_task, tskIDLE_PRIORITY);       /* the app (and the probe) run again */
+}
+
 int bt_ctrl_rtos_guard(uint32_t limit_us)
 {
     if (s_hung) {
@@ -162,10 +172,43 @@ int bt_ctrl_rtos_guard(uint32_t limit_us)
     if (s_ctrl_task == NULL || !s_in_run || now32() - s_run_t0 <= limit_us) {
         return 0;
     }
-    s_hung = 1u;
-    bt_ctrl_rtos_hard_stop();
-    vTaskPrioritySet(s_ctrl_task, tskIDLE_PRIORITY);       /* the app (and the probe) run again */
+    demote();
     return 1;
+}
+
+int bt_ctrl_rtos_cpu_guard(uint32_t limit_pm, uint32_t samples)
+{
+    if (s_cg_tripped) {
+        return 1;
+    }
+    if (s_ctrl_task == NULL || s_hung) {
+        return 0;
+    }
+    taskENTER_CRITICAL();                                  /* bt_ctrl updates these in its own critical section */
+    int trip = 0;
+    if (s_cg_armed) {
+        uint32_t now = now32();
+        uint32_t busy = s_st.ctrl_run_total_us + (s_in_run ? now - s_run_t0 : 0u);
+        trip = bt_cpu_guard_step(&s_cg, now, busy, limit_pm, samples);
+        if (s_cg.peak_pm > s_st.cpu_peak_pm) {
+            s_st.cpu_peak_pm = s_cg.peak_pm;
+        }
+    }
+    taskEXIT_CRITICAL();
+    if (!trip) {
+        return 0;
+    }
+    s_cg_tripped = 1u;
+    demote();
+    return 1;
+}
+
+void bt_ctrl_rtos_cpu_guard_arm(int on)
+{
+    taskENTER_CRITICAL();
+    bt_cpu_guard_reset(&s_cg);
+    s_cg_armed = on ? 1u : 0u;
+    taskEXIT_CRITICAL();
 }
 
 void bt_ctrl_rtos_stats(bt_ctrl_rtos_stats_t *out)
@@ -174,6 +217,7 @@ void bt_ctrl_rtos_stats(bt_ctrl_rtos_stats_t *out)
     *out = s_st;
     taskEXIT_CRITICAL();
     out->hung = s_hung;
+    out->cpu_tripped = s_cg_tripped;
     out->ctrl_stack_free_words = s_ctrl_task ? (uint32_t)uxTaskGetStackHighWaterMark(s_ctrl_task) : 0u;
     out->dlv_stack_free_words = s_dlv_task ? (uint32_t)uxTaskGetStackHighWaterMark(s_dlv_task) : 0u;
 }
@@ -182,5 +226,7 @@ void bt_ctrl_rtos_reset_max(void)
 {
     taskENTER_CRITICAL();
     s_st.ctrl_run_max_us = 0u;
+    s_st.cpu_peak_pm = 0u;
+    s_cg.peak_pm = 0u;
     taskEXIT_CRITICAL();
 }

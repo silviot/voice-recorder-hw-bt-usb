@@ -1,0 +1,23 @@
+# Allocation-failure sweep waivers for esp_bluedroid_enable() (tests/bt_host/run_sweep.py --waivers; make test-bt-host).
+#
+# Every line is an UPSTREAM Bluedroid site whose allocation failure is not handled. Plan M1 "general rule" requires a
+# documented patch (0011+) or an explicit waiver for each; these are the explicit waivers until the patches exist.
+# A waived sweep point is reported as WAIVED and does not fail the gate; any other CRASH / HANG / CHECK does, so a new
+# unhandled site (or a regression in patches 0008-0010) is caught. On target all of these end in the plan's recovery
+# ladder only indirectly: an assert reboots, a hang is a stuck enable (the app's BT enable deadline must catch it).
+# COUNT is the exact number of sweep points each waiver covers (stable over repeated runs). run_sweep.py fails when a
+# waiver matches more points than its COUNT (a new failing path that happens to end at a waived site, e.g. a new caller
+# of make_command, must not slip through) and warns when it matches fewer (fixed or stale: lower the COUNT or drop the
+# line). NOT_INJECTED points (sweep-one N whose N-th attempt never happened) can never be waived.
+# Found 2026-11-24 (111 allocation attempts per enable, all tasks; 61 waived points in total).
+# Format: function[<-caller]  CLASS  COUNT  reason
+bta_dm_enable                          CRASH   1  bta_dm_act.c:346 assert(0) when the BTA_SYS_API_ENABLE message cannot be allocated
+make_command                           CRASH  11  hci_packet_factory make_command(): assert(packet != NULL), every controller.c start-up command
+future_new                             CRASH  22  future.c:28/34 assert(future != NULL) (struct or its semaphore), every controller.c AWAIT_COMMAND
+btu_hcif_command_complete_evt          CRASH   6  btu_hcif.c:1618 dereferences its unchecked osi_calloc (CC hand-off to BTU) -> NULL deref
+bta_sys_hw_api_enable                  HANG    1  bta_sys_main.c:360 drops BTA_SYS_EVT_ENABLED_EVT when osi_malloc fails: enable never completes
+bta_sys_hw_btm_cback                   HANG    1  bta_sys_main.c:285 drops BTA_SYS_EVT_STACK_ENABLED_EVT: enable never completes
+btc_transfer_context<-btc_dm_sec_evt   HANG    1  BTA_DM_ENABLE_EVT (bta_dm_local_name_cback) lost when the BTC message cannot be allocated
+btc_dm_sec_cb_handler                  HANG    1  btc_dm.c:848 allocates a BLE message for every DM security event and returns on failure: BTA_DM_ENABLE_EVT lost
+event_command_ready                    HANG   11  hci_layer.c:470 list_append(commands_pending_response) fails after the command was sent: its CC is unmatched, a futured start-up command blocks BTU forever
+event_command_ready                    CHECK   6  same site, callback commands: the command buffer leaks (1 block) and its completion callback never runs

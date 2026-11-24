@@ -52,7 +52,7 @@ CFLAGS   += -DOPENFW_ENABLE_USB_EXP=1 -DOPENFW_UNATTENDED_DEV=1
 else ifeq ($(UNATTENDED_DEV),1)
 CFLAGS   += -DOPENFW_UNATTENDED_DEV=1
 endif
-# HCI_PROBE=1 (requires BT=1): Exp 1 stage A probe image (plan M5; bt_port/hci_probe.c, docs/BT_HW_RESULTS.md).
+# HCI_PROBE=1 (requires BT=1): Exp 1 stage A/B probe image (plan M5; bt_port/hci_probe.c, docs/BT_HW_RESULTS.md).
 HCI_PROBE ?= 0
 ifeq ($(HCI_PROBE),1)
 ifneq ($(BT),1)
@@ -138,6 +138,9 @@ SPLASH_HDR  := $(BUILD_DIR)/cassini_splash.h
 STOCK_DUMP  := ../dumps/firmware_2M.bin
 OUT_BIN     := ../dumps/firmware_2M_openfw.bin
 OUT_UP      := ../dumps/update_openfw.up
+# QEMU-only probe images (HCI_PROBE_AUTORUN runs the probe on every boot; HCI_PROBE_WAIVE_LIVENESS waives its checks)
+# never go to ../dumps, whose 2 MB image is what tools/dev_cycle.py flash writes (docs/BT_HW_RESULTS.md).
+HCI_PROBE_QEMU_ONLY := $(filter-out 0,$(HCI_PROBE_AUTORUN) $(HCI_PROBE_WAIVE_LIVENESS))
 
 .PHONY: all test-host test-host-san test-qemu test-qemu-rtos test-qemu-bt test-qemu-hciprobe test-qemu-hciprobe-full qemu-stub update-up wasm clean force-config fetch-lvgl
 
@@ -243,6 +246,8 @@ test-host-san:
 
 update-up: $(BUILD_DIR)/ram_boot.bin $(BUILD_DIR)/xip.bin tools/pack_firm.py
 	@test -f "$(STOCK_DUMP)" || (echo "Error: $(STOCK_DUMP) not found" >&2; exit 1)
+	@test -z "$(HCI_PROBE_QEMU_ONLY)" -o -z "$(filter $(abspath ../dumps),$(abspath $(dir $(OUT_BIN)) $(dir $(OUT_UP))))" \
+		|| (echo "Error: QEMU-only probe image (HCI_PROBE_AUTORUN / HCI_PROBE_WAIVE_LIVENESS): set OUT_BIN and OUT_UP outside ../dumps" >&2; exit 1)
 	python3 tools/pack_firm.py --ram-boot $(BUILD_DIR)/ram_boot.bin --xip $(BUILD_DIR)/xip.bin \
 		--out-firm $(BUILD_DIR)/open_fw_firm.bin \
 		--base-hlkj $(STOCK_DUMP) \
@@ -279,28 +284,37 @@ test-qemu-bt:
 	python3 tools/run_qemu.py --elf $(BT_QEMU_DIR)/open_fw.elf --stub $(BT_QEMU_DIR)/qemu_boot_stub.bin \
 		--flash $(OUT_BIN) --skip-keys --png-out $(BT_QEMU_DIR)/qemu_lcd.png
 
-# Exp 1 stage A probe image (BT=1 HCI_PROBE=1). QEMU has no RW-BT controller: the probe must report the IRQ-26
+# Exp 1 probe image (BT=1 HCI_PROBE=1). QEMU has no RW-BT controller: the probe must report the IRQ-26
 # liveness timeout, recover once, abort cleanly, put IRQ 26's priority back and release RW-BT for the legacy path,
-# while the boot checks and the RTOS self-test still pass. HCI_PROBE_AUTORUN=1: the blank QEMU SD card has no
-# HCIPROBE.RUN request (the trigger itself is host-tested in test-bt-port). The images these targets leave in ../dumps
-# must never be flashed.
+# then write its log copy to the SD card (HCIPROBE.LOG), while the boot checks and the RTOS self-test still pass.
+# HCI_PROBE_AUTORUN=1 (stage A; 2 = stage A + B): the blank QEMU SD card has no HCIPROBE.RUN request (the trigger
+# itself is host-tested in test-bt-port). These images are written to their BUILD_DIR, never to ../dumps (update-up
+# refuses that), and refuse to run on a part with programmed eFuses (HCIP OFF trig=qemu_only_on_silicon).
 HCIPROBE_QEMU_DIR ?= /tmp/sl6801_openfw_hciprobe
 test-qemu-hciprobe:
-	$(MAKE) update-up qemu-stub BT=1 HCI_PROBE=1 HCI_PROBE_AUTORUN=1 RTOS_SELFTEST=1 BUILD_DIR=$(HCIPROBE_QEMU_DIR)
+	$(MAKE) update-up qemu-stub BT=1 HCI_PROBE=1 HCI_PROBE_AUTORUN=1 RTOS_SELFTEST=1 BUILD_DIR=$(HCIPROBE_QEMU_DIR) \
+		OUT_BIN=$(HCIPROBE_QEMU_DIR)/firmware_2M_qemu_only.bin OUT_UP=$(HCIPROBE_QEMU_DIR)/update_qemu_only.up
 	python3 tools/run_qemu.py --elf $(HCIPROBE_QEMU_DIR)/open_fw.elf --stub $(HCIPROBE_QEMU_DIR)/qemu_boot_stub.bin \
-		--flash $(OUT_BIN) --skip-keys --png-out $(HCIPROBE_QEMU_DIR)/qemu_lcd.png \
+		--flash $(HCIPROBE_QEMU_DIR)/firmware_2M_qemu_only.bin --skip-keys --png-out $(HCIPROBE_QEMU_DIR)/qemu_lcd.png \
 		--expect-log "HCIP BEGIN" --expect-log "trig=autorun" --expect-log "HCIP TIMEOUT what=irq26" \
-		--expect-log "claimed=0 owner=0 lockout=0 legacy=allowed" --expect-log "HCIP END st=ABORT"
+		--expect-log "claimed=0 owner=0 lockout=0 legacy=allowed" --expect-log "HCIP END st=ABORT" \
+		--expect-log "HCIP LOGFILE file=HCIPROBE.LOG st=OK"
 
-# Dev check of the probe's full sequence (reads, idle window, 5 restarts, log volume) under QEMU: the IRQ-26 liveness
-# check is waived (logged waived=1). Separate BUILD_DIR; the image it leaves in ../dumps must never be flashed.
+# Dev check of the probe's full sequence (stage A reads, idle window, 5 restarts; stage B writes, read-backs, scan
+# windows; log volume) under QEMU: the IRQ-26 liveness check and stage B's ROM replies (QEMU's ROM never answers a
+# forwarded command) are waived (logged waived=1), the scan window is 3 s. Separate BUILD_DIR, which also holds its
+# 2 MB image (never ../dumps).
 HCIPROBE_FULL_QEMU_DIR ?= /tmp/sl6801_openfw_hciprobe_full
 test-qemu-hciprobe-full:
-	$(MAKE) update-up qemu-stub BT=1 HCI_PROBE=1 HCI_PROBE_WAIVE_LIVENESS=1 HCI_PROBE_AUTORUN=1 RTOS_SELFTEST=1 \
-		BUILD_DIR=$(HCIPROBE_FULL_QEMU_DIR)
+	$(MAKE) update-up qemu-stub BT=1 HCI_PROBE=1 HCI_PROBE_WAIVE_LIVENESS=1 HCI_PROBE_AUTORUN=2 RTOS_SELFTEST=1 \
+		BUILD_DIR=$(HCIPROBE_FULL_QEMU_DIR) \
+		OUT_BIN=$(HCIPROBE_FULL_QEMU_DIR)/firmware_2M_qemu_only.bin OUT_UP=$(HCIPROBE_FULL_QEMU_DIR)/update_qemu_only.up
 	python3 tools/run_qemu.py --elf $(HCIPROBE_FULL_QEMU_DIR)/open_fw.elf --stub $(HCIPROBE_FULL_QEMU_DIR)/qemu_boot_stub.bin \
-		--flash $(OUT_BIN) --skip-keys --png-out $(HCIPROBE_FULL_QEMU_DIR)/qemu_lcd.png --expect-seconds 90 \
-		--expect-log "HCIP RESTART i=5" --expect-log "legacy=allowed" --expect-log "HCIP END st=DONE"
+		--flash $(HCIPROBE_FULL_QEMU_DIR)/firmware_2M_qemu_only.bin --skip-keys --png-out $(HCIPROBE_FULL_QEMU_DIR)/qemu_lcd.png --expect-seconds 150 \
+		--expect-log "HCIP RESTART i=5" --expect-log "trig=autorun cpu_pm=700 cpu_n=10" --expect-log "HCIP WIN w=scan" \
+		--expect-log "HCIP STAGE s=B st=DONE" --expect-log "HCIP STACK ctrl_size=4096" \
+		--expect-log "legacy=allowed" --expect-log "HCIP END st=DONE" \
+		--expect-log "HCIP LOGFILE file=HCIPROBE.LOG st=OK"
 
 WASM_BUILD_DIR := $(BUILD_DIR)_wasm
 WASM_OUT       := ../web_emu/openfw.wasm

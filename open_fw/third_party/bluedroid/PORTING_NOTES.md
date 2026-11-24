@@ -2,7 +2,7 @@
 
 Upstream: `espressif/esp-idf` `ad20ded62a2d67a26e501fdc1905f43ba7ad6c81` (2026-11-15), Apache-2.0 (`LICENSE`).
 Vendored: `host/bluedroid`, `common` (osi, osal, btc core, tinycrypt), `deps/esp_ringbuf`, `deps/ble_profiles_common/include/bt_prf_task.h`.
-Local changes: see `../bluedroid_patches/README.md` (3 small patches). Port layer: `open_fw/bt_port/`. Build: `open_fw/bt/Makefile.bluedroid`.
+Local changes: see `../bluedroid_patches/README.md` (0001-0010). Port layer: `open_fw/bt_port/`. Build: `open_fw/bt/Makefile.bluedroid`.
 
 ## Reproduce
 ```
@@ -107,3 +107,21 @@ Upstream behaviours that matter on a small target (found in the Codex/agy plan r
 Process
 - Two independent AI reviewers (Codex, agy) converged on v18 of the plan after 17 rounds; most late findings were real
   edge cases in upstream code paths, which is why every one became a patch or a test rather than a comment.
+
+## Host harness lessons (2026-11-24, step 5 / M3, `make -C open_fw test-bt-host`, `open_fw/tests/bt_host/README.md`)
+- Bluedroid runs unmodified on x86-64 under ASan/UBSan/TSan on the FreeRTOS POSIX port, with three host-only
+  accommodations: link **`-no-pie`** (timer `param` and BTA JV fields are `UINT32` holding pointers to static control
+  blocks and code), `-fno-sanitize=alignment` for vendored code (BTC places callback arguments at offset 4 after
+  `btc_msg_t`: fine for 32-bit Cortex-M4, misaligned for 64-bit pointers), `-fno-sanitize=function` (`osi_free_func`
+  passed as typed free callbacks).
+- With BLE off, `smp_utils.c`/`smp_api.c` still reference BLE-only `smp_keys.c` functions; the firmware link drops the
+  callers (all-NULL `smp_sm_action[]`), a less aggressive link does not.
+- One enable (controller start-up + BTM reset + BTA enable) costs 111 allocation attempts and ~5 ms on the host; a full
+  init/enable/disable/deinit cycle returns every byte (200-cycle loop).
+- **Allocation failure on the enable path is mostly unhandled upstream**: of 111 single-failure points, 50 complete or
+  fail cleanly (incl. all RX-path points thanks to 0008; 0009's slot restore is not observable there and has
+  its own `fixed_queue` scenario), 61 hit one of 10 sites that assert
+  (`make_command`, `future_new`, `bta_dm_enable`), dereference NULL (`btu_hcif_command_complete_evt`), drop an enable
+  event (BTA sys/DM, `btc_dm_sec_cb_handler`) or lose a sent command from the pending list (`event_command_ready`).
+  They are explicit waivers in `open_fw/tests/bt_host/sweep_waivers.txt`; on target an assert reboots and a lost
+  event leaves enable blocked, so the app's BT enable path needs a deadline (recovery ladder) until patches 0011+.

@@ -1654,6 +1654,7 @@ static const openfw_exp_api_t k_exp_api = {
 void hci_probe_start(exfat_vol_t *vol, int sd_mounted);
 int  hci_probe_active(void);   /* legacy BT mode refused (probe running, or RW-BT left claimed) */
 int  hci_probe_running(void);  /* recording refused, USB MSC deferred until the probe's END */
+void hci_probe_poll(exfat_vol_t *vol, int sd_mounted); /* after END: writes SD:/HCIPROBE.LOG (app task owns the FS) */
 #endif
 
 int openfw_main(void)
@@ -1873,6 +1874,9 @@ int openfw_main(void)
 
     while (1) {
         wdt_feed();
+#if defined(OPENFW_HCI_PROBE) && OPENFW_HCI_PROBE
+        hci_probe_poll(&g_exfat_vol, g_sd_mounted);
+#endif
 
         uint32_t now_ms = millis();
         if (now_ms >= 3000u) {

@@ -100,7 +100,12 @@ When a silicon register, FIFO size, clock mux, IRQ line, or SD card write path i
   sudo env OPENFW_FIRM_BIN=$B/open_fw_firm.bin python3 tools/dev_cycle.py flash
   ```
   Building without `update-up` silently re-flashes whatever image `dumps/` already holds. Check the `Plan: … bytes`
-  line (the BT image is ~720 KB, the default ~434 KB).
+  line (the BT image is ~720 KB, the default ~434 KB). `test-qemu-rtos` / `test-qemu-bt` also overwrite `dumps/`; the
+  QEMU-only HCI-probe images (`HCI_PROBE_AUTORUN`, `HCI_PROBE_WAIVE_LIVENESS`) never do (`update-up` refuses them there)
+  and refuse to run on a part whose eFuse valid bit is set (`HCIP OFF trig=qemu_only_on_silicon`).
+- **QEMU vs silicon at run time:** QEMU's SL6801 model reads 0 for eFuse, RW-BT and `AON_BACKUP`, so the eFuse valid
+  bit (word 3 bit 31, after `rom_rst_release(0x58)` + `rom_clk_enable(0x1B)` — those are the **eFuse** reset/clock
+  ids, not RW-BT's) is the usable "this is silicon" signal on a programmed part.
 - **`sudo` drops your PATH**, so `exp` cannot find the toolchain. Pass it explicitly:
   `sudo env LLD=/path/to/ld.lld OBJCOPY=/path/to/llvm-objcopy CLANG=$(which clang) python3 tools/dev_cycle.py exp …`
 - **Read any firmware variable on silicon** with `open_fw/exp/exp_peek.c` (24 words at `--arg ADDR`; get the address

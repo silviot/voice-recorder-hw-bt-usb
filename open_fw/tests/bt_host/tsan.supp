@@ -1,0 +1,8 @@
+# ThreadSanitizer suppressions for make test-bt-host-tsan: races that are part of the FreeRTOS V11.1.0 POSIX port's
+# design, not of the code under test. The port's tick thread reads pxCurrentTCB without a lock to pick the thread
+# to signal (port.c prvTimerTickHandler); a stale value only delays one tick.
+race:prvTimerTickHandler
+# vTaskDelete(other) cancels the victim's pthread while it waits in pthread_cond_wait(); glibc re-acquires the event
+# mutex for the cancelled thread, which exits holding it, and vPortCancelThread() then destroys it (event_delete).
+# Same mechanism as the deadlock posix_port_shim.h defuses; the destroy is harmless (the event is freed with it).
+mutex:event_delete

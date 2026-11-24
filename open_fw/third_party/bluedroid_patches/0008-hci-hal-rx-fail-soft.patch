@@ -1,0 +1,34 @@
+diff --git a/open_fw/third_party/bluedroid/host/bluedroid/hci/hci_hal_h4.c b/open_fw/third_party/bluedroid/host/bluedroid/hci/hci_hal_h4.c
+index 84a8afc..d018760 100644
+--- a/open_fw/third_party/bluedroid/host/bluedroid/hci/hci_hal_h4.c
++++ b/open_fw/third_party/bluedroid/host/bluedroid/hci/hci_hal_h4.c
+@@ -654,16 +654,29 @@ static int host_recv_pkt_cb(uint8_t *data, uint16_t len)
+         pkt = (BT_HDR *) osi_calloc(pkt_size);
+         if (!pkt) {
+             HCI_TRACE_ERROR("%s couldn't acquire memory for inbound data buffer.\n", __func__);
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++            return -1; /* open_fw patch 0008: fail soft; the driver keeps its copy and retries */
++#else
+             assert(0);
++#endif
+         }
+ 
+         pkt->offset = 0;
+         pkt->len = len;
+         pkt->layer_specific = 0;
+         memcpy(pkt->data, data, len);
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++        /* open_fw patch 0008: list_append() inside fixed_queue_enqueue() can fail after a slot was taken (patch 0009
++         * gives the slot back); free our copy and report failure instead of leaking it and dropping the packet. */
++        if (!fixed_queue_enqueue(hci_hal_env.rx_q, pkt, FIXED_QUEUE_MAX_TIMEOUT)) {
++            osi_free(pkt);
++            return -1;
++        }
++#else
+         {
+             fixed_queue_enqueue(hci_hal_env.rx_q, pkt, FIXED_QUEUE_MAX_TIMEOUT);
+         }
++#endif
+     } else {
+         if (esp_bluedroid_get_status() != ESP_BLUEDROID_STATUS_ENABLED) {
+             // Prevent race condition during host deinit/disable

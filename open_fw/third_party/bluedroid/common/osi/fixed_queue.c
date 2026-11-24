@@ -151,6 +151,10 @@ bool fixed_queue_enqueue(fixed_queue_t *queue, void *data, uint32_t timeout)
 
     if(status == true )
         osi_sem_give(&queue->dequeue_sem);
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+    else
+        osi_sem_give(&queue->enqueue_sem); /* open_fw patch 0009: list node allocation failed, return the slot */
+#endif
 
     return status;
 }

@@ -432,6 +432,15 @@ telemetry: heap/stack watermarks, largest free block, IRQ-26 latency and multipl
   Clarified M1 RX rule: credit gating happens before ACL enters its ring, so events never wait behind credit-blocked
   ACL, but `bt_dlv` delivers events and ACL in arrival order — strict event priority at delivery would let an event
   (e.g. Disconnection Complete) overtake ACL the ROM delivered earlier. Not yet wired into the firmware.
+- 2026-11-24 (step 5, M3 path (b)): contract patches 0008 (fail-soft host RX), 0009 (fixed_queue slot restore),
+  0010 (NOACK queue ahead of the command-credit check) applied. `make -C open_fw test-bt-host`: Bluedroid + bt_port +
+  bt_ctrl + fake ROM on FreeRTOS V11.1.0's POSIX port under ASan/UBSan (`open_fw/tests/bt_host/`): enable reaches
+  ENABLED, GAP name/scan mode reach the ROM, 200 enable/disable/deinit cycles return heap/tasks/alarms to baseline,
+  0C35 leaves the host at zero command credits (fails without 0010). Allocation-failure sweep over enable (111
+  attempts): RX paths (0008) all recover via `bt_dlv` retry; 10 upstream sites crash or hang and are explicit
+  waivers with exact point counts (`tests/bt_host/sweep_waivers.txt`) pending patches 0011+. 0009 is checked directly
+  (capacity-2 `fixed_queue`), since the sweep cannot see one lost RX slot. TSan variant clean (cooperative scheduling).
+  Path (a) (Bumble) not started.
 
 ## 11. Round-1 traceability
 

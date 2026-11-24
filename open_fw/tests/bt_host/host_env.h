@@ -1,0 +1,57 @@
+/* Host harness environment for Bluedroid + bt_port + bt_ctrl on the FreeRTOS POSIX port (make test-bt-host,
+ * plan docs/BLUETOOTH_BLUEDROID_PLAN.md M3 path (b) "through M1"). Shared by host_heap.c, host_glue.c, host_ctrl.c and
+ * test_bt_host.c. Nothing here is built into the firmware.
+ * SPDX-License-Identifier: MIT */
+#ifndef BT_HOST_ENV_H
+#define BT_HOST_ENV_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#include "bt_ctrl.h"
+
+/* ---- heap (host_heap.c): every malloc/calloc/realloc/free of the harness objects (linked with --wrap), every
+ * pvPortMalloc and every heap_caps_* goes through one tracked allocator. ---- */
+typedef struct {
+    size_t live_bytes, live_blocks, peak_bytes;
+    uint64_t allocs;            /* successful allocations since start */
+    uint64_t armed_seen;        /* allocation attempts seen since bth_heap_fail_arm() */
+    uint64_t injected;          /* NULL returns caused by injection */
+    uint64_t rtos_failed_hook;  /* vApplicationMallocFailedHook calls */
+    void *last_injected_ra;     /* return address of the call that got the injected NULL */
+} bth_heap_stats_t;
+
+void bth_heap_stats(bth_heap_stats_t *out);
+/* Fail the n-th allocation attempt (1-based) from now on; n = 0 disarms. persistent: fail every attempt >= n. */
+void bth_heap_fail_arm(uint64_t n, bool persistent);
+void bth_heap_fail_disarm(void);
+/* Allocation attempts counted since the last arm (also counts while armed with n = 0 via bth_heap_count_start). */
+void bth_heap_count_start(void);
+uint64_t bth_heap_counted(void);
+
+/* ---- logging: serialised (FreeRTOS critical section), safe from any task ---- */
+void bth_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+
+/* ---- port glue (host_glue.c) ---- */
+int bth_port_init(void);                    /* entropy (TEST ONLY source), store, bt_alarm task, esp_timer shim */
+uint32_t bth_timers_in_use(void);           /* esp_timer slots held by Bluedroid (osi alarms) */
+uint32_t bth_hci_cmd_timeouts(void);        /* patch 0007 reports (bt_port_on_hci_command_timeout) */
+uint32_t bth_store_flush_requests(void);
+
+/* ---- controller side (host_ctrl.c): bt_ctrl tasks over tests/fake_rom.c ---- */
+int  bth_ctrl_init(void);                   /* bt_ctrl_init + bt_ctrl / bt_dlv tasks; once */
+int  bth_ctrl_open(void);                   /* bt_ctrl_open + esp_bluedroid_attach_hci_driver */
+int  bth_ctrl_close(uint32_t timeout_ms);   /* bt_ctrl_shutdown_begin, wait for the stop status and an idle bt_dlv */
+void bth_ctrl_kick(void);                   /* wake the bt_ctrl task (after fake_rom_inject*) */
+void bth_rom_lock(void);                    /* serialises fake_rom_* calls with the bt_ctrl task */
+void bth_rom_unlock(void);
+uint32_t bth_ctrl_faults(void);
+uint32_t bth_ctrl_first_fault(void);
+uint32_t bth_dlv_retries(void);
+
+/* ---- watchdog (host_main.c): every blocking step runs under a deadline enforced by a non-FreeRTOS thread ---- */
+void bth_step(const char *what, uint32_t timeout_ms);
+void bth_step_done(void);
+
+#endif /* BT_HOST_ENV_H */

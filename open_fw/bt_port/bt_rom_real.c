@@ -401,7 +401,7 @@ static uint32_t rr_hook_ret0(void) { return 0u; }             /* F:428 */
 
 static void rr_hook_3bbc_7_set_evt_mask(const uint8_t *mask)  /* F:481-488 verbatim */
 {
-    static const uint8_t mandatory[8] = { 0x00u, 0x60u, 0x04u, 0x00u, 0xF8u, 0x07u, 0x40u, 0xE2u };
+    static const uint8_t mandatory[8] = BT_ROM_REAL_EVT_MASK_MANDATORY;
     volatile uint8_t *dst = (volatile uint8_t *)0x00803D04u;
     for (int i = 0; i < 8; i++) {
         dst[i] = (uint8_t)(mask[i] | mandatory[i]);
@@ -811,7 +811,30 @@ void bt_rom_real_diag_reset_max(void)
     raw_irq_restore(pm);
 }
 
+uint32_t bt_rom_real_silence(void)                          /* see bt_rom_real.h; F:2151-2158 minus the ROM state */
+{
+    nvic_disable_irq(IRQ_BT);
+    RWBT_INTCNTL = 0u;
+    RWBT_INTACK  = 0xFFFFFFFFu;
+    RWBT_CNTL   &= ~(1u << 8);                                /* RWBTEN off */
+    RWBT_CNTL   |= (1u << 29);                                /* soft reset */
+    for (uint32_t t = 0u; t < SOFT_RESET_POLLS && (RWBT_CNTL & (1u << 29)); t++) {
+    }
+    nvic_clear_pending(IRQ_BT);
+    s_claimed = 1u;                                           /* whatever the soft reset did: state unknown */
+    return RWBT_CNTL;
+}
+
 int bt_rom_real_busy(void)
 {
     return s_owner != 0u || s_claimed != 0u;
+}
+
+/* Exp 1 stage B read-back of 0C01 (BT_ROM_INTERFACE §11 Q8): hci_tl_env.evt_msk, written by the ROM's Set Event Mask
+ * handler through hook 0x00803BBC[7] (rr_hook_3bbc_7_set_evt_mask: mask | mandatory). Plain RAM read, no ROM call. */
+void bt_rom_real_evt_mask(uint8_t out[8])
+{
+    for (uint32_t i = 0u; i < 8u; i++) {
+        out[i] = ((volatile uint8_t *)HCI_TL_ENV->evt_msk)[i];
+    }
 }

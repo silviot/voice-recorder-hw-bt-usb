@@ -2,7 +2,8 @@
 
 What `bt_ctrl` (plan M1, `docs/BLUETOOTH_BLUEDROID_PLAN.md` v18) must do at the `esp_bluedroid_attach_hci_driver()`
 boundary (plan D3). Every statement comes from reading the vendored sources, not from a trace. Line numbers refer to
-the tree on `feat/freertos-bluedroid` as it stands now, with patches 0001–0007 applied. Path prefixes:
+the tree on `feat/freertos-bluedroid` with patches 0001–0007 applied (0008–0010, applied later, shift line numbers in
+`hci_hal_h4.c`, `fixed_queue.c` and `hci_layer.c` by up to ~30 lines). Path prefixes:
 
 - `BD/` = `open_fw/third_party/bluedroid/host/bluedroid/`
 - `OSI/` = `open_fw/third_party/bluedroid/common/osi/`
@@ -11,7 +12,9 @@ the tree on `feat/freertos-bluedroid` as it stands now, with patches 0001–0007
 Opcode-level reply formats for every command (startup, BTA enable, pairing, links) are in `docs/BT_HCI_MATRIX.md`.
 This document covers the transport: who calls what, from which task, what blocks, how credits move, and what the
 host asserts on. §12 lists the requirements as a checklist. §11 lists where the plan and the code disagree. §13 gives
-the three upstream patches that are still missing, as diffs. They are **not applied**.
+the three upstream patches the contract needs, as diffs. They are **applied** as 0008-0010
+(`open_fw/third_party/bluedroid_patches/`) and exercised through the real stack by `make -C open_fw test-bt-host`
+(§13.4).
 
 Build facts this document relies on: `BT_CONTROLLER_INCLUDED` is FALSE (`PORT/sdkconfig.h:10`
 `CONFIG_BT_CONTROLLER_DISABLED`), so the driver-ops path of `BD/api/esp_bluedroid_hci.c` is used. BLE is off
@@ -423,7 +426,14 @@ for correct operation even though the parser tolerates failure. That matches the
   credit-blocked ordinary commands)" but says nothing about a partially sent ACL packet (`current_fragment_packet`).
   Patch 0010 puts NOACK **first**, so a `0C35` may go out between two fragments of one ACL packet. HCI allows this,
   because packet types are framed independently. bt_ctrl's ACL handling must therefore not assume that fragments of
-  one ACL packet arrive back to back.
+  one ACL packet arrive back to back. The host side of the interleave is safe by construction (code reading,
+  2026-11-24): `fragment_and_dispatch()` returns at once for any non-ACL packet (`BD/hci/packet_fragmenter.c:131-134`,
+  `callbacks->fragmented(packet, true)`, and for a command `transmit_fragment()` neither frees it nor calls
+  `transmit_finished`), so a `0C35` sent between fragments never touches `current_fragment_packet`. Only the ACL paths
+  assign it (`:149` oversize hand-back, `:158` first/middle fragment, `:181` segment-limit hand-back, `:187` last
+  fragment; `:101` in `init()`), and the next hciT iteration resumes the pending packet through `fragment_current_packet()`
+  (`BD/hci/hci_layer.c:364-366`). A fragmenter change that reset `current_fragment_packet` for every packet would drop
+  or duplicate the rest of the ACL packet; no test pins this yet (§13.4).
 - **D4 – Host-visible command window.** The plan gates commands on the ROM credit inside bt_ctrl, but does not say
   what `Num_HCI_Command_Packets` bt_ctrl reports to the host. §6.1 recommends a constant 1. This needs a decision.
 - **D5 – RX allocation failure.** Confirmed as described: `assert(0)` on copy failure, enqueue result ignored, slot
@@ -438,7 +448,11 @@ for correct operation even though the parser tolerates failure. That matches the
   failure is `assert(0)` (`BD/hci/packet_fragmenter.c:273-283`). `transmit_downward()` ignores
   `fixed_queue_enqueue()`'s result for outbound ACL (`BD/hci/hci_layer.c:408`). With 0009 the slot comes back, but
   the ACL buffer still leaks. Plan M1's "general rule (steps 2–3)" and the allocation-failure sweep will hit all three.
-  They need further documented patches or an explicit waiver.
+  They need further documented patches or an explicit waiver. The host harness's allocation-failure sweep over
+  `esp_bluedroid_enable()` (2026-11-24) found 10 more unhandled sites on the enable path (asserts in
+  `make_command`/`future_new`/`bta_dm_enable`, an unchecked `osi_calloc` in `btu_hcif_command_complete_evt`, lost
+  enable events, and `event_command_ready`'s `list_append` failure leaving a sent command off the pending list); they
+  are explicit waivers in `open_fw/tests/bt_host/sweep_waivers.txt` until patched.
 - **D8 – C2H credit flush failures are retried, not lost**, except `tab_add()` on the BTU host tab under OOM
   (`BD/stack/btu/c2h_credit.c:1013-1016`, logged drop) and `tab_add` dynamic-node OOM (`assert(0)`, :244-248). With
   `C2H_CREDIT_TAB_CAP` ≥ the number of links, the dynamic path is unreachable. A lost credit permanently shrinks the
@@ -478,7 +492,7 @@ for correct operation even though the parser tolerates failure. That matches the
 12. `1005`: `ACL_len` = 1021 (or what the ROM path accepts), `ACL_count` ≤ what the ROM can take immediately, all 7
     bytes present. One completed-packet count per accepted ACL packet.
 
-## 13. Required upstream patches (not yet written / not applied)
+## 13. Required upstream patches (applied as 0008-0010)
 
 All three follow the existing patch style: `#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID`, as in 0007
 (`BD/hci/hci_layer.c:18-20,508-515`), so the pristine upstream behaviour is kept in the `#else` branches. The diffs
@@ -652,9 +666,31 @@ Notes:
 
 ### 13.4 Tests these patches need (host harness, plan M1/M3)
 
+Status (2026-11-24, `make -C open_fw test-bt-host`):
+
+- **0008** runs in the allocation-failure sweep: 17 RX copy failures and 17 RX list-node failures during enable each
+  complete after one `bt_dlv` retry, with the heap back at baseline (no leaked copy). With 0008 compiled out the same
+  points assert or lose the Reset CC. Removing only the `osi_free(pkt)` of the enqueue-fail branch gives 17 CHECK
+  leaks at `fixed_queue_enqueue<-host_recv_pkt_cb`.
+- **0009 is not observable in the sweep.** On a list-node failure 0008 frees the copy and returns -1 whether or not
+  the slot comes back, and losing 1 of the RX queue's 254 slots changes nothing during enable: with only 0009 removed
+  the sweep result is identical (mutation run, 2026-11-24). 0009 has its own scenario (`test_bt_host fixedq`, run
+  first in `all`): the vendored `fixed_queue.c` under the tracked allocator, capacity 2, three `fixed_queue_enqueue(q,
+  x, 0)` with every allocation failing must all fail **at `list_append`** (3 injected node failures, not 2), then two
+  timeout-0 enqueues must succeed and a third must not (the free-slot count is back at exactly the capacity), FIFO
+  order holds and the heap returns to its baseline. With 0009 removed it fails 6 checks.
+- **0010**: the main item and the "no reply, credits unchanged" variant run as scenario 5 (fails with 0010 compiled
+  out). Not yet covered: the mid-fragmentation variant (needs host-to-controller ACL larger than the controller's ACL
+  data size, 1021 bytes, on a real L2CAP channel). The host side of the interleave is argued safe by code reading
+  (§11 D3); the test comes with the connected-link scenarios: an L2CAP payload larger than the ACL data size, held
+  mid-fragmentation by exhausted H2C ACL credits, while a `0C35` is pending; check the fragments reach bt_ctrl
+  complete and in order.
+
 - 0008/0009: fail the copy allocation, then fail the `list_append` node. Each time `notify_host_recv` returns ≠ 0, the
   heap returns to baseline, `fixed_queue_length` and free-slot count are unchanged, and the retried packet (a CC) is
-  processed exactly once, with the command not timing out. Run it through the allocation-failure sweep.
+  processed exactly once, with the command not timing out. Run it through the allocation-failure sweep (0008, the
+  retry and the heap), plus a direct `fixed_queue` check for the free-slot count (0009): the sweep cannot see one lost
+  slot out of 254.
 - 0010 (plan M1 test): command credits 0, C2H window exhausted, an ordinary command queued ahead → `0C35` reaches
   `send()` and inbound ACL resumes. A variant has an ACL packet mid-fragmentation: `0C35` is sent between fragments
   and the fragments stay in order. A further variant checks that no CC/CS is required for `0C35` and that

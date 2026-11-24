@@ -2,8 +2,9 @@
 # Each module owns its own section; keep targets self-contained with their own BUILD_DIR.
 #   test-bt-ctrl  : controller shim unit tests (fake ROM)       [owner: controller]
 #   test-bt-host  : Bluedroid-on-host end-to-end harness        [owner: hosttest]
+#   test-bt-host-tsan : the same harness under ThreadSanitizer    [owner: hosttest]
 #   test-bt-port  : entropy/DRBG/store shim tests               [owner: entropy]
-.PHONY: test-bt-ctrl test-bt-host test-bt-port test-bt-all
+.PHONY: test-bt-ctrl test-bt-host test-bt-host-tsan test-bt-port test-bt-all
 test-bt-all: test-bt-ctrl test-bt-host test-bt-port
 
 # ---- test-bt-port: entropy pool + HMAC_DRBG (plan M2, step 2). Host build, sanitizers on. ----
@@ -47,3 +48,24 @@ test-bt-ctrl:
 		bt_port/bt_ctrl_evt.c $(BT_CTRL_TEST_DIR)/hci_packet_parser.o $(BT_CTRL_TEST_DIR)/bt_ctrl_parser_shim.o \
 		-o $(BT_CTRL_TEST_DIR)/test_bt_ctrl
 	$(BT_CTRL_TEST_DIR)/test_bt_ctrl
+
+# ---- test-bt-host: Bluedroid end-to-end on the FreeRTOS POSIX port (plan M3 path (b), step 5). ----
+# Real Bluedroid (patches 0001-0010) + bt_port + bt_ctrl + tests/fake_rom.c on FreeRTOS-Kernel V11.1.0's POSIX port,
+# ASan/UBSan: patch 0009 fixed_queue slot restore, init/enable/GAP/disable/deinit, patch 0010 NOACK at zero command
+# credits, a 200-cycle leak loop, then the allocation-failure sweep over esp_bluedroid_enable() (one process per failing
+# attempt; known upstream sites are waived with exact point counts in tests/bt_host/sweep_waivers.txt, anything else
+# fails). Details: tests/bt_host/README.md.
+BT_HOST_TEST_DIR ?= /tmp/sl6801_bt_host_tests
+BT_HOST_JOBS ?= $(shell nproc 2>/dev/null || echo 4)
+test-bt-host:
+	$(MAKE) -f tests/bt_host/Makefile BUILD_DIR=$(BT_HOST_TEST_DIR) SAN=asan -j$(BT_HOST_JOBS)
+	$(BT_HOST_TEST_DIR)/asan/test_bt_host all 200
+	python3 tests/bt_host/run_sweep.py $(BT_HOST_TEST_DIR)/asan/test_bt_host --jobs $(BT_HOST_JOBS) --timeout 120 \
+		--waivers tests/bt_host/sweep_waivers.txt
+
+# TSan variant: cooperative scheduling (the POSIX port's in-signal-handler task switch deadlocks under TSan), two
+# suppressions for races inside the port itself (tests/bt_host/tsan.supp).
+test-bt-host-tsan:
+	$(MAKE) -f tests/bt_host/Makefile BUILD_DIR=$(BT_HOST_TEST_DIR) SAN=tsan -j$(BT_HOST_JOBS)
+	TSAN_OPTIONS="suppressions=$(CURDIR)/tests/bt_host/tsan.supp report_signal_unsafe=0 halt_on_error=1" \
+		$(BT_HOST_TEST_DIR)/tsan/test_bt_host all 50

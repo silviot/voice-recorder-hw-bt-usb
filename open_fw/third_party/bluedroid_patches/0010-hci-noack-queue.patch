@@ -1,0 +1,75 @@
+diff --git a/open_fw/third_party/bluedroid/host/bluedroid/hci/hci_layer.c b/open_fw/third_party/bluedroid/host/bluedroid/hci/hci_layer.c
+index a7ad804..42d72c4 100644
+--- a/open_fw/third_party/bluedroid/host/bluedroid/hci/hci_layer.c
++++ b/open_fw/third_party/bluedroid/host/bluedroid/hci/hci_layer.c
+@@ -73,6 +73,9 @@ typedef struct {
+ typedef struct {
+     int command_credits;
+     fixed_pkt_queue_t *command_queue;
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++    fixed_pkt_queue_t *noack_queue; /* open_fw patch 0010: NOACK commands (0C35), sent without a command credit */
++#endif
+     fixed_queue_t *packet_queue;
+     struct osi_event *downstream_data_ready;
+     command_waiting_response_t cmd_waiting_q;
+@@ -258,6 +261,15 @@ static int hci_layer_init_env(void)
+         HCI_TRACE_ERROR("%s unable to create pending command queue.", __func__);
+         return -1;
+     }
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++    hci_host_env.noack_queue = fixed_pkt_queue_new(QUEUE_SIZE_MAX);
++    if (hci_host_env.noack_queue) {
++        fixed_pkt_queue_register_dequeue(hci_host_env.noack_queue, event_command_ready);
++    } else {
++        HCI_TRACE_ERROR("%s unable to create NOACK command queue.", __func__);
++        return -1;
++    }
++#endif
+ 
+     struct osi_event *event = osi_event_create(hci_downstream_data_handler, NULL);
+     assert(event != NULL);
+@@ -303,6 +315,12 @@ static void hci_layer_deinit_env(void)
+         fixed_pkt_queue_free(hci_host_env.command_queue, (fixed_pkt_queue_free_cb)osi_free_func);
+         hci_host_env.command_queue = NULL;
+     }
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++    if (hci_host_env.noack_queue) {
++        fixed_pkt_queue_free(hci_host_env.noack_queue, (fixed_pkt_queue_free_cb)osi_free_func);
++        hci_host_env.noack_queue = NULL;
++    }
++#endif
+     if (hci_host_env.packet_queue) {
+         fixed_queue_free(hci_host_env.packet_queue, osi_free_func);
+         hci_host_env.packet_queue = NULL;
+@@ -333,6 +351,15 @@ static void hci_downstream_data_handler(void *arg)
+     UNUSED(arg);
+ 
+     while (hci_host_check_send_available()) {
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++        /* open_fw patch 0010: Host Number Of Completed Packets may be sent regardless of Num_HCI_Command_Packets
++         * (Core Vol 4 Part E 7.3.40), so NOACK commands go first: ahead of the command-credit check, ahead of
++         * credit-blocked ordinary commands and between fragments of an ACL packet. One send per iteration. */
++        if (!fixed_pkt_queue_is_empty(hci_host_env.noack_queue)) {
++            fixed_pkt_queue_process(hci_host_env.noack_queue);
++            continue;
++        }
++#endif
+         /*Now Target only allowed one packet per TX*/
+         BT_HDR *pkt = packet_fragmenter->fragment_current_packet();
+         if (pkt != NULL) {
+@@ -373,7 +400,15 @@ static void transmit_command(
+     HCI_TRACE_DEBUG("HCI Enqueue Command opcode=0x%x\n", metadata->opcode);
+     BTTRC_DUMP_BUFFER(NULL, command->data + command->offset, command->len);
+ 
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++    /* open_fw patch 0010: NOACK commands bypass the credit-gated FIFO (event_command_ready() already sends them
++     * without consuming a credit or waiting for a response). */
++    fixed_pkt_queue_enqueue((metadata->flags_src & HCI_CMD_MSG_F_SRC_NOACK) ? hci_host_env.noack_queue
++                                                                             : hci_host_env.command_queue,
++                            linked_pkt, FIXED_PKT_QUEUE_MAX_TIMEOUT);
++#else
+     fixed_pkt_queue_enqueue(hci_host_env.command_queue, linked_pkt, FIXED_PKT_QUEUE_MAX_TIMEOUT);
++#endif
+     hci_downstream_data_post(OSI_THREAD_MAX_TIMEOUT);
+ 
+ }

@@ -15,6 +15,7 @@ heap_5). Design and rationale: `docs/BLUETOOTH_BLUEDROID_PLAN.md` §3. Silicon r
 | Heap | `sl6801_firm.ld` `RTOS_HEAP_LO` (0x805C00, 81.9 KiB) + `RTOS_HEAP` (0x86B000, 84 KiB minus static) | both validated on silicon (Exp 0); ascending order required by heap_5 |
 | Kernel static objects | `.rtos_static` section | idle/timer TCBs + stacks, bt_alarm task; main `.bss` is nearly full |
 | Task waits | `OPENFW_TASK_WAIT()` (`sl6801_regs.h`) | WFI in bare-metal builds, `ulTaskNotifyTake(1 tick)` under the RTOS |
+| Host harness | `tests/bt_host/` (`make test-bt-host`) | same kernel sources on the V11.1.0 POSIX port (`third_party/freertos/portable/ThirdParty/GCC/Posix`), Bluedroid end-to-end under ASan/TSan; its own `FreeRTOSConfig.h` |
 | Self-test | `RTOS_SELFTEST=1`, `rtos_selftest.c` | 14 tests; `make test-qemu-rtos`, `make test-qemu-bt`; on silicon read `g_rtos_selftest` with `exp/exp_peek.c` |
 
 ## Lessons (each one cost a debugging round)
@@ -42,3 +43,6 @@ heap_5). Design and rationale: `docs/BLUETOOTH_BLUEDROID_PLAN.md` §3. Silicon r
   and new hot code in `.fast_ramtext`, not `.ramtext`.
 - Keep the default image byte-identical: guard every RTOS/BT change with `OPENFW_RTOS` / `OPENFW_BT_BLUEDROID` and
   compare `FIRM CRC-16` of `make all` before committing (currently 0xC786).
+- **POSIX port (host harness) V11.1.0 can hang in `vTaskDelete(other)`** (cancelled thread exits holding its event
+  mutex; fixed upstream in V11.2.0). `tests/bt_host/posix_port_shim.h` makes the mutex robust at compile time; see
+  `tests/bt_host/README.md` for the other host-port lessons (pre-emption inside malloc, TSan).
