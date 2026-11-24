@@ -1,9 +1,9 @@
-# Bluetooth Classic for open_fw — Integration Plan (v3, for joint review)
+# Bluetooth Classic for open_fw — Integration Plan (v4, for joint review)
 
 Branch `feat/freertos-bluedroid` (worktree `../voice-recorder-hw-bt-usb-bt`). Hardware: Smartlink SL6801 `HW_76`
 (dual Cortex-M4F @ 96 MHz, 512 KB SRAM, 2 MB SPI NOR XIP, **BR/EDR-only** RivieraWaves `RW-BT` controller in mask ROM,
 no BLE). This document is the single source of truth: it is reviewed by Codex and agy until both agree, then executed.
-v3 addresses every round-1 blocking item (see §11 for the traceability table).
+v3 addressed every round-1 blocking item, v4 every round-2 item (§11 traceability).
 
 ## 0. Goals, non-goals
 
@@ -52,7 +52,8 @@ Nothing has run on silicon yet. Legacy BT host code has never shipped to users.
 ```
  priority  task / context              owns / does
  ISR       DMA audio, USB, SDIO        unchanged; never call FreeRTOS APIs (priority above MAX_SYSCALL)
- ISR       IRQ26 RW-BT top half        explicit NVIC prio (numerically >= configMAX_SYSCALL_INTERRUPT_PRIORITY);
+ ISR       IRQ26 RW-BT top half        explicit NVIC prio: logical 4..7 i.e. IPR byte 0x80..0xE0 with 3 prio bits
+                                       (numerically >= configMAX_SYSCALL_INTERRUPT_PRIORITY = 0x80), read back;
                                        ack, count per-bit occurrences, vTaskNotifyGiveFromISR(bt_ctrl) +
                                        portYIELD_FROM_ISR; code in .fast_ramtext (NOT .ram_boot: 172 B left)
  ISR low   SysTick                     g_systick_ms, keys, exp watchdog, xPortSysTickHandler
@@ -76,9 +77,11 @@ Rules:
   FreeRTOS call site inside ROM callbacks (`eif_write`, notify paths); PRIMASK regions measured.
 - **App-task sleeping**: under `OPENFW_RTOS`, every `OPENFW_WFI()` executed in task context (`wfi_sleep_ms`, USB/BT
   loops in `main.c`, `player.c`, `cpu1_ui_sync`) becomes `vTaskDelay`/`ulTaskNotifyTake` via one helper
-  `openfw_sleep_ticks()`; only idle executes WFI. This lets idle run and reap deleted Bluedroid tasks.
-- **SysTick before scheduler**: `openfw_rtos_start()` calls `systick_init()` before `vTaskStartScheduler()`;
-  the later call in `main.c` becomes idempotent (no reprogramming) under `OPENFW_RTOS`.
+  `OPENFW_TASK_WAIT()`; only idle executes WFI. This lets idle run and reap deleted Bluedroid tasks.
+- **SysTick start**: `vPortSetupTimerInterrupt()` calls `systick_init()` — i.e. inside `xPortStartScheduler()`
+  after SHPR3 gives SysTick/PendSV the lowest priority and with interrupts masked (never earlier: a default-priority
+  tick could enter the kernel before the first task). The later call in `main.c` is a no-op under `OPENFW_RTOS` when
+  the configuration is unchanged. `configTIMER_TASK_PRIORITY = configMAX_PRIORITIES - 1` (9), static-asserted.
 
 ## 4. Memory and flash budget
 
@@ -95,17 +98,22 @@ SRAM (RTOS build): main `.bss` ends ≈`0x84EA18` (~5.5 KB left — nothing new 
 | FreeRTOS idle + timer static stacks/TCBs | ~2.2 KB | currently main `.bss` → move to RTOS region |
 | App task stack | 16 KB | heap (measure; trim only after silicon watermark) |
 | BT stacks: hciT 2 + BTU 4.25 + BTC 3 + bt_ctrl 2 + bt_dlv 1.5 | ~12.75 KB | heap; host + silicon watermarks |
-| bt_ctrl RX/TX rings (H4 copies, reserved CC/CS/NOCP slots) | ~6 KB | static in `.bt_bss` |
+| bt_ctrl rings: ACL RX 4 × (1021+5) + event RX 8 × 260 + cmd TX 2 × 259 + ACL TX 2 × 1026 | ~8.8 KB | static in `.bt_bss`, capacity asserted in bytes |
 | OSI objects, HCI cmd/ACL buffers, config cache | 8–20 KB | heap |
 | SPP mode RFCOMM queues + XREC RX stream buffer | 4–20 KB | heap |
 | A2DP mode encoded frames + PCM ring (100 ms @48 kHz) | ~26 KB | heap |
 | **Worst case** | **~105–120 KB** | exceeds the 84 KB high region |
 
+Placement: `.rtos_static` (kernel idle/timer objects), `.bt_data` (VMA) and `.bt_bss` are carved from the **start
+of `RTOS_HEAP` (`0x0086B000`)**; `_srtos_heap0` starts after `_ebt_bss` and heap_5 takes the rest; `.bt_data`'s LMA is
+contiguous after `.data` in XIP. (Main `SRAM` and `SRAM_HI` cannot hold them.)
+
 Linker rules: Bluedroid is built into `libbluedroid.a` (plus `libbt_port.a`, `libc.a`); the new sections select input
 explicitly (`libbluedroid.a:*(.bss .bss.* COMMON)` etc.) and appear **before** the catch-all `.data`/`.bss`; heap bounds
-are disjoint from every section; `ASSERT`s on each region. The step-1 link calls the real entry points
-(`esp_bluedroid_init/enable`, `esp_spp_*`, `esp_a2d_source_*`, `esp_avrc_*`) from a reference table so
-`--gc-sections` cannot produce a deceptively small image.
+are disjoint from every section; `ASSERT`s on each region. The step-1 link roots the real entry points
+(`esp_bluedroid_init/enable`, `esp_spp_*`, `esp_a2d_source_*`, `esp_avrc_*`) via a table in a dedicated section kept
+with `KEEP(*(.bt_link_roots))`, and a post-link check (`nm`) fails the build if any required entry point is missing,
+so `--gc-sections` cannot produce a deceptively small image.
 
 Expansion (only after Exp 0 validates on silicon):
 1. **Primary: lower region `0x805C00..0x81A37F` (~81.9 KB)** as a heap_5 region (heap_5 regions in ascending address
@@ -130,22 +138,37 @@ Acceptance budget per mode: minimum free heap under traffic ≥ 8 KB and largest
   - *Optional*: `REJECT` with correctly sized Command Complete / Command Status, status `0x01`.
   - Feature masking (no sniff, role switch, SC, unverified EDR types) reduces but does not prove absence of optional
     commands, hence the REJECT class. No opcode is silently consumed.
+- **ACL credit window (sized to physical storage)**: patch/config overrides upstream `L2CAP_HOST_FC_ACL_BUFS`
+  (default 100) and the `0C33` host ACL length (default `L2CAP_MTU_SIZE` 1691) to **4 packets × 1021 B** (the
+  controller ACL length); a static assert ties the ring byte capacity to these values.
 - **RX path (backpressure never reaches the ROM owner):** `bt_ctrl` copies each complete H4 packet into a bounded ring
-  before completing the ROM `eif_write` callback (copy-before-ack). Separate event ring with reserved slots for
-  CC/CS/NOCP; ACL ring sized from the host buffer count we program via `0C33`, enforced by controller→host flow control
-  in the shim (no ACL sent to host without a host credit). `bt_dlv` delivers to the host callback and is the only
-  context that may block in Bluedroid's queues. Ring overflow is impossible by construction for ACL; for non-reserved
-  events it increments a counter and triggers a controlled stack restart (not silent drop).
-- **TX admission (driver `send()` returns void):** `check_send_available()` returns true only after reserving a TX
-  slot for the single caller (hciT); `send()` consumes the reservation and cannot fail (assert). Slot release →
-  `notify_host_send_available`. Command credit = 1; ACL credits from NOCP.
+  before completing the ROM `eif_write` callback (copy-before-ack). An ACL host credit is **consumed before** the ROM
+  fragment is accepted; with zero credits the ACL fragment stays in the controller (EM) and the ROM callback is
+  deferred. Events have their own ring with reserved slots for CC/CS/NOCP and remain serviceable at zero ACL credit.
+  Whether the ROM's `eif_write` stream lets events overtake a deferred ACL fragment is an Exp 1 stage-C question; if it
+  does not, ACL-ring saturation is handled as a controlled link disconnect, not assumed impossible.
+  `bt_dlv` delivers to the host callback and is the only context that may block in Bluedroid's queues; it checks the
+  session id before each delivery and holds no lock across the callback. The host callback (`hci_hal_h4.c`) allocates
+  a second copy and asserts on failure: per-mode heap budgets reserve `window × (len + header)` for it, and a host test
+  injects allocation failure at that site (documented patch to fail soft if the assert is reachable).
+- **TX admission (driver `send()` returns void)**: hciT is the only caller of `check_send_available()`/`send()` and
+  may call the check and then not send (`hci_layer.c` loop exit, `packet_fragmenter.c` bounce). So
+  `check_send_available()` is a **pure, side-effect-free capacity query** (free slot in the relevant TX ring);
+  only `bt_ctrl` frees slots, so a true result stays true until hciT's next `send()`, which copies and cannot fail
+  (assert). `notify_host_send_available()` (unbounded post + mutex) is never called from `bt_ctrl`: bt_ctrl sets a
+  flag/notifies `bt_dlv`, which calls it. Tests: empty queue, zero command credits, full host work queue, teardown with
+  a pending send-available.
 - **Reset**: real controller reset inside `bt_ctrl`, then synthesized CC; same path on re-enable.
 - **Disable/teardown order**: Bluedroid disable + profile close completions run with transport alive → callbacks
   quiesced (session id bumped, late callbacks rejected) → admission closed → controller stopped, reset completion
   checked (status reported, not ignored) → IRQ 26 masked → rings freed → tasks deleted (idle reaps).
 - **IRQ multiplicity**: per-source counters; bottom half loops until the status register reads clear.
-- **Local identity**: stable per-device BD_ADDR: eFuse if present; else derived (SHA-256) from the SPI-NOR unique ID
-  (verified readable in Exp 1); else generated once from the DRBG and persisted; never timer-derived.
+- **Local identity**: stable per-device BD_ADDR: eFuse if present; else derived deterministically (SHA-256, fixed
+  domain-separation label, stable across firmware upgrades) from the SPI-NOR unique ID (`0x4B`, read from RAM code
+  with IRQs masked; Exp 1 verifies it is non-trivial and differs across units), with the locally-administered unicast
+  bits set (as `bt_hci.c` does today) and reserved LAPs avoided; else generated once from the DRBG and persisted (then a
+  card swap changes identity — documented). Never timer-derived. A production release would use an allocated public
+  address range; this is a hobby/prototype firmware.
 
 ### M2 — Platform shims (`bt_port/`)
 - **Entropy/DRBG — honest scope.** Classic-only Bluedroid never calls `esp_random`; P-192 SSP keys/nonces are
@@ -219,10 +242,10 @@ Every step: zero-warning ARM builds (`all`, `all RTOS=1`, flag build once it exi
 `test-qemu-rtos`, `wasm` when shared files change; legacy image byte-identical **at the same source revision and
 toolchain** until step 9.
 
-1. **RTOS hygiene + build plumbing**: priorities to 10, `openfw_sleep_ticks()` replacing task-context WFI, SysTick
-   before scheduler, idle/timer static memory out of main `.bss`, `nvic_set_priority()`; picolibc + `libbluedroid.a`
+1. **RTOS hygiene + build plumbing**: priorities to 10, `OPENFW_TASK_WAIT()` replacing task-context WFI, SysTick
+   started in `vPortSetupTimerInterrupt()`, idle/timer static memory out of main `.bss`, `nvic_set_priority()`; picolibc + `libbluedroid.a`
    under the flag; `.bt_data`/`.bt_bss` sections with explicit input selection + copy/zero + objcopy + ASSERTs;
-   reference-table link. Gate: flag build links with real entry points, QEMU boots, self-test passes (add a
+   KEEP-rooted reference table + post-link symbol check; ACL window overrides. Gate: flag build links with real entry points, QEMU boots, self-test passes (add a
    task-delete/reap test), budgets asserted.
 2. **Platform shims (M2)** with host tests: DRBG CAVP vectors, health-test triggers, fallible entropy gate, RAM KV store
    + flush with power-fail injection on an exFAT image, timer/log tests.
@@ -233,7 +256,8 @@ toolchain** until step 9.
    (Step 5 harness work proceeds in parallel; it does not wait for hardware.)
 5. **Host harness (M3)**: both paths green under sanitizers.
 6. **Bluedroid on silicon, phone mode**: Exp 1 stage C, pairing policy, XREC with Android app + both desktop tools;
-   lifecycle gate (disable/re-enable, MSC during transfer, card removal) before any user test; Exp 3.
+   lifecycle gate (disable/re-enable, MSC during transfer, card removal and replacement + cold reconnect) and the WDT
+   supervisor acceptance test before any user phone test; Exp 3.
 7. **A2DP source + AVRCP**: sink abstraction; Exp 4.
 8. **UI/settings/i18n, WDT supervisor, power transitions**; Exp 5.
 9. **Parity + switch default**; legacy host code deleted in a separate commit.
@@ -262,18 +286,17 @@ telemetry: heap/stack watermarks, largest free block, IRQ-26 latency and multipl
 | R11 | Host backpressure stalls controller | bt_dlv split; flow-controlled ACL; reserved event slots |
 | R12 | Bonds/identity on removable media | stable identity; documented trust model; fresh pairing |
 
-## 9. Open questions for reviewers (round 2)
+## 9. Open questions for reviewers (round 3)
 
-1. Is the `bt_dlv` split (bt_ctrl never blocks; delivery task may) plus host flow control sufficient for R11?
-2. Is the reserve-on-check TX admission sound given hciT is the only caller of `check_send_available`/`send`?
-3. Is deriving BD_ADDR from the SPI-NOR unique ID acceptable when no eFuse address exists?
-4. Any remaining blocker to starting step 1?
+1. Do the v4 changes resolve the round-2 blockers (SysTick start, link roots, TX admission, ACL window)?
+2. Any remaining blocker to starting steps 1–3?
 
 ## 10. Live log
 
 - 2026-11-24: FreeRTOS port + QEMU self-test (10/10). Bluedroid vendored, Phase 1 GO. Codex architecture review and HCI
   matrix integrated. `main` (i18n, 18 languages) merged. Plan v2 reviewed: Codex and agy both CHANGES_REQUIRED.
-  Plan v3 written.
+  Plan v3 written. Round 2: agy APPROVE_WITH_CHANGES, Codex CHANGES_REQUIRED (4 items). Plan v4 written.
+  Step-1 RTOS hygiene started in parallel (priorities, task-wait, SysTick in port hook, `.rtos_static`, reap test).
 
 ## 11. Round-1 traceability
 
@@ -289,6 +312,15 @@ telemetry: heap/stack watermarks, largest free block, IRQ-26 latency and multipl
 | Codex B8 (client compatibility) | native-SPP detection in tools; real-client gate |
 | agy B2 (REJECT on startup reads) | two-class opcode policy |
 | agy B3 / Codex NB3 (priority math) | `configMAX_PRIORITIES` 10; table fixed; static assert |
-| agy B4 (WFI starves idle; late SysTick) | `openfw_sleep_ticks()`; SysTick before scheduler; reap test |
+| agy B4 (WFI starves idle; late SysTick) | `OPENFW_TASK_WAIT()`; SysTick before scheduler; reap test |
 | agy B5 (.ram_boot 172 B, missing consumers) | IRQ handler in `.fast_ramtext`; table completed |
 | NB items (WDT, sink ops, NVS cache, timer daemon, wasm/k_exp_api, NVIC helper, PRIMASK, byte-identity scope, trace scrubbing, Exp 2 ordering) | M4 WDT/sink/i18n; M2 store/timer; §3 rules; §6 gates; M3 traces; step 4 |
+| **Round 2** | |
+| Codex N1 / agy NB2 (SysTick before SHPR3) | SysTick started in `vPortSetupTimerInterrupt()` |
+| agy NB1 (timer daemon priority) | `configMAX_PRIORITIES - 1`, static assert |
+| Codex N2 (GC can drop reference table) | `KEEP(.bt_link_roots)` + post-link `nm` check |
+| Codex N3 / agy N1 (TX slot leak, notify from bt_ctrl) | pure capacity query; send-available via `bt_dlv` |
+| Codex N4 / agy NB4 (ACL window vs storage) | 4 × 1021 B window overrides; byte-capacity assert; credit before ROM accept; alloc-failure test |
+| agy NB3 (target region) | `.bt_data`/`.bt_bss` at start of `RTOS_HEAP` |
+| Codex NB (IPR units; card swap; WDT before phone test) | §3 IPR bytes; step 6 gate |
+| agy A1/A3 (ROM C2H support; NOR UID safety, LAA bits) | Exp 1 stage C question; identity paragraph |
