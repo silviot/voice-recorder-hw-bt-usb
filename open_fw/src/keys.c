@@ -22,6 +22,8 @@ static volatile key_id_t g_key_stable        = KEY_NONE;
 static volatile uint32_t g_key_stable_since  = 0u;
 static key_id_t          g_key_cand          = KEY_NONE;
 static uint8_t           g_key_cand_count    = 0u;
+static volatile uint32_t g_key_last_edge_ms  = 0u;
+static volatile uint8_t  g_key_any_edge      = 0u;
 
 static inline __attribute__((always_inline)) void keys_barrier(void)
 {
@@ -150,6 +152,7 @@ void keys_init(void)
     g_key_stable_since  = 0u;
     g_key_cand          = KEY_NONE;
     g_key_cand_count    = 0u;
+    g_key_any_edge      = 0u;
     keys_barrier();
     g_keys_scan_en      = 1u;
 }
@@ -198,6 +201,9 @@ void keys_scan_tick(uint32_t now_ms)
         keys_barrier();
         g_key_stable       = raw;
         g_key_cand_count   = 0u;
+        g_key_last_edge_ms = now_ms;
+        keys_barrier();
+        g_key_any_edge     = 1u;
 
         if (g_key_resync_ignore) {
             /* The old key belongs to the previous input context. A direct
@@ -293,6 +299,25 @@ key_id_t keys_state(uint32_t *since_ms)
         *since_ms = sc;
     }
     return st;
+}
+
+/*
+ * Time of the last debounced key edge (press or release), whatever loop did or
+ * did not consume the event. The screen idle timer uses it so a press handled
+ * by a loop that does not run backlight_update() (e.g. the player) still counts
+ * as user activity once control returns to the menus.
+ */
+int keys_last_activity(uint32_t *t_ms)
+{
+    uint32_t pm;
+    OPENFW_IRQ_SAVE(pm);
+    int      any = g_key_any_edge;
+    uint32_t t   = g_key_last_edge_ms;
+    OPENFW_IRQ_RESTORE(pm);
+    if (any && t_ms) {
+        *t_ms = t;
+    }
+    return any;
 }
 
 uint16_t keys_read_adc(void)

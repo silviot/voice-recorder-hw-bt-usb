@@ -199,6 +199,13 @@ static void backlight_sleep_now(enum screen_sleep_state reason)
     g_fade_out_reason = reason; /* a manual off may upgrade an idle fade */
 }
 
+/* The player runs no screen idle timer: restart it on return to the menus so
+ * they get a full timeout, without waking a screen the user switched off. */
+static void backlight_note_activity(uint32_t now_ms)
+{
+    g_last_activity_ms = now_ms;
+}
+
 static int screen_manually_off(void)
 {
     return g_screen_off == SCREEN_MANUALLY_OFF || g_fade_out_reason == SCREEN_MANUALLY_OFF;
@@ -306,16 +313,21 @@ static void backlight_update(void)
         backlight_apply(user_bl_pct());
         return;
     }
-    /* A queued key may have arrived after the main loop sampled its clock. */
-    uint32_t idle_ms = millis() - g_last_activity_ms;
-    if (idle_ms >= off_ms) {
+    /* Any debounced key edge is activity, including presses consumed by loops
+     * that never call backlight_wake()/backlight_update() (the player): without
+     * this, BACK out of a long playback left an idle time of the whole playback
+     * and the very first backlight_update() blacked the screen out. */
+    uint32_t last = g_last_activity_ms;
+    uint32_t key_ms;
+    if (keys_last_activity(&key_ms) && (int32_t)(key_ms - last) > 0) {
+        last = key_ms;
+    }
+    /* millis() (not the loop's sampled clock): a queued key may be newer. */
+    uint8_t pct = 0u;
+    if (screen_idle_level(millis(), last, off_ms, user_bl_pct(), &pct) == SCREEN_IDLE_SLEEP) {
         backlight_sleep_now(SCREEN_IDLE_TIMEOUT);
-    } else if (off_ms >= 20000u && idle_ms >= (off_ms / 2u)) {
-        uint8_t u = user_bl_pct();
-        uint8_t dim = (u < 15u) ? u : 15u;
-        backlight_apply(dim);
     } else {
-        backlight_apply(user_bl_pct());
+        backlight_apply(pct);
     }
 #endif
 }
@@ -1732,6 +1744,7 @@ static void play_file_at_index(int start_idx)
         int rc = openfw_play_file_ui(&g_exfat_vol, g_file_dirs[idx], g_files[idx].filename, &g_ui);
         keys_ignore_held();
         apm_end_track(rc);
+        backlight_note_activity(millis());
         g_files[idx].unplayed   = 0u;
         g_files[idx].resume_sec = g_ui.play_file.resume_sec;
         g_ui.last_file          = g_files[idx];
@@ -1806,6 +1819,7 @@ static void play_named_file(const char *dir, ui_file_entry_t *entry)
     g_ui.play_autoplay = 0u;
     (void)openfw_play_file_ui(&g_exfat_vol, dir, entry->filename, &g_ui);
     keys_ignore_held();
+    backlight_note_activity(millis());
     entry->resume_sec = g_ui.play_file.resume_sec;
     save_persisted_state();
 }

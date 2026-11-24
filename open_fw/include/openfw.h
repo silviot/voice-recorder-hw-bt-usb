@@ -154,6 +154,10 @@ typedef enum {
 
 power_button_action_t power_button_update(uint8_t events, uint32_t now, int screen_off,
                                           uint8_t *progress);
+/* Screen idle policy (pure): off_ms 0 = never; dims to 15% after off_ms/2 when off_ms >= 20 s. */
+typedef enum { SCREEN_IDLE_FULL, SCREEN_IDLE_DIM, SCREEN_IDLE_SLEEP } screen_idle_t;
+screen_idle_t   screen_idle_level(uint32_t now_ms, uint32_t last_activity_ms,
+                                  uint32_t off_ms, uint8_t user_pct, uint8_t *out_pct);
 void            pmu_soft_poweroff(void) __attribute__((noreturn));
 void            pmu_unattended_init(void);
 void            pmu_poll_charge_manage(void);
@@ -191,6 +195,7 @@ int         keys_event_pending(void);
 key_id_t    keys_flush_events(void); /* held key at the queue boundary */
 void        keys_ignore_held(void); /* start a screen transition, suppress the exiting press */
 key_id_t    keys_state(uint32_t *since_ms);
+int         keys_last_activity(uint32_t *t_ms); /* 1 + time of last debounced edge */
 
 /* ST7735S 80x160 / 160x80 8080 Parallel LCD + PWM3 Backlight (lcd_st7735s.c) */
 #define LCD_WIDTH   80u
