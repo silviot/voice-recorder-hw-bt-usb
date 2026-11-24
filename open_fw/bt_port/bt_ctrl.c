@@ -158,16 +158,27 @@ static struct {
     uint32_t note_head, note_n;
     uint8_t peer_name_ok, peer_bda[6];       /* newest successful remote name (under enter(), bt_ctrl_peer_name) */
     char peer_name[BT_CTRL_PEER_NAME_MAX];
-    /* per-link view (bt_ctrl_link_info; written by bt_ctrl context under enter(), read by any task under enter()) */
-    bt_ctrl_link_info_t link[BT_CTRL_MAX_LINKS];
-    uint8_t link_wire[BT_CTRL_MAX_LINKS][6]; /* the link's BD_ADDR in wire order, for Role Change matching */
+    bt_ctrl_stats_t st;
+} g;
+
+/* Link view and inquiry/page state for the headphones path (bt_ctrl_link_info, bt_ctrl_scan_enable,
+ * bt_ctrl_inquiry_active). On target it lives in SRAM_HI (.bss_hi, zeroed at boot, like bt_xrec_fw.c's recovery
+ * objects): `g` is in .bt_bss, which comes out of the RTOS_HEAP region, and the BT=1 HCI_PROBE self-test image had
+ * only ~28 B left above the 32 KiB heap_5 floor asserted by sl6801_firm.ld. Reset with `g` (bt_ctrl_init) and at
+ * every controller reset. */
+#if defined(__arm__)
+#define BT_CTRL_HI __attribute__((section(".bss_hi"), aligned(4)))
+#else
+#define BT_CTRL_HI
+#endif
+static struct {
+    bt_ctrl_link_info_t link[BT_CTRL_MAX_LINKS];   /* written by bt_ctrl context and read by any task, under enter() */
     uint8_t page_pending, page_bda[6];       /* 0405 accepted by the ROM (CS 0), Connection Complete still to come */
     uint8_t accept_pending, accept_bda[6], accept_role;   /* 0409 accepted (CS 0), its Role parameter */
     uint8_t scan_enable;                     /* last 0C1A value the ROM accepted (bt_ctrl_scan_enable) */
     uint8_t inq_active;                      /* 0401 CS 0 seen, no Inquiry Complete / 0402 CC since */
     uint32_t inq_results;                    /* inquiry result events of the running inquiry */
-    bt_ctrl_stats_t st;
-} g;
+} lv BT_CTRL_HI;
 
 /* ------------------------------------------------------------------------------------------------------------- */
 /* helpers                                                                                                        */
@@ -452,26 +463,37 @@ static void cmd_note(uint16_t op, uint16_t handle, uint8_t status, uint8_t local
     }
 }
 
-static bt_ctrl_link_info_t *link_of(uint16_t h)
+static bt_ctrl_link_info_t *link_of(uint16_t hdl)
 {
-    return (h >= 0x80u && h < 0x80u + BT_CTRL_MAX_LINKS) ? &g.link[h - 0x80u] : NULL;
+    return (hdl >= 0x80u && hdl < 0x80u + BT_CTRL_MAX_LINKS) ? &lv.link[hdl - 0x80u] : NULL;
+}
+
+/* bda in BD_ADDR order (MSB first) equals the wire-order (LSB first) address w */
+static bool bda_is_wire(const uint8_t *bda, const uint8_t *w)
+{
+    for (uint32_t i = 0u; i < 6u; i++) {
+        if (bda[i] != w[5u - i]) {
+            return false;
+        }
+    }
+    return true;
 }
 
 /* The ROM accepted a forwarded command (status 0 in its initial reply): state the link view needs later. */
 static void cmd_accepted(uint16_t op)
 {
     if (op == BT_CTRL_OP_CREATE_CONN && g.fwd_plen >= 6u) {
-        g.page_pending = 1u;                 /* the Connection Complete for this address makes an outgoing link */
-        memcpy(g.page_bda, g.fwd_params, 6u);
+        lv.page_pending = 1u;                 /* the Connection Complete for this address makes an outgoing link */
+        memcpy(lv.page_bda, g.fwd_params, 6u);
     } else if (op == BT_CTRL_OP_ACCEPT_CONN && g.fwd_plen >= 7u) {
-        g.accept_pending = 1u;
-        memcpy(g.accept_bda, g.fwd_params, 6u);
-        g.accept_role = g.fwd_params[6];
+        lv.accept_pending = 1u;
+        memcpy(lv.accept_bda, g.fwd_params, 6u);
+        lv.accept_role = g.fwd_params[6];
     } else if (op == BT_CTRL_OP_INQUIRY) {
-        g.inq_active = 1u;
-        g.inq_results = 0u;
+        lv.inq_active = 1u;
+        lv.inq_results = 0u;
     } else if (op == BT_CTRL_OP_WRITE_SCAN_ENABLE && g.fwd_plen >= 1u) {
-        g.scan_enable = g.fwd_params[0];
+        lv.scan_enable = g.fwd_params[0];
     }
 }
 
@@ -483,12 +505,12 @@ static void link_event(const bt_ctrl_evt_info_t *info, const uint8_t *param, uin
     switch (info->evt_code) {
     case BT_HCI_EVT_CONN_CMP: {                        /* {s, pad, h, pad, bdaddr@5, type, enc} (13) */
         const uint8_t *a = &param[5];
-        uint8_t out = g.page_pending && memcmp(a, g.page_bda, 6u) == 0;
-        uint8_t acc = g.accept_pending && memcmp(a, g.accept_bda, 6u) == 0;
+        uint8_t out = lv.page_pending && memcmp(a, lv.page_bda, 6u) == 0;
+        uint8_t acc = lv.accept_pending && memcmp(a, lv.accept_bda, 6u) == 0;
         uint8_t role = out ? BT_CTRL_ROLE_MASTER
-                       : acc ? (g.accept_role == 0u ? BT_CTRL_ROLE_MASTER : BT_CTRL_ROLE_SLAVE) : BT_CTRL_ROLE_UNKNOWN;
-        g.page_pending = out ? 0u : g.page_pending;
-        g.accept_pending = acc ? 0u : g.accept_pending;
+                       : acc ? (lv.accept_role == 0u ? BT_CTRL_ROLE_MASTER : BT_CTRL_ROLE_SLAVE) : BT_CTRL_ROLE_UNKNOWN;
+        lv.page_pending = out ? 0u : lv.page_pending;
+        lv.accept_pending = acc ? 0u : lv.accept_pending;
         l = link_of(h);
         if (info->status == BT_HCI_OK && l != NULL) {
             g.p.enter();
@@ -499,7 +521,6 @@ static void link_event(const bt_ctrl_evt_info_t *info, const uint8_t *param, uin
             for (uint32_t i = 0u; i < 6u; i++) {
                 l->bda[i] = a[5u - i];
             }
-            memcpy(g.link_wire[h - 0x80u], a, 6u);
             g.p.exit();
         }
         break;
@@ -515,12 +536,12 @@ static void link_event(const bt_ctrl_evt_info_t *info, const uint8_t *param, uin
     case BT_HCI_EVT_ROLE_CHG: {                        /* {s, bdaddr, role} (8) verbatim */
         uint16_t hh = 0u;
         for (uint32_t i = 0u; i < BT_CTRL_MAX_LINKS; i++) {
-            if (g.link[i].up && memcmp(g.link_wire[i], &param[1], 6u) == 0) {
+            if (lv.link[i].up && bda_is_wire(lv.link[i].bda, &param[1])) {
                 hh = (uint16_t)(0x80u + i);
                 g.p.enter();
-                g.link[i].role_changes++;
+                lv.link[i].role_changes++;
                 if (info->status == BT_HCI_OK) {
-                    g.link[i].role = param[7];
+                    lv.link[i].role = param[7];
                 }
                 g.p.exit();
                 break;
@@ -556,11 +577,11 @@ static void link_event(const bt_ctrl_evt_info_t *info, const uint8_t *param, uin
     case BT_HCI_EVT_INQ_RES:
     case BT_HCI_EVT_INQ_RSSI:
     case BT_HCI_EVT_INQ_EXT:
-        g.inq_results++;
+        lv.inq_results++;
         break;
     case BT_HCI_EVT_INQ_CMP:
-        g.inq_active = 0u;
-        note_add(BT_CTRL_NOTE_INQ_DONE, 0u, info->status, (uint8_t)(g.inq_results > 255u ? 255u : g.inq_results), 0u);
+        lv.inq_active = 0u;
+        note_add(BT_CTRL_NOTE_INQ_DONE, 0u, info->status, (uint8_t)(lv.inq_results > 255u ? 255u : lv.inq_results), 0u);
         break;
     default:
         break;
@@ -742,7 +763,7 @@ static bt_rom_msg_ret_t up_on_hci_msg(void *ctx, uint16_t id, uint8_t *param, ui
             cmd_accepted(info.opcode);
         }
         if (info.opcode == BT_CTRL_OP_INQUIRY_CANCEL) {
-            g.inq_active = 0u;               /* 0402 CC: the inquiry is over (no Inquiry Complete follows a cancel) */
+            lv.inq_active = 0u;               /* 0402 CC: the inquiry is over (no Inquiry Complete follows a cancel) */
         }
         g.fwd_pending = 0u;
         g.fwd_orphan = 0u;
@@ -840,13 +861,12 @@ static void controller_state_reset(void)
     g.c2h_out_total = 0u;
     memset(g.local_name, 0, sizeof(g.local_name));
     g.ssp_host = 0u;
-    g.page_pending = g.accept_pending = 0u;
-    g.inq_active = 0u;
-    g.inq_results = 0u;
+    lv.page_pending = lv.accept_pending = 0u;
+    lv.inq_active = 0u;
+    lv.inq_results = 0u;
     g.p.enter();
-    memset(g.link, 0, sizeof(g.link));
-    memset(g.link_wire, 0, sizeof(g.link_wire));
-    g.scan_enable = 0u;
+    memset(lv.link, 0, sizeof(lv.link));
+    lv.scan_enable = 0u;
     g.p.exit();
     g.held_head = g.held_n = 0u;
     g.def_head = g.def_n = 0u;
@@ -1888,6 +1908,7 @@ int bt_ctrl_dlv_run(void)
 int bt_ctrl_init(const bt_rom_if_t *rom, const bt_ctrl_platform_t *platform, const uint8_t bd_addr[6])
 {
     memset(&g, 0, sizeof(g));
+    memset(&lv, 0, sizeof(lv));
     g.rom = rom;
     g.p = *platform;
     memcpy(g.bd_addr, bd_addr, 6u);
@@ -2087,7 +2108,7 @@ int bt_ctrl_link_info(uint16_t h, bt_ctrl_link_info_t *out)
 uint8_t bt_ctrl_scan_enable(void)
 {
     g.p.enter();
-    uint8_t v = g.scan_enable;
+    uint8_t v = lv.scan_enable;
     g.p.exit();
     return v;
 }
@@ -2095,7 +2116,7 @@ uint8_t bt_ctrl_scan_enable(void)
 int bt_ctrl_inquiry_active(void)
 {
     g.p.enter();
-    int v = g.inq_active ? 1 : 0;
+    int v = lv.inq_active ? 1 : 0;
     g.p.exit();
     return v;
 }
