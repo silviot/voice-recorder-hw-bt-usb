@@ -1,9 +1,9 @@
-# Bluetooth Classic for open_fw — Integration Plan (v5, for joint review)
+# Bluetooth Classic for open_fw — Integration Plan (v6, for joint review)
 
 Branch `feat/freertos-bluedroid` (worktree `../voice-recorder-hw-bt-usb-bt`). Hardware: Smartlink SL6801 `HW_76`
 (dual Cortex-M4F @ 96 MHz, 512 KB SRAM, 2 MB SPI NOR XIP, **BR/EDR-only** RivieraWaves `RW-BT` controller in mask ROM,
 no BLE). This document is the single source of truth: it is reviewed by Codex and agy until both agree, then executed.
-v3 addressed round 1, v4 round 2, v5 round 3 (§11 traceability).
+v3 addressed round 1, v4 round 2, v5 round 3, v6 round 4 (§11 traceability).
 
 ## 0. Goals, non-goals
 
@@ -160,7 +160,9 @@ Acceptance budget per mode: minimum free heap under traffic ≥ 8 KB and largest
   and `check_send_available()` is a **pure, side-effect-free query** "unified ring has a free slot". Only hciT fills
   and only `bt_ctrl` frees, so a true result stays true until hciT's next `send()`, which copies and cannot fail
   (assert). Command credit / ACL credit gating happens inside `bt_ctrl` when draining the ring to the ROM, never in the
-  check. `notify_host_send_available()` (unbounded post + mutex) is never called from `bt_ctrl`: it notifies `bt_dlv`,
+  check; the drain is **not strict FIFO**: an eligible command is taken ahead of a credit-blocked ACL entry (order
+  preserved within each type), so ACL at the head cannot block `0C35`/Disconnect. `1005` never advertises more
+  controller ACL buffers than `bt_ctrl` can hand to the ROM immediately, so the ring cannot fill with undrainable ACL. `notify_host_send_available()` (unbounded post + mutex) is never called from `bt_ctrl`: it notifies `bt_dlv`,
   which calls it. Tests: empty queue, zero command credits, zero ACL credits with a queued command (command must still
   go out), full host work queue, teardown with a pending send-available.
 - **Reset**: real controller reset inside `bt_ctrl`, then synthesized CC; same path on re-enable.
@@ -194,9 +196,14 @@ Acceptance budget per mode: minimum free heap under traffic ≥ 8 KB and largest
   store and silently falls back to an empty config). Test: cold boot with an existing bond reconnects without pairing; `nvs_commit()` posts an asynchronous flush to the app (atomic exFAT staged replace, CRC).
   No SD → RAM-only bonds for the session. Link keys never logged. Trust model documented: keys on MSC-visible media are
   readable/replaceable by anyone with physical access; CRC only detects corruption.
-- `esp_timer`/`osi_alarm` → FreeRTOS timers + `us_timer_now()`. Patch (documented) so timer callbacks that post to
-  threads use a bounded timeout and count failures instead of `OSI_THREAD_MAX_TIMEOUT`; timer daemon stack watermark
-  measured under A2DP load.
+- `esp_timer`/`osi_alarm` → FreeRTOS timers + `us_timer_now()`. The timer daemon must never block, but an alarm
+  expiry must never be lost (e.g. `hci_layer.c`'s command-response timeout is a one-shot whose only invocation is that
+  post). Documented patch in `osi/alarm.c`: the daemon callback posts with timeout 0; on a full target queue it marks
+  the alarm `expiry_pending` and re-arms a short retry (5 ms) instead of dropping; the pending flag is cleared only when
+  the post succeeds, and `alarm_cancel`/`alarm_free` clear it (so the handler runs **exactly once**, or not at all if
+  cancelled). Retry count is telemetry. Test: fill the BTC queue at expiry, drain it, verify `command_timed_out` (and an
+  A2DP media tick) runs exactly once; cancel while pending → never runs. Timer daemon stack watermark measured under
+  A2DP load.
 - `esp_log` → `openfw_log` with redaction; `esp_ringbuf` stress-tested on host, stream-buffer fallback by patch.
 
 ### M3 — Host harness
@@ -294,7 +301,7 @@ telemetry: heap/stack watermarks, largest free block, IRQ-26 latency and multipl
 
 ## 9. Open questions for reviewers (round 3)
 
-1. Do the v5 changes resolve the round-3 blockers (unified TX ring, RX dispatcher ordering, store load before init)?
+1. Does the v6 alarm change resolve the round-4 blocker (lost one-shot expiry)?
 2. Any remaining blocker to starting steps 1–3?
 
 ## 10. Live log
@@ -304,7 +311,8 @@ telemetry: heap/stack watermarks, largest free block, IRQ-26 latency and multipl
   Plan v3 written. Round 2: agy APPROVE_WITH_CHANGES, Codex CHANGES_REQUIRED (4 items). Plan v4 written.
   Step-1 RTOS hygiene committed (`1d3e5db`: priorities, `OPENFW_TASK_WAIT()`, SysTick in port hook, `.rtos_static`,
   T_REAP; QEMU 11/11; default image byte-identical). Round 3: agy APPROVE_WITH_CHANGES, Codex CHANGES_REQUIRED
-  (3 precise items). Plan v5 written.
+  (3 precise items). Plan v5 written. Round 4: agy APPROVE, Codex CHANGES_REQUIRED (1 item: lost alarm expiry).
+  Plan v6 written.
 
 ## 11. Round-1 traceability
 
@@ -337,3 +345,6 @@ telemetry: heap/stack watermarks, largest free block, IRQ-26 latency and multipl
 | Codex N2 (events stall behind deferred ACL) | RX dispatcher order: events first, credit check before fragment mutation, kick on credit return |
 | Codex N3 (bonds read at `esp_bluedroid_init`) | cache loaded before init; cold-boot bond test |
 | agy NB (0C33 call site; header comment) | `controller.c` patch with 1021 B constant; comment fixed in `1d3e5db` |
+| **Round 4** | |
+| Codex N1 (bounded alarm post loses one-shot expiry) | `expiry_pending` + retry re-arm, exactly-once, cancel clears; test |
+| agy NB (TX head-of-line; 1005 advertisement) | command-before-blocked-ACL drain; 1005 ≤ immediately drainable |
