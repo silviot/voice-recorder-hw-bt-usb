@@ -1,9 +1,9 @@
-# Bluetooth Classic for open_fw — Integration Plan (v11, for joint review)
+# Bluetooth Classic for open_fw — Integration Plan (v12, for joint review)
 
 Branch `feat/freertos-bluedroid` (worktree `../voice-recorder-hw-bt-usb-bt`). Hardware: Smartlink SL6801 `HW_76`
 (dual Cortex-M4F @ 96 MHz, 512 KB SRAM, 2 MB SPI NOR XIP, **BR/EDR-only** RivieraWaves `RW-BT` controller in mask ROM,
 no BLE). This document is the single source of truth: it is reviewed by Codex and agy until both agree, then executed.
-v3–v11 address rounds 1–9 (§11 traceability).
+v3–v12 address rounds 1–10 (§11 traceability).
 
 ## 0. Goals, non-goals
 
@@ -37,7 +37,8 @@ Nothing has run on silicon yet. Legacy BT host code has never shipped to users.
 
 - **D1 Host stack = Bluedroid.** Rejected: BTstack (licence), Zephyr host, NimBLE (BLE only), hand-rolled host.
 - **D2 FreeRTOS confined to CPU0**; CPU1 (LVGL worker) stays bare-metal. DMA audio/USB/SDIO stay ISR/poll driven.
-- **D3 HCI boundary = `esp_bluedroid_attach_hci_driver()`** (H4 framed); `hci_layer.c`/`hci_hal_h4.c` stay pristine.
+- **D3 HCI boundary = `esp_bluedroid_attach_hci_driver()`** (H4 framed); no custom HAL. `hci_layer.c`,
+  `hci_hal_h4.c`, `fixed_queue.c` and `osi/alarm.c` receive only the small documented patches listed in M1/M2 (D6).
 - **D4 libc = picolibc** (pinned) + 6 compiler-rt builtins; `startup.c`'s `__aeabi_mem*`/64-bit division authoritative.
 - **D5 Legacy path stays default** until parity: flag `OPENFW_BT_BLUEDROID=1` (implies `RTOS=1`).
 - **D6 Upstream pristine**: every change is a documented patch file.
@@ -165,7 +166,8 @@ Acceptance budget per mode: minimum free heap under traffic ≥ 8 KB and largest
   after a slot was taken, leaking the copy and dropping the packet (a lost Command Complete stalls command dispatch).
   Documented patch: the copy allocation fails soft, an enqueue failure frees the copy and restores the slot
   (`fixed_queue.c`), and the callback returns failure to the driver. `bt_dlv` keeps ownership of the ring entry on
-  failure and retries with a 1-tick backoff; after N consecutive failures it starts a controlled stack restart (M1
+  failure and retries with a 1-tick backoff; after N consecutive failures it posts a **BT fault** to the app task (never tears down from
+  `bt_dlv`, which must keep delivering disable-path events) — see "Recovery ladder" below (M1
   teardown), never a silent drop. Per-mode heap budgets reserve `window × (len + header)` for these copies.
   **General rule (steps 2–3)**: every allocation on the HCI/OSI/BTC paths that Bluedroid uses must either propagate
   failure or be covered by a documented patch; enforced by an **allocation-failure sweep** in the host harness that
@@ -186,6 +188,16 @@ Acceptance budget per mode: minimum free heap under traffic ≥ 8 KB and largest
 - **Disable/teardown order**: Bluedroid disable + profile close completions run with transport alive → callbacks
   quiesced (session id bumped, late callbacks rejected) → admission closed → controller stopped, reset completion
   checked (status reported, not ignored) → IRQ 26 masked → rings freed → tasks deleted (idle reaps).
+- **Recovery ladder (bounded, works under persistent allocation failure)**: the app task handles a BT fault (RX
+  delivery failures, ring overflow, command timeout storm, `bt_ctrl` invariant violation): (1) graceful
+  `esp_bluedroid_disable()` + teardown with a 2 s deadline; (2) if that returns an error (e.g. `ESP_ERR_NO_MEM`: it
+  allocates a future) or the deadline passes, a **hard path that needs no heap**: mask IRQ 26, stop the recorder
+  through its existing finalize path (static buffers only) so no recording is lost, write a fault record
+  (`AON_BACKUP`, code `0xB1` + reason), and reboot via `system_reboot()`. After a BT-fault reboot BT starts **disabled**
+  (fault record checked at boot; the UI shows "Bluetooth stopped after an error") so persistent faults cannot loop.
+  Test: hold allocation failure active from the RX failure through recovery → the hard path completes, recording file
+  is valid, the next boot has BT off.
+
 - **IRQ multiplicity**: per-source counters; bottom half loops until the status register reads clear.
 - **Local identity**: stable per-device BD_ADDR: eFuse if present; else derived deterministically (SHA-256, fixed
   domain-separation label, stable across firmware upgrades) from the SPI-NOR unique ID (`0x4B`, read from RAM code
@@ -343,7 +355,7 @@ telemetry: heap/stack watermarks, largest free block, IRQ-26 latency and multipl
 
 ## 9. Open questions for reviewers (round 3)
 
-1. Does v11 (fail-soft H4 RX with retained retry + allocation-failure sweep) resolve the round-9 item?
+1. Does the v12 recovery ladder (graceful with deadline, then heap-free hard path + BT-off reboot) resolve round 10?
 2. Any remaining blocker to starting steps 1–3?
 
 ## 10. Live log
@@ -361,7 +373,8 @@ telemetry: heap/stack watermarks, largest free block, IRQ-26 latency and multipl
   replaces FreeRTOS software timers for BT alarms with the `bt_alarm` service. Step 1 build plumbing committed
   (`fc8402e`: BT=1 links Bluedroid, `.bt_data`/`.bt_bss`, link roots, QEMU 12/12). Round 8: agy APPROVE; Codex 1 item
   (`0C35` blocked by hciT command credits). Plan v10. Round 9: agy APPROVE; Codex 1 item (H4 RX enqueue
-  failure drops packet). Plan v11 adds the fail-soft RX patch and a general allocation-failure sweep.
+  failure drops packet). Plan v11 adds the fail-soft RX patch and a general allocation-failure sweep. Round 10: agy
+  APPROVE; Codex 1 item (recovery itself allocates). Plan v12 adds the bounded recovery ladder.
 
 ## 11. Round-1 traceability
 
@@ -412,3 +425,6 @@ telemetry: heap/stack watermarks, largest free block, IRQ-26 latency and multipl
 | agy NB (sub-tick busy spin) | wait rounded up to ≥ 1 tick |
 | **Round 9** | |
 | Codex N1 (enqueue node allocation failure drops packet) | fail-soft `host_recv_pkt_cb` + slot restore; `bt_dlv` retains/retries/restarts; allocation-failure sweep over all scenarios |
+| **Round 10** | |
+| Codex N1 (recovery needs memory) | recovery ladder: graceful with deadline → heap-free hard path (finalize recording, fault record, reboot, BT off next boot); persistent-failure test |
+| agy NB (D3 wording; restart from app, not bt_dlv) | D3 lists the documented patches; BT fault posted to the app task |
