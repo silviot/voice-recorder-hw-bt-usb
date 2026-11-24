@@ -1510,16 +1510,16 @@ static void do_stop(void)
 
 uint32_t bt_ctrl_run(void)
 {
-    if (!g.inited || g.parked) {
+    if (!g.inited) {
         return 0u;
     }
     /* need_dlv is NOT cleared here: it is cleared only when wake_dlv() is actually called (end of this function), so
      * a wake withheld because the ROM lock was held is not lost. */
     if (g.state == ST_STOPPING) {
-        do_stop();
+        do_stop();                           /* gate() inside do_stop() skips all ROM calls if g.parked -> STOP_PARKED */
         return 0u;
     }
-    if (g.state != ST_OPEN) {
+    if (g.parked || g.state != ST_OPEN) {
         return 0u;
     }
     bool more = false;

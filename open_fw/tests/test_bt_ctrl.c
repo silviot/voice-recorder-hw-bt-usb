@@ -1127,7 +1127,7 @@ static void test_bt_stop_sweep(void)
         bt_ctrl_run();
         t_quiet = 0;
         if (fake_rom.stop_fired_at != k || !fake_rom.stop_call_completed || fake_rom.calls_after_stop != 0u ||
-            stats().parked != 1u || fake_rom.errors != 0u) {
+            stats().parked != 1u || bt_ctrl_shutdown_status() != BT_CTRL_STOP_PARKED || fake_rom.errors != 0u) {
             bad++;
             if (bad < 4) {
                 printf("  k=%u fired=%u completed=%u after=%u parked=%u err=%s\n", k, fake_rom.stop_fired_at,
@@ -1651,6 +1651,25 @@ static void test_0c13_rom_nul_guard(void)
     CHECK(r != NULL && fake_rom.n_cmds == c0 + 1u && fake_rom.cmds[c0].len >= 249u && fake_rom.cmds[c0].data[248] == 0u,
           "0C13 >248 B clamped before guard byte");
     shutdown_and_check();
+}
+
+/* If bt_stop latched before bt_ctrl_shutdown_begin(), bt_ctrl_run() must still run do_stop() to report
+ * BT_CTRL_STOP_PARKED and return to ST_OFF instead of stranding BT_CTRL_STOP_PENDING. */
+static void test_parked_shutdown_completes(void)
+{
+    setup();
+    bring_up();
+    t_stop = true;
+    fake_rom_raise_irq(BT_ROM_IRQ_CSCNT);
+    uint32_t c0 = fake_rom.calls;
+    (void)bt_ctrl_run();
+    CHECK(dbg().parked == 1u && fake_rom.calls == c0, "parked on bt_stop without ROM calls");
+    bt_ctrl_shutdown_begin();
+    CHECK(bt_ctrl_shutdown_status() == BT_CTRL_STOP_PENDING, "pending right after shutdown_begin");
+    (void)bt_ctrl_run();
+    CHECK(bt_ctrl_shutdown_status() == BT_CTRL_STOP_PARKED && dbg().state == 0u && fake_rom.calls == c0,
+          "do_stop completed as STOP_PARKED with 0 ROM calls (status %d, state %u)",
+          bt_ctrl_shutdown_status(), dbg().state);
 }
 
 /* Finding 10: send-available only on a full -> not-full transition. */
@@ -3019,6 +3038,7 @@ int main(void)
         { "stale_rx_acl_flush", test_stale_rx_acl_flush },
         { "unsolicited_reply_dropped", test_unsolicited_reply_dropped },
         { "0c13_rom_nul_guard", test_0c13_rom_nul_guard },
+        { "parked_shutdown_completes", test_parked_shutdown_completes },
         { "send_avail_only_when_full", test_send_avail_only_when_full },
         { "class_m_fwd_fault", test_class_m_fwd_fault },
         { "deferred_order_after_free", test_deferred_order_after_free },
