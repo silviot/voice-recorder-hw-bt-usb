@@ -1,9 +1,9 @@
-# Bluetooth Classic for open_fw — Integration Plan (v6, for joint review)
+# Bluetooth Classic for open_fw — Integration Plan (v7, for joint review)
 
 Branch `feat/freertos-bluedroid` (worktree `../voice-recorder-hw-bt-usb-bt`). Hardware: Smartlink SL6801 `HW_76`
 (dual Cortex-M4F @ 96 MHz, 512 KB SRAM, 2 MB SPI NOR XIP, **BR/EDR-only** RivieraWaves `RW-BT` controller in mask ROM,
 no BLE). This document is the single source of truth: it is reviewed by Codex and agy until both agree, then executed.
-v3 addressed round 1, v4 round 2, v5 round 3, v6 round 4 (§11 traceability).
+v3–v7 address rounds 1–5 (§11 traceability).
 
 ## 0. Goals, non-goals
 
@@ -196,14 +196,26 @@ Acceptance budget per mode: minimum free heap under traffic ≥ 8 KB and largest
   store and silently falls back to an empty config). Test: cold boot with an existing bond reconnects without pairing; `nvs_commit()` posts an asynchronous flush to the app (atomic exFAT staged replace, CRC).
   No SD → RAM-only bonds for the session. Link keys never logged. Trust model documented: keys on MSC-visible media are
   readable/replaceable by anyone with physical access; CRC only detects corruption.
-- `esp_timer`/`osi_alarm` → FreeRTOS timers + `us_timer_now()`. The timer daemon must never block, but an alarm
-  expiry must never be lost (e.g. `hci_layer.c`'s command-response timeout is a one-shot whose only invocation is that
-  post). Documented patch in `osi/alarm.c`: the daemon callback posts with timeout 0; on a full target queue it marks
-  the alarm `expiry_pending` and re-arms a short retry (5 ms) instead of dropping; the pending flag is cleared only when
-  the post succeeds, and `alarm_cancel`/`alarm_free` clear it (so the handler runs **exactly once**, or not at all if
-  cancelled). Retry count is telemetry. Test: fill the BTC queue at expiry, drain it, verify `command_timed_out` (and an
-  A2DP media tick) runs exactly once; cancel while pending → never runs. Timer daemon stack watermark measured under
-  A2DP load.
+- `esp_timer`/`osi_alarm` → FreeRTOS timers + `us_timer_now()`. Requirements: the timer daemon never blocks, an
+  expiry is never lost, a cancelled/re-armed alarm never delivers a stale expiry. Design (documented patches in
+  `osi/alarm.c`, `btc/core/btc_task.c`; no retry timers):
+  1. Each alarm has a `generation` (incremented by set, cancel and free) and a `pending` flag; both guarded by a
+     short critical section (never `alarm_mutex`, which is held around `esp_timer_stop/delete` → ABBA risk).
+  2. Daemon callback: under the critical section, if not already pending, mark pending, record `gen`, link the alarm
+     into a pending list; then try a **timeout-0** post of a single "drain alarms" message to BTC (new non-blocking
+     `btc_transfer_context` variant; at most one such message outstanding, tracked by a flag).
+  3. **Guaranteed wakeup without timers**: the BTC thread loop calls `osi_alarm_drain_pending()` after **every**
+     message it dispatches. If the timeout-0 post failed, the BTC queue was full, so BTC will dispatch at least one more
+     message and drain then; if it succeeded, the drain message does it. Pending is set before the post, so no window.
+  4. Drain: for each pending alarm, under the critical section unlink it and compare the recorded `gen` with the
+     alarm's current `generation`; mismatch (cancelled, re-armed, freed) → drop; match → invoke the callback in BTC
+     context. Cancel/free remove the alarm from the pending list and bump `generation`.
+  5. Periodic alarms (A2DP media tick) are never re-armed by this path; overlapping expiries coalesce into one pending
+     delivery (A2DP computes frames from elapsed time, so coalescing is safe); coalesce count is telemetry.
+  Tests (host, with FreeRTOS POSIX): BTC queue full at expiry → drained exactly once; both BTC queue and timer command
+  queue full → still exactly once; cancel after the drain message is queued but before BTC runs → never delivered;
+  cancel + re-arm (HCI command timeout pattern, `hci_layer.c`) → only the new expiry fires; periodic cadence preserved
+  under a slow BTC. Timer daemon stack watermark measured under A2DP load.
 - `esp_log` → `openfw_log` with redaction; `esp_ringbuf` stress-tested on host, stream-buffer fallback by patch.
 
 ### M3 — Host harness
@@ -301,7 +313,7 @@ telemetry: heap/stack watermarks, largest free block, IRQ-26 latency and multipl
 
 ## 9. Open questions for reviewers (round 3)
 
-1. Does the v6 alarm change resolve the round-4 blocker (lost one-shot expiry)?
+1. Does the v7 alarm design (pending list + generation + drain-after-every-BTC-message) resolve the round-5 items?
 2. Any remaining blocker to starting steps 1–3?
 
 ## 10. Live log
@@ -312,7 +324,8 @@ telemetry: heap/stack watermarks, largest free block, IRQ-26 latency and multipl
   Step-1 RTOS hygiene committed (`1d3e5db`: priorities, `OPENFW_TASK_WAIT()`, SysTick in port hook, `.rtos_static`,
   T_REAP; QEMU 11/11; default image byte-identical). Round 3: agy APPROVE_WITH_CHANGES, Codex CHANGES_REQUIRED
   (3 precise items). Plan v5 written. Round 4: agy APPROVE, Codex CHANGES_REQUIRED (1 item: lost alarm expiry).
-  Plan v6 written.
+  Plan v6 written. Round 5: agy APPROVE; Codex CHANGES_REQUIRED (retry wakeup not guaranteed; stale expiry after
+  cancel). Plan v7 replaces the retry-timer approach.
 
 ## 11. Round-1 traceability
 
@@ -348,3 +361,7 @@ telemetry: heap/stack watermarks, largest free block, IRQ-26 latency and multipl
 | **Round 4** | |
 | Codex N1 (bounded alarm post loses one-shot expiry) | `expiry_pending` + retry re-arm, exactly-once, cancel clears; test |
 | agy NB (TX head-of-line; 1005 advertisement) | command-before-blocked-ACL drain; 1005 ≤ immediately drainable |
+| **Round 5** | |
+| Codex N1 (retry re-arm can fail) | no retry timers: BTC drains pending alarms after every message; full queue ⇒ BTC runs again |
+| Codex N2 (stale expiry after cancel/re-arm) | per-alarm generation validated at dispatch; cancel/free unlink + bump |
+| agy NB (timeout-0 BTC post, no `alarm_mutex` in daemon, periodic alarms) | non-blocking transfer variant; critical section; periodic coalescing |
