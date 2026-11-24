@@ -22,5 +22,11 @@ typedef int esp_err_t;
 #define ESP_ERR_NVS_NOT_INITIALIZED (ESP_ERR_NVS_BASE + 0x01)
 #define ESP_ERR_NVS_NO_FREE_PAGES (ESP_ERR_NVS_BASE + 0x0d)
 #define ESP_ERR_NVS_NEW_VERSION_FOUND (ESP_ERR_NVS_BASE + 0x10)
+#define ESP_ERR_NVS_NOT_ENOUGH_SPACE (ESP_ERR_NVS_BASE + 0x05)
+#define ESP_ERR_NVS_INVALID_HANDLE (ESP_ERR_NVS_BASE + 0x07)
+#define ESP_ERR_NVS_READ_ONLY (ESP_ERR_NVS_BASE + 0x08)
+#define ESP_ERR_NVS_INVALID_NAME (ESP_ERR_NVS_BASE + 0x09)
+#define ESP_ERR_NVS_KEY_TOO_LONG (ESP_ERR_NVS_BASE + 0x0a)
+#define ESP_ERR_NVS_INVALID_LENGTH (ESP_ERR_NVS_BASE + 0x0c)
 static inline const char *esp_err_to_name(esp_err_t e) { (void)e; return "esp_err"; }
 #define ESP_ERROR_CHECK(x) do { esp_err_t _e = (x); (void)_e; } while (0)

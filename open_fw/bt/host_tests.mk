@@ -17,3 +17,5 @@ test-bt-port:
 	$(BT_PORT_TEST_DIR)/test_bt_entropy
 	$(HOST_CC) $(BT_PORT_TEST_CFLAGS) tests/test_bt_alarm.c bt_port/bt_alarm.c -o $(BT_PORT_TEST_DIR)/test_bt_alarm
 	$(BT_PORT_TEST_DIR)/test_bt_alarm
+	$(HOST_CC) $(BT_PORT_TEST_CFLAGS) tests/test_bt_store.c bt_port/bt_store.c src/crypto.c -o $(BT_PORT_TEST_DIR)/test_bt_store
+	$(BT_PORT_TEST_DIR)/test_bt_store

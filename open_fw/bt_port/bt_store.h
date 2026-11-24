@@ -1,0 +1,44 @@
+/* bt_store: the nvs_* surface Bluedroid uses (osi/config.c, bond keys), served from a RAM key-value cache that the
+ * app task owns (plan docs/BLUETOOTH_BLUEDROID_PLAN.md M2 "Store").
+ *
+ * - The app loads the cache from SD (bt_store_load) BEFORE esp_bluedroid_init(); nothing in here touches the
+ *   filesystem. nvs_commit() only marks the cache dirty and calls the platform's request_flush() (non-blocking post
+ *   to the app), which serialises it (bt_store_serialize) and writes it with the exFAT staged replace.
+ * - Serialised form: "BTS1" | u16 entry_count | entries { u8 ns_len, ns, u8 key_len, key, u16 len, data } |
+ *   8-byte SHA-256 prefix over everything before it. bt_store_load() validates every bound and the checksum and
+ *   rejects the whole image on any error (the store then starts empty: bonds are lost, never misparsed).
+ * - Capacity is fixed (no heap). Link keys are never logged.
+ * SPDX-License-Identifier: MIT */
+#ifndef BT_STORE_H
+#define BT_STORE_H
+
+#include <stddef.h>
+#include <stdint.h>
+#include "nvs.h"
+
+#define BT_STORE_DATA_MAX     4096u   /* total value bytes */
+#define BT_STORE_ENTRIES_MAX  24u
+#define BT_STORE_NS_MAX       4u      /* distinct namespaces open at once */
+#define BT_STORE_NAME_MAX     15u     /* NVS_KEY_NAME_MAX_SIZE - 1 */
+#define BT_STORE_IMAGE_MAX    (8u + BT_STORE_ENTRIES_MAX * (2u + 2u * BT_STORE_NAME_MAX + 2u) + BT_STORE_DATA_MAX + 8u)
+
+typedef struct {
+    void (*lock)(void *ctx);
+    void (*unlock)(void *ctx);
+    void (*request_flush)(void *ctx);   /* non-blocking; the app serialises + writes later */
+    void *ctx;
+} bt_store_platform_t;
+
+/* Reset to an empty store. platform may be NULL (single-threaded tests, no flush requests). */
+void bt_store_init(const bt_store_platform_t *platform);
+
+/* Replace the cache with a serialised image. Returns ESP_OK, or ESP_ERR_INVALID_CRC / ESP_ERR_INVALID_SIZE /
+ * ESP_ERR_INVALID_VERSION / ESP_ERR_INVALID_ARG; on any error the store is left empty. */
+esp_err_t bt_store_load(const uint8_t *img, size_t len);
+
+/* Serialise into buf. Returns the image length, or 0 if cap is too small. Clears the dirty flag on success. */
+size_t bt_store_serialize(uint8_t *buf, size_t cap);
+
+int bt_store_dirty(void);
+
+#endif /* BT_STORE_H */
