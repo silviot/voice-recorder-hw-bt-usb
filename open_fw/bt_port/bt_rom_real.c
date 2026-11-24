@@ -856,6 +856,22 @@ const bt_rom_if_t bt_rom_real = {
     rr_lock_depth, rr_stats,
 };
 
+/* docs/BT_ROM_HCI_MAP.md §11: TASK_LC state array (descriptor 0x008005F8 -> state 0x0080137C, ke_state_get ROM
+ * 0x309B0), LD link state bytes (ld_env 0x0080296C + 0x110, counted by ROM 0x368FC), LC env 0x00801384 stride 0x208
+ * (+0x57 read by the E458 sender ROM 0x2A31A). Byte reads only; safe while the ROM runs (a torn view is just stale). */
+#define ROM_LC_STATE   0x0080137Cu
+#define ROM_LD_LINK_ST 0x00802A7Cu
+#define ROM_LC_ENV     0x00801384u
+#define ROM_LC_STRIDE  0x208u
+void bt_rom_real_links(uint8_t lc[BT_ROM_REAL_LINKS], uint8_t ld[BT_ROM_REAL_LINKS], uint8_t rep[BT_ROM_REAL_LINKS])
+{
+    for (uint32_t i = 0u; i < BT_ROM_REAL_LINKS; i++) {
+        lc[i] = *(volatile const uint8_t *)(uintptr_t)(ROM_LC_STATE + i);
+        ld[i] = *(volatile const uint8_t *)(uintptr_t)(ROM_LD_LINK_ST + i);
+        rep[i] = *(volatile const uint8_t *)(uintptr_t)(ROM_LC_ENV + ROM_LC_STRIDE * i + 0x57u);
+    }
+}
+
 void bt_rom_real_diag(bt_rom_real_diag_t *out)
 {
     uint32_t pm = raw_irq_save();

@@ -644,6 +644,41 @@ secret of ~33 predictable bits: bench-only waiver, see the review-round entry be
   "power the codec down" must stop at what the capture added. (c) Health tests sized for H = 0.5 on 2-bit symbols
   are blind to anything but a stuck value; a source-specific plausibility check on the raw samples has to sit in
   front of the credit.
+- 2026-11-24 (silicon bench `BT=1 BENCH=1`, CRC 0x3599, laptop as phone; diagnosis + fixes host-only): after a
+  581,676-byte GETS the laptop closed RFCOMM and dropped the idle ACL (its `LMP_detach` was acknowledged), but the
+  device's host never got a Disconnection Complete; its own idle `0406` left the link DISCONNECTING, so the laptop's
+  re-pages were rejected `0x0F` (`l2c_link_hci_conn_req`); when the bench reopened the pairing window, `0C1A 03`
+  came back `0x0C` and `bt_ctrl` stopped BT (`first code 6`, class-M rule). (1) **Fault site, proven offline:** the
+  ROM's `0C1A` handler refuses page scan whenever more than one ACL link is up (`BT_ROM_HCI_MAP.md` §11; ROM
+  `0x3EAC4`), here the dead link plus the rejected re-page. The fake ROM models the rule; the phone scenario's new
+  step P20 replays the sequence and, without the fix, logs exactly the silicon line (`bt_ctrl fault, first code 6
+  site 4 a=0x00000C1A b=0x0000000C`). **Fix:** `0C1A` answered `0x0C` is passed through, counted (`scan_refused`) and
+  noted, not a BT fault (opcode table rule 7 exception); the session re-applies its scan mode when a link goes (a
+  closing window is refused too, so the device could otherwise stay discoverable). With the fix P20 recovers: the
+  ROM's supervision timeout ends the dead link, the scan mode is re-applied and accepted, the laptop reconnects.
+  (2) **Unproven:** why the ROM kept (or silently dropped) the laptop's link. Ruled out on the host: ACL in flight at
+  the detach (the ROM flushes it with a NOCP before E458, now modelled; `test_bt_ctrl detach_with_acl_in_flight`).
+  Candidates and how the next run tells them apart: `BT_ROM_HCI_MAP.md` §11. (3) **Diagnostics:** every fault raise
+  records a site + two values (`bt_ctrl.h BT_CTRL_SITE_*`), logged with the fault line; link notes (connection
+  request / complete, disconnection complete with reason, the `0406` answer ROM or local, a refused scan enable) go to
+  the session log one line each (`BT HCI ...`); `BT ROM links lc=.. ld=.. rep=..` (ROM LC/LD state per link) is logged
+  on change and at a fault. (4) **"value 0" (bench autoconfirm):** upstream BTA reports a User Confirmation Request for
+  a peer whose name is unknown after a name request, with a value it has not stored yet: the device showed the
+  previous pairing's value or 0, so a user could not compare it. Patch 0028; P17 now fails the first name request and
+  checks the logged value. Lessons: (a) a class-M write that also runs at run time (`0C1A` from every visibility
+  change) needs its ROM-defined refusals listed, or a legitimate controller answer becomes a BT stop; (b) Bluedroid
+  writes the scan mode twice per change (discoverability, connectability): expect two refusals; (c) the fake ROM's
+  name request always succeeded, which hid an upstream BTA bug for the whole phone-mode work.
+  Review round on this fix (host-only): (e) re-applying the scan mode only on a GAP link-down event left a lasting
+  wrong state when the extra ROM link was one the host never knew (a rejected re-page ends with a failed Connection
+  Complete): the session now retries every 3 s while refused, drains the refusal notes before the GAP events, and fails
+  closed (scan off `0x00`) when a closing window's write is refused after a discoverable one (`test_bt_xrec` [21];
+  P20 now ends the rejected link first, then refuses a window close: both fail without the fix). (f) The fault line
+  printed `bt_ctrl_rtos`'s per-boot first code next to this session's site: now one `bt_ctrl_fault_format()` line
+  read under one critical section, plus `bt_ctrl_stats_format()` (`unk short late unsol fwd_to late_reply late_drop
+  scan_refused notes_lost`) at a fault, at stop and in every BENCH status, for the hypothesis that `bt_ctrl` dropped an
+  E458. (g) `BT ROM links` change logging is bench-image only and keyed on LC/LD bytes. (h) §11's `0406` mapping
+  fixed: a silent ROM shows as `st=0x22 local` after 7 s, not `0x02`.
 
 ## 11. Round-1 traceability
 

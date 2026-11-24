@@ -52,6 +52,45 @@ enum {
     BT_CTRL_FAULT_INVARIANT,       /* class-M FWD nonzero status, EM TX alloc failure with credit, lock depth, table */
 };
 
+/* ---- fault sites: where the session's first fault was raised, with two key values (bt_ctrl_stats_t.fault_site,
+ * fault_a, fault_b). Logged with the "BT bt_ctrl fault" line so one silicon run pinpoints the raise. ---- */
+enum {
+    BT_CTRL_SITE_NONE = 0,
+    BT_CTRL_SITE_NOCP_TABLE,       /*  1 INVARIANT: NOCP pending table full            a = handle, b = count */
+    BT_CTRL_SITE_ACL_RX_HELD,      /*  2 INVARIANT: ACL_RX with every hold slot used   a = handle, b = length */
+    BT_CTRL_SITE_LOCK_UPCALL,      /*  3 INVARIANT: TASK_HCI upcall, ROM lock held     a = ROM msg id, b = depth */
+    BT_CTRL_SITE_CLASS_M_STATUS,   /*  4 INVARIANT: class-M command, nonzero ROM reply a = opcode, b = status */
+    BT_CTRL_SITE_CLASS_M_LOCAL,    /*  5 INVARIANT: class-M command failed locally     a = opcode, b = status */
+    BT_CTRL_SITE_EM_TX_ALLOC,      /*  6 INVARIANT: EM TX alloc failed with a credit   a = handle, b = in flight */
+    BT_CTRL_SITE_INFLIGHT_TABLE,   /*  7 INVARIANT: in-flight table full               a = handle, b = in flight */
+    BT_CTRL_SITE_C2H_TABLE,        /*  8 INVARIANT: C2H outstanding table full         a = handle, b = outstanding */
+    BT_CTRL_SITE_LOCK_RUN,         /*  9 INVARIANT: ROM lock held at the end of a run  a = 0, b = depth */
+    BT_CTRL_SITE_INIT_TABLE,       /* 10 INVARIANT: opcode/event table errors          a = error count */
+    BT_CTRL_SITE_EVT_OVERFLOW,     /* 11 EVT_OVERFLOW: event ring + defer list full    a = ROM msg id, b = deferred */
+    BT_CTRL_SITE_ROM_FAULT,        /* 12 ROM: on_fault upcall                          a = ROM fault code */
+    BT_CTRL_SITE_RESET,            /* 13 RESET: controller stop/start failed           a = HCI status */
+    BT_CTRL_SITE_DLV,              /* 14 DLV: notify_host_recv kept failing            a = consecutive failures */
+    BT_CTRL_SITE_HOST_MALFORMED,   /* 15 HOST_CONTRACT: bad H4 packet from the host    a = length, b = H4 type */
+    BT_CTRL_SITE_HOST_FULL,        /* 16 HOST_CONTRACT: send() on a full TX ring       a = length, b = H4 type */
+};
+
+/* ---- link notes: one record per link-level controller event, for the session log (bt_ctrl_note_pop) ---- */
+#define BT_CTRL_NOTES 8u
+enum {
+    BT_CTRL_NOTE_CONN = 1,         /* Connection Complete from the ROM: handle, status */
+    BT_CTRL_NOTE_DISC,             /* Disconnection Complete from the ROM: handle, status, reason */
+    BT_CTRL_NOTE_CONN_REQ,         /* Connection Request from the ROM (a peer paged us) */
+    BT_CTRL_NOTE_SCAN_REFUSED,     /* 0C1A Write Scan Enable refused by the ROM: status, reason = scan byte */
+    BT_CTRL_NOTE_DISC_CMD,         /* the host's 0406 Disconnect answered: handle, status; local = not by the ROM */
+};
+
+typedef struct {
+    uint8_t  kind, status, reason, local;
+    uint16_t handle;
+} bt_ctrl_note_t;
+
+#define BT_CTRL_NOTE_LINE 64u      /* bt_ctrl_note_format() buffer size that always fits */
+
 /* ---- lifecycle results ---- */
 #define BT_CTRL_STOP_PENDING  (-1)
 #define BT_CTRL_STOP_OK       0
@@ -107,6 +146,9 @@ typedef struct {
     uint32_t resets, reset_failures, rf_cal_last, rom_faults, late_upcalls, lock_violations, invariant, faults;
     uint32_t stop_faults;           /* ROM faults raised on the teardown path (reported as BT_CTRL_STOP_ERR) */
     uint32_t first_fault, parked;
+    uint32_t fault_site, fault_a, fault_b;   /* BT_CTRL_SITE_* and key values of first_fault (this session) */
+    uint32_t scan_refused;          /* 0C1A answered 0x0C by the ROM (> 1 ACL link): passed through, no fault */
+    uint32_t notes_lost;            /* link notes dropped because nobody drained the ring */
 } bt_ctrl_stats_t;
 
 typedef struct {
@@ -145,5 +187,20 @@ int bt_ctrl_dlv_run(void);
 
 void bt_ctrl_get_stats(bt_ctrl_stats_t *out);
 void bt_ctrl_get_debug(bt_ctrl_debug_t *out);
+
+/* Oldest link note (any task; recorded by bt_ctrl context, BT_CTRL_NOTES deep, overflow counted in notes_lost).
+ * Returns 1 if one was popped. bt_ctrl_note_format() writes one log line (no newline) and returns its length. */
+int      bt_ctrl_note_pop(bt_ctrl_note_t *out);
+uint16_t bt_ctrl_note_format(const bt_ctrl_note_t *n, char *buf, uint16_t cap);
+
+/* Session log lines (no newline; return the length; truncated within cap). Fault: "BT bt_ctrl fault, first code N
+ * site S a=0x........ b=0x........", this session's first fault with its site and values read together (all 0 when
+ * the session has not faulted). Stats: the counters that tell a ROM event bt_ctrl dropped (unknown id, short) or
+ * answered late from one the ROM never sent: "BT ctrl stats unk=.. short=.. late=.. unsol=.. fwd_to=.. late_reply=..
+ * late_drop=.. scan_refused=.. notes_lost=..". */
+#define BT_CTRL_FAULT_LINE 80u
+#define BT_CTRL_STATS_LINE 192u
+uint16_t bt_ctrl_fault_format(char *buf, uint16_t cap);
+uint16_t bt_ctrl_stats_format(char *buf, uint16_t cap);
 
 #endif /* BT_CTRL_H */

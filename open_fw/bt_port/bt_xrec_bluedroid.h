@@ -46,6 +46,7 @@
 #define BT_XREC_SSP_AFTER_MS         1000u   /* ENTER/BACK within 1 s after a prompt ended are swallowed (-3), not
                                               * taken as "open a window" / "leave BT mode" (the prompt can end by
                                               * itself just before the key, and the screen lags up to 150 ms) */
+#define BT_XREC_SCAN_RETRY_MS        3000u   /* a refused scan mode (ROM 0C1A rule: > 1 ACL link) is sent again */
 #define BT_XREC_PIN_KEEP_MS          10000u  /* re-opening a window with more than this left keeps its XREC PIN */
 #define BT_XREC_PEER_NAME_MAX        24u     /* bytes incl. NUL: remote name (UTF-8, cut at a character) or address */
 
@@ -97,6 +98,10 @@ typedef struct {
     uint32_t ssp_gate_refused;   /* SSP part of a pairing window refused by the M2.3 gate (open, or deferred to READY) */
     uint8_t  ssp_burned;         /* a pairing this session accepted then failed: SSP refused until the next BT entry */
     uint32_t ssp_gate_cfm_rejects;  /* numeric comparisons rejected because the gate stopped holding (request/answer) */
+    uint32_t ctrl_notes;         /* controller link notes logged (bt_xrec_plat_ctrl_note) */
+    uint32_t scan_refused;       /* scan mode refused by the controller (more than one ACL link) */
+    uint32_t scan_reapplied;     /* scan mode re-applied after a refusal (a link went down, or BT_XREC_SCAN_RETRY_MS) */
+    uint32_t scan_failsafe;      /* scan switched off (0x00) because a write dropping discoverability was refused */
 } bt_xrec_debug_t;
 void bt_xrec_get_debug(bt_xrec_debug_t *out);
 
@@ -187,5 +192,11 @@ uint32_t bt_xrec_plat_poll(void);            /* bond-store flush when requested;
 void     bt_xrec_plat_session_end(void);     /* final bond-store flush; release the volume */
 void     bt_xrec_plat_reboot(uint8_t mode);  /* 1 reboot, 2 SD OTA, 3 USB DFU (legacy F:2138-2147) */
 uint32_t bt_xrec_plat_irq_count(void);
+/* App task: the next controller link note (bt_ctrl_note_t: connection request / complete, disconnection complete,
+ * the 0406 answer, a refused scan enable) formatted as one log line into line[cap]; *arg gets its reason byte (for a
+ * refused scan enable: the refused scan value). Returns its kind (BT_XREC_NOTE_*), 0 when there is none. */
+#define BT_XREC_NOTE_SCAN_REFUSED 4u        /* == BT_CTRL_NOTE_SCAN_REFUSED */
+#define BT_XREC_NOTE_LINE         64u       /* == BT_CTRL_NOTE_LINE */
+int      bt_xrec_plat_ctrl_note(char *line, uint16_t cap, uint8_t *arg);
 
 #endif /* BT_XREC_BLUEDROID_H */

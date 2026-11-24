@@ -318,3 +318,50 @@ zero-padded to the stock size (§1.1), so no command needed a repacking step.
   (`tests/fake_rom.h` `fake_peer_*`) plays both so host tests cover both.
 - Bluedroid's 8 s command timeout is a stack restart, not a retry: any ROM behaviour that delays an initial reply that
   long (SAVED commands, silent consumption) costs the whole session. `bt_ctrl` answers class-O commands at 7 s.
+
+## 11. Link end and the scan-enable rule (2026-11-24, after the silicon bench fault)
+
+Static disassembly, like the rest of this file; addresses are ROM offsets. Read to explain a bench run in which the
+laptop dropped an idle ACL link (`LMP_detach`, acknowledged: its own Disconnection Complete came 150 ms later) but the
+device's host never received a Disconnection Complete; 20 s later `bt_ctrl` stopped BT on a refused `0C1A`.
+
+| Fact | Where | Conf. |
+|---|---|---|
+| **`0C1A` refuses page scan with more than one ACL link.** Handler `E02C` → `0x3EAC4`: `n` = LD links with state byte 1 (`0x368FC`: `ld_env 0x0080296C + 0x110 + i`, i = 0..6). Value 0 or 1: CC 0. Value 2 or 3: `n > 1` → CC `0x0C`, else CC 0. Value > 3: `0x12`. So with two phones up, or one live link plus one the ROM has not finished tearing down, the host cannot make the device discoverable/connectable **or** connectable-only (window close). | `0x3EAC4`, `0x368FC` | exact |
+| `0406` (`E400`, `0x20000`): LC state 0 → **no reply** (silent); state `0x20` or `0x24..0x26` (detach in progress) → CS `0x0C`; otherwise stores the reason (LC env `+0x40`), sets `+0x1E8` (host-requested: the final reason becomes `0x16`), starts the LMP detach (`E4F9` to itself) and CS 0 | `0x20000..0x200AE` | exact |
+| Link-end finalisation `0x2A8B4` (called from `0x21B94`, inferred to be the received-`LMP_detach` path, and from `0x2248C`): reason `0x08` (supervision timeout) ends the link at once (`0x2A300`). Otherwise `0x302B8` flushes the link's TX: every queued TX descriptor (`0x3D968` pop) and two per-link buffer pointers (`0x008030D8 + 0x48 + 4·link`, `+ 0x6C + 4·link`; inferred: the buffers in the exchange memory) are freed through `0x305EC` and counted; the count is reported as **one `E462` NOCP `{1, h, count}`** (`0x29F5E`, src LC) **before** the Disconnection Complete; then `0x3D1C4` (LD stop): 0 → LC state `0x25` (wait for the LD, re-run on `E487`), else end now | `0x2A8B4..0x2A942`, `0x302B8`, `0x29F5E` | exact (flow); inferred (meaning of `0x3D1C4`) |
+| `E458` sender `0x29FF8 (dst, status, h, reason)` has one caller, `0x2A300`: it sends `E458` **only if LC env `+0x57` != 0**; `+0x55` == 0 sends `E0D2` (failed Connection Complete) instead. Reason: `0x08` stays `0x08`; otherwise `+0x1E8` ? `0x16` : the caller's reason. A link whose `+0x57` is 0 at its end disappears **without any event to the host** | `0x2A300..0x2A34A`, `0x2A3F8` | exact (flow); inferred (what `+0x57`/`+0x55` mean) |
+| LC env base `0x00801384`, stride `0x208` per link; TASK_LC state bytes at `0x0080137C + link` (`ke_state_get` `0x309B0`) | literals `0x200B0`, `0x2A42C` | exact |
+
+**Not resolved statically:** why the ROM did not end the laptop's link after an acknowledged `LMP_detach` (an
+earlier idle detach in the same run worked; this one came 2 s after a 581,676-byte device → laptop transfer). The ROM
+accepted the laptop's next page (the host rejected it `0x0F`, Bluedroid `l2c_link_hci_conn_req` with its link
+DISCONNECTING), so LM did not block a second link to the same address. Candidates:
+
+| # | Hypothesis | Next run shows |
+|---|---|---|
+| H1 | The ROM kept the link: LC stayed in `0x25` (LD stop never completed) or never left state 5 (`LMP_detach` not processed) | `BT ROM links`: `lc` ≠ 0 and `ld` = 01 for link 0 until the supervision timeout; then `BT HCI disconnection complete h=0x0080 ... reason=0x08` about 20 s after the peer's detach. The host's `0406`: `st=0x0C rom` (detach states) or `st=0x00 rom` (state 5) |
+| H2 | The link ended with LC env `+0x57` = 0: no event to the host | `lc` = 00, `ld` = 00 (check `rep`), no `disconnection complete` note. The host's `0406` (it goes to the LC only while the HCI link byte `0x00804128 + 7·link` is 1, `conhdl_to_task`): byte cleared → `st=0x02 local` **without** an earlier `disconnection complete` note; byte still set → LC state 0 is silent, so `bt_ctrl` answers at its 7 s forwarded-command deadline: `st=0x22 local`, `fwd_to` +1 in `BT ctrl stats`, and the host's next command (the `040A` reject of a re-page) waits behind it |
+| H2b | The ROM sent `E458` (or `E0D2`, the `+0x55` = 0 path) but `bt_ctrl` dropped it before packing (no note is made then) | `BT ctrl stats` (at a fault, at stop, and in the BENCH status line): `unk` or `short` > 0, or `late` > 0 (an upcall from a stopped session) |
+| H3 | ACL still queued or in flight at the detach | Ruled out for `bt_ctrl` on the host (`test_bt_ctrl detach_with_acl_in_flight`); if the ROM did not free its TX buffers the next send faults at site 6 (EM TX alloc) |
+
+How the `0406` answer maps: `st=0x00 rom` / `st=0x0C rom` = the ROM's CS; `st=0x02 local` = `bt_ctrl` refused it
+before the ROM (dead handle after a seen `disconnection complete`, or `conhdl_to_task` invalid) or the link's
+Disconnection Complete came while it was pending (orphan); `st=0x22 local` = the ROM never answered (7 s deadline).
+In the silicon trace the laptop's first re-page got its `0x0F` reject at once (21:34:29.1), and `bt_ctrl` forwards one
+command at a time, so that run's `0406` was most likely answered promptly: against the silent-LC variant of H2.
+
+`BT ROM links lc=.. ld=.. rep=..` (`bt_rom_real_links()`, byte meanings inferred) is logged at a fault in every BT
+image, and in the bench image also whenever an LC or LD byte changes. The fake ROM models the flush + NOCP-before-E458
+order (`fake_rom.c peer_flush_air`), the `0C1A` rule (and the accepted scan value, `fake_rom.scan_enable`) and a
+rejected re-page whose link stays counted (`fake_peer_page_again`, ended by `fake_peer_ghost_end` with a failed
+Connection Complete and no Disconnection Complete); `bt_ctrl` handles all of them (`test_bt_ctrl
+detach_with_acl_in_flight`, `scan_refused_two_links`; `test_bt_host phone` P20).
+
+**The session's side of the `0C1A` rule** (`bt_xrec_bluedroid.c apply_scan_mode`): a refusal is retried every
+`BT_XREC_SCAN_RETRY_MS` (3 s) while refused, at once when a GAP link goes or when the wanted mode changes. The retry
+timer is what recovers when the extra ROM link is one the host never knew (a rejected re-page ends with a failed
+Connection Complete, not a link-down event). Refusal notes are drained before the GAP events of each poll. A refused
+write without inquiry scan after a discoverable one was sent means the ROM may still be at `0x03` after the window
+closed: the session fails closed with scan off (`0x00`, never refused; log `BT XREC scan mode refused while
+discoverable: scan off until it can be applied`) and retries the connectable mode on the timer.

@@ -1764,7 +1764,13 @@ int bth_phone_scenario(const char *img_path)
         PCHECK(S().d.ssp_window, "window closed before D");
         fake_peer_cfg_t d;
         peer_cfg(&d, 0xD4u, 0x01u, 0x05u, 0x05u, "laptop-D");
+        /* silicon bench 2026-11-24: the peer's name was not known when its User Confirmation Request came, so BTA
+         * fetched it first (bta_dm_sp_cback -> bta_dm_pinname_cback) and reported a stale value ("value 0" logged
+         * while the laptop showed 230749; patch 0028) */
         peer_attach(&d, NULL);
+        bth_rom_lock();
+        fake_peer.name_fail_n = 1u;                  /* the name request of the link set-up fails */
+        bth_rom_unlock();
         bthx_snap_t s0 = S();
         if (!peer_page_and_connect()) {
             goto out;
@@ -1774,6 +1780,11 @@ int bth_phone_scenario(const char *img_path)
         PCHECK(paired && fake_peer.host_confirms == 1u && fake_peer.host_rejects == 0u, "D not paired by the bench "
                "override (pairings %u confirms %u rejects %u)", fake_peer.pairings, fake_peer.host_confirms,
                fake_peer.host_rejects);
+        PCHECK(fake_peer.name_fail_n == 0u, "the link set-up name request was not made");
+        (void)WAIT(bthx_ssp_value_logged() == d.numeric % 1000000u, 2000);   /* the log line can trail the pairing */
+        PCHECK(bthx_ssp_value_logged() == d.numeric % 1000000u, "bench accept logged value %u, want the comparison "
+               "value %u (name unknown at the request)", (unsigned)bthx_ssp_value_logged(),
+               (unsigned)(d.numeric % 1000000u));
         (void)WAIT(S().d.ssp_bench_autoconfirmed != s0.d.ssp_bench_autoconfirmed, 2000);   /* snapshot can trail */
         bthx_snap_t s1 = S();
         PCHECK(s1.d.ssp_bench_autoconfirmed == s0.d.ssp_bench_autoconfirmed + 1u &&
@@ -1948,7 +1959,153 @@ int bth_phone_scenario(const char *img_path)
     }
 
     /* ---- 20 ---- */
-    bth_log("[P20] bt_xrec_stop\n");
+    /* Silicon bench 2026-11-24 (docs/BLUETOOTH_BLUEDROID_PLAN.md live log): after a long GETS the laptop closed RFCOMM
+     * and dropped the ACL, but the ROM never reported the detach (no Disconnection Complete for 20 s); the host's own
+     * idle disconnect left its link DISCONNECTING, so the laptop's next pages were rejected 0x0F; then the bench
+     * reopened the pairing window and the ROM refused 0C1A 03 (more than one ACL link: ROM 0x3EAC4) -> class-M
+     * INVARIANT -> BT stopped. Why the ROM kept the first link is not modelled (unknown); everything after it is. */
+    bth_log("[P20] ROM keeps a dead link after a long GETS; re-page rejected 0x0F; the pairing window reopens with two "
+            "ROM links (0C1A refused): no BT fault; retried on a timer when the rejected link ends first; a refused window "
+            "close fails closed (scan off); re-applied when the dead link goes, D reconnects\n");
+    {
+        rom_cmds_clear();
+        bthx_call(BTHX_OPEN_PAIRING, 1u, 2000u);                 /* close P19's window (deadline passed at once) */
+        PCHECK(WAIT(!S().d.window_open && S().d.scan_applied == 1u, 2000), "window not closed (open %u scan %u)",
+               S().d.window_open, S().d.scan_applied);
+        fake_peer_cfg_t d;
+        peer_cfg(&d, 0xD4u, 0x01u, 0x05u, 0x05u, "laptop-D");
+        peer_attach(&d, dkey);
+        if (!peer_page_and_connect()) {
+            goto out;
+        }
+        peer_authenticate();
+        PCHECK(WAIT(fake_peer.authenticated && fake_peer.encrypted, 3000), "D authentication with its stored key");
+        if (!step_rfcomm_open()) {
+            goto out;
+        }
+        static const uint8_t xkey2[32] = { 0xA5, 0x5A, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 31, 30, 29, 28,
+                                           27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10 };
+        PCHECK(xrec_auth_chal(xkey2), "CHAL/AUTH (D)");
+        PCHECK(gets_verify("BIG0002.WAV", 2u, 0u, 300000u, 640u, -1, NULL), "long GETS (300000 B)");
+        bthx_snap_t s0 = S();
+        uint32_t fl0 = bth_ctrl_faults();
+        /* the laptop closes RFCOMM, then drops the link; the ROM never reports that detach (modelled: nothing), and
+         * the device's own idle disconnect is accepted (CS 0) but never completes either */
+        bth_rom_lock();
+        fake_peer.defer_detach = true;
+        bth_rom_unlock();
+        l2_disconnect(&P.rfc);
+        PCHECK(WAIT(!S().d.conn_open, 3000), "SPP still open after the laptop closed its L2CAP channel");
+        PCHECK(WAIT(fake_peer.detach_deferred >= 1u, 10000), "the device never sent its idle disconnect (0406)");
+        PCHECK(S().d.acl_links == 1u, "session sees the link go (acl_links %u) without a Disconnection Complete",
+               S().d.acl_links);
+        /* the laptop pages again: rejected 0x0F (Bluedroid: link still DISCONNECTING, l2c_link_hci_conn_req) */
+        bth_rom_lock();
+        int pr = fake_peer_page_again(1u);
+        bth_rom_unlock();
+        bth_ctrl_kick();
+        PCHECK(pr == 0 && WAIT(fake_peer.ghost_rejects == 1u, 3000), "second page not answered (rejects %u)",
+               fake_peer.ghost_rejects);
+        PCHECK(fake_peer.ghost_reject_reason == 0x0Fu, "second page rejected with 0x%02X, want 0x0F (silicon)",
+               fake_peer.ghost_reject_reason);
+        /* the bench reopens the pairing window: 0C1A 03 with two ROM links */
+        uint32_t refused0 = fake_rom.scan_refused;
+        bthx_call(BTHX_OPEN_PAIRING, 60000u, 2000u);
+        /* BTA writes the scan mode twice (BTM_SetDiscoverability, BTM_SetConnectability): both refused */
+        PCHECK(WAIT(fake_rom.scan_refused >= refused0 + 1u, 2000), "0C1A 03 not refused by the ROM rule (%u)",
+               fake_rom.scan_refused - refused0);
+        vTaskDelay(pdMS_TO_TICKS(300));
+        uint32_t refused1 = fake_rom.scan_refused;
+        bthx_snap_t s1 = S();
+        PCHECK(bth_ctrl_faults() == fl0 && s1.d.state == BT_XREC_ST_READY, "BT fault on the refused 0C1A (faults %u, "
+               "state %u, last fault %u)", bth_ctrl_faults() - fl0, s1.d.state, s1.d.last_fault);
+        PCHECK(s1.d.scan_refused == s0.d.scan_refused + (refused1 - refused0) && s1.d.ctrl_notes > s0.d.ctrl_notes,
+               "refusal not seen "
+               "by the session (refused %u notes %u)", s1.d.scan_refused - s0.d.scan_refused,
+               s1.d.ctrl_notes - s0.d.ctrl_notes);
+        if (p_fail) {
+            goto out;
+        }
+        PCHECK(fake_rom.scan_enable == 0x02u, "ROM scan value 0x%02X after the refusal, want 0x02 (kept)",
+               fake_rom.scan_enable);
+        /* (review) the rejected re-page ends first: a failed Connection Complete, no GAP link-down event for the
+         * session. The refused window mode is sent again on the retry timer and is accepted (one ROM link left). */
+        bth_rom_lock();
+        fake_peer_ghost_end(0x0Fu);
+        bth_rom_unlock();
+        bth_ctrl_kick();
+        PCHECK(WAIT(fake_rom.scan_enable == 0x03u, BT_XREC_SCAN_RETRY_MS + 3000u), "window never discoverable after "
+               "the rejected link ended (ROM scan 0x%02X, reapplied %u)", fake_rom.scan_enable,
+               S().d.scan_reapplied - s0.d.scan_reapplied);
+        PCHECK(WAIT(S().d.acl_links == 1u && S().d.scan_reapplied >= s0.d.scan_reapplied + 1u, 1000), "retry without a link-down "
+               "event (acl %u reapplied %u)", S().d.acl_links, S().d.scan_reapplied - s0.d.scan_reapplied);
+        if (p_fail) {
+            goto out;
+        }
+        /* (review) the laptop pages again (rejected 0x0F, counted), then the window closes: both 0C1A 02 writes are
+         * refused while the ROM is at 0x03. The session fails closed: scan off (0x00), not discoverable. */
+        bth_rom_lock();
+        pr = fake_peer_page_again(1u);
+        bth_rom_unlock();
+        bth_ctrl_kick();
+        PCHECK(pr == 0 && WAIT(fake_peer.ghost_rejects == 2u, 3000), "third page not answered (rejects %u)",
+               fake_peer.ghost_rejects);
+        bthx_snap_t s2 = S();
+        uint32_t refused2 = fake_rom.scan_refused;
+        bthx_call(BTHX_OPEN_PAIRING, 1u, 2000u);         /* window closes (deadline passed at once) */
+        PCHECK(WAIT(fake_rom.scan_refused >= refused2 + 1u, 2000), "0C1A 02 not refused (%u)",
+               fake_rom.scan_refused - refused2);
+        PCHECK(WAIT(fake_rom.scan_enable == 0x00u && S().d.scan_failsafe == s2.d.scan_failsafe + 1u, 2000),
+               "device left discoverable after the window closed (ROM scan 0x%02X, failsafe %u)",
+               fake_rom.scan_enable, S().d.scan_failsafe - s2.d.scan_failsafe);
+        PCHECK(!S().d.window_open && !S().d.scan_disc && bth_ctrl_faults() == fl0, "state after the fail-safe");
+        if (p_fail) {
+            goto out;
+        }
+        /* the ROM's supervision timeout ends the dead link (Disconnection Complete 0x08): the session re-applies its
+         * scan mode at once, now accepted (one ROM link: the rejected one) */
+        rom_cmds_clear();
+        uint32_t refused3 = fake_rom.scan_refused;
+        uint32_t ra3 = S().d.scan_reapplied;
+        bth_rom_lock();
+        fake_peer.defer_detach = false;
+        fake_peer_disconnect(0x08u);
+        bth_rom_unlock();
+        bth_ctrl_kick();
+        PCHECK(WAIT(S().d.acl_links == 0u && S().d.scan_reapplied >= ra3 + 1u, 3000),
+               "scan mode not re-applied after the link went (acl %u reapplied %u)", S().d.acl_links,
+               S().d.scan_reapplied - ra3);
+        int found2 = 0;
+        PCHECK(WAIT(fake_rom.scan_enable == 0x02u && rom_cmd_last_byte0(0xE02Cu, &found2) == 0x02u && found2, 2000),
+               "re-applied 0C1A 02 not accepted (ROM scan 0x%02X, refused %u more)", fake_rom.scan_enable,
+               fake_rom.scan_refused - refused3);
+        bth_rom_lock();
+        fake_peer_ghost_end(0x0Fu);                       /* the second rejected link's completion, late */
+        bth_rom_unlock();
+        bth_ctrl_kick();
+        vTaskDelay(pdMS_TO_TICKS(200));
+        PCHECK(bth_ctrl_faults() == fl0 && S().d.state == BT_XREC_ST_READY, "fault after the late completions");
+        PCHECK(fake_rom.scan_enable == 0x02u, "ROM scan 0x%02X at the end, want 0x02", fake_rom.scan_enable);
+        /* D pages again: accepted, reconnects with its key, XREC works */
+        peer_attach(&d, dkey);
+        if (!peer_page_and_connect()) {
+            goto out;
+        }
+        peer_authenticate();
+        PCHECK(WAIT(fake_peer.authenticated && fake_peer.encrypted, 3000), "D re-authentication");
+        if (!step_rfcomm_open()) {
+            goto out;
+        }
+        PCHECK(x_send("+XREC:PING\r") && x_line(line, sizeof(line), 3000u), "PING after the recovery");
+        peer_drop(0x13u);
+        PCHECK(WAIT(!S().d.conn_open && S().d.acl_links == 0u, 3000), "D link not down");
+    }
+    if (p_fail) {
+        goto out;
+    }
+
+    /* ---- 21 ---- */
+    bth_log("[P21] bt_xrec_stop\n");
     stop_session(&base, "final stop");
     {
         static uint8_t img[BT_STORE_IMAGE_MAX];

@@ -67,6 +67,12 @@ static inline int bt_rom_real_msg_fits(uint32_t heap_used, uint32_t largest_payl
 }
 
 void bt_rom_real_diag(bt_rom_real_diag_t *out);
+
+/* ROM link state per link 0..6 (read-only, ROM RAM; static analysis, docs/BT_ROM_HCI_MAP.md §11): lc = TASK_LC state
+ * (0 idle, 5 connected, 0x20/0x24..0x26 detach in progress), ld = LD link state (1 = counted as an ACL link by the
+ * 0C1A rule), rep = LC env +0x57 (the link was reported to the host; the E458 sender skips the event when it is 0). */
+#define BT_ROM_REAL_LINKS 7u
+void bt_rom_real_links(uint8_t lc[BT_ROM_REAL_LINKS], uint8_t ld[BT_ROM_REAL_LINKS], uint8_t rep[BT_ROM_REAL_LINKS]);
 /* Reset the *_max_us fields (window measurements). */
 void bt_rom_real_diag_reset_max(void);
 /* 1 while bt_rom_real owns or may have left RW-BT in an unknown state: from the first rf_calibrate()/start() until a

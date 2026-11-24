@@ -92,6 +92,13 @@ static struct {
     uint8_t  ssp_deferred;             /* window opened before READY: the M2.3 gate is evaluated once READY */
     uint32_t window_deadline;
     uint8_t  scan_disc, scan_applied;      /* scan_applied: 0 none, 1 connectable, 2 connectable+discoverable */
+    uint8_t  scan_refused;                 /* the controller refused a scan mode write (> 1 ACL link, ROM 0C1A
+                                              rule, docs/BT_ROM_HCI_MAP.md §11): sent again at scan_retry_at, at
+                                              once when a link goes or when the wanted mode changes */
+    uint8_t  scan_failsafe;                /* a refused write dropped discoverability: scan off (0x00) first */
+    uint8_t  scan_disc_sent;               /* a discoverable mode was sent since the last fail-safe write */
+    uint8_t  scan_want_sent;               /* the mode last sent (1 / 2); scan_applied is cleared by a fail-safe */
+    uint32_t scan_retry_at;
     uint8_t  ssp_showing;
     char     ssp_digits[8];
     uint32_t ssp_deadline;
@@ -869,6 +876,9 @@ static void on_gap_event(const ev_t *e)
         if (s.acl_links > 0u) {
             s.acl_links--;
         }
+        if (s.scan_refused) {
+            s.scan_retry_at = bt_xrec_plat_now_ms();   /* apply_scan_mode() sends the wanted mode again this poll */
+        }
         if (slot_is(&s.acl_peer, e->bda)) {
             s.acl_peer.valid = 0u;
         }
@@ -1141,12 +1151,61 @@ static void config_begin(void)
     }
 }
 
+/* Controller link notes into the session log, one line each (bounded per poll; bt_ctrl counts what overflows).
+ * Drained before the GAP events of the poll: a refusal is always noted (bt_ctrl context) before the host can see a
+ * later link drop, so the drop finds scan_refused set. The retry timer covers a link that ends without any GAP event
+ * (a rejected re-page the ROM still counted) and a note that reached the ring only after the drain. */
+static void ctrl_notes_drain(void)
+{
+    char line[BT_XREC_NOTE_LINE];
+    for (int i = 0; i < 8; i++) {
+        uint8_t arg = 0u;
+        int kind = bt_xrec_plat_ctrl_note(line, sizeof(line), &arg);
+        if (kind == 0) {
+            return;
+        }
+        s.d.ctrl_notes++;
+        bt_xrec_plat_log(line);
+        if (kind == (int)BT_XREC_NOTE_SCAN_REFUSED) {
+            s.d.scan_refused++;
+            s.scan_refused = 1u;
+            s.scan_retry_at = bt_xrec_plat_now_ms() + BT_XREC_SCAN_RETRY_MS;
+            if ((arg & 0x01u) == 0u && s.scan_disc_sent) {
+                /* a write without inquiry scan refused after a discoverable one was sent: the ROM may still be at
+                 * 0x03 (discoverable after the window closed). Fail closed: scan off, which it always accepts. */
+                s.scan_failsafe = 1u;
+            }
+        }
+    }
+}
+
 static void apply_scan_mode(void)
 {
     if (s.state != BT_XREC_ST_READY) {
         return;
     }
+    if (s.scan_failsafe) {
+        /* BTA writes 0C1A twice (discoverability, then connectability): the last one is 0x00 */
+        esp_err_t r = esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
+        if (r != ESP_OK) {
+            bt_xrec_plat_log_u32("BT XREC set_scan_mode off failed (retrying)", (uint32_t)r);
+            return;
+        }
+        s.scan_failsafe = 0u;
+        s.scan_disc_sent = 0u;
+        s.scan_applied = 0u;
+        s.d.scan_failsafe++;
+        bt_xrec_plat_log("BT XREC scan mode refused while discoverable: scan off until it can be applied");
+    }
     uint8_t want = s.ssp_window ? 2u : 1u;
+    if (s.scan_refused) {
+        if (want == s.scan_want_sent && !time_reached(bt_xrec_plat_now_ms(), s.scan_retry_at)) {
+            return;                        /* bounded: one retry per BT_XREC_SCAN_RETRY_MS while refused */
+        }
+        s.scan_refused = 0u;
+        s.scan_applied = 0u;
+        s.d.scan_reapplied++;
+    }
     if (want == s.scan_applied) {
         return;
     }
@@ -1154,6 +1213,10 @@ static void apply_scan_mode(void)
                                            want == 2u ? ESP_BT_GENERAL_DISCOVERABLE : ESP_BT_NON_DISCOVERABLE);
     if (r == ESP_OK) {
         s.scan_applied = want;
+        s.scan_want_sent = want;
+        if (want == 2u) {
+            s.scan_disc_sent = 1u;
+        }
     } else {
         bt_xrec_plat_log_u32("BT XREC set_scan_mode failed (retrying)", (uint32_t)r);
     }
@@ -1234,6 +1297,7 @@ int bt_shutdown(void)
     }
     s.spp_inited = 0u;
     s.scan_applied = 0u;
+    s.scan_refused = s.scan_failsafe = s.scan_disc_sent = s.scan_want_sent = 0u;
     s.acl_links = 0u;
     s.cfm_ok.valid = s.auth_ok.valid = s.reject.valid = s.acl_peer.valid = s.name_asked.valid = 0u;
     free_session();
@@ -1406,6 +1470,7 @@ void bt_xrec_poll(void)
         }
     }
 
+    ctrl_notes_drain();                         /* before the GAP events: see ctrl_notes_drain() */
     drain_events();
     if (s.state != BT_XREC_ST_CONFIG && s.state != BT_XREC_ST_READY) {
         return;
@@ -1477,6 +1542,7 @@ void bt_xrec_poll(void)
         return;
     }
 
+    ctrl_notes_drain();
     uint32_t why = bt_xrec_plat_poll();
     if (why != 0u) {
         bt_xrec_plat_log_u32("BT platform fault", why);

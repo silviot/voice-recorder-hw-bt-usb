@@ -252,9 +252,39 @@ static void peer_addr_evt(uint16_t id, uint16_t src)                   /* {bdadd
     peer_emit(id, src, s_peer.addr, 6u);
 }
 
+static void nocp_send(const uint16_t *handles, const uint16_t *counts, uint32_t n);
+
+/* The ROM's link end (LC 0x2A8B4 -> 0x302B8, docs/BT_ROM_HCI_MAP.md §11): ACL still queued or in flight for the link
+ * is freed (EM TX buffers back to the pool) and reported in one E462 NOCP {1, h, count} (ROM 0x29F5E) BEFORE the
+ * Disconnection Complete. */
+static void peer_flush_air(uint16_t h)
+{
+    uint16_t cnt = 0u;
+    for (uint32_t i = 0u; i < f.air_n;) {
+        if (f.air[i].handle != h) {
+            i++;
+            continue;
+        }
+        bool tx;
+        uint32_t idx, off;
+        if (em_locate(f.air[i].em, &tx, &idx, &off) == 0 && tx) {
+            f.tx_used[idx] = 0u;
+        }
+        memmove(&f.air[i], &f.air[i + 1u], (f.air_n - i - 1u) * sizeof(air_t));
+        f.air_n--;
+        cnt++;
+    }
+    fake_rom.acl_in_air = f.air_n;
+    if (cnt != 0u) {
+        fake_peer.tx_flushed += cnt;
+        nocp_send(&h, &cnt, 1u);
+    }
+}
+
 static void peer_link_down(uint8_t reason)
 {
     uint8_t r = reason;
+    peer_flush_air(fake_peer.handle);
     peer_s_h(0xE458u, 0u, &r, 1u);                                       /* Disconnection Complete {s,pad,h,reason} */
     f.links[fake_peer.link] = false;
     fake_peer.connected = fake_peer.encrypted = fake_peer.authenticated = false;
@@ -307,6 +337,10 @@ static bool peer_handle(msg_t *m)
     switch (m->id) {
     case 0xE006u:                                                        /* 0409 Accept Connection Request */
         if (!peer_need(m, 7u) || !peer_addr_is(p)) return false;
+        if (fake_peer.ghost_pending) {
+            err("ghost page accepted by the host (the fake models one link per peer)");
+            return false;
+        }
         fake_peer.host_accept_role = p[6];
         peer_status1(0xE0C9u, BT_ROM_TASK_LM, 0u);
         f.links[fake_peer.link] = true;
@@ -326,6 +360,14 @@ static bool peer_handle(msg_t *m)
     case 0xE007u:                                                        /* 040A Reject Connection Request */
         if (!peer_need(m, 7u) || !peer_addr_is(p)) return false;
         peer_status1(0xE0CAu, BT_ROM_TASK_LM, 0u);
+        if (fake_peer.ghost_pending) {
+            fake_peer.ghost_pending = false;
+            fake_peer.ghost_up = true;
+            fake_peer.ghost_rejects++;
+            fake_peer.ghost_reject_reason = p[6];
+            f.links[fake_peer.ghost_link] = true;                        /* still an LD link: its detach stalls */
+            return true;
+        }
         {
             uint8_t c[13];
             memset(c, 0, sizeof(c));
@@ -375,6 +417,9 @@ static bool peer_handle(msg_t *m)
         peer_status1(0xE0CBu, BT_ROM_TASK_LM, 0u);
         if (!peer_addr_is(p)) {
             r[0] = 0x04u;                                                /* Page Timeout: nobody answers */
+        } else if (fake_peer.name_fail_n != 0u) {
+            fake_peer.name_fail_n--;
+            r[0] = 0x22u;                                                /* LMP Response Timeout: no name */
         } else {
             if (s_peer.host_feat_notify) {
                 uint8_t h[14];
@@ -569,6 +614,37 @@ void fake_peer_disconnect(uint8_t reason)
     }
 }
 
+int fake_peer_page_again(uint32_t link)
+{
+    if (!fake_peer.enabled || !fake_peer.connected || link >= 7u || link == fake_peer.link || f.links[link] ||
+        fake_peer.ghost_pending || fake_peer.ghost_up) {
+        return -1;
+    }
+    fake_peer.ghost_link = link;
+    fake_peer.ghost_pending = true;
+    uint8_t c[10];
+    memcpy(c, s_peer.addr, 6u);
+    memcpy(&c[6], s_peer.cod, 3u);
+    c[9] = 1u;
+    peer_emit(0xE457u, BT_ROM_TASK_LM, c, 10u);
+    return 0;
+}
+
+void fake_peer_ghost_end(uint8_t status)
+{
+    if (!fake_peer.ghost_up) {
+        return;
+    }
+    uint8_t c[13];
+    memset(c, 0, sizeof(c));
+    c[0] = status;
+    memcpy(&c[5], s_peer.addr, 6u);
+    c[11] = 1u;
+    peer_emit(0xE0D2u, BT_ROM_TASK_LM, c, 13u);
+    f.links[fake_peer.ghost_link] = false;
+    fake_peer.ghost_up = false;
+}
+
 int fake_peer_send_acl(const uint8_t *data, uint16_t len)
 {
     return fake_peer.connected ? fake_rom_inject_acl(fake_peer.handle, 0x2u, data, len) : -1;
@@ -659,6 +735,21 @@ static void lmlc_handle(msg_t *m)
     uint8_t p[64];
     memset(p, 0, sizeof(p));
     p[0] = r->status;
+    if (m->id == 0xE02Cu && r->status == 0u && m->len >= 1u) {
+        /* 0C1A Write Scan Enable, ROM handler 0x3EAC4 (docs/BT_ROM_HCI_MAP.md §11): a value with page scan (2, 3) is
+         * refused with 0x0C while more than one ACL link is up (LD link count, ROM 0x368FC); > 3 is 0x12. */
+        uint8_t scan = m->block[MSG_HDR];
+        uint32_t links = 0u;
+        for (uint32_t i = 0u; i < 7u; i++) {
+            links += f.links[i] ? 1u : 0u;
+        }
+        p[0] = scan > 3u ? 0x12u : ((scan & 0x02u) != 0u && links > 1u) ? 0x0Cu : 0x00u;
+        fake_rom.scan_refused += p[0] == 0x0Cu;
+        fake_rom.scan_writes++;
+        if (p[0] == 0x00u) {
+            fake_rom.scan_enable = scan;
+        }
+    }
     if (r->echo_addr) {
         memcpy(&p[1], m->block + MSG_HDR, m->len >= 6u ? 6u : m->len);
     }

@@ -130,6 +130,54 @@ void bt_xrec_plat_service(void) { recorder_poll(); }
 void bt_xrec_plat_wait(void) { vTaskDelay(1); }
 uint32_t bt_xrec_plat_irq_count(void) { return s_irq_cache; }
 
+/* "BT ROM links lc=.. ld=.. rep=..", two hex digits per link 0..6 (bt_rom_real_links): tells a link the ROM still
+ * holds (lc 5 / ld 1) from one it dropped without telling the host (rep 0). Always at a fault; in the bench image
+ * also when an LC or LD state byte changed (not rep: its meaning is only inferred, and a busy field would log on
+ * every poll). The release image does not log on change: the byte meanings come from static analysis only. */
+static uint8_t s_links_last[3u * BT_ROM_REAL_LINKS];
+static void rom_links_log(int force)
+{
+    uint8_t v[3u * BT_ROM_REAL_LINKS];
+    bt_rom_real_links(&v[0], &v[BT_ROM_REAL_LINKS], &v[2u * BT_ROM_REAL_LINKS]);
+    if (!force && memcmp(v, s_links_last, 2u * BT_ROM_REAL_LINKS) == 0) {
+        return;
+    }
+    memcpy(s_links_last, v, sizeof(v));
+    static const char k[] = "0123456789ABCDEF";
+    static const char *const tag[3] = { "BT ROM links lc=", " ld=", " rep=" };
+    for (uint32_t t = 0u; t < 3u; t++) {
+        openfw_log_puts(tag[t]);
+        for (uint32_t i = 0u; i < BT_ROM_REAL_LINKS; i++) {
+            uint8_t b = v[t * BT_ROM_REAL_LINKS + i];
+            openfw_log_putc(k[b >> 4]);
+            openfw_log_putc(k[b & 0xFu]);
+        }
+    }
+    openfw_log_putc('\n');
+}
+
+/* One bt_ctrl session log line (bt_ctrl_fault_format / bt_ctrl_stats_format); app task only. */
+static char s_ctrl_line[BT_CTRL_STATS_LINE > BT_CTRL_FAULT_LINE ? BT_CTRL_STATS_LINE : BT_CTRL_FAULT_LINE];
+static void log_ctrl_line(uint16_t (*fmt)(char *buf, uint16_t cap))
+{
+    (void)fmt(s_ctrl_line, (uint16_t)sizeof(s_ctrl_line));
+    openfw_log_puts(s_ctrl_line);
+    openfw_log_putc('\n');
+}
+
+_Static_assert(BT_XREC_NOTE_SCAN_REFUSED == BT_CTRL_NOTE_SCAN_REFUSED, "note kind seen by the session");
+_Static_assert(BT_XREC_NOTE_LINE == BT_CTRL_NOTE_LINE, "note line buffer");
+int bt_xrec_plat_ctrl_note(char *line, uint16_t cap, uint8_t *arg)
+{
+    bt_ctrl_note_t n;
+    if (!bt_ctrl_note_pop(&n)) {
+        return 0;
+    }
+    *arg = n.reason;
+    (void)bt_ctrl_note_format(&n, line, cap);
+    return n.kind;
+}
+
 int bt_xrec_plat_start_allowed(void)
 {
     return g_prev_fault_code != (OPENFW_FAULT_MAGIC_BASE | BT_FAULT_RECORD_CODE);
@@ -811,6 +859,7 @@ int bt_xrec_plat_stack_up_begin(exfat_vol_t *vol, int sd_mounted, const uint8_t 
     s_hci_to_base = bt_port_hci_command_timeouts();
     s_ctrl_hung = 0u;
     s_last_check = millis();
+    memset(s_links_last, 0, sizeof(s_links_last));    /* first non-idle ROM link state of the session is logged */
     mem_reset();
     (void)xTimerStart(s_guard_timer, 0);
     post_job(JOB_UP);
@@ -878,10 +927,17 @@ uint32_t bt_xrec_plat_poll(void)
     if (s_ctrl_hung) {
         return 1u;
     }
+#if defined(OPENFW_BT_BENCH_IMAGE) && OPENFW_BT_BENCH_IMAGE
+    rom_links_log(0);
+#endif
     bt_ctrl_rtos_stats_t st;
     bt_ctrl_rtos_stats(&st);
     if (st.faults != s_faults_base) {
-        bt_xrec_plat_log_u32("BT bt_ctrl fault, first code", st.first_fault);
+        /* this session's first fault with its raise site and two key values (bt_ctrl.h BT_CTRL_SITE_*), read together
+         * (st.first_fault is per boot), then bt_ctrl's silent-drop counters and the ROM's link states */
+        log_ctrl_line(bt_ctrl_fault_format);
+        log_ctrl_line(bt_ctrl_stats_format);
+        rom_links_log(1);
         return 2u;
     }
     if (bt_port_hci_command_timeouts() != s_hci_to_base) {
@@ -900,6 +956,7 @@ void bt_xrec_plat_session_end(void)
     s_bond_fails = 0u;
     mem_sample();                                        /* the Bluedroid tasks are gone: their last samples */
     mem_log("stop");
+    log_ctrl_line(bt_ctrl_stats_format);
     bt_rom_real_sec_t sec;
     bt_rom_real_sec(&sec);
     openfw_log_puts("BT ROM keys: installed ");

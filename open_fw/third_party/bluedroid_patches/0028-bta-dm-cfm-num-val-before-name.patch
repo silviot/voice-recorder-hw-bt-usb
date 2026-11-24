@@ -1,0 +1,17 @@
+diff --git a/open_fw/third_party/bluedroid/host/bluedroid/bta/dm/bta_dm_act.c b/open_fw/third_party/bluedroid/host/bluedroid/bta/dm/bta_dm_act.c
+index d0cca26..7167523 100644
+--- a/open_fw/third_party/bluedroid/host/bluedroid/bta/dm/bta_dm_act.c
++++ b/open_fw/third_party/bluedroid/host/bluedroid/bta/dm/bta_dm_act.c
+@@ -3484,6 +3484,12 @@ static UINT8 bta_dm_sp_cback (tBTM_SP_EVT event, tBTM_SP_EVT_DATA *p_data)
+         sec_event.cfm_req.rmt_auth_req = p_data->cfm_req.rmt_auth_req;
+         sec_event.cfm_req.loc_io_caps = p_data->cfm_req.loc_io_caps;
+         sec_event.cfm_req.rmt_io_caps = p_data->cfm_req.rmt_io_caps;
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++        /* open_fw patch 0028: when the peer's name is unknown, the request is reported from bta_dm_pinname_cback()
++         * after a remote name request, with bta_dm_cb.num_val; upstream sets that only after the name branch below
++         * (which returns first), so the user saw the previous pairing's value or 0 (silicon bench 2026-11-24). */
++        bta_dm_cb.num_val = p_data->cfm_req.num_val;
++#endif
+ 
+         /* continue to next case */
+     /* Passkey entry mode, mobile device with output capability is very

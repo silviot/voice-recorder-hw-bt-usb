@@ -59,17 +59,46 @@ void bt_xrec_plat_lock(void)
 }
 void bt_xrec_plat_unlock(void) { m_lock_depth--; }
 void bt_xrec_plat_notify_app(void) { m_notifies++; }
+static char m_last_log[160];
+static uint32_t m_cfm_logged = 0xFFFFFFFFu;   /* value of the last "numeric comparison accepted" line */
 void bt_xrec_plat_log(const char *msg)
 {
+    snprintf(m_last_log, sizeof(m_last_log), "%s", msg);
     if (m_verbose) {
         printf("    log: %s\n", msg);
     }
 }
 void bt_xrec_plat_log_u32(const char *msg, uint32_t v)
 {
+    snprintf(m_last_log, sizeof(m_last_log), "%s %u", msg, (unsigned)v);
+    if (strstr(msg, "numeric comparison accepted") != NULL) {
+        m_cfm_logged = v;
+    }
     if (m_verbose) {
         printf("    log: %s %u\n", msg, (unsigned)v);
     }
+}
+/* Controller link notes (bt_ctrl_note_pop + bt_ctrl_note_format on target): a scripted queue. */
+static struct { int kind; uint8_t arg; char line[64]; } m_notes[8];
+static int m_notes_n;
+int bt_xrec_plat_ctrl_note(char *line, uint16_t cap, uint8_t *arg)
+{
+    if (m_notes_n == 0) {
+        return 0;
+    }
+    int kind = m_notes[0].kind;
+    *arg = m_notes[0].arg;
+    snprintf(line, cap, "%s", m_notes[0].line);
+    memmove(&m_notes[0], &m_notes[1], sizeof(m_notes[0]) * (size_t)(m_notes_n - 1));
+    m_notes_n--;
+    return kind;
+}
+static void note_push(int kind, uint8_t arg, const char *line)
+{
+    m_notes[m_notes_n].kind = kind;
+    m_notes[m_notes_n].arg = arg;
+    snprintf(m_notes[m_notes_n].line, sizeof(m_notes[0].line), "%s", line);
+    m_notes_n++;
 }
 uint16_t bt_xrec_plat_spp_peer_mtu(uint32_t handle) { (void)handle; return m_peer_mtu; }
 /* Live session blocks and their sizes: a block must go back to the heap zeroed (no key, no PAIR line left in it). */
@@ -550,6 +579,9 @@ static void mocks_reset(void)
     m_srv_name[0] = '\0';
     m_scan_calls = 0;
     m_scan_c = m_scan_d = -1;
+    m_notes_n = 0;
+    m_last_log[0] = '\0';
+    m_cfm_logged = 0xFFFFFFFFu;
     m_cfm_calls = m_pin_calls = m_passkey_calls = m_remove_calls = m_disc_calls = 0;
     m_cfm_accept = m_pin_accept = m_passkey_accept = -1;
     memset(m_cfm_bda, 0, sizeof(m_cfm_bda));
@@ -1512,6 +1544,8 @@ static void t_bench_autoconfirm(void)
     CHECK(m_cfm_calls == 2 && m_cfm_accept == 1 && !ui().prompt && dbg().ssp_bench_autoconfirmed == 1u,
           "accepted at once without a prompt");
     CHECK(strcmp(status().pair_pin, "004242") == 0, "value shown through pair_pin, got '%s'", status().pair_pin);
+    CHECK(m_cfm_logged == 4242u, "bench accept logged value %u, want the comparison value 4242",
+          (unsigned)m_cfm_logged);
     auth_cmpl(PEER, ESP_BT_STATUS_SUCCESS, ESP_BT_LINK_KEY_AUTHED_COMB_P192);
     add_bond(PEER);
     bt_xrec_poll();
@@ -1568,6 +1602,107 @@ static void t_bench_autoconfirm(void)
  * the peer the result of a DHKey check with this session's key (invalid-curve oracle): such a key is spent until the
  * next BT-mode entry. The gate is re-checked when a request arrives and when the user accepts (not only by the poll
  * after the event drain). */
+/* Silicon bench 2026-11-24: the pairing window reopened while the controller held two ACL links; the ROM refuses
+ * page scan then (0C1A -> 0x0C). The session logs the controller's link notes and sends its scan mode again when a
+ * link goes, so the window becomes discoverable (and a closing window stops being discoverable) once it can. */
+static void t_scan_refused(void)
+{
+    printf("[20] controller link notes; scan mode refused with two links, re-applied when a link goes\n");
+    mocks_reset();
+    bring_up();
+    bt_xrec_open_pairing(60000u);
+    bt_xrec_poll();
+    int calls = m_scan_calls;
+    CHECK(m_scan_d == ESP_BT_GENERAL_DISCOVERABLE, "window: discoverable requested");
+    note_push(1, 0u, "BT HCI connection complete h=0x0081 st=0x00");
+    note_push(4, 0x03u, "BT HCI scan enable 0x03 refused st=0x0C");
+    bt_xrec_poll();
+    CHECK(m_notes_n == 0 && dbg().ctrl_notes == 2u, "notes drained and logged (%u)", dbg().ctrl_notes);
+    CHECK(strcmp(m_last_log, "BT HCI scan enable 0x03 refused st=0x0C") == 0, "last log '%s'", m_last_log);
+    CHECK(dbg().scan_refused == 1u && m_scan_calls == calls, "refusal recorded, no retry while two links (%d calls)",
+          m_scan_calls - calls);
+    bt_xrec_poll();
+    CHECK(m_scan_calls == calls, "no retry loop");
+    acl_disc(PEER2);
+    bt_xrec_poll();
+    CHECK(m_scan_calls == calls + 1 && m_scan_d == ESP_BT_GENERAL_DISCOVERABLE && dbg().scan_reapplied == 1u,
+          "scan mode sent again after a link went (%d calls, reapplied %u)", m_scan_calls - calls,
+          dbg().scan_reapplied);
+    acl_disc(PEER);
+    bt_xrec_poll();
+    CHECK(m_scan_calls == calls + 1, "re-applied once per refusal");
+    stop_ok();
+}
+
+/* Review of the bench fix: a refusal must not wait for a link-down event the session may never get (the extra link
+ * the ROM counts can be one the host never knew, e.g. a rejected re-page ending with a failed Connection Complete),
+ * must be seen before a link drop queued with it, and a refused write that drops discoverability (window close) must
+ * not leave the controller discoverable: fail closed with scan off (0x00, which the ROM always accepts). */
+static void t_scan_refused_retry(void)
+{
+    printf("[21] scan mode refused: retried on a timer, seen before a queued link drop, fail-safe scan off on a "
+           "refused window close\n");
+    mocks_reset();
+    bring_up();
+    bt_xrec_open_pairing(60000u);
+    bt_xrec_poll();
+    int calls = m_scan_calls;
+    /* (a) the link that caused the refusal ends without any ACL event to the session */
+    note_push(4, 0x03u, "BT HCI scan enable 0x03 refused st=0x0C");
+    bt_xrec_poll();
+    CHECK(m_scan_calls == calls, "no immediate retry (%d calls)", m_scan_calls - calls);
+    m_now += BT_XREC_SCAN_RETRY_MS - 1u;
+    bt_xrec_poll();
+    CHECK(m_scan_calls == calls, "retried before BT_XREC_SCAN_RETRY_MS (%d calls)", m_scan_calls - calls);
+    m_now += 1u;
+    bt_xrec_poll();
+    CHECK(m_scan_calls == calls + 1 && m_scan_d == ESP_BT_GENERAL_DISCOVERABLE && dbg().scan_reapplied == 1u,
+          "refused scan mode not retried on the timer (%d calls, reapplied %u)", m_scan_calls - calls,
+          dbg().scan_reapplied);
+    m_now += BT_XREC_SCAN_RETRY_MS;
+    bt_xrec_poll();
+    CHECK(m_scan_calls == calls + 1, "retried again without a new refusal (%d calls)", m_scan_calls - calls);
+    /* (b) the refusal note and the GAP link drop are both pending when the poll runs */
+    calls = m_scan_calls;
+    note_push(4, 0x03u, "BT HCI scan enable 0x03 refused st=0x0C");
+    acl_disc(PEER2);
+    bt_xrec_poll();
+    bt_xrec_poll();
+    CHECK(m_scan_calls == calls + 1 && dbg().scan_reapplied == 2u, "refusal not seen before the queued link drop "
+          "(%d calls, reapplied %u)", m_scan_calls - calls, dbg().scan_reapplied);
+    /* (c) the window closes; BTA's two 0C1A 02 writes are refused while the ROM is still at 0x03 */
+    calls = m_scan_calls;
+    m_now += 60001u;
+    bt_xrec_poll();
+    CHECK(!dbg().window_open && m_scan_calls == calls + 1 && m_scan_c == ESP_BT_CONNECTABLE &&
+          m_scan_d == ESP_BT_NON_DISCOVERABLE, "window close: connectable only (%d calls)", m_scan_calls - calls);
+    note_push(4, 0x02u, "BT HCI scan enable 0x02 refused st=0x0C");
+    note_push(4, 0x02u, "BT HCI scan enable 0x02 refused st=0x0C");
+    bt_xrec_poll();
+    CHECK(m_scan_calls == calls + 2 && m_scan_c == ESP_BT_NON_CONNECTABLE && m_scan_d == ESP_BT_NON_DISCOVERABLE &&
+          dbg().scan_failsafe == 1u, "refused close left the controller discoverable: no fail-safe scan off (%d calls, "
+          "c %d d %d, failsafe %u)", m_scan_calls - calls, m_scan_c, m_scan_d, dbg().scan_failsafe);
+    CHECK(!dbg().scan_disc, "reported discoverable after the fail-safe");
+    /* the fail-safe's own first write (BTM_SetDiscoverability, page scan still on in BTM) is refused as well */
+    note_push(4, 0x02u, "BT HCI scan enable 0x02 refused st=0x0C");
+    bt_xrec_poll();
+    CHECK(m_scan_calls == calls + 2 && dbg().scan_failsafe == 1u, "fail-safe repeated (%d calls)",
+          m_scan_calls - calls);
+    m_now += BT_XREC_SCAN_RETRY_MS;
+    bt_xrec_poll();
+    CHECK(m_scan_calls == calls + 3 && m_scan_c == ESP_BT_CONNECTABLE && m_scan_d == ESP_BT_NON_DISCOVERABLE,
+          "connectable mode not retried after the fail-safe (%d calls)", m_scan_calls - calls);
+    /* (d) a refused 0x02 with nothing discoverable sent since: the ROM kept 0x02 or 0x00, no fail-safe */
+    note_push(4, 0x02u, "BT HCI scan enable 0x02 refused st=0x0C");
+    bt_xrec_poll();
+    CHECK(m_scan_calls == calls + 3 && dbg().scan_failsafe == 1u, "fail-safe without a discoverable mode sent");
+    m_now += BT_XREC_SCAN_RETRY_MS;
+    bt_xrec_poll();
+    CHECK(m_scan_calls == calls + 4 && m_scan_c == ESP_BT_CONNECTABLE, "connectable retry (%d calls)",
+          m_scan_calls - calls);
+    stop_ok();
+}
+
 static void t_ssp_key_spent(void)
 {
     printf("[17] accepted pairing that fails: P-192 key spent, SSP refused until the next BT-mode entry\n");
@@ -1693,6 +1828,8 @@ int main(int argc, char **argv)
     t_bench_autoconfirm();
     t_pairing_gate();
     t_ssp_key_spent();
+    t_scan_refused();
+    t_scan_refused_retry();
     bt_xrec_test_reset();
     printf("test_bt_xrec: %d checks, %d failures\n", g_checks, g_fails);
     return g_fails == 0 ? 0 : 1;

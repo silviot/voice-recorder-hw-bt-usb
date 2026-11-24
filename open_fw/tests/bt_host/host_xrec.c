@@ -105,6 +105,16 @@ void bt_xrec_plat_identity(uint8_t bd[6]) { memcpy(bd, k_bd_addr, 6u); }
 void bt_xrec_plat_service(void) {}
 void bt_xrec_plat_wait(void) { vTaskDelay(1); }
 uint32_t bt_xrec_plat_irq_count(void) { return 0u; }
+int bt_xrec_plat_ctrl_note(char *line, uint16_t cap, uint8_t *arg)
+{
+    bt_ctrl_note_t n;
+    if (!bt_ctrl_note_pop(&n)) {
+        return 0;
+    }
+    *arg = n.reason;
+    (void)bt_ctrl_note_format(&n, line, cap);
+    return n.kind;
+}
 void bt_xrec_plat_reboot(uint8_t mode) { s_reboot_mode = mode; }
 
 /* Entropy as the session sees it on target (bt_xrec_fw.c). The DRBG itself is always seeded on the host (host_glue.c
@@ -452,7 +462,10 @@ uint32_t bt_xrec_plat_poll(void)
         bonds_write();
     }
     if (bth_ctrl_faults() != s_faults_base) {
-        bth_log("    [xrec] bt_ctrl fault, first code %u\n", (unsigned)bth_ctrl_first_fault());
+        char fl[BT_CTRL_FAULT_LINE], sl[BT_CTRL_STATS_LINE];   /* the firmware's lines (bt_xrec_fw.c) */
+        (void)bt_ctrl_fault_format(fl, sizeof(fl));
+        (void)bt_ctrl_stats_format(sl, sizeof(sl));
+        bth_log("    [xrec] %s\n    [xrec] %s\n", fl, sl);
         return 2u;
     }
     if (bth_hci_cmd_timeouts() != s_hci_to_base) {

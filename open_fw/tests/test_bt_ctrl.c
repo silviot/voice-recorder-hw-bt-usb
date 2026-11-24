@@ -739,6 +739,9 @@ static void test_rx_paths(void)
           "event ring %u used, %u deferred", d.evt_used, d.evt_deferred);
     CHECK(stats().evt_overflow == 2u && t_faults == 1u && t_fault_last == BT_CTRL_FAULT_EVT_OVERFLOW,
           "overflow counted (%u), one fault posted (first: overflow)", stats().evt_overflow);
+    CHECK(stats().fault_site == BT_CTRL_SITE_EVT_OVERFLOW && stats().fault_a == 0xE457u &&
+          stats().fault_b == BT_CTRL_EVT_DEFER, "fault site %u a=0x%X b=%u, want overflow E457/%u",
+          stats().fault_site, stats().fault_a, stats().fault_b, BT_CTRL_EVT_DEFER);
     CHECK(fake_rom_msgs_owned_by_ctrl() == BT_CTRL_EVT_DEFER, "deferred events are KEEP'd ROM messages");
     /* the general area is full and bt_dlv is stuck: a command (FWD and SYN) still gets its reserved reply slot */
     uint8_t one = 1u;
@@ -1137,6 +1140,9 @@ static void test_faults(void)
     const pkt_t *r = roundtrip(0x0C1Au, &one, 1);
     if (r) CHECK(status_of(r) == BT_HCI_ERR_MEM_FULL, "refused allocation -> local CC 0x07");
     CHECK(stats().cmd_alloc_refused == 1u && t_fault_last == BT_CTRL_FAULT_INVARIANT, "class M local failure faults");
+    CHECK(stats().fault_site == BT_CTRL_SITE_CLASS_M_LOCAL && stats().fault_a == 0x0C1Au &&
+          stats().fault_b == BT_HCI_ERR_MEM_FULL, "fault site %u a=0x%X b=0x%X, want class-M local 0C1A/07",
+          stats().fault_site, stats().fault_a, stats().fault_b);
     fake_rom.heap_budget = 8192;
     fake_rom_set_reply_status(0xE01Cu, 0x0C);
     uint8_t mask[8] = { 0 };
@@ -1151,6 +1157,8 @@ static void test_faults(void)
     fake_rom.heap_budget = fake_rom.heap_used + 24u;   /* bt_ctrl's 3-byte request (16 + 8) fits; the reply does not */
     pump();
     CHECK(stats().rom_faults == 1u && t_fault_last == BT_CTRL_FAULT_ROM, "ROM on_fault -> BT fault");
+    CHECK(stats().fault_site == BT_CTRL_SITE_ROM_FAULT && stats().fault_a == 1u, "fault site %u a=%u, want ROM/1",
+          stats().fault_site, stats().fault_a);
     /* ROM calling TASK_HCI with its lock held */
     setup();
     bring_up();
@@ -1524,6 +1532,9 @@ static void test_class_m_fwd_fault(void)
     if (r) CHECK(status_of(r) == 0x0Cu, "status passed through");
     CHECK(t_faults == f0 + 1u && t_fault_last == BT_CTRL_FAULT_INVARIANT && stats().invariant == inv0 + 1u &&
           stats().mandatory_fwd_fail == 1u, "class M FWD failure posted as an invariant fault");
+    CHECK(stats().fault_site == BT_CTRL_SITE_CLASS_M_STATUS && stats().fault_a == 0x0C01u && stats().fault_b == 0x0Cu,
+          "fault site %u a=0x%X b=0x%X, want class-M status 0C01/0C", stats().fault_site, stats().fault_a,
+          stats().fault_b);
     fake_rom_set_reply_status(0xE01Cu, 0x00);
     shutdown_and_check();
 }
@@ -1606,6 +1617,9 @@ static void test_acl_tx_error_paths(void)
     bt_ctrl_run();
     CHECK(stats().acl_tx_em_fail == 1u && t_faults == 1u && t_fault_last == BT_CTRL_FAULT_INVARIANT,
           "EM TX failure with a credit -> invariant fault");
+    CHECK(stats().fault_site == BT_CTRL_SITE_EM_TX_ALLOC && stats().fault_a == 0x80u && stats().fault_b == 0u,
+          "fault site %u a=0x%X b=%u, want EM TX alloc on 0x80 with 0 in flight", stats().fault_site,
+          stats().fault_a, stats().fault_b);
     fake_rom.em_tx_fail = false;
     pump();
     CHECK(fake_rom.n_acl == 1u && dbg().tx_free == BT_CTRL_TX_SLOTS, "ACL sent after EM TX recovers");
@@ -2506,6 +2520,212 @@ static void test_fuzz_tx(void)
     }
 }
 
+/* A peer detach right after a device -> peer ACL burst: every controller credit in flight at the ROM (no acks), more
+ * in the TX ring. The ROM flushes the link's TX (NOCP for the flushed count, then E458, ROM 0x2A8B4); bt_ctrl drops
+ * the queued ACL, owes no NOCP for the dead handle, keeps no credit, and the next link on the same handle sends at
+ * once. */
+static void test_detach_with_acl_in_flight(void)
+{
+    setup();
+    bring_up();
+    fake_peer_cfg_t c;
+    phone_cfg(&c);
+    fake_peer_init(&c);
+    phone_connects();
+    fake_rom.auto_ack_acl = false;                   /* the peer stops acking: everything stays "in air" */
+    for (uint32_t i = 0u; i < BT_CTRL_H2C_ACL_CREDITS; i++) {
+        send_acl(0x80, 2, 600, (uint8_t)i);
+        pump();
+    }
+    send_acl(0x80, 2, 600, 0x55);                    /* credit-blocked in the TX ring */
+    send_acl(0x80, 2, 600, 0x56);
+    pump();
+    CHECK(dbg().h2c_inflight == BT_CTRL_H2C_ACL_CREDITS && fake_rom_em_tx_in_use() == BT_CTRL_H2C_ACL_CREDITS &&
+          dbg().tx_free == BT_CTRL_TX_SLOTS - 2u, "burst: %u in flight, %u EM TX used, %u TX slots free",
+          dbg().h2c_inflight, fake_rom_em_tx_in_use(), dbg().tx_free);
+    uint32_t f0 = t_faults;
+    fake_peer_disconnect(0x13);
+    pump();
+    CHECK(fake_peer.tx_flushed == BT_CTRL_H2C_ACL_CREDITS && fake_rom_em_tx_in_use() == 0u, "ROM flush: %u flushed, "
+          "%u EM TX still used", fake_peer.tx_flushed, fake_rom_em_tx_in_use());
+    CHECK(dbg().h2c_inflight == 0u && dbg().nocp_pending == 0u && dbg().tx_free == BT_CTRL_TX_SLOTS,
+          "after the detach: %u in flight, %u NOCP owed, %u TX slots free", dbg().h2c_inflight, dbg().nocp_pending,
+          dbg().tx_free);
+    CHECK(t_faults == f0 && stats().invariant == 0u, "detach with ACL in flight faulted (site %u a=0x%X b=0x%X)",
+          stats().fault_site, stats().fault_a, stats().fault_b);
+    bool disc = false;
+    for (const pkt_t *p = next_pkt(); p != NULL; p = next_pkt()) {
+        if (is_evt(p, 0x05)) disc = true;
+    }
+    CHECK(disc, "Disconnection Complete delivered");
+    fake_rom.auto_ack_acl = true;
+    phone_connects();                                /* same handle 0x80 */
+    uint32_t n0 = fake_rom.n_acl;
+    for (uint32_t i = 0u; i < BT_CTRL_H2C_ACL_CREDITS; i++) {
+        send_acl(0x80, 2, 100, (uint8_t)(0x60u + i));
+        pump();
+    }
+    CHECK(fake_rom.n_acl == n0 + BT_CTRL_H2C_ACL_CREDITS && stats().acl_tx_em_fail == 0u && t_faults == f0,
+          "new link: %u of %u packets sent, EM fails %u", fake_rom.n_acl - n0, BT_CTRL_H2C_ACL_CREDITS,
+          stats().acl_tx_em_fail);
+    fake_peer_init(NULL);
+    shutdown_and_check();
+}
+
+/* Silicon bench 2026-11-24 (BT=1 BENCH=1, CRC 0x3599): the pairing window reopened while the ROM still held the
+ * laptop's dead link plus a second one; 0C1A answered 0x0C and bt_ctrl stopped BT (INVARIANT, class M). The ROM's
+ * Write Scan Enable handler (0x3EAC4) refuses page scan (2, 3) with 0x0C whenever more than one ACL link is up: a
+ * defined controller answer, so it is passed through, counted and noted, never a BT fault. */
+static void test_scan_refused_two_links(void)
+{
+    setup();
+    bring_up();
+    uint8_t v = 0x03u;
+    link_up(0);
+    const pkt_t *r = roundtrip(0x0C1Au, &v, 1u);
+    if (r) CHECK(status_of(r) == 0x00u, "one link: 0C1A 03 accepted (%02X)", status_of(r));
+    link_up(1);
+    uint32_t f0 = t_faults, inv0 = stats().invariant;
+    r = roundtrip(0x0C1Au, &v, 1u);
+    if (r) CHECK(status_of(r) == 0x0Cu, "two links: 0C1A 03 refused by the ROM, status passed through (%02X)",
+                 status_of(r));
+    CHECK(t_faults == f0 && stats().invariant == inv0 && stats().mandatory_fwd_fail == 0u,
+          "0C1A refused with two links posted a BT fault (faults %u, site %u a=0x%X b=0x%X)", t_faults - f0,
+          stats().fault_site, stats().fault_a, stats().fault_b);
+    CHECK(stats().scan_refused == 1u, "scan_refused %u", stats().scan_refused);
+    bt_ctrl_note_t n;
+    int got = 0, refused = 0;
+    while (bt_ctrl_note_pop(&n)) {
+        got++;
+        if (n.kind == BT_CTRL_NOTE_SCAN_REFUSED && n.status == 0x0Cu && n.reason == 0x03u) refused++;
+    }
+    CHECK(refused == 1, "scan refusal note (%d notes, %d refusals)", got, refused);
+    v = 0x02u;                                       /* window closing: page scan only, still two links */
+    r = roundtrip(0x0C1Au, &v, 1u);
+    if (r) CHECK(status_of(r) == 0x0Cu, "two links: 0C1A 02 refused too (%02X)", status_of(r));
+    CHECK(t_faults == f0 && stats().scan_refused == 2u, "0C1A 02 refused: no fault, counted");
+    v = 0x01u;                                       /* inquiry scan only: never refused */
+    r = roundtrip(0x0C1Au, &v, 1u);
+    if (r) CHECK(status_of(r) == 0x00u, "0C1A 01 accepted with two links (%02X)", status_of(r));
+    fake_rom_link(1, false);
+    v = 0x03u;
+    r = roundtrip(0x0C1Au, &v, 1u);
+    if (r) CHECK(status_of(r) == 0x00u, "back to one link: 0C1A 03 accepted (%02X)", status_of(r));
+    /* any other class-M failure (here 0C1A with an invalid value) is still a BT fault, with its site */
+    fake_rom_set_reply_status(0xE02Cu, 0x12u);
+    r = roundtrip(0x0C1Au, &v, 1u);
+    CHECK(t_faults == f0 + 1u && stats().fault_site == BT_CTRL_SITE_CLASS_M_STATUS && stats().fault_a == 0x0C1Au &&
+          stats().fault_b == 0x12u, "0C1A status 12: fault %u site %u a=0x%X b=0x%X", t_faults - f0,
+          stats().fault_site, stats().fault_a, stats().fault_b);
+    fake_rom_set_reply_status(0xE02Cu, 0x00u);
+    shutdown_and_check();
+}
+
+static int note_line_is(const char *want)
+{
+    bt_ctrl_note_t n;
+    char line[BT_CTRL_NOTE_LINE];
+    if (!bt_ctrl_note_pop(&n)) {
+        printf("    no note, want '%s'\n", want);
+        return 0;
+    }
+    uint16_t len = bt_ctrl_note_format(&n, line, sizeof(line));
+    if (strcmp(line, want) != 0 || len != strlen(want)) {
+        printf("    note '%s' (%u), want '%s'\n", line, len, want);
+        return 0;
+    }
+    return 1;
+}
+
+/* Link notes for the session log: what the ROM reported about links, and how the host's 0406 was answered. */
+static void test_link_notes(void)
+{
+    setup();
+    bring_up();
+    bt_ctrl_note_t n;
+    while (bt_ctrl_note_pop(&n)) {
+    }
+    inject_conn_req(1);
+    link_up(0);
+    inject_conn_cmp(0x80);
+    pump();
+    uint8_t d[3] = { 0x80, 0x00, 0x13 };
+    const pkt_t *r = roundtrip(0x0406u, d, 3u);       /* forwarded: the ROM's CS */
+    if (r) CHECK(status_of(r) == 0x00u, "0406 CS %02X", status_of(r));
+    inject_disc(0x80, 0x16);
+    pump();
+    r = roundtrip(0x0406u, d, 3u);                    /* dead handle: answered locally */
+    if (r) CHECK(status_of(r) == BT_HCI_ERR_UNKNOWN_CONN, "0406 on a dead handle %02X", status_of(r));
+    CHECK(note_line_is("BT HCI connection request"), "conn request note");
+    CHECK(note_line_is("BT HCI connection complete h=0x0080 st=0x00"), "conn complete note");
+    CHECK(note_line_is("BT HCI disconnect cmd h=0x0080 st=0x00 rom"), "0406 CS note");
+    CHECK(note_line_is("BT HCI disconnection complete h=0x0080 st=0x00 reason=0x16"), "disconnection note");
+    CHECK(note_line_is("BT HCI disconnect cmd h=0x0080 st=0x02 local"), "0406 local note");
+    CHECK(!bt_ctrl_note_pop(&n), "no further note");
+    uint32_t lost0 = stats().notes_lost;
+    for (uint32_t i = 0u; i < BT_CTRL_NOTES + 3u; i++) {
+        inject_disc(0x81, 0x08);
+    }
+    pump();
+    CHECK(stats().notes_lost == lost0 + 3u, "notes lost %u, want 3", stats().notes_lost - lost0);
+    uint32_t k = 0u;
+    while (bt_ctrl_note_pop(&n)) {
+        k++;
+    }
+    CHECK(k == BT_CTRL_NOTES, "%u notes kept, want %u", k, BT_CTRL_NOTES);
+    char small[12];
+    n.kind = BT_CTRL_NOTE_DISC;
+    uint16_t len = bt_ctrl_note_format(&n, small, sizeof(small));
+    CHECK(len == sizeof(small) - 1u && small[len] == '\0', "format truncates within the buffer (%u)", len);
+    shutdown_and_check();
+}
+
+/* Session log lines (bt_xrec_fw.c): the fault line takes code, site and values from this session together (review:
+ * the firmware printed bt_ctrl_rtos's per-boot first code next to this session's site), and the stats line carries
+ * the silent-drop counters that tell "the ROM never sent E458" from "bt_ctrl dropped it". */
+static void test_session_lines(void)
+{
+    setup();
+    bring_up();
+    char line[BT_CTRL_FAULT_LINE];
+    uint16_t len = bt_ctrl_fault_format(line, sizeof(line));
+    CHECK(strcmp(line, "BT bt_ctrl fault, first code 0 site 0 a=0x00000000 b=0x00000000") == 0 && len == strlen(line),
+          "no fault: '%s'", line);
+    uint8_t sco[4] = { 0x03, 0x80, 0x00, 0x00 };     /* session 1: HOST_CONTRACT (malformed H4) */
+    bt_ctrl_send(sco, 4u);
+    pump();
+    (void)bt_ctrl_fault_format(line, sizeof(line));
+    CHECK(strcmp(line, "BT bt_ctrl fault, first code 1 site 15 a=0x00000004 b=0x00000003") == 0, "session 1: '%s'",
+          line);
+    shutdown_and_check();
+    /* session 2 of the same boot: no fault yet, then a class-M INVARIANT */
+    CHECK(bt_ctrl_open() == 0, "reopen");
+    bring_up();
+    (void)bt_ctrl_fault_format(line, sizeof(line));
+    CHECK(strcmp(line, "BT bt_ctrl fault, first code 0 site 0 a=0x00000000 b=0x00000000") == 0,
+          "session 2 before its fault shows session 1's: '%s'", line);
+    fake_rom_set_reply_status(0xE02Cu, 0x12u);
+    uint8_t v = 0x03u;
+    (void)roundtrip(0x0C1Au, &v, 1u);
+    fake_rom_set_reply_status(0xE02Cu, 0x00u);
+    (void)bt_ctrl_fault_format(line, sizeof(line));
+    CHECK(strcmp(line, "BT bt_ctrl fault, first code 6 site 4 a=0x00000C1A b=0x00000012") == 0, "session 2: '%s'",
+          line);
+    char small[20];
+    len = bt_ctrl_fault_format(small, sizeof(small));
+    CHECK(len == sizeof(small) - 1u && small[len] == '\0', "fault line truncates within the buffer (%u)", len);
+    char sl[BT_CTRL_STATS_LINE];
+    len = bt_ctrl_stats_format(sl, sizeof(sl));
+    bt_ctrl_stats_t s = stats();
+    char want[BT_CTRL_STATS_LINE];
+    snprintf(want, sizeof(want), "BT ctrl stats unk=%u short=%u late=%u unsol=%u fwd_to=%u late_reply=%u "
+             "late_drop=%u scan_refused=%u notes_lost=%u", s.rom_unknown_ids, s.rom_short, s.late_upcalls,
+             s.evt_unsolicited_reply, s.fwd_deadline, s.fwd_late_reply, s.fwd_late_dropped, s.scan_refused,
+             s.notes_lost);
+    CHECK(strcmp(sl, want) == 0 && len == strlen(want), "stats line '%s'", sl);
+    shutdown_and_check();
+}
+
 int main(void)
 {
     struct sigaction sa;
@@ -2545,6 +2765,10 @@ int main(void)
         { "phone_path", test_phone_path },
         { "fwd_deadline", test_fwd_deadline },
         { "fwd_late_same_opcode", test_fwd_late_same_opcode },
+        { "scan_refused_two_links", test_scan_refused_two_links },
+        { "detach_with_acl_in_flight", test_detach_with_acl_in_flight },
+        { "link_notes", test_link_notes },
+        { "session_lines", test_session_lines },
         { "fuzz_rx", test_fuzz_rx },
         { "fuzz_tx", test_fuzz_tx },
     };

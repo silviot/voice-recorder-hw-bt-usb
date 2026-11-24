@@ -96,6 +96,7 @@ static struct {
     int stop_result;
     uint32_t session, rom_gen;
     uint32_t pending_rom_fault;
+    uint32_t pending_site, pending_a, pending_b;   /* BT_CTRL_SITE_* + key values of pending_rom_fault */
     uint8_t need_dlv, upcall_activity;
 
     /* unified TX ring */
@@ -153,6 +154,8 @@ static struct {
     uint32_t dlv_fails;
     uint8_t dlv_faulted, dlv_busy, fault_raised;
     uint8_t scratch[BT_CTRL_EVT_MAX_H4];
+    bt_ctrl_note_t notes[BT_CTRL_NOTES];     /* link notes: bt_ctrl context adds, any task pops (both under enter()) */
+    uint32_t note_head, note_n;
     bt_ctrl_stats_t st;
 } g;
 
@@ -175,7 +178,7 @@ static bool seq_before(uint32_t a, uint32_t b)
     return (int32_t)(a - b) < 0;
 }
 
-static void raise_fault(uint32_t code)
+static void raise_fault(uint32_t code, uint32_t site, uint32_t a, uint32_t b)
 {
     bool post = false;
     g.p.enter();
@@ -183,6 +186,9 @@ static void raise_fault(uint32_t code)
     if (!g.fault_raised) {
         g.fault_raised = 1u;
         g.st.first_fault = code;
+        g.st.fault_site = site;              /* where, with the values that decided it (bt_ctrl.h BT_CTRL_SITE_*) */
+        g.st.fault_a = a;
+        g.st.fault_b = b;
         post = true;
     }
     g.p.exit();
@@ -193,10 +199,13 @@ static void raise_fault(uint32_t code)
 
 /* Upcalls (inside rom->run()) only record a fault; bt_ctrl_run() posts it after the ROM call returned, so no
  * FreeRTOS call is made from ROM context (plan §3 rule (e)). */
-static void defer_fault(uint32_t code)
+static void defer_fault(uint32_t code, uint32_t site, uint32_t a, uint32_t b)
 {
     if (g.pending_rom_fault == BT_CTRL_FAULT_NONE) {
         g.pending_rom_fault = code;
+        g.pending_site = site;
+        g.pending_a = a;
+        g.pending_b = b;
     }
 }
 
@@ -349,10 +358,31 @@ static void tx_drop_acl_for(uint16_t h)
     }
 }
 
+/* One link note for the session log (bt_ctrl_note_pop); the oldest is kept when nobody drains the ring. */
+static void note_add(uint8_t kind, uint16_t handle, uint8_t status, uint8_t reason, uint8_t local)
+{
+    g.p.enter();
+    if (g.note_n < BT_CTRL_NOTES) {
+        bt_ctrl_note_t *n = &g.notes[(g.note_head + g.note_n) % BT_CTRL_NOTES];
+        n->kind = kind;
+        n->handle = handle;
+        n->status = status;
+        n->reason = reason;
+        n->local = local;
+        g.note_n++;
+    } else {
+        g.st.notes_lost++;
+    }
+    g.p.exit();
+}
+
 /* ------------------------------------------------------------------------------------------------------------- */
 /* ROM upcalls                                                                                                    */
 /* ------------------------------------------------------------------------------------------------------------- */
 #define BT_HCI_EVT_CONN_CMP 0x03u
+#define BT_HCI_EVT_CONN_REQ 0x04u
+#define BT_CTRL_OP_DISCONNECT 0x0406u
+#define BT_CTRL_OP_WRITE_SCAN_ENABLE 0x0C1Au
 
 /* One bit per ROM ACL handle 0x80..0x86 (BT_CTRL_MAX_LINKS); 0 for any other handle. */
 static uint8_t handle_bit(uint16_t h)
@@ -408,7 +438,7 @@ static bt_rom_msg_ret_t accept_general(uint16_t id, uint8_t *param, uint16_t par
         return BT_ROM_MSG_KEEP;
     }
     g.st.evt_overflow++;
-    defer_fault(BT_CTRL_FAULT_EVT_OVERFLOW);
+    defer_fault(BT_CTRL_FAULT_EVT_OVERFLOW, BT_CTRL_SITE_EVT_OVERFLOW, id, g.def_n);
     return BT_ROM_MSG_CONSUMED;
 }
 
@@ -433,7 +463,7 @@ static void rom_nocp(const uint8_t *p, uint16_t len)
         g.st.nocp_excess += c - done;
         if (done != 0u && !hc_add(g.nocp_pend, h, done)) {
             g.st.invariant++;
-            defer_fault(BT_CTRL_FAULT_INVARIANT);
+            defer_fault(BT_CTRL_FAULT_INVARIANT, BT_CTRL_SITE_NOCP_TABLE, h, done);
         }
     }
 }
@@ -455,7 +485,7 @@ static bt_rom_msg_ret_t rom_acl_rx(uint8_t *param, uint16_t len, uint32_t seq)
         if (g.held_n >= BT_CTRL_HELD_ACL) {
             g.st.acl_rx_overflow++;
             g.st.invariant++;
-            defer_fault(BT_CTRL_FAULT_INVARIANT);
+            defer_fault(BT_CTRL_FAULT_INVARIANT, BT_CTRL_SITE_ACL_RX_HELD, d.conhdl, d.length);
         } else {
             g.st.acl_rx_bad++;
         }
@@ -491,7 +521,7 @@ static bt_rom_msg_ret_t up_on_hci_msg(void *ctx, uint16_t id, uint8_t *param, ui
     if (g.rom->lock_depth != NULL && g.rom->lock_depth() != 0u) {
         g.st.lock_violations++;              /* ROM must call TASK_HCI with its lock released (BT_ROM_INTERFACE §3.4) */
         g.st.invariant++;
-        defer_fault(BT_CTRL_FAULT_INVARIANT);
+        defer_fault(BT_CTRL_FAULT_INVARIANT, BT_CTRL_SITE_LOCK_UPCALL, id, g.rom->lock_depth());
     }
     g.st.rom_msgs++;
     g.upcall_activity = 1u;
@@ -515,6 +545,9 @@ static bt_rom_msg_ret_t up_on_hci_msg(void *ctx, uint16_t id, uint8_t *param, ui
     }
     if ((info.kind == BT_CTRL_EVK_CC || info.kind == BT_CTRL_EVK_CS) && g.fwd_pending && info.opcode == g.fwd_opcode) {
         /* Reply to the forwarded command: its slot was reserved when the command was admitted. */
+        if (info.opcode == BT_CTRL_OP_DISCONNECT) {
+            note_add(BT_CTRL_NOTE_DISC_CMD, g.fwd_handle, info.status, 0u, 0u);
+        }
         g.fwd_pending = 0u;
         g.fwd_orphan = 0u;
         g.rom_cmd_credits++;
@@ -529,10 +562,17 @@ static bt_rom_msg_ret_t up_on_hci_msg(void *ctx, uint16_t id, uint8_t *param, ui
                 g.ssp_host = (g.fwd_plen >= 1u && g.fwd_params[0] == 0x01u) ? 1u : 0u;
             }
         }
-        if (g.fwd_cls == BTC_M && info.status != BT_HCI_OK) {
+        if (info.opcode == BT_CTRL_OP_WRITE_SCAN_ENABLE && info.status == BT_HCI_ERR_CMD_DISALLOWED) {
+            /* ROM 0x3EAC4 refuses page scan while more than one ACL link is up (BT_ROM_HCI_MAP.md §11): a defined
+             * controller answer at run time (second peer paging, or a dead link the ROM has not reported yet), not
+             * a broken controller. Passed through and noted (the session re-applies its scan mode when a link
+             * goes); no BT fault (silicon bench 2026-11-24 stopped BT here). */
+            g.st.scan_refused++;
+            note_add(BT_CTRL_NOTE_SCAN_REFUSED, 0u, info.status, g.fwd_plen >= 1u ? g.fwd_params[0] : 0u, 0u);
+        } else if (g.fwd_cls == BTC_M && info.status != BT_HCI_OK) {
             g.st.mandatory_fwd_fail++;       /* opcode table §2 rule 7: passed through, BT fault */
             g.st.invariant++;
-            defer_fault(BT_CTRL_FAULT_INVARIANT);
+            defer_fault(BT_CTRL_FAULT_INVARIANT, BT_CTRL_SITE_CLASS_M_STATUS, info.opcode, info.status);
         }
         return BT_ROM_MSG_CONSUMED;
     }
@@ -546,6 +586,12 @@ static bt_rom_msg_ret_t up_on_hci_msg(void *ctx, uint16_t id, uint8_t *param, ui
     }
     if (info.kind == BT_CTRL_EVK_CC || info.kind == BT_CTRL_EVK_CS) {
         g.st.evt_unsolicited_reply++;
+    } else if (info.evt_code == BT_HCI_EVT_DISC) {
+        note_add(BT_CTRL_NOTE_DISC, (uint16_t)(info.handle & 0x0FFFu), info.status, len >= 7u ? g.scratch[6] : 0u, 0u);
+    } else if (info.evt_code == BT_HCI_EVT_CONN_CMP) {
+        note_add(BT_CTRL_NOTE_CONN, (uint16_t)(info.handle & 0x0FFFu), info.status, 0u, 0u);
+    } else if (info.evt_code == BT_HCI_EVT_CONN_REQ) {
+        note_add(BT_CTRL_NOTE_CONN_REQ, 0u, 0u, 0u, 0u);
     }
     apply_event_side_effects(&info);
     return accept_general(id, param, param_len, g.scratch, len, seq);
@@ -561,9 +607,11 @@ static void up_on_irq(void *ctx)
 static void up_on_fault(void *ctx, uint32_t code)
 {
     (void)ctx;
-    (void)code;
     g.st.rom_faults++;                       /* may run with the ROM lock held: flags only */
     g.pending_rom_fault = BT_CTRL_FAULT_ROM;   /* overrides a lesser pending code */
+    g.pending_site = BT_CTRL_SITE_ROM_FAULT;
+    g.pending_a = code;
+    g.pending_b = 0u;
 }
 
 /* ------------------------------------------------------------------------------------------------------------- */
@@ -713,7 +761,7 @@ static uint8_t do_reset(uint32_t keep)
         }
         g.rom->irq_enable(0);
         g.st.reset_failures++;
-        raise_fault(BT_CTRL_FAULT_RESET);
+        raise_fault(BT_CTRL_FAULT_RESET, BT_CTRL_SITE_RESET, status, 0u);
     }
     return status;
 }
@@ -841,6 +889,9 @@ static uint8_t forward_cmd(const bt_ctrl_cmd_row_t *row, uint16_t op, const uint
  * going to send would already have been dispatched before its queue ran empty, and is then matched normally. */
 static void fwd_local_reply(uint8_t status)
 {
+    if (g.fwd_opcode == BT_CTRL_OP_DISCONNECT) {
+        note_add(BT_CTRL_NOTE_DISC_CMD, g.fwd_handle, status, 0u, 1u);
+    }
     const bt_ctrl_cmd_row_t *row = bt_ctrl_cmds_lookup(g.fwd_opcode);
     uint16_t len = bt_ctrl_cmds_reply_fail(row, g.fwd_opcode, g.fwd_params, g.fwd_plen, status, g.scratch);
     g.fwd_pending = 0u;
@@ -951,9 +1002,12 @@ static void process_cmd(uint32_t idx)
             return;
         }
         g.st.cmd_local_fail++;
+        if (op == BT_CTRL_OP_DISCONNECT) {
+            note_add(BT_CTRL_NOTE_DISC_CMD, plen >= 2u ? (uint16_t)(rd16(prm) & 0x0FFFu) : 0u, s, 0u, 1u);
+        }
         if (row->cls == BTC_M) {
             g.st.invariant++;                /* class M must not fail */
-            raise_fault(BT_CTRL_FAULT_INVARIANT);
+            raise_fault(BT_CTRL_FAULT_INVARIANT, BT_CTRL_SITE_CLASS_M_LOCAL, op, s);
         }
         local_reply(bt_ctrl_cmds_reply_fail(row, op, prm, plen, s, g.scratch));
         return;
@@ -1004,7 +1058,7 @@ static int process_acl(uint32_t idx)
     if (em == NULL) {
         g.st.acl_tx_em_fail++;               /* opcode table §3.1: EM TX failure with a credit = invariant violation */
         g.st.invariant++;
-        raise_fault(BT_CTRL_FAULT_INVARIANT);
+        raise_fault(BT_CTRL_FAULT_INVARIANT, BT_CTRL_SITE_EM_TX_ALLOC, handle, g.inflight_total);
         return ACL_BLOCKED;
     }
     if (!gate()) {
@@ -1035,7 +1089,7 @@ static int process_acl(uint32_t idx)
     g.rom->msg_send(m);
     if (!hc_add(g.inflight, handle, 1u)) {
         g.st.invariant++;
-        raise_fault(BT_CTRL_FAULT_INVARIANT);
+        raise_fault(BT_CTRL_FAULT_INVARIANT, BT_CTRL_SITE_INFLIGHT_TABLE, handle, g.inflight_total);
     }
     g.inflight_total++;
     g.st.acl_to_rom++;
@@ -1195,7 +1249,7 @@ static bool dispatch_acl(void)
         if (g.c2h_fc) {
             if (!hc_add(g.c2h_out, h->handle, 1u)) {
                 g.st.invariant++;
-                raise_fault(BT_CTRL_FAULT_INVARIANT);
+                raise_fault(BT_CTRL_FAULT_INVARIANT, BT_CTRL_SITE_C2H_TABLE, h->handle, g.c2h_out_total);
             }
             g.c2h_out_total++;
         }
@@ -1410,13 +1464,16 @@ uint32_t bt_ctrl_run(void)
     if (g.rom->lock_depth != NULL && g.rom->lock_depth() != 0u) {
         g.st.lock_violations++;
         g.st.invariant++;
-        defer_fault(BT_CTRL_FAULT_INVARIANT);
+        defer_fault(BT_CTRL_FAULT_INVARIANT, BT_CTRL_SITE_LOCK_RUN, 0u, g.rom->lock_depth());
         return more ? 1u : 0u;
     }
     if (g.pending_rom_fault != BT_CTRL_FAULT_NONE) {
-        uint32_t code = g.pending_rom_fault;
+        /* code, site and values taken together: up_on_fault (ROM heap paths) may overwrite them at any time */
+        g.p.enter();
+        uint32_t code = g.pending_rom_fault, site = g.pending_site, a = g.pending_a, b = g.pending_b;
         g.pending_rom_fault = BT_CTRL_FAULT_NONE;
-        raise_fault(code);
+        g.p.exit();
+        raise_fault(code, site, a, b);
     }
     if (g.need_dlv) {
         g.need_dlv = 0u;
@@ -1466,7 +1523,8 @@ void bt_ctrl_send(uint8_t *data, uint16_t len)
         g.p.enter();
         g.st.tx_malformed++;
         g.p.exit();
-        raise_fault(BT_CTRL_FAULT_HOST_CONTRACT);
+        raise_fault(BT_CTRL_FAULT_HOST_CONTRACT, BT_CTRL_SITE_HOST_MALFORMED, len,
+                    (data != NULL && len != 0u) ? data[0] : 0u);
         return;
     }
     g.p.enter();
@@ -1485,7 +1543,7 @@ void bt_ctrl_send(uint8_t *data, uint16_t len)
     if (idx < 0) {
         g.st.tx_contract_violation++;        /* send() without a true check: the driver contract forbids it */
         g.p.exit();
-        raise_fault(BT_CTRL_FAULT_HOST_CONTRACT);
+        raise_fault(BT_CTRL_FAULT_HOST_CONTRACT, BT_CTRL_SITE_HOST_FULL, len, data[0]);
         return;
     }
     tx_slot_t *s = &g.tx[idx];
@@ -1595,7 +1653,8 @@ int bt_ctrl_dlv_run(void)
             }
             g.p.exit();
             if (fault) {
-                raise_fault(BT_CTRL_FAULT_DLV);  /* posted to the app; bt_dlv keeps delivering (plan M1) */
+                /* posted to the app; bt_dlv keeps delivering (plan M1) */
+                raise_fault(BT_CTRL_FAULT_DLV, BT_CTRL_SITE_DLV, BT_CTRL_DLV_FAULT_AFTER, 0u);
             }
             return BT_CTRL_DLV_RETRY;            /* entry kept */
         }
@@ -1644,7 +1703,7 @@ int bt_ctrl_init(const bt_rom_if_t *rom, const bt_ctrl_platform_t *platform, con
     g.inited = 1u;
     if (err != 0) {
         g.st.invariant++;
-        raise_fault(BT_CTRL_FAULT_INVARIANT);
+        raise_fault(BT_CTRL_FAULT_INVARIANT, BT_CTRL_SITE_INIT_TABLE, (uint32_t)err, 0u);
     }
     return err;
 }
@@ -1677,6 +1736,7 @@ int bt_ctrl_open(void)
     g.dlv_faulted = 0u;
     g.fault_raised = 0u;
     g.pending_rom_fault = BT_CTRL_FAULT_NONE;   /* a new session never inherits a fault of the previous one */
+    g.note_head = g.note_n = 0u;
     g.need_dlv = 0u;
     g.admission_open = 1u;
     g.dlv_open = 1u;
@@ -1760,4 +1820,121 @@ void bt_ctrl_get_debug(bt_ctrl_debug_t *out)
     }
     out->nocp_pending = np;
     g.p.exit();
+}
+
+int bt_ctrl_note_pop(bt_ctrl_note_t *out)
+{
+    int got = 0;
+    g.p.enter();
+    if (g.note_n != 0u) {
+        *out = g.notes[g.note_head];
+        g.note_head = (g.note_head + 1u) % BT_CTRL_NOTES;
+        g.note_n--;
+        got = 1;
+    }
+    g.p.exit();
+    return got;
+}
+
+static uint16_t put_str(char *buf, uint16_t cap, uint16_t at, const char *s)
+{
+    while (*s != '\0' && at + 1u < cap) {
+        buf[at++] = *s++;
+    }
+    buf[at] = '\0';
+    return at;
+}
+
+static uint16_t put_hex(char *buf, uint16_t cap, uint16_t at, const char *label, uint32_t v, uint32_t digits)
+{
+    static const char k[] = "0123456789ABCDEF";
+    at = put_str(buf, cap, at, label);
+    at = put_str(buf, cap, at, "0x");
+    for (uint32_t i = digits; i-- > 0u && at + 1u < cap;) {
+        buf[at++] = k[(v >> (4u * i)) & 0xFu];
+    }
+    buf[at] = '\0';
+    return at;
+}
+
+static uint16_t put_dec(char *buf, uint16_t cap, uint16_t at, const char *label, uint32_t v)
+{
+    char d[10];
+    uint32_t i = 0u;
+    do {
+        d[i++] = (char)('0' + v % 10u);
+        v /= 10u;
+    } while (v != 0u);
+    at = put_str(buf, cap, at, label);
+    while (i > 0u && at + 1u < cap) {
+        buf[at++] = d[--i];
+    }
+    buf[at] = '\0';
+    return at;
+}
+
+uint16_t bt_ctrl_fault_format(char *buf, uint16_t cap)
+{
+    if (buf == NULL || cap == 0u) {
+        return 0u;
+    }
+    uint32_t code = 0u, site = 0u, a = 0u, b = 0u;
+    g.p.enter();
+    if (g.fault_raised) {                    /* this session's: first_fault outlives the session that set it */
+        code = g.st.first_fault;
+        site = g.st.fault_site;
+        a = g.st.fault_a;
+        b = g.st.fault_b;
+    }
+    g.p.exit();
+    uint16_t at = put_dec(buf, cap, 0u, "BT bt_ctrl fault, first code ", code);
+    at = put_dec(buf, cap, at, " site ", site);
+    at = put_hex(buf, cap, at, " a=", a, 8u);
+    return put_hex(buf, cap, at, " b=", b, 8u);
+}
+
+uint16_t bt_ctrl_stats_format(char *buf, uint16_t cap)
+{
+    if (buf == NULL || cap == 0u) {
+        return 0u;
+    }
+    bt_ctrl_stats_t s;
+    bt_ctrl_get_stats(&s);
+    uint16_t at = put_dec(buf, cap, 0u, "BT ctrl stats unk=", s.rom_unknown_ids);
+    at = put_dec(buf, cap, at, " short=", s.rom_short);
+    at = put_dec(buf, cap, at, " late=", s.late_upcalls);
+    at = put_dec(buf, cap, at, " unsol=", s.evt_unsolicited_reply);
+    at = put_dec(buf, cap, at, " fwd_to=", s.fwd_deadline);
+    at = put_dec(buf, cap, at, " late_reply=", s.fwd_late_reply);
+    at = put_dec(buf, cap, at, " late_drop=", s.fwd_late_dropped);
+    at = put_dec(buf, cap, at, " scan_refused=", s.scan_refused);
+    return put_dec(buf, cap, at, " notes_lost=", s.notes_lost);
+}
+
+uint16_t bt_ctrl_note_format(const bt_ctrl_note_t *n, char *buf, uint16_t cap)
+{
+    if (buf == NULL || cap == 0u) {
+        return 0u;
+    }
+    uint16_t at = put_str(buf, cap, 0u, "BT HCI ");
+    switch (n->kind) {
+    case BT_CTRL_NOTE_CONN:
+        at = put_hex(buf, cap, put_str(buf, cap, at, "connection complete"), " h=", n->handle, 4u);
+        return put_hex(buf, cap, at, " st=", n->status, 2u);
+    case BT_CTRL_NOTE_DISC:
+        at = put_hex(buf, cap, put_str(buf, cap, at, "disconnection complete"), " h=", n->handle, 4u);
+        at = put_hex(buf, cap, at, " st=", n->status, 2u);
+        return put_hex(buf, cap, at, " reason=", n->reason, 2u);
+    case BT_CTRL_NOTE_CONN_REQ:
+        return put_str(buf, cap, at, "connection request");
+    case BT_CTRL_NOTE_SCAN_REFUSED:
+        at = put_hex(buf, cap, put_str(buf, cap, at, "scan enable"), " ", n->reason, 2u);
+        return put_hex(buf, cap, at, " refused st=", n->status, 2u);
+    case BT_CTRL_NOTE_DISC_CMD:
+        at = put_hex(buf, cap, put_str(buf, cap, at, "disconnect cmd"), " h=", n->handle, 4u);
+        at = put_hex(buf, cap, at, " st=", n->status, 2u);
+        return put_str(buf, cap, at, n->local ? " local" : " rom");
+    default:
+        return put_hex(buf, cap, put_str(buf, cap, at, "note"), " ", n->kind, 2u);
+    }
 }

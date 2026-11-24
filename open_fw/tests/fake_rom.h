@@ -71,6 +71,9 @@ typedef struct {
     fake_acl_rec_t *acl;            /* ACL packets received on "air" (allocated, FAKE_ROM_LOG_MAX entries) */
     uint32_t n_acl;
     uint32_t acl_in_air;
+    uint32_t scan_refused;          /* 0C1A refused by the ROM's more-than-one-link rule */
+    uint8_t  scan_enable;           /* the scan value of the last accepted 0C1A (0 after reset): 1 inquiry, 2 page */
+    uint32_t scan_writes;           /* 0C1A writes received (accepted or refused) */
 } fake_rom_t;
 
 extern fake_rom_t fake_rom;
@@ -137,8 +140,18 @@ typedef struct {
     /* Runtime knob (set under bth_rom_lock): 0406 gets its CS 0 but the LMP detach never completes (no E458), like a
      * phone that walked out of range or froze (a real controller waits for the supervision timeout, up to 20 s). */
     bool defer_detach;
+    /* Runtime knob (under bth_rom_lock): the next name_fail_n remote name requests fail (E0D3 status 0x22). */
+    uint32_t name_fail_n;
+    /* Ghost page (fake_peer_page_again): the peer pages again while the ROM still holds its first link (a detach the
+     * ROM never reported). The host's 040A gets its CS; the rejected link stays counted as an ACL link (LD) and no
+     * Connection Complete comes until fake_peer_ghost_end() (its own detach stalls like the first: silicon bench
+     * 2026-11-24, where the laptop's second page was rejected 0x0F as well). */
+    bool ghost_pending, ghost_up;
+    uint32_t ghost_link, ghost_rejects;
+    uint8_t ghost_reject_reason;
     uint32_t detach_deferred;       /* 0406 accepted without a Disconnection Complete */
     uint32_t stop_kills;            /* the link was still up when the controller stopped (no event: the ROM is gone) */
+    uint32_t tx_flushed;            /* ACL in flight when the link ended: freed, reported by NOCP before E458 */
 } fake_peer_t;
 
 extern fake_peer_t fake_peer;
@@ -150,6 +163,8 @@ void fake_peer_authenticate(void);                   /* the peer authenticates: 
 void fake_peer_encrypt(bool on);                     /* the peer switches encryption: E45A */
 void fake_peer_disconnect(uint8_t reason);           /* the peer drops the link: E458 */
 int  fake_peer_send_acl(const uint8_t *data, uint16_t len);   /* peer -> host ACL start fragment (PB 10) */
+int  fake_peer_page_again(uint32_t link);            /* ghost page while connected (see ghost_pending); -1 if not */
+void fake_peer_ghost_end(uint8_t status);            /* the rejected link ends: E0D2 Connection Complete(status) */
 
 uint32_t fake_rom_em_rx_in_use(void);
 uint32_t fake_rom_em_tx_in_use(void);

@@ -9,6 +9,7 @@
 #include "task.h"
 #include "openfw.h"
 #include "bt_bench.h"
+#include "bt_ctrl.h"
 
 /* SRAM_HI (.bss_hi, zeroed at boot) like hci_probe.c's log copy: .bt_bss would come out of the RTOS heap region. */
 #define BENCH_HI           __attribute__((section(".bss_hi"), aligned(4)))
@@ -139,6 +140,10 @@ static void log_status(uint32_t el_ms)
     lku("rx", st.rx_acl_pkts);
     lku("tx", st.tx_acl_pkts);
     lku("pairs", s_run.pairs);
+    lemit();
+    static char cl[BT_CTRL_STATS_LINE] BENCH_HI;
+    (void)bt_ctrl_stats_format(cl, (uint16_t)sizeof(cl));
+    lbegin(cl);                              /* "BENCH BT ctrl stats unk=.. short=.. ...": bt_ctrl's silent drops */
     lemit();
 }
 

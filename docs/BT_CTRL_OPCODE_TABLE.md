@@ -71,6 +71,13 @@ set fails the build (§7, item 10).
 7. **FWD with a nonzero ROM status is passed through unchanged** for class O. For class M rows, the ROM status
    is checked against the golden vectors in Exp 1. A class M FWD reply with a nonzero status on target counts as
    a `bt_ctrl` invariant violation (BT fault, plan M1 recovery ladder). It is never rewritten to `0x00`.
+   **One exception (2026-11-24, silicon bench):** `0C1A` answered `0x0C` is a defined run-time refusal, not a broken
+   controller: the ROM refuses page scan (`02`/`03`) while more than one ACL link is up (`BT_ROM_HCI_MAP.md` §11).
+   It is passed through, counted (`scan_refused`) and noted for the session log. The session sends its scan mode
+   again every `BT_XREC_SCAN_RETRY_MS` (3 s) while refused, at once when a link goes or the wanted mode changes, and
+   fails closed: a refused write without inquiry scan, after a discoverable one was sent, is followed by scan off
+   (`0x00`, never refused), so a closing window cannot leave the device discoverable. Any other `0C1A` status is
+   still a fault.
 8. **Dead handles.** After a successful Disconnection Complete for handle `h` (and until a successful Connection
    Complete reuses it), an LC-destined FWD command for `h` is answered locally with `0x02` (Unknown Connection
    Identifier, `cmd_dead_handle`) and host ACL for `h` is dropped (`acl_tx_dead_handle`). Reason: the ROM can still
