@@ -1599,6 +1599,38 @@ static void test_stale_rx_acl_flush(void)
     shutdown_and_check();
 }
 
+/* Unsolicited ROM CC/CS replies (e.g. a second late command reply after g.fwd_late_op was overwritten or expired)
+ * must be counted and consumed, never forwarded with Num_HCI_Command_Packets=1 to Bluedroid. */
+static void test_unsolicited_reply_dropped(void)
+{
+    setup();
+    bring_up();
+    link_up(0);
+    t_rx_rd = t_rx_n;
+    /* Direct unsolicited CC (0xE088 -> 0x0C18) with no command pending */
+    uint8_t cc_ok[2] = { 0x00, 0x00 };
+    fake_rom_inject(0xE088u, cc_ok, 1u);
+    pump();
+    CHECK(stats().evt_unsolicited_reply == 1u && pending_pkts() == 0u,
+          "unsolicited CC must be dropped, not delivered (%u pkts)", pending_pkts());
+    /* Late CS (0xE0CB -> 0x0419) arriving while another command (0x0C1A) is in flight */
+    fake_rom.hold_replies = true;
+    uint8_t one = 1u;
+    send_cmd(0x0C1Au, &one, 1u);
+    pump();
+    CHECK(dbg().fwd_pending == 1u && dbg().rom_cmd_credits == 0u, "0C1A in flight");
+    fake_rom_inject(0xE0CBu, cc_ok, 2u);
+    pump();
+    CHECK(stats().evt_unsolicited_reply == 2u && pending_pkts() == 0u && dbg().fwd_pending == 1u,
+          "unsolicited CS while 0C1A in flight must not reach host (%u pkts)", pending_pkts());
+    fake_rom.hold_replies = false;
+    fake_rom_release_held();
+    pump();
+    const pkt_t *p = next_pkt();
+    CHECK(is_reply(p, 0x0C1Au) && next_pkt() == NULL, "real 0C1A reply delivered intact");
+    shutdown_and_check();
+}
+
 /* Finding 10: send-available only on a full -> not-full transition. */
 static void test_send_avail_only_when_full(void)
 {
@@ -2941,6 +2973,7 @@ int main(void)
         { "fwd_orphan", test_fwd_orphan },
         { "stale_tx_acl_flush", test_stale_tx_acl_flush },
         { "stale_rx_acl_flush", test_stale_rx_acl_flush },
+        { "unsolicited_reply_dropped", test_unsolicited_reply_dropped },
         { "send_avail_only_when_full", test_send_avail_only_when_full },
         { "class_m_fwd_fault", test_class_m_fwd_fault },
         { "deferred_order_after_free", test_deferred_order_after_free },

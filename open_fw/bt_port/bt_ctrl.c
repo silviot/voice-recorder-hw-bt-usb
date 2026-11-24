@@ -622,6 +622,7 @@ static bt_rom_msg_ret_t up_on_hci_msg(void *ctx, uint16_t id, uint8_t *param, ui
     }
     if (info.kind == BT_CTRL_EVK_CC || info.kind == BT_CTRL_EVK_CS) {
         g.st.evt_unsolicited_reply++;
+        return BT_ROM_MSG_CONSUMED;          /* never forward Num_HCI_Command_Packets=1 without a matching command */
     } else if (info.evt_code == BT_HCI_EVT_DISC) {
         note_add(BT_CTRL_NOTE_DISC, (uint16_t)(info.handle & 0x0FFFu), info.status, len >= 7u ? g.scratch[6] : 0u, 0u);
     } else if (info.evt_code == BT_HCI_EVT_CONN_CMP) {
