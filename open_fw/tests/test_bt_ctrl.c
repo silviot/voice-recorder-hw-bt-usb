@@ -1631,6 +1631,28 @@ static void test_unsolicited_reply_dropped(void)
     shutdown_and_check();
 }
 
+/* 0x0C13 (Write Local Name): a spec-valid 248-byte non-NUL UTF-8 name must still give ROM handler 0x3ED00 a NUL
+ * guard byte at m[248] so its 249-byte scan never reads adjacent g_bt_heap metadata (BT_ROM_HCI_MAP.md §2). */
+static void test_0c13_rom_nul_guard(void)
+{
+    setup();
+    bring_up();
+    uint8_t full_name[250];
+    memset(full_name, 'A', sizeof(full_name));
+    uint32_t c0 = fake_rom.n_cmds;
+    const pkt_t *r = roundtrip(0x0C13u, full_name, 248u);
+    CHECK(r != NULL && status_of(r) == 0u && fake_rom.n_cmds == c0 + 1u, "0C13 248 B accepted");
+    CHECK(fake_rom.cmds[c0].len >= 249u && fake_rom.cmds[c0].data[248] == 0u,
+          "0C13 KE msg must have NUL guard at offset 248 (len %u, byte248 0x%02X)",
+          fake_rom.cmds[c0].len, fake_rom.cmds[c0].data[248]);
+    /* Oversize H4 parameter (> 248 B) must also clamp copied name to 248 B, preserving m[248] == 0 */
+    c0 = fake_rom.n_cmds;
+    r = roundtrip(0x0C13u, full_name, 250u);
+    CHECK(r != NULL && fake_rom.n_cmds == c0 + 1u && fake_rom.cmds[c0].len >= 249u && fake_rom.cmds[c0].data[248] == 0u,
+          "0C13 >248 B clamped before guard byte");
+    shutdown_and_check();
+}
+
 /* Finding 10: send-available only on a full -> not-full transition. */
 static void test_send_avail_only_when_full(void)
 {
@@ -2974,6 +2996,7 @@ int main(void)
         { "stale_tx_acl_flush", test_stale_tx_acl_flush },
         { "stale_rx_acl_flush", test_stale_rx_acl_flush },
         { "unsolicited_reply_dropped", test_unsolicited_reply_dropped },
+        { "0c13_rom_nul_guard", test_0c13_rom_nul_guard },
         { "send_avail_only_when_full", test_send_avail_only_when_full },
         { "class_m_fwd_fault", test_class_m_fwd_fault },
         { "deferred_order_after_free", test_deferred_order_after_free },

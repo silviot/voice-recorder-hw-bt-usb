@@ -898,7 +898,8 @@ static uint8_t forward_cmd(const bt_ctrl_cmd_row_t *row, uint16_t op, const uint
         }
     }
     uint8_t min_len = bt_ctrl_cmds_fwd_min_len(op);
-    uint16_t alloc_len = plen > min_len ? plen : min_len;
+    uint8_t copy_len = (op == 0x0C13u && plen > BT_CTRL_NAME_LEN) ? BT_CTRL_NAME_LEN : plen;
+    uint16_t alloc_len = copy_len > min_len ? copy_len : min_len;
     if (!gate()) {
         return 0xFFu;
     }
@@ -907,8 +908,8 @@ static uint8_t forward_cmd(const bt_ctrl_cmd_row_t *row, uint16_t op, const uint
         g.st.cmd_alloc_refused++;            /* real impl: g_bt_heap budget check refused (ROM itself cannot fail) */
         return BT_HCI_ERR_MEM_FULL;
     }
-    if (plen != 0u) {
-        memcpy(m, prm, plen);                /* verified layouts only (fwd_min_len table) */
+    if (copy_len != 0u) {
+        memcpy(m, prm, copy_len);            /* verified layouts only (fwd_min_len table; 0x0C13 keeps m[248]==0) */
     }
     if (!gate()) {
         return 0xFFu;
