@@ -1,9 +1,9 @@
-# Bluetooth Classic for open_fw — Integration Plan (v16, for joint review)
+# Bluetooth Classic for open_fw — Integration Plan (v17, for joint review)
 
 Branch `feat/freertos-bluedroid` (worktree `../voice-recorder-hw-bt-usb-bt`). Hardware: Smartlink SL6801 `HW_76`
 (dual Cortex-M4F @ 96 MHz, 512 KB SRAM, 2 MB SPI NOR XIP, **BR/EDR-only** RivieraWaves `RW-BT` controller in mask ROM,
 no BLE). This document is the single source of truth: it is reviewed by Codex and agy until both agree, then executed.
-v3–v16 address rounds 1–14 (§11 traceability).
+v3–v17 address rounds 1–15 (§11 traceability).
 
 ## 0. Goals, non-goals
 
@@ -199,10 +199,17 @@ Acceptance budget per mode: minimum free heap under traffic ≥ 8 KB and largest
   worker completion against **one absolute 2 s deadline** (it waits in `ulTaskNotifyTake(…, 1 tick)` but decides
   only on an explicit `bt_recover` done/status variable, since other tasks may notify the app too).
   **BT silencing does not depend on the app**: when recovery starts, the app arms a deadline that the SysTick ISR
-  enforces (no heap, no task): at 2 s it masks IRQ 26 and sets a `bt_stop` flag that `bt_ctrl` checks before every ROM
-  call, so the controller is silenced on time even if the app is inside a long synchronous SD write (card-ready wait
-  up to 500 ms plus per-sector retries). Recording finalisation and the reboot stay with the app, which reaches them
-  when its current call returns. Every
+  enforces (no heap, no task): at 2 s it masks IRQ 26 and sets a `bt_stop` flag. Guarantee, stated precisely: IRQ 26 is
+  masked at the deadline; `bt_ctrl` checks `bt_stop` before every ROM call, so at most **one** ROM call that had already
+  passed its check can still complete (ROM handlers are short and non-blocking; their worst-case duration is measured in
+  Exp 1 and asserted ≤ 1 ms), and with IRQ 26 masked no bottom-half dispatch can follow; `bt_ctrl` then parks. This holds
+  even if the app is inside a long synchronous SD write. When `bt_recover` reports success near the deadline, the app
+  first disarms the deadline, then checks whether `bt_stop` already latched; if so it continues on the hard path (BT is
+  never left masked after a "successful" graceful recovery). Recording finalisation and the reboot stay with the app,
+  which reaches them when its current call returns.
+  **Audio continuity bound**: recovery promises exactly what normal recording promises, no more. The DMA ring holds
+  3 × 128 ms; SD stalls shorter than that lose nothing, longer stalls are handled by the existing recorder overrun
+  path (counter + bounded silence substitution), which is reported in the recording's metadata/log as today. Every
   upstream wait inside disable/deinit (`btc_transfer_context` posts with `OSI_THREAD_MAX_TIMEOUT`, `future_await`) may
   block the worker forever without affecting the app, so no timed variants are needed; (2) if the worker reports an
   error (e.g. `ESP_ERR_NO_MEM`) or the deadline passes, the app runs a **hard path that needs no heap and no BT task**: mask IRQ 26, stop the recorder
@@ -220,7 +227,9 @@ Acceptance budget per mode: minimum free heap under traffic ≥ 8 KB and largest
   (b) host: worker stalled at each blocking point (BTC queue full with its consumer stalled before the
   disable post; disable completion withheld; deinit post blocked; deinit completion withheld) → app reaches the hard
   path, IRQ 26 is masked by the ISR at 2 s (also when an SD write crossing the deadline is injected), and the app
-  then finalises the recording with continuous audio; (c) target (QEMU +
+  then finalises the recording: with injected SD stalls below the ring bound the audio is continuous; above it the
+  overrun is counted and reported and the file is valid; fake-ROM test with expiry between the `bt_stop` check and the
+  ROM call → exactly that one call completes, then no further ROM calls; (c) target (QEMU +
   silicon): exhaust the real heap_5 allocator with a recording active → no `0xF1` reboot, recording finalised, BT
   fault record `0xB1`.
 
@@ -381,7 +390,7 @@ telemetry: heap/stack watermarks, largest free block, IRQ-26 latency and multipl
 
 ## 9. Open questions for reviewers (round 3)
 
-1. Does v16 (ISR-enforced BT-silencing deadline independent of the app) resolve round 14?
+1. Does v17 (precise silencing guarantee; continuity bounded like normal recording) resolve round 15?
 2. Any remaining blocker to starting steps 1–3?
 
 ## 10. Live log
@@ -406,7 +415,8 @@ telemetry: heap/stack watermarks, largest free block, IRQ-26 latency and multipl
   whose blocking cannot affect the app. Code so far: step 1 complete; step 2 entropy/DRBG, `bt_alarm`, non-rebooting
   malloc hook committed with host/QEMU tests. Round 13: agy APPROVE; Codex 1 item (recovery wait starves the
   recorder). Plan v15. Round 14: agy APPROVE; Codex 1 item (app cannot enforce its deadline during a long SD
-  write). Plan v16. Exp 0 probes (`exp/exp_sram_fill.c`, `exp/exp_sram_check.c`) written.
+  write). Plan v16. Round 15: agy APPROVE; Codex 2 items (continuity beyond the DMA ring; check-then-ROM-call race).
+  Plan v17 states both guarantees at their enforceable bounds. Exp 0 probes (`exp/exp_sram_fill.c`, `exp/exp_sram_check.c`) written.
 
 ## 11. Round-1 traceability
 
@@ -472,3 +482,7 @@ telemetry: heap/stack watermarks, largest free block, IRQ-26 latency and multipl
 | **Round 14** | |
 | Codex N1 (deadline unenforceable during long SD write) | SysTick-ISR deadline masks IRQ 26 + `bt_stop` flag checked by bt_ctrl; app finalises when its call returns; SD-write-crossing-deadline test |
 | agy NB (any notification wakes the app) | explicit `bt_recover` done/status variable |
+| **Round 15** | |
+| Codex N1 (continuity beyond DMA ring) | bound equals normal recording (3 × 128 ms); longer stalls use the existing overrun path, tested both sides |
+| Codex N2 (bt_stop check vs ROM entry) | guarantee: IRQ masked at deadline, at most one in-flight bounded ROM call (≤ 1 ms, measured Exp 1); fake-ROM race test |
+| agy NB (success near deadline) | disarm first, then check latched `bt_stop` → hard path |
