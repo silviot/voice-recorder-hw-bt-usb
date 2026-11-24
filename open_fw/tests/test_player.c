@@ -26,6 +26,17 @@ static unsigned vol_calls;
 static int drop_volume_release;
 static unsigned lookup_delay;
 
+/* play_tick_cb probe */
+static const ui_model_t *g_tick_model;
+static unsigned tick_calls, tick_max_pos, tick_saw_end;
+static void count_tick(uint32_t now_ms)
+{
+    (void)now_ms;
+    tick_calls++;
+    if (g_tick_model->play_pos_sec > tick_max_pos) tick_max_pos = g_tick_model->play_pos_sec;
+    if (g_tick_model->play_state == 2u) tick_saw_end = 1;
+}
+
 /* Simulated 1 kHz SysTick key debouncer + SPSC queue */
 static key_event_t stub_q[32];
 static unsigned    stub_q_head, stub_q_tail;
@@ -826,14 +837,19 @@ static void test_autoplay(void)
     assert(m.play_file.resume_sec == 0u);
     assert(ended == 0); /* never sat on the End screen */
 
-    /* Autoplay folder but last track: stops at the end as before */
+    /* Autoplay folder but last track: stops at the end as before. The tick
+     * callback (position memory) sees the live position and the End state. */
     memset(&m, 0, sizeof(m));
     m.cfg.spk_vol      = 18;
     m.play_has_next    = 0;
     m.play_autoplay    = 1;
+    m.play_tick_cb     = count_tick;
+    tick_calls = tick_max_pos = tick_saw_end = 0;
+    g_tick_model = &m;
     reset_run(back_after_end);
     assert(openfw_play_file_ui(&vol, "/record", "test.wav", &m) == 0);
     assert(ended == 1 && consumed == FRAMES);
+    assert(tick_calls > 0 && tick_saw_end && tick_max_pos == FRAMES / 16000);
 
     /* No marker: a next file exists but the player waits on the End screen */
     memset(&m, 0, sizeof(m));

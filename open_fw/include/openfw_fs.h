@@ -98,5 +98,12 @@ int  exfat_checkpoint_file(exfat_writer_t *w, const void *hdr, uint32_t hdr_len)
 int  exfat_close_file(exfat_writer_t *w);
 int  exfat_delete_file(exfat_vol_t *vol, const char *dir_path, const char *filename);
 int  exfat_replace_file(exfat_vol_t *vol, const char *dir_path, const char *src_name, const char *dst_name);
+/*
+ * Overwrite one 512-byte sector of an existing file in place. offset must be
+ * sector aligned and offset + 512 <= ValidDataLength. Touches nothing but that
+ * data sector (no FAT, bitmap, directory entry or timestamp update).
+ */
+int  exfat_overwrite_sector(exfat_vol_t *vol, const exfat_entry_t *file, uint64_t offset,
+                            const void *sec512);
 
 #endif /* OPENFW_FS_H */

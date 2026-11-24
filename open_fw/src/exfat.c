@@ -1664,6 +1664,35 @@ int exfat_checkpoint_file(exfat_writer_t *w, const void *hdr, uint32_t hdr_len)
     return 0;
 }
 
+int exfat_overwrite_sector(exfat_vol_t *vol, const exfat_entry_t *file, uint64_t offset,
+                           const void *sec512)
+{
+    if (!vol || !vol->dev || !vol->dev->write_sectors || !file || !sec512 || file->is_dir ||
+        (offset & 511u) != 0u) {
+        return -1;
+    }
+    uint64_t vdl = (file->valid_data_len < file->size) ? file->valid_data_len : file->size;
+    if (offset + 512u > vdl) {
+        return -1;
+    }
+    uint32_t cls_shift = 9u + (uint32_t)vol->spc_shift;
+    uint64_t skip      = offset >> cls_shift;
+    uint32_t cls       = file->first_cluster;
+    if (cls < 2u || (cls - 2u) >= vol->cluster_count || skip >= (uint64_t)vol->cluster_count) {
+        return -1;
+    }
+    for (uint64_t i = 0u; i < skip; i++) {
+        uint32_t nxt = 0u;
+        if (next_cluster(vol, cls, file->no_fat_chain, &nxt) != 0 || nxt < 2u ||
+            (nxt - 2u) >= vol->cluster_count) {
+            return -1;
+        }
+        cls = nxt;
+    }
+    uint32_t sec_in_cls = (uint32_t)((offset & ((uint64_t)vol->cluster_size - 1u)) >> 9);
+    return vol->dev->write_sectors(vol->dev->ctx, cluster_to_lba(vol, cls) + sec_in_cls, 1u, sec512);
+}
+
 static int free_file_clusters(exfat_vol_t *vol, uint32_t first_cluster, uint64_t size, uint8_t no_fat_chain);
 
 int exfat_close_file(exfat_writer_t *w)

@@ -1136,6 +1136,9 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
             if (show_player) {
                 ui_render_screen(UI_SCR_PLAYER, m);
             }
+            if (m->play_tick_cb) {
+                m->play_tick_cb(now); /* e.g. autoplay-folder position memory */
+            }
         }
 
         if (!keys_event_pending() &&
