@@ -98,10 +98,20 @@ void openfw_rtos_assert_failed(const char *file, int line)
     openfw_rtos_fatal(0xF0u, (uint32_t)line, (uint32_t)(uintptr_t)file);
 }
 
+#if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID
+/* BT=1: allocation failure must reach the caller (Bluedroid fail-soft paths, BT recovery ladder; plan M1). Count it
+ * for telemetry and let pvPortMalloc() return NULL. Boot-time kernel object creation checks its own results. */
+volatile uint32_t g_rtos_malloc_failures;
+void vApplicationMallocFailedHook(void)
+{
+    g_rtos_malloc_failures++;
+}
+#else
 void vApplicationMallocFailedHook(void)
 {
     openfw_rtos_fatal(0xF1u, (uint32_t)xPortGetFreeHeapSize(), (uint32_t)xPortGetMinimumEverFreeHeapSize());
 }
+#endif
 
 void vApplicationStackOverflowHook(TaskHandle_t task, char *name)
 {

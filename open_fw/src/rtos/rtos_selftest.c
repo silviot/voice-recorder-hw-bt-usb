@@ -19,7 +19,7 @@
 
 enum {
     T_DELAY = 0, T_QUEUE, T_MUTEX_PI, T_TIMER, T_NOTIFY, T_EVENTGROUP,
-    T_HEAP, T_PREEMPT, T_FROM_ISR, T_STACK, T_REAP, T_BTDATA, T_COUNT
+    T_HEAP, T_PREEMPT, T_FROM_ISR, T_STACK, T_REAP, T_BTDATA, T_MALLOCFAIL, T_COUNT
 };
 
 typedef struct {
@@ -304,6 +304,20 @@ static void selftest_main(void *arg)
         report(T_BTDATA, ok, (uint32_t)((uintptr_t)&_ebt_data - (uintptr_t)&_sbt_data));
 #else
         report(T_BTDATA, 1, 0u);
+#endif
+    }
+    /* T_MALLOCFAIL: BT=1 images must let allocation failure reach the caller (no reboot from the hook). */
+    {
+#if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID
+        extern volatile uint32_t g_rtos_malloc_failures;
+        uint32_t before = g_rtos_malloc_failures;
+        void *p = pvPortMalloc(1024u * 1024u);
+        report(T_MALLOCFAIL, p == NULL && g_rtos_malloc_failures == before + 1u, g_rtos_malloc_failures);
+        if (p != NULL) {
+            vPortFree(p);
+        }
+#else
+        report(T_MALLOCFAIL, 1, 0u);
 #endif
     }
     /* T_STACK: this task's high-water mark is sane (not overflowed, not untouched) */
