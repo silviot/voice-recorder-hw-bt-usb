@@ -1,9 +1,9 @@
-# Bluetooth Classic for open_fw — Integration Plan (v17, for joint review)
+# Bluetooth Classic for open_fw — Integration Plan (v18, for joint review)
 
 Branch `feat/freertos-bluedroid` (worktree `../voice-recorder-hw-bt-usb-bt`). Hardware: Smartlink SL6801 `HW_76`
 (dual Cortex-M4F @ 96 MHz, 512 KB SRAM, 2 MB SPI NOR XIP, **BR/EDR-only** RivieraWaves `RW-BT` controller in mask ROM,
 no BLE). This document is the single source of truth: it is reviewed by Codex and agy until both agree, then executed.
-v3–v17 address rounds 1–15 (§11 traceability).
+v3–v18 address rounds 1–16 (§11 traceability).
 
 ## 0. Goals, non-goals
 
@@ -208,8 +208,10 @@ Acceptance budget per mode: minimum free heap under traffic ≥ 8 KB and largest
   never left masked after a "successful" graceful recovery). Recording finalisation and the reboot stay with the app,
   which reaches them when its current call returns.
   **Audio continuity bound**: recovery promises exactly what normal recording promises, no more. The DMA ring holds
-  3 × 128 ms; SD stalls shorter than that lose nothing, longer stalls are handled by the existing recorder overrun
-  path (counter + bounded silence substitution), which is reported in the recording's metadata/log as today. Every
+  3 × 128 ms slots; a stall is lossless iff the DMA completions during it do not exceed the free slots at its start
+  (so the lossless duration depends on the queue depth and DMA phase when the stall begins, as in normal recording).
+  Beyond that the existing recorder overrun path applies (live counter + bounded silence substitution). Today the
+  overrun count is not persisted in the WAV; persisting it is a separate recorder follow-up, outside this plan. Every
   upstream wait inside disable/deinit (`btc_transfer_context` posts with `OSI_THREAD_MAX_TIMEOUT`, `future_await`) may
   block the worker forever without affecting the app, so no timed variants are needed; (2) if the worker reports an
   error (e.g. `ESP_ERR_NO_MEM`) or the deadline passes, the app runs a **hard path that needs no heap and no BT task**: mask IRQ 26, stop the recorder
@@ -227,8 +229,9 @@ Acceptance budget per mode: minimum free heap under traffic ≥ 8 KB and largest
   (b) host: worker stalled at each blocking point (BTC queue full with its consumer stalled before the
   disable post; disable completion withheld; deinit post blocked; deinit completion withheld) → app reaches the hard
   path, IRQ 26 is masked by the ISR at 2 s (also when an SD write crossing the deadline is injected), and the app
-  then finalises the recording: with injected SD stalls below the ring bound the audio is continuous; above it the
-  overrun is counted and reported and the file is valid; fake-ROM test with expiry between the `bt_stop` check and the
+  then finalises the recording: with the initial queue depth and DMA phase pinned, an injected stall within the free-slot
+  bound yields continuous audio; a longer one increments the live overrun counter (asserted before the reboot) and the
+  file is valid afterwards; fake-ROM test with expiry between the `bt_stop` check and the
   ROM call → exactly that one call completes, then no further ROM calls; (c) target (QEMU +
   silicon): exhaust the real heap_5 allocator with a recording active → no `0xF1` reboot, recording finalised, BT
   fault record `0xB1`.
@@ -390,7 +393,7 @@ telemetry: heap/stack watermarks, largest free block, IRQ-26 latency and multipl
 
 ## 9. Open questions for reviewers (round 3)
 
-1. Does v17 (precise silencing guarantee; continuity bounded like normal recording) resolve round 15?
+1. Does v18 (free-slot continuity bound; live overrun assertion) resolve round 16?
 2. Any remaining blocker to starting steps 1–3?
 
 ## 10. Live log
@@ -416,7 +419,8 @@ telemetry: heap/stack watermarks, largest free block, IRQ-26 latency and multipl
   malloc hook committed with host/QEMU tests. Round 13: agy APPROVE; Codex 1 item (recovery wait starves the
   recorder). Plan v15. Round 14: agy APPROVE; Codex 1 item (app cannot enforce its deadline during a long SD
   write). Plan v16. Round 15: agy APPROVE; Codex 2 items (continuity beyond the DMA ring; check-then-ROM-call race).
-  Plan v17 states both guarantees at their enforceable bounds. Exp 0 probes (`exp/exp_sram_fill.c`, `exp/exp_sram_check.c`) written.
+  Plan v17 states both guarantees at their enforceable bounds. Round 16: agy APPROVE (no items); Codex 1.5 items
+  (bound depends on queue depth; overrun not persisted). Plan v18. Exp 0 probes (`exp/exp_sram_fill.c`, `exp/exp_sram_check.c`) written.
 
 ## 11. Round-1 traceability
 
@@ -486,3 +490,5 @@ telemetry: heap/stack watermarks, largest free block, IRQ-26 latency and multipl
 | Codex N1 (continuity beyond DMA ring) | bound equals normal recording (3 × 128 ms); longer stalls use the existing overrun path, tested both sides |
 | Codex N2 (bt_stop check vs ROM entry) | guarantee: IRQ masked at deadline, at most one in-flight bounded ROM call (≤ 1 ms, measured Exp 1); fake-ROM race test |
 | agy NB (success near deadline) | disarm first, then check latched `bt_stop` → hard path |
+| **Round 16** | |
+| Codex (lossless bound depends on queue state; overrun not persisted) | free-slot bound with pinned initial state in test; live counter asserted before reboot; persistence = recorder follow-up |
