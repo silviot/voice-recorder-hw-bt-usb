@@ -1,9 +1,9 @@
-# Bluetooth Classic for open_fw — Integration Plan (v14, for joint review)
+# Bluetooth Classic for open_fw — Integration Plan (v15, for joint review)
 
 Branch `feat/freertos-bluedroid` (worktree `../voice-recorder-hw-bt-usb-bt`). Hardware: Smartlink SL6801 `HW_76`
 (dual Cortex-M4F @ 96 MHz, 512 KB SRAM, 2 MB SPI NOR XIP, **BR/EDR-only** RivieraWaves `RW-BT` controller in mask ROM,
 no BLE). This document is the single source of truth: it is reviewed by Codex and agy until both agree, then executed.
-v3–v14 address rounds 1–12 (§11 traceability).
+v3–v15 address rounds 1–13 (§11 traceability).
 
 ## 0. Goals, non-goals
 
@@ -101,7 +101,7 @@ SRAM (RTOS build): main `.bss` ends ≈`0x84EA18` (~5.5 KB left — nothing new 
 | `g_bt_heap` (ROM-required, already in main `.bss`) | 8 KB | unchanged (counted) |
 | FreeRTOS idle + timer static stacks/TCBs | ~2.2 KB | currently main `.bss` → move to RTOS region |
 | App task stack | 16 KB | heap (measure; trim only after silicon watermark) |
-| BT stacks: hciT 2 + BTU 4.25 + BTC 3 + bt_ctrl 2 + bt_dlv 1.5 + bt_alarm 1 | ~13.75 KB | heap; host + silicon watermarks |
+| BT stacks: hciT 2 + BTU 4.25 + BTC 3 + bt_ctrl 2 + bt_dlv 1.5 + bt_alarm 1 (+ bt_recover 1, static in `.rtos_static`) | ~14.75 KB | heap; host + silicon watermarks |
 | bt_ctrl rings: ACL RX 4 × (1021+5) + event RX 8 × 260 + unified TX 3 × 1026 (any packet type) | ~9.2 KB | static in `.bt_bss`, capacity asserted in bytes |
 | OSI objects, HCI cmd/ACL buffers, config cache | 8–20 KB | heap |
 | SPP mode RFCOMM queues + XREC RX stream buffer | 4–20 KB | heap |
@@ -193,24 +193,27 @@ Acceptance budget per mode: minimum free heap under traffic ≥ 8 KB and largest
 - **Recovery ladder (bounded, works under persistent allocation failure)**: the app task handles a BT fault (RX
   delivery failures, ring overflow, command timeout storm, `bt_ctrl` invariant violation): (1) graceful
   `esp_bluedroid_disable()` + `esp_bluedroid_deinit()` + M1 teardown run in a dedicated **`bt_recover` worker** (static
-  TCB/stack created at BT enable, so it exists without heap; priority 2). The app never calls into Bluedroid during
-  recovery: it notifies the worker and waits with `ulTaskNotifyTake()` against **one absolute 2 s deadline**. Every
+  TCB/stack in `.rtos_static`, created once at first BT enable and reused, so it exists without heap; priority 2).
+  The app never calls into Bluedroid during recovery: it notifies the worker and then **keeps running its recorder
+  service loop** (`recorder_poll()` at the normal cadence; the DMA ring holds only 3 × 128 ms of audio) while checking
+  worker completion with `ulTaskNotifyTake(…, 1 tick)` against **one absolute 2 s deadline**. Every
   upstream wait inside disable/deinit (`btc_transfer_context` posts with `OSI_THREAD_MAX_TIMEOUT`, `future_await`) may
   block the worker forever without affecting the app, so no timed variants are needed; (2) if the worker reports an
   error (e.g. `ESP_ERR_NO_MEM`) or the deadline passes, the app runs a **hard path that needs no heap and no BT task**: mask IRQ 26, stop the recorder
-  through its existing finalize path (static buffers only) so no recording is lost, write a fault record
+  through its existing finalize path (static buffers only) after a final `recorder_poll()`, so no audio is lost, write a fault record
   (`AON_BACKUP`, code `0xB1` + reason), and reboot via `system_reboot()`. After a BT-fault reboot BT starts **disabled**
   (fault record checked at boot; the UI shows "Bluetooth stopped after an error") so persistent faults cannot loop.
   **Allocation failure must reach the code on target**: today `vApplicationMallocFailedHook()` reboots immediately
   (`0xF1`), so `malloc()` never returns NULL and an OOM would lose an active recording. Under `BT=1` the hook only
-  counts failures and records the largest failed size (telemetry) and returns, so `pvPortMalloc()` returns NULL and
+  counts failures and returns, so `pvPortMalloc()` returns NULL and
   callers fail soft; kernel objects created at boot are checked by their callers (existing `openfw_rtos_fatal` on a
   failed boot-time create). The failed size is recorded by the `malloc` wrapper (`bt_port_heap.c`; the hook has no
   size argument). The WDT supervisor tolerates the 2 s graceful window.
   Tests: (a) host: allocation failure held active from the RX failure through recovery → hard path, recording valid,
-  next boot BT off; (b) host: worker stalled at each blocking point (BTC queue full with its consumer stalled before the
+  next boot BT off, and identifiable PCM fed throughout is continuous in the finalised file (no silence substitution);
+  (b) host: worker stalled at each blocking point (BTC queue full with its consumer stalled before the
   disable post; disable completion withheld; deinit post blocked; deinit completion withheld) → app reaches the hard
-  path within 2 s and finalises the recording; (c) target (QEMU +
+  path within 2 s and finalises the recording with continuous audio; (c) target (QEMU +
   silicon): exhaust the real heap_5 allocator with a recording active → no `0xF1` reboot, recording finalised, BT
   fault record `0xB1`.
 
@@ -371,8 +374,7 @@ telemetry: heap/stack watermarks, largest free block, IRQ-26 latency and multipl
 
 ## 9. Open questions for reviewers (round 3)
 
-1. Does the v14 `bt_recover` worker (app waits with one absolute deadline, never calls Bluedroid during recovery)
-   resolve round 12?
+1. Does v15 (app keeps servicing the recorder during the recovery wait) resolve round 13?
 2. Any remaining blocker to starting steps 1–3?
 
 ## 10. Live log
@@ -395,7 +397,8 @@ telemetry: heap/stack watermarks, largest free block, IRQ-26 latency and multipl
   reviewers found the same 2 items (malloc-failed hook reboots; disable waits forever). Plan v13. Round 12: both found
   unbounded posts before/after the timed wait (disable and deinit). Plan v14 moves graceful recovery into a worker
   whose blocking cannot affect the app. Code so far: step 1 complete; step 2 entropy/DRBG, `bt_alarm`, non-rebooting
-  malloc hook committed with host/QEMU tests.
+  malloc hook committed with host/QEMU tests. Round 13: agy APPROVE; Codex 1 item (recovery wait starves the
+  recorder). Plan v15.
 
 ## 11. Round-1 traceability
 
@@ -455,3 +458,6 @@ telemetry: heap/stack watermarks, largest free block, IRQ-26 latency and multipl
 | **Round 12** | |
 | Codex+agy N1 (disable/deinit block on posts before any timed wait) | `bt_recover` worker; app waits with one absolute deadline and never calls Bluedroid in recovery; stall tests at each blocking point; timed-variant patches dropped |
 | agy NB (hook has no size) | failed size recorded in the `malloc` wrapper |
+| **Round 13** | |
+| Codex N1 (recovery wait drops audio) | app keeps calling `recorder_poll()` while waiting; continuity test with identifiable PCM |
+| agy NB (bt_recover memory; wording) | static in `.rtos_static`, created once; hook wording fixed |
