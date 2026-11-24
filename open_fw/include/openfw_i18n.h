@@ -96,6 +96,9 @@ typedef enum {
     UI_STR_NEXT,
     UI_STR_PAUSE,
     UI_STR_PLAY,
+    UI_STR_FAST,               /* player speed dial: forward 2x/4x */
+    UI_STR_REVERSE,            /* reverse -1x..-4x */
+    UI_STR_SEEKING,            /* silent 8x and above, either way */
 
     /* Delete confirm */
     UI_STR_DELETE_Q,
@@ -119,6 +122,7 @@ typedef enum {
     UI_STR_SND_CLARITY,
     UI_STR_SND_BYPASS,
     UI_STR_SKIP_TRACK,
+    UI_STR_SKIP_SPEED,
     UI_STR_NEVER,
     UI_STR_ON,
     UI_STR_OFF,

@@ -29,7 +29,7 @@ python3 web_emu/serve.py --open
 
 Features included in the browser emulator:
 - Real `160×80` ST7735S RGB565 display + PWM3 backlight dimming + clickable/keyboard-mapped physical buttons (`R` REC slide switch, `←`/`→` Prev/Next, `↑`/`↓` Volume, `Enter`/`O` OK, `B`/`Delete`/`Esc` Back, `P`/`Space` Power).
-- Real 16 kHz stereo Web Audio API playback over a zero-allocation `SharedArrayBuffer` ring buffer (including pitch-preserving `2×–5×` hold-scrubbing and `PB30` speaker PA / `PB11` headphone jack toggles).
+- Real 16 kHz stereo Web Audio API playback over a zero-allocation `SharedArrayBuffer` ring buffer (including the pitch-preserving `2×`/`4×`/reverse speed dial and `PB30` speaker PA / `PB11` headphone jack toggles).
 - Live browser microphone recording (or built-in synthetic voice/formant generator) into a real in-memory **32 MiB exFAT** microSD card preloaded with the Cassini mission's final moments (`cassini-final-moments.wav` + 4-speaker synced `.cwx` transcript) and 1-click `.wav` download.
 - Works on static HTTPS hosts (such as GitHub Pages) via `web_emu/coi-serviceworker.js`.
 
