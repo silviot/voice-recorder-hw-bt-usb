@@ -1,9 +1,9 @@
-# Bluetooth Classic for open_fw — Integration Plan (v9, for joint review)
+# Bluetooth Classic for open_fw — Integration Plan (v10, for joint review)
 
 Branch `feat/freertos-bluedroid` (worktree `../voice-recorder-hw-bt-usb-bt`). Hardware: Smartlink SL6801 `HW_76`
 (dual Cortex-M4F @ 96 MHz, 512 KB SRAM, 2 MB SPI NOR XIP, **BR/EDR-only** RivieraWaves `RW-BT` controller in mask ROM,
 no BLE). This document is the single source of truth: it is reviewed by Codex and agy until both agree, then executed.
-v3–v9 address rounds 1–7 (§11 traceability).
+v3–v10 address rounds 1–8 (§11 traceability).
 
 ## 0. Goals, non-goals
 
@@ -149,6 +149,13 @@ Acceptance budget per mode: minimum free heap under traffic ≥ 8 KB and largest
   fragment state or marking the transport busy — with zero credits ACL is simply not selected (data stays in EM) and
   events keep flowing; (3) a credit return (`0C35` from the host) kicks the dispatcher. Events have their own ring with
   reserved slots for CC/CS/NOCP. Test: event delivery with zero credits and an empty ACL ring; credit return resumes ACL.
+  **Host side of the credit return**: Bluedroid queues `0C35` like any command and hciT checks `command_credits > 0`
+  before dequeuing (`hci_layer.c`), so with zero command credits a credit return could never leave the host. The HCI
+  spec allows Host Number Of Completed Packets regardless of Num_HCI_Command_Packets; a documented `hci_layer.c` patch
+  gives NOACK commands (`0C35`) their own queue, drained ahead of the credit check (and ahead of credit-blocked
+  ordinary commands); `bt_ctrl` handles `0C35` locally without consuming a controller command credit. Test through
+  hciT: command credits 0, ACL window exhausted, an ordinary command already queued → `0C35` still reaches `bt_ctrl`
+  and inbound ACL resumes.
   Whether the ROM's `eif_write` stream lets events overtake a deferred ACL fragment is an Exp 1 stage-C question; if it
   does not, ACL-ring saturation is handled as a controlled link disconnect, not assumed impossible.
   `bt_dlv` delivers to the host callback and is the only context that may block in Bluedroid's queues; it checks the
@@ -207,7 +214,8 @@ Acceptance budget per mode: minimum free heap under traffic ≥ 8 KB and largest
      critical section, which also removes the alarm from both lists. There is no command queue, so nothing can lag behind
      a cancel or re-arm.
   2. A `bt_alarm` task (priority just below `bt_ctrl`, ~1 KB stack) sleeps in `ulTaskNotifyTake()` with a timeout to the
-     earliest deadline; set/cancel call `xTaskNotifyGive()` (cannot fail) when the earliest deadline changes. On wake it
+     earliest deadline (any positive remaining time rounded **up** to ≥ 1 tick, clamped below `portMAX_DELAY`, so it
+     never busy-spins inside a tick); set/cancel call `xTaskNotifyGive()` (cannot fail) when the earliest deadline changes. On wake it
      moves every due entry, stamped with the `generation` it was armed with, from the deadline list to the pending list
      (one-shots leave the deadline list; periodics are re-inserted at `deadline + period`, coalescing if late), then posts
      a drain work item to BTC with **`osi_thread_post(btc_thread, drain_fn, NULL, 0, 0)`** (allocation-free; a failure
@@ -326,7 +334,7 @@ telemetry: heap/stack watermarks, largest free block, IRQ-26 latency and multipl
 
 ## 9. Open questions for reviewers (round 3)
 
-1. Does the v9 `bt_alarm` service (caller-synchronous generation, no timer command queue) resolve the round-7 item?
+1. Does the v10 NOACK path for `0C35` resolve the round-8 item?
 2. Any remaining blocker to starting steps 1–3?
 
 ## 10. Live log
@@ -341,7 +349,9 @@ telemetry: heap/stack watermarks, largest free block, IRQ-26 latency and multipl
   cancel). Plan v7 replaces the retry-timer approach. Round 6: agy APPROVE_WITH_CHANGES (no blockers); Codex 2 items
   (allocation-failure wakeup; validate-then-callback race). Plan v8 written. Step-1 build plumbing in progress.
   Round 7: agy APPROVE; Codex 1 item (FreeRTOS timer command lag lets an old expiry carry the new generation). Plan v9
-  replaces FreeRTOS software timers for BT alarms with the `bt_alarm` service.
+  replaces FreeRTOS software timers for BT alarms with the `bt_alarm` service. Step 1 build plumbing committed
+  (`fc8402e`: BT=1 links Bluedroid, `.bt_data`/`.bt_bss`, link roots, QEMU 12/12). Round 8: agy APPROVE; Codex 1 item
+  (`0C35` blocked by hciT command credits). Plan v10.
 
 ## 11. Round-1 traceability
 
@@ -387,3 +397,6 @@ telemetry: heap/stack watermarks, largest free block, IRQ-26 latency and multipl
 | agy NB2 (hook placement, flag hygiene, memset) | end of `btc_thread_handler()`; flag cleared on failure/start; generation preserved |
 | **Round 7** | |
 | Codex N1 (timer command lag: old expiry stamped with new generation) | `bt_alarm` service: caller-synchronous list + generation under one critical section; no FreeRTOS timer queue; interleaving tests |
+| **Round 8** | |
+| Codex N1 (`0C35` cannot leave hciT at zero command credits) | `hci_layer.c` NOACK queue ahead of the credit check; local `0C35` in bt_ctrl; through-hciT test |
+| agy NB (sub-tick busy spin) | wait rounded up to ≥ 1 tick |
