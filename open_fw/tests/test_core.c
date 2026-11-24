@@ -1776,7 +1776,7 @@ static void run_exfat_img_test(const char *path)
 
     /* Persistent settings (/cassini/settings.bin) round-trip, clamping, and CRC-16 rejection */
     ui_settings_t cfg_def = {
-        .reserved0 = 0u, .mic_gain = 20u, .sound_mode = 0u, .channels = 2u,
+        .lang = UI_LANG_EN, .mic_gain = 20u, .sound_mode = 0u, .channels = 2u,
         .vor_enabled = 0u, .brightness_idx = 3u, .screen_off_idx = UI_SCR_OFF_30S,
         .skip_mode = UI_SKIP_5_10, .hp_vol = 18u, .spk_vol = 18u
     };
@@ -1792,7 +1792,7 @@ static void run_exfat_img_test(const char *path)
 
     /* Save custom settings & last-played state, remount, and verify round-trip */
     ui_settings_t cfg_save = {
-        .reserved0 = 0u, .mic_gain = 27u, .sound_mode = AUDIO_DSP_ASR_RAW, .channels = 1u,
+        .lang = UI_LANG_IT, .mic_gain = 27u, .sound_mode = AUDIO_DSP_ASR_RAW, .channels = 1u,
         .vor_enabled = 1u, .brightness_idx = 4u, .screen_off_idx = UI_SCR_OFF_5M,
         .skip_mode = UI_SKIP_10_30, .hp_vol = 22u, .spk_vol = 14u
     };
@@ -1806,13 +1806,13 @@ static void run_exfat_img_test(const char *path)
 
     /* Overwrite with out-of-range values -> verify clamping on save/load */
     ui_settings_t cfg_oob = {
-        .reserved0 = 5u, .mic_gain = 99u, .sound_mode = 7u, .channels = 9u,
+        .lang = 99u, .mic_gain = 99u, .sound_mode = 7u, .channels = 9u,
         .vor_enabled = 3u, .brightness_idx = 9u, .screen_off_idx = 9u,
         .skip_mode = 9u, .hp_vol = 99u, .spk_vol = 99u
     };
     assert(ui_persist_save(&vol3, &cfg_oob, "", 123u, 0) == 0);
     assert(ui_persist_load(&vol3, &cfg_load, last_name, &last_resume, &has_last) == 0);
-    assert(cfg_load.reserved0 == 0u && cfg_load.mic_gain == 31u && cfg_load.sound_mode == AUDIO_DSP_VOICE_CLARITY);
+    assert(cfg_load.lang == UI_LANG_EN && cfg_load.mic_gain == 31u && cfg_load.sound_mode == AUDIO_DSP_VOICE_CLARITY);
     assert(cfg_load.channels == 2u && cfg_load.vor_enabled == 1u && cfg_load.brightness_idx == 3u);
     assert(cfg_load.screen_off_idx == UI_SCR_OFF_30S && cfg_load.skip_mode == UI_SKIP_5_10);
     assert(cfg_load.hp_vol == 31u && cfg_load.spk_vol == 31u);

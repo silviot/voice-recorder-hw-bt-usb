@@ -671,6 +671,78 @@ int main(int argc, char **argv)
     /* Verify UI_SCR_OFF cleanly renders and reports final LVGL heap stats */
     ui_render_screen(UI_SCR_OFF, &m);
     sample_heap("off");
+
+    /* Verify i18n: all 17 languages have non-empty strings and 100% glyph coverage
+     * in ui_font_sm and ui_font_md (zero missing glyphs / tofu boxes). */
+    {
+        size_t total_strings = 0u;
+        size_t total_glyphs  = 0u;
+        for (uint8_t lang = 0u; lang < (uint8_t)UI_LANG_COUNT; lang++) {
+            const char *lname = ui_lang_native_name(lang);
+            assert(lname && lname[0] != '\0');
+            const char *check_list[UI_STR_COUNT + 1 + 7 + 12];
+            size_t ncheck = 0u;
+            check_list[ncheck++] = lname;
+            for (uint8_t w = 0u; w < 7u; w++) {
+                check_list[ncheck++] = ui_i18n_weekday(lang, w);
+            }
+            for (uint8_t mo = 1u; mo <= 12u; mo++) {
+                check_list[ncheck++] = ui_i18n_month(lang, mo);
+            }
+            for (unsigned id = 0u; id < (unsigned)UI_STR_COUNT; id++) {
+                check_list[ncheck++] = ui_tr_lang(lang, (ui_str_id_t)id);
+            }
+            for (size_t si = 0u; si < ncheck; si++) {
+                const uint8_t *p = (const uint8_t *)check_list[si];
+                assert(p && p[0] != '\0');
+                total_strings++;
+                while (*p) {
+                    uint32_t cp = 0u;
+                    if (*p < 0x80u) {
+                        cp = *p++;
+                    } else if ((*p & 0xE0u) == 0xC0u) {
+                        cp = ((uint32_t)(p[0] & 0x1Fu) << 6) | (uint32_t)(p[1] & 0x3Fu);
+                        p += 2;
+                    } else if ((*p & 0xF0u) == 0xE0u) {
+                        cp = ((uint32_t)(p[0] & 0x0Fu) << 12) | ((uint32_t)(p[1] & 0x3Fu) << 6) |
+                             (uint32_t)(p[2] & 0x3Fu);
+                        p += 3;
+                    } else {
+                        assert(!"Unexpected 4-byte UTF-8 in i18n table");
+                    }
+                    lv_font_glyph_dsc_t dsc_sm, dsc_md;
+                    if (!lv_font_get_glyph_dsc(&ui_font_sm, &dsc_sm, cp, 0u) ||
+                        !lv_font_get_glyph_dsc(&ui_font_md, &dsc_md, cp, 0u)) {
+                        fprintf(stderr, "Missing glyph U+%04X in lang=%u (%s) string=\"%s\"\n",
+                                (unsigned)cp, (unsigned)lang, lname, check_list[si]);
+                        assert(0);
+                    }
+                    total_glyphs++;
+                }
+            }
+        }
+        /* Render key screens across representative languages (incl. Bulgarian Cyrillic,
+         * Polish, Czech, Hungarian, Romanian, German, Italian) to verify zero layout/heap issues */
+        static const uint8_t sample_langs[] = {
+            UI_LANG_IT, UI_LANG_FR, UI_LANG_DE, UI_LANG_PL,
+            UI_LANG_CS, UI_LANG_HU, UI_LANG_BG, UI_LANG_RO
+        };
+        for (size_t li = 0u; li < sizeof(sample_langs) / sizeof(sample_langs[0]); li++) {
+            m.cfg.lang   = sample_langs[li];
+            m.set_sel    = 8;
+            m.set_scroll = 6;
+            ui_render_screen(UI_SCR_SETTINGS, &m);
+            ui_render_screen(UI_SCR_HOME, &m);
+            ui_render_screen(UI_SCR_ABOUT, &m);
+            ui_render_screen(UI_SCR_POWER, &m);
+        }
+        m.cfg.lang = UI_LANG_EN;
+        ui_i18n_set_lang(UI_LANG_EN);
+        ui_render_screen(UI_SCR_OFF, &m);
+        printf("i18n check OK: %u languages, %zu strings, %zu glyphs verified in sm/md fonts\n",
+               (unsigned)UI_LANG_COUNT, total_strings, total_glyphs);
+    }
+
     {
         lv_mem_monitor_t mon;
         lv_mem_monitor(&mon);

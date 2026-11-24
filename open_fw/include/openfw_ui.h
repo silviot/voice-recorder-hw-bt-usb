@@ -13,6 +13,7 @@
 #include <stdint.h>
 #include "openfw.h"
 #include "openfw_cwx.h"
+#include "openfw_i18n.h"
 
 /* =========================================================================
  * 14-Color RGB565 Palette (exact hardware panel values)
@@ -129,7 +130,7 @@ typedef enum {
 } ui_screen_off_t;
 
 typedef struct {
-    uint8_t reserved0;      /* reserved (0); keeps openfw_persist_t 64-byte layout */
+    uint8_t lang;           /* ui_lang_t (0=English default); keeps openfw_persist_t 64-byte layout */
     uint8_t mic_gain;       /* 0..31 (default 20) */
     uint8_t sound_mode;     /* 0=Raw, 1=Clarity (default), 2=Bypass */
     uint8_t channels;       /* 1=1ch, 2=2ch (default) */

@@ -777,7 +777,7 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
                 player_pause_rewind(&winfo, &data_off, &played_frames,
                                     &buf_pos, &buf_frames, &skip_frames);
                 str_copy_cap(m->toast_msg, (int)sizeof(m->toast_msg),
-                             "Headphones out \xC2\xB7 paused");
+                             ui_tr_lang(m->cfg.lang, UI_STR_TOAST_HP_PAUSED));
                 m->toast_col = UI_COL_AMBER;
                 toast_until  = now + 1500u;
             } else {
@@ -870,7 +870,7 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
                 break;
             }
             str_copy_cap(m->toast_msg, (int)sizeof(m->toast_msg),
-                         (file_dir > 0) ? "End of list" : "Start of list");
+                         ui_tr_lang(m->cfg.lang, (file_dir > 0) ? UI_STR_TOAST_END_LIST : UI_STR_TOAST_START_LIST));
             m->toast_col = UI_COL_AMBER;
             toast_until  = now + 1500u;
             ui_dirty     = 1;

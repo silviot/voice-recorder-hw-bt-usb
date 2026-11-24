@@ -58,22 +58,26 @@ static void start_ease_out_anim(lv_obj_t *obj, lv_anim_exec_xcb_t cb,
  * ========================================================================= */
 static const char *sound_mode_name(uint8_t mode)
 {
-    if (mode == 0u) return "Raw";
-    if (mode == 1u) return "Clarity";
-    return "Bypass";
+    if (mode == 0u) return ui_tr(UI_STR_SND_RAW);
+    if (mode == 1u) return ui_tr(UI_STR_SND_CLARITY);
+    return ui_tr(UI_STR_SND_BYPASS);
 }
 
 static const char *skip_mode_name(uint8_t mode)
 {
     if (mode == UI_SKIP_5_10)  return "5 / 10s";
     if (mode == UI_SKIP_10_30) return "10 / 30s";
-    return "Track";
+    return ui_tr(UI_STR_SKIP_TRACK);
 }
 
 static const char *screen_off_name(uint8_t idx)
 {
-    static const char *const names[5] = { "15s", "30s", "1m", "5m", "Never" };
-    return (idx < 5u) ? names[idx] : "30s";
+    if (idx == 0u) return "15s";
+    if (idx == 1u) return "30s";
+    if (idx == 2u) return "1m";
+    if (idx == 3u) return "5m";
+    if (idx == 4u) return ui_tr(UI_STR_NEVER);
+    return "30s";
 }
 
 static int is_generic_recording_name(const char *name)
@@ -117,7 +121,7 @@ static void format_file_title(char *dst, int cap,
 
 void ui_settings_defaults(ui_settings_t *cfg)
 {
-    cfg->reserved0      = 0u;
+    cfg->lang           = (uint8_t)UI_LANG_EN;
     cfg->mic_gain       = 20u;
     cfg->sound_mode     = AUDIO_DSP_DEFAULT_PROFILE;
     cfg->channels       = 2u;
@@ -437,41 +441,43 @@ static void home_scroll_event(lv_event_t *event)
 
 static void bind_home_detail(const ui_model_t *m, unsigned page, lv_obj_t *title, lv_obj_t *detail)
 {
-    char l1[48] = "", l2[48] = "";
+    char l1[64] = "", l2[64] = "";
     uint32_t col1 = UI_HEX_TEXT;
     if (!m->sd_ok) {
-        lv_snprintf(l1, sizeof(l1), "Storage error");
-        lv_snprintf(l2, sizeof(l2), "Connect USB to check it");
+        lv_snprintf(l1, sizeof(l1), "%s", ui_tr(UI_STR_STORAGE_ERROR));
+        lv_snprintf(l2, sizeof(l2), "%s", ui_tr(UI_STR_CONNECT_USB_CHECK));
         col1 = UI_HEX_RED;
     } else if (page == 0u) {
         if (!m->has_last) {
-            lv_snprintf(l1, sizeof(l1), "Nothing played yet");
+            lv_snprintf(l1, sizeof(l1), "%s", ui_tr(UI_STR_NOTHING_PLAYED));
             col1 = UI_HEX_DIM;
         } else {
-            char dt_s[28], dur_s[12], res_s[12];
+            char dt_s[32], dur_s[12], res_s[12];
             format_file_title(dt_s, (int)sizeof(dt_s), &m->now, &m->last_file);
             ui_format_duration(dur_s, (int)sizeof(dur_s), m->last_file.duration_sec);
             lv_snprintf(l1, sizeof(l1), "%s \xC2\xB7 %s", dt_s, dur_s);
             if (m->last_file.resume_sec > 0u) {
                 ui_format_duration(res_s, (int)sizeof(res_s), m->last_file.resume_sec);
-                lv_snprintf(l2, sizeof(l2), "Resume at %s", res_s);
+                lv_snprintf(l2, sizeof(l2), ui_tr(UI_STR_RESUME_AT_FMT), res_s);
             } else {
-                lv_snprintf(l2, sizeof(l2), "Play from start");
+                lv_snprintf(l2, sizeof(l2), "%s", ui_tr(UI_STR_PLAY_FROM_START));
             }
         }
     } else if (page == 1u) {
         char free_s[20];
         ui_format_free_time(free_s, (int)sizeof(free_s), m->sd_free_sec);
-        lv_snprintf(l1, sizeof(l1), "%d %s", m->file_count, (m->file_count == 1) ? "recording" : "recordings");
-        lv_snprintf(l2, sizeof(l2), "%s of space left", free_s);
+        lv_snprintf(l1, sizeof(l1), "%d %s", m->file_count,
+                    ui_tr((m->file_count == 1) ? UI_STR_RECORDING_ONE : UI_STR_RECORDING_MANY));
+        lv_snprintf(l2, sizeof(l2), ui_tr(UI_STR_SPACE_LEFT_FMT), free_s);
     } else if (page == 2u) {
-        lv_snprintf(l1, sizeof(l1), "Gain %u \xC2\xB7 %s \xC2\xB7 %s",
-                    (unsigned)m->cfg.mic_gain, (m->cfg.channels == 1u) ? "1ch" : "2ch",
+        lv_snprintf(l1, sizeof(l1), "%s %u \xC2\xB7 %s \xC2\xB7 %s",
+                    ui_tr(UI_STR_GAIN), (unsigned)m->cfg.mic_gain,
+                    (m->cfg.channels == 1u) ? "1ch" : "2ch",
                     sound_mode_name(m->cfg.sound_mode));
-        lv_snprintf(l2, sizeof(l2), "%s", m->cfg.vor_enabled ? "Voice trigger on" : "Voice trigger off");
+        lv_snprintf(l2, sizeof(l2), "%s", ui_tr(m->cfg.vor_enabled ? UI_STR_VOR_ON : UI_STR_VOR_OFF));
     } else {
-        lv_snprintf(l1, sizeof(l1), "Bluetooth file sync");
-        lv_snprintf(l2, sizeof(l2), "Device name %s", m->bt_name[0] ? m->bt_name : "HW_76");
+        lv_snprintf(l1, sizeof(l1), "%s", ui_tr(UI_STR_BT_FILE_SYNC));
+        lv_snprintf(l2, sizeof(l2), ui_tr(UI_STR_DEVICE_NAME_FMT), m->bt_name[0] ? m->bt_name : "HW_76");
     }
     set_changed_text(title, l1);
     set_changed_text_color(title, lv_color_hex(col1));
@@ -480,7 +486,7 @@ static void bind_home_detail(const ui_model_t *m, unsigned page, lv_obj_t *title
 
 static void bind_home(const ui_model_t *m, bool entering)
 {
-    char date_str[20];
+    char date_str[28];
     lv_snprintf(date_str, sizeof(date_str), "%s %u %s",
                 ui_weekday_name(m->now.year, m->now.month, m->now.day),
                 (unsigned)m->now.day, ui_month_name(m->now.month));
@@ -492,6 +498,10 @@ static void bind_home(const ui_model_t *m, bool entering)
     lv_obj_t *tiles[4] = { objects.home_tile_0, objects.home_tile_1, objects.home_tile_2, objects.home_tile_3 };
     lv_obj_t *ics[4]   = { objects.home_tile_ic_0, objects.home_tile_ic_1, objects.home_tile_ic_2, objects.home_tile_ic_3 };
     lv_obj_t *lbls[4]  = { objects.home_tile_lbl_0, objects.home_tile_lbl_1, objects.home_tile_lbl_2, objects.home_tile_lbl_3 };
+    set_changed_text(lbls[0], ui_tr(UI_STR_TILE_LAST));
+    set_changed_text(lbls[1], ui_tr(UI_STR_TILE_FILES));
+    set_changed_text(lbls[2], ui_tr(UI_STR_TILE_SETUP));
+    set_changed_text(lbls[3], ui_tr(UI_STR_TILE_SYNC));
     static uint8_t previous_focus;
     uint8_t focus = (m->home_focus < 4u) ? m->home_focus : 3u;
     if (entering || focus != previous_focus) {
@@ -544,7 +554,7 @@ static void bind_rec(const ui_model_t *m, bool entering)
                         objects.rec_bar_r, objects.rec_bar_hp, objects.rec_batt,
                         objects.rec_batt_fill, objects.rec_batt_nub,
                         m, UI_COL_AMBER, UI_COL_BLACK, UI_ICON_PAUSE, UI_COL_BLACK,
-                        "Waiting for voice", NULL, NULL, 1);
+                        ui_tr(UI_STR_WAITING_VOICE), NULL, NULL, 1);
     } else {
         bind_status_bar(objects.rec_bar, objects.rec_bar_ic, objects.rec_bar_l, objects.rec_bar_sub,
                         objects.rec_bar_r, objects.rec_bar_hp, objects.rec_batt,
@@ -553,13 +563,13 @@ static void bind_rec(const ui_model_t *m, bool entering)
                         m->rec_blink ? UI_COL_TEXT : UI_COL_REC_DIM, "REC", NULL, badge, 1);
     }
 
-    char tbuf[16], gbuf[16], free_s[24], ftxt[32];
+    char tbuf[16], gbuf[24], free_s[24], ftxt[40];
     ui_format_duration(tbuf, (int)sizeof(tbuf), m->rec_sec);
     set_changed_text(objects.rec_timer, tbuf);
     set_changed_text_color(objects.rec_timer,
                            lv_color_hex(m->rec_vor_wait ? UI_HEX_MUTE : UI_HEX_TEXT));
 
-    lv_snprintf(gbuf, sizeof(gbuf), "Gain %u", (unsigned)m->cfg.mic_gain);
+    lv_snprintf(gbuf, sizeof(gbuf), "%s %u", ui_tr(UI_STR_GAIN), (unsigned)m->cfg.mic_gain);
     set_changed_text(objects.rec_gain_lbl, gbuf);
     set_changed_bg_color(objects.rec_gain_pill,
                          lv_color_hex(m->rec_gain_bar ? UI_HEX_CYAN : UI_HEX_TILE));
@@ -567,7 +577,7 @@ static void bind_rec(const ui_model_t *m, bool entering)
                            lv_color_hex(m->rec_gain_bar ? UI_HEX_BLACK : UI_HEX_TEXT));
 
     ui_format_free_time(free_s, (int)sizeof(free_s), m->sd_free_sec);
-    lv_snprintf(ftxt, sizeof(ftxt), "%s left", free_s);
+    lv_snprintf(ftxt, sizeof(ftxt), ui_tr(UI_STR_LEFT_FMT), free_s);
     set_changed_text(objects.rec_free_lbl, ftxt);
     set_changed_text_color(objects.rec_free_lbl,
                            lv_color_hex((m->sd_free_sec < 600u) ? UI_HEX_AMBER : UI_HEX_DIM));
@@ -629,7 +639,7 @@ static void bind_rec(const ui_model_t *m, bool entering)
         set_hidden(objects.rec_foot_bar, true);
         set_hidden(objects.rec_foot_right, true);
         set_hidden(objects.rec_foot_left, false);
-        set_changed_text(objects.rec_foot_left, "Resumes when you speak");
+        set_changed_text(objects.rec_foot_left, ui_tr(UI_STR_RESUMES_SPEAK));
         set_changed_text_color(objects.rec_foot_left, lv_color_hex(UI_HEX_DIM));
         set_changed_text_align(objects.rec_foot_left, LV_TEXT_ALIGN_CENTER);
         set_changed_width(objects.rec_foot_left, 152);
@@ -648,7 +658,7 @@ static void bind_rec(const ui_model_t *m, bool entering)
             set_changed_text(objects.rec_foot_right, mb);
             set_changed_text_color(objects.rec_foot_right, lv_color_hex(UI_HEX_CYAN));
         } else {
-            set_changed_text(objects.rec_foot_right, "OK Mark");
+            set_changed_text(objects.rec_foot_right, ui_tr(UI_STR_OK_MARK));
             set_changed_text_color(objects.rec_foot_right, lv_color_hex(UI_HEX_DIM));
         }
     }
@@ -657,6 +667,7 @@ static void bind_rec(const ui_model_t *m, bool entering)
 void ui_rec_update_live_sync(const ui_model_t *m)
 {
     if (!m || s_active_eez_scr != SCREEN_ID_REC) return;
+    ui_i18n_set_lang(m->cfg.lang);
     if (m->spec && objects.rec_spec_img) {
         lv_obj_invalidate(objects.rec_spec_img);
         s_last_spec_ptr = m->spec;
@@ -680,26 +691,26 @@ static void bind_rec_err(const ui_model_t *m)
         bind_status_bar(objects.rec_err_bar, objects.rec_err_bar_ic, objects.rec_err_bar_l, objects.rec_err_bar_sub,
                         objects.rec_err_bar_r, objects.rec_err_bar_hp, objects.rec_err_batt,
                         objects.rec_err_batt_fill, objects.rec_err_batt_nub,
-                        m, UI_COL_DRED, UI_COL_TEXT, UI_ICON_STOP, UI_COL_TEXT, "Not recording", NULL, NULL, 1);
-        set_changed_text(objects.rec_err_title, "Storage error");
+                        m, UI_COL_DRED, UI_COL_TEXT, UI_ICON_STOP, UI_COL_TEXT, ui_tr(UI_STR_NOT_RECORDING), NULL, NULL, 1);
+        set_changed_text(objects.rec_err_title, ui_tr(UI_STR_STORAGE_ERROR));
         set_changed_text_color(objects.rec_err_title, lv_color_hex(UI_HEX_RED));
-        set_changed_text(objects.rec_err_l1, "Nothing is being recorded.");
-        set_changed_text(objects.rec_err_l2, "Slide REC off, then connect");
-        set_changed_text(objects.rec_err_l3, "USB to check the storage.");
+        set_changed_text(objects.rec_err_l1, ui_tr(UI_STR_NOTHING_RECORDED));
+        set_changed_text(objects.rec_err_l2, ui_tr(UI_STR_SLIDE_REC_OFF_USB));
+        set_changed_text(objects.rec_err_l3, ui_tr(UI_STR_USB_CHECK_STORAGE));
     } else {
         bind_status_bar(objects.rec_err_bar, objects.rec_err_bar_ic, objects.rec_err_bar_l, objects.rec_err_bar_sub,
                         objects.rec_err_bar_r, objects.rec_err_bar_hp, objects.rec_err_batt,
                         objects.rec_err_batt_fill, objects.rec_err_batt_nub,
-                        m, UI_COL_FAINT, UI_COL_TEXT, UI_ICON_STOP, UI_COL_TEXT, "Stopped", NULL, NULL, 1);
-        set_changed_text(objects.rec_err_title, m->rec_stop_reason[0] ? m->rec_stop_reason : "Storage full");
+                        m, UI_COL_FAINT, UI_COL_TEXT, UI_ICON_STOP, UI_COL_TEXT, ui_tr(UI_STR_STOPPED), NULL, NULL, 1);
+        set_changed_text(objects.rec_err_title, m->rec_stop_reason[0] ? m->rec_stop_reason : ui_tr(UI_STR_STORAGE_FULL));
         set_changed_text_color(objects.rec_err_title, lv_color_hex(UI_HEX_AMBER));
-        char l1[44], dur[16], l2[32];
-        lv_snprintf(l1, sizeof(l1), "Saved %s", m->rec_filename);
+        char l1[56], dur[16], l2[40];
+        lv_snprintf(l1, sizeof(l1), ui_tr(UI_STR_SAVED_FILE_FMT), m->rec_filename);
         ui_format_duration(dur, (int)sizeof(dur), m->rec_sec);
-        lv_snprintf(l2, sizeof(l2), "%s recorded", dur);
+        lv_snprintf(l2, sizeof(l2), ui_tr(UI_STR_RECORDED_FMT), dur);
         set_changed_text(objects.rec_err_l1, l1);
         set_changed_text(objects.rec_err_l2, l2);
-        set_changed_text(objects.rec_err_l3, "Slide REC off to continue");
+        set_changed_text(objects.rec_err_l3, ui_tr(UI_STR_SLIDE_REC_CONT));
     }
 }
 
@@ -708,14 +719,15 @@ static void bind_saved(const ui_model_t *m)
     bind_status_bar(objects.saved_bar, objects.saved_bar_ic, objects.saved_bar_l, objects.saved_bar_sub,
                     objects.saved_bar_r, objects.saved_bar_hp, objects.saved_batt,
                     objects.saved_batt_fill, objects.saved_batt_nub,
-                    m, UI_COL_GREEN, UI_COL_BLACK, UI_ICON_CHECK, UI_COL_BLACK, "Saved", NULL, NULL, 1);
-    char dur[16], dt_s[28], meta[44];
+                    m, UI_COL_GREEN, UI_COL_BLACK, UI_ICON_CHECK, UI_COL_BLACK, ui_tr(UI_STR_SAVED), NULL, NULL, 1);
+    char dur[16], dt_s[32], meta[48];
     ui_format_duration(dur, (int)sizeof(dur), m->saved_sec);
     ui_format_date_label(dt_s, (int)sizeof(dt_s), &m->now, &m->saved_dt);
     lv_snprintf(meta, sizeof(meta), "%s \xC2\xB7 %s", dt_s, (m->saved_channels == 1u) ? "1ch" : "2ch");
     set_changed_text(objects.saved_dur, dur);
     set_changed_text(objects.saved_meta, meta);
     set_changed_text(objects.saved_file, m->saved_filename);
+    set_changed_text(objects.saved_footer, ui_tr(UI_STR_SAVED_FOOTER));
     set_changed_bar_value(objects.saved_prog, (int32_t)m->saved_frac_pct);
 }
 
@@ -731,7 +743,8 @@ static void bind_files(const ui_model_t *m)
                     objects.files_bar_r, objects.files_bar_hp, objects.files_batt,
                     objects.files_batt_fill, objects.files_batt_nub,
                     m, UI_COL_BAR, UI_COL_TEXT, UI_ICON_NONE, UI_COL_TEXT,
-                    m->files_title[0] ? m->files_title : "Files", sub, NULL, 0);
+                    m->files_title[0] ? m->files_title : ui_tr(UI_STR_FILES), sub, NULL, 0);
+    set_changed_text(objects.files_footer, ui_tr(UI_STR_FILES_FOOTER));
 
     lv_obj_t *rows[3]   = { objects.files_row_0, objects.files_row_1, objects.files_row_2 };
     lv_obj_t *dots[3]   = { objects.files_dot_0, objects.files_dot_1, objects.files_dot_2 };
@@ -1093,13 +1106,14 @@ static void bind_player(const ui_model_t *m, bool entering)
 
     ui_icon_t st_ic = (m->play_state == 0u) ? UI_ICON_PLAY : (m->play_state == 1u ? UI_ICON_PAUSE : UI_ICON_STOP);
     uint16_t  st_c  = (m->play_state == 0u) ? UI_COL_CYAN : (m->play_state == 1u ? UI_COL_AMBER : UI_COL_DIM);
-    const char *st_t = (m->play_state == 0u) ? "Playing" : (m->play_state == 1u ? "Paused" : "End");
+    const char *st_t = (m->play_state == 0u) ? ui_tr(UI_STR_PLAYING)
+                     : (m->play_state == 1u ? ui_tr(UI_STR_PAUSED) : ui_tr(UI_STR_END));
     bind_status_bar(objects.play_bar, objects.play_bar_ic, objects.play_bar_l, objects.play_bar_sub,
                     objects.play_bar_r, objects.play_bar_hp, objects.play_batt,
                     objects.play_batt_fill, objects.play_batt_nub,
                     m, UI_COL_BAR, st_c, st_ic, st_c, st_t, NULL, NULL, 0);
 
-    char dt_s[28], vbuf[16], pos_s[14], tmp[12], tot_s[16], ftxt[48];
+    char dt_s[32], vbuf[16], pos_s[14], tmp[12], tot_s[16], ftxt[64];
     format_file_title(dt_s, (int)sizeof(dt_s), &m->now, &m->play_file);
     set_changed_text(objects.player_date, dt_s);
 
@@ -1126,12 +1140,12 @@ static void bind_player(const ui_model_t *m, bool entering)
     set_changed_bar_value(objects.player_prog, pct);
 
     if (m->play_state == 2u) {
-        set_changed_text(objects.player_footer, m->play_has_next ? "OK Replay \xC2\xB7 \xE2\x96\xB6 Next file" : "OK Replay");
+        set_changed_text(objects.player_footer, ui_tr(m->play_has_next ? UI_STR_OK_REPLAY_NEXT : UI_STR_OK_REPLAY));
     } else {
-        const char *la = (m->cfg.skip_mode == UI_SKIP_5_10) ? "5s" : (m->cfg.skip_mode == UI_SKIP_10_30 ? "10s" : "Prev");
-        const char *ra = (m->cfg.skip_mode == UI_SKIP_5_10) ? "10s" : (m->cfg.skip_mode == UI_SKIP_10_30 ? "30s" : "Next");
+        const char *la = (m->cfg.skip_mode == UI_SKIP_5_10) ? "5s" : (m->cfg.skip_mode == UI_SKIP_10_30 ? "10s" : ui_tr(UI_STR_PREV));
+        const char *ra = (m->cfg.skip_mode == UI_SKIP_5_10) ? "10s" : (m->cfg.skip_mode == UI_SKIP_10_30 ? "30s" : ui_tr(UI_STR_NEXT));
         lv_snprintf(ftxt, sizeof(ftxt), "\xE2\x97\x80 %s \xC2\xB7 OK %s \xC2\xB7 \xE2\x96\xB6 %s",
-                    la, (m->play_state == 0u) ? "Pause" : "Play", ra);
+                    la, ui_tr((m->play_state == 0u) ? UI_STR_PAUSE : UI_STR_PLAY), ra);
         set_changed_text(objects.player_footer, ftxt);
     }
 }
@@ -1141,17 +1155,17 @@ static void bind_delete(const ui_model_t *m)
     bind_status_bar(objects.del_bar, objects.del_bar_ic, objects.del_bar_l, objects.del_bar_sub,
                     objects.del_bar_r, objects.del_bar_hp, objects.del_batt,
                     objects.del_batt_fill, objects.del_batt_nub,
-                    m, UI_COL_RED, UI_COL_TEXT, UI_ICON_NONE, UI_COL_TEXT, "Delete?", NULL, NULL, 1);
+                    m, UI_COL_RED, UI_COL_TEXT, UI_ICON_NONE, UI_COL_TEXT, ui_tr(UI_STR_DELETE_Q), NULL, NULL, 1);
     const ui_file_entry_t *f = &m->play_file;
     if (m->files && m->file_sel >= 0 && m->file_sel < m->file_count) f = &m->files[m->file_sel];
-    char dt_s[28], dur_s[12], sub[52];
+    char dt_s[32], dur_s[12], sub[52];
     format_file_title(dt_s, (int)sizeof(dt_s), &m->now, f);
     ui_format_duration(dur_s, (int)sizeof(dur_s), f->duration_sec);
     lv_snprintf(sub, sizeof(sub), "%s \xC2\xB7 %s", dur_s, f->filename);
     set_changed_text(objects.del_date, dt_s);
     set_changed_text(objects.del_sub, sub);
     set_changed_bar_value(objects.del_hold_bar, (int32_t)m->del_hold_pct);
-    set_changed_text(objects.del_footer, m->del_holding ? "Keep holding OK\xE2\x80\xA6" : "Hold OK Delete \xC2\xB7 BACK Keep");
+    set_changed_text(objects.del_footer, ui_tr(m->del_holding ? UI_STR_KEEP_HOLD_OK : UI_STR_DEL_FOOTER));
     set_changed_text_color(objects.del_footer, lv_color_hex(m->del_holding ? UI_HEX_TEXT : UI_HEX_DIM));
 }
 
@@ -1163,32 +1177,34 @@ static void format_setting_val(const ui_model_t *m, int idx, char *val, int vcap
     case 0: lv_snprintf(val, (size_t)vcap, "%u", (unsigned)m->cfg.mic_gain); break;
     case 1: lv_snprintf(val, (size_t)vcap, "%s", sound_mode_name(m->cfg.sound_mode)); break;
     case 2: lv_snprintf(val, (size_t)vcap, "%s", (m->cfg.channels == 1u) ? "1ch" : "2ch"); break;
-    case 3: lv_snprintf(val, (size_t)vcap, "%s", m->cfg.vor_enabled ? "On" : "Off"); break;
+    case 3: lv_snprintf(val, (size_t)vcap, "%s", ui_tr(m->cfg.vor_enabled ? UI_STR_ON : UI_STR_OFF)); break;
     case 4: lv_snprintf(val, (size_t)vcap, "%u%%", (unsigned)brt_pct[m->cfg.brightness_idx < 5u ? m->cfg.brightness_idx : 3u]); break;
     case 5: lv_snprintf(val, (size_t)vcap, "%s", screen_off_name(m->cfg.screen_off_idx)); break;
     case 6: ui_format_clock(val, vcap, m->now.hour, m->now.minute); *adj = 0; break;
     case 7: lv_snprintf(val, (size_t)vcap, "%s", skip_mode_name(m->cfg.skip_mode)); break;
-    case 8: lv_snprintf(val, (size_t)vcap, "%s", m->vbus_present ? "Connect" : "Unplugged"); *adj = 0; break;
+    case 8: lv_snprintf(val, (size_t)vcap, "%s", ui_lang_native_name(m->cfg.lang)); break;
+    case 9: lv_snprintf(val, (size_t)vcap, "%s", ui_tr(m->vbus_present ? UI_STR_CONNECT : UI_STR_UNPLUGGED)); *adj = 0; break;
     default: lv_snprintf(val, (size_t)vcap, "%s", BOARD_FW_VERSION_STR); *adj = 0; break;
     }
 }
 
 static void bind_settings(const ui_model_t *m)
 {
-    static const char *const labels[10] = {
-        "Mic gain", "Sound", "Mics", "Voice trigger",
-        "Brightness", "Screen off", "Clock", "Skip", "USB disk", "About"
+    static const ui_str_id_t label_ids[11] = {
+        UI_STR_SET_MIC_GAIN, UI_STR_SET_SOUND, UI_STR_SET_MICS, UI_STR_SET_VOR,
+        UI_STR_SET_BRIGHTNESS, UI_STR_SET_SCREEN_OFF, UI_STR_SET_CLOCK,
+        UI_STR_SET_SKIP, UI_STR_SET_LANGUAGE, UI_STR_SET_USB_DISK, UI_STR_SET_ABOUT
     };
     int sel_disp = m->set_sel;
     if (sel_disp < 0) sel_disp = 0;
-    if (sel_disp > 9) sel_disp = 9;
+    if (sel_disp > 10) sel_disp = 10;
 
     char sub[12];
-    lv_snprintf(sub, sizeof(sub), "%d / 10", sel_disp + 1);
+    lv_snprintf(sub, sizeof(sub), "%d / 11", sel_disp + 1);
     bind_status_bar(objects.set_bar, objects.set_bar_ic, objects.set_bar_l, objects.set_bar_sub,
                     objects.set_bar_r, objects.set_bar_hp, objects.set_batt,
                     objects.set_batt_fill, objects.set_batt_nub,
-                    m, UI_COL_BAR, UI_COL_TEXT, UI_ICON_NONE, UI_COL_TEXT, "Settings", sub, NULL, 0);
+                    m, UI_COL_BAR, UI_COL_TEXT, UI_ICON_NONE, UI_COL_TEXT, ui_tr(UI_STR_SETTINGS), sub, NULL, 0);
 
     lv_obj_t *rows[3] = { objects.set_row_0, objects.set_row_1, objects.set_row_2 };
     lv_obj_t *lbls[3] = { objects.set_lbl_0, objects.set_lbl_1, objects.set_lbl_2 };
@@ -1196,11 +1212,11 @@ static void bind_settings(const ui_model_t *m)
 
     for (int r = 0; r < 3; r++) {
         int idx = m->set_scroll + r;
-        if (idx < 0 || idx >= 10) { set_hidden(rows[r], true); continue; }
+        if (idx < 0 || idx >= 11) { set_hidden(rows[r], true); continue; }
         set_hidden(rows[r], false);
         int sel = (idx == m->set_sel);
         set_changed_bg_opa(rows[r], sel ? LV_OPA_COVER : LV_OPA_TRANSP);
-        set_changed_text(lbls[r], labels[idx]);
+        set_changed_text(lbls[r], ui_tr(label_ids[idx]));
 
         if (idx == 6 && sel && m->set_edit_clock != 0u) {
             char cbuf[16];
@@ -1209,7 +1225,7 @@ static void bind_settings(const ui_model_t *m)
             set_changed_text(vals[r], cbuf);
             set_changed_text_color(vals[r], lv_color_hex(UI_HEX_CYAN));
         } else {
-            char val[16], disp[24];
+            char val[24], disp[32];
             int adj = 0;
             format_setting_val(m, idx, val, (int)sizeof(val), &adj);
             if (sel && adj) {
@@ -1218,34 +1234,36 @@ static void bind_settings(const ui_model_t *m)
                 set_changed_text_color(vals[r], lv_color_hex(UI_HEX_CYAN));
             } else {
                 set_changed_text(vals[r], val);
-                set_changed_text_color(vals[r], lv_color_hex((idx == 8 && sel && m->vbus_present) ? UI_HEX_CYAN : UI_HEX_DIM));
+                set_changed_text_color(vals[r], lv_color_hex((idx == 9 && sel && m->vbus_present) ? UI_HEX_CYAN : UI_HEX_DIM));
             }
         }
     }
-    bind_scrollbar(objects.set_scroll_thumb, 10, m->set_scroll, 3, 50);
+    bind_scrollbar(objects.set_scroll_thumb, 11, m->set_scroll, 3, 50);
 
     if (m->set_edit_clock != 0u) {
         set_hidden(objects.set_foot_vu_box, true);
         set_hidden(objects.set_foot_desc, false);
-        set_changed_text(objects.set_foot_desc, "\xC2\xB1 Set \xC2\xB7 \xE2\x97\x80\xE2\x96\xB6 Field \xC2\xB7 OK Save");
+        set_changed_text(objects.set_foot_desc, ui_tr(UI_STR_CLOCK_EDIT_FOOT));
     } else if (m->set_sel == 0) {
         set_hidden(objects.set_foot_desc, true);
         set_hidden(objects.set_foot_vu_box, false);
+        set_changed_text(objects.set_foot_vu_lbl, ui_tr(UI_STR_INPUT));
         set_changed_bar_value(objects.set_foot_vu_bar, (int32_t)m->set_input_vu);
     } else {
         set_hidden(objects.set_foot_vu_box, true);
         set_hidden(objects.set_foot_desc, false);
-        const char *desc = "Version and update mode";
+        const char *desc = ui_tr(UI_STR_DESC_ABOUT);
         switch (m->set_sel) {
-        case 1: desc = (m->cfg.sound_mode == 0u) ? "Best for transcripts" :
-                       (m->cfg.sound_mode == 1u ? "More even voice levels" : "No processing at all"); break;
-        case 2: desc = (m->cfg.channels == 1u) ? "One mic, half the file size" : "Both mics, stereo"; break;
-        case 3: desc = "Pauses the file during silence"; break;
-        case 4: desc = "Lower saves battery"; break;
-        case 5: desc = "Recording continues"; break;
-        case 6: desc = "OK to edit \xC2\xB7 syncs over USB"; break;
-        case 7: desc = "Jump size in the player"; break;
-        case 8: desc = m->vbus_present ? "OK to mount as USB drive" : "Plug in USB cable first"; break;
+        case 1: desc = ui_tr((m->cfg.sound_mode == 0u) ? UI_STR_DESC_SND_RAW :
+                             (m->cfg.sound_mode == 1u ? UI_STR_DESC_SND_CLARITY : UI_STR_DESC_SND_BYPASS)); break;
+        case 2: desc = ui_tr((m->cfg.channels == 1u) ? UI_STR_DESC_MIC_1CH : UI_STR_DESC_MIC_2CH); break;
+        case 3: desc = ui_tr(UI_STR_DESC_VOR); break;
+        case 4: desc = ui_tr(UI_STR_DESC_BRIGHTNESS); break;
+        case 5: desc = ui_tr(UI_STR_DESC_SCREEN_OFF); break;
+        case 6: desc = ui_tr(UI_STR_DESC_CLOCK); break;
+        case 7: desc = ui_tr(UI_STR_DESC_SKIP); break;
+        case 8: desc = ui_tr(UI_STR_DESC_LANGUAGE); break;
+        case 9: desc = ui_tr(m->vbus_present ? UI_STR_DESC_USB_MOUNT : UI_STR_DESC_USB_PLUG); break;
         default: break;
         }
         set_changed_text(objects.set_foot_desc, desc);
@@ -1257,16 +1275,17 @@ static void bind_about(const ui_model_t *m)
     bind_status_bar(objects.about_bar, objects.about_bar_ic, objects.about_bar_l, objects.about_bar_sub,
                     objects.about_bar_r, objects.about_bar_hp, objects.about_batt,
                     objects.about_batt_fill, objects.about_batt_nub,
-                    m, UI_COL_BAR, UI_COL_TEXT, UI_ICON_NONE, UI_COL_TEXT, "About", NULL, NULL, 0);
+                    m, UI_COL_BAR, UI_COL_TEXT, UI_ICON_NONE, UI_COL_TEXT, ui_tr(UI_STR_SET_ABOUT), NULL, NULL, 0);
     set_changed_text(objects.about_title, BOARD_FW_TITLE_STR);
     uint32_t gb10 = (m->sd_total_mb * 10u) / 1024u;
-    char st[44], bt[44];
-    lv_snprintf(st, sizeof(st), "Storage %u.%u GB \xC2\xB7 %uh left",
+    char st[52], bt[52];
+    lv_snprintf(st, sizeof(st), ui_tr(UI_STR_ABOUT_STORAGE_FMT),
                 (unsigned)(gb10 / 10u), (unsigned)(gb10 % 10u), (unsigned)(m->sd_free_sec / 3600u));
-    lv_snprintf(bt, sizeof(bt), "Battery %u.%02u V \xC2\xB7 %u%%",
+    lv_snprintf(bt, sizeof(bt), ui_tr(UI_STR_ABOUT_BATT_FMT),
                 (unsigned)(m->batt_mv / 1000u), (unsigned)((m->batt_mv % 1000u) / 10u), (unsigned)m->batt_pct);
     set_changed_text(objects.about_storage, st);
     set_changed_text(objects.about_batt_lbl, bt);
+    set_changed_text(objects.about_footer, ui_tr(UI_STR_ABOUT_FOOTER));
 }
 
 static void bind_usb(const ui_model_t *m)
@@ -1275,6 +1294,8 @@ static void bind_usb(const ui_model_t *m)
                     objects.usb_bar_r, objects.usb_bar_hp, objects.usb_batt,
                     objects.usb_batt_fill, objects.usb_batt_nub,
                     m, UI_COL_BAR, UI_COL_CYAN, UI_ICON_NONE, UI_COL_TEXT, "USB", NULL, NULL, 1);
+    set_changed_text(objects.usb_title, ui_tr(UI_STR_SET_USB_DISK));
+    set_changed_text(objects.usb_eject_lbl, ui_tr(UI_STR_USB_EJECT));
     char tx_s[16], rx_s[16], tx_f[24], rx_f[24], bp[12];
     ui_format_bytes_short(tx_s, (int)sizeof(tx_s), m->usb_tx_bytes);
     ui_format_bytes_short(rx_s, (int)sizeof(rx_s), m->usb_rx_bytes);
@@ -1295,23 +1316,25 @@ static void bind_bt(const ui_model_t *m)
     bind_status_bar(objects.bt_bar, objects.bt_bar_ic, objects.bt_bar_l, objects.bt_bar_sub,
                     objects.bt_bar_r, objects.bt_bar_hp, objects.bt_batt,
                     objects.bt_batt_fill, objects.bt_batt_nub,
-                    m, UI_COL_BAR, UI_COL_TEXT, UI_ICON_NONE, UI_COL_TEXT, "Bluetooth sync", NULL, NULL, 0);
+                    m, UI_COL_BAR, UI_COL_TEXT, UI_ICON_NONE, UI_COL_TEXT, ui_tr(UI_STR_BT_SYNC), NULL, NULL, 0);
     set_changed_text(objects.bt_name_lbl, m->bt_name[0] ? m->bt_name : "HW_76");
+    set_changed_text(objects.bt_l2_lbl, ui_tr(UI_STR_BT_OPEN_APP));
+    set_changed_text(objects.bt_footer, ui_tr(UI_STR_BT_FOOTER));
     if (m->bt_state == 0u) {
-        set_changed_text(objects.bt_l1_lbl, "Waiting for phone\xE2\x80\xA6");
+        set_changed_text(objects.bt_l1_lbl, ui_tr(UI_STR_BT_WAITING));
         set_changed_text_color(objects.bt_l1_lbl, lv_color_hex(UI_HEX_DIM));
         set_hidden(objects.bt_l2_lbl, false);
         set_hidden(objects.bt_prog, true);
     } else if (m->bt_state == 1u) {
-        char cs[44];
-        lv_snprintf(cs, sizeof(cs), "\xE2\x9C\x93 Connected \xC2\xB7 %s", m->bt_peer[0] ? m->bt_peer : "Phone");
+        char cs[52];
+        lv_snprintf(cs, sizeof(cs), ui_tr(UI_STR_BT_CONNECTED_FMT), m->bt_peer[0] ? m->bt_peer : ui_tr(UI_STR_PHONE));
         set_changed_text(objects.bt_l1_lbl, cs);
         set_changed_text_color(objects.bt_l1_lbl, lv_color_hex(UI_HEX_GREEN));
         set_hidden(objects.bt_l2_lbl, true);
         set_hidden(objects.bt_prog, true);
     } else {
-        char ss[32];
-        lv_snprintf(ss, sizeof(ss), "Sending %u of %u", (unsigned)m->bt_sent, (unsigned)m->bt_total);
+        char ss[40];
+        lv_snprintf(ss, sizeof(ss), ui_tr(UI_STR_BT_SENDING_FMT), (unsigned)m->bt_sent, (unsigned)m->bt_total);
         set_changed_text(objects.bt_l1_lbl, ss);
         set_changed_text_color(objects.bt_l1_lbl, lv_color_hex(UI_HEX_TEXT));
         set_hidden(objects.bt_l2_lbl, true);
@@ -1325,10 +1348,11 @@ static void bind_charge(const ui_model_t *m)
     bind_status_bar(objects.chg_bar, objects.chg_bar_ic, objects.chg_bar_l, objects.chg_bar_sub,
                     objects.chg_bar_r, objects.chg_bar_hp, objects.chg_batt,
                     objects.chg_batt_fill, objects.chg_batt_nub,
-                    m, UI_COL_BAR, UI_COL_GREEN, UI_ICON_NONE, UI_COL_TEXT, "Charging", NULL, NULL, 0);
+                    m, UI_COL_BAR, UI_COL_GREEN, UI_ICON_NONE, UI_COL_TEXT, ui_tr(UI_STR_CHARGING), NULL, NULL, 0);
     char bp[16];
     lv_snprintf(bp, sizeof(bp), "+ %u%%", (unsigned)m->batt_pct);
     set_changed_text(objects.chg_pct_lbl, bp);
+    set_changed_text(objects.chg_footer, ui_tr(UI_STR_CHARGE_FOOTER));
 }
 
 /* =========================================================================
@@ -1357,6 +1381,7 @@ static enum ScreensEnum map_eez_screen(ui_screen_id_t scr, const ui_model_t *m)
 void ui_render_screen_sync(ui_screen_id_t scr, const ui_model_t *m)
 {
     if (!m) return;
+    ui_i18n_set_lang(m->cfg.lang);
     ui_port_init();
 #ifndef OPENFW_HOST_MMIO
     uint64_t t_start = us_timer_now();
@@ -1378,7 +1403,9 @@ void ui_render_screen_sync(ui_screen_id_t scr, const ui_model_t *m)
         bind_status_bar(objects.files_e_bar, objects.files_e_bar_ic, objects.files_e_bar_l, objects.files_e_bar_sub,
                         objects.files_e_bar_r, objects.files_e_bar_hp, objects.files_e_batt,
                         objects.files_e_batt_fill, objects.files_e_batt_nub,
-                        m, UI_COL_BAR, UI_COL_TEXT, UI_ICON_NONE, UI_COL_TEXT, "Files", NULL, NULL, 0);
+                        m, UI_COL_BAR, UI_COL_TEXT, UI_ICON_NONE, UI_COL_TEXT, ui_tr(UI_STR_FILES), NULL, NULL, 0);
+        set_changed_text(objects.files_empty_title, ui_tr(UI_STR_NO_RECORDINGS));
+        set_changed_text(objects.files_empty_foot, ui_tr(UI_STR_SLIDE_REC_RECORD));
         break;
     case SCREEN_ID_PLAYER:
     case SCREEN_ID_PLAYER_TR:      bind_player(m, entering); break;
@@ -1389,8 +1416,9 @@ void ui_render_screen_sync(ui_screen_id_t scr, const ui_model_t *m)
     case SCREEN_ID_BT:             bind_bt(m); break;
     case SCREEN_ID_CHARGE:         bind_charge(m); break;
     case SCREEN_ID_POWER:
+        set_changed_text_static(objects.pwr_title, ui_tr(UI_STR_POWER_OFF));
         set_changed_text_static(objects.pwr_sub,
-                                m->power_hold_pct == 100u ? "Powering off..." : "Keep holding POWER");
+                                ui_tr(m->power_hold_pct == 100u ? UI_STR_POWERING_OFF : UI_STR_KEEP_HOLD_PWR));
         set_changed_bar_value(objects.pwr_hold_bar, (int32_t)m->power_hold_pct);
         ui_toast_update(NULL, 0u);
         ui_port_render_now();

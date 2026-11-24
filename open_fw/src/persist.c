@@ -38,7 +38,7 @@ static void persist_copy_str(char *dst, uint32_t cap, const char *src)
 
 static void persist_clamp_settings(ui_settings_t *dst, const ui_settings_t *src)
 {
-    dst->reserved0      = 0u;
+    dst->lang           = (src->lang < (uint8_t)UI_LANG_COUNT) ? src->lang : (uint8_t)UI_LANG_EN;
     dst->mic_gain       = (src->mic_gain <= 31u) ? src->mic_gain : 31u;
     dst->sound_mode     = (src->sound_mode <= 2u) ? src->sound_mode : AUDIO_DSP_DEFAULT_PROFILE;
     dst->channels       = (src->channels == 1u || src->channels == 2u) ? src->channels : 2u;

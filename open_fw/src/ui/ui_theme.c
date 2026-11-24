@@ -5,6 +5,7 @@
  */
 #include <stdint.h>
 #include "board_config.h"
+#include "openfw_i18n.h"
 #include "ui_theme.h"
 
 static lv_obj_t *s_toast_pill       = NULL;
@@ -12,12 +13,6 @@ static lv_obj_t *s_toast_lbl        = NULL;
 static int       s_toast_visible    = 0;
 static uint16_t  s_toast_last_col   = 0u;
 static char      s_toast_last_msg[64];
-
-static const char *const k_wdays[7] = { "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun" };
-static const char *const k_months[12] = {
-    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
-};
 
 /* =========================================================================
  * Minimal Freestanding String Formatting Helpers (zero libc dependency)
@@ -145,7 +140,7 @@ static const char *weekday_from_days(int32_t days)
 {
     int32_t wd = (days + 3) % 7;
     if (wd < 0) wd += 7;
-    return k_wdays[wd];
+    return ui_i18n_weekday(ui_i18n_get_lang(), (uint8_t)wd);
 }
 
 const char *ui_weekday_name(uint16_t year, uint8_t month, uint8_t day)
@@ -157,7 +152,7 @@ const char *ui_weekday_name(uint16_t year, uint8_t month, uint8_t day)
 
 const char *ui_month_name(uint8_t month)
 {
-    return (month >= 1u && month <= 12u) ? k_months[month - 1u] : k_months[0];
+    return ui_i18n_month(ui_i18n_get_lang(), month);
 }
 
 void ui_format_date_label(char *dst, int dst_len,
@@ -166,7 +161,7 @@ void ui_format_date_label(char *dst, int dst_len,
     fmt_buf_t fb;
     fmt_init(&fb, dst, dst_len);
     if (!rec || !rec->year) {
-        fmt_puts(&fb, "Date unknown");
+        fmt_puts(&fb, ui_tr(UI_STR_DATE_UNKNOWN));
         return;
     }
 
@@ -183,11 +178,11 @@ void ui_format_date_label(char *dst, int dst_len,
         int32_t diff     = now_days - rec_days;
 
         if (diff == 0) {
-            fmt_puts(&fb, "Today "); fmt_put_2d(&fb, hh); fmt_putc(&fb, ':'); fmt_put_2d(&fb, mm);
+            fmt_puts(&fb, ui_tr(UI_STR_TODAY)); fmt_putc(&fb, ' '); fmt_put_2d(&fb, hh); fmt_putc(&fb, ':'); fmt_put_2d(&fb, mm);
             return;
         }
         if (diff == 1) {
-            fmt_puts(&fb, "Yest. "); fmt_put_2d(&fb, hh); fmt_putc(&fb, ':'); fmt_put_2d(&fb, mm);
+            fmt_puts(&fb, ui_tr(UI_STR_YESTERDAY)); fmt_putc(&fb, ' '); fmt_put_2d(&fb, hh); fmt_putc(&fb, ':'); fmt_put_2d(&fb, mm);
             return;
         }
         if (diff >= 2 && diff <= 6) {
