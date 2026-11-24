@@ -1,0 +1,14 @@
+diff --git a/open_fw/third_party/bluedroid/host/bluedroid/bta/sys/bta_sys_main.c b/open_fw/third_party/bluedroid/host/bluedroid/bta/sys/bta_sys_main.c
+index d21b9d2..34e0f70 100644
+--- a/open_fw/third_party/bluedroid/host/bluedroid/bta/sys/bta_sys_main.c
++++ b/open_fw/third_party/bluedroid/host/bluedroid/bta/sys/bta_sys_main.c
+@@ -206,6 +206,9 @@ BOOLEAN bta_sys_init_ok(void)
+ void bta_sys_free(void)
+ {
+     hash_map_free(bta_alarm_hash_map);
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++    bta_alarm_hash_map = NULL; /* open_fw patch 0031: avoid UAF/double-free if a later init fails before bta_sys_init */
++#endif
+     osi_mutex_free(&bta_alarm_lock);
+ #if BTA_DYNAMIC_MEMORY
+     FREE_AND_RESET(bta_sys_cb_ptr);

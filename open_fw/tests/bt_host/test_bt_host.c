@@ -571,6 +571,34 @@ static void scenario_deinit_hcif_handoff_oom(const baseline_t *base)
           now.bytes, now.blocks, (unsigned long)now.tasks, now.timers);
 }
 
+/* Patch 0031: bta_sys_free() left bta_alarm_hash_map non-NULL after hash_map_free(). On a FIRST boot cycle (what
+ * run_sweep.py tests, one fresh process per point), bta_alarm_hash_map starts NULL; on a SECOND init in the same
+ * boot that fails inside btu_init_core() (after btu_core_started = true, before bta_sys_init()), cleanup runs
+ * btu_task_shut_down() -> bta_sys_free() -> double-free of the first cycle's hash map. */
+static void scenario_bta_sys_double_free(const baseline_t *base)
+{
+    bth_log("[0d] patch 0031: bta_sys_free() clears bta_alarm_hash_map across a later failed init\n");
+    bth_heap_count_start();
+    CHECK(do_init() == ESP_OK, "p31 first init");
+    uint64_t total = bth_heap_counted();
+    do_teardown();
+    CHECK(total > 10u, "init allocs = %llu", (unsigned long long)total);
+    /* Sweep every init allocation on a SECOND cycle in the same process (where globals hold post-deinit state). */
+    for (uint64_t k = 1u; k <= total && g_fail == 0; k++) {
+        CHECK(bth_ctrl_open() == 0, "p31 ctrl_open");
+        bth_heap_fail_arm(k, false);
+        esp_err_t e = esp_bluedroid_init();
+        bth_heap_fail_disarm();
+        if (e == ESP_OK) {
+            CHECK(esp_bluedroid_deinit() == ESP_OK, "p31 deinit");
+        }
+        CHECK(bth_ctrl_close(4000u) == BT_CTRL_STOP_OK, "p31 ctrl_close");
+        baseline_t now;
+        CHECK(settle_to(base, &now), "after patch 0031 k=%llu: heap %zu/%zu, tasks %lu, timers %u",
+              (unsigned long long)k, now.bytes, now.blocks, (unsigned long)now.tasks, now.timers);
+    }
+}
+
 /* Allocation-failure sweep (plan M1 "general rule"; run_sweep.py). One mode per lifecycle call: the stack is brought
  * to the state before that call, the N-th allocation attempt made while the call runs (all tasks) fails, then:
  *   - the call returned ESP_OK, or an error with the API state unchanged (a clean failure);
@@ -755,6 +783,9 @@ void bth_test_task(void *arg)
     } else if (strcmp(mode, "patch30") == 0) {
         scenario_deinit_hcif_handoff_oom(&base);
         rc = g_fail ? 1 : 0;
+    } else if (strcmp(mode, "patch31") == 0) {
+        scenario_bta_sys_double_free(&base);
+        rc = g_fail ? 1 : 0;
     } else if (strcmp(mode, "noack") == 0) {
         scenario_noack_zero_credits(&base);
         rc = g_fail ? 1 : 0;
@@ -770,6 +801,9 @@ void bth_test_task(void *arg)
         }
         if (g_fail == 0) {
             scenario_deinit_hcif_handoff_oom(&base);
+        }
+        if (g_fail == 0) {
+            scenario_bta_sys_double_free(&base);
         }
         if (g_fail == 0) {
             scenario_enable_gap_disable(&base);
