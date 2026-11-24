@@ -2,6 +2,7 @@
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 #include "openfw.h"
 #include "openfw_player.h"
 #include "openfw_wav.h"
@@ -157,9 +158,18 @@ void audio_dac_stop(void) { if (strict) assert(!count); count = 0; }
 void audio_dac_set_volume(uint8_t level, uint16_t digital) { (void)level; (void)digital; vol_calls++; }
 void audio_dac_set_mute(int mute) { (void)mute; }
 
+static const char *marker_path;   /* existing .autoplay file (exFAT: case-insensitive) */
+static char last_lookup[128];
+static uint8_t marker_is_dir;
+
 int exfat_find_path(const exfat_vol_t *vol, const char *path, exfat_entry_t *ent)
 {
     (void)vol;
+    snprintf(last_lookup, sizeof(last_lookup), "%s", path);
+    if (marker_path && strcasecmp(path, marker_path) == 0) {
+        *ent = (exfat_entry_t){ .size = 0u, .is_dir = marker_is_dir };
+        return 0;
+    }
     if (strcmp(path, "/record/test.wav")) return -1;
     advance(lookup_delay);
     *ent = (exfat_entry_t){ .size = file_size };
@@ -730,6 +740,116 @@ static void test_scripted_keys(void)
     puts("[OK] player loop: double tap RIGHT -> next file, double tap LEFT at start -> stays, hold RIGHT seeks, hold VOL+ repeats, brief 20ms tap in render stall");
 }
 
+/* ---- per-folder .autoplay ------------------------------------------------- */
+
+static key_id_t back_after_end(unsigned ms)
+{
+    if (ended) {
+        if (ended_at_ms == 0u) ended_at_ms = ms;
+        return (ms < ended_at_ms + 40u) ? KEY_BACK : KEY_NONE;
+    }
+    return KEY_NONE;
+}
+
+static void test_autoplay(void)
+{
+    /* Marker detection: one lookup of <dir>/.autoplay (exFAT matches it
+     * case-insensitively, so .AUTOPLAY counts too); a folder named .autoplay does not */
+    exfat_vol_t vol = {0};
+    marker_path = "/audiobooks/Jekyll_Hyde/.AUTOPLAY";
+    assert(player_dir_has_autoplay(&vol, "/audiobooks/Jekyll_Hyde") == 1);
+    assert(strcmp(last_lookup, "/audiobooks/Jekyll_Hyde/.autoplay") == 0);
+    assert(player_dir_has_autoplay(&vol, "/audiobooks/jekyll_hyde/") == 1);
+    assert(player_dir_has_autoplay(&vol, "/audiobooks/Other") == 0);
+    marker_is_dir = 1;
+    assert(player_dir_has_autoplay(&vol, "/audiobooks/Jekyll_Hyde") == 0);
+    marker_is_dir = 0;
+    assert(player_dir_has_autoplay(&vol, "") == 0);
+    assert(player_dir_has_autoplay(NULL, "/audiobooks/Jekyll_Hyde") == 0);
+    marker_path = "/.autoplay";
+    assert(player_dir_has_autoplay(&vol, "/") == 1);
+    marker_path = NULL;
+
+    /* Next-track selection in Files-list order: skips folder rows, never
+     * leaves the folder, stops (-1) after the last track. */
+    enum { N = 7, CAP = 48 };
+    static ui_file_entry_t files[N];
+    static char dirs[N][CAP];
+    static const struct { const char *dir; const char *name; uint8_t is_dir; } rows[N] = {
+        { "/audiobooks/JH/Extras", "Extras",          1 },
+        { "/audiobooks/JH",        "JH_01a_Cap1.wav", 0 },
+        { "/audiobooks/JH",        "JH_01b_Cap1.wav", 0 },
+        { "/audiobooks/JH/Sub",    "Sub",             1 },
+        { "/audiobooks/jh",        "JH_02a_Cap2.wav", 0 },
+        { "/record",               "REC_0001.wav",    0 },
+        { "/record",               "REC_0002.wav",    0 },
+    };
+    for (int i = 0; i < N; i++) {
+        memset(&files[i], 0, sizeof(files[i]));
+        snprintf(files[i].filename, sizeof(files[i].filename), "%s", rows[i].name);
+        files[i].is_dir = rows[i].is_dir;
+        snprintf(dirs[i], CAP, "%s", rows[i].dir);
+    }
+    assert(player_autoplay_next_index(files, &dirs[0][0], CAP, N, 1) == 2);
+    assert(player_autoplay_next_index(files, &dirs[0][0], CAP, N, 2) == 4); /* skips folder row */
+    assert(player_autoplay_next_index(files, &dirs[0][0], CAP, N, 4) == -1); /* next is /record */
+    assert(player_autoplay_next_index(files, &dirs[0][0], CAP, N, 5) == 6);
+    assert(player_autoplay_next_index(files, &dirs[0][0], CAP, N, 6) == -1); /* last: no wrap */
+    assert(player_autoplay_next_index(files, &dirs[0][0], CAP, N, -1) == -1);
+    assert(player_autoplay_next_index(files, &dirs[0][0], CAP, N, N) == -1);
+    assert(player_autoplay_next_index(files, &dirs[0][0], CAP, 3, 2) == -1); /* end of list */
+
+    /* Playback: natural end of track with autoplay returns PLAYER_RC_AUTO_NEXT
+     * once the DAC queue has fully drained, with the resume point cleared. */
+    static ui_model_t m;
+    channels = 2; /* rebuild the plain 16 kHz stereo PCM fixture */
+    {
+        uint32_t bytes = FRAMES * channels * 2;
+        file_size = 44 + bytes;
+        assert(!wav_build_header(recording, 16000, channels, 16, bytes));
+        for (unsigned i = 0; i < FRAMES; i++) {
+            for (unsigned ch = 0; ch < channels; ch++) {
+                uint16_t sv = (uint16_t)sample(i, ch);
+                unsigned off = 44 + (i * channels + ch) * 2;
+                recording[off] = (uint8_t)sv;
+                recording[off + 1] = (uint8_t)(sv >> 8);
+            }
+        }
+    }
+    memset(&m, 0, sizeof(m));
+    m.cfg.spk_vol      = 18;
+    m.play_has_next    = 1;
+    m.play_autoplay    = 1;
+    reset_run(back_after_end);
+    assert(openfw_play_file_ui(&vol, "/record", "test.wav", &m) == PLAYER_RC_AUTO_NEXT);
+    assert(consumed == FRAMES && count == 0);
+    assert(m.play_file.resume_sec == 0u);
+    assert(ended == 0); /* never sat on the End screen */
+
+    /* Autoplay folder but last track: stops at the end as before */
+    memset(&m, 0, sizeof(m));
+    m.cfg.spk_vol      = 18;
+    m.play_has_next    = 0;
+    m.play_autoplay    = 1;
+    reset_run(back_after_end);
+    assert(openfw_play_file_ui(&vol, "/record", "test.wav", &m) == 0);
+    assert(ended == 1 && consumed == FRAMES);
+
+    /* No marker: a next file exists but the player waits on the End screen */
+    memset(&m, 0, sizeof(m));
+    m.cfg.spk_vol      = 18;
+    m.play_has_next    = 1;
+    m.play_autoplay    = 0;
+    reset_run(back_after_end);
+    assert(openfw_play_file_ui(&vol, "/record", "test.wav", &m) == 0);
+    assert(ended == 1 && consumed == FRAMES);
+
+    key_script = NULL;
+    stub_keys_reset();
+    strict = 1;
+    puts("[OK] .autoplay: marker lookup (case-insensitive, file only), same-folder next-track order, EOF auto-advance only with marker and next track");
+}
+
 int main(void)
 {
     test_key_gestures();
@@ -758,5 +878,6 @@ int main(void)
     test_scripted_keys(); /* uses the stereo fixture left by the loop above */
     test_pause_zero_loss_and_ima2048();
     test_scrub_pitch();
+    test_autoplay();
     return 0;
 }

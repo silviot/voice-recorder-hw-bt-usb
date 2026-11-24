@@ -65,15 +65,35 @@ player_action_t player_keys_edge(player_keys_t *s, key_id_t key, uint32_t now_ms
 player_action_t player_keys_step(player_keys_t *s, key_id_t raw, uint32_t now_ms);
 
 /*
+ * Per-folder "autoplay next track": a file named .autoplay (any content, may be
+ * empty, matched case-insensitively) in a folder makes the end of one track
+ * continue with the next track of that folder, in Files-list order.
+ */
+#define PLAYER_AUTOPLAY_MARKER ".autoplay"
+#define PLAYER_RC_AUTO_NEXT    3
+
+/* 1 when dir_path/.autoplay exists as a file (one exFAT path lookup). */
+int player_dir_has_autoplay(exfat_vol_t *vol, const char *dir_path);
+/*
+ * Next track after files[idx] for autoplay: skips folder entries and returns
+ * -1 at the end of the list or when the next track lives in another folder.
+ * dirs points at count rows of dir_stride bytes (one folder path per entry).
+ */
+int player_autoplay_next_index(const ui_file_entry_t *files, const char *dirs,
+                               unsigned dir_stride, int count, int idx);
+
+/*
  * Before calling, set m->play_has_prev / m->play_has_next to say whether a
  * previous / next file exists; without one the player shows a toast instead
- * of returning -1 / 1.
+ * of returning -1 / 1. Set m->play_autoplay (with play_has_next) to have the
+ * natural end of the track return PLAYER_RC_AUTO_NEXT.
  *
  * Returns:
  *   0 : exited via KEY_BACK
  *   1 : requested next track
  *  -1 : requested previous track
  *   2 : interrupted by REC slide switch ON
+ *   3 : PLAYER_RC_AUTO_NEXT, track ended and m->play_autoplay was set
  */
 int  openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_name,
                          ui_model_t *m);
