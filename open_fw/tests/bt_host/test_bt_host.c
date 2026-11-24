@@ -30,7 +30,9 @@
 #include "esp_bt_main.h"
 #include "esp_bt_device.h"
 #include "esp_gap_bt_api.h"
+#include "nvs.h"
 #include "osi/alarm.h"
+#include "osi/config.h"
 #include "osi/fixed_queue.h"
 #include "bt_ctrl.h"
 #include "fake_rom.h"
@@ -599,6 +601,52 @@ static void scenario_bta_sys_double_free(const baseline_t *base)
     }
 }
 
+/* Patch 0032: (a) config_parse() allocated exact buf_size bytes and ran strchr(p_line_bgn, '\n') without a trailing
+ * NUL guard, reading out-of-bounds heap memory when bt_cfg_key0 has no newline; (b) config_save() left stale
+ * bt_cfg_key1+ blobs in NVS when the config shrank below CONFIG_FILE_MAX_SIZE (1536 B), wasting space in the 4 KiB
+ * bt_store quota (BT_STORE_DATA_MAX). */
+static void scenario_config_parse_and_shrink(const baseline_t *base)
+{
+    bth_log("[0e] patch 0032: osi/config NUL-terminates blob buffer and erases stale chunks on shrink\n");
+    nvs_handle_t h = 0;
+    CHECK(nvs_open("p32_cfg", NVS_READWRITE, &h) == ESP_OK, "p32 nvs_open");
+    static const char k_no_nl[] = "[Sec]\nKey = no_newline!!";
+    CHECK(nvs_set_blob(h, "bt_cfg_key0", k_no_nl, strlen(k_no_nl)) == ESP_OK, "p32 set unterminated blob");
+    config_t *cfg = config_new("p32_cfg");
+    CHECK(cfg != NULL, "p32 config_new on unterminated blob");
+    if (cfg != NULL) {
+        config_free(cfg);
+    }
+
+    /* Multi-chunk save (>1536 B) followed by shrink (<1536 B) must erase bt_cfg_key1. */
+    cfg = config_new_empty();
+    CHECK(cfg != NULL, "p32 config_new_empty");
+    char val[200];
+    memset(val, 'A', sizeof(val) - 1u);
+    val[sizeof(val) - 1u] = '\0';
+    for (int i = 0; i < 9; i++) {
+        char sec[16];
+        snprintf(sec, sizeof(sec), "S%d", i);
+        config_set_string(cfg, sec, "Data", val, false);
+    }
+    CHECK(config_save(cfg, "p32_cfg"), "p32 save >1536 B");
+    size_t c1_len = 0;
+    CHECK(nvs_get_blob(h, "bt_cfg_key1", NULL, &c1_len) == ESP_OK && c1_len > 0u, "p32 bt_cfg_key1 written");
+    for (int i = 1; i < 9; i++) {
+        char sec[16];
+        snprintf(sec, sizeof(sec), "S%d", i);
+        config_remove_section(cfg, sec);
+    }
+    CHECK(config_save(cfg, "p32_cfg"), "p32 save shrunk <1536 B");
+    CHECK(nvs_get_blob(h, "bt_cfg_key1", NULL, &c1_len) == ESP_ERR_NVS_NOT_FOUND,
+          "stale bt_cfg_key1 survived config shrink (patch 0032 missing?)");
+    config_free(cfg);
+    CHECK(nvs_erase_all(h) == ESP_OK, "p32 erase_all");
+    nvs_close(h);
+    baseline_t now;
+    CHECK(settle_to(base, &now), "after patch 0032: heap %zu/%zu", now.bytes, now.blocks);
+}
+
 /* Allocation-failure sweep (plan M1 "general rule"; run_sweep.py). One mode per lifecycle call: the stack is brought
  * to the state before that call, the N-th allocation attempt made while the call runs (all tasks) fails, then:
  *   - the call returned ESP_OK, or an error with the API state unchanged (a clean failure);
@@ -786,6 +834,9 @@ void bth_test_task(void *arg)
     } else if (strcmp(mode, "patch31") == 0) {
         scenario_bta_sys_double_free(&base);
         rc = g_fail ? 1 : 0;
+    } else if (strcmp(mode, "patch32") == 0) {
+        scenario_config_parse_and_shrink(&base);
+        rc = g_fail ? 1 : 0;
     } else if (strcmp(mode, "noack") == 0) {
         scenario_noack_zero_credits(&base);
         rc = g_fail ? 1 : 0;
@@ -804,6 +855,9 @@ void bth_test_task(void *arg)
         }
         if (g_fail == 0) {
             scenario_bta_sys_double_free(&base);
+        }
+        if (g_fail == 0) {
+            scenario_config_parse_and_shrink(&base);
         }
         if (g_fail == 0) {
             scenario_enable_gap_disable(&base);
