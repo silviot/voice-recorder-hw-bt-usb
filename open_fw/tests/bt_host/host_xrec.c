@@ -158,6 +158,14 @@ const char *bt_xrec_plat_pairing_block(void)
 }
 
 /* ============================================ files (app task) ================================================== */
+static void wipe_mem(void *p, size_t n)
+{
+    volatile uint8_t *v = (volatile uint8_t *)p;
+    for (size_t i = 0u; i < n; i++) {
+        v[i] = 0u;
+    }
+}
+
 static int save_root_file_atomic(const char *tmp_name, const char *final_name, const void *data, uint32_t len)
 {
     if (!s_sd || s_vol == NULL) {
@@ -198,11 +206,10 @@ static int read_root_file(exfat_vol_t *vol, const char *name, uint8_t *buf, uint
 void bt_xrec_plat_load_bound_key(xrec_ctx_t *ctx)
 {
     uint8_t blob[36];
-    if (read_root_file(ctx->vol, "cassini.key", blob, sizeof(blob)) != 36 || memcmp(blob, "CSK5", 4u) != 0) {
-        return;
+    if (read_root_file(ctx->vol, "cassini.key", blob, sizeof(blob)) == 36 && memcmp(blob, "CSK5", 4u) == 0) {
+        xrec_set_bound_key(ctx, &blob[4]);
     }
-    xrec_set_bound_key(ctx, &blob[4]);
-    memset(blob, 0, sizeof(blob));
+    wipe_mem(blob, sizeof(blob));
 }
 
 void bt_xrec_plat_save_bound_key(const uint8_t key[32])
@@ -215,7 +222,7 @@ void bt_xrec_plat_save_bound_key(const uint8_t key[32])
     } else {
         bt_xrec_plat_log("BT XREC key not saved (SD write failed)");
     }
-    memset(blob, 0, sizeof(blob));
+    wipe_mem(blob, sizeof(blob));
 }
 
 static void bonds_load(void)
@@ -235,7 +242,7 @@ static void bonds_load(void)
             bt_xrec_plat_log_u32("BT bond file rejected (store starts empty), err", (uint32_t)r);
         }
     }
-    memset(img, 0, BT_STORE_IMAGE_MAX);
+    wipe_mem(img, BT_STORE_IMAGE_MAX);
     vPortFree(img);
 }
 
@@ -261,7 +268,7 @@ static void bonds_write(void)
         }
         s_bond_retry_at = bt_xrec_plat_now_ms() + BOND_RETRY_MS;
     }
-    memset(img, 0, BT_STORE_IMAGE_MAX);
+    wipe_mem(img, BT_STORE_IMAGE_MAX);
     vPortFree(img);
 }
 
