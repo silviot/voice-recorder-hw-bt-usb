@@ -39,6 +39,17 @@ static unsigned time_limit_ms = 6000;
 static uint32_t synth_frames;    /* >0: stereo file synthesized on read (L = frame % 30000, R = frame / 30000) */
 static int synth_tri;            /* synthesized file is a 200 Hz triangle on both channels instead */
 
+/* play_tick_cb probe */
+static const ui_model_t *g_tick_model;
+static unsigned tick_calls, tick_max_pos, tick_saw_end;
+static void count_tick(uint32_t now_ms)
+{
+    (void)now_ms;
+    tick_calls++;
+    if (g_tick_model->play_pos_sec > tick_max_pos) tick_max_pos = g_tick_model->play_pos_sec;
+    if (g_tick_model->play_state == 2u) tick_saw_end = 1;
+}
+
 /* Simulated 1 kHz SysTick key debouncer + SPSC queue */
 static key_event_t stub_q[32];
 static unsigned    stub_q_head, stub_q_tail;
@@ -643,6 +654,23 @@ static void dial_model(unsigned start_s)
 
 static int64_t synth_frame(unsigned i) { return (int64_t)heard_r[i] * 30000 + heard_l[i]; }
 
+/* play_tick_cb probe for the dial: what position memory would see at each tick */
+enum { DIAL_TICKS = 1024 };
+static const ui_model_t *dial_tick_model;
+static unsigned dial_ticks, dial_tick_ms[DIAL_TICKS];
+static uint32_t dial_tick_pos[DIAL_TICKS];
+static int8_t dial_tick_speed[DIAL_TICKS];
+static uint8_t dial_tick_state[DIAL_TICKS];
+static void dial_tick(uint32_t now)
+{
+    if (dial_ticks >= DIAL_TICKS) return;
+    dial_tick_ms[dial_ticks] = now;
+    dial_tick_pos[dial_ticks] = dial_tick_model->play_pos_ms;
+    dial_tick_speed[dial_ticks] = dial_tick_model->play_scrub_speed;
+    dial_tick_state[dial_ticks] = dial_tick_model->play_state;
+    dial_ticks++;
+}
+
 static void test_speed_dial(void)
 {
     exfat_vol_t vol = {0};
@@ -675,6 +703,9 @@ static void test_speed_dial(void)
         ui_model_t m = {0};
         m.cfg.spk_vol = 18;
         m.play_file.resume_sec = cases[c].start_s;
+        m.play_tick_cb = dial_tick;
+        dial_tick_model = &m;
+        dial_ticks = 0;
         dial_presses = cases[c].p;
         dial_npress = cases[c].n;
         dial_model(cases[c].start_s);
@@ -730,6 +761,21 @@ static void test_speed_dial(void)
         printf("    %-18s from %3us: 1x again at %8.3fs (model %8.3fs), top %dx\n", cases[c].name,
                cases[c].start_s, got / (double)DIAL_RATE, want / (double)DIAL_RATE, max_scrub_speed);
         assert(got >= want - tol && got <= want + tol);
+        /* Whenever the dial reads 1x (also while grains hand back over to 1x),
+         * the position the tick callback sees (and position memory would store)
+         * is the frame being heard at that moment. */
+        unsigned checked = 0;
+        for (unsigned k = 0; k < dial_ticks; k++) {
+            if (dial_tick_speed[k] != 0 || dial_tick_state[k] != 0) continue;
+            unsigned i = 0;
+            while (i + 1 < heard_n && heard_t[i + 1] <= dial_tick_ms[k]) i++;
+            if (!heard_n || (unsigned)heard_t[i] + 2u < dial_tick_ms[k]) continue;   /* nothing audible right then */
+            int64_t live = synth_frame(i), shown = (int64_t)dial_tick_pos[k] * 16;
+            assert(shown >= live - 16 * 60 && shown <= live + 16 * 60);
+            checked++;
+        }
+        if (model_pos[DIAL_MS - 1] != 0 && model_pos[DIAL_MS - 1] != (int64_t)synth_frames)
+            assert(checked >= 3);   /* cases that end back at 1x, playing */
     }
     synth_frames = 0;
     time_limit_ms = 6000;
@@ -1133,14 +1179,19 @@ static void test_autoplay(void)
     assert(m.play_file.resume_sec == 0u);
     assert(ended == 0); /* never sat on the End screen */
 
-    /* Autoplay folder but last track: stops at the end as before */
+    /* Autoplay folder but last track: stops at the end as before. The tick
+     * callback (position memory) sees the live position and the End state. */
     memset(&m, 0, sizeof(m));
     m.cfg.spk_vol      = 18;
     m.play_has_next    = 0;
     m.play_autoplay    = 1;
+    m.play_tick_cb     = count_tick;
+    tick_calls = tick_max_pos = tick_saw_end = 0;
+    g_tick_model = &m;
     reset_run(back_after_end);
     assert(openfw_play_file_ui(&vol, "/record", "test.wav", &m) == 0);
     assert(ended == 1 && consumed == FRAMES);
+    assert(tick_calls > 0 && tick_saw_end && tick_max_pos == FRAMES / 16000);
 
     /* No marker: a next file exists but the player waits on the End screen */
     memset(&m, 0, sizeof(m));

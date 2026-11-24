@@ -237,6 +237,7 @@ typedef struct {
     uint8_t        play_has_prev;    /* set by caller: a previous file exists */
     uint8_t        play_has_next;    /* set by caller: a next file exists */
     uint8_t        play_autoplay;    /* set by caller: continue with the next file at end of track */
+    void         (*play_tick_cb)(uint32_t now_ms); /* optional, called by the player after each UI tick */
     cwx_tr_slot_t  tr_lines[CWX_TR_VIEW_LINES]; /* [0]=above, [1..4]=visible, [5]=below */
     int8_t         tr_active_slot;   /* 1..4 active row in tr_lines[], or -1 */
     int32_t        tr_top_line_id;   /* monotonic line_id of tr_lines[1] (drives scroll anim) */

@@ -26,6 +26,7 @@
 #include "openfw_exp.h"
 #include "openfw_wav.h"
 #include "openfw_player.h"
+#include "openfw_apmem.h"
 #include "cassini_splash.h"
 
 #define MENU_MAX_FILES 96
@@ -69,6 +70,7 @@ static uint32_t         g_vbus_poll_ms = 0u;
 static int              g_vbus_cache_valid = 0;
 
 static void save_persisted_state(void);
+static void apm_power_off(int screen);
 
 volatile uint32_t       g_ui_screen = UI_SCR_HOME;
 static ui_model_t       g_ui;
@@ -82,6 +84,18 @@ static char             g_browse_dir[MENU_DIR_CAP] = "";
 /* One-entry cache of "does this folder contain .autoplay" (-1 = unknown) */
 static char             g_autoplay_dir[MENU_DIR_CAP];
 static int8_t           g_autoplay_state = -1;
+/* Autoplay-folder memory (.autoplay.state): the track in the player and any
+ * position write deferred while a recording owns the card. */
+static struct {
+    char          dir[MENU_DIR_CAP];
+    char          name[32];
+    uint32_t      tag;      /* low 32 bits of the WAV size: detects a replaced file */
+    uint8_t       active;   /* the player's track lives in an autoplay folder */
+    uint8_t       failed;   /* a write failed (read-only/full card): quiet until reload */
+    uint8_t       pending;  /* pending_pos not written yet */
+    uint32_t      pending_pos;
+    apmem_sched_t sched;
+} g_apm;
 static int              g_root_file_sel = 0;
 static int              g_root_file_scroll = 0;
 static uint32_t         g_sd_free_mb   = 0u;
@@ -260,6 +274,7 @@ int ui_poll_power_button(ui_screen_id_t screen, ui_model_t *model, uint32_t now)
                 g_ui.last_file.resume_sec = (g_ui.play_state == 2u) ? 0u : g_ui.play_pos_sec;
             }
             (void)recorder_stop();
+            apm_power_off((int)screen);
             if (screen == UI_SCR_SETTINGS || screen == UI_SCR_PLAYER) {
                 save_persisted_state();
             }
@@ -795,6 +810,7 @@ static void reload_files_and_sd_stats(void)
     g_ui.file_count = 0;
     g_ui.files_title[0] = '\0';
     g_autoplay_state = -1; /* USB/BT may have added or removed a .autoplay marker */
+    g_apm.failed     = 0u; /* card may have been swapped, freed or unlocked */
 
     if (!g_sd_mounted) {
         g_ui.sd_ok       = 0;
@@ -1566,6 +1582,130 @@ static int dir_has_autoplay_cached(const char *dir)
     return g_autoplay_state;
 }
 
+/* Write a deferred position (never while recording: the caller checks). */
+static void apm_flush(void)
+{
+    if (!g_apm.pending) {
+        return;
+    }
+    if (recorder_is_saving()) {
+        return; /* retried from the main loop once the recording is closed */
+    }
+    g_apm.pending = 0u;
+    if (g_apm.failed || !g_sd_mounted) {
+        return;
+    }
+    if (apmem_save_pos(&g_exfat_vol, g_apm.dir, g_apm.name, g_apm.tag, g_apm.pending_pos) != 0) {
+        g_apm.failed = 1u;
+    }
+}
+
+static void apm_player_tick(uint32_t now_ms)
+{
+    if (!g_apm.active || g_apm.failed || recorder_is_saving()) {
+        return;
+    }
+    if (g_ui.play_scrub_speed != 0) {
+        /* Speed dial away from 1x: the position is in flight. play_pos_sec is the
+         * heard position, but writing mid-seek is pointless; the first tick back
+         * at 1x (or a pause, or leaving the track) writes it instead. */
+        return;
+    }
+    if (apmem_sched_tick(&g_apm.sched, now_ms, g_ui.play_pos_sec, g_ui.play_state, g_ui.batt_mv)) {
+        uint32_t pos = apmem_store_pos(g_ui.play_pos_sec, g_ui.play_file.duration_sec, 0);
+        if (apmem_save_pos(&g_exfat_vol, g_apm.dir, g_apm.name, g_apm.tag, pos) != 0) {
+            g_apm.failed = 1u;
+        }
+        apmem_sched_saved(&g_apm.sched, now_ms, g_ui.play_pos_sec);
+    }
+}
+
+/* Before g_files[idx] starts: pick its remembered position and focus it. */
+static void apm_begin_track(int idx)
+{
+    g_apm.active = 0u;
+    g_ui.play_tick_cb = 0;
+    apm_flush();
+    if (!dir_has_autoplay_cached(g_file_dirs[idx])) {
+        return;
+    }
+    copy_cstr(g_apm.dir, (int)sizeof(g_apm.dir), g_file_dirs[idx]);
+    copy_cstr(g_apm.name, (int)sizeof(g_apm.name), g_files[idx].filename);
+    if (apmem_file_tag(&g_exfat_vol, g_apm.dir, g_apm.name, &g_apm.tag) != 0) {
+        return;
+    }
+    uint32_t saved = g_files[idx].resume_sec;
+    (void)apmem_load_pos(&g_exfat_vol, g_apm.dir, g_apm.name, g_apm.tag, &saved);
+    g_files[idx].resume_sec = apmem_resume_pos(saved, g_files[idx].duration_sec);
+    if (!g_apm.failed && !recorder_is_saving() &&
+        apmem_save_focus(&g_exfat_vol, g_apm.dir, g_apm.name) != 0) {
+        g_apm.failed = 1u;
+    }
+    g_apm.active = 1u;
+    apmem_sched_start(&g_apm.sched, millis(), g_files[idx].resume_sec);
+    g_ui.play_tick_cb = apm_player_tick;
+}
+
+/* After the player returned: remember where the track was left. */
+static void apm_end_track(int rc)
+{
+    g_ui.play_tick_cb = 0;
+    if (!g_apm.active) {
+        return;
+    }
+    g_apm.active      = 0u;
+    g_apm.pending_pos = apmem_store_pos(g_ui.play_file.resume_sec, g_ui.play_file.duration_sec,
+                                        rc == PLAYER_RC_AUTO_NEXT);
+    g_apm.pending     = 1u; /* an unchanged slot costs reads only, no write */
+    if (rc != 2) {
+        apm_flush(); /* REC slide (rc 2): deferred until the recording is over */
+    }
+}
+
+/* Files list inside an autoplay folder: remember the focused track. */
+static void apm_save_focus_sel(void)
+{
+    if (!g_sd_mounted || g_apm.failed || recorder_is_saving() || g_browse_dir[0] == '\0' ||
+        g_ui.file_sel < 0 || g_ui.file_sel >= g_ui.file_count || g_files[g_ui.file_sel].is_dir ||
+        !str_eq_ci(g_file_dirs[g_ui.file_sel], g_browse_dir) || !dir_has_autoplay_cached(g_browse_dir)) {
+        return;
+    }
+    if (apmem_save_focus(&g_exfat_vol, g_browse_dir, g_files[g_ui.file_sel].filename) != 0) {
+        g_apm.failed = 1u;
+    }
+}
+
+/* Just entered g_browse_dir: focus the folder's last focused track. */
+static void apm_focus_on_enter(void)
+{
+    char name[APMEM_FOCUS_CAP];
+    if (!g_sd_mounted || g_browse_dir[0] == '\0' || !dir_has_autoplay_cached(g_browse_dir) ||
+        apmem_load_focus(&g_exfat_vol, g_browse_dir, name, (uint32_t)sizeof(name)) != 0) {
+        return;
+    }
+    for (int i = 0; i < g_ui.file_count; i++) {
+        if (!g_files[i].is_dir && str_eq_ci(g_files[i].filename, name)) {
+            g_ui.file_sel    = i;
+            g_ui.file_scroll = (i > 0) ? i - 1 : 0;
+            if (g_ui.file_scroll > g_ui.file_count - 3) {
+                g_ui.file_scroll = (g_ui.file_count > 3) ? g_ui.file_count - 3 : 0;
+            }
+            return;
+        }
+    }
+}
+
+static void apm_power_off(int screen)
+{
+    if (screen == (int)UI_SCR_PLAYER && g_apm.active) {
+        g_ui.play_file.resume_sec = (g_ui.play_state == 2u) ? 0u : g_ui.play_pos_sec;
+        apm_end_track(0);
+    } else if (screen == (int)UI_SCR_FILES) {
+        apm_save_focus_sel();
+    }
+    apm_flush(); /* the recorder was stopped just before */
+}
+
 static void play_file_at_index(int start_idx)
 {
     int idx = start_idx;
@@ -1584,11 +1724,14 @@ static void play_file_at_index(int start_idx)
         g_ui.play_autoplay = (auto_idx >= 0 && dir_has_autoplay_cached(g_file_dirs[idx])) ? 1u : 0u;
         /* Record the track as "last played" before it starts so a power-off
          * mid-track (also after an automatic advance) resumes this track. */
+        apm_begin_track(idx); /* autoplay folder: remembered position + focus */
+        g_ui.play_file = g_files[idx];
         g_ui.last_file = g_files[idx];
         copy_cstr(g_last_dir, (int)sizeof(g_last_dir), g_file_dirs[idx]);
         g_ui.has_last  = 1;
         int rc = openfw_play_file_ui(&g_exfat_vol, g_file_dirs[idx], g_files[idx].filename, &g_ui);
         keys_ignore_held();
+        apm_end_track(rc);
         g_files[idx].unplayed   = 0u;
         g_files[idx].resume_sec = g_ui.play_file.resume_sec;
         g_ui.last_file          = g_files[idx];
@@ -1602,8 +1745,8 @@ static void play_file_at_index(int start_idx)
         }
 
         if (rc == PLAYER_RC_AUTO_NEXT && auto_idx >= 0) {
-            /* Continuous listening: the next chapter starts from its beginning */
-            g_files[auto_idx].resume_sec = 0u;
+            /* Continuous listening: the next chapter resumes where it was left
+             * (apm_begin_track), or starts at 0:00 when it has no saved position */
             idx = auto_idx;
         } else if (rc == 1 && next_idx < g_ui.file_count) {
             idx = next_idx;
@@ -2358,6 +2501,7 @@ int openfw_main(void)
                         if (key == KEY_BACK) {
                             if (g_browse_dir[0] != '\0') {
                                 /* Return from subfolder to parent / root Files list */
+                                apm_save_focus_sel();
                                 g_browse_dir[0]  = '\0';
                                 g_ui.file_sel    = g_root_file_sel;
                                 g_ui.file_scroll = g_root_file_scroll;
@@ -2412,6 +2556,7 @@ int openfw_main(void)
                                 g_ui.file_sel    = 0;
                                 g_ui.file_scroll = 0;
                                 reload_files_and_sd_stats();
+                                apm_focus_on_enter();
                                 dirty = 1;
                             } else {
                                 play_file_at_index(g_ui.file_sel);
@@ -2632,6 +2777,9 @@ int openfw_main(void)
         /* 7. Periodic 2 Hz telemetry & battery cutoff supervision */
         if ((uint32_t)(now_ms - last_slow_ms) >= 500u || last_slow_ms == 0u) {
             last_slow_ms = now_ms;
+            if (g_apm.pending && !rec_active) {
+                apm_flush(); /* position deferred by the REC slide */
+            }
             pmu_poll_charge_manage();
             uint8_t prev_min = g_ui.now.minute;
             uint8_t prev_bat = g_ui.batt_pct;

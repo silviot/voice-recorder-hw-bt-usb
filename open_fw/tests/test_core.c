@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "openfw_apmem.h"
 #include "openfw_bt_spp.h"
 #include "openfw_crypto.h"
 #include "openfw_cwx.h"
@@ -830,6 +831,304 @@ static void test_exfat_remount_cache_invalidation(void)
     assert(byte_b == 0x66u);
 
     printf("  [PASS] exfat remount cache invalidation (same first_cluster across two volumes)\n");
+}
+
+/* ---- Autoplay-folder memory (.autoplay.state) ---- */
+
+static void test_apmem_format(void)
+{
+    /* Hash: case-insensitive, never 0, distinct for neighbouring chapter names */
+    assert(apmem_name_hash("JH_01a_Cap1.wav") == apmem_name_hash("jh_01A_CAP1.WAV"));
+    assert(apmem_name_hash("JH_01a_Cap1.wav") != apmem_name_hash("JH_01b_Cap1.wav"));
+    assert(apmem_name_hash("") != 0u);
+    for (uint32_t h = 0u; h < 1000u; h++) {
+        uint32_t l = apmem_slot_lsec(h * 2654435761u);
+        assert(l >= 1u && l <= APMEM_SLOT_LSECS);
+    }
+
+    /* Seal / validate: magic, lsec, version and CRC all checked */
+    uint8_t sec[512];
+    apmem_sec_empty(sec, 3u);
+    uint32_t seq = 0u;
+    assert(!apmem_sec_valid(sec, 3u, &seq)); /* zero-filled fresh file = empty */
+    apmem_sec_seal(sec, 3u, 7u);
+    assert(apmem_sec_valid(sec, 3u, &seq) && seq == 7u);
+    assert(!apmem_sec_valid(sec, 4u, NULL));
+    sec[300] ^= 0x40u;
+    assert(!apmem_sec_valid(sec, 3u, NULL));
+
+    /* A/B pick: newest valid copy, wrap-safe, falls back to the survivor of a torn write */
+    uint8_t pair[1024];
+    apmem_sec_empty(pair, 5u);
+    apmem_sec_empty(pair + 512, 5u);
+    assert(apmem_pick_copy(pair, 5u, &seq) == -1);
+    apmem_sec_seal(pair, 5u, 10u);
+    apmem_sec_seal(pair + 512, 5u, 11u);
+    assert(apmem_pick_copy(pair, 5u, &seq) == 1 && seq == 11u);
+    apmem_sec_seal(pair, 5u, 0xFFFFFFFFu);
+    apmem_sec_seal(pair + 512, 5u, 0u); /* 0 follows 0xFFFFFFFF */
+    assert(apmem_pick_copy(pair, 5u, &seq) == 1 && seq == 0u);
+    memset(pair + 512 + 100, 0xFF, 200); /* torn newest copy */
+    assert(apmem_pick_copy(pair, 5u, &seq) == 0 && seq == 0xFFFFFFFFu);
+
+    /* Slots: set/get/update/clear, unchanged writes reported as no change */
+    apmem_sec_empty(sec, 1u);
+    uint32_t pos = 0u;
+    assert(!apmem_slot_get(sec, 0x1234u, 1000u, &pos));
+    assert(apmem_slot_set(sec, 0x1234u, 1000u, 0u, 1u) == 0); /* clearing absent = no-op */
+    assert(apmem_slot_set(sec, 0x1234u, 1000u, 95u, 1u) == 1);
+    assert(apmem_slot_get(sec, 0x1234u, 1000u, &pos) && pos == 95u);
+    assert(apmem_slot_set(sec, 0x1234u, 1000u, 95u, 2u) == 0);
+    assert(apmem_slot_set(sec, 0x1234u, 1000u, 130u, 3u) == 1);
+    assert(apmem_slot_get(sec, 0x1234u, 1000u, &pos) && pos == 130u);
+    /* Hash collision: same hash, different size tag => independent slots */
+    assert(apmem_slot_set(sec, 0x1234u, 2000u, 7u, 4u) == 1);
+    assert(apmem_slot_get(sec, 0x1234u, 1000u, &pos) && pos == 130u);
+    assert(apmem_slot_get(sec, 0x1234u, 2000u, &pos) && pos == 7u);
+    /* Stale entry: the file was replaced (new size) => not found */
+    assert(!apmem_slot_get(sec, 0x1234u, 1001u, &pos));
+    assert(apmem_slot_set(sec, 0x1234u, 1000u, 0u, 5u) == 1);
+    assert(!apmem_slot_get(sec, 0x1234u, 1000u, &pos));
+    assert(apmem_slot_get(sec, 0x1234u, 2000u, &pos) && pos == 7u);
+
+    /* Full sector: the least recently written slot is evicted */
+    apmem_sec_empty(sec, 1u);
+    for (uint32_t i = 0u; i < APMEM_SLOTS_PER_SEC; i++) {
+        assert(apmem_slot_set(sec, 100u + i, 1u, 10u + i, 100u + i) == 1);
+    }
+    assert(apmem_slot_set(sec, 100u, 1u, 99u, 500u) == 1); /* refresh the first one */
+    assert(apmem_slot_set(sec, 999u, 1u, 42u, 501u) == 1);
+    assert(apmem_slot_get(sec, 999u, 1u, &pos) && pos == 42u);
+    assert(apmem_slot_get(sec, 100u, 1u, &pos) && pos == 99u);
+    assert(!apmem_slot_get(sec, 101u, 1u, &pos)); /* oldest stamp went */
+    for (uint32_t i = 2u; i < APMEM_SLOTS_PER_SEC; i++) {
+        assert(apmem_slot_get(sec, 100u + i, 1u, &pos) && pos == 10u + i);
+    }
+
+    /* Header focus name */
+    char name[APMEM_FOCUS_CAP];
+    apmem_sec_empty(sec, 0u);
+    apmem_hdr_get_focus(sec, name, sizeof(name));
+    assert(name[0] == '\0');
+    assert(apmem_hdr_set_focus(sec, "JH_05a_Cap5.wav") == 1);
+    assert(apmem_hdr_set_focus(sec, "JH_05a_Cap5.wav") == 0);
+    apmem_hdr_get_focus(sec, name, sizeof(name));
+    assert(strcmp(name, "JH_05a_Cap5.wav") == 0);
+    assert(apmem_hdr_set_focus(sec, "JH_06.wav") == 1);
+    apmem_hdr_get_focus(sec, name, sizeof(name));
+    assert(strcmp(name, "JH_06.wav") == 0); /* shorter name fully replaces the longer one */
+
+    printf("  [PASS] apmem format (hash, CRC, A/B pick + wrap, slots, collisions, eviction, focus)\n");
+}
+
+static void test_apmem_policy(void)
+{
+    /* Resume: saved position honoured unless in the last APMEM_TAIL_SEC or unknown length */
+    assert(apmem_resume_pos(0u, 600u) == 0u);
+    assert(apmem_resume_pos(120u, 600u) == 120u);
+    assert(apmem_resume_pos(589u, 600u) == 589u);
+    assert(apmem_resume_pos(590u, 600u) == 0u);
+    assert(apmem_resume_pos(700u, 600u) == 0u);
+    assert(apmem_resume_pos(120u, 0u) == 0u);
+    assert(apmem_resume_pos(5u, 12u) == 0u); /* tiny file */
+    assert(apmem_store_pos(120u, 600u, 0) == 120u);
+    assert(apmem_store_pos(120u, 600u, 1) == 0u); /* finished track restarts at 0:00 */
+    assert(apmem_store_pos(595u, 600u, 0) == 0u);
+
+    /* Scheduler */
+    apmem_sched_t s;
+    apmem_sched_start(&s, 1000u, 30u);
+    assert(!apmem_sched_tick(&s, 1120u, 30u, 0u, 4000u));        /* nothing moved */
+    assert(!apmem_sched_tick(&s, 30000u, 59u, 0u, 4000u));       /* playing < 60 s */
+    assert(apmem_sched_tick(&s, 61000u, 90u, 0u, 4000u));        /* 60 s elapsed */
+    apmem_sched_saved(&s, 61000u, 90u);
+    assert(!apmem_sched_tick(&s, 61120u, 90u, 0u, 4000u));
+    assert(!apmem_sched_tick(&s, 70000u, 99u, 0u, 4000u));
+    assert(apmem_sched_tick(&s, 70120u, 99u, 1u, 4000u));        /* pause edge: at once */
+    apmem_sched_saved(&s, 70120u, 99u);
+    assert(!apmem_sched_tick(&s, 70240u, 99u, 1u, 4000u));       /* still paused */
+    assert(!apmem_sched_tick(&s, 71000u, 109u, 1u, 4000u));      /* skip while paused: coalesced */
+    assert(!apmem_sched_tick(&s, 74000u, 119u, 1u, 4000u));
+    assert(apmem_sched_tick(&s, 75200u, 119u, 1u, 4000u));       /* ...written after 5 s */
+    apmem_sched_saved(&s, 75200u, 119u);
+    assert(!apmem_sched_tick(&s, 80000u, 125u, 0u, 4000u));      /* resumed playing */
+    assert(!apmem_sched_tick(&s, 200000u, 600u, 2u, 4000u));     /* ended: caller clears on exit */
+    /* Low battery shortens the period to 15 s */
+    apmem_sched_start(&s, 0u, 0u);
+    assert(!apmem_sched_tick(&s, 14000u, 14u, 0u, 3400u));
+    assert(apmem_sched_tick(&s, 15000u, 15u, 0u, 3400u));
+    assert(!apmem_sched_tick(&s, 15000u, 15u, 0u, 4000u));
+    /* One hour of uninterrupted listening: 60 writes */
+    apmem_sched_start(&s, 0u, 0u);
+    unsigned writes = 0u;
+    for (uint32_t t = 0u; t <= 3600000u; t += 120u) {
+        if (apmem_sched_tick(&s, t, t / 1000u, 0u, 4000u)) {
+            apmem_sched_saved(&s, t, t / 1000u);
+            writes++;
+        }
+    }
+    assert(writes == 60u);
+
+    printf("  [PASS] apmem policy (resume/tail rule, finished restart, pause edge, 60 s/15 s periodic, 60 writes/h)\n");
+}
+
+static unsigned count_diff_sectors(const uint8_t *a, const uint8_t *b, uint32_t secs, uint32_t *last)
+{
+    unsigned n = 0u;
+    for (uint32_t i = 0u; i < secs; i++) {
+        if (memcmp(a + i * 512u, b + i * 512u, 512u) != 0) {
+            n++;
+            if (last) *last = i;
+        }
+    }
+    return n;
+}
+
+static void apmem_make_file(exfat_vol_t *vol, const char *dir, const char *name, uint32_t len)
+{
+    exfat_writer_t w;
+    uint8_t blk[64];
+    memset(blk, 0x5A, sizeof(blk));
+    assert(exfat_create_file(vol, dir, name, &w) == 0);
+    for (uint32_t off = 0u; off < len; off += (uint32_t)sizeof(blk)) {
+        uint32_t n = (len - off < sizeof(blk)) ? (len - off) : (uint32_t)sizeof(blk);
+        assert(exfat_write(&w, blk, n) == 0);
+    }
+    assert(exfat_close_file(&w) == 0);
+}
+
+static void test_apmem_storage(void)
+{
+    enum { SECS = 148u }; /* 128 x 512 B clusters: each 16 KiB state file spans a 32-cluster FAT chain */
+    static uint8_t disk[SECS * 512u];
+    static uint8_t snap[SECS * 512u];
+    init_tiny_exfat(disk, SECS);
+    put_le64(&disk[20u * 512u] + 24u, 16u); /* allocation bitmap covers 128 clusters */
+    fault_disk_t fd = { disk, SECS, -1, 0 };
+    blkdev_t dev = { fault_read_sectors, fault_write_sectors, SECS, &fd };
+    exfat_vol_t vol;
+    assert(exfat_mount(&vol, &dev) == 0);
+    assert(exfat_mkdir(&vol, "book") == 0);
+    apmem_make_file(&vol, "/book", "CH_01.wav", 300u);
+    apmem_make_file(&vol, "/book", "CH_02.wav", 400u);
+    apmem_make_file(&vol, "/book", ".autoplay", 0u);
+
+    uint32_t tag1 = 0u, tag2 = 0u, pos = 0u;
+    assert(apmem_file_tag(&vol, "/book", "CH_01.wav", &tag1) == 0 && tag1 == 300u);
+    assert(apmem_file_tag(&vol, "/book", "CH_02.wav", &tag2) == 0 && tag2 == 400u);
+    assert(apmem_file_tag(&vol, "/book", "NOPE.wav", &tag2) == -1);
+
+    /* Nothing stored yet: loads fail, clearing never creates the state file */
+    char name[APMEM_FOCUS_CAP];
+    assert(apmem_load_pos(&vol, "/book", "CH_01.wav", tag1, &pos) == -1);
+    assert(apmem_load_focus(&vol, "/book", name, sizeof(name)) == -1);
+    fd.write_count = 0;
+    assert(apmem_save_pos(&vol, "/book", "CH_01.wav", tag1, 0u) == 0);
+    assert(fd.write_count == 0);
+    exfat_entry_t st;
+    assert(exfat_find_path(&vol, "/book/" APMEM_STATE_NAME, &st) != 0);
+
+    /* First real save creates the 16 KiB file once */
+    assert(apmem_save_pos(&vol, "/book", "CH_01.wav", tag1, 125u) == 0);
+    assert(exfat_find_path(&vol, "/book/.AUTOPLAY.STATE", &st) == 0 && st.size == APMEM_FILE_BYTES);
+    assert(apmem_load_pos(&vol, "/book", "ch_01.WAV", tag1, &pos) == 0 && pos == 125u);
+    assert(exfat_find_path(&vol, "/book/.autoplay", &st) == 0 && st.size == 0u); /* marker untouched */
+
+    /* Every later save is exactly ONE 512 B sector write and nothing else changes */
+    memcpy(snap, disk, sizeof(snap));
+    fd.write_count = 0;
+    assert(apmem_save_pos(&vol, "/book", "CH_01.wav", tag1, 186u) == 0);
+    assert(fd.write_count == 1);
+    uint32_t changed = 0u;
+    assert(count_diff_sectors(snap, disk, SECS, &changed) == 1u);
+    assert(apmem_load_pos(&vol, "/book", "CH_01.wav", tag1, &pos) == 0 && pos == 186u);
+    /* An unchanged value writes nothing */
+    fd.write_count = 0;
+    assert(apmem_save_pos(&vol, "/book", "CH_01.wav", tag1, 186u) == 0);
+    assert(fd.write_count == 0);
+    /* Focus: one sector too */
+    memcpy(snap, disk, sizeof(snap));
+    fd.write_count = 0;
+    assert(apmem_save_focus(&vol, "/book", "CH_02.wav") == 0);
+    assert(fd.write_count == 1 && count_diff_sectors(snap, disk, SECS, NULL) == 1u);
+    assert(apmem_load_focus(&vol, "/book", name, sizeof(name)) == 0 && strcmp(name, "CH_02.wav") == 0);
+    fd.write_count = 0;
+    assert(apmem_save_focus(&vol, "/book", "CH_02.wav") == 0 && fd.write_count == 0);
+
+    /* Torn write: the sector being written is garbage => previous value survives */
+    assert(apmem_save_pos(&vol, "/book", "CH_02.wav", tag2, 40u) == 0);
+    memcpy(snap, disk, sizeof(snap));
+    assert(apmem_save_pos(&vol, "/book", "CH_02.wav", tag2, 77u) == 0);
+    assert(count_diff_sectors(snap, disk, SECS, &changed) == 1u);
+    memset(&disk[changed * 512u + 37u], 0xA5, 300u);
+    assert(apmem_load_pos(&vol, "/book", "CH_02.wav", tag2, &pos) == 0 && pos == 40u);
+    assert(apmem_load_pos(&vol, "/book", "CH_01.wav", tag1, &pos) == 0 && pos == 186u);
+    /* ...and the next save repairs it by writing over the damaged copy */
+    assert(apmem_save_pos(&vol, "/book", "CH_02.wav", tag2, 80u) == 0);
+    assert(apmem_load_pos(&vol, "/book", "CH_02.wav", tag2, &pos) == 0 && pos == 80u);
+    /* Many alternating saves keep working (A/B ping-pong) */
+    for (uint32_t i = 1u; i <= 50u; i++) {
+        assert(apmem_save_pos(&vol, "/book", "CH_02.wav", tag2, 100u + i) == 0);
+        assert(apmem_load_pos(&vol, "/book", "CH_02.wav", tag2, &pos) == 0 && pos == 100u + i);
+    }
+
+    /* Stale entries: renamed (other name) or replaced (other size) files are not matched */
+    assert(apmem_load_pos(&vol, "/book", "CH_01_renamed.wav", tag1, &pos) == -1);
+    assert(apmem_load_pos(&vol, "/book", "CH_01.wav", tag1 + 1u, &pos) == -1);
+
+    /* Finished track: the slot is cleared */
+    assert(apmem_save_pos(&vol, "/book", "CH_01.wav", tag1, 0u) == 0);
+    assert(apmem_load_pos(&vol, "/book", "CH_01.wav", tag1, &pos) == -1);
+
+    /* Hundreds of files: all positions retrievable (eviction only beyond a sector's 31 slots) */
+    for (uint32_t i = 0u; i < 200u; i++) {
+        char fn[24];
+        snprintf(fn, sizeof(fn), "CHAP_%03u.wav", (unsigned)i);
+        assert(apmem_save_pos(&vol, "/book", fn, 1000u + i, 10u + i) == 0);
+    }
+    unsigned found = 0u;
+    for (uint32_t i = 0u; i < 200u; i++) {
+        char fn[24];
+        snprintf(fn, sizeof(fn), "CHAP_%03u.wav", (unsigned)i);
+        if (apmem_load_pos(&vol, "/book", fn, 1000u + i, &pos) == 0) {
+            assert(pos == 10u + i);
+            found++;
+        }
+    }
+    assert(found == 200u);
+    assert(apmem_load_focus(&vol, "/book", name, sizeof(name)) == 0 && strcmp(name, "CH_02.wav") == 0);
+
+    /* Read-only / failing card: saves fail quietly, nothing is half-created */
+    assert(exfat_mkdir(&vol, "book2") == 0);
+    apmem_make_file(&vol, "/book2", "A.wav", 100u);
+    fd.fail_write_at = fd.write_count; /* every further write fails */
+    assert(apmem_save_pos(&vol, "/book2", "A.wav", 100u, 50u) == -1);
+    assert(apmem_save_focus(&vol, "/book", "CH_01.wav") == -1);
+    assert(apmem_load_focus(&vol, "/book", name, sizeof(name)) == 0 && strcmp(name, "CH_02.wav") == 0);
+    fd.fail_write_at = -1;
+
+    /* Truncated state file (power cut during the one-time creation) is ignored, then rebuilt */
+    {
+        exfat_writer_t w;
+        uint8_t z[512];
+        memset(z, 0, sizeof(z));
+        (void)exfat_delete_file(&vol, "/book2", APMEM_STATE_NAME);
+        assert(exfat_create_file(&vol, "/book2", APMEM_STATE_NAME, &w) == 0);
+        assert(exfat_write(&w, z, sizeof(z)) == 0);
+        assert(exfat_close_file(&w) == 0);
+    }
+    assert(apmem_load_pos(&vol, "/book2", "A.wav", 100u, &pos) == -1);
+    assert(apmem_save_pos(&vol, "/book2", "A.wav", 100u, 50u) == 0);
+    assert(exfat_find_path(&vol, "/book2/" APMEM_STATE_NAME, &st) == 0 && st.size == APMEM_FILE_BYTES);
+    assert(apmem_load_pos(&vol, "/book2", "A.wav", 100u, &pos) == 0 && pos == 50u);
+
+    /* Remount (power cycle) keeps everything */
+    exfat_vol_t vol2;
+    assert(exfat_mount(&vol2, &dev) == 0);
+    assert(apmem_load_pos(&vol2, "/book", "CH_02.wav", tag2, &pos) == 0 && pos == 150u);
+    assert(apmem_load_focus(&vol2, "/book", name, sizeof(name)) == 0 && strcmp(name, "CH_02.wav") == 0);
+
+    printf("  [PASS] apmem storage (lazy create, 1 sector/save, torn write, stale, 200 files, RO card, truncated file)\n");
 }
 
 static void test_exfat_checkpoint_fault_injection(void)
@@ -1940,6 +2239,34 @@ static void run_exfat_img_test(const char *path)
         assert(exfat_delete_file(&vol4, "/pcdir", "EMPTY.TXT") == 0);
     }
 
+    /* Autoplay-folder memory on a real mkfs.exfat image (fsck.exfat runs afterwards) */
+    {
+        exfat_vol_t va;
+        assert(exfat_mount(&va, &dev) == 0);
+        assert(exfat_mkdir(&va, "Jekyll_Hyde") == 0); /* exfat_mkdir creates root-level dirs */
+        exfat_writer_t aw;
+        assert(exfat_create_file(&va, "/Jekyll_Hyde", ".autoplay", &aw) == 0);
+        assert(exfat_close_file(&aw) == 0);
+        assert(exfat_create_file(&va, "/Jekyll_Hyde", "JH_01a_Cap1.wav", &aw) == 0);
+        assert(exfat_write(&aw, pcm, 4000u) == 0);
+        assert(exfat_close_file(&aw) == 0);
+        uint32_t tag = 0u, p = 0u;
+        assert(apmem_file_tag(&va, "/Jekyll_Hyde", "JH_01a_Cap1.wav", &tag) == 0 && tag == 4000u);
+        assert(apmem_save_focus(&va, "/Jekyll_Hyde", "JH_01a_Cap1.wav") == 0);
+        for (uint32_t i = 1u; i <= 20u; i++) {
+            assert(apmem_save_pos(&va, "/Jekyll_Hyde", "JH_01a_Cap1.wav", tag, 60u * i) == 0);
+        }
+        exfat_vol_t vb;
+        assert(exfat_mount(&vb, &dev) == 0);
+        assert(apmem_load_pos(&vb, "/Jekyll_Hyde", "JH_01a_Cap1.wav", tag, &p) == 0 && p == 1200u);
+        char fn[APMEM_FOCUS_CAP];
+        assert(apmem_load_focus(&vb, "/Jekyll_Hyde", fn, sizeof(fn)) == 0 &&
+               strcmp(fn, "JH_01a_Cap1.wav") == 0);
+        exfat_entry_t se;
+        assert(exfat_find_path(&vb, "/Jekyll_Hyde/.autoplay.state", &se) == 0 &&
+               se.size == APMEM_FILE_BYTES && !se.is_dir);
+    }
+
     fclose(fp);
     printf("  [PASS] exfat-img (%s: 16,428 B multi-cluster WAV + checkpoint + atomic replace + NoFatChain grow + settings.bin verified)\n", path);
 }
@@ -2322,6 +2649,8 @@ static void test_bt_spp_and_xrec(void)
     /* Empty per-folder autoplay marker: hidden from LS, found case-insensitively */
     assert(exfat_create_file(&vol, "/record", ".autoplay", &w) == 0);
     assert(exfat_close_file(&w) == 0);
+    /* Autoplay memory file next to it: hidden from LS as well */
+    assert(apmem_save_focus(&vol, "/record", "REC_0002.wav") == 0);
     {
         exfat_entry_t ap;
         assert(exfat_find_path(&vol, "/record/.AUTOPLAY", &ap) == 0 && !ap.is_dir && ap.size == 0u);
@@ -2909,6 +3238,9 @@ int main(int argc, char **argv)
     test_exfat_checkpoint_fault_injection();
     test_exfat_replace_fault_injection();
     test_exfat_hardening_and_batching();
+    test_apmem_format();
+    test_apmem_policy();
+    test_apmem_storage();
     test_usb_msc();
     test_usb_msc_async_pingpong();
     test_usb_msc_vendor_e0();
