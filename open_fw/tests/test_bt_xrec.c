@@ -45,6 +45,7 @@ static int m_lock_depth, m_lock_max, m_notifies, m_allocs, m_frees, m_alloc_fail
 static int m_entropy_fail;
 static uint32_t m_entropy_ctr = 0x00123456u;
 static int m_up_calls, m_down_calls, m_hold_up, m_hold_down, m_up_result, m_down_result, m_job_kind, m_job_pending;
+static int m_deinit_needed_at_down;
 static int m_dl_latched, m_hard_reason, m_service, m_session_end, m_reboot_mode, m_saved_key, m_poll_fault;
 static uint16_t m_peer_mtu = 660u;
 static int m_verbose;
@@ -243,6 +244,7 @@ int bt_xrec_plat_stack_up_begin(exfat_vol_t *vol, int sd_mounted, const uint8_t 
 void bt_xrec_plat_stack_down_begin(void)
 {
     m_down_calls++;
+    m_deinit_needed_at_down = bt_xrec_spp_deinit_needed();
     m_job_kind = 2;
     m_job_pending = 1;
 }
@@ -620,7 +622,7 @@ static void mocks_reset(void)
     m_pair_block = NULL;
     m_pair_block_calls = 0;
     m_up_calls = m_down_calls = m_hold_up = m_hold_down = m_up_result = m_down_result = m_job_kind = 0;
-    m_job_pending = 0;
+    m_job_pending = m_deinit_needed_at_down = 0;
     m_dl_latched = m_hard_reason = m_service = m_session_end = m_reboot_mode = m_saved_key = m_poll_fault = 0;
     m_peer_mtu = 660u;
     m_gap_cb = NULL;
@@ -1299,9 +1301,27 @@ static void t_evq_overflow_and_faults(void)
     mocks_reset();
     CHECK(bt_xrec_start(NULL, 0) == 0, "start");
     bt_xrec_poll();
+    CHECK(dbg().state == BT_XREC_ST_CONFIG && bt_xrec_spp_deinit_needed() == 1,
+          "SPP deinit needed immediately after esp_spp_enhanced_init before INIT_EVT");
+    stop_ok();
+    CHECK(m_deinit_needed_at_down == 1 && bt_xrec_spp_deinit_needed() == 0,
+          "teardown in ST_CONFIG sees deinit_needed=1 and clears it on exit");
+    mocks_reset();
+    CHECK(bt_xrec_start(NULL, 0) == 0, "start");
+    bt_xrec_poll();
+    memset(&p, 0, sizeof(p));
+    p.init.status = ESP_SPP_NO_RESOURCE;
+    spp_evt(ESP_SPP_INIT_EVT, &p);
+    bt_xrec_poll();
+    CHECK(dbg().last_fault == BT_XREC_FAULT_CONFIG && m_deinit_needed_at_down == 0,
+          "failed ESP_SPP_INIT_EVT clears deinit_needed before teardown");
+    mocks_reset();
+    CHECK(bt_xrec_start(NULL, 0) == 0, "start");
+    bt_xrec_poll();
     m_now += BT_XREC_CONFIG_DEADLINE_MS;
     bt_xrec_poll();
-    CHECK(dbg().last_fault == BT_XREC_FAULT_CONFIG_TIMEOUT, "configuration timeout");
+    CHECK(dbg().last_fault == BT_XREC_FAULT_CONFIG_TIMEOUT && m_deinit_needed_at_down == 1,
+          "configuration timeout still requests SPP deinit");
 }
 
 static void t_hard_paths(void)

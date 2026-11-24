@@ -149,6 +149,7 @@ static volatile uint8_t s_spp_uninit_seen;
 static volatile uint8_t s_bench_autoconfirm;   /* BENCH ONLY (bt_xrec_set_bench_autoconfirm); outside s: survives start */
 static char s_bench_pin[8];                     /* BENCH ONLY (bt_xrec_set_bench_xrec_pin): "" = DRBG PIN; app task */
 #endif
+static volatile uint8_t s_spp_init_posted;
 
 #if defined(BT_XREC_TEST_HOOKS) && BT_XREC_TEST_HOOKS
 /* Host tests only: an in-flight window above BTC's ring, so esp_spp_write() reaches ESP_ERR_NO_MEM against the real
@@ -1102,6 +1103,7 @@ static void on_spp_event(const ev_t *e)
         if (s.state != BT_XREC_ST_CONFIG) {
             s.d.stale_events++;
         } else if (e->status != ESP_SPP_SUCCESS) {
+            s_spp_init_posted = 0u;
             bt_xrec_plat_log_u32("BT XREC SPP init failed, status", e->status);
             fault(BT_XREC_FAULT_CONFIG);
         } else {
@@ -1294,6 +1296,8 @@ static void config_begin(void)
         (r = esp_spp_enhanced_init(&cfg)) != ESP_OK) {
         bt_xrec_plat_log_u32("BT XREC GAP/SPP configuration failed", (uint32_t)r);
         fault(BT_XREC_FAULT_CONFIG);
+    } else {
+        s_spp_init_posted = 1u;
     }
 }
 
@@ -1471,6 +1475,7 @@ int bt_shutdown(void)
         bt_xrec_plat_wait();
     }
     s.spp_inited = 0u;
+    s_spp_init_posted = 0u;
     s.scan_applied = 0u;
     s.scan_refused = s.scan_failsafe = s.scan_disc_sent = s.scan_want_sent = 0u;
     s.acl_links = 0u;
@@ -1522,6 +1527,7 @@ int bt_xrec_start(exfat_vol_t *vol, int sd_mounted)
     uint32_t last_fault = s.last_fault;
     memset(&s, 0, sizeof(s));
     s.last_fault = last_fault;
+    s_spp_init_posted = 0u;
     bt_xrec_plat_identity(s.bd);
     static const char hex[] = "0123456789ABCDEF";
     memcpy(s.name, "Cassini_", 8u);            /* legacy naming scheme F:2005-2012 */
@@ -1919,6 +1925,11 @@ int bt_xrec_spp_uninit_seen(void)
     return s_spp_uninit_seen != 0u;
 }
 
+int bt_xrec_spp_deinit_needed(void)
+{
+    return s_spp_init_posted != 0u;
+}
+
 #if defined(BT_XREC_TEST_HOOKS) && BT_XREC_TEST_HOOKS
 /* Host tests only: forget a DEAD session (on target the hard path reboots). */
 void bt_xrec_test_reset(void);
@@ -1933,5 +1944,6 @@ void bt_xrec_test_reset(void)
     s_bench_autoconfirm = 0u;
     memset(s_bench_pin, 0, sizeof(s_bench_pin));
 #endif
+    s_spp_init_posted = 0u;
 }
 #endif

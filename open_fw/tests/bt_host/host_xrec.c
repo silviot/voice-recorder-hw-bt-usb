@@ -324,7 +324,7 @@ static int job_down(void)
     if (esp_bluedroid_get_status() == ESP_BLUEDROID_STATUS_ENABLED) {
         esp_spp_profile_status_t ps;
         memset(&ps, 0, sizeof(ps));
-        if (esp_spp_get_profile_status(&ps) == ESP_OK && ps.spp_inited) {
+        if ((esp_spp_get_profile_status(&ps) == ESP_OK && ps.spp_inited) || bt_xrec_spp_deinit_needed()) {
             if (esp_spp_deinit() == ESP_OK) {
                 while (!bt_xrec_spp_uninit_seen()) {
                     vTaskDelay(1);
