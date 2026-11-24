@@ -1045,7 +1045,11 @@ static void process_cmd(uint32_t idx)
         if (s == 0u) {
             g.st.cmd_fwd++;
             if (held) {
-                g.fwd_t0 = g.hold_t0;        /* its deadline stays inside the host's 8 s command timeout */
+                /* Keep inside Bluedroid's 8 s command timeout while leaving >= 500 ms for the ROM to execute it. */
+                uint32_t max_age = BT_CTRL_FWD_DEADLINE_MS - 500u;
+                g.fwd_t0 = (g.now_ms != NULL && (uint32_t)(g.fwd_t0 - g.hold_t0) > max_age)
+                               ? (uint32_t)(g.fwd_t0 - max_age)
+                               : g.hold_t0;
             }
             return;
         }

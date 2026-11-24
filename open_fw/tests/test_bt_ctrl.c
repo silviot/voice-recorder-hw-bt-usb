@@ -2508,6 +2508,28 @@ static void test_fwd_late_same_opcode(void)
     pump();
     while (next_pkt() != NULL) {
     }
+    /* host dispatches next same-opcode command at +0 ms upon receiving 0x22: when the prior late reply never arrives,
+     * the held command must still get a non-zero execution window in the ROM instead of timing out in Pass 1 (0 ms) */
+    fake_rom.hold_replies = true;
+    send_cmd(0x041Du, h80, 2);
+    pump();
+    t_now_ms += BT_CTRL_FWD_DEADLINE_MS;
+    pump();
+    p = next_pkt();
+    CHECK(is_reply(p, 0x041Du) && status_of(p) == BT_HCI_ERR_LMP_TIMEOUT, "E answered 0x22 at deadline");
+    send_cmd(0x041Du, h80, 2);                   /* sent at +0 ms (same tick as 0x22) */
+    pump();
+    t_now_ms += BT_CTRL_FWD_DEADLINE_MS;         /* prior late reply expires -> F forwarded now */
+    pump();
+    CHECK(dbg().fwd_pending == 1u && pending_pkts() == 0u,
+          "held command sent at +0 ms must not 0-ms-timeout in the pass that forwards it");
+    t_now_ms += 20u;
+    fake_rom.hold_replies = false;
+    fake_rom_set_reply_status(0xE407u, 0x00);
+    fake_rom_release_held();
+    pump();
+    p = next_pkt();
+    CHECK(is_reply(p, 0x041Du) && status_of(p) == 0x00u, "F completed with real ROM status within its window");
     shutdown_and_check();
 }
 
