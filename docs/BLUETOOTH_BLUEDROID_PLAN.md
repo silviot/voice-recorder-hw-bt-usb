@@ -1,9 +1,9 @@
-# Bluetooth Classic for open_fw — Integration Plan (v8, for joint review)
+# Bluetooth Classic for open_fw — Integration Plan (v9, for joint review)
 
 Branch `feat/freertos-bluedroid` (worktree `../voice-recorder-hw-bt-usb-bt`). Hardware: Smartlink SL6801 `HW_76`
 (dual Cortex-M4F @ 96 MHz, 512 KB SRAM, 2 MB SPI NOR XIP, **BR/EDR-only** RivieraWaves `RW-BT` controller in mask ROM,
 no BLE). This document is the single source of truth: it is reviewed by Codex and agy until both agree, then executed.
-v3–v8 address rounds 1–6 (§11 traceability).
+v3–v9 address rounds 1–7 (§11 traceability).
 
 ## 0. Goals, non-goals
 
@@ -57,9 +57,10 @@ Nothing has run on silicon yet. Legacy BT host code has never shipped to users.
                                        ack, count per-bit occurrences, vTaskNotifyGiveFromISR(bt_ctrl) +
                                        portYIELD_FROM_ISR; code in .fast_ramtext (NOT .ram_boot: 172 B left)
  ISR low   SysTick                     g_systick_ms, keys, exp watchdog, xPortSysTickHandler
- 9         FreeRTOS timer daemon       osi alarm / esp_timer callbacks: bounded, never block (see M2)
+ 9         FreeRTOS timer daemon       kernel/app timers only (BT alarms use bt_alarm, see M2)
  8         bt_ctrl (controller owner)  ALL RW-BT ROM/EM calls; cmd/ACL TX queues; RX packing into bounded rings
  7         hciT (upstream configMAX-3) Bluedroid HCI host
+ 7         bt_alarm                    BT deadline list → pending list → BTC drain post (never blocks otherwise)
  6         bt_dlv (delivery)           pops bt_ctrl RX rings → host callback (may block on host queues; bt_ctrl never does)
  5         BTU  (upstream configMAX-5)
  4         BTC  (upstream configMAX-6)
@@ -97,7 +98,7 @@ SRAM (RTOS build): main `.bss` ends ≈`0x84EA18` (~5.5 KB left — nothing new 
 | `g_bt_heap` (ROM-required, already in main `.bss`) | 8 KB | unchanged (counted) |
 | FreeRTOS idle + timer static stacks/TCBs | ~2.2 KB | currently main `.bss` → move to RTOS region |
 | App task stack | 16 KB | heap (measure; trim only after silicon watermark) |
-| BT stacks: hciT 2 + BTU 4.25 + BTC 3 + bt_ctrl 2 + bt_dlv 1.5 | ~12.75 KB | heap; host + silicon watermarks |
+| BT stacks: hciT 2 + BTU 4.25 + BTC 3 + bt_ctrl 2 + bt_dlv 1.5 + bt_alarm 1 | ~13.75 KB | heap; host + silicon watermarks |
 | bt_ctrl rings: ACL RX 4 × (1021+5) + event RX 8 × 260 + unified TX 3 × 1026 (any packet type) | ~9.2 KB | static in `.bt_bss`, capacity asserted in bytes |
 | OSI objects, HCI cmd/ACL buffers, config cache | 8–20 KB | heap |
 | SPP mode RFCOMM queues + XREC RX stream buffer | 4–20 KB | heap |
@@ -196,39 +197,38 @@ Acceptance budget per mode: minimum free heap under traffic ≥ 8 KB and largest
   store and silently falls back to an empty config). Test: cold boot with an existing bond reconnects without pairing; `nvs_commit()` posts an asynchronous flush to the app (atomic exFAT staged replace, CRC).
   No SD → RAM-only bonds for the session. Link keys never logged. Trust model documented: keys on MSC-visible media are
   readable/replaceable by anyone with physical access; CRC only detects corruption.
-- `esp_timer`/`osi_alarm` → FreeRTOS timers + `us_timer_now()`. Requirements: the timer daemon never blocks, an
-  expiry is never lost, a cancelled/re-armed alarm never delivers a stale expiry. Design (documented patches in
-  `osi/alarm.c`, `btc/core/btc_task.c`; no retry timers):
-  1. Each alarm has a `generation` (incremented by set, cancel and free) and a `pending` flag; both guarded by a
-     short critical section (never `alarm_mutex`, which is held around `esp_timer_stop/delete` → ABBA risk).
-  2. Daemon callback: under the critical section, if not already pending, mark pending, record `gen`, link the alarm
-     into a pending list; then post a drain work item with **`osi_thread_post(btc_thread, drain_fn, NULL, 0, 0)`** —
-     allocation-free (the `work_item` is copied by value into the queue), timeout 0, so a failure can **only** mean
-     the BTC queue is full (never heap exhaustion; `btc_transfer_context` is not used because it `osi_malloc`s).
-     At most one drain item outstanding (flag); the flag is cleared on a failed post and at the start of `drain_fn`
-     before draining.
-  3. **Guaranteed wakeup without timers**: `btc_thread_handler()` calls `osi_alarm_drain_pending()` at its end, i.e.
-     after **every** BTC message. If the post failed, the queue was full, so BTC dispatches at least one more message
-     and drains then; if it succeeded, `drain_fn` does it. Pending is set before the post, so there is no window.
-     Test: expiry while heap allocation is failing and with no later traffic → delivered once.
-  4. Drain: for each pending alarm, under the critical section unlink it and compare the recorded `gen` with the
-     alarm's current `generation`; mismatch (cancelled, re-armed, freed) → drop; match → invoke the callback in BTC
-     context **outside** the critical section, with the validated `gen` available via
-     `osi_alarm_delivery_gen()`. Cancel/free remove the alarm from the pending list and bump `generation`
-     (`generation` is preserved across `alarm_free()`'s `memset`).
-  4a. Because a higher-priority task can re-arm between validation and the callback taking its own lock, any callback
-     whose meaning depends on "which arming" must re-validate under its **own** lock. All `osi_alarm` users are
-     audited in step 2; the known case is `hci_layer.c` `command_timed_out`: patch records the generation when the
-     command-response timer is (re)armed under `commands_pending_response_lock`, and the callback, after taking that
-     lock, ignores the expiry unless `osi_alarm_delivery_gen()` equals the recorded generation, before reading the
-     queue head. Test: re-arm after BTC validated but before the callback takes the lock → ignored; the new command's
-     timeout still fires.
-  5. Periodic alarms (A2DP media tick) are never re-armed by this path; overlapping expiries coalesce into one pending
-     delivery (A2DP computes frames from elapsed time, so coalescing is safe); coalesce count is telemetry.
-  Tests (host, with FreeRTOS POSIX): BTC queue full at expiry → drained exactly once; both BTC queue and timer command
-  queue full → still exactly once; cancel after the drain message is queued but before BTC runs → never delivered;
-  cancel + re-arm (HCI command timeout pattern, `hci_layer.c`) → only the new expiry fires; periodic cadence preserved
-  under a slow BTC. Timer daemon stack watermark measured under A2DP load.
+- **Alarms (`esp_timer` shim under `osi_alarm`)** — requirements: the timer context never blocks, an expiry is never
+  lost, a cancelled or re-armed alarm never delivers a stale expiry. FreeRTOS software timers are **not** used for this:
+  their start/stop commands go through the daemon's queue, so an old expiry can be processed before a queued stop/re-arm
+  and can only be identified by a reusable slot pointer (round-7 finding). Instead a small **`bt_alarm` service**
+  (`bt_port/bt_alarm.c`, host-tested) owns all BT deadlines:
+  1. State: a deadline list (sorted, `us_timer_now()` based) and a pending list, both guarded by one short critical
+     section. Each alarm carries `generation`, bumped by every set/cancel/free **synchronously in the caller** under that
+     critical section, which also removes the alarm from both lists. There is no command queue, so nothing can lag behind
+     a cancel or re-arm.
+  2. A `bt_alarm` task (priority just below `bt_ctrl`, ~1 KB stack) sleeps in `ulTaskNotifyTake()` with a timeout to the
+     earliest deadline; set/cancel call `xTaskNotifyGive()` (cannot fail) when the earliest deadline changes. On wake it
+     moves every due entry, stamped with the `generation` it was armed with, from the deadline list to the pending list
+     (one-shots leave the deadline list; periodics are re-inserted at `deadline + period`, coalescing if late), then posts
+     a drain work item to BTC with **`osi_thread_post(btc_thread, drain_fn, NULL, 0, 0)`** (allocation-free; a failure
+     can only mean the BTC queue is full). At most one drain item outstanding (flag cleared on failed post and at the
+     start of `drain_fn`). The task never blocks on anything else.
+  3. **Guaranteed delivery**: `btc_thread_handler()` calls `osi_alarm_drain_pending()` at its end, i.e. after every BTC
+     message (documented patch in `btc_task.c`). A failed post means a full queue, so BTC runs again and drains.
+  4. Drain: under the critical section unlink each pending entry and deliver only if its stamped generation equals the
+     alarm's current `generation` (cancel/re-arm/free since expiry ⇒ drop); the callback runs in BTC context outside the
+     critical section with the validated generation available via `osi_alarm_delivery_gen()`. `generation` survives
+     `alarm_free()`'s `memset`.
+  5. Callers whose meaning depends on "which arming" re-validate under their own lock (a higher-priority task can re-arm
+     between drain validation and the callback taking that lock). All `osi_alarm` users are audited in step 2; the known
+     case is `hci_layer.c` `command_timed_out`: the command-response timer generation is recorded when (re)armed under
+     `commands_pending_response_lock`, and the callback ignores the expiry unless `osi_alarm_delivery_gen()` matches,
+     before reading the queue head.
+  Tests (host, FreeRTOS POSIX + deterministic fake clock): BTC queue full at expiry → delivered exactly once; heap
+  allocation failing with no later traffic → delivered once; cancel or re-arm at every interleaving point (before due,
+  after due but before the `bt_alarm` scan, after stamping but before drain, after drain validation but before the HCI
+  lock) → the old expiry is never accepted and the new one fires exactly once; periodic cadence under a slow BTC;
+  `bt_alarm` stack watermark under A2DP load.
 - `esp_log` → `openfw_log` with redaction; `esp_ringbuf` stress-tested on host, stream-buffer fallback by patch.
 
 ### M3 — Host harness
@@ -326,7 +326,7 @@ telemetry: heap/stack watermarks, largest free block, IRQ-26 latency and multipl
 
 ## 9. Open questions for reviewers (round 3)
 
-1. Do the v8 changes (allocation-free drain post; per-user re-validation under the user's lock) resolve round 6?
+1. Does the v9 `bt_alarm` service (caller-synchronous generation, no timer command queue) resolve the round-7 item?
 2. Any remaining blocker to starting steps 1–3?
 
 ## 10. Live log
@@ -340,6 +340,8 @@ telemetry: heap/stack watermarks, largest free block, IRQ-26 latency and multipl
   Plan v6 written. Round 5: agy APPROVE; Codex CHANGES_REQUIRED (retry wakeup not guaranteed; stale expiry after
   cancel). Plan v7 replaces the retry-timer approach. Round 6: agy APPROVE_WITH_CHANGES (no blockers); Codex 2 items
   (allocation-failure wakeup; validate-then-callback race). Plan v8 written. Step-1 build plumbing in progress.
+  Round 7: agy APPROVE; Codex 1 item (FreeRTOS timer command lag lets an old expiry carry the new generation). Plan v9
+  replaces FreeRTOS software timers for BT alarms with the `bt_alarm` service.
 
 ## 11. Round-1 traceability
 
@@ -383,3 +385,5 @@ telemetry: heap/stack watermarks, largest free block, IRQ-26 latency and multipl
 | Codex N1 / agy NB1 (drain post allocates) | `osi_thread_post` work item, allocation-free; heap-failure test |
 | Codex N2 (re-arm between validation and callback) | 4a: per-user re-validation under its own lock; `hci_layer.c` command generation; audit all alarm users |
 | agy NB2 (hook placement, flag hygiene, memset) | end of `btc_thread_handler()`; flag cleared on failure/start; generation preserved |
+| **Round 7** | |
+| Codex N1 (timer command lag: old expiry stamped with new generation) | `bt_alarm` service: caller-synchronous list + generation under one critical section; no FreeRTOS timer queue; interleaving tests |
