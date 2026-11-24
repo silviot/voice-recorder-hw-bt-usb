@@ -721,6 +721,21 @@ int main(int argc, char **argv)
                 }
             }
         }
+        /* Verify every language's "Language" label + "- <NativeName> +" fits on the 140px
+         * settings row without wrapping or colliding. */
+        for (uint8_t lang = 0u; lang < (uint8_t)UI_LANG_COUNT; lang++) {
+            const char *lbl = ui_tr_lang(lang, UI_STR_SET_LANGUAGE);
+            const char *nam = ui_lang_native_name(lang);
+            char val_disp[40];
+            snprintf(val_disp, sizeof(val_disp), "- %s +", nam);
+            int32_t lw = lv_text_get_width(lbl, (uint32_t)strlen(lbl), &ui_font_md, 0);
+            int32_t vw = lv_text_get_width(val_disp, (uint32_t)strlen(val_disp), &ui_font_sm, 0);
+            if (lw + vw + 4 > 140) {
+                fprintf(stderr, "Settings Language row overflow for lang=%u (%s): lw=%d vw=%d\n",
+                        (unsigned)lang, nam, (int)lw, (int)vw);
+                assert(0);
+            }
+        }
         /* Render key screens across representative languages (incl. Bulgarian Cyrillic,
          * Polish, Czech, Hungarian, Romanian, German, Italian) to verify zero layout/heap issues */
         static const uint8_t sample_langs[] = {
