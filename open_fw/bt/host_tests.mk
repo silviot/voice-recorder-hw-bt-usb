@@ -5,3 +5,13 @@
 #   test-bt-port  : entropy/DRBG/store shim tests               [owner: entropy]
 .PHONY: test-bt-ctrl test-bt-host test-bt-port test-bt-all
 test-bt-all: test-bt-ctrl test-bt-host test-bt-port
+
+# ---- test-bt-port: entropy pool + HMAC_DRBG (plan M2, step 2). Host build, sanitizers on. ----
+BT_PORT_TEST_DIR ?= /tmp/sl6801_bt_port_tests
+BT_PORT_TEST_CFLAGS := -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-frame-pointer \
+                       -Iinclude -Ibt_port -Itests
+test-bt-port:
+	@mkdir -p $(BT_PORT_TEST_DIR)
+	$(HOST_CC) $(BT_PORT_TEST_CFLAGS) tests/test_bt_entropy.c bt_port/bt_entropy.c bt_port/bt_drbg.c src/crypto.c \
+		-lm -o $(BT_PORT_TEST_DIR)/test_bt_entropy
+	$(BT_PORT_TEST_DIR)/test_bt_entropy
