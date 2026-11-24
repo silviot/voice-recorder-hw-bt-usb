@@ -1543,7 +1543,7 @@ static void adjust_setting(int idx, int delta, uint32_t now_ms)
         g_ui.cfg.screen_off_idx = (uint8_t)((g_ui.cfg.screen_off_idx + (delta > 0 ? 1u : 4u)) % 5u);
         break;
     case 7: /* Skip */
-        g_ui.cfg.skip_mode = (uint8_t)((g_ui.cfg.skip_mode + (delta > 0 ? 1u : 2u)) % 3u);
+        g_ui.cfg.skip_mode = (g_ui.cfg.skip_mode == UI_SKIP_TRACK) ? UI_SKIP_SPEED : UI_SKIP_TRACK;
         break;
     case 8: /* Language */
         g_ui.cfg.lang = (uint8_t)((g_ui.cfg.lang + (delta > 0 ? 1u : ((uint32_t)UI_LANG_COUNT - 1u))) % (uint32_t)UI_LANG_COUNT);

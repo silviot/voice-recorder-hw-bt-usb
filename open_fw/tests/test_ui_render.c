@@ -388,6 +388,58 @@ int main(int argc, char **argv)
     ui_render_screen(UI_SCR_PLAYER, &m);
     assert(g_written_pixels > player_pixels && g_written_pixels - player_pixels < 160u * 10u);
 
+    /* 5b: Player speed dial: speed pill, header state, and dial footer */
+    {
+        static const struct { int8_t speed; uint8_t state; const char *pill, *head, *foot; } dial[] = {
+            {   0, 0u, NULL,   "Playing", "\xE2\x97\x80 \xE2\x88\x92" "1\xC3\x97 \xC2\xB7 OK Pause \xC2\xB7 2\xC3\x97 \xE2\x96\xB6" },
+            {   0, 1u, NULL,   "Paused",  "\xE2\x97\x80 \xE2\x88\x92" "1\xC3\x97 \xC2\xB7 OK Play \xC2\xB7 2\xC3\x97 \xE2\x96\xB6" },
+            {   2, 0u, "2\xC3\x97", "Fast", "\xE2\x97\x80 1\xC3\x97 \xC2\xB7 OK 1\xC3\x97 \xC2\xB7 4\xC3\x97 \xE2\x96\xB6" },
+            {  -4, 0u, "\xE2\x88\x92" "4\xC3\x97", "Reverse",
+               "\xE2\x97\x80 \xE2\x88\x92" "8\xC3\x97 \xC2\xB7 OK 1\xC3\x97 \xC2\xB7 \xE2\x88\x92" "2\xC3\x97 \xE2\x96\xB6" },
+            {  16, 0u, "16\xC3\x97", "Seeking", "\xE2\x97\x80 8\xC3\x97 \xC2\xB7 OK 1\xC3\x97 \xC2\xB7 32\xC3\x97 \xE2\x96\xB6" },
+            {  32, 0u, "32\xC3\x97", "Seeking", "\xE2\x97\x80 16\xC3\x97 \xC2\xB7 OK 1\xC3\x97" },
+            { -32, 0u, "\xE2\x88\x92" "32\xC3\x97", "Seeking", "OK 1\xC3\x97 \xC2\xB7 \xE2\x88\x92" "16\xC3\x97 \xE2\x96\xB6" },
+        };
+        for (size_t i = 0; i < sizeof(dial) / sizeof(dial[0]); i++) {
+            m.play_scrub_speed = dial[i].speed;
+            m.play_state       = dial[i].state;
+            ui_render_screen(UI_SCR_PLAYER, &m);
+            assert(strcmp(lv_label_get_text(objects.play_bar_l), dial[i].head) == 0);
+            if (strcmp(lv_label_get_text(objects.player_footer), dial[i].foot) != 0) {
+                fprintf(stderr, "dial footer %d: \"%s\" != \"%s\"\n", dial[i].speed,
+                        lv_label_get_text(objects.player_footer), dial[i].foot);
+                assert(0);
+            }
+            if (dial[i].pill) assert(strcmp(lv_label_get_text(objects.player_vol_lbl), dial[i].pill) == 0);
+            else assert(strstr(lv_label_get_text(objects.player_vol_lbl), "\xC3\x97") == NULL); /* volume */
+            int32_t fw = lv_text_get_width(dial[i].foot, (uint32_t)strlen(dial[i].foot),
+                                           lv_obj_get_style_text_font(objects.player_footer, LV_PART_MAIN), 0);
+            assert(fw <= 156);
+        }
+        m.cfg.skip_mode = UI_SKIP_TRACK;
+        m.play_scrub_speed = 0;
+        ui_render_screen(UI_SCR_PLAYER, &m);
+        assert(strcmp(lv_label_get_text(objects.player_footer),
+                      "\xE2\x97\x80 Prev \xC2\xB7 OK Pause \xC2\xB7 \xE2\x96\xB6 Next") == 0);
+        m.cfg.skip_mode = UI_SKIP_SPEED;
+        /* Every language's dial header word fits where the longest play state does. */
+        const lv_font_t *hf = lv_obj_get_style_text_font(objects.play_bar_l, LV_PART_MAIN);
+        for (uint8_t lang = 0u; lang < (uint8_t)UI_LANG_COUNT; lang++) {
+            static const ui_str_id_t ids[] = { UI_STR_FAST, UI_STR_REVERSE, UI_STR_SEEKING };
+            for (size_t k = 0; k < 3; k++) {
+                const char *t = ui_tr_lang(lang, ids[k]);
+                int32_t w = lv_text_get_width(t, (uint32_t)strlen(t), hf, 0);
+                if (w > 60) {
+                    fprintf(stderr, "Player header too wide for lang=%u: \"%s\" %d px\n", (unsigned)lang, t, (int)w);
+                    assert(0);
+                }
+            }
+        }
+        m.play_scrub_speed = 0;
+        m.play_state       = 0;
+        ui_render_screen(UI_SCR_PLAYER, &m);
+    }
+
     /* 6: Player (Full-Height Smooth-Scrolling Transcript mode) */
     /* First verify cwx_measure_md_px matches ui_font_md glyph-for-glyph for all ASCII 0x20..0x7E */
     for (int cp = 0x20; cp <= 0x7E; cp++) {

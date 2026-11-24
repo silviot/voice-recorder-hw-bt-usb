@@ -1778,7 +1778,7 @@ static void run_exfat_img_test(const char *path)
     ui_settings_t cfg_def = {
         .lang = UI_LANG_EN, .mic_gain = 20u, .sound_mode = 0u, .channels = 2u,
         .vor_enabled = 0u, .brightness_idx = 3u, .screen_off_idx = UI_SCR_OFF_30S,
-        .skip_mode = UI_SKIP_5_10, .hp_vol = 18u, .spk_vol = 18u
+        .skip_mode = UI_SKIP_SPEED, .hp_vol = 18u, .spk_vol = 18u
     };
     ui_settings_t cfg_load = cfg_def;
     char     last_name[32] = "UNCHANGED";
@@ -1794,7 +1794,7 @@ static void run_exfat_img_test(const char *path)
     ui_settings_t cfg_save = {
         .lang = UI_LANG_IT, .mic_gain = 27u, .sound_mode = AUDIO_DSP_ASR_RAW, .channels = 1u,
         .vor_enabled = 1u, .brightness_idx = 4u, .screen_off_idx = UI_SCR_OFF_5M,
-        .skip_mode = UI_SKIP_10_30, .hp_vol = 22u, .spk_vol = 14u
+        .skip_mode = UI_SKIP_TRACK, .hp_vol = 22u, .spk_vol = 14u
     };
     assert(ui_persist_save(&vol2, &cfg_save, "REC_0001.wav", 42u, 1) == 0);
 
@@ -1814,7 +1814,7 @@ static void run_exfat_img_test(const char *path)
     assert(ui_persist_load(&vol3, &cfg_load, last_name, &last_resume, &has_last) == 0);
     assert(cfg_load.lang == UI_LANG_EN && cfg_load.mic_gain == 31u && cfg_load.sound_mode == AUDIO_DSP_VOICE_CLARITY);
     assert(cfg_load.channels == 2u && cfg_load.vor_enabled == 1u && cfg_load.brightness_idx == 3u);
-    assert(cfg_load.screen_off_idx == UI_SCR_OFF_30S && cfg_load.skip_mode == UI_SKIP_5_10);
+    assert(cfg_load.screen_off_idx == UI_SCR_OFF_30S && cfg_load.skip_mode == UI_SKIP_SPEED);
     assert(cfg_load.hp_vol == 31u && cfg_load.spk_vol == 31u);
     assert(has_last == 0 && last_resume == 0u && last_name[0] == '\0');
 

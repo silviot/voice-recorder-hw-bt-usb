@@ -21,7 +21,7 @@ open_fw/
 │   ├── audio_dac.c           # Stereo DAC0/DAC1 DMAC CH0 playback, PB30 speaker PA & 32-step log volume
 │   ├── audio_dsp.c           # Clean-room Voice Clarity / ASR Raw / Bypass DSP + VOR gate
 │   ├── recorder.c            # Checkpointed WAV recording state machine
-│   ├── player.c              # WAV (PCM/IMA-ADPCM) player with audible 2x-5x scrub & CWX captions
+│   ├── player.c              # WAV (PCM/IMA-ADPCM) player with speed dial (-32x..32x) & CWX captions
 │   ├── wav.c / cwx.c         # WAV parser/writer & CWX1 timed-word transcript engine
 │   ├── sdio.c / exfat.c      # 1-bit SDIO driver (CMD18/CMD25) & crash-safe exFAT filesystem
 │   ├── persist.c             # Persistent settings (/cassini/settings.bin)
@@ -98,11 +98,11 @@ The recorder uses a single exFAT partition on the microSD card with the followin
 
 ### File Browser Rules (`src/main.c`, `src/ui/ui_screens.c`)
 - **Root `Files` view:** Shows all non-empty subfolders discovered under `/audiobooks/`, `/cassini/`, `/record/`, and `/` (sorted A–Z with an amber dot and `<N> ▶` chapter count), followed by loose `.wav` files from `/record/`, `/cassini/`, and `/` sorted **newest-first** (up to `96` entries per view).
-- **Inside a folder (`OK` to enter, `BACK` to return):** Shows any nested subfolders first, followed by `.wav` files sorted **ascending (A–Z)** so audiobook chapters play in order. Double-tap prev/next in the player navigates only within audio files and skips folder rows.
+- **Inside a folder (`OK` to enter, `BACK` to return):** Shows any nested subfolders first, followed by `.wav` files sorted **ascending (A–Z)** so audiobook chapters play in order. With the *Skip: Track* setting, prev/next in the player navigates only within audio files and skips folder rows.
 - **Display titles:** Generic recorder names (`REC_*` or `YYYY*` timestamps) render as friendly dates (`Today 14:32`); custom names (folders and audiobook chapters) strip `.wav` and replace `_` with spaces (e.g., `Jekyll_Hyde` → `Jekyll Hyde`, `JH_01a_Cap1.wav` → `JH 01a Cap1`).
 - **Transcripts (`.cwx`):** Any `<stem>.cwx` sitting in the same directory as `<stem>.wav` is automatically matched and displayed as live karaoke captions during playback.
 - **Hidden files:** Names starting with `.` (the `.autoplay` marker, macOS `._*` AppleDouble twins) are never listed as tracks, counted as chapters, or returned by `+XREC:LS`.
-- **Autoplay (`.autoplay`):** If a folder contains a file named `.autoplay` (matched case-insensitively, any content), a track that plays to its natural end continues immediately with the next track **of the same folder** in Files-list order (next chapter starts at 0:00). The last track stops on the End screen as usual (no wrap); seeking or scrubbing to the end does not advance. The marker is looked up once per folder via `player_dir_has_autoplay()` and cached in `main.c` until the file list is reloaded (USB/BT exit, delete, folder change). Resuming such a track from Home opens its folder in Files so playback can continue through it. Without the marker nothing changes.
+- **Autoplay (`.autoplay`):** If a folder contains a file named `.autoplay` (matched case-insensitively, any content), a track that plays to its natural end continues immediately with the next track **of the same folder** in Files-list order (next chapter starts at 0:00). The last track stops on the End screen as usual (no wrap). Fast-forwarding into the end with the speed dial counts as reaching it (the dial hands over to the normal end-of-file path), so it advances too; without the marker the player stays on End even while RIGHT is held. The marker is looked up once per folder via `player_dir_has_autoplay()` and cached in `main.c` until the file list is reloaded (USB/BT exit, delete, folder change). Resuming such a track from Home opens its folder in Files so playback can continue through it. Without the marker nothing changes.
 - **Safety & resume:** The track being played is recorded as "last played" before it starts, and a power-off during playback saves the live position, so resume follows automatic advances. Folder rows are protected from long-press delete; `settings.bin` resume lookup searches both loose files and discovered folders.
 
 For deeper technical details, see **[../docs/LVGL_ARCHITECTURE.md](../docs/LVGL_ARCHITECTURE.md)**, **[../docs/SL6801_HW76_HARDWARE.md](../docs/SL6801_HW76_HARDWARE.md)**, and **[../docs/DEVELOPMENT_WORKFLOW.md](../docs/DEVELOPMENT_WORKFLOW.md)**.

@@ -65,9 +65,7 @@ static const char *sound_mode_name(uint8_t mode)
 
 static const char *skip_mode_name(uint8_t mode)
 {
-    if (mode == UI_SKIP_5_10)  return "5 / 10s";
-    if (mode == UI_SKIP_10_30) return "10 / 30s";
-    return ui_tr(UI_STR_SKIP_TRACK);
+    return ui_tr(mode == UI_SKIP_TRACK ? UI_STR_SKIP_TRACK : UI_STR_SKIP_SPEED);
 }
 
 static const char *screen_off_name(uint8_t idx)
@@ -128,7 +126,7 @@ void ui_settings_defaults(ui_settings_t *cfg)
     cfg->vor_enabled    = 0u;
     cfg->brightness_idx = 3u;
     cfg->screen_off_idx = UI_SCR_OFF_30S;
-    cfg->skip_mode      = UI_SKIP_5_10;
+    cfg->skip_mode      = UI_SKIP_SPEED;
     cfg->hp_vol         = 18u;
     cfg->spk_vol        = 18u;
 }
@@ -820,6 +818,12 @@ static void format_vol_label(char *dst, size_t cap, int hp_plugged, uint8_t vol)
     }
 }
 
+/* "2×", "−4×" (U+2212 minus) */
+static void format_speed(char *dst, size_t cap, int speed)
+{
+    lv_snprintf(dst, cap, "%s%d\xC3\x97", speed < 0 ? "\xE2\x88\x92" : "", speed < 0 ? -speed : speed);
+}
+
 static void bind_player_tr(const ui_model_t *m, bool entering)
 {
     uint32_t dur = m->play_file.duration_sec ? m->play_file.duration_sec : 1u;
@@ -860,11 +864,10 @@ static void bind_player_tr(const ui_model_t *m, bool entering)
         set_hidden(objects.ptr_vol_pill, false);
         set_changed_text(objects.ptr_vol_lbl, vbuf);
     } else if (m->play_scrub_speed != 0) {
-        char sbuf[16];
-        int spd = (m->play_scrub_speed < 0) ? -m->play_scrub_speed : m->play_scrub_speed;
-        lv_snprintf(sbuf, sizeof(sbuf), "%s %d\xC3\x97",
-                    (m->play_scrub_speed > 0) ? "\xE2\x96\xB6\xE2\x96\xB6" : "\xE2\x97\x80\xE2\x97\x80",
-                    spd);
+        char sbuf[24], spd[12];
+        format_speed(spd, sizeof(spd), m->play_scrub_speed < 0 ? -m->play_scrub_speed : m->play_scrub_speed);
+        lv_snprintf(sbuf, sizeof(sbuf), "%s %s",
+                    (m->play_scrub_speed > 0) ? "\xE2\x96\xB6\xE2\x96\xB6" : "\xE2\x97\x80\xE2\x97\x80", spd);
         set_hidden(objects.ptr_vol_pill, true);
         set_hidden(objects.ptr_spk_dot, true);
         set_hidden(objects.ptr_bar_sub, false);
@@ -1104,10 +1107,17 @@ static void bind_player(const ui_model_t *m, bool entering)
         return;
     }
 
+    int speed  = m->play_scrub_speed;                 /* 0 = 1x */
+    int silent = speed >= UI_SPEED_SILENT || speed <= -UI_SPEED_SILENT;
     ui_icon_t st_ic = (m->play_state == 0u) ? UI_ICON_PLAY : (m->play_state == 1u ? UI_ICON_PAUSE : UI_ICON_STOP);
     uint16_t  st_c  = (m->play_state == 0u) ? UI_COL_CYAN : (m->play_state == 1u ? UI_COL_AMBER : UI_COL_DIM);
     const char *st_t = (m->play_state == 0u) ? ui_tr(UI_STR_PLAYING)
                      : (m->play_state == 1u ? ui_tr(UI_STR_PAUSED) : ui_tr(UI_STR_END));
+    if (speed != 0) {
+        st_ic = (speed > 0) ? UI_ICON_RIGHT : UI_ICON_LEFT;
+        st_c  = UI_COL_AMBER;
+        st_t  = ui_tr(silent ? UI_STR_SEEKING : (speed > 0 ? UI_STR_FAST : UI_STR_REVERSE));
+    }
     bind_status_bar(objects.play_bar, objects.play_bar_ic, objects.play_bar_l, objects.play_bar_sub,
                     objects.play_bar_r, objects.play_bar_hp, objects.play_batt,
                     objects.play_batt_fill, objects.play_batt_nub,
@@ -1125,15 +1135,24 @@ static void bind_player(const ui_model_t *m, bool entering)
     } else {
         lv_snprintf(vbuf, sizeof(vbuf), "%s %u", m->hp_plugged ? "HP" : "SPK", (unsigned)(tenths / 10u));
     }
-    set_changed_text(objects.player_vol_lbl, vbuf);
-    set_changed_bg_color(objects.player_vol_pill, lv_color_hex(m->play_vol_hi ? UI_HEX_CYAN : UI_HEX_TILE));
-    set_changed_text_color(objects.player_vol_lbl, lv_color_hex(m->play_vol_hi ? UI_HEX_BLACK : UI_HEX_DIM));
+    if (speed != 0 && !m->play_vol_hi) {
+        /* Speed dial: the pill shows the speed; amber when seeking silently. */
+        format_speed(vbuf, sizeof(vbuf), speed);
+        set_changed_text(objects.player_vol_lbl, vbuf);
+        set_changed_bg_color(objects.player_vol_pill, lv_color_hex(silent ? UI_HEX_AMBER : UI_HEX_TILE));
+        set_changed_text_color(objects.player_vol_lbl, lv_color_hex(silent ? UI_HEX_BLACK : UI_HEX_AMBER));
+    } else {
+        set_changed_text(objects.player_vol_lbl, vbuf);
+        set_changed_bg_color(objects.player_vol_pill, lv_color_hex(m->play_vol_hi ? UI_HEX_CYAN : UI_HEX_TILE));
+        set_changed_text_color(objects.player_vol_lbl, lv_color_hex(m->play_vol_hi ? UI_HEX_BLACK : UI_HEX_DIM));
+    }
 
     ui_format_duration(pos_s, (int)sizeof(pos_s), pos);
     ui_format_duration(tmp, (int)sizeof(tmp), dur);
     lv_snprintf(tot_s, sizeof(tot_s), "/ %s", tmp);
     set_changed_text(objects.player_pos, pos_s);
-    set_changed_text_color(objects.player_pos, lv_color_hex((m->play_state == 2u) ? UI_HEX_MUTE : UI_HEX_TEXT));
+    set_changed_text_color(objects.player_pos, lv_color_hex((m->play_state == 2u) ? UI_HEX_MUTE
+                                                            : (silent ? UI_HEX_AMBER : UI_HEX_TEXT)));
     set_changed_text(objects.player_tot, tot_s);
     set_changed_bar_value(objects.player_vu_l, (int32_t)m->play_vu_l);
     set_changed_bar_value(objects.player_vu_r, (int32_t)m->play_vu_r);
@@ -1142,10 +1161,28 @@ static void bind_player(const ui_model_t *m, bool entering)
     if (m->play_state == 2u) {
         set_changed_text(objects.player_footer, ui_tr(m->play_has_next ? UI_STR_OK_REPLAY_NEXT : UI_STR_OK_REPLAY));
     } else {
-        const char *la = (m->cfg.skip_mode == UI_SKIP_5_10) ? "5s" : (m->cfg.skip_mode == UI_SKIP_10_30 ? "10s" : ui_tr(UI_STR_PREV));
-        const char *ra = (m->cfg.skip_mode == UI_SKIP_5_10) ? "10s" : (m->cfg.skip_mode == UI_SKIP_10_30 ? "30s" : ui_tr(UI_STR_NEXT));
-        lv_snprintf(ftxt, sizeof(ftxt), "\xE2\x97\x80 %s \xC2\xB7 OK %s \xC2\xB7 \xE2\x96\xB6 %s",
-                    la, ui_tr((m->play_state == 0u) ? UI_STR_PAUSE : UI_STR_PLAY), ra);
+        if (m->cfg.skip_mode == UI_SKIP_TRACK) {
+            lv_snprintf(ftxt, sizeof(ftxt), "\xE2\x97\x80 %s \xC2\xB7 OK %s \xC2\xB7 \xE2\x96\xB6 %s",
+                        ui_tr(UI_STR_PREV), ui_tr((m->play_state == 0u) ? UI_STR_PAUSE : UI_STR_PLAY),
+                        ui_tr(UI_STR_NEXT));
+        } else {
+            /* "◀ −1× · OK Pause · 2× ▶"; away from 1x OK reads "1×". A side
+             * at the end of the dial is left out. */
+            int cur = speed ? speed : 1;
+            int lo = ui_speed_step(cur, -1), hi = ui_speed_step(cur, 1);
+            char ls[28] = "", rs[28] = "", ok[32];
+            if (lo != cur) {
+                format_speed(tmp, sizeof(tmp), lo);
+                lv_snprintf(ls, sizeof(ls), "\xE2\x97\x80 %s \xC2\xB7 ", tmp);
+            }
+            if (hi != cur) {
+                format_speed(tmp, sizeof(tmp), hi);
+                lv_snprintf(rs, sizeof(rs), " \xC2\xB7 %s \xE2\x96\xB6", tmp);
+            }
+            if (speed != 0) lv_snprintf(ok, sizeof(ok), "OK 1\xC3\x97");
+            else lv_snprintf(ok, sizeof(ok), "OK %s", ui_tr((m->play_state == 0u) ? UI_STR_PAUSE : UI_STR_PLAY));
+            lv_snprintf(ftxt, sizeof(ftxt), "%s%s%s", ls, ok, rs);
+        }
         set_changed_text(objects.player_footer, ftxt);
     }
 }

@@ -45,7 +45,7 @@ static void persist_clamp_settings(ui_settings_t *dst, const ui_settings_t *src)
     dst->vor_enabled    = src->vor_enabled ? 1u : 0u;
     dst->brightness_idx = (src->brightness_idx <= 4u) ? src->brightness_idx : 3u;
     dst->screen_off_idx = (src->screen_off_idx <= 4u) ? src->screen_off_idx : UI_SCR_OFF_30S;
-    dst->skip_mode      = (src->skip_mode <= 2u) ? src->skip_mode : UI_SKIP_5_10;
+    dst->skip_mode      = (src->skip_mode == UI_SKIP_TRACK) ? UI_SKIP_TRACK : UI_SKIP_SPEED; /* old 5/10, 10/30 -> speed dial */
     dst->hp_vol         = (src->hp_vol <= 31u) ? src->hp_vol : 31u;
     dst->spk_vol        = (src->spk_vol <= 31u) ? src->spk_vol : 31u;
 }

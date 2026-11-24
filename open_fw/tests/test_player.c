@@ -1,6 +1,7 @@
 /* Exercise the production playback loop with a 16 kHz DMA clock and a blocking LCD. */
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include "openfw.h"
@@ -14,10 +15,19 @@ static unsigned slots[AUDIO_DAC_QUEUE_SLOTS], head, count;
 static int ended;
 static int strict = 1;           /* full-drain assertions (plain playback runs) */
 static int track_pcm = 0;        /* capture heard PCM stream across pause/resume */
-static int16_t heard_l[FRAMES + 2048];
+enum { HEARD_MAX = 16000 * 12 };
+static int16_t heard_l[HEARD_MAX], heard_r[HEARD_MAX];
+static uint16_t heard_t[HEARD_MAX];   /* ms at which each frame was heard */
 static unsigned heard_n;
-static unsigned flush_at[2];
-static int16_t slot_l[AUDIO_DAC_QUEUE_SLOTS][SLOT_FRAMES];
+enum { FLUSH_LOG = 16 };
+static unsigned flush_at[FLUSH_LOG], flush_ms[FLUSH_LOG];
+static int16_t slot_l[AUDIO_DAC_QUEUE_SLOTS][SLOT_FRAMES], slot_r[AUDIO_DAC_QUEUE_SLOTS][SLOT_FRAMES];
+static unsigned read_last_ms;
+static unsigned win_from, win_to, win_writes, win_reads; /* activity inside [win_from, win_to) */
+static int16_t before_win_l;     /* last left sample submitted before win_from */
+static int max_scrub_speed;
+static uint8_t last_play_state;
+static uint32_t last_pos_ms;
 static unsigned slot_off[AUDIO_DAC_QUEUE_SLOTS];
 static unsigned unaligned_reads_after_first;
 static unsigned pcm_read_idx;
@@ -25,6 +35,9 @@ static key_id_t (*key_script)(unsigned ms);
 static unsigned vol_calls;
 static int drop_volume_release;
 static unsigned lookup_delay;
+static unsigned time_limit_ms = 6000;
+static uint32_t synth_frames;    /* >0: stereo file synthesized on read (L = frame % 30000, R = frame / 30000) */
+static int synth_tri;            /* synthesized file is a 200 Hz triangle on both channels instead */
 
 /* Simulated 1 kHz SysTick key debouncer + SPSC queue */
 static key_event_t stub_q[32];
@@ -85,14 +98,16 @@ static void advance(unsigned ms)
 {
     for (unsigned i = 0; i < ms; i++) {
         now_ms++;
-        assert(now_ms < 6000);
+        assert(now_ms < time_limit_ms);
         stub_keys_tick_1ms(now_ms);
     }
     unsigned frames = 16 * ms;
     while (frames && count) {
         unsigned take = slots[head] < frames ? slots[head] : frames;
         if (track_pcm) {
-            for (unsigned i = 0; i < take && heard_n < (FRAMES + 2048); i++) {
+            for (unsigned i = 0; i < take && heard_n < HEARD_MAX; i++) {
+                heard_r[heard_n] = slot_r[head][slot_off[head] + i];
+                heard_t[heard_n] = (uint16_t)now_ms;
                 heard_l[heard_n++] = slot_l[head][slot_off[head] + i];
             }
         }
@@ -126,10 +141,13 @@ int audio_dac_write_stereo(const int16_t *pcm, uint32_t frames)
     if (track_pcm) {
         for (unsigned i = 0; i < frames; i++) {
             slot_l[idx][i] = pcm[2*i];
+            slot_r[idx][i] = pcm[2*i+1];
         }
         slot_off[idx] = 0;
     }
     submitted += frames;
+    if (now_ms >= win_from && now_ms < win_to) win_writes++;
+    if (now_ms < win_from) before_win_l = pcm[2 * (frames - 1)];
     slots[idx] = frames;
     count++;
     return (int)frames;
@@ -137,7 +155,10 @@ int audio_dac_write_stereo(const int16_t *pcm, uint32_t frames)
 int audio_dac_is_busy(void) { return count != 0; }
 void audio_dac_flush(void)
 {
-    if (flush_calls < 2u) flush_at[flush_calls] = heard_n;
+    if (flush_calls < FLUSH_LOG) {
+        flush_at[flush_calls] = heard_n;
+        flush_ms[flush_calls] = now_ms;
+    }
     flush_calls++;
     head = count = 0;
     for (unsigned i = 0; i < AUDIO_DAC_QUEUE_SLOTS; i++) {
@@ -185,8 +206,25 @@ int exfat_read_file(const exfat_vol_t *vol, const exfat_entry_t *ent,
             unaligned_reads_after_first++;
         }
         pcm_read_idx++;
+        read_last_ms = now_ms;
+        if (now_ms >= win_from && now_ms < win_to) win_reads++;
     }
-    memcpy(dst, recording + offset, len);
+    if (synth_frames) {
+        uint8_t *d = dst;
+        for (uint32_t i = 0; i < len; i++) {
+            uint64_t o = offset + i;
+            if (o < 44u) { d[i] = recording[o]; continue; }
+            uint32_t frame = (uint32_t)((o - 44u) / 4u);
+            uint16_t v = (uint16_t)((o - 44u) % 4u < 2u ? frame % 30000u : frame / 30000u);
+            if (synth_tri) {
+                int ph = (int)(frame % 80u);
+                v = (uint16_t)(int16_t)((ph < 40 ? ph : 80 - ph) * 400 - 8000);
+            }
+            d[i] = (uint8_t)(((o - 44u) & 1u) ? v >> 8 : v);
+        }
+    } else {
+        memcpy(dst, recording + offset, len);
+    }
     *got = len;
     advance(1);
     return 0;
@@ -203,6 +241,10 @@ void ui_render_screen(ui_screen_id_t screen, const ui_model_t *m)
 {
     assert(screen == UI_SCR_PLAYER);
     ended = m->play_state == 2;
+    int spd = m->play_scrub_speed < 0 ? -m->play_scrub_speed : m->play_scrub_speed;
+    if (spd > max_scrub_speed) max_scrub_speed = spd;
+    last_play_state = m->play_state;
+    last_pos_ms = m->play_pos_ms;
     advance(strict ? 150u : 45u);
 }
 void ui_dispatch_tick(void) { }
@@ -271,40 +313,23 @@ static void test_key_gestures(void)
     player_action_t acts[64];
     unsigned n;
 
-    /* Single RIGHT tap: one seek step, only after the double-tap window */
+    /* Single RIGHT tap: one step as soon as the press is debounced */
     player_keys_init(&k, KEY_NONE, 0); n = 0;
-    feed(&k, KEY_RIGHT, 0, 150, acts, &n);
-    feed(&k, KEY_NONE, 150, 400, acts, &n);
-    assert(n == 0);                              /* still waiting for a 2nd tap */
-    feed(&k, KEY_NONE, 400, 1000, acts, &n);
+    feed(&k, KEY_RIGHT, 0, 31, acts, &n);
     assert(n == 1 && acts[0] == PLAYER_ACT_SEEK_FWD);
+    feed(&k, KEY_RIGHT, 31, 150, acts, &n);
+    feed(&k, KEY_NONE, 150, 1000, acts, &n);
+    assert(n == 1);
 
-    /* Double RIGHT tap: next file at the second press, and no seek */
+    /* Two quick taps: two steps, never a file change */
     player_keys_init(&k, KEY_NONE, 0); n = 0;
     feed(&k, KEY_RIGHT, 0, 100, acts, &n);
     feed(&k, KEY_NONE, 100, 250, acts, &n);
     feed(&k, KEY_RIGHT, 250, 350, acts, &n);
-    assert(n == 1 && acts[0] == PLAYER_ACT_NEXT_FILE);
     feed(&k, KEY_NONE, 350, 2000, acts, &n);
-    assert(n == 1);
-
-    /* Double LEFT tap: previous file; holding the second tap does nothing more */
-    player_keys_init(&k, KEY_NONE, 0); n = 0;
-    feed(&k, KEY_LEFT, 0, 100, acts, &n);
-    feed(&k, KEY_NONE, 100, 250, acts, &n);
-    feed(&k, KEY_LEFT, 250, 2000, acts, &n);
-    feed(&k, KEY_NONE, 2000, 3000, acts, &n);
-    assert(n == 1 && acts[0] == PLAYER_ACT_PREV_FILE);
-
-    /* Two slow taps: two seek steps, no file skip */
-    player_keys_init(&k, KEY_NONE, 0); n = 0;
-    feed(&k, KEY_RIGHT, 0, 100, acts, &n);
-    feed(&k, KEY_NONE, 100, 700, acts, &n);
-    feed(&k, KEY_RIGHT, 700, 800, acts, &n);
-    feed(&k, KEY_NONE, 800, 1500, acts, &n);
     assert(n == 2 && count_of(acts, n, PLAYER_ACT_SEEK_FWD) == 2);
 
-    /* RIGHT tap then quick LEFT tap: forward step, then back step */
+    /* RIGHT tap then quick LEFT tap: forward step, then back step, in order */
     player_keys_init(&k, KEY_NONE, 0); n = 0;
     feed(&k, KEY_RIGHT, 0, 100, acts, &n);
     feed(&k, KEY_NONE, 100, 200, acts, &n);
@@ -312,17 +337,12 @@ static void test_key_gestures(void)
     feed(&k, KEY_NONE, 300, 1000, acts, &n);
     assert(n == 2 && acts[0] == PLAYER_ACT_SEEK_FWD && acts[1] == PLAYER_ACT_SEEK_BACK);
 
-    /* RIGHT hold: one continuous scrub gesture */
+    /* LEFT hold: step on press (30 ms), then every PLAYER_KEY_STEP_MS; release is silent */
     player_keys_init(&k, KEY_NONE, 0); n = 0;
-    feed(&k, KEY_RIGHT, 0, 1300, acts, &n);
-    assert(n == 1 && count_of(acts, n, PLAYER_ACT_SCRUB_FWD) == 1);
-    feed(&k, KEY_NONE, 1300, 3000, acts, &n);
-    assert(n == 1);                              /* release is not a tap */
-
-    /* LEFT hold: seek back */
-    player_keys_init(&k, KEY_NONE, 0); n = 0;
-    feed(&k, KEY_LEFT, 0, 600, acts, &n);
-    assert(n == 1 && acts[0] == PLAYER_ACT_SCRUB_BACK);
+    feed(&k, KEY_LEFT, 0, 30 + 3 * PLAYER_KEY_STEP_MS + 1, acts, &n);
+    assert(n == 4 && count_of(acts, n, PLAYER_ACT_SEEK_BACK) == 4);
+    feed(&k, KEY_NONE, 30 + 3 * PLAYER_KEY_STEP_MS + 1, 4000, acts, &n);
+    assert(n == 4);
 
     /* VOL+ hold: one step on press, repeats after the delay, stops on release */
     player_keys_init(&k, KEY_NONE, 0); n = 0;
@@ -343,7 +363,8 @@ static void test_key_gestures(void)
     /* Debounce: a short glitch through another key's band does nothing */
     player_keys_init(&k, KEY_NONE, 0); n = 0;
     feed(&k, KEY_BACK, 0, 10, acts, &n);
-    feed(&k, KEY_NONE, 10, 100, acts, &n);
+    feed(&k, KEY_RIGHT, 10, 20, acts, &n);
+    feed(&k, KEY_NONE, 20, 100, acts, &n);
     assert(n == 0);
 
     /* A key held when the player starts is ignored until released */
@@ -357,22 +378,26 @@ static void test_key_gestures(void)
     feed(&k, KEY_ENTER, 600, 700, acts, &n);
     assert(n == 1 && acts[0] == PLAYER_ACT_PLAY_PAUSE);
 
-    /* Timer wrap-around: double tap across the 32-bit rollover */
+    /* Timer wrap-around: hold repeats across the 32-bit rollover */
     player_keys_init(&k, KEY_NONE, 0xFFFFFF00u); n = 0;
-    for (unsigned t = 0; t < 1000; t++) {
-        key_id_t key = (t < 100 || (t >= 250 && t < 350)) ? KEY_RIGHT : KEY_NONE;
-        player_action_t a = player_keys_step(&k, key, 0xFFFFFF00u + t);
+    for (unsigned t = 0; t < 1300; t++) {
+        player_action_t a = player_keys_step(&k, KEY_RIGHT, 0xFFFFFF00u + t);
         if (a != PLAYER_ACT_NONE) acts[n++] = a;
     }
-    assert(n == 1 && acts[0] == PLAYER_ACT_NEXT_FILE);
+    assert(n == 3 && count_of(acts, n, PLAYER_ACT_SEEK_FWD) == 3);
 
-    /* Direct edge+tick API: press/release with no tick in between -> SEEK after 350 ms */
+    /* Direct edge+tick API: the press itself returns the step, on the same call */
     player_keys_init(&k, KEY_NONE, 0);
-    assert(player_keys_edge(&k, KEY_RIGHT, 100u) == PLAYER_ACT_NONE);
-    assert(player_keys_edge(&k, KEY_NONE,  120u) == PLAYER_ACT_NONE);
-    assert(player_keys_tick(&k, 469u) == PLAYER_ACT_NONE);
-    assert(player_keys_tick(&k, 470u) == PLAYER_ACT_SEEK_FWD);
-    assert(player_keys_tick(&k, 900u) == PLAYER_ACT_NONE);
+    assert(player_keys_edge(&k, KEY_RIGHT, 100u) == PLAYER_ACT_SEEK_FWD);
+    assert(player_keys_tick(&k, 100u + PLAYER_KEY_STEP_MS - 1u) == PLAYER_ACT_NONE);
+    assert(player_keys_tick(&k, 100u + PLAYER_KEY_STEP_MS) == PLAYER_ACT_SEEK_FWD);
+    assert(player_keys_edge(&k, KEY_NONE, 800u) == PLAYER_ACT_NONE);
+    assert(player_keys_tick(&k, 5000u) == PLAYER_ACT_NONE);
+    /* A late tick repeats once and keeps the period from the tick */
+    assert(player_keys_edge(&k, KEY_LEFT, 6000u) == PLAYER_ACT_SEEK_BACK);
+    assert(player_keys_tick(&k, 9000u) == PLAYER_ACT_SEEK_BACK);
+    assert(player_keys_tick(&k, 9001u) == PLAYER_ACT_NONE);
+    assert(player_keys_tick(&k, 9000u + PLAYER_KEY_STEP_MS) == PLAYER_ACT_SEEK_BACK);
 
     const key_id_t controls[] = { KEY_ENTER, KEY_BACK, KEY_VOL_UP, KEY_VOL_DOWN };
     const player_action_t actions[] = {
@@ -380,12 +405,12 @@ static void test_key_gestures(void)
     };
     for (unsigned i = 0; i < sizeof(controls) / sizeof(controls[0]); i++) {
         player_keys_init(&k, KEY_NONE, 0);
-        assert(player_keys_edge(&k, KEY_RIGHT, 20) == PLAYER_ACT_NONE);
+        assert(player_keys_edge(&k, KEY_RIGHT, 20) == PLAYER_ACT_SEEK_FWD);
         assert(player_keys_edge(&k, KEY_NONE, 40) == PLAYER_ACT_NONE);
         assert(player_keys_edge(&k, controls[i], 60) == actions[i]);
-        assert(player_keys_tick(&k, 61) == PLAYER_ACT_SEEK_FWD);
+        assert(player_keys_tick(&k, 61) == PLAYER_ACT_NONE);
         assert(player_keys_edge(&k, KEY_NONE, 80) == PLAYER_ACT_NONE);
-        assert(player_keys_tick(&k, 500) == PLAYER_ACT_NONE);
+        assert(player_keys_tick(&k, 2000) == PLAYER_ACT_NONE);
     }
 
     /* Direct edge+tick API: brief 20 ms VOL_UP tap -> one step, no repeat */
@@ -394,18 +419,18 @@ static void test_key_gestures(void)
     assert(player_keys_edge(&k, KEY_NONE,   120u) == PLAYER_ACT_NONE);
     assert(player_keys_tick(&k, 700u) == PLAYER_ACT_NONE);
 
-    puts("[OK] player key gestures (double tap file, tap/hold seek, VOL repeat, debounce, held-at-start, edge+tick)");
+    puts("[OK] player key gestures (LEFT/RIGHT act on press, repeat while held, VOL repeat, debounce, held-at-start, edge+tick)");
 }
 
 /* ---- playback loop with scripted keys --------------------------------------- */
 
-static key_id_t double_right(unsigned ms)
+static key_id_t tap_right(unsigned ms)
 {
-    return ((ms >= 300 && ms < 400) || (ms >= 500 && ms < 600)) ? KEY_RIGHT : KEY_NONE;
+    return (ms >= 300 && ms < 400) ? KEY_RIGHT : KEY_NONE;
 }
-static key_id_t double_left_then_back(unsigned ms)
+static key_id_t tap_left_then_back(unsigned ms)
 {
-    if ((ms >= 300 && ms < 400) || (ms >= 500 && ms < 600)) return KEY_LEFT;
+    if (ms >= 300 && ms < 400) return KEY_LEFT;
     if (ms >= 2000 && ms < 2200) return KEY_BACK;
     return KEY_NONE;
 }
@@ -462,6 +487,10 @@ static void reset_run(key_id_t (*script)(unsigned))
 {
     now_ms = submitted = consumed = gaps = head = count = vol_calls = flush_calls = 0;
     heard_n = unaligned_reads_after_first = pcm_read_idx = ended_at_ms = 0;
+    read_last_ms = 0;
+    win_from = win_to = win_writes = win_reads = 0;
+    before_win_l = 0x7FFF;
+    max_scrub_speed = 0;
     ended = 0;
     strict = 0;
     track_pcm = 0;
@@ -482,37 +511,307 @@ static key_id_t pause_resume_then_finish(unsigned ms)
 }
 
 static key_id_t scrub_key;
-static key_id_t scrub_then_release(unsigned ms)
+static unsigned scrub_tap_at;
+static key_id_t tap_then_ok(unsigned ms)
 {
-    if (ms >= 40 && ms < 680) return scrub_key;
-    if (ms >= 950 && ms < 1050) return KEY_BACK;
+    if (ms >= scrub_tap_at && ms < scrub_tap_at + 60) return scrub_key;
+    if (ms >= scrub_tap_at + 400 && ms < scrub_tap_at + 460) return KEY_ENTER;
+    if (ms >= scrub_tap_at + 700 && ms < scrub_tap_at + 800) return KEY_BACK;
     return KEY_NONE;
 }
 
+/* Start of the last run of consecutive source frames in the heard stream. */
+static unsigned final_run(int64_t (*frame_of)(unsigned))
+{
+    unsigned e = heard_n - 1;
+    while (e > 0 && frame_of(e) == frame_of(e - 1) + 1) e--;
+    return e;
+}
+static int64_t fixture_frame(unsigned i) { return heard_l[i]; }
+
 /* The stereo fixture contains the source frame index in the left channel.
- * Inspect the samples actually drained from the simulated DAC across release. */
+ * One RIGHT press: 2x. One LEFT press: -1x. OK returns to 1x. Neither way is
+ * the DAC flushed: queued 1x audio plays out into the first grain, and the last
+ * 1x grain hands over to normal playback sample-exactly. */
 static void test_audible_scrub(void)
 {
     exfat_vol_t vol = {0};
-    for (int speed = -2; speed <= 2; speed += 4) {
+    static const int speeds[] = { 2, -1 };
+    for (unsigned c = 0; c < 2; c++) {
+        int speed = speeds[c];
         ui_model_t m = {0};
         m.cfg.spk_vol = 18;
         scrub_key = speed < 0 ? KEY_LEFT : KEY_RIGHT;
-        reset_run(scrub_then_release);
+        scrub_tap_at = speed < 0 ? 500 : 40;
+        reset_run(tap_then_ok);
         track_pcm = 1;
         assert(openfw_play_file_ui(&vol, "/record", "test.wav", &m) == 0);
-        assert(flush_calls == 2);
-        unsigned first = flush_at[0], end = flush_at[1];
-        assert(end > first + 1000 && heard_n > end + 100);
+        assert(flush_calls == 0 && max_scrub_speed == (speed < 0 ? -speed : speed));
+        unsigned first = 0;
+        while (first < heard_n && heard_l[first] == (int)first) first++;
+        unsigned end = final_run(fixture_frame);
+        assert(end > first + 1000 && heard_n > end + 1000);
+        /* 1x audio queued at the press is heard first: about the 4-slot queue. */
+        assert(heard_t[first] >= scrub_tap_at + 8 && heard_t[first] <= scrub_tap_at + 8 + 300);
         int direction = speed > 0 ? 1 : -1;
         unsigned native_steps = 0;
         for (unsigned i = first + 1; i < end; i++)
             if (heard_l[i] - heard_l[i - 1] == direction) native_steps++;
-        assert(native_steps * 100u > (end - first) * 65u);
-        assert(heard_l[end] == (int)first + speed * (int)(end - first));
-        for (unsigned i = end + 1; i < heard_n; i++) assert(heard_l[i] == heard_l[i-1] + 1);
+        assert(native_steps * 100u > (end - first) * 60u);
+        if (speed > 0) assert(heard_l[end] > (int)end && heard_l[end] <= (int)(first + 2 * (end - first) + 600));
+        else assert(heard_l[end] < (int)first + 600);
     }
-    puts("[OK] +/-2x scrub progress, original-rate grains, and accurate release");
+    puts("[OK] 2x and -1x dial: no flush in or out, original-rate grains, contiguous 1x after OK");
+}
+
+/* Ladder stepping and the silent clock (pure functions). */
+static void test_speed_dial_math(void)
+{
+    static const int ladder[] = { -32, -16, -8, -4, -2, -1, 1, 2, 4, 8, 16, 32 };
+    for (unsigned i = 0; i < 12; i++) {
+        assert(ui_speed_step(ladder[i], 1) == ladder[i < 11 ? i + 1 : 11]);
+        assert(ui_speed_step(ladder[i], -1) == ladder[i > 0 ? i - 1 : 0]);
+    }
+    assert(ui_speed_step(1, 1) == 2 && ui_speed_step(1, -1) == -1 && ui_speed_step(-1, 1) == 1);
+    assert(ui_speed_step(3, 1) == 4 && ui_speed_step(3, -1) == 2 && ui_speed_step(99, 1) == 32);
+
+    uint32_t rem = 0;
+    /* 1 ms ticks at 44.1 kHz carry the 0.1-frame remainder exactly, both ways. */
+    int64_t pos = 1000;
+    for (unsigned i = 0; i < 1000; i++) pos = player_scrub_advance(pos, 10000000u, 8, 44100, 1, &rem);
+    assert(pos == 1000 + 8 * 44100 && rem == 0);
+    for (unsigned i = 0; i < 1000; i++) pos = player_scrub_advance(pos, 10000000u, -8, 44100, 1, &rem);
+    assert(pos == 1000);
+    /* Clamp at both ends, from any distance, and stay clamped. */
+    rem = 0;
+    assert(player_scrub_advance(16000, 32000, 32, 16000, 1000, &rem) == 32000 && rem == 0);
+    assert(player_scrub_advance(32000, 32000, 32, 16000, 7, &rem) == 32000);
+    assert(player_scrub_advance(16000, 32000, -32, 16000, 1000, &rem) == 0 && rem == 0);
+    assert(player_scrub_advance(0, 32000, -8, 16000, 3, &rem) == 0);
+    assert(player_scrub_advance(5, 32000, -8, 16000, 0, &rem) == 5);
+    /* A one-hour 16 kHz chapter at 32x: 1 s of real time is 32 s of audio. */
+    rem = 0;
+    assert(player_scrub_advance(0, 3600u * 16000u, 32, 16000, 1000, &rem) == 32 * 16000);
+    puts("[OK] speed dial ladder (-32..-1, 1..32, clamped) and silent clock remainder/clamping");
+}
+
+/* ---- speed dial on a long synthetic file, against an ideal model ---------- */
+
+typedef struct { key_id_t key; unsigned from, to; } press_t;
+static const press_t *dial_presses;
+static unsigned dial_npress;
+static key_id_t dial_script(unsigned ms)
+{
+    for (unsigned i = 0; i < dial_npress; i++)
+        if (ms >= dial_presses[i].from && ms < dial_presses[i].to) return dial_presses[i].key;
+    return KEY_NONE;
+}
+
+enum { DIAL_RATE = 16000, DIAL_SECS = 120, DIAL_MS = 8000 };
+static int64_t model_pos[DIAL_MS];
+static int model_speed[DIAL_MS];
+
+/* 1 ms model of the dial: a press acts 8 ms after it starts (debounce) and
+ * repeats every PLAYER_KEY_STEP_MS while held. */
+static void dial_model(unsigned start_s)
+{
+    int64_t pos = (int64_t)start_s * DIAL_RATE, total = (int64_t)DIAL_SECS * DIAL_RATE;
+    int speed = 1, paused = 0, ended = 0;
+    for (unsigned t = 0; t < DIAL_MS; t++) {
+        for (unsigned i = 0; i < dial_npress; i++) {
+            const press_t *p = &dial_presses[i];
+            unsigned at = p->from + 8;
+            int fire = t == at || (t > at && t < p->to + 8 && (t - at) % PLAYER_KEY_STEP_MS == 0);
+            if (!fire || ended) continue;
+            if (p->key == KEY_ENTER) {
+                if (speed != 1) speed = 1, paused = 0;
+                else if (t == at) paused ^= 1;
+            } else if (p->key == KEY_LEFT || p->key == KEY_RIGHT) {
+                speed = ui_speed_step(speed, p->key == KEY_RIGHT ? 1 : -1);
+                paused = 0;
+            }
+        }
+        if (!paused && !ended) {
+            pos += speed * (DIAL_RATE / 1000);
+            if (pos <= 0 && speed < 0) pos = 0, speed = 1, paused = 1;
+            if (pos >= total) pos = total, speed = 1, ended = 1;
+        }
+        model_pos[t] = pos;
+        model_speed[t] = paused ? 0 : speed;
+    }
+}
+
+static int64_t synth_frame(unsigned i) { return (int64_t)heard_r[i] * 30000 + heard_l[i]; }
+
+static void test_speed_dial(void)
+{
+    exfat_vol_t vol = {0};
+    synth_frames = DIAL_RATE * DIAL_SECS;
+    file_size = 44 + synth_frames * 4;
+    assert(!wav_build_header(recording, DIAL_RATE, 2, 16, synth_frames * 4));
+    channels = 2;
+    time_limit_ms = DIAL_MS;
+    /* Hold RIGHT 40..1300 ms: 2x (48), 4x (648), 8x (1248). */
+    static const press_t fwd8[] = { {KEY_RIGHT, 40, 1300}, {KEY_ENTER, 3000, 3060}, {KEY_BACK, 3600, 3700} };
+    static const press_t rev8[] = { {KEY_LEFT, 40, 1900}, {KEY_ENTER, 3500, 3560}, {KEY_BACK, 4100, 4200} };
+    static const press_t to_zero[] = { {KEY_LEFT, 40, 3500}, {KEY_BACK, 4500, 4600} }; /* held on past 0:00 */
+    static const press_t to_end[] = { {KEY_RIGHT, 40, 3100}, {KEY_BACK, 4500, 4600} };
+    static const press_t from_pause[] = { {KEY_ENTER, 100, 160}, {KEY_RIGHT, 400, 460},
+                                          {KEY_ENTER, 1400, 1460}, {KEY_BACK, 2000, 2100} };
+    static const press_t through_1x[] = { {KEY_RIGHT, 100, 160}, {KEY_LEFT, 700, 760}, {KEY_LEFT, 1300, 1360},
+                                          {KEY_RIGHT, 1900, 1960}, {KEY_BACK, 2500, 2600} };
+    static const press_t down_from_8[] = { {KEY_RIGHT, 40, 1300}, {KEY_LEFT, 2500, 2560},
+                                           {KEY_ENTER, 3200, 3260}, {KEY_BACK, 3800, 3900} };
+    static const struct { const char *name; const press_t *p; unsigned n, start_s; } cases[] = {
+        { "fwd 2-4-8x, OK", fwd8, 3, 60 },
+        { "rev -1..-8x, OK", rev8, 3, 60 },
+        { "rev to 0:00", to_zero, 2, 10 },
+        { "fwd to end", to_end, 2, 100 },
+        { "pause, RIGHT, OK", from_pause, 4, 60 },
+        { "2x, 1x, -1x, 1x", through_1x, 5, 60 },
+        { "8x down to 4x", down_from_8, 4, 30 },
+    };
+    for (unsigned c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        ui_model_t m = {0};
+        m.cfg.spk_vol = 18;
+        m.play_file.resume_sec = cases[c].start_s;
+        dial_presses = cases[c].p;
+        dial_npress = cases[c].n;
+        dial_model(cases[c].start_s);
+        reset_run(dial_script);
+        track_pcm = 1;
+        /* Silent stretch in the model: nothing may be read or written inside it. */
+        unsigned s0 = 0, s1 = 0;
+        for (unsigned t = 0; t < DIAL_MS; t++) {
+            int sp = model_speed[t] < 0 ? -model_speed[t] : model_speed[t];
+            if (sp >= UI_SPEED_SILENT && !s0) s0 = t;
+            if (s0 && !s1 && sp < UI_SPEED_SILENT) s1 = t;
+        }
+        if (s0) {
+            win_from = s0 + 150;
+            win_to = s1 ? s1 - 30 : DIAL_MS;
+        }
+        unsigned w_from = win_from, w_to = win_to;
+        assert(openfw_play_file_ui(&vol, "/record", "test.wav", &m) == 0);
+        win_from = w_from; win_to = w_to;
+        assert(flush_calls <= FLUSH_LOG);
+
+        if (s0) {
+            assert(win_writes == 0 && win_reads == 0);
+            assert(before_win_l == 0);                    /* last grain faded to zero */
+        }
+        /* The final run of contiguous frames is 1x playback again; compare where it
+         * started with the model at that moment. */
+        unsigned last = flush_calls ? flush_calls - 1 : 0;
+        unsigned at = heard_n ? final_run(synth_frame) : 0;
+        int64_t want = model_pos[heard_t[at]];
+        int max_sp = 1;
+        for (unsigned t = 0; t < heard_t[at]; t++)
+            if (abs(model_speed[t]) > max_sp) max_sp = abs(model_speed[t]);
+        int64_t tol = 16 * (450 + 150 * (int64_t)max_sp); /* key latency, render stalls, queue drains */
+        int64_t got;
+        if (model_pos[DIAL_MS - 1] == 0) {
+            want = 0;
+            at = flush_at[last];
+            assert(heard_n == at && last_play_state == 1 && last_pos_ms == 0);   /* paused at 0:00 */
+            unsigned zero_ms = 0;
+            while (model_pos[zero_ms]) zero_ms++;
+            assert(flush_ms[last] < zero_ms + 300);   /* hold repeats past 0:00 do nothing */
+            got = 0;
+        } else if (model_pos[DIAL_MS - 1] == (int64_t)synth_frames) {
+            want = synth_frames;
+            at = flush_at[last];
+            assert(heard_n == at && last_play_state == 2 && m.play_file.resume_sec == 0);  /* normal EOF */
+            got = want;
+        } else {
+            assert(heard_n > at + 1000);
+            got = synth_frame(at);
+        }
+        printf("    %-18s from %3us: 1x again at %8.3fs (model %8.3fs), top %dx\n", cases[c].name,
+               cases[c].start_s, got / (double)DIAL_RATE, want / (double)DIAL_RATE, max_scrub_speed);
+        assert(got >= want - tol && got <= want + tol);
+    }
+    synth_frames = 0;
+    time_limit_ms = 6000;
+    win_from = win_to = 0;
+    puts("[OK] speed dial: silent >= 8x (no SD reads or DAC writes, faded last grain), OK/step back to 1x "
+         "at the heard frame, pause -> RIGHT, reverse to 0:00 pauses, forward to the end ends");
+}
+
+/* 200 Hz triangle (slope 400 per sample) through every kind of transition:
+ * 1x -> 2x -> 4x -> 8x (silent) -> 4x -> OK -> -1x -> 1x -> 2x -> OK. No heard
+ * sample may jump far beyond the signal's own slope. */
+static void test_dial_clicks(void)
+{
+    static const press_t script[] = {
+        {KEY_RIGHT, 300, 360}, {KEY_RIGHT, 900, 960}, {KEY_RIGHT, 1500, 1560}, {KEY_LEFT, 2500, 2560},
+        {KEY_ENTER, 3000, 3060}, {KEY_LEFT, 3600, 3660}, {KEY_RIGHT, 4200, 4260}, {KEY_RIGHT, 4800, 4860},
+        {KEY_ENTER, 5400, 5460}, {KEY_BACK, 6300, 6400},
+    };
+    exfat_vol_t vol = {0};
+    synth_frames = 16000 * 120;
+    synth_tri = 1;
+    file_size = 44 + synth_frames * 4;
+    assert(!wav_build_header(recording, 16000, 2, 16, synth_frames * 4));
+    channels = 2;
+    time_limit_ms = 8000;
+    ui_model_t m = {0};
+    m.cfg.spk_vol = 18;
+    m.play_file.resume_sec = 60;
+    dial_presses = script;
+    dial_npress = sizeof(script) / sizeof(script[0]);
+    reset_run(dial_script);
+    track_pcm = 1;
+    assert(openfw_play_file_ui(&vol, "/record", "test.wav", &m) == 0);
+    assert(flush_calls == 0 && max_scrub_speed == 8);
+    int worst = 0;
+    unsigned worst_at = 0;
+    for (unsigned i = 1; i < heard_n; i++) {
+        int d = abs(heard_l[i] - heard_l[i - 1]);
+        if (d > worst) worst = d, worst_at = i;
+        d = abs(heard_r[i] - heard_r[i - 1]);
+        if (d > worst) worst = d, worst_at = i;
+    }
+    printf("    largest step %d (signal slope 400) at %u ms over %u heard frames\n", worst,
+           (unsigned)heard_t[worst_at], heard_n);
+    assert(worst <= 1600);
+    synth_frames = 0;
+    synth_tri = 0;
+    time_limit_ms = 6000;
+    puts("[OK] speed dial transitions are click-free (no flushes, crossfades and fades only)");
+}
+
+/* The dial's end of file is the normal one: with .autoplay a fast-forward into
+ * the end continues with the next track; without it the player stays on End
+ * even while RIGHT is still held. */
+static void test_dial_autoplay(void)
+{
+    static const press_t hold_to_end[] = { {KEY_RIGHT, 40, 3500}, {KEY_BACK, 4500, 4600} };
+    exfat_vol_t vol = {0};
+    synth_frames = 16000 * 120;
+    file_size = 44 + synth_frames * 4;
+    assert(!wav_build_header(recording, 16000, 2, 16, synth_frames * 4));
+    channels = 2;
+    time_limit_ms = 8000;
+    for (int autoplay = 1; autoplay >= 0; autoplay--) {
+        ui_model_t m = {0};
+        m.cfg.spk_vol = 18;
+        m.play_file.resume_sec = 100;
+        m.play_has_next = 1;
+        m.play_autoplay = (uint8_t)autoplay;
+        dial_presses = hold_to_end;
+        dial_npress = 2;
+        reset_run(dial_script);
+        int rc = openfw_play_file_ui(&vol, "/record", "test.wav", &m);
+        if (autoplay) {
+            assert(rc == PLAYER_RC_AUTO_NEXT && now_ms < 3500 && m.play_file.resume_sec == 0);
+        } else {
+            assert(rc == 0 && last_play_state == 2 && now_ms >= 4500);   /* End screen, no file change */
+        }
+    }
+    synth_frames = 0;
+    time_limit_ms = 6000;
+    puts("[OK] speed dial into the end: .autoplay continues with the next track, otherwise End (held RIGHT never changes file)");
 }
 
 static void put_le16_t(uint8_t *p, uint16_t v)
@@ -538,12 +837,18 @@ static void test_scrub_pitch(void)
         ui_model_t m = {0};
         m.cfg.spk_vol = 18;
         scrub_key = dir > 0 ? KEY_RIGHT : KEY_LEFT;
-        reset_run(scrub_then_release);
+        scrub_tap_at = dir > 0 ? 40 : 500;
+        reset_run(tap_then_ok);
         track_pcm = 1;
         assert(openfw_play_file_ui(&vol, "/record", "test.wav", &m) == 0);
-        assert(flush_calls == 2 && flush_at[1] > flush_at[0] + 1000);
-        unsigned crossings = 0, span = flush_at[1] - flush_at[0];
-        for (unsigned i = flush_at[0]+1; i < flush_at[1]; i++)
+        /* Dial audio only: after the queued 1x audio, before OK's queued grains end. */
+        unsigned from = 0, to;
+        while (from < heard_n && heard_t[from] < scrub_tap_at + 300) from++;
+        to = from;
+        while (to < heard_n && heard_t[to] < scrub_tap_at + 480) to++;
+        assert(to > from + 1000);
+        unsigned crossings = 0, span = to - from;
+        for (unsigned i = from + 1; i < to; i++)
             if (heard_l[i-1] <= 0 && heard_l[i] > 0) crossings++;
         assert(crossings * 37 + 38 >= span && crossings * 37 <= span + 38);
         printf("[OK] %s scrub: %u Hz (input 432 Hz)\n", dir > 0 ? "Forward" : "Reverse",
@@ -665,29 +970,31 @@ static void test_scripted_keys(void)
     exfat_vol_t vol = {0};
     channels = 2; /* the main() loop leaves the stereo fixture in place */
 
-    /* Double tap RIGHT with a next file: player returns 1 */
+    /* "Track" mode: one RIGHT press with a next file returns 1 right away */
     memset(&m, 0, sizeof(m));
     m.cfg.spk_vol = 18;
+    m.cfg.skip_mode = UI_SKIP_TRACK;
     m.play_has_next = 1;
-    reset_run(double_right);
+    reset_run(tap_right);
     assert(openfw_play_file_ui(&vol, "/record", "test.wav", &m) == 1);
-    assert(now_ms < 800);
+    assert(now_ms < 400);
 
-    /* Double tap LEFT on the first file: toast, stay, then BACK leaves */
-    memset(&m, 0, sizeof(m));
-    m.cfg.spk_vol = 18;
-    reset_run(double_left_then_back);
-    assert(openfw_play_file_ui(&vol, "/record", "test.wav", &m) == 0);
-    assert(now_ms >= 2000);
-    assert(strcmp(m.toast_msg, "Start of list") == 0 || m.toast_msg[0] == '\0');
-
-    /* Hold RIGHT seeks, it never changes file even when a next one exists */
+    /* "Speed" mode: the same press steps the dial instead and never changes file */
     memset(&m, 0, sizeof(m));
     m.cfg.spk_vol = 18;
     m.play_has_next = 1;
     reset_run(hold_right_then_back);
     assert(openfw_play_file_ui(&vol, "/record", "test.wav", &m) == 0);
     assert(now_ms >= 2000);
+
+    /* "Track" mode: LEFT on the first file: toast, stay, then BACK leaves */
+    memset(&m, 0, sizeof(m));
+    m.cfg.spk_vol = 18;
+    m.cfg.skip_mode = UI_SKIP_TRACK;
+    reset_run(tap_left_then_back);
+    assert(openfw_play_file_ui(&vol, "/record", "test.wav", &m) == 0);
+    assert(now_ms >= 2000);
+    assert(strcmp(m.toast_msg, "Start of list") == 0 || m.toast_msg[0] == '\0');
 
     /* Hold VOL+ for 1 s: several steps, capped below 31 */
     memset(&m, 0, sizeof(m));
@@ -737,7 +1044,7 @@ static void test_scripted_keys(void)
     key_script = NULL;
     stub_keys_reset();
     strict = 1;
-    puts("[OK] player loop: double tap RIGHT -> next file, double tap LEFT at start -> stays, hold RIGHT seeks, hold VOL+ repeats, brief 20ms tap in render stall");
+    puts("[OK] player loop: Track RIGHT -> next file at once, Track LEFT at start -> stays, Speed RIGHT never changes file, hold VOL+ repeats, brief 20ms tap in render stall");
 }
 
 /* ---- per-folder .autoplay ------------------------------------------------- */
@@ -852,6 +1159,7 @@ static void test_autoplay(void)
 
 int main(void)
 {
+    setvbuf(stdout, NULL, _IONBF, 0);
     test_key_gestures();
     for (channels = 1; channels <= 2; channels++) {
         uint32_t bytes = FRAMES * channels * 2;
@@ -875,9 +1183,13 @@ int main(void)
     }
     puts("[OK] 16 kHz mono and stereo playback, 512B aligned SD reads, blocking display, complete DMA drain");
     test_audible_scrub();
+    test_speed_dial_math();
     test_scripted_keys(); /* uses the stereo fixture left by the loop above */
     test_pause_zero_loss_and_ima2048();
     test_scrub_pitch();
     test_autoplay();
+    test_speed_dial();   /* replaces the fixture with a synthetic 2-minute file */
+    test_dial_clicks();
+    test_dial_autoplay();
     return 0;
 }

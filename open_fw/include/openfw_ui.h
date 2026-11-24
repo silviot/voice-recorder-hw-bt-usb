@@ -116,10 +116,27 @@ typedef enum {
 } ui_screen_id_t;
 
 typedef enum {
-    UI_SKIP_5_10 = 0,
-    UI_SKIP_10_30,
-    UI_SKIP_TRACK,
+    UI_SKIP_SPEED = 0,       /* LEFT/RIGHT step the player speed dial */
+    UI_SKIP_LEGACY_10_30,    /* old 10/30 s skip setting, loaded as UI_SKIP_SPEED */
+    UI_SKIP_TRACK,           /* LEFT/RIGHT change file */
 } ui_skip_mode_t;
+
+/* Player speed dial: signed playback speed, no 0. |speed| <= 4 is audible,
+ * 8x and above seek silently. Returns the next speed toward dir (+1/-1),
+ * clamped at the ends. */
+#define UI_SPEED_SILENT 8
+static inline int ui_speed_step(int speed, int dir)
+{
+    static const int8_t ladder[] = { -32, -16, -8, -4, -2, -1, 1, 2, 4, 8, 16, 32 };
+    const int n = (int)(sizeof(ladder) / sizeof(ladder[0]));
+    int i = 0;
+    while (i < n - 1 && ladder[i] < speed) i++;
+    if (ladder[i] != speed && dir < 0 && i > 0) i--; /* off-ladder: nearest step that way */
+    else if (ladder[i] == speed) i += dir > 0 ? 1 : -1;
+    if (i < 0) i = 0;
+    if (i > n - 1) i = n - 1;
+    return ladder[i];
+}
 
 typedef enum {
     UI_SCR_OFF_15S = 0,
@@ -212,7 +229,7 @@ typedef struct {
     uint32_t       play_pos_ms;      /* millisecond playback position for smooth progress */
     uint32_t       play_dur_ms;      /* millisecond duration for smooth progress */
     uint8_t        play_state;       /* 0=Playing, 1=Paused, 2=End */
-    int8_t         play_scrub_speed; /* 0=normal, +/-2..5 during audible scrub */
+    int8_t         play_scrub_speed; /* speed dial: 0=1x normal, else -32..-1, 2..32 */
     uint8_t        play_vol_hi;      /* 1 for 1.5s after VOL+/- */
     uint8_t        play_vu_l;
     uint8_t        play_vu_r;
