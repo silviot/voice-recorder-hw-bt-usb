@@ -239,6 +239,8 @@ $(BUILD_DIR)/qemu_boot_stub.bin: tools/qemu_boot_stub.S | $(BUILD_DIR)
 test-qemu: all update-up $(BUILD_DIR)/qemu_boot_stub.bin
 	python3 tools/run_qemu.py --elf $(BUILD_DIR)/open_fw.elf --stub $(BUILD_DIR)/qemu_boot_stub.bin --flash $(OUT_BIN)
 
+-include bt/host_tests.mk
+
 # FreeRTOS scheduler/primitives self-test + normal boot checks on the SL6801 QEMU model.
 # Usage: make -C open_fw test-qemu-rtos   (needs tools/setup_qemu.sh + ../dumps/*)
 RTOS_QEMU_DIR ?= /tmp/sl6801_openfw_rtos_selftest
