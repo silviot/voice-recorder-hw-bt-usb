@@ -108,3 +108,48 @@ test-bt-xrec:
 	@if nm $(BT_XREC_TEST_DIR)/bt_xrec_release.o | grep -i bench; then \
 		echo "FAIL: release bt_xrec_bluedroid.o has bench override symbols (above)" >&2; exit 1; \
 	else echo "release session object: no bench overrides"; fi
+
+# ---- test-bt-hp: headphones-mode audio core (docs/BT_A2DP_DESIGN.md milestone H1). Host build, ASan/UBSan; the
+# ring stress again under TSan (clang: TSan does not model fences under gcc). test_hp_tx links the vendored SBC
+# encoder (as on target) and the vendored SBC decoder (host only: the target build excludes it) for round trips.
+# test_audio_out: the BT=1 output dispatch (DAC / headset / both) on a fake DAC, and the BT=0 macro identity.
+BT_HP_TEST_DIR ?= /tmp/sl6801_bt_hp_tests
+BT_HP_BD := third_party/bluedroid/host/bluedroid
+BT_HP_SBC_ENC := $(wildcard $(BT_HP_BD)/external/sbc/encoder/srce/*.c)
+BT_HP_SBC_DEC := $(wildcard $(BT_HP_BD)/external/sbc/decoder/srce/*.c)
+BT_HP_CC ?= clang
+test-bt-hp:
+	@mkdir -p $(BT_HP_TEST_DIR)
+	$(BT_HP_CC) -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-frame-pointer -iquote bt_port \
+		-Itests tests/test_hp_sink.c bt_port/hp_sink.c -lm -pthread \
+		-o $(BT_HP_TEST_DIR)/test_hp_sink
+	$(BT_HP_TEST_DIR)/test_hp_sink 2
+	$(BT_HP_CC) -O1 -g -Wall -Wextra -Werror -fsanitize=thread -iquote bt_port -Itests tests/test_hp_sink.c \
+		bt_port/hp_sink.c -lm -pthread -o $(BT_HP_TEST_DIR)/test_hp_sink_tsan
+	TSAN_OPTIONS="halt_on_error=1" $(BT_HP_TEST_DIR)/test_hp_sink_tsan --stress-only 3
+	@# vendored SBC codec: shifts of negative values and wrapping fixed-point sums are its idiom (2s complement on both targets)
+	$(BT_HP_CC) $(BT_CTRL_TEST_CFLAGS) $(BT_CTRL_BD_DEFS) $(BT_CTRL_BD_INCS) -DSBC_DEC_INCLUDED=1 -w -fno-sanitize=shift,signed-integer-overflow \
+		-c $(BT_HP_SBC_ENC) $(BT_HP_SBC_DEC)
+	@mkdir -p $(BT_HP_TEST_DIR)/sbc && mv -f $(notdir $(BT_HP_SBC_ENC:.c=.o) $(BT_HP_SBC_DEC:.c=.o)) $(BT_HP_TEST_DIR)/sbc/
+	$(BT_HP_CC) $(BT_CTRL_TEST_CFLAGS) $(BT_CTRL_BD_DEFS) $(BT_CTRL_BD_INCS) -DSBC_DEC_INCLUDED=1 \
+		tests/test_hp_tx.c bt_port/hp_tx.c bt_port/hp_sink.c bt_port/hp_sbc.c bt_port/hp_selftest.c \
+		$(BT_HP_TEST_DIR)/sbc/*.o -lm \
+		-o $(BT_HP_TEST_DIR)/test_hp_tx
+	$(BT_HP_TEST_DIR)/test_hp_tx
+	@# patch 0034 (H0 gate): the patched ext-codec source queue against an in-test fixed_queue and stubs
+	$(BT_HP_CC) $(BT_CTRL_TEST_CFLAGS) $(BT_CTRL_BD_DEFS) $(BT_CTRL_BD_INCS) -Wno-unused-parameter \
+		-I$(BT_HP_BD)/btc/profile/std/include tests/test_xsrc_stats.c \
+		$(BT_HP_BD)/btc/profile/std/a2dp/btc_a2dp_source_ext_codec.c -o $(BT_HP_TEST_DIR)/test_xsrc_stats
+	$(BT_HP_TEST_DIR)/test_xsrc_stats
+	@# output sink: BT=0 macro identity, then the BT=1 dispatch (DAC / headset / both) on a fake DAC
+	$(BT_HP_CC) -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-frame-pointer -DOPENFW_HOST_MMIO \
+		-DAOUT_TEST_BT0 -Iinclude tests/test_audio_out.c -o $(BT_HP_TEST_DIR)/test_audio_out_bt0
+	$(BT_HP_TEST_DIR)/test_audio_out_bt0
+	$(BT_HP_CC) $(BT_CTRL_TEST_CFLAGS) $(BT_CTRL_BD_DEFS) $(BT_CTRL_BD_INCS) -DOPENFW_HOST_MMIO -DOPENFW_BT_BLUEDROID=1 \
+		-DAOUT_HOST_TEST -Iinclude tests/test_audio_out.c src/audio_out.c bt_port/hp_tx.c bt_port/hp_sink.c \
+		bt_port/hp_sbc.c $(BT_HP_TEST_DIR)/sbc/sbc_*.o -lm -o $(BT_HP_TEST_DIR)/test_audio_out
+	$(BT_HP_TEST_DIR)/test_audio_out
+	@# the RTOS self-test (T_HPCORE, test-qemu-bt) checks the ARM output against the same golden
+	python3 -c "import re,sys; a=re.search(r'HP_SELFTEST_GOLDEN (0x[0-9A-Fa-f]+)u', open('bt_port/hp_selftest.h').read()).group(1); \
+		b=re.search(r'ST_HP_GOLDEN (0x[0-9A-Fa-f]+)u', open('src/rtos/rtos_selftest.c').read()).group(1); \
+		sys.exit(0 if a.lower() == b.lower() else 'ST_HP_GOLDEN %s != HP_SELFTEST_GOLDEN %s' % (b, a))"

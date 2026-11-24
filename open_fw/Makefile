@@ -130,7 +130,11 @@ SRCS      := src/startup.c src/wdt_timer.c src/rtc.c src/uart.c src/pmu.c \
              src/xrec_proto.c src/bt_hci.c src/recorder.c src/player.c \
              src/exp_runner.c src/crypto.c src/wav.c src/cwx.c src/exfat.c \
              src/persist.c src/main.c
+ifeq ($(BT),1)
+SRCS      += src/audio_out.c   # output dispatch DAC / headset / both (include/audio_out.h; BT=0 aliases the DAC)
+endif
 OBJS      := $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(SRCS))
+$(BUILD_DIR)/audio_out.o: CFLAGS += -Ibt_port
 
 # FreeRTOS kernel + glue (ARM link only; not part of WASM/host builds)
 RTOS_SRCS := $(FREERTOS_DIR)/tasks.c $(FREERTOS_DIR)/queue.c $(FREERTOS_DIR)/list.c \

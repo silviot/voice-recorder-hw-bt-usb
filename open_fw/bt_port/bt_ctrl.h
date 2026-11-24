@@ -171,6 +171,11 @@ int bt_ctrl_init(const bt_rom_if_t *rom, const bt_ctrl_platform_t *platform, con
  * Called only from bt_ctrl_run() (bt_ctrl task context). NULL (the default) disables the deadline. */
 void bt_ctrl_set_clock(uint32_t (*now_ms)(void));
 
+/* Optional NOCP observer (headphones mode: NOCP-acked stream position and the credit-stall watchdog,
+ * docs/BT_A2DP_DESIGN.md §4.4/§4.6). Called from bt_ctrl_run() (bt_ctrl task context) with the packets the ROM
+ * completed on a handle, after bt_ctrl's own credit accounting. Must not block. NULL (the default) = none. */
+void bt_ctrl_set_nocp_observer(void (*obs)(uint16_t handle, uint32_t pkts));
+
 /* Lifecycle. open: new session, admission open; the ROM is started by the host's HCI Reset (plan M1 "Reset ... same
  * path on re-enable"). Returns -1 if not OFF or bt_dlv is still inside a host callback.
  * shutdown_begin (plan M1 teardown order): session bumped + deliveries closed (callbacks quiesced) -> admission

@@ -53,6 +53,11 @@ FW_PORT_SRCS := $(ROOT)/bt_port/bt_port_fw_stubs.c $(ROOT)/bt_port/bt_port_glue.
                 $(ROOT)/bt_port/bt_esp_timer.c $(ROOT)/bt_port/bt_entropy.c $(ROOT)/bt_port/bt_drbg.c \
                 $(ROOT)/bt_port/bt_store.c $(ROOT)/bt_port/bt_ctrl.c $(ROOT)/bt_port/bt_ctrl_cmds.c \
                 $(ROOT)/bt_port/bt_ctrl_evt.c
+# Headphones-mode audio core (docs/BT_A2DP_DESIGN.md §3-4, every BT=1 image): PCM ring + resampler and the pacer are
+# pure C (-Wextra); the SBC wrapper and the Bluedroid binding include stack internals (vendored-code warning set).
+HP_PURE_SRCS := $(ROOT)/bt_port/hp_sink.c $(ROOT)/bt_port/hp_tx.c $(ROOT)/bt_port/hp_selftest.c
+FW_PORT_SRCS += $(HP_PURE_SRCS) $(ROOT)/bt_port/hp_sbc.c $(ROOT)/bt_port/hp_tx_bd.c
+$(patsubst $(ROOT)/%.c,$(BUILD_DIR)/%.o,$(HP_PURE_SRCS)): CFLAGS += -Wextra
 # HCI probe image (make BT=1 HCI_PROBE=1, plan M5 Exp 1 stage A): real ROM interface, bt_ctrl FreeRTOS glue, probe.
 PROBE_SRCS := $(ROOT)/bt_port/bt_rom_real.c $(ROOT)/bt_port/bt_ctrl_rtos.c $(ROOT)/bt_port/hci_probe.c \
               $(ROOT)/bt_port/hci_probe_trigger.c

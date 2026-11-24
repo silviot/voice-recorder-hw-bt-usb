@@ -9,6 +9,7 @@
 #include "openfw_wav.h"
 #include "openfw_cwx.h"
 #include "openfw_player.h"
+#include "audio_out.h"
 
 #define PLAYER_DAC_CHUNK_FRAMES 1024u
 
@@ -316,7 +317,7 @@ player_action_t player_keys_step(player_keys_t *s, key_id_t raw, uint32_t now_ms
 
 static uint32_t player_heard_frames(uint32_t played_frames, uint32_t skip_frames)
 {
-    uint32_t queued = audio_dac_queued_frames();
+    uint32_t queued = aout_queued_frames();
     uint32_t base   = (played_frames > queued) ? (played_frames - queued) : 0u;
     return base + skip_frames;
 }
@@ -360,7 +361,7 @@ typedef struct {
 
 static uint32_t scrub_heard(const scrub_t *s, uint32_t total)
 {
-    uint32_t queued = audio_dac_queued_frames();
+    uint32_t queued = aout_queued_frames();
     uint32_t rate = (uint32_t)(s->speed > 0 ? s->speed : -s->speed);
     int64_t distance = 2 * (int64_t)queued;
     for (uint32_t step = 0; step < rate - 2u; step++) {
@@ -519,7 +520,7 @@ static void scrub_queue(scrub_t *s, exfat_vol_t *vol, const exfat_entry_t *file,
             s->finished = 1; /* End of this directional pass, or SD read error. */
             break;
         }
-        int sent = audio_dac_write_stereo(g_mono_tx + 2 * s->pending_pos, s->pending_count);
+        int sent = aout_write(g_mono_tx + 2 * s->pending_pos, s->pending_count, 2);
         if (sent <= 0) break;
         s->pending_pos += (uint32_t)sent;
         s->pending_count -= (uint32_t)sent;
@@ -540,7 +541,7 @@ static void player_pause_rewind(const wav_stream_info_t *winfo,
     *skip_frames = (heard > *played_frames) ? (heard - *played_frames) : 0u;
     *buf_pos     = 0u;
     *buf_frames  = 0u;
-    audio_dac_flush();
+    aout_flush();
 }
 
 int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_name,
@@ -641,10 +642,10 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
     if (volume > 31u) {
         volume = 18u;
     }
-    if (audio_dac_start(winfo.sample_rate, volume) != 0) {
+    if (aout_start(winfo.sample_rate, volume) != 0) {
         return 0;
     }
-    /* Re-sample PB11 after codec analog bias is enabled by audio_dac_start() */
+    /* Re-sample PB11 after codec analog bias is enabled by audio_dac_start() (via aout_start) */
     int hp_post = keys_read_hp_detect();
     if (hp_post != hp_in) {
         hp_in  = hp_post;
@@ -652,7 +653,7 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
         if (volume > 31u) {
             volume = 18u;
         }
-        audio_dac_set_volume(volume, 0x1FFu);
+        aout_set_volume(volume, 0x1FFu);
     }
     /* Route audio to built-in speaker PA (PB30) when no 3.5 mm jack is inserted */
     audio_pa_set(!hp_in);
@@ -754,14 +755,14 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
         if (scrub.speed && (!keys.hold_active || unplug ||
                             (!keys_event_pending() && keys_state(NULL) != keys.held))) {
             uint32_t heard = scrub_heard(&scrub, winfo.total_samples);
-            audio_dac_flush();
+            aout_flush();
             scrub.speed = 0;
             player_seek_to_frame(&winfo, heard, &data_off, &played_frames);
             skip_frames = heard - played_frames;
             buf_pos = buf_frames = 0;
             eof_reached = heard == winfo.total_samples;
             if (eof_reached) played_frames = heard;
-            audio_dac_set_mute(paused || eof_reached);
+            aout_set_mute(paused || eof_reached);
             audio_pa_set(!paused && !eof_reached && !hp_in && !unplug);
             ui_dirty = 1;
         }
@@ -769,11 +770,11 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
             int was_hp = hp_in;
             hp_in  = cur_hp;
             volume = hp_in ? m->cfg.hp_vol : m->cfg.spk_vol;
-            audio_dac_set_volume(volume, 0x1FFu);
+            aout_set_volume(volume, 0x1FFu);
             if (was_hp && !hp_in && !paused && !eof_reached) {
                 paused = 1;
                 audio_pa_set(0);
-                audio_dac_set_mute(1);
+                aout_set_mute(1);
                 player_pause_rewind(&winfo, &data_off, &played_frames,
                                     &buf_pos, &buf_frames, &skip_frames);
                 str_copy_cap(m->toast_msg, (int)sizeof(m->toast_msg),
@@ -799,17 +800,17 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
                 skip_frames   = 0u;
                 eof_reached   = 0;
                 paused        = 0;
-                audio_dac_flush();
+                aout_flush();
             } else {
                 paused ^= 1;
                 if (paused) {
-                    audio_dac_set_mute(1);
+                    aout_set_mute(1);
                     audio_pa_set(0);
                     player_pause_rewind(&winfo, &data_off, &played_frames,
                                         &buf_pos, &buf_frames, &skip_frames);
                 }
             }
-            audio_dac_set_mute(paused);
+            aout_set_mute(paused);
             audio_pa_set((!hp_in && !paused && !eof_reached) ? 1 : 0);
             ui_dirty = 1;
         } else if (act == PLAYER_ACT_VOL_UP || act == PLAYER_ACT_VOL_DOWN) {
@@ -823,16 +824,16 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
             } else {
                 m->cfg.spk_vol = volume;
             }
-            audio_dac_set_volume(volume, 0x1FFu);
+            aout_set_volume(volume, 0x1FFu);
             last_vol_ms = now ? now : 1u;
             ui_dirty    = 1;
         } else if (act == PLAYER_ACT_PREV_FILE || act == PLAYER_ACT_NEXT_FILE) {
             file_dir = (act == PLAYER_ACT_NEXT_FILE) ? 1 : -1;
         } else if ((act == PLAYER_ACT_SCRUB_BACK || act == PLAYER_ACT_SCRUB_FWD) && !unplug) {
             uint32_t heard = eof_reached ? played_frames : player_heard_frames(played_frames, skip_frames);
-            audio_dac_flush();
+            aout_flush();
             scrub = (scrub_t){ .speed = act == PLAYER_ACT_SCRUB_FWD ? 2 : -2, .next = heard };
-            audio_dac_set_mute(0);
+            aout_set_mute(0);
             audio_pa_set(!hp_in);
             ui_dirty = 1;
         } else if (act == PLAYER_ACT_SEEK_BACK || act == PLAYER_ACT_SEEK_FWD) {
@@ -859,7 +860,7 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
                 buf_frames  = 0u;
                 skip_frames = 0u;
                 eof_reached = 0;
-                audio_dac_flush();
+                aout_flush();
                 audio_pa_set((!hp_in && !paused) ? 1 : 0);
                 ui_dirty    = 1;
             }
@@ -883,7 +884,7 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
             for (unsigned iter = 0; iter < AUDIO_DAC_QUEUE_SLOTS; iter++) {
                 if (buf_pos >= buf_frames) {
                     if (data_off >= winfo.data_bytes || played_frames >= winfo.total_samples) {
-                        if (audio_dac_is_busy()) break;
+                        if (aout_is_busy()) break;
                         eof_reached = 1;
                         peak_l_pct  = 0u;
                         peak_r_pct  = 0u;
@@ -915,7 +916,7 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
                     chunk -= chunk % winfo.block_align;
                     if (!chunk) {
                         data_off = winfo.data_bytes;
-                        if (!audio_dac_is_busy()) {
+                        if (!aout_is_busy()) {
                             eof_reached = 1;
                             peak_l_pct  = 0u;
                             peak_r_pct  = 0u;
@@ -929,7 +930,7 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
                     if (exfat_read_file(vol, &wav_ent, (uint64_t)winfo.data_offset + data_off,
                                         g_file_buf, chunk, &got) != 0 || got < chunk) {
                         data_off = winfo.data_bytes;
-                        if (!audio_dac_is_busy()) {
+                        if (!aout_is_busy()) {
                             eof_reached = 1;
                             peak_l_pct  = 0u;
                             peak_r_pct  = 0u;
@@ -986,8 +987,7 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
                 if (buf_pos < buf_frames) {
                     int sent;
                     if (winfo.channels == 2u) {
-                        sent = audio_dac_write_stereo(&pcm_buf[buf_pos * 2u],
-                                                      buf_frames - buf_pos);
+                        sent = aout_write(&pcm_buf[buf_pos * 2u], buf_frames - buf_pos, 2);
                     } else {
                         uint32_t n = buf_frames - buf_pos;
                         if (n > PLAYER_DAC_CHUNK_FRAMES) {
@@ -999,7 +999,7 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
                             g_mono_tx[i * 2u + 0u] = s;
                             g_mono_tx[i * 2u + 1u] = s;
                         }
-                        sent = audio_dac_write_stereo(g_mono_tx, n);
+                        sent = aout_write(g_mono_tx, n, 2);
                     }
                     if (sent <= 0) {
                         break;
@@ -1079,7 +1079,7 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
         }
 
         if (!keys_event_pending() &&
-            (scrub.speed || paused || eof_reached || (audio_dac_is_busy() &&
+            (scrub.speed || paused || eof_reached || (aout_is_busy() &&
             (buf_pos < buf_frames || data_off >= winfo.data_bytes || played_frames >= winfo.total_samples)))) {
             OPENFW_TASK_WAIT();
         }
@@ -1090,7 +1090,7 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
         m->play_pos_sec = frames_to_ms(heard, winfo.sample_rate) / 1000u;
         eof_reached = heard == winfo.total_samples;
     }
-    audio_dac_stop();
+    aout_stop();
     m->play_file.resume_sec = eof_reached ? 0u : m->play_pos_sec;
 
     return ret_code;

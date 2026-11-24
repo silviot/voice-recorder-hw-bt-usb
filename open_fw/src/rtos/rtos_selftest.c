@@ -19,7 +19,7 @@
 
 enum {
     T_DELAY = 0, T_QUEUE, T_MUTEX_PI, T_TIMER, T_NOTIFY, T_EVENTGROUP,
-    T_HEAP, T_PREEMPT, T_FROM_ISR, T_STACK, T_REAP, T_BTDATA, T_MALLOCFAIL, T_BTPORT, T_COUNT
+    T_HEAP, T_PREEMPT, T_FROM_ISR, T_STACK, T_REAP, T_BTDATA, T_MALLOCFAIL, T_BTPORT, T_HPCORE, T_COUNT
 };
 
 typedef struct {
@@ -198,6 +198,9 @@ extern void bt_port_alarm_drain(void);
 extern int bt_entropy_get(void *out, unsigned n);
 static volatile uint32_t g_bt_timer_hits;
 static void bt_timer_cb(void *a) { (void)a; g_bt_timer_hits++; }
+/* T_HPCORE: headphones audio core bit-exact with the host (bt_port/hp_selftest.h; golden checked by test_hp_tx). */
+extern uint32_t hp_selftest_crc(void *work);   /* work: hp_selftest_work_t, < 4 KiB */
+#define ST_HP_GOLDEN 0x3F0E9D61u   /* = HP_SELFTEST_GOLDEN */
 #endif
 
 static void selftest_main(void *arg)
@@ -369,6 +372,17 @@ static void selftest_main(void *arg)
         report(T_BTPORT, step == 6u, step);
 #else
         report(T_BTPORT, 1, 0u);
+#endif
+    }
+    /* T_HPCORE: SBC encoder + resampler output CRC equals the host's (detail = the CRC) */
+    {
+#if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID
+        void *work = pvPortMalloc(4096);
+        uint32_t crc = work ? hp_selftest_crc(work) : 0u;
+        vPortFree(work);
+        report(T_HPCORE, crc == ST_HP_GOLDEN, crc);
+#else
+        report(T_HPCORE, 1, 0u);
 #endif
     }
     /* T_STACK: this task's high-water mark is sane (not overflowed, not untouched) */

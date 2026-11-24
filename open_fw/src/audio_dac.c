@@ -344,6 +344,21 @@ int audio_dac_write_stereo(const int16_t *interleaved_lr, uint32_t num_frames)
     return (int)frames;
 }
 
+#if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID
+#include "audio_out.h"
+/* Headphones mode (include/audio_out.h): the A2DP ring borrows the slot buffer while the DAC is stopped. */
+int16_t *audio_dac_borrow_buf(uint32_t *out_bytes)
+{
+    if (g_dac_running) {
+        return 0;
+    }
+    if (out_bytes) {
+        *out_bytes = (uint32_t)sizeof(g_dac_buf);
+    }
+    return &g_dac_buf[0][0];
+}
+#endif
+
 int audio_dac_is_busy(void)
 {
     return g_tx_active;

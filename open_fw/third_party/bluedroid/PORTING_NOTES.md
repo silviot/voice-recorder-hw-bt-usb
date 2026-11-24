@@ -61,8 +61,8 @@ Dynamic estimate (heap arena; ESTIMATES from config constants — to be replaced
 | HCI command bufs (660 B × 2–3), ACL rx (≈1 KB in flight), L2CAP tx queue (controller credits × ≤1 KB) | 4–12 KB |
 | bt_config / bond DB in RAM (4 bonds) | 2–4 KB |
 | **SPP mode** extra: RFCOMM rx/tx queues (high watermark 10 × 990 B each way, credits ≤ 16 frames) | 4–20 KB |
-| **A2DP mode** extra: encoded frames ≤ 5 × 1280 B (patch 0002) | ≈ 6.4 KB |
-| A2DP app-side PCM staging ring (our code, 100 ms of 44.1 kHz stereo) | ≈ 17.6 KB |
+| **A2DP mode** extra: encoded packets, external-codec path (`CONFIG_BT_A2DP_USE_EXTERNAL_CODEC`, docs/BT_A2DP_DESIGN.md §12.1): app-sized buffers ≤ 1.03 KB each, `audio_tx_q` capped at 4 (patch 0029) + BTA `a2d_list` 3 + L2CAP 5 + 1 being built; patch 0002's `BTC_MEDIA_AA_BUF_SIZE` no longer applies (the internal encoder is compiled out). Earlier text said "≤ 5 × 1280 B", which was never the bound: the internal encoder queued up to 27 frames | ≈ 2–3 KB steady, ≈ 13.4 KB worst |
+| A2DP app-side PCM ring (`bt_port/hp_sink.c`: borrows the DAC's 16 KiB slot buffer, or 16–32 KiB of heap in output mode BOTH) | 0–32 KB |
 | App task stack (the current main loop moves into a FreeRTOS task: needs its own stack) | not counted |
 Totals (dynamic): SPP mode ≈ 24–40 KB typical, ≈ 55 KB worst case; A2DP mode ≈ 35–45 KB typical, ≈ 50 KB worst. With 21.4 KB static: **≈ 60–70 KB total per mode**, inside the 84 KB region with ≈ 15–25 KB margin; the coordinator's "80 KB first, 160 KB max" budget holds. Biggest knobs if tight: `PORT_RX/TX_BUF_HIGH_WM` (RFCOMM), `BT_ALARM_MAX_NUM`, `BT_BTU/BTC_TASK_STACK_SIZE` (measure stack high-water first), PCM ring size.
 

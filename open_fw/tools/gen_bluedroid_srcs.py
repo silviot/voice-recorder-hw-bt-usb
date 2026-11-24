@@ -49,6 +49,12 @@ for rel, marker in (("host/bluedroid/CMakeLists.txt", "list(APPEND bluedroid_hos
     p = os.path.join(bd, rel); tmp = tempfile.NamedTemporaryFile("w", delete=False, suffix=".txt")
     tmp.write(section(p, marker)); tmp.close()
     out += parse(tmp.name, os.path.dirname(p)); os.unlink(tmp.name)
+# KEEP: the vendored CMakeLists adds the SBC encoder only when CONFIG_BT_A2DP_USE_EXTERNAL_CODEC is off, but headphones
+# mode encodes SBC itself through the external-codec path (bt_port/hp_sbc.c; docs/BT_A2DP_DESIGN.md §5.1).
+KEEP = ("host/bluedroid/external/sbc/encoder/srce",)
+for k in KEEP:
+    d = os.path.join(bd, k)
+    out += [os.path.join(d, f) for f in sorted(os.listdir(d)) if f.endswith(".c")]
 out = sorted({os.path.relpath(f, root) for f in out if not any(x in f for x in EXCLUDE) and os.path.exists(f)})
 # osal (freertos) is guarded by CONFIG_BT_OSAL_ENABLED in CMake; always needed for bt_prf_task etc.
 osal = "third_party/bluedroid/common/osal/src/bt_osal_freertos.c"

@@ -412,7 +412,7 @@ def main() -> int:
 
         selftest_result: dict = {}
         selftest_names = ["delay", "queue", "mutex_pi", "timer", "notify", "eventgroup",
-                          "heap", "preempt", "from_isr", "stack", "reap", "btdata", "mallocfail", "btport"]
+                          "heap", "preempt", "from_isr", "stack", "reap", "btdata", "mallocfail", "btport", "hpcore"]
 
         def read_selftest(client: GdbRspClient):
             """FreeRTOS self-test (make RTOS=1 RTOS_SELFTEST=1): poll g_rtos_selftest until done."""

@@ -469,6 +469,13 @@ static bt_rom_msg_ret_t accept_general(uint16_t id, uint8_t *param, uint16_t par
     return BT_ROM_MSG_CONSUMED;
 }
 
+static void (*volatile s_nocp_obs)(uint16_t handle, uint32_t pkts);
+
+void bt_ctrl_set_nocp_observer(void (*obs)(uint16_t handle, uint32_t pkts))
+{
+    s_nocp_obs = obs;
+}
+
 static void rom_nocp(const uint8_t *p, uint16_t len)
 {
     g.st.nocp_from_rom++;
@@ -491,6 +498,10 @@ static void rom_nocp(const uint8_t *p, uint16_t len)
         if (done != 0u && !hc_add(g.nocp_pend, h, done)) {
             g.st.invariant++;
             defer_fault(BT_CTRL_FAULT_INVARIANT, BT_CTRL_SITE_NOCP_TABLE, h, done);
+        }
+        void (*obs)(uint16_t, uint32_t) = s_nocp_obs;
+        if (done != 0u && obs != NULL) {
+            obs(h, done);
         }
     }
 }
