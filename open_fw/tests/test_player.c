@@ -16,6 +16,7 @@ static int strict = 1;           /* full-drain assertions (plain playback runs) 
 static int track_pcm = 0;        /* capture heard PCM stream across pause/resume */
 enum { HEARD_MAX = 16000 * 12 };
 static int16_t heard_l[HEARD_MAX], heard_r[HEARD_MAX];
+static uint16_t heard_t[HEARD_MAX];   /* ms at which each frame was heard */
 static unsigned heard_n;
 enum { FLUSH_LOG = 16 };
 static unsigned flush_at[FLUSH_LOG], flush_ms[FLUSH_LOG];
@@ -35,6 +36,7 @@ static int drop_volume_release;
 static unsigned lookup_delay;
 static unsigned time_limit_ms = 6000;
 static uint32_t synth_frames;    /* >0: stereo file synthesized on read (L = frame % 30000, R = frame / 30000) */
+static int synth_tri;            /* synthesized file is a 200 Hz triangle on both channels instead */
 
 /* Simulated 1 kHz SysTick key debouncer + SPSC queue */
 static key_event_t stub_q[32];
@@ -104,6 +106,7 @@ static void advance(unsigned ms)
         if (track_pcm) {
             for (unsigned i = 0; i < take && heard_n < HEARD_MAX; i++) {
                 heard_r[heard_n] = slot_r[head][slot_off[head] + i];
+                heard_t[heard_n] = (uint16_t)now_ms;
                 heard_l[heard_n++] = slot_l[head][slot_off[head] + i];
             }
         }
@@ -203,6 +206,10 @@ int exfat_read_file(const exfat_vol_t *vol, const exfat_entry_t *ent,
             if (o < 44u) { d[i] = recording[o]; continue; }
             uint32_t frame = (uint32_t)((o - 44u) / 4u);
             uint16_t v = (uint16_t)((o - 44u) % 4u < 2u ? frame % 30000u : frame / 30000u);
+            if (synth_tri) {
+                int ph = (int)(frame % 80u);
+                v = (uint16_t)(int16_t)((ph < 40 ? ph : 80 - ph) * 400 - 8000);
+            }
             d[i] = (uint8_t)(((o - 44u) & 1u) ? v >> 8 : v);
         }
     } else {
@@ -503,8 +510,19 @@ static key_id_t tap_then_ok(unsigned ms)
     return KEY_NONE;
 }
 
+/* Start of the last run of consecutive source frames in the heard stream. */
+static unsigned final_run(int64_t (*frame_of)(unsigned))
+{
+    unsigned e = heard_n - 1;
+    while (e > 0 && frame_of(e) == frame_of(e - 1) + 1) e--;
+    return e;
+}
+static int64_t fixture_frame(unsigned i) { return heard_l[i]; }
+
 /* The stereo fixture contains the source frame index in the left channel.
- * One RIGHT press: 2x. One LEFT press: -1x. OK returns to 1x at the frame heard. */
+ * One RIGHT press: 2x. One LEFT press: -1x. OK returns to 1x. Neither way is
+ * the DAC flushed: queued 1x audio plays out into the first grain, and the last
+ * 1x grain hands over to normal playback sample-exactly. */
 static void test_audible_scrub(void)
 {
     exfat_vol_t vol = {0};
@@ -518,18 +536,22 @@ static void test_audible_scrub(void)
         reset_run(tap_then_ok);
         track_pcm = 1;
         assert(openfw_play_file_ui(&vol, "/record", "test.wav", &m) == 0);
-        assert(flush_calls == 2 && max_scrub_speed == (speed < 0 ? -speed : speed));
-        unsigned first = flush_at[0], end = flush_at[1];
-        assert(end > first + 1000 && heard_n > end + 100);
+        assert(flush_calls == 0 && max_scrub_speed == (speed < 0 ? -speed : speed));
+        unsigned first = 0;
+        while (first < heard_n && heard_l[first] == (int)first) first++;
+        unsigned end = final_run(fixture_frame);
+        assert(end > first + 1000 && heard_n > end + 1000);
+        /* 1x audio queued at the press is heard first: about the 4-slot queue. */
+        assert(heard_t[first] >= scrub_tap_at + 8 && heard_t[first] <= scrub_tap_at + 8 + 300);
         int direction = speed > 0 ? 1 : -1;
         unsigned native_steps = 0;
         for (unsigned i = first + 1; i < end; i++)
             if (heard_l[i] - heard_l[i - 1] == direction) native_steps++;
-        assert(native_steps * 100u > (end - first) * 65u);
-        assert(heard_l[end] == (int)first + speed * (int)(end - first));
-        for (unsigned i = end + 1; i < heard_n; i++) assert(heard_l[i] == heard_l[i-1] + 1);
+        assert(native_steps * 100u > (end - first) * 60u);
+        if (speed > 0) assert(heard_l[end] > (int)end && heard_l[end] <= (int)(first + 2 * (end - first) + 600));
+        else assert(heard_l[end] < (int)first + 600);
     }
-    puts("[OK] 2x and -1x dial progress, original-rate grains, and exact return to 1x on OK");
+    puts("[OK] 2x and -1x dial: no flush in or out, original-rate grains, contiguous 1x after OK");
 }
 
 /* Ladder stepping and the silent clock (pure functions). */
@@ -609,6 +631,8 @@ static void dial_model(unsigned start_s)
     }
 }
 
+static int64_t synth_frame(unsigned i) { return (int64_t)heard_r[i] * 30000 + heard_l[i]; }
+
 static void test_speed_dial(void)
 {
     exfat_vol_t vol = {0};
@@ -660,22 +684,25 @@ static void test_speed_dial(void)
         unsigned w_from = win_from, w_to = win_to;
         assert(openfw_play_file_ui(&vol, "/record", "test.wav", &m) == 0);
         win_from = w_from; win_to = w_to;
-        assert(flush_calls >= 2 && flush_calls <= FLUSH_LOG);
+        assert(flush_calls <= FLUSH_LOG);
 
         if (s0) {
             assert(win_writes == 0 && win_reads == 0);
             assert(before_win_l == 0);                    /* last grain faded to zero */
         }
-        /* After the last flush (back to 1x) playback is contiguous from the model position. */
-        unsigned last = flush_calls - 1, at = flush_at[last];
-        int64_t want = model_pos[flush_ms[last]];
+        /* The final run of contiguous frames is 1x playback again; compare where it
+         * started with the model at that moment. */
+        unsigned last = flush_calls ? flush_calls - 1 : 0;
+        unsigned at = heard_n ? final_run(synth_frame) : 0;
+        int64_t want = model_pos[heard_t[at]];
         int max_sp = 1;
-        for (unsigned t = 0; t < flush_ms[last]; t++)
+        for (unsigned t = 0; t < heard_t[at]; t++)
             if (abs(model_speed[t]) > max_sp) max_sp = abs(model_speed[t]);
-        int64_t tol = 16 * (150 + 150 * (int64_t)max_sp); /* key latency, render stalls, grain drain */
+        int64_t tol = 16 * (450 + 150 * (int64_t)max_sp); /* key latency, render stalls, queue drains */
         int64_t got;
         if (model_pos[DIAL_MS - 1] == 0) {
             want = 0;
+            at = flush_at[last];
             assert(heard_n == at && last_play_state == 1 && last_pos_ms == 0);   /* paused at 0:00 */
             unsigned zero_ms = 0;
             while (model_pos[zero_ms]) zero_ms++;
@@ -683,13 +710,12 @@ static void test_speed_dial(void)
             got = 0;
         } else if (model_pos[DIAL_MS - 1] == (int64_t)synth_frames) {
             want = synth_frames;
+            at = flush_at[last];
             assert(heard_n == at && last_play_state == 2 && m.play_file.resume_sec == 0);  /* normal EOF */
             got = want;
         } else {
             assert(heard_n > at + 1000);
-            got = (int64_t)heard_r[at] * 30000 + heard_l[at];
-            for (unsigned i = at + 1; i < heard_n; i++)
-                assert((int64_t)heard_r[i] * 30000 + heard_l[i] == (int64_t)heard_r[i - 1] * 30000 + heard_l[i - 1] + 1);
+            got = synth_frame(at);
         }
         printf("    %-18s from %3us: 1x again at %8.3fs (model %8.3fs), top %dx\n", cases[c].name,
                cases[c].start_s, got / (double)DIAL_RATE, want / (double)DIAL_RATE, max_scrub_speed);
@@ -700,6 +726,49 @@ static void test_speed_dial(void)
     win_from = win_to = 0;
     puts("[OK] speed dial: silent >= 8x (no SD reads or DAC writes, faded last grain), OK/step back to 1x "
          "at the heard frame, pause -> RIGHT, reverse to 0:00 pauses, forward to the end ends");
+}
+
+/* 200 Hz triangle (slope 400 per sample) through every kind of transition:
+ * 1x -> 2x -> 4x -> 8x (silent) -> 4x -> OK -> -1x -> 1x -> 2x -> OK. No heard
+ * sample may jump far beyond the signal's own slope. */
+static void test_dial_clicks(void)
+{
+    static const press_t script[] = {
+        {KEY_RIGHT, 300, 360}, {KEY_RIGHT, 900, 960}, {KEY_RIGHT, 1500, 1560}, {KEY_LEFT, 2500, 2560},
+        {KEY_ENTER, 3000, 3060}, {KEY_LEFT, 3600, 3660}, {KEY_RIGHT, 4200, 4260}, {KEY_RIGHT, 4800, 4860},
+        {KEY_ENTER, 5400, 5460}, {KEY_BACK, 6300, 6400},
+    };
+    exfat_vol_t vol = {0};
+    synth_frames = 16000 * 120;
+    synth_tri = 1;
+    file_size = 44 + synth_frames * 4;
+    assert(!wav_build_header(recording, 16000, 2, 16, synth_frames * 4));
+    channels = 2;
+    time_limit_ms = 8000;
+    ui_model_t m = {0};
+    m.cfg.spk_vol = 18;
+    m.play_file.resume_sec = 60;
+    dial_presses = script;
+    dial_npress = sizeof(script) / sizeof(script[0]);
+    reset_run(dial_script);
+    track_pcm = 1;
+    assert(openfw_play_file_ui(&vol, "/record", "test.wav", &m) == 0);
+    assert(flush_calls == 0 && max_scrub_speed == 8);
+    int worst = 0;
+    unsigned worst_at = 0;
+    for (unsigned i = 1; i < heard_n; i++) {
+        int d = abs(heard_l[i] - heard_l[i - 1]);
+        if (d > worst) worst = d, worst_at = i;
+        d = abs(heard_r[i] - heard_r[i - 1]);
+        if (d > worst) worst = d, worst_at = i;
+    }
+    printf("    largest step %d (signal slope 400) at %u ms over %u heard frames\n", worst,
+           (unsigned)heard_t[worst_at], heard_n);
+    assert(worst <= 1600);
+    synth_frames = 0;
+    synth_tri = 0;
+    time_limit_ms = 6000;
+    puts("[OK] speed dial transitions are click-free (no flushes, crossfades and fades only)");
 }
 
 static void put_le16_t(uint8_t *p, uint16_t v)
@@ -729,9 +798,14 @@ static void test_scrub_pitch(void)
         reset_run(tap_then_ok);
         track_pcm = 1;
         assert(openfw_play_file_ui(&vol, "/record", "test.wav", &m) == 0);
-        assert(flush_calls == 2 && flush_at[1] > flush_at[0] + 1000);
-        unsigned crossings = 0, span = flush_at[1] - flush_at[0];
-        for (unsigned i = flush_at[0]+1; i < flush_at[1]; i++)
+        /* Dial audio only: after the queued 1x audio, before OK's queued grains end. */
+        unsigned from = 0, to;
+        while (from < heard_n && heard_t[from] < scrub_tap_at + 300) from++;
+        to = from;
+        while (to < heard_n && heard_t[to] < scrub_tap_at + 480) to++;
+        assert(to > from + 1000);
+        unsigned crossings = 0, span = to - from;
+        for (unsigned i = from + 1; i < to; i++)
             if (heard_l[i-1] <= 0 && heard_l[i] > 0) crossings++;
         assert(crossings * 37 + 38 >= span && crossings * 37 <= span + 38);
         printf("[OK] %s scrub: %u Hz (input 432 Hz)\n", dir > 0 ? "Forward" : "Reverse",
@@ -961,5 +1035,6 @@ int main(void)
     test_pause_zero_loss_and_ima2048();
     test_scrub_pitch();
     test_speed_dial();   /* replaces the fixture with a synthetic 2-minute file */
+    test_dial_clicks();
     return 0;
 }

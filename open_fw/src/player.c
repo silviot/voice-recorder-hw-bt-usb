@@ -344,6 +344,9 @@ typedef struct {
     uint32_t overlap;
     uint32_t silent_ms;      /* silent clock: last time next was advanced */
     uint32_t silent_rem;     /* sub-frame remainder of the silent clock */
+    int64_t cont;            /* source boundary right after the last grain's audio */
+    int cont_speed;          /* speed of the grain that set cont */
+    int prime;               /* seed the overlap with the 1x audio still queued */
     int finished;
 } scrub_t;
 
@@ -352,11 +355,24 @@ static int scrub_silent(int speed)
     return speed >= UI_SPEED_SILENT || speed <= -UI_SPEED_SILENT;
 }
 
-static void scrub_start(scrub_t *s, int speed, uint32_t pos, uint32_t now_ms)
+/* Start at source boundary pos. queued_1x frames of normal playback are still in
+ * the DAC queue and end at pos: they keep playing, and the first grain crossfades
+ * from their continuation, so nothing clicks. With nothing queued (paused, at the
+ * end) the first grain fades in instead. */
+static void scrub_start(scrub_t *s, int speed, uint32_t pos, uint32_t queued_1x, uint32_t now_ms)
 {
     *s = (scrub_t){ .speed = speed, .target = speed, .next = pos, .silent_ms = now_ms,
-                    .fade_in = 1, .seg_n = 1 };
+                    .submitted = queued_1x, .seg_n = 1 };
     s->seg[0].speed = speed;
+    if (queued_1x) {
+        s->seg[0].speed = 1;
+        s->seg[1].start = queued_1x;
+        s->seg[1].speed = speed;
+        s->seg_n = 2;
+        s->prime = 1;
+    } else {
+        s->fade_in = 1;
+    }
 }
 
 static void scrub_set_speed(scrub_t *s, int speed)
@@ -378,7 +394,7 @@ static void scrub_apply(scrub_t *s, uint32_t now_ms)
         return;
     }
     if (was_silent && !silent) s->fade_in = 1;
-    if (was_silent || (s->target > 0) != (s->speed > 0)) s->overlap = 0;
+    if (was_silent) s->overlap = 0; /* else crossfade from the old grain's continuation */
     s->fade = 0;
     s->finished = 0;
     if (s->seg[(s->seg_n - 1u) % SCRUB_SEGS].start != s->submitted) s->seg_n++;
@@ -409,6 +425,14 @@ static uint32_t scrub_heard(const scrub_t *s, uint32_t total)
     if (pos < 0) return 0;
     if (pos > total) return total;
     return (uint32_t)pos;
+}
+
+/* Back at 1x: a whole 1x grain went out and only 1x grains are queued, so normal
+ * playback can take over at cont without a flush (sample-continuous). */
+static int scrub_at_1x(const scrub_t *s)
+{
+    return s->speed == 1 && s->target == 1 && s->cont_speed == 1 && !s->pending_count &&
+           !s->finished && s->submitted - s->seg[(s->seg_n - 1u) % SCRUB_SEGS].start >= audio_dac_queued_frames();
 }
 
 /* The engine reached the file start (reverse) or end (forward) and the DAC is empty. */
@@ -528,6 +552,8 @@ static int scrub_grain(scrub_t *s, exfat_vol_t *vol, const exfat_entry_t *file,
         shift = scrub_match(search, blend);
     }
     frame += direction * (int32_t)shift;
+    s->cont = frame + direction * (int32_t)hop; /* used for forward 1x hand-over */
+    s->cont_speed = s->speed;
     if (!scrub_copy(s, vol, file, w, pcm, frame, direction, g_mono_tx, hop)) return 0;
     for (uint32_t i = 0; i < blend; i++) {
         for (unsigned ch = 0; ch < 2; ch++) {
@@ -563,6 +589,7 @@ static void scrub_queue(scrub_t *s, exfat_vol_t *vol, const exfat_entry_t *file,
 {
     for (unsigned slot = 0; slot < AUDIO_DAC_QUEUE_SLOTS; slot++) {
         if (!s->pending_count) scrub_apply(s, now_ms);
+        if (!s->pending_count && scrub_at_1x(s)) return; /* hand over to normal playback */
         if (scrub_silent(s->speed)) {
             /* Nothing is read or submitted. Hold the clock while the faded grain
              * drains (scrub_heard walks through it), then advance in real time. */
@@ -574,6 +601,18 @@ static void scrub_queue(scrub_t *s, exfat_vol_t *vol, const exfat_entry_t *file,
             return;
         }
         if (!s->pending_count) {
+            if (s->prime) {
+                /* Seed the WSOLA overlap with the audio normal playback would play next. */
+                s->prime = 0;
+                uint32_t tail = w->sample_rate / 160u;
+                if (tail > SCRUB_OVERLAP_MAX) tail = SCRUB_OVERLAP_MAX;
+                if (s->next + tail <= (int64_t)w->total_samples &&
+                    scrub_copy(s, vol, file, w, pcm, s->next, 1, g_scrub_tail, tail)) {
+                    s->overlap = tail;
+                } else {
+                    s->fade_in = 1;
+                }
+            }
             if (s->finished || !scrub_grain(s, vol, file, w, pcm)) {
                 s->finished = 1; /* End of this directional pass, or SD read error. */
                 break;
@@ -861,15 +900,16 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
         if (act == PLAYER_ACT_BACK) {
             ret_code = 0;
             break;
-        } else if (act == PLAYER_ACT_PLAY_PAUSE && scrub.speed) {
-            /* Any speed other than 1x: OK returns to 1x where it is heard now. */
-            scrub_stop(&scrub, &winfo, &data_off, &played_frames, &skip_frames, &buf_pos, &buf_frames);
-            paused = 0;
-            eof_reached = 0;
-            audio_dac_set_mute(0);
-            audio_pa_set(!hp_in);
+        } else if (act == PLAYER_ACT_PLAY_PAUSE && scrub.speed && scrub.target != 1) {
+            /* Any speed other than 1x: OK returns to 1x. The queued grains play
+             * out and 1x grains hand over to normal playback without a flush. */
+            scrub_set_speed(&scrub, 1);
             ui_dirty = 1;
         } else if (act == PLAYER_ACT_PLAY_PAUSE) {
+            if (scrub.speed) {
+                /* Still handing over to 1x: finish now, then pause as at 1x. */
+                scrub_stop(&scrub, &winfo, &data_off, &played_frames, &skip_frames, &buf_pos, &buf_frames);
+            }
             if (eof_reached) {
                 data_off      = 0u;
                 played_frames = 0u;
@@ -915,17 +955,17 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
             } else if (!unplug && !(keys.repeat && cur == 1 && (paused || eof_reached))) {
                 /* (A held key that ran into 0:00 or the end stays stopped there.) */
                 int want = ui_speed_step(cur, fwd ? 1 : -1);
-                if (want == 1) {
-                    scrub_stop(&scrub, &winfo, &data_off, &played_frames, &skip_frames, &buf_pos, &buf_frames);
-                    paused = 0;
-                    eof_reached = 0;
-                    audio_dac_set_mute(0);
-                    audio_pa_set(!hp_in);
-                } else if (!scrub.speed) {
-                    /* From 1x, playing or paused: start the dial where it is heard. */
-                    uint32_t heard = eof_reached ? played_frames : player_heard_frames(played_frames, skip_frames);
-                    audio_dac_flush();
-                    scrub_start(&scrub, want, heard, now);
+                if (!scrub.speed) {
+                    /* From 1x, playing or paused: start the dial after the audio
+                     * already queued (paused or at the end nothing is queued). */
+                    uint32_t queued = (paused || eof_reached) ? 0u : audio_dac_queued_frames();
+                    uint32_t pos = eof_reached ? played_frames : played_frames + skip_frames;
+                    if (!queued) {
+                        audio_dac_flush();
+                        pos = eof_reached ? played_frames : player_heard_frames(played_frames, skip_frames);
+                    }
+                    buf_pos = buf_frames = 0u;
+                    scrub_start(&scrub, want, pos, queued, now);
                     paused = 0;
                     eof_reached = 0;
                     audio_dac_set_mute(0);
@@ -951,7 +991,14 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
         /* Refill PCM decode staging buffer & fill the DAC queue before doing display work */
         if (scrub.speed) {
             scrub_queue(&scrub, vol, &wav_ent, &winfo, pcm_buf, millis());
-            if (scrub_done(&scrub, winfo.total_samples)) {
+            if (scrub_at_1x(&scrub)) {
+                /* Normal playback continues sample-exactly after the last 1x grain. */
+                player_seek_to_frame(&winfo, (uint64_t)scrub.cont, &data_off, &played_frames);
+                skip_frames = (uint32_t)scrub.cont - played_frames;
+                buf_pos = buf_frames = 0u;
+                scrub.speed = 0;
+                ui_dirty = 1;
+            } else if (scrub_done(&scrub, winfo.total_samples)) {
                 /* Forward: 1x at the end, so the normal end-of-file path runs next.
                  * Reverse: 1x paused at 0:00. */
                 paused = scrub.speed < 0;
@@ -1145,7 +1192,7 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
             m->play_pos_ms      = pos_ms;
             m->play_dur_ms      = dur_ms;
             m->play_state       = scrub.speed ? 0u : eof_reached ? 2u : (paused ? 1u : 0u);
-            m->play_scrub_speed = (int8_t)(scrub.speed ? scrub.target : 0);
+            m->play_scrub_speed = (int8_t)(scrub.speed && scrub.target != 1 ? scrub.target : 0);
             m->play_vol_hi      = (last_vol_ms != 0u && (uint32_t)(now - last_vol_ms) < 1500u) ? 1u : 0u;
             m->play_vu_l        = (paused || eof_reached || scrub.speed) ? 0u : peak_l_pct;
             m->play_vu_r        = (paused || eof_reached || scrub.speed) ? 0u : peak_r_pct;
