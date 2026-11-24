@@ -134,6 +134,11 @@ typedef struct {
     /* outcome counters */
     uint32_t conn_count, auth_ok, auth_fail, pairings, name_requests, events_sent;
     uint8_t last_disc_reason;
+    /* Runtime knob (set under bth_rom_lock): 0406 gets its CS 0 but the LMP detach never completes (no E458), like a
+     * phone that walked out of range or froze (a real controller waits for the supervision timeout, up to 20 s). */
+    bool defer_detach;
+    uint32_t detach_deferred;       /* 0406 accepted without a Disconnection Complete */
+    uint32_t stop_kills;            /* the link was still up when the controller stopped (no event: the ROM is gone) */
 } fake_peer_t;
 
 extern fake_peer_t fake_peer;

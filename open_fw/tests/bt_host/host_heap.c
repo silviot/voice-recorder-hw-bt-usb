@@ -237,6 +237,13 @@ void bth_heap_stats(bth_heap_stats_t *out)
     unlock();
 }
 
+void bth_heap_peak_reset(void)
+{
+    lock();
+    s_st.peak_bytes = s_st.live_bytes;
+    unlock();
+}
+
 void bth_heap_fail_arm(uint64_t n, bool persistent)
 {
     void *warm[2];

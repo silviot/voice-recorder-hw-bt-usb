@@ -13,6 +13,7 @@
 #include <string.h>
 
 #include "openfw.h"
+#include "openfw_crypto.h"
 #include "esp_err.h"
 #include "esp_gap_bt_api.h"
 #include "esp_spp_api.h"
@@ -70,18 +71,43 @@ void bt_xrec_plat_log_u32(const char *msg, uint32_t v)
     }
 }
 uint16_t bt_xrec_plat_spp_peer_mtu(uint32_t handle) { (void)handle; return m_peer_mtu; }
+/* Live session blocks and their sizes: a block must go back to the heap zeroed (no key, no PAIR line left in it). */
+static void *m_blk[8];
+static size_t m_blk_n[8];
+static int m_free_dirty;
 void *bt_xrec_plat_alloc(size_t n)
 {
     if (m_alloc_fail) {
         return NULL;
     }
     m_allocs++;
-    return malloc(n);
+    void *p = malloc(n);
+    for (int i = 0; p != NULL && i < 8; i++) {
+        if (m_blk[i] == NULL) {
+            m_blk[i] = p;
+            m_blk_n[i] = n;
+            break;
+        }
+    }
+    return p;
 }
 void bt_xrec_plat_free(void *p)
 {
     if (p != NULL) {
         m_frees++;
+        for (int i = 0; i < 8; i++) {
+            if (m_blk[i] == p) {
+                const uint8_t *b = (const uint8_t *)p;
+                for (size_t k = 0; k < m_blk_n[i]; k++) {
+                    if (b[k] != 0u) {
+                        m_free_dirty++;
+                        break;
+                    }
+                }
+                m_blk[i] = NULL;
+                break;
+            }
+        }
     }
     free(p);
 }
@@ -124,7 +150,15 @@ static uint32_t dev_read_log(void *user, uint32_t off, uint8_t *dst, uint32_t ma
 }
 static const xrec_ops_t k_dev_ops = { .read_log = dev_read_log };
 const xrec_ops_t *bt_xrec_plat_device_ops(void) { return &k_dev_ops; }
-void bt_xrec_plat_load_bound_key(xrec_ctx_t *ctx) { (void)ctx; }
+static const uint8_t m_key[32] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+                                   16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31 };
+static int m_have_key;           /* SD:/cassini.key present */
+void bt_xrec_plat_load_bound_key(xrec_ctx_t *ctx)
+{
+    if (m_have_key) {
+        xrec_set_bound_key(ctx, m_key);
+    }
+}
 void bt_xrec_plat_save_bound_key(const uint8_t key[32]) { (void)key; m_saved_key++; }
 
 int bt_xrec_plat_stack_up_begin(exfat_vol_t *vol, int sd_mounted, const uint8_t bd[6])
@@ -175,7 +209,8 @@ static int m_remove_calls, m_disc_calls;
 static uint32_t m_disc_handle;
 static esp_err_t m_spp_init_ret = ESP_OK, m_srv_ret = ESP_OK;
 static uint8_t m_bonds[8][6];
-static int m_nbonds;
+static uint8_t m_bond_mitm[8];   /* stored link key type authenticated (bt_xrec_plat_bond_mitm) */
+static int m_nbonds, m_purges;
 
 esp_err_t esp_bt_gap_register_callback(esp_bt_gap_cb_t cb) { m_gap_cb = cb; return ESP_OK; }
 esp_err_t esp_spp_register_callback(esp_spp_cb_t cb) { m_spp_cb = cb; return ESP_OK; }
@@ -245,11 +280,28 @@ esp_err_t esp_bt_gap_remove_bond_device(esp_bd_addr_t bda)
     for (int i = 0; i < m_nbonds; i++) {
         if (memcmp(m_bonds[i], bda, 6u) == 0) {
             memmove(m_bonds[i], m_bonds[i + 1], (size_t)(m_nbonds - i - 1) * 6u);
+            memmove(&m_bond_mitm[i], &m_bond_mitm[i + 1], (size_t)(m_nbonds - i - 1));
             m_nbonds--;
             break;
         }
     }
     return ESP_OK;
+}
+int bt_xrec_plat_bond_mitm(const uint8_t bda[6])
+{
+    for (int i = 0; i < m_nbonds; i++) {
+        if (memcmp(m_bonds[i], bda, 6u) == 0) {
+            return m_bond_mitm[i];
+        }
+    }
+    return 0;
+}
+void bt_xrec_plat_bond_purge(const uint8_t bda[6])
+{
+    m_purges++;
+    int r = m_remove_calls;
+    (void)esp_bt_gap_remove_bond_device((uint8_t *)bda);   /* the config entry goes at once */
+    m_remove_calls = r;
 }
 int esp_bt_gap_get_bond_device_num(void) { return m_nbonds; }
 esp_err_t esp_bt_gap_get_bond_device_list(int *dev_num, esp_bd_addr_t *dev_list)
@@ -382,10 +434,12 @@ static void auth_cmpl(const uint8_t bda[6], esp_bt_status_t st, uint8_t lk)
     gap_evt(ESP_BT_GAP_AUTH_CMPL_EVT, &p);
 }
 
-static void add_bond(const uint8_t bda[6])
+static void add_bond_type(const uint8_t bda[6], int mitm)
 {
+    m_bond_mitm[m_nbonds] = (uint8_t)mitm;
     memcpy(m_bonds[m_nbonds++], bda, 6u);
 }
+static void add_bond(const uint8_t bda[6]) { add_bond_type(bda, 1); }
 
 static bool wire_has(const char *needle)
 {
@@ -441,7 +495,10 @@ static void mocks_reset(void)
     m_cfm_accept = m_pin_accept = m_passkey_accept = -1;
     m_disc_handle = 0u;
     m_spp_init_ret = m_srv_ret = ESP_OK;
-    m_nbonds = 0;
+    m_nbonds = m_purges = 0;
+    m_have_key = 0;
+    m_free_dirty = 0;
+    memset(m_blk, 0, sizeof(m_blk));
     m_wire_len = m_btc_used = 0u;
     m_btc_cap = 100000u;
     m_writes = m_upper_cong = m_write_calls_after_stop = 0;
@@ -477,6 +534,8 @@ static void stop_ok(void)
     bt_xrec_stop();
     CHECK(dbg().state == BT_XREC_ST_OFF, "OFF after stop (state %u)", dbg().state);
     CHECK(m_allocs == m_frees, "session buffers freed (%d allocs, %d frees)", m_allocs, m_frees);
+    CHECK(m_free_dirty == 0, "session block returned to the heap with %d non-zero block(s) (key / PAIR line)",
+          m_free_dirty);
 }
 
 /* Numeric comparison inside the window, MITM bond, SPP open, XREC PAIR -> authenticated session. */
@@ -524,8 +583,9 @@ static void t_bring_up_config(void)
     spp_evt(ESP_SPP_INIT_EVT, &p);
     bt_xrec_poll();
     CHECK(m_srv_cfg.local_scn == 1u && m_srv_cfg.create_spp_record &&
-          m_srv_cfg.sec_mask == (ESP_SPP_SEC_AUTHENTICATE | ESP_SPP_SEC_ENCRYPT) && m_srv_cfg.role == ESP_SPP_ROLE_SLAVE &&
-          strcmp(m_srv_name, "Cassini") == 0, "SPP server: ch 1, SDP record, auth+encrypt, 'Cassini'");
+          m_srv_cfg.sec_mask == (ESP_SPP_SEC_AUTHENTICATE | ESP_SPP_SEC_ENCRYPT | ESP_SPP_SEC_MITM) &&
+          m_srv_cfg.role == ESP_SPP_ROLE_SLAVE && strcmp(m_srv_name, "Cassini") == 0,
+          "SPP server: ch 1, SDP record, auth+encrypt+MITM, 'Cassini'");
     CHECK(m_scan_calls == 0, "not connectable before the server listens");
     memset(&p, 0, sizeof(p));
     p.start.status = ESP_SPP_SUCCESS;
@@ -564,6 +624,15 @@ static void t_pairing_and_data(void)
     st = status();
     CHECK(strcmp(st.pair_pin, "000042") != 0 && strlen(st.pair_pin) == 6u, "back to the XREC PIN after AUTH_CMPL");
     CHECK(m_remove_calls == 0, "MITM bond kept");
+    /* one bond per window (review finding): discoverability and numeric comparison end with the first MITM bond, the
+     * XREC PIN stays for the phone's PAIR */
+    CHECK(st.pair_active && m_scan_d == ESP_BT_NON_DISCOVERABLE && !dbg().ssp_window,
+          "SSP window closed after the first bond (discoverable %d, ssp_window %u)", m_scan_d, dbg().ssp_window);
+    cfm_req(PEER2, 77u);
+    bt_xrec_poll();
+    CHECK(m_cfm_calls == 2 && m_cfm_accept == 0, "a second device's numeric comparison rejected in the same window");
+    auth_cmpl(PEER2, ESP_BT_STATUS_AUTH_FAILURE, 0u);
+    bt_xrec_poll();
     srv_open(H1, PEER);
     bt_xrec_poll();
     CHECK(dbg().conn_authorized && dbg().mtu == 660u, "SPP open, authorized, mtu %u", dbg().mtu);
@@ -680,6 +749,24 @@ static void t_bonded_reconnect(void)
     srv_open(H2, PEER2);   /* not bonded, never paired on this link */
     rx(H2, "+XREC:PING\r\n");
     CHECK(m_disc_calls == 2 && m_disc_handle == H2 && m_wire_len == 0u, "unbonded peer refused, no reply");
+    spp_close(H2);
+    bt_xrec_poll();
+    /* a bond whose stored key is NOT MITM-authenticated (a Just Works key a stop / power loss / lost AUTH_CMPL left in
+     * the store): bonded, but refused (review finding: is_bonded() alone authorized it) */
+    add_bond_type(PEER2, 0);
+    srv_open(H2, PEER2);
+    rx(H2, "+XREC:PING\r\n");
+    CHECK(m_disc_calls == 3 && m_wire_len == 0u && dbg().conns_authorized == 1u,
+          "unauthenticated stored key refused (authorized %u)", dbg().conns_authorized);
+    stop_ok();
+
+    printf("    stale unauthenticated bond purged before the device is connectable\n");
+    mocks_reset();
+    add_bond(PEER);
+    add_bond_type(PEER2, 0);
+    bring_up();
+    CHECK(m_nbonds == 1 && memcmp(m_bonds[0], PEER, 6u) == 0 && m_purges == 1 && dbg().bonds_removed == 1u,
+          "only the MITM bond left (bonds %d, purges %d)", m_nbonds, m_purges);
     stop_ok();
 }
 
@@ -919,6 +1006,37 @@ static void t_entropy_fail_closed(void)
     rx(H1, "+XREC:CHAL\r\n");
     CHECK(!wire_has("+XREC:CHAL"), "no challenge without entropy");
     CHECK(m_disc_calls == 1 && dbg().conn_closing, "link closed (fail closed)");
+    stop_ok();
+
+    /* review finding: CHAL without entropy armed a challenge over an all-zero nonce, and an AUTH with HMAC(key, 0^16)
+     * in the SAME SPP write was accepted before the next poll closed the link: the privileged command after it ran */
+    printf("    CHAL + AUTH(HMAC over the zero nonce) + REBOOT in one write, entropy unavailable\n");
+    mocks_reset();
+    m_have_key = 1;
+    add_bond(PEER);
+    bring_up();
+    m_entropy_fail = 1;
+    srv_open(H1, PEER);
+    bt_xrec_poll();
+    CHECK(status().xrec_bound == 1u, "bound key loaded");
+    uint8_t zero[16] = { 0 }, mac[32];
+    openfw_hmac_sha256(m_key, 32u, zero, 16u, mac);
+    char line[200] = "+XREC:CHAL\r\n+XREC:AUTH,";
+    size_t o = strlen(line);
+    for (int i = 0; i < 32; i++) {
+        o += (size_t)snprintf(&line[o], sizeof(line) - o, "%02x", mac[i]);
+    }
+    snprintf(&line[o], sizeof(line) - o, "\r\n+XREC:REBOOT\r\n");
+    CHECK(strlen(line) <= 128u, "one 128-byte drain chunk (%zu)", strlen(line));
+    rx(H1, line);
+    for (int i = 0; i < 5; i++) {
+        m_now += 100u;
+        bt_xrec_poll();
+    }
+    CHECK(status().xrec_auth == 0u && dbg().reboot_mode == 0u && m_reboot_mode == 0 && m_down_calls == 0,
+          "zero-nonce AUTH not accepted, REBOOT not run (auth %u, reboot %u/%d)", status().xrec_auth,
+          dbg().reboot_mode, m_reboot_mode);
+    CHECK(m_disc_calls == 1, "link closed");
     stop_ok();
 }
 

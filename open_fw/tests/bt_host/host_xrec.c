@@ -69,6 +69,12 @@ static TimerHandle_t s_dl_timer;
 static volatile uint8_t s_dl_armed, s_dl_fired;
 static volatile uint32_t s_dl_fired_total, s_hard_reason, s_bond_writes, s_key_writes, s_reboot_mode;
 static uint32_t s_faults_base, s_hci_to_base, s_flush_seen;
+static volatile uint8_t s_fail_bond_writes;   /* test knob: every /bt_bonds.bin write fails (full / removed card) */
+static volatile uint32_t s_bond_write_fails;
+static uint8_t s_bond_fails;                  /* as bt_xrec_fw.c: consecutive failures, bounded retry */
+static uint32_t s_bond_retry_at;
+#define BOND_RETRY_MS  1000u
+#define BOND_RETRY_MAX 8u
 
 /* ============================================ small helpers ===================================================== */
 uint32_t bt_xrec_plat_now_ms(void) { return (uint32_t)(us_timer_now() / 1000u); }
@@ -198,10 +204,17 @@ static void bonds_write(void)
         return;                      /* retried on the next flush request / session end */
     }
     size_t n = bt_store_serialize(img, BT_STORE_IMAGE_MAX);
-    if (n != 0u && save_root_file_atomic(BOND_TMP, BOND_FILE, img, (uint32_t)n) == 0) {
+    if (n != 0u && !s_fail_bond_writes && save_root_file_atomic(BOND_TMP, BOND_FILE, img, (uint32_t)n) == 0) {
+        bt_store_mark_saved();       /* as bt_xrec_fw.c: only after the write succeeded */
+        s_bond_fails = 0u;
         s_bond_writes++;
     } else {
-        bt_xrec_plat_log("BT bonds not saved (SD write failed)");
+        s_bond_write_fails++;
+        bt_xrec_plat_log("BT bonds not saved (SD write failed, retrying)");
+        if (s_bond_fails < BOND_RETRY_MAX) {
+            s_bond_fails++;
+        }
+        s_bond_retry_at = bt_xrec_plat_now_ms() + BOND_RETRY_MS;
     }
     memset(img, 0, BT_STORE_IMAGE_MAX);
     vPortFree(img);
@@ -393,6 +406,9 @@ uint32_t bt_xrec_plat_poll(void)
     if (fl != s_flush_seen) {        /* bt_store asked for a flush (nvs_commit from the BTC config save) */
         s_flush_seen = fl;
         bonds_write();
+    } else if (s_bond_fails != 0u && s_bond_fails < BOND_RETRY_MAX &&
+               (int32_t)(bt_xrec_plat_now_ms() - s_bond_retry_at) >= 0) {
+        bonds_write();
     }
     if (bth_ctrl_faults() != s_faults_base) {
         bth_log("    [xrec] bt_ctrl fault, first code %u\n", (unsigned)bth_ctrl_first_fault());
@@ -407,6 +423,7 @@ uint32_t bt_xrec_plat_poll(void)
 void bt_xrec_plat_session_end(void)
 {
     bonds_write();                   /* final flush of the bond store */
+    s_bond_fails = 0u;
     s_vol = NULL;
     s_sd = 0;
 }
@@ -524,5 +541,7 @@ void bthx_snap(bthx_snap_t *out)
 uint32_t bthx_hard_path_reason(void) { return s_hard_reason; }
 uint32_t bthx_deadline_fired(void) { return s_dl_fired_total; }
 uint32_t bthx_bond_writes(void) { return s_bond_writes; }
+void bthx_fail_bond_writes(int on) { s_fail_bond_writes = on ? 1u : 0u; }
+uint32_t bthx_bond_write_fails(void) { return s_bond_write_fails; }
 uint32_t bthx_key_writes(void) { return s_key_writes; }
 uint32_t bthx_reboot_mode(void) { return s_reboot_mode; }

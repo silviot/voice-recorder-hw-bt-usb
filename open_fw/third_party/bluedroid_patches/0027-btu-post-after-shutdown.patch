@@ -1,0 +1,23 @@
+diff --git a/open_fw/third_party/bluedroid/host/bluedroid/stack/btu/btu_task.c b/open_fw/third_party/bluedroid/host/bluedroid/stack/btu/btu_task.c
+index 7530665..f36ad87 100644
+--- a/open_fw/third_party/bluedroid/host/bluedroid/stack/btu/btu_task.c
++++ b/open_fw/third_party/bluedroid/host/bluedroid/stack/btu/btu_task.c
+@@ -358,6 +358,18 @@ bool btu_task_post(uint32_t sig, void *param, uint32_t timeout)
+ {
+     bool status = false;
+ 
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++    /* open_fw patch 0027: BTU_ShutDown() frees btu_thread BEFORE btu_task_shut_down() -> btu_free_core() -> l2c_free()
++     * releases the link control blocks. An LCB still in use (a link whose Disconnection Complete never came: the peer
++     * is out of range and the controller is stopped before the supervision timeout; patch 0026 reports DISABLE ~600 ms
++     * after its detach either way) goes through l2cu_release_lcb() -> btm_acl_removed() -> bta_sys_sendmsg() ->
++     * here, and osi_thread_post() asserts on the NULL thread (a NULL dereference without asserts). Every caller already
++     * handles a failed post (bta_sys_sendmsg frees the message: its own comment expects exactly this race). */
++    if (btu_thread == NULL) {
++        return false;
++    }
++#endif
++
+     switch (sig) {
+         case SIG_BTU_START_UP:
+             status = osi_thread_post(btu_thread, btu_task_start_up, param, 0, timeout);

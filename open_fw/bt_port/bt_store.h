@@ -36,8 +36,11 @@ void bt_store_init(const bt_store_platform_t *platform);
  * ESP_ERR_INVALID_VERSION / ESP_ERR_INVALID_ARG; on any error the store is left empty. */
 esp_err_t bt_store_load(const uint8_t *img, size_t len);
 
-/* Serialise into buf. Returns the image length, or 0 if cap is too small. Clears the dirty flag on success. */
+/* Serialise into buf. Returns the image length, or 0 if cap is too small. The dirty flag is NOT cleared: a write of the
+ * image can still fail (full or removed card), and the store must then stay dirty so the next flush retries. */
 size_t bt_store_serialize(uint8_t *buf, size_t cap);
+/* The image of the last bt_store_serialize() was stored: clears the dirty flag unless the store changed since. */
+void bt_store_mark_saved(void);
 
 int bt_store_dirty(void);
 

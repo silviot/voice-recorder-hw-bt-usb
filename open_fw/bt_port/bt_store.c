@@ -26,6 +26,8 @@ static struct {
     uint16_t data_used;          /* data[] is kept compact: entries own [off, off+len) without gaps */
     ns_slot_t ns[BT_STORE_NS_MAX];
     int dirty;
+    uint32_t gen;                /* bumped on every change; serialize remembers the one it wrote */
+    uint32_t ser_gen;
     int initialised;
 } g;
 
@@ -232,6 +234,7 @@ esp_err_t nvs_set_blob(nvs_handle_t h, const char *key, const void *val, size_t 
     }
     g.data_used = (uint16_t)(g.data_used + len);
     g.dirty = 1;
+    g.gen++;
     unlock();
     return ESP_OK;
 }
@@ -268,6 +271,7 @@ esp_err_t nvs_erase_key(nvs_handle_t h, const char *key)
         } else {
             remove_entry(x);
             g.dirty = 1;
+            g.gen++;
         }
     }
     unlock();
@@ -288,6 +292,7 @@ esp_err_t nvs_erase_all(nvs_handle_t h)
             if (g.e[i].used && strcmp(g.e[i].ns, s->name) == 0) {
                 remove_entry(&g.e[i]);
                 g.dirty = 1;
+                g.gen++;
             }
         }
     }
@@ -344,9 +349,18 @@ size_t bt_store_serialize(uint8_t *buf, size_t cap)
     openfw_sha256(buf, (uint32_t)n, digest);
     PUT(digest, 8u);
 #undef PUT
-    g.dirty = 0;
+    g.ser_gen = g.gen;          /* dirty stays set until the caller stored the image (bt_store_mark_saved) */
     unlock();
     return n;
+}
+
+void bt_store_mark_saved(void)
+{
+    lock();
+    if (g.gen == g.ser_gen) {
+        g.dirty = 0;            /* nothing changed since that image was serialised */
+    }
+    unlock();
 }
 
 esp_err_t bt_store_load(const uint8_t *img, size_t len)

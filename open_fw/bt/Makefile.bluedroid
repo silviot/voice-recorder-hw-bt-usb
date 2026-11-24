@@ -59,14 +59,14 @@ PROBE_SRCS := $(ROOT)/bt_port/bt_rom_real.c $(ROOT)/bt_port/bt_ctrl_rtos.c $(ROO
 PROBE_OBJS := $(patsubst $(ROOT)/%.c,$(BUILD_DIR)/%.o,$(PROBE_SRCS))
 # Bluedroid phone mode (every other BT=1 image, plan M4): the same ROM interface and bt_ctrl glue, plus the XREC session
 # (bt_xrec_bluedroid.c provides the bt_xrec_* API; open_fw/Makefile renames the legacy ones in bt_hci.c).
-# bt_xrec_spp_mtu.c includes Bluedroid internals, so it gets the vendored-code warning set only.
+# bt_xrec_spp_mtu.c and bt_xrec_bond.c include Bluedroid internals, so it gets the vendored-code warning set only.
 XREC_SRCS := $(ROOT)/bt_port/bt_rom_real.c $(ROOT)/bt_port/bt_ctrl_rtos.c $(ROOT)/bt_port/bt_xrec_bluedroid.c \
              $(ROOT)/bt_port/bt_xrec_fw.c
 XREC_OBJS := $(patsubst $(ROOT)/%.c,$(BUILD_DIR)/%.o,$(XREC_SRCS))
 ifeq ($(HCI_PROBE),1)
 FW_PORT_SRCS += $(PROBE_SRCS)
 else
-FW_PORT_SRCS += $(XREC_SRCS) $(ROOT)/bt_port/bt_xrec_spp_mtu.c
+FW_PORT_SRCS += $(XREC_SRCS) $(ROOT)/bt_port/bt_xrec_spp_mtu.c $(ROOT)/bt_port/bt_xrec_bond.c
 $(XREC_OBJS): CFLAGS += -Wextra
 endif
 FW_PORT_OBJS := $(patsubst $(ROOT)/%.c,$(BUILD_DIR)/%.o,$(FW_PORT_SRCS))

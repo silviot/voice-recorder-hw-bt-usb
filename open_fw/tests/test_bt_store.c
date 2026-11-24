@@ -124,7 +124,20 @@ static void test_random_ops(void)
     static uint8_t img[BT_STORE_IMAGE_MAX];
     size_t n = bt_store_serialize(img, sizeof(img));
     CHECK(n > 0, "serialise");
-    CHECK(!bt_store_dirty(), "dirty after serialise");
+    /* review finding: serialise cleared the dirty flag before the caller had written anything, so a failed SD write
+     * left the card stale with nothing left to retry. Dirty stays set until the image is marked saved. */
+    CHECK(bt_store_dirty(), "dirty flag cleared by serialise alone (a failed write would never be retried)");
+    bt_store_mark_saved();
+    CHECK(!bt_store_dirty(), "still dirty after the image was marked saved");
+    /* a change between serialise and mark_saved keeps the store dirty (that change is not in the stored image) */
+    CHECK(nvs_set_blob(h, "late", "x", 1u) == ESP_OK, "late change");
+    n = bt_store_serialize(img, sizeof(img));
+    CHECK(nvs_erase_key(h, "late") == ESP_OK, "change after serialise");
+    bt_store_mark_saved();
+    CHECK(bt_store_dirty(), "a change made after serialise was marked saved");
+    n = bt_store_serialize(img, sizeof(img));
+    bt_store_mark_saved();
+    CHECK(!bt_store_dirty(), "clean after serialise + mark_saved");
     CHECK(bt_store_serialize(img, n - 1u) == 0u, "serialise into too-small buffer succeeded");
     n = bt_store_serialize(img, sizeof(img));
     CHECK(bt_store_load(img, n) == ESP_OK, "reload own image");

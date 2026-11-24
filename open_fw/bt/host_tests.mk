@@ -51,11 +51,11 @@ test-bt-ctrl:
 	$(BT_CTRL_TEST_DIR)/test_bt_ctrl
 
 # ---- test-bt-host: Bluedroid end-to-end on the FreeRTOS POSIX port (plan M3 path (b), step 5). ----
-# Real Bluedroid (patches 0001-0026) + bt_port + bt_ctrl + tests/fake_rom.c on FreeRTOS-Kernel V11.1.0's POSIX port,
+# Real Bluedroid (patches 0001-0027) + bt_port + bt_ctrl + tests/fake_rom.c on FreeRTOS-Kernel V11.1.0's POSIX port,
 # ASan/UBSan: patch 0009 fixed_queue slot restore, init/enable/GAP/disable/deinit, patch 0010 NOACK at zero command
 # credits, a 200-cycle leak loop, the phone-mode end-to-end scenario (BT=1 XREC backend + fake ROM laptop: SSP, bond
-# store, SDP, RFCOMM, XREC PAIR/CHAL/GETS with congestion, reconnect, stop with traffic outstanding, restart, policy
-# rejections; tests/bt_host/test_phone.c, on a 4096-sector exFAT image), then the allocation-failure sweeps over
+# store, SDP, RFCOMM, XREC PAIR/CHAL/GETS with congestion (session window and BTC ring), reconnect, stop with traffic
+# outstanding, stop with a detach that never completes, restart, policy rejections incl. stale Just Works bonds; tests/bt_host/test_phone.c, on a 4096-sector exFAT image), then the allocation-failure sweeps over
 # esp_bluedroid_init/enable/disable/deinit (one process per failing attempt; waivers, if any, carry exact point counts
 # in tests/bt_host/sweep_waivers.txt, anything else fails; none since patches 0011-0023). Details:
 # tests/bt_host/README.md.

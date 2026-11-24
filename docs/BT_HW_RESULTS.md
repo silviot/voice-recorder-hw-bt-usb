@@ -316,8 +316,22 @@ first thing this test checks.
 `bt_entropy_get()` fails closed, so the XREC PIN is not issued (`+XREC:PAIR` answers `+XREC:ERR,PAIRCLOSED`) and
 `+XREC:CHAL` closes the link. Everything below the XREC authentication (radio, Bluedroid over `bt_ctrl`/ROM, pairing,
 bonds, SDP, RFCOMM, `+XREC:PING`, `+XREC:ERR,LOCKED` for privileged commands, reconnect, BT exit) is testable now.
-Bluedroid's Classic paths never ask for randomness (only BLE code calls `esp_random()`), so pairing does not hit the
-`0xB0` entropy fatal.
+Bluedroid's Classic host paths never ask for randomness (only BLE code calls `esp_random()`), so pairing does not hit
+the `0xB0` entropy fatal.
+
+**Bench-only waiver: pairing keys are weak on this build** (plan live log, review round on the phone path; plan M2.1 /
+M2.3 deviation). The ROM, not Bluedroid, generates the SSP P-192 secret, from SHA-256 over the BD_ADDR, one CLKN byte
+and four bytes of the `0x00803C24` hook, which is still the legacy timer xorshift returning 0..79
+(`docs/BT_ROM_INTERFACE.md` §2.3): roughly 33 predictable bits. An observer of the pairing can recover the link key
+offline. Pair only bench devices, in a quiet place, and treat the bond and its traffic as unprotected; delete the
+bonds (`SD:/bt_bonds.bin`, the laptop's `remove`) after the session. Release blockers: a credited entropy source, DRBG
+output through the hook plus more entropy into that SHA-256 block, the SSP window closed until `bt_entropy` reports
+credit, and the local accept/reject prompt below.
+
+**The device side does not verify the numeric-comparison value** (interim, plan M4 prompt not built yet): inside the
+user-opened window the device auto-confirms; only the laptop's user compares the digits. The SSP part of the window
+(discoverability, numeric comparison) therefore closes at the **first** MITM bond; the XREC PIN stays for the rest of
+the 60 s.
 
 **Build and flash** (as the probe recipe above; `update-up` writes `dumps/firmware_2M_openfw.bin`, which QEMU gates
 overwrite, so build right before flashing):
@@ -373,17 +387,41 @@ host, with its TEST-ONLY source, it is 1 inside the window); the raw socket gets
 3. *Exit with a link up:* keep the raw socket open (`s.connect` then `input()`), press BACK on the device: the
    device must leave BT mode in about a second with no reboot (host: ~0.64 s with data outstanding, patch 0026), and
    the laptop sees the link drop.
+3b. *Exit while the peer is gone* (the LMP detach can never complete: phone out of range): with the raw socket open,
+   cut the laptop's radio without a clean disconnect (`sudo btmgmt power off`, or walk the device out of range), then
+   press BACK within a few seconds (before the supervision timeout drops the link by itself). The device must leave
+   BT mode in under a second, **no reboot, no fault record** (`dev_cycle.py status`: previous fault unchanged), and the
+   ring log shows `BT stopped`. Before patch 0027 this crashed inside `esp_bluedroid_deinit()` (host harness: assert
+   in `osi_thread_post`, step P12). Power the laptop radio back on (`btmgmt power on`) before the next step.
 4. *Pairing refused with the window closed:* from a second laptop/phone, pair while the window is closed: refused.
+   Also *one bond per window:* open the window, pair laptop A (step above), then try a second device inside the same
+   60 s: the device is no longer discoverable and refuses the numeric comparison (`BT SSP window closed after the
+   first bond`, then `... rejected: pairing window closed`).
 5. *Just Works refused:* `bluetoothctl` with `agent NoInputNoOutput`, window open, `pair`: BlueZ reports success
-   briefly, then the device removes the bond and drops the link.
+   briefly, then the device removes the bond and drops the link. Then, from that laptop, `--ping` (or the raw socket)
+   must get **no** `+XREC:PONG`: the link is dropped or the SPP open refused (`BT XREC close: peer not bonded with
+   MITM`). Repeat after BACK + re-entering BT mode: still no PONG, and `SD:/bt_bonds.bin` never contains that
+   laptop's address (the session purges the key from the store when it refuses it, and at every start drops stored
+   bonds whose key is not MITM-authenticated: `BT stored bond removed: not MITM-authenticated`).
+6. *SPP with `ESP_SPP_SEC_MITM`:* the SPP server now requires MITM (esp_spp_api.h advises against that flag "due to
+   certain limitations"; the host harness runs bonded, re-paired and Just Works peers with it). If laptop A pairs but
+   its RFCOMM connect is then refused or re-paired, suspect this flag first: capture btmon and the ring log.
+7. *RAM under traffic:* during a long `GETS` (`bt_sync.py` download of a large recording), and after BACK, read the
+   `BT mem` lines: `min` (lowest free heap since boot) must stay >= 8192, `largest` >= the largest single allocation,
+   `mallocfail` 0; record the `BT stack free words` per task (a value near 0 is a stack about to overflow).
 
 **Device log** (`g_openfw_log`; read it after BACK, with USB up: `sudo python3 tools/dev_cycle.py log >
 /tmp/bt_phone_ring.log`). Expected lines, in order: `BT start (Bluedroid):` `Cassini_1D` · `BT XREC READY (SPP
 channel 1)` · `BT XREC PIN unavailable: entropy not ready (SSP pairing window open)` · `BT SSP numeric comparison
-accepted (pairing window), value NNNNNN` · `BT SSP bonded (numeric comparison, MITM)` · `BT XREC SPP open, mtu N` ·
-`BT XREC SPP closed` · `BT stopped` · `BT bt_recover stack free words N`. Refusals: `BT SSP numeric comparison
-rejected: pairing window closed`, `BT SSP bond removed: Just Works / unauthenticated key`, `BT XREC CHAL refused:
-entropy not ready`. Faults: `BT bring-up failed, code N` (1 `bt_ctrl_open`, 2 HCI driver attach, 3
+accepted (pairing window), value NNNNNN` · `BT SSP bonded (numeric comparison, MITM)` · `BT SSP window closed after
+the first bond` · `BT XREC SPP open, mtu N` · `BT mem run heap free F min M largest L mallocfail N` and `BT stack free
+words BTU_TASK=w BTC_TASK=w hciT=w bt_ctrl=w bt_dlv=w bt_recover=w app=w` (every 30 s while BT runs) · `BT XREC SPP
+closed` · the same two lines as `BT mem stop ...` · `BT stopped` (`-` = that task did not run this session; the old
+`BT bt_recover stack free words N` line is now part of `BT stack free words`). Refusals: `BT SSP numeric comparison
+rejected: pairing window closed`, `BT SSP bond removed: Just Works / unauthenticated key`, `BT stored bond removed: not
+MITM-authenticated`, `BT XREC close: peer not bonded with MITM`, `BT XREC CHAL refused: entropy not ready` followed by
+`BT XREC close: entropy not ready`, `BT bonds not saved (SD write failed, retrying)` (retried every second, up to 8
+times per session, and at BT stop). Faults: `BT bring-up failed, code N` (1 `bt_ctrl_open`, 2 HCI driver attach, 3
 `esp_bluedroid_init`, 4 `esp_bluedroid_enable`: the HCI Reset .. init chain through the ROM), `BT fault, reason N` /
 `BT shutdown: hard path, reason N` (`BT_XREC_FAULT_*` in `bt_xrec_bluedroid.h`: 2 bring-up timeout, 4 SPP config
 timeout, 6 platform, 7 teardown deadline), `BT platform fault N` (1 `bt_ctrl_run()` stuck > 3 s, 2 `bt_ctrl` fault,

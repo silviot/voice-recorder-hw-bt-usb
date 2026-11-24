@@ -27,8 +27,9 @@ SANFLAGS  := $(SAN_$(SAN))
 OPT       := -O1 -g -ffunction-sections -fdata-sections
 
 include $(ROOT)/bt/bluedroid_srcs.mk
-# bt_xrec_spp_mtu.c (phone mode) includes Bluedroid internals: built like vendored code, as in bt/Makefile.bluedroid.
-BD_SRCS   := $(addprefix $(ROOT)/,$(BLUEDROID_SRCS)) $(ROOT)/bt_port/bt_xrec_spp_mtu.c
+# bt_xrec_spp_mtu.c / bt_xrec_bond.c (phone mode) include Bluedroid internals: built like vendored code, as in bt/Makefile.bluedroid.
+BD_SRCS   := $(addprefix $(ROOT)/,$(BLUEDROID_SRCS)) $(ROOT)/bt_port/bt_xrec_spp_mtu.c \
+             $(ROOT)/bt_port/bt_xrec_bond.c
 PORT_SRCS := $(addprefix $(ROOT)/bt_port/,bt_alarm.c bt_esp_timer.c bt_entropy.c bt_drbg.c bt_store.c bt_ctrl.c \
              bt_ctrl_cmds.c bt_ctrl_evt.c bt_xrec_bluedroid.c)
 HOST_SRCS := $(HT)/host_heap.c $(HT)/host_glue.c $(HT)/host_ctrl.c $(HT)/test_bt_host.c $(HT)/host_link_stubs.c \
@@ -85,6 +86,8 @@ $(call obj,$(PPORT_SRCS)): CFLAGS_KERN += -D_GNU_SOURCE -Wno-macro-redefined -Wn
 $(OUT)/third_party/bluedroid/host/bluedroid/btc/profile/std/spp/btc_spp.o: CFLAGS_BD += -Wno-incompatible-pointer-types
 # fake_rom's own bookkeeping allocations are not part of the system under test (real_alloc.h).
 $(OUT)/tests/fake_rom.o: CFLAGS_HOST += -include $(HT)/real_alloc.h
+# Test hooks of the XREC session (bt_xrec_test_set_inflight_max: phone scenario step P5b).
+$(OUT)/bt_port/bt_xrec_bluedroid.o: CFLAGS_PORT += -DBT_XREC_TEST_HOOKS=1
 # bt_osal_time_t is uint32_t while the POSIX port's TickType_t is 64-bit: portMAX_DELAY truncates to 0xFFFFFFFF (an
 # "infinite" osal wait becomes 49.7 days). Host-only difference (the firmware tick is 32-bit); bt_osal is not on the
 # Classic data path.

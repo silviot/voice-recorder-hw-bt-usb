@@ -89,6 +89,40 @@ The ROM also uses `0x00803C28` as a **base pointer for LM fields far beyond `hci
 ROM `0x41778`, `0x420F4`, `0x3F414`); open_fw's `hci_tl_env` struct only covers `0x803C28..0x803D0B`.
 `bt_ctrl` must not reuse anything in `0x00800000..0x00804BFF` (FA:609).
 
+### 2.3 ROM RNG trace: what seeds SSP P-192 (plan M2.1; static, 2026-11-24, not yet confirmed on silicon)
+
+Disassembly recipe: `docs/BT_ROM_HCI_MAP.md` §8 (`rom.dis`, base 0). The `0x00803C24` hook (`bt_rand80`,
+`bt_rom_real.c rr_rand80`, legacy F:293-309: timer xorshift, returns `0..79`) is reached only through the thunk
+`0x3DE98` (`ldr r3,=0x00803C1C; ldr r3,[r3,#8]; bx r3`). Its 11 call sites:
+
+| Call site(s) | Function | Use of the result |
+|---|---|---|
+| `0x31D72/7C/84/8C` | `0x31D6C` (called by `rom_lm_sec_p192_init` `0x31DE4`, and by `0x31E54`) | **one byte each** (`strb`) into the 28-byte block at `0x0080340C` (offsets `+0x0C/+0x10/+0x14/+0x18`) |
+| `0x31EE4` | `0x31EE2` | `rand % 1000000` (literal `0x000F4240`): the SSP **passkey** (passkey display; open_fw rejects passkey pairing, M4) |
+| `0x312FA`, `0x313FC`, `0x3577C`, `0x39C2C`, `0x42F74`, `0x4414E` | not traced yet | `udiv`/`mls` (modulo) or compares: backoff / slot choices, judging by their shape |
+
+`0x31D6C` builds the P-192 secret: after the four hook bytes it samples CLKN (`0x4002001C` = 1, poll for 0, low byte
+of `0x40020020` stored at `0x00803414`, i.e. block offset `+0x08`), copies 6 bytes of the device's own identity from
+`0x00802C14` (`0x3BA68`: the BD_ADDR) to block offset `+0x00`, runs **SHA-256** over the 28-byte block (`0x40ABA`:
+`0x80` padding, bit length at `+0xBE/+0xBF`, 8-word IV) and keeps the **first 16 bytes** as the 128-bit secret that
+`rom_lm_sec_p192_init` hands to `0x31A00` (the P-192 key set-up). The block's other bytes are never written there
+(zero, or whatever the other users of the `0x00803348` SSP control block left: `0x0080340C` has 6 literal references,
+`0x31B58 .. 0x3253C`).
+
+**Consequence.** The ROM's P-192 secret has at most `4 x log2(range of the hook) + 8` bits of entropy, the rest being
+public (BD_ADDR) or constant: with the legacy hook (0..79, timer-derived) about 25 + 8 bits, all of them predictable
+from the boot time and CLKN; with DRBG bytes through the hook (0..255) at most 32 + 8 = 40 bits. The device's public
+key goes over the air in every SSP exchange, so an observer can search that space offline (one P-192 point
+multiplication per candidate), recover the secret, derive the DHKey and with it the link key: **a passive attack on
+the pairing**, and on all later traffic of that bond. Feeding the DRBG through `0x00803C24` (plan M2.1 "covered
+hooks") is necessary but cannot reach 128 bits by itself. Candidates, each needing a trace of the other `0x0080340C`
+users and a silicon check: fill the block's unwritten bytes (`+0x06/07, +0x09..0B, +0x0D..0F, +0x11..13, +0x15..17,
++0x19..1B`, 17 bytes) from a pre-filled DRBG pool inside the hook (it runs in ROM context, possibly with the ROM lock
+held: no FreeRTOS call, no blocking); or replace the 16-byte secret after `0x31D6C` returns if a hookable point exists
+between it and `0x31A00`. Not traced yet: where the SSP **nonces** (Na/Nb, 128 bits each) come from; if they share
+this source, the numeric comparison's protection weakens too. Open_fw's position until then: bench-only waiver
+(plan live log, "review round on the phone path"; `docs/BT_HW_RESULTS.md` phone-mode recipe).
+
 ## 3. Host → controller: HCI commands
 
 ### 3.1 Message layout (`struct ke_msg`, F:50–60; confirmed by ROM `ke_msg_alloc` body `0x30A00`)

@@ -175,7 +175,16 @@ Process
   comparison raises `ESP_BT_GAP_CFM_REQ_EVT`. A policy that forbids Just Works must act at `ESP_BT_GAP_AUTH_CMPL_EVT`
   (`lk_type` 0x04/0x07 = unauthenticated) by removing the bond (`esp_bt_gap_remove_bond_device()` also drops the ACL).
 - **`AUTH_CMPL` success is raised only for new link keys** (`bta_dm_new_link_key_cback`), not for reconnections with a
-  stored key, so "authorized" for a reconnect = bonded (every kept bond passed the check above).
+  stored key. "Authorized" for a reconnect must therefore check the STORED key type (`LinkKeyType` 5 or 8 in the BTC
+  config, `bt_port/bt_xrec_bond.c`), not bond existence: Bluedroid stores (and flushes) a Just Works key before the app
+  sees `AUTH_CMPL`, and `esp_bt_gap_remove_bond_device()` on a connected peer only marks it `BTA_DM_UNPAIRING`; the
+  store entry goes when BTA DM sees the ACL drop, which a BT stop (disable drops DM's ACL events, see 0026) or a power
+  loss pre-empts. Purge the config entry yourself (`btc_storage_remove_bonded_device()` under btc_config's mutex is
+  safe from the app task) and drop unauthenticated bonds at start.
+- **`ESP_SPP_SEC_MITM` does not enforce MITM.** BTM asks for a key upgrade only when an authenticated key is possible
+  (`btm_sec_is_upgrade_possible`: needs the peer's IO caps, unknown on a reconnect with a stored key, and a capable
+  IO pair); otherwise it accepts the unauthenticated key and opens the service. esp_spp_api.h also advises against
+  the flag. The app-level key-type check is the enforcement.
 - Internal Bluedroid headers define `bt_status_t`, which clashes with open_fw's (`include/openfw.h`): keep files that
   need Bluedroid internals separate from files that include `openfw.h`.
 
@@ -206,3 +215,13 @@ found what the mocked `test-bt-xrec` could not:
   SDP, AVDT, HF AG) point at static control blocks in this configuration (`*_DYNAMIC_MEMORY` off).
 - BTC callback arguments are 4-aligned (copied right after the 4-byte `btc_msg_t`): fine on Cortex-M4, an UBSan
   alignment report on x86-64; the app's two BTC callbacks carry `no_sanitize("alignment")` (`bt_xrec_bluedroid.c`).
+- **A disable never waits for the link to go down, so deinit can meet a live link** (review round, patch 0027): with
+  the peer out of range the LMP detach only completes at the supervision timeout (up to 20 s), long after 0026's
+  600 ms. `btu_free_core()` then releases the still-connected L2CAP link control block on the BTC task after
+  `btu_thread` was freed; every BTA/BTM callback it triggers must tolerate a missing BTU thread. The fake ROM's
+  `fake_peer.defer_detach` models it; a fake that completes `0406` at once (as before) cannot catch it.
+- **btc_spp's congestion only shows if the app writes more than `tx_buffer_size` ahead of `ESP_SPP_WRITE_EVT`.** An
+  in-flight cap equal to the ring size keeps BTC's ring from ever refusing a write (`ESP_ERR_NO_MEM` / `CONG_EVT`
+  never happen in a test), except that `items_waiting` also counts a partially accepted, still checked-out chunk
+  (`write_held`), so on air partial acceptance can still reach it. `test_bt_host phone` P5b raises the cap with a
+  test hook to run that path against the real ring.

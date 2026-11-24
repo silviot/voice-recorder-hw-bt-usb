@@ -471,7 +471,8 @@ telemetry: heap/stack watermarks, largest free block, IRQ-26 latency and multipl
   PAIRCLOSED and CHAL closes the link (fail closed) until Exp 2's source is wired. (6) Without eFuse the BD_ADDR is a
   fixed fallback (probe scheme), never timer-derived; NOR-UID derivation pending. (7) `main.c` still calls
   `bt_rf_init_calibrated()` before `bt_xrec_start()`, so RF is calibrated twice per BT-mode entry (bt_rom_real
-  calibrates again at HCI Reset).
+  calibrates again at HCI Reset). (8) SSP pairing without credited entropy on a ROM-generated P-192 secret of ~33
+predictable bits: bench-only waiver, see the review-round entry below.
 - 2026-11-24 (integration: bt_ctrl phone path + 0011-0023 + XREC backend, step 6 host gate): **phone mode end to end
   on the host**: `make test-bt-host` now also runs `test_bt_host phone` (`tests/bt_host/test_phone.c`, 228 checks):
   the real BT=1 XREC backend (`bt_xrec_bluedroid.c` + `xrec_proto.c` + `exfat.c` on a RAM exFAT card, platform
@@ -496,6 +497,41 @@ telemetry: heap/stack watermarks, largest free block, IRQ-26 latency and multipl
   OpenFW sends nothing after RFCOMM open, the stock HFP unit sends `AT+BRSF` at once), unit-tested in
   `tools/test_tools.py`. Silicon recipe: `docs/BT_HW_RESULTS.md` "Phone mode (BT=1) on silicon". Still interim:
   deviations (1)-(7) above; on silicon XREC PAIR/CHAL fail closed until an entropy source is registered.
+- 2026-11-24 (review round on the phone path: 11 findings, 3 blocking; all fixed or waived, each fix with a test
+  that fails without it): (1) **BT stop crashed when a link's detach never completed** (phone out of range: patch
+  0026 reports DISABLE after 600 ms either way, then `btu_free_core -> l2c_free -> l2cu_release_lcb ->
+  btm_acl_removed -> bta_sys_sendmsg` posted to the freed BTU thread: assert / NULL dereference). Patch 0027:
+  `btu_task_post()` fails once `btu_thread` is gone (every caller already frees on a failed post). Test: fake ROM
+  `defer_detach`, phone step P12. (2) **Just Works keys could reach `SD:/bt_bonds.bin` and authorize XREC later**:
+  `link_authorized()` trusted any bond. Now it needs a stored authenticated key type (`bt_xrec_bond.c`, under
+  btc_config's mutex), a refused bond is purged from the BTC config synchronously (not only by BTA DM after link
+  down), and unauthenticated bonds are dropped at every start before the device is connectable. The SPP server also
+  sets `ESP_SPP_SEC_MITM`, but that alone does NOT refuse an unauthenticated key BTM cannot upgrade (NoIO peer, or
+  unknown IO caps on a reconnect): the harness opened SPP for a stale Just Works bond with the flag alone. Steps
+  P13-P15. (3) `bt_store_serialize()` cleared dirty before the write: a failed SD write was never retried; now
+  `bt_store_mark_saved()` after success, bounded retry (1 s, 8 per session) and at stop (P15 with a failing card).
+  (4) `bt_ctrl`: a command with the opcode of a deadline-answered one is held in the TX ring until the late reply was
+  consumed, its LC link went, or 7 s more passed (its own deadline counted from when it was held, inside the host's 8 s
+  timeout); before, the late reply was delivered as the new command's (`test_bt_ctrl fwd_late_same_opcode`).
+  (5) CHAL without entropy armed a challenge over a zero nonce and an AUTH with HMAC(key, 0^16) in the same SPP write
+  was accepted: RX now goes to xrec_proto line by line and the challenge is disarmed and the link closed at once.
+  (6) The SSP part of the pairing window (discoverable, numeric comparison) closes at the first MITM bond: the device
+  side does not verify the value (deviation (1)), and XREC PAIR, which used to close the window, fails without
+  entropy. (7) The session block is wiped whole before it is freed (a PAIR line with the XREC key stayed in the RX
+  ring). (8) The phone scenario's "congestion" never reached BTC's ring: step P5b raises the session window above
+  `tx_buffer_size` (test hook) so `ESP_ERR_NO_MEM` and the `ESP_SPP_CONG_EVT(false)` resume run against the real
+  `btc_spp`. (9) RAM telemetry on silicon: `BT mem` (free, min ever, largest block, malloc failures) and `BT stack
+  free words` per BT task every 30 s and at stop; the host asserts a scenario heap peak against a host regression
+  ceiling (x86-64 sizes are not the target's, so the plan §4 budget is checked from the silicon lines).
+  (10) **ROM RNG trace done for the P-192 path** (`docs/BT_ROM_INTERFACE.md` §2.3): the ROM derives the SSP secret
+  from SHA-256(BD_ADDR, one CLKN byte, four bytes of the `0x00803C24` hook) — about 33 predictable bits with the
+  legacy timer hook, at most 40 even with DRBG bytes. **Waiver (bench only), deviation (8):** SSP pairing stays
+  available without credited entropy, against M2.1 ("covered hooks get DRBG output") and M2.3 ("new pairing
+  unavailable while not credited"), so that the silicon recipe can run; residual risk: a passive observer of the
+  pairing can recover the link key. Release blockers: credited source; DRBG through the hook and into the unwritten
+  bytes of the hashed block (or replace the secret at a hookable point; trace the other users of `0x0080340C` first);
+  the SSP nonce source traced; the SSP window closed until `bt_entropy` reports credit; the local accept/reject prompt
+  with its 30 s timeout (deviation (1)).
 
 ## 11. Round-1 traceability
 

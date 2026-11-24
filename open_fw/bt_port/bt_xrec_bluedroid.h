@@ -74,7 +74,7 @@ int bt_shutdown(void);
 /* Observability for tests and logs. */
 typedef struct {
     uint8_t  state, window_open, scan_disc, scan_applied, conn_open, conn_authorized, conn_closing, cong;
-    uint8_t  spp_inited, ssp_showing, entropy_fail, reboot_mode;
+    uint8_t  spp_inited, ssp_showing, entropy_fail, reboot_mode, ssp_window;
     uint32_t conn_handle, tx_used, rx_used, inflight, evq_used, acl_links;
     uint16_t mtu;
     uint32_t last_fault;
@@ -82,6 +82,7 @@ typedef struct {
     uint32_t rx_frames, rx_bytes, rx_dropped, rx_overflows, tx_writes, tx_bytes, tx_nomem, tx_errors, tx_busy;
     uint32_t write_evts, write_evt_bytes, cong_evts, evq_lost, stale_events;
     uint32_t ssp_accepted, ssp_rejected, pin_rejected, passkey_rejected, bonds_removed, conns_rejected;
+    uint32_t conns_authorized;   /* SPP connections marked authorized for XREC */
 } bt_xrec_debug_t;
 void bt_xrec_get_debug(bt_xrec_debug_t *out);
 
@@ -98,6 +99,11 @@ void     bt_xrec_plat_log(const char *msg);  /* one line, no secrets */
 void     bt_xrec_plat_log_u32(const char *msg, uint32_t v);
 /* BTC context: negotiated RFCOMM MTU of an open SPP connection (0 = unknown). */
 uint16_t bt_xrec_plat_spp_peer_mtu(uint32_t handle);
+/* App task, stack enabled (bt_xrec_bond.c, under btc_config's mutex): 1 if the stored bond of bda holds an
+ * authenticated combination key (P-192 0x05 / P-256 0x08); purge drops bda's bond from the BTC config at once (the
+ * next bond-file write cannot carry it), independent of BTA DM's deferred unpair. */
+int      bt_xrec_plat_bond_mitm(const uint8_t bda[6]);
+void     bt_xrec_plat_bond_purge(const uint8_t bda[6]);
 
 /* App task. */
 void    *bt_xrec_plat_alloc(size_t n);       /* NULL on failure (fail soft) */

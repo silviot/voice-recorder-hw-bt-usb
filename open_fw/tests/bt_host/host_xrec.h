@@ -31,6 +31,8 @@ void bthx_snap(bthx_snap_t *out);
 uint32_t bthx_hard_path_reason(void);    /* bt_xrec_plat_hard_path() calls (reason of the first; 0 = never) */
 uint32_t bthx_deadline_fired(void);
 uint32_t bthx_bond_writes(void);         /* /bt_bonds.bin replaced */
+void bthx_fail_bond_writes(int on);       /* every /bt_bonds.bin write fails while on (full / removed card) */
+uint32_t bthx_bond_write_fails(void);
 uint32_t bthx_key_writes(void);          /* /cassini.key replaced */
 uint32_t bthx_reboot_mode(void);
 uint32_t bthx_ssp_value_logged(void);    /* value of the last "numeric comparison accepted" log line */

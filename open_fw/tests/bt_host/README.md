@@ -45,7 +45,7 @@ make -C open_fw test-bt-host-tsan   # ThreadSanitizer variant (scenarios, 50 cyc
 P. **Phone mode end to end** (`test_bt_host phone IMG`, its own process; IMG = a 4096-sector exFAT image, created by
    the make target): the real BT=1 XREC backend (`bt_port/bt_xrec_bluedroid.c`, `src/xrec_proto.c`, `src/exfat.c` on
    a RAM copy of IMG with `/record/REC0001.WAV` 40000 B and `/record/BIG0002.WAV` 300000 B) over this stack and the
-   fake ROM's scripted peer (`fake_peer_*`), driven as a laptop. 228 checks, ~5 s:
+   fake ROM's scripted peer (`fake_peer_*`), driven as a laptop. 383 checks, ~8 s:
    - warm-up start/stop (no peer): only btc_spp's 2 resident objects stay; the baseline is taken after it;
    - P1 `bt_xrec_start` -> READY (connectable only), pairing window -> discoverable (`0C1A 0x03` at the ROM), PIN;
    - P2 laptop A (DisplayYesNo) pages and authenticates: Bluedroid's set-up reads, link key request -> negative
@@ -57,6 +57,10 @@ P. **Phone mode end to end** (`test_bt_host phone IMG`, its own process; IMG = a
    - P5 PING (`bound=0,auth=0,pair=1`), PAIR with the PIN (window and discoverability close, `0C1A 0x02`,
      `/cassini.key` written), LS, GETS 40000 B in 63 frames, byte-exact, with a 300 ms stall after frame 12 (no
      RFCOMM credits, no baseband acks): the session's in-flight cap (2048 B) holds, nothing lost or duplicated;
+   - P5b the same GETS with the session's in-flight window at 2 x `tx_buffer_size` (`bt_xrec_test_set_inflight_max`,
+     host-only hook): BTC's own ring fills, `esp_spp_write()` returns `ESP_ERR_NO_MEM` (session congested) and the
+     real `btc_spp` low-watermark `ESP_SPP_CONG_EVT(false)` resumes it; byte-exact. Without it the congestion path ran
+     only against the mocked BTC of `test-bt-xrec` (review finding);
    - P6 link loss (reason 0x08): SPP closed, XREC authorization cleared;
    - P7 reconnect, window closed: stored key (`040B` carries the peer's key), no pairing; RFCOMM straight to channel 1;
      PING (`bound=1`), CHAL/AUTH (HMAC with the bound key), GETS;
@@ -67,8 +71,20 @@ P. **Phone mode end to end** (`test_bt_host phone IMG`, its own process; IMG = a
    - P10 laptop B pairs with the window closed: numeric comparison rejected (`042D`), no bond;
    - P11 window open, laptop C (NoInputNoOutput): Bluedroid auto-confirms Just Works, the session removes the
      unauthenticated bond at `AUTH_CMPL` and the link drops; C never reaches XREC;
-   - P12 stop: baseline; `/bt_bonds.bin` holds A only. Every stop also checks: no fake-ROM contract error, unknown
-     opcode, ROM id without a packer, forwarded-command deadline, BT fault, HCI command timeout, XREC hard path.
+   - P12 A reconnects, then its LMP detach never completes (`fake_peer.defer_detach`: phone out of range); stop:
+     graceful in ~0.64 s although `esp_bluedroid_deinit()` finds the L2CAP link still allocated (crashed in
+     `osi_thread_post` before patch 0027); the fake ROM's `stop()` kills the peer's link (`fake_peer.stop_kills`);
+   - P13 window open, C pairs Just Works with its detach deferred, BT stops right after the rejection: C's key is not
+     in `/bt_bonds.bin` (the session purges it from the BTC config synchronously; BTA DM's own removal needs the link
+     down, which never came);
+   - P14 restart, C reconnects with that key: never authorized (no PONG, `conns_authorized` unchanged);
+   - P15 a stale Just Works bond of C planted in `/bt_bonds.bin` (`plant_bond`), the card failing every write
+     (`bthx_fail_bond_writes`) while the session removes it at start; once the card recovers the bounded retry
+     rewrites the file without C (`bt_store` stays dirty until `bt_store_mark_saved()`); C never authorized;
+   - P16 stop: baseline; `/bt_bonds.bin` holds A only; the scenario's heap peak (`bth_heap_peak_reset()` after the
+     warm-up) under a host regression ceiling (x86-64 sizes; the target budget is read from the firmware's `BT mem`
+     lines). Every stop also checks: no fake-ROM contract error, unknown opcode, ROM id without a packer,
+     forwarded-command deadline, BT fault, HCI command timeout, XREC hard path.
    Debug aids: `BTH_PHONE_DUMP=1` (bond file text, down-job step times on a failed stop), `BTH_HEAP_TRACE=1` (call
    stacks of leaked blocks: `bth_heap_dump_since()`, symbolise with `addr2line -f -e test_bt_host`).
 

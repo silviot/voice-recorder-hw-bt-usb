@@ -23,6 +23,7 @@ typedef struct {
 } bth_heap_stats_t;
 
 void bth_heap_stats(bth_heap_stats_t *out);
+void bth_heap_peak_reset(void);   /* peak_bytes = live_bytes (scenario-local peaks) */
 /* Fail the n-th allocation attempt (1-based) from now on; n = 0 disarms. persistent: fail every attempt >= n. */
 void bth_heap_fail_arm(uint64_t n, bool persistent);
 void bth_heap_fail_disarm(void);

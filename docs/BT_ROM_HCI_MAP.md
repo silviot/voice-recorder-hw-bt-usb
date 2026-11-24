@@ -164,6 +164,13 @@ Status of these items in `bt_ctrl` (2026-11-24): 1 → dead-handle rule and forw
 (`BT_CTRL_OPCODE_TABLE.md` §2 rules 8–9); 2 → the deadline is 7 s, so a command SAVED for longer (an RNR behind a
 long inquiry) is answered `0x22`, which Bluedroid would otherwise turn into an 8 s command timeout and a BT fault;
 3 → `0402`/`0C37` stay gated; 5 → `0434` is FWD; 6 → `040F` stays gated; 8 → still open (inquiry mode 0 only).
+Follow-up to 2 (review finding, same day): replies are matched on the opcode alone, so after a `0x22` deadline reply
+a NEW command with the same opcode must not reach the ROM while the old one's late reply can still come (the late
+reply would be delivered as the new command's, and the new command's own reply swallowed as "late": the realistic case
+is a SAVED `0419` RNR behind another LM state). `bt_ctrl` keeps such a command in its TX ring until the late reply
+was consumed, the late command's LC link disconnected (the ROM drops a saved message with its LC instance), or another
+7 s passed; the held command's own deadline counts from when it was first held, so it stays inside Bluedroid's 8 s
+command timeout (`bt_ctrl.c fwd_late_hold`, `test_bt_ctrl fwd_late_same_opcode`).
 
 ## 7. What remains uncertain and how stage B/C confirms it
 

@@ -1,6 +1,6 @@
 /* Phone-mode end-to-end scenario for make test-bt-host (test_bt_host phone <exfat.img>): the real BT=1 XREC backend
  * (bt_port/bt_xrec_bluedroid.c + src/xrec_proto.c + src/exfat.c, platform tests/bt_host/host_xrec.c) on the real
- * Bluedroid (patches 0001-0023) + bt_port + bt_ctrl, against tests/fake_rom.c's scripted remote peer, which this file
+ * Bluedroid (patches 0001-0027) + bt_port + bt_ctrl, against tests/fake_rom.c's scripted remote peer, which this file
  * extends with a laptop's host stack: L2CAP signalling, an SDP client, an RFCOMM client (TS 07.10 basic mode with
  * credit-based flow control) and the +XREC client side of tools/bt_sync.py.
  *
@@ -12,7 +12,9 @@
  *   4. RFCOMM: mux SABM, PN (CFC), DLC SABM, MSC -> ESP_SPP_SRV_OPEN, link authorized for XREC.
  *   5. XREC: bt_sync.py's native-SPP start (no HFP AT lines from the device), PING, PAIR with the window's PIN
  *      (window and discoverability close), LS, a multi-frame GETS of a 40000-byte file with congestion (the peer
- *      withholds RFCOMM credits and baseband acks mid-transfer), byte-exact.
+ *      withholds RFCOMM credits and baseband acks mid-transfer), byte-exact. 5b: the same GETS with the session's
+ *      in-flight window raised above BTC's ring (test hook), so esp_spp_write() returns ESP_ERR_NO_MEM against the real
+ *      btc_spp and ESP_SPP_CONG_EVT(false) resumes it (otherwise only the session's own window is ever hit).
  *   6. A drops the link (supervision timeout): SPP closed, XREC authorization cleared.
  *   7. A reconnects with the stored key, window closed: no new pairing; RFCOMM straight to channel 1; CHAL/AUTH; GETS.
  *   8. bt_xrec_stop with a 300000-byte GETS outstanding and the peer stalled: graceful teardown inside the 2 s
@@ -21,7 +23,14 @@
  *  10. Laptop B tries to pair with the window closed: numeric comparison rejected, no bond.
  *  11. Window open, laptop C (NoInputNoOutput): Just Works pairing completes in Bluedroid, the session removes the
  *      unauthenticated bond and drops the link; C never reaches XREC.
- *  12. bt_xrec_stop: baseline restored, no fake-ROM contract error, no unknown opcode, no BT fault, no HCI timeout.
+ *  12. A reconnects, then walks out of range: its LMP detach never completes (fake_peer.defer_detach); bt_xrec_stop
+ *      ends gracefully although Bluedroid's deinit finds the link still allocated (patch 0027).
+ *  13. C pairs Just Works again and BT stops while its link is still up: C's key never reaches /bt_bonds.bin.
+ *  14. Restart; C reconnects with that key: never authorized for XREC.
+ *  15. A stale Just Works bond of C planted in /bt_bonds.bin, the card refusing writes meanwhile: removed at start
+ *      (and the removal written once the card recovers), C never authorized.
+ *  16. bt_xrec_stop: baseline restored, no fake-ROM contract error, no unknown opcode, no BT fault, no HCI timeout;
+ *      the scenario's heap peak against a host regression ceiling.
  * SPDX-License-Identifier: MIT */
 #include <stdbool.h>
 #include <stdio.h>
@@ -39,6 +48,13 @@
 #include "host_xrec.h"
 
 int bth_phone_scenario(const char *img_path);
+void bt_xrec_test_set_inflight_max(uint32_t n);   /* bt_xrec_bluedroid.c test hook (0 = default) */
+
+/* Host regression ceiling for the scenario's heap peak above the post-warm-up baseline: measured 189,170 B on x86-64
+ * (2026-11-24) + ~18 %. NOT the target budget (plan §4: >= 8 KiB free of the BT=1 image's 118,264 B heap): on the host,
+ * pointers, list nodes, alignment and every task stack (StackType_t is 8 bytes) are wider, so the target figure comes
+ * from the firmware's "BT mem" log lines (bt_xrec_fw.c, BT_HW_RESULTS recipe), not from here. */
+#define PHONE_HEAP_CEILING (224u * 1024u)
 
 static int p_fail, p_checks;
 #define PCHECK(cond, ...)                                                                                             \
@@ -752,17 +768,28 @@ static uint32_t peer_poll(void)
 }
 
 /* ---- connection helpers ---- */
-static bool rfc_connect(uint8_t scn)
+/* must = false: an attempt the device may refuse (policy steps); failures are returned, not CHECKed. */
+#define RCHECK(cond, ...)                                                                                             \
+    do {                                                                                                              \
+        if (must) {                                                                                                   \
+            PCHECK(cond, __VA_ARGS__);                                                                                \
+        }                                                                                                             \
+    } while (0)
+
+static bool rfc_connect_ex(uint8_t scn, bool must)
 {
     l2_connect(&P.rfc, 0x0003u, LCID_RFC);
     if (!WAIT(l2_open(&P.rfc) || P.rfc.closed, 5000)) {
-        PCHECK(0, "L2CAP RFCOMM channel not configured (pending %u)", P.rfc.pending);
+        RCHECK(0, "L2CAP RFCOMM channel not configured (pending %u)", P.rfc.pending);
         return false;
     }
-    PCHECK(!P.rfc.closed, "L2CAP RFCOMM refused (%u)", P.rfc.refused);
+    RCHECK(!P.rfc.closed, "L2CAP RFCOMM refused (%u)", P.rfc.refused);
+    if (P.rfc.closed) {
+        return false;
+    }
     rfc_frame(0u, 0x3Fu, true, NULL, 0u, -1);                 /* SABM(P) on DLCI 0 */
     if (!WAIT(P.mux_up || P.mux_dm, 3000) || !P.mux_up) {
-        PCHECK(0, "RFCOMM multiplexer not up");
+        RCHECK(0, "RFCOMM multiplexer not up");
         return false;
     }
     P.dlci = (uint8_t)(scn << 1);                              /* initiator: D = 0 */
@@ -770,22 +797,24 @@ static bool rfc_connect(uint8_t scn)
     P.rx_credits = 7;
     mux_send(0x20u, true, pn, 8u);
     if (!WAIT(P.pn_rsp, 3000)) {
-        PCHECK(0, "no PN response");
+        RCHECK(0, "no PN response");
         return false;
     }
-    PCHECK(P.cfc, "device did not accept credit-based flow control");
+    RCHECK(P.cfc, "device did not accept credit-based flow control");
     rfc_frame(P.dlci, 0x3Fu, true, NULL, 0u, -1);             /* SABM(P) on the server channel */
     if (!WAIT(P.dlc_up || P.dlc_dm, 5000) || !P.dlc_up) {
-        PCHECK(0, "DLC %u not opened (DM %u)", P.dlci, P.dlc_dm);
+        RCHECK(0, "DLC %u not opened (DM %u)", P.dlci, P.dlc_dm);
         return false;
     }
     uint8_t msc[2] = { (uint8_t)((P.dlci << 2) | 0x03u), 0x8Du };   /* RTC, RTR, DV */
     mux_send(0x38u, true, msc, 2u);
-    PCHECK(WAIT(P.msc_cmd_rx && P.msc_rsp_rx, 3000), "MSC exchange incomplete (cmd %u rsp %u)", P.msc_cmd_rx,
-           P.msc_rsp_rx);
+    bool msc_ok = WAIT(P.msc_cmd_rx && P.msc_rsp_rx, 3000);
+    RCHECK(msc_ok, "MSC exchange incomplete (cmd %u rsp %u)", P.msc_cmd_rx, P.msc_rsp_rx);
     rfc_grant();
-    return true;
+    return msc_ok || must;
 }
+
+static bool rfc_connect(uint8_t scn) { return rfc_connect_ex(scn, true); }
 
 static bool x_send(const char *s)
 {
@@ -1217,6 +1246,73 @@ static bool step_rfcomm_open(void)
     return open;
 }
 
+/* A peer that must never reach XREC (policy steps): it pages and authenticates; whatever the stack then does with it
+ * (re-pairing, the session's bond removal, an SPP refusal), an XREC PING never gets an answer and the session never
+ * marks an SPP connection authorized. The link is down afterwards. */
+static void expect_never_authorized(const char *who)
+{
+    uint32_t auth0 = S().d.conns_authorized;
+    peer_authenticate();
+    (void)WAIT(!fake_peer.connected || fake_peer.encrypted, 3000);
+    vTaskDelay(pdMS_TO_TICKS(200));
+    peer_poll();
+    bool pong = false, spp = false;
+    if (fake_peer.connected && rfc_connect_ex(BT_XREC_SPP_SCN, false) && P.dlc_up && P.tx_credits > 0) {
+        spp = true;
+        P.tx_credits--;
+        rfc_frame(P.dlci, 0xEFu, true, (const uint8_t *)"+XREC:PING\r", 11u, -1);
+        char line[160];
+        pong = x_line(line, sizeof(line), 500u) && strncmp(line, "+XREC:PONG", 10) == 0;
+    }
+    bthx_snap_t s = S();
+    PCHECK(!pong && s.d.conns_authorized == auth0, "%s reached XREC (PONG %d, authorized connections %u -> %u)", who,
+           pong, auth0, s.d.conns_authorized);
+    bth_log("    %s: encrypted %u, pairings %u, SPP dlc %d; session bonds_removed %u conns_rejected %u\n", who,
+            fake_peer.encrypted, fake_peer.pairings, spp, s.d.bonds_removed, s.d.conns_rejected);
+    if (fake_peer.connected) {
+        peer_drop(0x13u);
+    }
+    PCHECK(WAIT(!fake_peer.connected && S().d.acl_links == 0u && !S().d.conn_open, 3000), "%s link not down", who);
+}
+
+/* Write a bond for bda (Bluedroid's "xx:xx:xx:xx:xx:xx") with the given link key type into /bt_bonds.bin, next to
+ * what the file holds (session OFF): the state a power loss, a failed SD write or a lost AUTH_CMPL leaves behind. */
+static bool plant_bond(const char *bdstr, int key_type, const uint8_t wire_key[16])
+{
+    int n = bthx_read_root_file("bt_bonds.bin", s_img, sizeof(s_img));
+    if (n <= 0 || bt_store_load(s_img, (size_t)n) != ESP_OK) {
+        return false;
+    }
+    nvs_handle_t h;
+    if (nvs_open("bt_config.conf", NVS_READWRITE, &h) != ESP_OK) {
+        return false;
+    }
+    static char cfg[1600];
+    size_t len = sizeof(cfg) - 1u;
+    bool ok = nvs_get_blob(h, "bt_cfg_key0", cfg, &len) == ESP_OK;
+    if (ok) {
+        uint8_t rev[16];
+        for (int i = 0; i < 16; i++) {
+            rev[i] = wire_key[15 - i];           /* stored byte-reversed (see bond_file_has_key) */
+        }
+        char kh[40];
+        hex(kh, rev, 16u);
+        int add = snprintf(cfg + len, sizeof(cfg) - len, "\n[%s]\nLinkKeyType = %d\nPinLength = 0\nSCSupport = 0\n"
+                           "LinkKey = %s\n", bdstr, key_type, kh);
+        ok = add > 0 && (size_t)add < sizeof(cfg) - len && len + (size_t)add < 1536u &&
+             nvs_set_blob(h, "bt_cfg_key0", cfg, len + (size_t)add) == ESP_OK;
+    }
+    nvs_close(h);
+    size_t m = ok ? bt_store_serialize(s_img, sizeof(s_img)) : 0u;
+    if (m == 0u) {
+        return false;
+    }
+    exfat_writer_t w;
+    (void)exfat_delete_file(&s_card, "/", "bt_bonds.bin");
+    return exfat_create_file(&s_card, "/", "bt_bonds.bin", &w) == 0 && exfat_write(&w, s_img, (uint32_t)m) == 0 &&
+           exfat_close_file(&w) == 0;
+}
+
 int bth_phone_scenario(const char *img_path)
 {
     bth_log("[P] phone mode end to end: XREC backend + Bluedroid + bt_ctrl + fake ROM peer\n");
@@ -1249,6 +1345,7 @@ int bth_phone_scenario(const char *img_path)
         }
     }
     pbase_t base = psnap();
+    bth_heap_peak_reset();           /* scenario-local peak: everything above the post-warm-up baseline */
     static const uint8_t xkey[32] = { 0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE, 1, 2, 3, 4, 5, 6, 7, 8,
                                       9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24 };
     uint8_t lkey[16];
@@ -1284,7 +1381,7 @@ int bth_phone_scenario(const char *img_path)
         goto out;
     }
     /* ---- 5 ---- */
-    bth_log("[P5] XREC: PING, PAIR, LS, GETS with congestion\n");
+    bth_log("[P5] XREC: PING, PAIR, LS, GETS with congestion (session in-flight window)\n");
     PCHECK(x_send("+XREC:PING\r") && x_line(line, sizeof(line), 3000u), "PING");
     PCHECK(strncmp(line, "+XREC:PONG,openfw_v5,v5,bound=0,auth=0,pair=1", 45) == 0, "PONG '%s'", line);
     {
@@ -1323,6 +1420,27 @@ int bth_phone_scenario(const char *img_path)
         bth_log("    GETS 40000 B in %u frames; writes %u, write events %u, cong events %u, nomem %u, peer UIH %u, "
                 "credit grants %u\n", frames, (unsigned)s.d.tx_writes, (unsigned)s.d.write_evts,
                 (unsigned)s.d.cong_evts, (unsigned)s.d.tx_nomem, (unsigned)P.uih_rx, (unsigned)P.credit_grants);
+    }
+    {
+        /* Review finding: the step above only fills the session's own in-flight window (= tx_buffer_size), so BTC's
+         * ring never refuses a write: ESP_ERR_NO_MEM -> s.cong and the ESP_SPP_CONG_EVT(false) resume never ran
+         * against the real btc_spp (upper_cong / SPP_TX_LOW_WM). With a window of twice the ring they must. */
+        bth_log("[P5b] GETS with BTC's ring full (session window 2 x tx_buffer_size): ESP_ERR_NO_MEM, CONG_EVT\n");
+        bthx_snap_t s0 = S();
+        bt_xrec_test_set_inflight_max(2u * BT_XREC_SPP_TX_BUF);
+        uint32_t frames = 0u;
+        bth_step("GETS 40000 with BTC congested", 30000u);
+        PCHECK(gets_verify("REC0001.WAV", 1u, 0u, 40000u, 640u, 12, &frames), "GETS REC0001.WAV, BTC congested");
+        bth_step_done();
+        bt_xrec_test_set_inflight_max(0u);
+        s = S();
+        PCHECK(frames == 63u, "GETS frames %u (want 63)", frames);
+        PCHECK(s.d.tx_nomem > s0.d.tx_nomem && s.d.cong_evts > s0.d.cong_evts && !s.d.cong,
+               "BTC congestion path not exercised (nomem %u -> %u, cong events %u -> %u, cong %u)",
+               (unsigned)s0.d.tx_nomem, (unsigned)s.d.tx_nomem, (unsigned)s0.d.cong_evts, (unsigned)s.d.cong_evts,
+               s.d.cong);
+        bth_log("    GETS 40000 B: nomem %u, cong events %u\n", (unsigned)(s.d.tx_nomem - s0.d.tx_nomem),
+                (unsigned)(s.d.cong_evts - s0.d.cong_evts));
     }
     PCHECK(P.fcs_errors == 0u && P.bad_frames == 0u, "peer saw %u FCS errors, %u bad frames", P.fcs_errors,
            P.bad_frames);
@@ -1371,7 +1489,7 @@ int bth_phone_scenario(const char *img_path)
     bth_log("    outstanding at stop: inflight %u, tx_used %u, cong %u\n", (unsigned)s.d.inflight,
             (unsigned)s.d.tx_used, s.d.cong);
     stop_session(&base, "stop with traffic outstanding");
-    PCHECK(!fake_peer.connected, "link still up after bt_xrec_stop");
+    PCHECK(!fake_peer.connected && fake_peer.stop_kills == 0u, "link still up when the controller stopped (no detach)");
     PCHECK(P.dlc_disc_rx == 1u || P.mux_disc_rx == 1u || P.rfc.closed, "RFCOMM/L2CAP not closed by the device "
            "(DISC dlc %u mux %u, L2CAP closed %u)", P.dlc_disc_rx, P.mux_disc_rx, P.rfc.closed);
     if (p_fail) {
@@ -1447,10 +1565,136 @@ int bth_phone_scenario(const char *img_path)
         PCHECK(fake_peer.pairings == 1u && fake_peer.host_confirms == 1u, "C: Bluedroid auto-confirmed (%u, %u)",
                fake_peer.pairings, fake_peer.host_confirms);
         PCHECK(S().d.ssp_accepted == 0u, "Just Works reached the numeric-comparison policy");
+        /* the session's own view of the link (ACL_DISCONN_CMPL through BTC) can trail the peer's: the next page
+         * counts links from here */
+        PCHECK(WAIT(S().d.acl_links == 0u && !S().d.conn_open, 3000), "session still counts C's link (acl %u)",
+               S().d.acl_links);
     }
 
     /* ---- 12 ---- */
-    bth_log("[P12] bt_xrec_stop\n");
+    /* Review finding: Patch 0026 reports DISABLE ~600 ms after its detach whether the link went down or not. A phone
+     * that walked out of range never completes the LMP detach (the controller waits for the supervision timeout), so
+     * Bluedroid's deinit ran with the L2CAP link still allocated: btu_free_core -> l2c_free -> l2cu_release_lcb ->
+     * btm_acl_removed -> bta_sys_sendmsg -> osi_thread_post(NULL btu_thread): assert / NULL dereference (patch 0027). */
+    bth_log("[P12] laptop A reconnects; it walks out of range: its detach never completes; bt_xrec_stop\n");
+    {
+        fake_peer_cfg_t a;
+        peer_cfg(&a, 0xA1u, 0x01u, 0x05u, 0x05u, "laptop-A");
+        peer_attach(&a, lkey);
+    }
+    if (!peer_page_and_connect()) {
+        goto out;
+    }
+    peer_authenticate();
+    PCHECK(WAIT(fake_peer.authenticated && fake_peer.encrypted, 3000), "A authentication");
+    if (!step_rfcomm_open()) {
+        goto out;
+    }
+    bth_rom_lock();
+    fake_peer.defer_detach = true;
+    bth_rom_unlock();
+    stop_session(&base, "stop, detach never completes");
+    PCHECK(fake_peer.detach_deferred >= 1u && fake_peer.stop_kills == 1u, "detach not exercised (deferred %u, link "
+           "killed by the controller stop %u)", fake_peer.detach_deferred, fake_peer.stop_kills);
+    if (p_fail) {
+        goto out;
+    }
+
+    /* ---- 13 ---- */
+    /* Review finding: a Just Works key is stored (and a flush requested) before the app sees AUTH_CMPL; BTA DM removes
+     * it only once the ACL is down, which never happens if BT stops first. It must still never reach the card. */
+    bth_log("[P13] window open, laptop C pairs Just Works; its link is still up when bt_xrec_stop runs\n");
+    uint8_t ckey[16];
+    rom_cmds_clear();
+    if (!wait_ready()) {
+        goto out;
+    }
+    {
+        bthx_call(BTHX_OPEN_PAIRING, 60000u, 2000u);
+        PCHECK(WAIT(S().d.scan_disc == 1u, 2000), "window not opened");
+        fake_peer_cfg_t c;
+        peer_cfg(&c, 0xC3u, 0x03u, 0x04u, 0x04u, "laptop-C");
+        peer_attach(&c, NULL);
+        uint32_t rm0 = S().d.bonds_removed;
+        if (!peer_page_and_connect()) {
+            goto out;
+        }
+        bth_rom_lock();
+        fake_peer.defer_detach = true;               /* the rejection's disconnect does not complete before the stop */
+        bth_rom_unlock();
+        peer_authenticate();
+        PCHECK(WAIT(S().d.bonds_removed == rm0 + 1u, 3000), "Just Works bond not removed (removed %u)",
+               S().d.bonds_removed);
+        memcpy(ckey, fake_peer.key, 16u);
+        PCHECK(fake_peer.pairings == 1u && fake_peer.connected, "C: pairing %u, link up %u", fake_peer.pairings,
+               fake_peer.connected);
+        stop_session(&base, "stop right after the Just Works rejection");
+        int n = bthx_read_root_file("bt_bonds.bin", s_img, sizeof(s_img));
+        PCHECK(n > 0 && !mem_has(s_img, (uint32_t)n, "00:5b:1a:51:7e:c3", 17u),
+               "Just Works key of C persisted in /bt_bonds.bin after the stop");
+        PCHECK(n > 0 && mem_has(s_img, (uint32_t)n, "00:5b:1a:51:7e:a1", 17u), "A lost from /bt_bonds.bin");
+    }
+    if (p_fail) {
+        goto out;
+    }
+
+    /* ---- 14 ---- */
+    bth_log("[P14] restart; C reconnects with its Just Works key: never authorized\n");
+    rom_cmds_clear();
+    if (!wait_ready()) {
+        goto out;
+    }
+    PCHECK(S().bonds == 1, "bonds %d at start (want only A)", S().bonds);
+    {
+        fake_peer_cfg_t c;
+        peer_cfg(&c, 0xC3u, 0x03u, 0x04u, 0x04u, "laptop-C");
+        peer_attach(&c, ckey);
+        if (!peer_page_and_connect()) {
+            goto out;
+        }
+        expect_never_authorized("C (key from an earlier Just Works pairing)");
+    }
+    stop_session(&base, "stop after C");
+    if (p_fail) {
+        goto out;
+    }
+
+    /* ---- 15 ---- */
+    /* Review finding: link_authorized() trusted any stored bond. A Just Works bond left on the card (power loss after
+     * the key was written, a failed rewrite, a lost AUTH_CMPL) must neither load as a bond nor authorize XREC. */
+    bth_log("[P15] a stale Just Works bond of C in /bt_bonds.bin; restart; C reconnects with it\n");
+    PCHECK(plant_bond("00:5b:1a:51:7e:c3", 4, ckey), "could not write C's stale bond into /bt_bonds.bin");
+    {
+        /* Review finding (bt_store): serialise cleared the dirty flag before the write, so the removal's failed write
+         * (full card, SDIO error) left the stale bond on the card with nothing left to retry. The card refuses writes
+         * while the session removes the stale bond, then recovers: the bounded retry must clean the file. */
+        uint32_t wf0 = bthx_bond_write_fails();
+        bthx_fail_bond_writes(1);
+        rom_cmds_clear();
+        if (!wait_ready()) {
+            bthx_fail_bond_writes(0);
+            goto out;
+        }
+        PCHECK(WAIT(S().bonds == 1, 2000), "stale Just Works bond loaded (bonds %d, want only A)", S().bonds);
+        PCHECK(S().d.bonds_removed == 1u, "stale bond not removed at start (removed %u)", S().d.bonds_removed);
+        PCHECK(WAIT(bthx_bond_write_fails() > wf0, 2000), "the removal never tried to write /bt_bonds.bin");
+        bthx_fail_bond_writes(0);
+        int n = -1;
+        bool clean = WAIT((n = bthx_read_root_file("bt_bonds.bin", s_img, sizeof(s_img))) > 0 &&
+                          !mem_has(s_img, (uint32_t)n, "00:5b:1a:51:7e:c3", 17u), 3000);
+        PCHECK(clean, "stale bond still in /bt_bonds.bin after a failed write and the card's recovery (%u failed "
+               "writes)", bthx_bond_write_fails() - wf0);
+        fake_peer_cfg_t c;
+        peer_cfg(&c, 0xC3u, 0x03u, 0x04u, 0x04u, "laptop-C");
+        peer_attach(&c, ckey);
+        if (!peer_page_and_connect()) {
+            goto out;
+        }
+        expect_never_authorized("C (stale Just Works bond on the card)");
+    }
+
+    /* ---- 16 ---- */
+    bth_log("[P16] bt_xrec_stop\n");
     stop_session(&base, "final stop");
     {
         static uint8_t img[BT_STORE_IMAGE_MAX];
@@ -1461,6 +1705,17 @@ int bth_phone_scenario(const char *img_path)
         PCHECK(n > 0 && mem_has(img, (uint32_t)n, a_addr, 17u), "A missing from /bt_bonds.bin");
         PCHECK(n > 0 && !mem_has(img, (uint32_t)n, b_addr, 17u) && !mem_has(img, (uint32_t)n, c_addr, 17u),
                "B or C persisted in /bt_bonds.bin");
+    }
+    {
+        /* Review finding: nothing measured phone mode against the RAM budget. Host side: a scenario-local peak (all of
+         * Bluedroid, bt_port, the session, task stacks) against a regression ceiling; see PHONE_HEAP_CEILING. */
+        bth_heap_stats_t hs;
+        bth_heap_stats(&hs);
+        size_t peak = hs.peak_bytes - base.bytes;
+        bth_log("    heap: scenario peak %zu B above the post-warm-up baseline (host ceiling %u B; x86-64 sizes)\n",
+                peak, (unsigned)PHONE_HEAP_CEILING);
+        PCHECK(peak <= PHONE_HEAP_CEILING, "scenario heap peak %zu B > host ceiling %u B", peak,
+               (unsigned)PHONE_HEAP_CEILING);
     }
 out:
     if (p_fail != 0 && S().d.state != BT_XREC_ST_OFF) {

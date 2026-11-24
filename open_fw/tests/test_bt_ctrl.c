@@ -2251,6 +2251,99 @@ static void test_fwd_deadline(void)
     shutdown_and_check();
 }
 
+/* The host sends the SAME opcode again after a deadline reply (review finding: replies are matched on the opcode alone,
+ * so the first command's late reply was delivered as the second's, and the second's own reply swallowed as "late").
+ * The second command waits in the TX ring until the late reply was consumed, then gets its own (distinct) status. */
+static uint32_t rom_cmds_with(uint16_t id)
+{
+    uint32_t n = 0u;
+    for (uint32_t i = 0u; i < fake_rom.n_cmds; i++) {
+        n += fake_rom.cmds[i].id == id;
+    }
+    return n;
+}
+
+static void test_fwd_late_same_opcode(void)
+{
+    setup();
+    bt_ctrl_set_clock(clk);
+    t_now_ms = 0x1000u;
+    bring_up();
+    link_up(0);
+    link_up(1);
+    uint8_t h80[2] = { 0x80, 0x00 }, h81[2] = { 0x81, 0x00 };
+    /* A: 041D for 0x80, consumed without a reply until after its deadline */
+    fake_rom.hold_replies = true;
+    send_cmd(0x041Du, h80, 2);
+    pump();
+    t_now_ms += BT_CTRL_FWD_DEADLINE_MS;
+    pump();
+    const pkt_t *p = next_pkt();
+    CHECK(is_reply(p, 0x041Du) && status_of(p) == BT_HCI_ERR_LMP_TIMEOUT, "A answered 0x22 at the deadline");
+    /* B: the same opcode (other link) while A's late reply can still come: not forwarded yet */
+    t_now_ms += 100u;
+    send_cmd(0x041Du, h81, 2);
+    pump();
+    CHECK(rom_cmds_with(0xE407u) == 1u && pending_pkts() == 0u && dbg().fwd_pending == 0u,
+          "B held in the TX ring (ROM saw %u x 041D)", rom_cmds_with(0xE407u));
+    CHECK(stats().fwd_late_held == 1u, "fwd_late_held %u", stats().fwd_late_held);
+    /* A's late reply (status 0x00) arrives, then B is forwarded and the ROM answers it 0x0C */
+    fake_rom.hold_replies = false;
+    fake_rom_set_reply_status(0xE407u, 0x00);
+    fake_rom_release_held();
+    fake_rom_set_reply_status(0xE407u, 0x0C);
+    pump();
+    uint32_t n41d = 0u;
+    uint8_t st41d = 0xFFu;
+    while ((p = next_pkt()) != NULL) {
+        if (is_reply(p, 0x041Du)) {
+            n41d++;
+            st41d = status_of(p);
+        }
+    }
+    CHECK(n41d == 1u && st41d == 0x0Cu, "B got exactly its own reply (%u replies, status 0x%02X, want 0x0C)", n41d,
+          st41d);
+    CHECK(rom_cmds_with(0xE407u) == 2u && stats().fwd_late_reply == 1u && stats().evt_unsolicited_reply == 0u,
+          "late reply consumed once, B forwarded after it");
+    /* the late reply never comes: B waits at most BT_CTRL_FWD_DEADLINE_MS from A's deadline, and B's own deadline
+     * runs from when it was first held (inside the host's 8 s command timeout) */
+    fake_rom.hold_replies = true;
+    send_cmd(0x041Du, h80, 2);
+    pump();
+    t_now_ms += BT_CTRL_FWD_DEADLINE_MS;
+    pump();
+    p = next_pkt();
+    CHECK(is_reply(p, 0x041Du) && status_of(p) == BT_HCI_ERR_LMP_TIMEOUT, "C answered 0x22 at the deadline");
+    t_now_ms += 1000u;
+    send_cmd(0x041Du, h81, 2);
+    pump();
+    CHECK(rom_cmds_with(0xE407u) == 3u, "D held");
+    t_now_ms += BT_CTRL_FWD_DEADLINE_MS - 1000u;
+    pump();
+    CHECK(rom_cmds_with(0xE407u) == 4u && stats().fwd_late_expired == 1u && dbg().fwd_pending == 1u,
+          "D forwarded once the late reply is given up (expired %u)", stats().fwd_late_expired);
+    t_now_ms += 1000u;
+    pump();
+    p = next_pkt();
+    CHECK(is_reply(p, 0x041Du) && status_of(p) == BT_HCI_ERR_LMP_TIMEOUT && stats().fwd_deadline == 3u,
+          "D's deadline counted from when it was held");
+    /* an LC command's late reply dies with its link: the same opcode is forwarded at once after the disconnect */
+    inject_disc(0x81u, 0x13u);
+    pump();
+    while (next_pkt() != NULL) {
+    }
+    CHECK(stats().fwd_late_dropped == 1u, "late reply given up at the disconnect (%u)", stats().fwd_late_dropped);
+    send_cmd(0x041Du, h80, 2);
+    pump();
+    CHECK(rom_cmds_with(0xE407u) == 5u && dbg().fwd_pending == 1u, "forwarded at once after the link went");
+    fake_rom.hold_replies = false;
+    fake_rom_release_held();
+    pump();
+    while (next_pkt() != NULL) {
+    }
+    shutdown_and_check();
+}
+
 /* ------------------------------------------------------------------------------------------------------------- */
 /* 12. fuzzing                                                                                                    */
 /* ------------------------------------------------------------------------------------------------------------- */
@@ -2451,6 +2544,7 @@ int main(void)
         { "event_packers", test_event_packers },
         { "phone_path", test_phone_path },
         { "fwd_deadline", test_fwd_deadline },
+        { "fwd_late_same_opcode", test_fwd_late_same_opcode },
         { "fuzz_rx", test_fuzz_rx },
         { "fuzz_tx", test_fuzz_tx },
     };

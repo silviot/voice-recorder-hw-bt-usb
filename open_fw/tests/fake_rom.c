@@ -505,6 +505,10 @@ static bool peer_handle(msg_t *m)
     case 0xE400u:                                                        /* 0406 Disconnect */
         if (!peer_need(m, 4u)) return false;
         peer_status1(0xE43Au, peer_lc_src(), 0u);
+        if (fake_peer.defer_detach) {
+            fake_peer.detach_deferred++;                                 /* LMP detach pending until supervision TO */
+            return true;
+        }
         peer_link_down(0x16u);                                           /* Connection Terminated By Local Host */
         return true;
     default:
@@ -790,6 +794,14 @@ static int i_stop(void)
     }
     f.stale_up = f.up;                       /* upcalls of the incarnation being stopped */
     f.have_stale = true;
+    if (fake_peer.enabled && fake_peer.connected) {
+        /* The controller is gone: the scripted peer's link dies with it (the peer sees a supervision timeout). */
+        f.links[fake_peer.link] = false;
+        fake_peer.connected = fake_peer.encrypted = fake_peer.authenticated = false;
+        fake_peer.origin = FAKE_PEER_ORIGIN_NONE;
+        fake_peer.last_disc_reason = 0x08u;
+        fake_peer.stop_kills++;
+    }
     f.running = false;
     f.rf_cal_since_stop = false;
     drop_all();

@@ -50,6 +50,8 @@
 #define BT_FAULT_RECORD_CODE    0xB1u     /* plan M1: AON fault record, BT stays off on the next boot */
 #define BOND_FILE               "bt_bonds.bin"
 #define BOND_TMP                ".bt_bonds.tmp"
+#define BOND_RETRY_MS           1000u     /* a failed bond-file write is retried this often ... */
+#define BOND_RETRY_MAX          8u        /* ... this many times per session (then at the next change / session end) */
 
 /* ---- session ---- */
 static exfat_vol_t *s_vol;
@@ -73,7 +75,21 @@ static TimerHandle_t s_dl_timer, s_guard_timer;
 static volatile uint8_t s_dl_armed, s_dl_fired, s_ctrl_hung;
 
 /* ---- faults / telemetry ---- */
+/* RAM budget telemetry (plan §4: free heap under traffic >= 8 KiB, largest free block >= the largest allocation;
+ * review finding: nothing measured it on silicon). Stack high-water marks are sampled each second while BT runs (the
+ * Bluedroid tasks exist only then) and logged with the heap figures every 30 s and at "BT stopped". */
+#define BT_MEM_SAMPLE_MS        1000u
+#define BT_MEM_LOG_MS           30000u
+#define BT_MEM_NTASKS           7u
+static const char *const k_mem_tasks[BT_MEM_NTASKS] = {
+    "BTU_TASK", "BTC_TASK", "hciT", "bt_ctrl", "bt_dlv", "bt_recover", "app",
+};
+static uint32_t s_mem_wm[BT_MEM_NTASKS];   /* lowest stack high-water mark this session, words; UINT32_MAX = unseen */
+static uint32_t s_mem_sample_at, s_mem_log_at;
+extern volatile uint32_t g_rtos_malloc_failures;    /* src/rtos/rtos_port.c (BT=1: failures are counted, not fatal) */
 static volatile uint8_t s_store_flush_req;
+static uint8_t s_bond_fails;             /* consecutive failed bond-file writes (store kept dirty) */
+static uint32_t s_bond_retry_at;
 static uint32_t s_last_check, s_faults_base, s_hci_to_base, s_irq_cache;
 
 /* ============================================ small helpers ===================================================== */
@@ -233,8 +249,15 @@ static void bonds_write(void)
         return;
     }
     size_t n = bt_store_serialize(img, BT_STORE_IMAGE_MAX);
-    if (n == 0u || save_root_file_atomic(BOND_TMP, BOND_FILE, img, (uint32_t)n) != 0) {
-        bt_xrec_plat_log("BT bonds not saved (SD write failed)");
+    if (n != 0u && save_root_file_atomic(BOND_TMP, BOND_FILE, img, (uint32_t)n) == 0) {
+        bt_store_mark_saved();       /* only now: a failed write keeps the store dirty (review finding) */
+        s_bond_fails = 0u;
+    } else {
+        bt_xrec_plat_log("BT bonds not saved (SD write failed, retrying)");
+        if (s_bond_fails < BOND_RETRY_MAX) {
+            s_bond_fails++;
+        }
+        s_bond_retry_at = millis() + BOND_RETRY_MS;
     }
     memset(img, 0, BT_STORE_IMAGE_MAX);
     vPortFree(img);
@@ -435,6 +458,60 @@ static const xrec_ops_t k_dev_ops = {
 
 const xrec_ops_t *bt_xrec_plat_device_ops(void) { return &k_dev_ops; }
 
+/* ============================================ RAM telemetry (app task) ========================================== */
+static void mem_reset(void)
+{
+    for (uint32_t i = 0u; i < BT_MEM_NTASKS; i++) {
+        s_mem_wm[i] = UINT32_MAX;
+    }
+    s_mem_sample_at = s_mem_log_at = millis();
+}
+
+static void mem_sample(void)
+{
+    for (uint32_t i = 0u; i < BT_MEM_NTASKS; i++) {
+        TaskHandle_t h = xTaskGetHandle(k_mem_tasks[i]);
+        if (h != NULL) {
+            uint32_t w = (uint32_t)uxTaskGetStackHighWaterMark(h);
+            if (w < s_mem_wm[i]) {
+                s_mem_wm[i] = w;
+            }
+        }
+    }
+}
+
+/* "BT mem <when> heap free F min M largest L mallocfail N" and "BT stack free words BTU_TASK=w ... app=w" (- = the
+ * task did not run this session). */
+static void mem_log(const char *when)
+{
+    HeapStats_t hs;
+    memset(&hs, 0, sizeof(hs));
+    vPortGetHeapStats(&hs);
+    openfw_log_puts("BT mem ");
+    openfw_log_puts(when);
+    openfw_log_puts(" heap free ");
+    openfw_log_u32((uint32_t)hs.xAvailableHeapSpaceInBytes);
+    openfw_log_puts(" min ");
+    openfw_log_u32((uint32_t)xPortGetMinimumEverFreeHeapSize());
+    openfw_log_puts(" largest ");
+    openfw_log_u32((uint32_t)hs.xSizeOfLargestFreeBlockInBytes);
+    openfw_log_puts(" mallocfail ");
+    openfw_log_u32(g_rtos_malloc_failures);
+    openfw_log_putc('\n');
+    openfw_log_puts("BT stack free words");
+    for (uint32_t i = 0u; i < BT_MEM_NTASKS; i++) {
+        openfw_log_putc(' ');
+        openfw_log_puts(k_mem_tasks[i]);
+        openfw_log_putc('=');
+        if (s_mem_wm[i] == UINT32_MAX) {
+            openfw_log_putc('-');
+        } else {
+            openfw_log_u32(s_mem_wm[i]);
+        }
+    }
+    openfw_log_putc('\n');
+}
+
 /* ============================================ HCI driver (hciT -> bt_ctrl) ====================================== */
 /* esp_bluedroid_hci_driver_callbacks_t and bt_ctrl_host_cb_t are the same table (bt_ctrl.h; tests/bt_host/host_ctrl.c). */
 _Static_assert(sizeof(esp_bluedroid_hci_driver_callbacks_t) == sizeof(bt_ctrl_host_cb_t), "callback table shape");
@@ -623,6 +700,7 @@ int bt_xrec_plat_stack_up_begin(exfat_vol_t *vol, int sd_mounted, const uint8_t 
     s_hci_to_base = bt_port_hci_command_timeouts();
     s_ctrl_hung = 0u;
     s_last_check = millis();
+    mem_reset();
     (void)xTimerStart(s_guard_timer, 0);
     post_job(JOB_UP);
     return 0;
@@ -663,11 +741,21 @@ void bt_xrec_plat_hard_path(uint32_t reason)
 
 uint32_t bt_xrec_plat_poll(void)
 {
+    uint32_t now = millis();
     if (s_store_flush_req) {
         s_store_flush_req = 0u;
         bonds_write();
+    } else if (s_bond_fails != 0u && s_bond_fails < BOND_RETRY_MAX && (int32_t)(now - s_bond_retry_at) >= 0) {
+        bonds_write();               /* still dirty after a failed write: bounded retry, no write on every poll */
     }
-    uint32_t now = millis();
+    if (now - s_mem_sample_at >= BT_MEM_SAMPLE_MS) {
+        s_mem_sample_at = now;
+        mem_sample();
+        if (now - s_mem_log_at >= BT_MEM_LOG_MS) {
+            s_mem_log_at = now;
+            mem_log("run");
+        }
+    }
     if (now - s_last_check < BT_FAULT_CHECK_MS) {
         return 0u;
     }
@@ -696,10 +784,10 @@ void bt_xrec_plat_session_end(void)
         (void)xTimerStop(s_guard_timer, 0);
     }
     s_store_flush_req = 0u;
-    bonds_write();                                       /* final flush of the bond store */
-    if (s_rec_task != NULL) {
-        bt_xrec_plat_log_u32("BT bt_recover stack free words", (uint32_t)uxTaskGetStackHighWaterMark(s_rec_task));
-    }
+    bonds_write();                                       /* final flush of the bond store (retried once more) */
+    s_bond_fails = 0u;
+    mem_sample();                                        /* the Bluedroid tasks are gone: their last samples */
+    mem_log("stop");
     s_vol = NULL;
     s_sd = 0;
 }

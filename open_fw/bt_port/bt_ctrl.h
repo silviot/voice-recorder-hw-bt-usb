@@ -84,6 +84,9 @@ typedef struct {
     uint32_t fwd_orphaned;          /* LC-destined command answered locally (0x02) after its link went, no ROM reply */
     uint32_t fwd_deadline;          /* class-O command answered locally (0x22) at BT_CTRL_FWD_DEADLINE_MS */
     uint32_t fwd_late_reply;        /* ROM reply that arrived after its command was answered at the deadline (consumed) */
+    uint32_t fwd_late_held;         /* a new command with the late opcode kept in the TX ring until the late reply came */
+    uint32_t fwd_late_expired;      /* ...or until BT_CTRL_FWD_DEADLINE_MS passed again (late reply given up) */
+    uint32_t fwd_late_dropped;      /* late reply given up because its LC link disconnected (the ROM dropped it) */
     uint32_t cmd_dead_handle;       /* LC-destined command for a handle already reported disconnected (answered 0x02) */
     uint32_t acl_tx_dead_handle;    /* host ACL for a handle already reported disconnected (dropped; also acl_tx_dropped) */
     uint16_t unknown_opcode_last;

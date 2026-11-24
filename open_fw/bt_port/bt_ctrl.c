@@ -110,6 +110,13 @@ static struct {
     uint8_t fwd_orphan;           /* ...and that link's Disconnection Complete arrived while it was pending */
     uint16_t fwd_opcode, fwd_handle;
     uint16_t fwd_late_op;         /* opcode answered locally at its deadline; the ROM's late reply is consumed once */
+    uint8_t fwd_late_lc;          /* ...it went to the LC task of fwd_late_handle (the ROM drops it with that link) */
+    uint8_t fwd_late_counted;     /* the command now held for the current late opcode was counted, hold_t0 taken */
+    uint8_t hold_valid;           /* the next forwarded command was held: its deadline runs from hold_t0 */
+    uint32_t hold_t0;             /* now_ms() when that command was first held (~ when the host sent it) */
+    uint16_t fwd_late_handle;
+    uint32_t fwd_late_t0;         /* now_ms() of that deadline: a new command with the same opcode waits until the late
+                                     reply was consumed, the link went, or BT_CTRL_FWD_DEADLINE_MS passed again */
     uint32_t fwd_t0;              /* now_ms() when the pending command was forwarded */
     uint8_t fwd_params[255];
     uint8_t dead;                 /* handles 0x80..0x86 whose Disconnection Complete came after their last Connection
@@ -371,6 +378,10 @@ static void apply_event_side_effects(const bt_ctrl_evt_info_t *info)
         if (g.fwd_pending && g.fwd_lc && g.fwd_handle == h) {
             g.fwd_orphan = 1u;               /* answered locally once the ROM queue is idle (bt_ctrl_run) */
         }
+        if (g.fwd_late_op != 0u && g.fwd_late_lc && g.fwd_late_handle == h) {
+            g.fwd_late_op = 0u;              /* the ROM dropped the saved message with the LC instance: no late reply */
+            g.st.fwd_late_dropped++;
+        }
     } else if (info->evt_code == BT_HCI_EVT_CONN_CMP) {
         /* A new link on h: the host has not seen this Connection Complete yet, so any ACL for h in the TX ring was
          * sent for an earlier link that used the same handle. */
@@ -565,6 +576,9 @@ static void controller_state_reset(void)
     g.fwd_lc = 0u;
     g.fwd_orphan = 0u;
     g.fwd_late_op = 0u;
+    g.fwd_late_lc = 0u;
+    g.fwd_late_handle = 0u;
+    g.hold_valid = 0u;
     g.dead = 0u;
     g.evt_resv = 0u;
     memset(g.inflight, 0, sizeof(g.inflight));
@@ -859,7 +873,35 @@ static void fwd_deadline_check(void)
     }
     g.st.fwd_deadline++;
     g.fwd_late_op = g.fwd_opcode;
+    g.fwd_late_lc = g.fwd_lc;
+    g.fwd_late_handle = g.fwd_handle;
+    g.fwd_late_t0 = g.now_ms();
+    g.fwd_late_counted = 0u;
     fwd_local_reply(BT_HCI_ERR_LMP_TIMEOUT);
+}
+
+/* Both the late-reply match and the pending-reply match key on the opcode alone, so a new command with the opcode of a
+ * deadline-answered one must not reach the ROM while that late reply can still come: the late reply would be taken as
+ * the new command's and the new command's own reply swallowed as "late" (a SAVED 0419 behind another LM state is the
+ * realistic case, BT_ROM_HCI_MAP.md §6.2). It stays in the TX ring (the host's one-command window keeps it the only
+ * one) until the late reply was consumed, its link disconnected, or BT_CTRL_FWD_DEADLINE_MS passed again. */
+static bool fwd_late_hold(uint16_t op)
+{
+    if (g.fwd_late_op == 0u || op != g.fwd_late_op) {
+        return false;
+    }
+    if (g.now_ms == NULL || (uint32_t)(g.now_ms() - g.fwd_late_t0) >= BT_CTRL_FWD_DEADLINE_MS) {
+        g.fwd_late_op = 0u;                  /* given up on the late reply: if it still comes it is unsolicited */
+        g.st.fwd_late_expired++;
+        return false;
+    }
+    if (!g.fwd_late_counted) {
+        g.fwd_late_counted = 1u;             /* one count per held command (the host has one command in flight) */
+        g.st.fwd_late_held++;
+        g.hold_valid = 1u;
+        g.hold_t0 = g.now_ms();
+    }
+    return true;
 }
 
 static void process_cmd(uint32_t idx)
@@ -873,6 +915,8 @@ static void process_cmd(uint32_t idx)
         return;
     }
     g.st.tx_cmds++;
+    bool held = g.hold_valid != 0u;          /* this command waited in the ring for a late reply (fwd_late_hold) */
+    g.hold_valid = 0u;
     const bt_ctrl_cmd_row_t *row = bt_ctrl_cmds_lookup(op);
     if (row == NULL) {                       /* closed table default: CS 0x01, counted (opcode table §2 rule 5) */
         g.st.cmd_unknown++;
@@ -901,6 +945,9 @@ static void process_cmd(uint32_t idx)
         }
         if (s == 0u) {
             g.st.cmd_fwd++;
+            if (held) {
+                g.fwd_t0 = g.hold_t0;        /* its deadline stays inside the host's 8 s command timeout */
+            }
             return;
         }
         g.st.cmd_local_fail++;
@@ -1018,7 +1065,7 @@ static int tx_pick(void)
         }
     }
     g.p.exit();
-    bool cmd_ok = oc >= 0 && g.rom_cmd_credits > 0u && evt_reply_space();
+    bool cmd_ok = oc >= 0 && g.rom_cmd_credits > 0u && evt_reply_space() && !fwd_late_hold(rd16(&g.tx[oc].data[1]));
     bool acl_ok = oa >= 0 && !g.acl_blocked && (!g.rom_running || g.inflight_total < BT_CTRL_H2C_ACL_CREDITS);
     if (oa >= 0 && !acl_ok && !g.acl_blocked) {
         g.st.acl_tx_credit_blocked++;

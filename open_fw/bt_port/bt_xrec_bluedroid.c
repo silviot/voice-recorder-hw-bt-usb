@@ -78,6 +78,7 @@ static struct {
     char     name[16];
     uint8_t  spp_inited;
     uint8_t  window_open, xrec_pin_issued;
+    uint8_t  ssp_window;               /* numeric comparison accepted + discoverable: closes at the first MITM bond */
     uint32_t window_deadline;
     uint8_t  scan_disc, scan_applied;      /* scan_applied: 0 none, 1 connectable, 2 connectable+discoverable */
     uint8_t  ssp_showing;
@@ -99,6 +100,17 @@ static struct {
 } s;
 
 static volatile uint8_t s_spp_uninit_seen;
+
+#if defined(BT_XREC_TEST_HOOKS) && BT_XREC_TEST_HOOKS
+/* Host tests only: an in-flight window above BTC's ring, so esp_spp_write() reaches ESP_ERR_NO_MEM against the real
+ * btc_spp ring and the CONG_EVT(false) resume runs end to end (test_bt_host phone, step P5b). */
+static volatile uint32_t s_inflight_max = BT_XREC_INFLIGHT_MAX;
+#define INFLIGHT_MAX s_inflight_max
+void bt_xrec_test_set_inflight_max(uint32_t n);
+void bt_xrec_test_set_inflight_max(uint32_t n) { s_inflight_max = n != 0u ? n : BT_XREC_INFLIGHT_MAX; }
+#else
+#define INFLIGHT_MAX BT_XREC_INFLIGHT_MAX
+#endif
 
 /* ============================================ helpers ========================================================== */
 static bool bda_eq(const uint8_t a[6], const uint8_t b[6]) { return memcmp(a, b, 6u) == 0; }
@@ -359,8 +371,12 @@ static void tx_kick(void)
         if (n > BT_XREC_WRITE_MAX) {
             n = BT_XREC_WRITE_MAX;
         }
-        if (n > BT_XREC_INFLIGHT_MAX - s.inflight) {
-            n = BT_XREC_INFLIGHT_MAX - s.inflight;
+        uint32_t cap = INFLIGHT_MAX;
+        if (s.inflight >= cap) {
+            return;              /* resumes on ESP_SPP_WRITE_EVT */
+        }
+        if (n > cap - s.inflight) {
+            n = cap - s.inflight;
         }
         if (n == 0u) {
             return;              /* resumes on ESP_SPP_WRITE_EVT */
@@ -436,6 +452,7 @@ static void xo_entropy(void *user, uint8_t out[16])
 static void window_close(void)
 {
     s.window_open = 0u;
+    s.ssp_window = 0u;
     s.xrec_pin_issued = 0u;
     if (s.b != NULL) {
         xrec_close_pairing(&s.b->xrec);
@@ -480,15 +497,17 @@ static bool is_bonded(const uint8_t bda[6])
     return false;
 }
 
-/* XREC traffic only on a link that is encrypted (SPP security mask) and MITM-authenticated: either this link just
- * bonded through an accepted numeric comparison, or the peer holds a bond made that way (unauthenticated bonds are
- * removed at AUTH_CMPL, so every stored bond passed the same check). */
+/* XREC traffic only on a link that is encrypted and MITM-authenticated (SPP security mask, start_server): either this
+ * link just bonded through an accepted numeric comparison, or the peer's STORED key is an authenticated combination
+ * key. A bond's existence proves nothing (review finding): Bluedroid stores a Just Works key before the app sees
+ * AUTH_CMPL, BTA DM removes it only once the ACL is down, and a stop, a power loss, a failed SD rewrite or a lost
+ * AUTH_CMPL (fail-soft allocation) can each leave it behind. */
 static bool link_authorized(const uint8_t bda[6])
 {
     if (slot_is(&s.reject, bda)) {
         return false;
     }
-    return slot_is(&s.auth_ok, bda) || is_bonded(bda);
+    return slot_is(&s.auth_ok, bda) || (is_bonded(bda) && bt_xrec_plat_bond_mitm(bda));
 }
 
 static void reject_bond(const uint8_t bda[6], const char *why)
@@ -496,6 +515,9 @@ static void reject_bond(const uint8_t bda[6], const char *why)
     slot_set(&s.reject, bda);
     s.d.bonds_removed++;
     bt_xrec_plat_log(why);
+    /* The key leaves the BTC config (and so every later bond-file write) now; BTA DM's own removal below waits for the
+     * ACL to go down, which a BT stop or a power loss can pre-empt (review finding). */
+    bt_xrec_plat_bond_purge(bda);
     esp_err_t r = esp_bt_gap_remove_bond_device((uint8_t *)bda);   /* also takes the ACL down (bta_dm_remove_device) */
     if (r != ESP_OK) {
         bt_xrec_plat_log_u32("BT SSP remove_bond_device failed", (uint32_t)r);
@@ -521,10 +543,14 @@ static void on_gap_event(const ev_t *e)
     esp_err_t r;
     switch (e->type) {
     case EV_CFM_REQ: {
-        bool accept = s.window_open && s.state == BT_XREC_ST_READY;
-        /* INTERIM (plan M4 needs a local accept/reject prompt with a 30 s timeout; its strings belong to step 8):
-         * auto-confirm inside the user-opened pairing window only, show the value through bt_status_t.pair_pin
-         * (the BT screen's existing "PIN" toast) and log it. */
+        bool accept = s.ssp_window && s.state == BT_XREC_ST_READY;
+        /* INTERIM (plan M4 needs a local accept/reject prompt with a 30 s timeout; its strings belong to step 8; a
+         * release blocker): auto-confirm inside the user-opened pairing window only, show the value through
+         * bt_status_t.pair_pin (the BT screen's existing "PIN" toast) and log it. The DEVICE side does not verify the
+         * value: only the phone's user compares digits, so a relay between phone and device would still bond. The SSP
+         * part of the window therefore closes at the first MITM bond (review finding: XREC PAIR, which closed it in
+         * the legacy flow, cannot succeed without entropy, so a second device could pair silently in the rest of the
+         * 60 s). */
         r = esp_bt_gap_ssp_confirm_reply((uint8_t *)e->bda, accept);
         if (r != ESP_OK) {
             bt_xrec_plat_log_u32("BT SSP confirm_reply failed", (uint32_t)r);
@@ -576,6 +602,10 @@ static void on_gap_event(const ev_t *e)
             if (mitm && slot_is(&s.cfm_ok, e->bda) && !slot_is(&s.reject, e->bda)) {
                 slot_set(&s.auth_ok, e->bda);
                 bt_xrec_plat_log("BT SSP bonded (numeric comparison, MITM)");
+                if (s.ssp_window) {
+                    s.ssp_window = 0u;     /* one bond per window; apply_scan_mode() drops discoverability */
+                    bt_xrec_plat_log("BT SSP window closed after the first bond");
+                }
             } else {
                 reject_bond(e->bda, mitm ? "BT SSP bond removed: not confirmed in the pairing window"
                                          : "BT SSP bond removed: Just Works / unauthenticated key");
@@ -612,13 +642,45 @@ static void on_gap_event(const ev_t *e)
     }
 }
 
+/* Bonds loaded from the card whose key is not MITM-authenticated (left there by a power loss or a failed rewrite while a
+ * rejected bond was still stored) are removed before the device becomes connectable. */
+static void purge_unauthenticated_bonds(void)
+{
+    int n = esp_bt_gap_get_bond_device_num();
+    if (n <= 0) {
+        return;
+    }
+    esp_bd_addr_t list[8];
+    int cnt = (int)(sizeof(list) / sizeof(list[0]));
+    if (esp_bt_gap_get_bond_device_list(&cnt, list) != ESP_OK) {
+        return;
+    }
+    for (int i = 0; i < cnt && i < (int)(sizeof(list) / sizeof(list[0])); i++) {
+        if (!bt_xrec_plat_bond_mitm(list[i])) {
+            s.d.bonds_removed++;
+            bt_xrec_plat_log("BT stored bond removed: not MITM-authenticated");
+            bt_xrec_plat_bond_purge(list[i]);
+            esp_err_t r = esp_bt_gap_remove_bond_device(list[i]);   /* no ACL yet: BTM record dropped at once */
+            if (r != ESP_OK) {
+                bt_xrec_plat_log_u32("BT SSP remove_bond_device failed", (uint32_t)r);
+            }
+        }
+    }
+}
+
 static void start_server(void)
 {
     esp_spp_start_srv_cfg_t cfg;
     memset(&cfg, 0, sizeof(cfg));
     cfg.local_scn = BT_XREC_SPP_SCN;
     cfg.create_spp_record = true;
-    cfg.sec_mask = ESP_SPP_SEC_AUTHENTICATE | ESP_SPP_SEC_ENCRYPT;
+    /* MITM: BTM asks for a link-key upgrade when an unauthenticated key could become an authenticated one (the upgrade
+     * pairing then meets the numeric-comparison gate). It does NOT refuse an unauthenticated key it cannot upgrade
+     * (btm_sec_is_upgrade_possible: a NoInputNoOutput peer, or unknown IO caps on a reconnect with a stored key): the
+     * host harness opened SPP for a stale Just Works bond with this flag alone. link_authorized()'s key-type check is
+     * the enforcement. esp_spp_api.h advises against ESP_SPP_SEC_MITM "due to certain limitations"; the harness runs
+     * the bonded, re-paired and Just Works paths with it (silicon: BT_HW_RESULTS recipe). */
+    cfg.sec_mask = ESP_SPP_SEC_AUTHENTICATE | ESP_SPP_SEC_ENCRYPT | ESP_SPP_SEC_MITM;
     cfg.role = ESP_SPP_ROLE_SLAVE;
     cfg.name = BT_XREC_SPP_NAME;
     esp_err_t r = esp_spp_start_srv_with_cfg(&cfg);
@@ -639,6 +701,7 @@ static void on_spp_event(const ev_t *e)
             fault(BT_XREC_FAULT_CONFIG);
         } else {
             s.spp_inited = 1u;
+            purge_unauthenticated_bonds();
             start_server();
         }
         break;
@@ -674,6 +737,7 @@ static void on_spp_event(const ev_t *e)
         s.mtu = (uint16_t)(e->val > 0xFFFFu ? 0xFFFFu : e->val);
         if (link_authorized(e->bda)) {
             s.conn_authorized = 1u;
+            s.d.conns_authorized++;
             bt_xrec_plat_log_u32("BT XREC SPP open, mtu", s.mtu);
         } else {
             s.d.conns_rejected++;
@@ -708,6 +772,37 @@ static void on_spp_event(const ev_t *e)
         break;
     default:
         break;
+    }
+}
+
+/* Hand received bytes to xrec_proto one line at a time ('\r' ends a command; xrec_proto is a stream parser, so the
+ * split changes nothing else). A CHAL that found no entropy (xo_entropy) leaves xrec_proto with chal_active set over
+ * an all-zero nonce: nothing after that line may reach it, or an AUTH carrying HMAC(key, 0^16) in the same SPP write
+ * would authorize the privileged commands that follow it (review finding). The challenge is disarmed and the link
+ * closed before the next line. */
+static void rx_feed(const uint8_t *p, uint32_t n)
+{
+    uint32_t i = 0u;
+    while (i < n) {
+        uint32_t k = i;
+        while (k < n && p[k] != '\r') {
+            k++;
+        }
+        uint32_t seg = (k < n ? k + 1u : n) - i;
+        s.d.rx_bytes += seg;
+        xrec_on_rx(&s.b->xrec, &p[i], (uint16_t)seg);
+        i += seg;
+        if (s.entropy_fail) {
+            s.b->xrec.chal_active = 0u;
+            memset(s.b->xrec.nonce, 0, sizeof(s.b->xrec.nonce));
+            conn_close_request("BT XREC close: entropy not ready");
+            s.d.rx_dropped += n - i;
+            return;
+        }
+        if (!s.conn_open || s.conn_closing) {
+            s.d.rx_dropped += n - i;          /* closed by a send error inside xrec_proto: nothing more is served */
+            return;
+        }
     }
 }
 
@@ -747,8 +842,7 @@ static void drain_events(void)
 
         if (e.type == EV_DATA) {
             if (s.conn_open && e.handle == s.conn_handle && s.conn_authorized && !s.conn_closing && !s.entropy_fail) {
-                s.d.rx_bytes += n;
-                xrec_on_rx(&s.b->xrec, chunk, (uint16_t)n);
+                rx_feed(chunk, n);
             } else {
                 s.d.rx_dropped += n;
             }
@@ -801,7 +895,7 @@ static void apply_scan_mode(void)
     if (s.state != BT_XREC_ST_READY) {
         return;
     }
-    uint8_t want = s.window_open ? 2u : 1u;
+    uint8_t want = s.ssp_window ? 2u : 1u;
     if (want == s.scan_applied) {
         return;
     }
@@ -812,6 +906,18 @@ static void apply_scan_mode(void)
     } else {
         bt_xrec_plat_log_u32("BT XREC set_scan_mode failed (retrying)", (uint32_t)r);
     }
+}
+
+/* The whole session block goes back to the heap zeroed: besides xrec.key, the RX ring and xrec.rx_line still hold an
+ * XREC PAIR line ("+XREC:PAIR,<pin>,<64-hex key>") in plaintext, and the next allocation of that block would get it
+ * (review finding). volatile: the stores are not dropped as dead before the free. */
+static void wipe_free(bufs_t *b)
+{
+    volatile uint8_t *v = (volatile uint8_t *)b;
+    for (size_t i = 0u; i < sizeof(*b); i++) {
+        v[i] = 0u;
+    }
+    bt_xrec_plat_free(b);
 }
 
 static void free_session(void)
@@ -826,8 +932,7 @@ static void free_session(void)
     s.evq_lost = 0u;
     bt_xrec_plat_unlock();
     if (b != NULL) {
-        memset(&b->xrec.key, 0, sizeof(b->xrec.key));
-        bt_xrec_plat_free(b);
+        wipe_free(b);
     }
 }
 
@@ -848,7 +953,7 @@ int bt_shutdown(void)
         xrec_on_disconnect(&s.b->xrec);
     }
     conn_reset();
-    s.window_open = s.xrec_pin_issued = s.ssp_showing = 0u;
+    s.window_open = s.xrec_pin_issued = s.ssp_showing = s.ssp_window = 0u;
     s.reboot_mode = 0u;
     /* 2. graceful teardown in the worker; the app keeps the recorder serviced and enforces one absolute deadline. */
     s_spp_uninit_seen = 0u;
@@ -963,6 +1068,7 @@ void bt_xrec_open_pairing(uint32_t duration_ms)
         return;
     }
     s.window_open = 1u;
+    s.ssp_window = 1u;
     s.window_deadline = bt_xrec_plat_now_ms() + (duration_ms ? duration_ms : 60000u);
     /* XREC PIN from the DRBG (rejection sampling: no modulo bias). Fails closed: the SSP window still opens, but
      * XREC PAIR answers PAIRCLOSED until entropy is credited. */
@@ -1119,6 +1225,7 @@ void bt_xrec_get_debug(bt_xrec_debug_t *out)
     out->ssp_showing = s.ssp_showing;
     out->entropy_fail = s.entropy_fail;
     out->reboot_mode = s.reboot_mode;
+    out->ssp_window = s.ssp_window;
     out->conn_handle = s.conn_handle;
     out->tx_used = s.tx_head - s.tx_tail;
     out->inflight = s.inflight;
@@ -1146,7 +1253,7 @@ void bt_xrec_test_reset(void);
 void bt_xrec_test_reset(void)
 {
     if (s.b != NULL) {
-        bt_xrec_plat_free(s.b);
+        wipe_free(s.b);
     }
     memset(&s, 0, sizeof(s));
     s_spp_uninit_seen = 0u;
