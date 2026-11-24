@@ -35,6 +35,15 @@ typedef enum {
 } osi_alarm_err_t;
 
 #define ALARM_CBS_NUM   UC_ALARM_MAX_NUM
+
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+/* open_fw patch 0005: alarm generation (bumped by set/cancel/free) and the generation of the expiry being
+ * delivered. A callback that depends on "which arming" accepts the expiry only if they match under its own lock. */
+#include <stdint.h>
+struct alarm_t;
+uint32_t osi_alarm_generation(const struct alarm_t *alarm);
+uint32_t osi_alarm_delivery_gen(void);
+#endif
 #define ALARM_ID_BASE   1000
 
 int osi_alarm_create_mux(void);

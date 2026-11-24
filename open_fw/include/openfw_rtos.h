@@ -20,6 +20,7 @@ extern "C" {
 #define OPENFW_PRIO_BT_BTC   4u   /* Bluedroid BTC (profile callbacks)                    = configMAX_PRIORITIES - 6 */
 #define OPENFW_PRIO_BT_BTU   5u   /* Bluedroid BTU                                        = configMAX_PRIORITIES - 5 */
 #define OPENFW_PRIO_BT_DLV   6u   /* bt_dlv: controller RX rings -> host callback (may block) */
+#define OPENFW_PRIO_BT_ALARM 7u   /* bt_alarm deadline service (never blocks except waiting for work) */
 #define OPENFW_PRIO_BT_HCI   7u   /* Bluedroid hciT                                       = configMAX_PRIORITIES - 3 */
 #define OPENFW_PRIO_BT_CTRL  8u   /* bt_ctrl: sole owner of RW-BT ROM/EM, never blocks on the host */
 /* priority 9 = FreeRTOS timer daemon (configTIMER_TASK_PRIORITY = configMAX_PRIORITIES - 1) */

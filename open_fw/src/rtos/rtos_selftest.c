@@ -19,7 +19,7 @@
 
 enum {
     T_DELAY = 0, T_QUEUE, T_MUTEX_PI, T_TIMER, T_NOTIFY, T_EVENTGROUP,
-    T_HEAP, T_PREEMPT, T_FROM_ISR, T_STACK, T_REAP, T_BTDATA, T_MALLOCFAIL, T_COUNT
+    T_HEAP, T_PREEMPT, T_FROM_ISR, T_STACK, T_REAP, T_BTDATA, T_MALLOCFAIL, T_BTPORT, T_COUNT
 };
 
 typedef struct {
@@ -184,6 +184,21 @@ static void heap_victim(void *a)
     }
 }
 
+#if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID
+/* T_BTPORT: Bluedroid port glue on target (bt_alarm task, esp_timer shim, entropy gate). Declarations kept local:
+ * firmware sources do not include Bluedroid/bt_port headers. */
+typedef struct { void (*callback)(void *); void *arg; int dispatch_method; const char *name; _Bool skip; } st_timer_args_t;
+extern int bt_port_init(void (*flush)(void));
+extern int esp_timer_create(const st_timer_args_t *a, void **h);
+extern int esp_timer_start_once(void *h, unsigned long long us);
+extern _Bool esp_timer_is_active(void *h);
+extern int esp_timer_delete(void *h);
+extern void bt_port_alarm_drain(void);
+extern int bt_entropy_get(void *out, unsigned n);
+static volatile uint32_t g_bt_timer_hits;
+static void bt_timer_cb(void *a) { (void)a; g_bt_timer_hits++; }
+#endif
+
 static void selftest_main(void *arg)
 {
     (void)arg;
@@ -318,6 +333,35 @@ static void selftest_main(void *arg)
         }
 #else
         report(T_MALLOCFAIL, 1, 0u);
+#endif
+    }
+    /* T_BTPORT */
+    {
+#if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID
+        uint32_t step = 0u;
+        void *t = NULL;
+        uint8_t rnd[16];
+        st_timer_args_t a = { bt_timer_cb, NULL, 0 /* ESP_TIMER_TASK */, "st", 0 };
+        if (bt_port_init(NULL) == 0) step = 1u;
+        if (step == 1u && bt_entropy_get(rnd, sizeof(rnd)) == -1 /* BT_ENT_NOT_READY */) step = 2u;
+        if (step == 2u && esp_timer_create(&a, &t) == 0 && esp_timer_start_once(t, 5000u) == 0) step = 3u;
+        if (step == 3u) {
+            vTaskDelay(pdMS_TO_TICKS(3));
+            if (esp_timer_is_active(t) && g_bt_timer_hits == 0u) step = 4u;   /* not early */
+        }
+        if (step == 4u) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            if (!esp_timer_is_active(t) && g_bt_timer_hits == 0u) step = 5u; /* moved to pending by bt_alarm task */
+        }
+        if (step == 5u) {
+            bt_port_alarm_drain();                                          /* what BTC does after each message */
+            bt_port_alarm_drain();
+            if (g_bt_timer_hits == 1u) step = 6u;
+        }
+        if (t != NULL) (void)esp_timer_delete(t);
+        report(T_BTPORT, step == 6u, step);
+#else
+        report(T_BTPORT, 1, 0u);
 #endif
     }
     /* T_STACK: this task's high-water mark is sane (not overflowed, not untouched) */

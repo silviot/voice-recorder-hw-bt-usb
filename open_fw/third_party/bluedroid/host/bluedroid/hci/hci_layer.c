@@ -15,6 +15,9 @@
  *  limitations under the License.
  *
  ******************************************************************************/
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+#include "bt_port_hooks.h" /* open_fw patch 0007 */
+#endif
 #include <string.h>
 #include "sdkconfig.h"
 #include "common/bt_target.h"
@@ -502,6 +505,14 @@ static void command_timed_out(void *context)
     uint16_t opcode = 0;
 
     osi_mutex_lock(&cmd_wait_q->commands_pending_response_lock, OSI_MUTEX_MAX_TIMEOUT);
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+    /* open_fw patch 0007: the timer is (re)armed and cancelled only under this lock; an expiry from an older arming
+     * (cancelled or re-armed after the alarm drain validated it) must not be attributed to the current command. */
+    if (osi_alarm_delivery_gen() != osi_alarm_generation(cmd_wait_q->command_response_timer)) {
+        osi_mutex_unlock(&cmd_wait_q->commands_pending_response_lock);
+        return;
+    }
+#endif
     wait_entry = (list_is_empty(cmd_wait_q->commands_pending_response) ?
                   NULL : list_front(cmd_wait_q->commands_pending_response));
     if (wait_entry != NULL) {
@@ -518,6 +529,9 @@ static void command_timed_out(void *context)
         // If it's caused by a software bug, fix it. If it's a hardware bug, fix it.
     {
         HCI_TRACE_ERROR("%s hci layer timeout waiting for response to a command. opcode: 0x%x", __func__, opcode);
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+        bt_port_on_hci_command_timeout(opcode); /* open_fw patch 0007: feeds the BT fault / recovery ladder */
+#endif
     }
 }
 

@@ -22,6 +22,10 @@
 #include "osi/allocator.h"
 #include "osi/list.h"
 #include "esp_timer.h"
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+#include "bt_esp_timer.h"  /* open_fw patch 0005 */
+#include "bt_port_hooks.h"
+#endif
 #include "btc/btc_task.h"
 #include "btc/btc_alarm.h"
 #include "osi/mutex.h"
@@ -143,6 +147,13 @@ static void alarm_cb_handler(struct alarm_t *alarm)
         OSI_TRACE_WARNING("%s, invalid state %d\n", __func__, alarm_state);
         return;
     }
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+    /* open_fw patch 0005: the esp_timer shim delivers in BTC context (bt_alarm drain), already validated against
+     * the alarm generation; call directly instead of btc_transfer_context (which allocates and may block). */
+    if (alarm->cb != NULL) {
+        alarm->cb(alarm->cb_data);
+    }
+#else
     btc_msg_t msg = {0};
     btc_alarm_args_t arg;
     msg.sig = BTC_SIG_API_CALL;
@@ -150,7 +161,21 @@ static void alarm_cb_handler(struct alarm_t *alarm)
     arg.cb = alarm->cb;
     arg.cb_data = alarm->cb_data;
     btc_transfer_context(&msg, &arg, sizeof(btc_alarm_args_t), NULL, NULL);
+#endif
 }
+
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+/* open_fw patch 0005: compare under the caller's own lock (see bt_alarm.h). */
+uint32_t osi_alarm_generation(const osi_alarm_t *alarm)
+{
+    return (alarm != NULL) ? bt_esp_timer_generation(alarm->alarm_hdl) : 0u;
+}
+
+uint32_t osi_alarm_delivery_gen(void)
+{
+    return bt_port_alarm_delivery_gen();
+}
+#endif
 
 osi_alarm_t *osi_alarm_new(const char *alarm_name, osi_alarm_callback_t callback, void *data, period_ms_t timer_expire)
 {

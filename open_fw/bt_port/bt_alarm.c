@@ -247,6 +247,11 @@ uint32_t bt_alarm_delivery_gen(void)
     return g.delivery_gen;
 }
 
+uint64_t bt_alarm_now_us(void)
+{
+    return g.p.now_us();
+}
+
 void bt_alarm_get_stats(bt_alarm_stats_t *out)
 {
     g.p.enter();

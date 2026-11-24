@@ -4,6 +4,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+#include "bt_port_hooks.h" /* open_fw patch 0006 */
+#endif
 #include <stdlib.h>
 #include <string.h>
 #include "btc/btc_task.h"
@@ -329,7 +332,25 @@ static void btc_thread_handler(void *arg)
     }
 
     osi_free(msg);
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+    bt_port_alarm_drain(); /* open_fw patch 0006: guaranteed alarm delivery even when the drain post failed */
+#endif
 }
+
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+/* open_fw patch 0006: allocation-free (work item copied by value), non-blocking post of an alarm drain. A failure
+ * means the BTC queue is full; btc_thread_handler drains after every message, so no expiry is lost. */
+static void btc_alarm_drain_work(void *ctx)
+{
+    (void)ctx;
+    bt_port_alarm_drain();
+}
+
+bool btc_post_alarm_drain(void)
+{
+    return btc_thread != NULL && osi_thread_post(btc_thread, btc_alarm_drain_work, NULL, 0, 0);
+}
+#endif
 
 static bt_status_t btc_task_post(btc_msg_t *msg, uint32_t timeout)
 {

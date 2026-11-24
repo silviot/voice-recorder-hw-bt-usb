@@ -83,4 +83,7 @@ uint32_t bt_alarm_delivery_gen(void);
 
 void bt_alarm_get_stats(bt_alarm_stats_t *out);
 
+/* The platform clock (for the esp_timer shim's esp_timer_get_time). */
+uint64_t bt_alarm_now_us(void);
+
 #endif /* BT_ALARM_H */

@@ -49,8 +49,12 @@ $(BUILD_DIR)/third_party/bluedroid/host/bluedroid/btc/profile/std/spp/btc_spp.o:
 
 # ---- firmware link inputs (BT=1) ---------------------------------------------------------------
 # Archive names matter: sl6801_firm.ld routes *libbluedroid.a: / *libbt_port.a: .data/.bss into .bt_data/.bt_bss.
-FW_PORT_SRCS := $(ROOT)/bt_port/bt_port_fw_stubs.c
+FW_PORT_SRCS := $(ROOT)/bt_port/bt_port_fw_stubs.c $(ROOT)/bt_port/bt_port_glue.c $(ROOT)/bt_port/bt_alarm.c \
+                $(ROOT)/bt_port/bt_esp_timer.c $(ROOT)/bt_port/bt_entropy.c $(ROOT)/bt_port/bt_drbg.c \
+                $(ROOT)/bt_port/bt_store.c
 FW_PORT_OBJS := $(patsubst $(ROOT)/%.c,$(BUILD_DIR)/%.o,$(FW_PORT_SRCS))
+# Port objects also see open_fw/include (openfw_crypto.h, openfw_rtos.h); Bluedroid objects do not.
+$(FW_PORT_OBJS): CFLAGS += -I$(ROOT)/include
 fw: $(BUILD_DIR)/libbluedroid.a $(BUILD_DIR)/libbt_port.a $(BUILD_DIR)/bt_link_roots.o
 $(BUILD_DIR)/libbluedroid.a: $(OBJS)
 	@rm -f $@
