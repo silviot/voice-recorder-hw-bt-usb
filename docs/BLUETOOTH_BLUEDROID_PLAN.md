@@ -1,6 +1,6 @@
 # Bluetooth Classic via Espressif Bluedroid — Integration Plan
 
-Status: **plan / not started**. Goal: two modes on the SL6801 (BR/EDR only, ROM `RW-BT` controller):
+Status: **in progress** on branch `feat/freertos-bluedroid` (worktree `../voice-recorder-hw-bt-usb-bt`). See §8 for the live log. Goal: two modes on the SL6801 (BR/EDR only, ROM `RW-BT` controller):
 1. **Headphones**: A2DP Source (SBC) + AVRCP Target (+ AVRCP controller for headset buttons optional).
 2. **Phone companion**: SPP (RFCOMM) carrying the existing `+XREC v5` protocol (`xrec_proto.c`).
 
@@ -31,10 +31,48 @@ Open question: BT stack on CPU0 (with FreeRTOS) vs CPU1 (currently the LVGL work
 
 ## 3. Memory budget (must be written down before coding)
 
-SRAM: main `0x0081A380 +0x35C80` (~220 KB), `SRAM_HI` 44 KB (file list), `_ebss < 0x00850000`.
+**Correction (2026-11-24):** open_fw links only into part of the SoC SRAM. Physical SRAM is 512 KB
+(`0x00800000..0x0087FFFF`, see `FIRMWARE_ANALYSIS.md` §17; the stock firmware ran a 291 KB FreeRTOS heap plus
+two secondary heaps up to `0x87FFFF`). Free for open_fw: `0x0086B000..0x00880000` (84 KB, now the `.rtos_heap`
+region in `sl6801_firm.ld`) and `0x00805C00..0x0081A37F` (~84 KB, candidate second heap_5 region — needs a
+hardware check that nothing else uses it). Main SRAM below `0x850000` has only ~5 KB left (RTOS build).
+**Hardware experiment 0:** fill both regions with a pattern, run BT bring-up + UI + recording for a while, verify
+pattern intact and that writes/reads above `0x86B000` work.
 Targets to fill in from Phase 1 measurement: Bluedroid heap, 3 task stacks, SBC encoder state, A2DP PCM ring, RFCOMM buffers. Use a dedicated static heap arena for BT (`osi_malloc` → arena), with a high-water-mark counter exposed in the telemetry log, and `BT_BLUEDROID_MEM_DEBUG`-style leak checks in host tests.
 
 Flash: XIP 2 MB image; track `.text` growth per phase in CI via `size -A`.
+
+## 3b. Freestanding runtime (no libc today)
+
+The build is `clang --target=thumbv7em -ffreestanding -fno-builtin` with `ld.lld` and no libc; `startup.c` has a few
+`__aeabi_mem*`/64-bit div helpers. Kernel needs only `memcpy/memset/memmove/memcmp/strlen/strncpy`
+(provisional weak impls in `src/rtos/libc_min.c`). Bluedroid needs much more (snprintf, qsort?, string ops, assert).
+Decision pending the Phase 1 evidence: **picolibc + matching compiler-rt/libgcc** (Codex's and my preference) vs a tiny
+in-tree libc. Overlaps with `startup.c` helpers must be resolved deliberately (`__aeabi_memset` arg order differs).
+
+## 3c. Findings from the Codex review (kept as design rules)
+
+1. **One controller-owner task** owns every RW-BT ROM call (`rom_ke_*`, EM, controller start/stop). IRQ 26 only acks and
+   notifies it. Other tasks enqueue commands/ACL to it; it copies typed H4 packets to the HCI thread. Don't hold a mutex
+   around `rom_ke_msg_send` alone — alloc/credit/teardown must be inside the same owner.
+2. **`eif_write` completion**: copy the full H4 packet into an owned RX buffer *before* completing, because event 5
+   frees the ke message / EM and may reuse headroom.
+3. **HCI init deadlock risk** (top risk): `Reset` completion is synthesized without resetting the controller; opcodes
+   `0x1001`/`0x1005` have command mappings but no completion packer; unknown ROM messages are silently consumed;
+   `g_openfw_cmd_tbl` covers only ~21 opcodes. => Build an opcode/event compatibility matrix (see
+   `docs/BT_HCI_MATRIX.md`) and probe on hardware before Bluedroid bring-up.
+4. **Lost baseband IRQs**: IRQ bits coalesce; bottom half only handles bits 0, 1, 10. Instrument raw status and latency.
+5. **Flow control**: three distinct signals (HAL queue space, command credits, ACL credits via Number Of Completed
+   Packets). Start with 1 outstanding command.
+6. **Watchdog**: `wdt_feed()` must not come from tick/idle (would mask a hung BT task). Supervisor feeds after task
+   heartbeats. Experiment keep-alive must be separated from hardware feeding.
+7. **Teardown**: close admission, stop producers, cancel alarms, drain, then reset RW-BT in its owner; reject stale
+   callbacks from the previous session.
+8. **Storage/recorder reentrancy**: queue exFAT/recorder operations from BT callbacks to the app/storage owner.
+9. **A2DP pacing**: the player is paced by DAC frames; add an output-sink boundary feeding an owned PCM ring at the
+   media clock; AVRCP *Target* role for headset buttons.
+10. **Bond migration / snoop**: redact link keys and XREC payloads from persistent HCI traces.
+11. **Compile-only ELF gives a false RAM pass** (GC drops unused profiles): link real entry points and add dynamic arenas.
 
 ## 4. Phased work, each with a gate
 
@@ -99,3 +137,10 @@ Rule: nothing goes to hardware before its host gate is green. Existing gate: `ma
 
 - Exp 1: ROM controller supports standard HCI command set needed by Bluedroid init (`Read_Local_Supported_Commands`, `Read_Buffer_Size`, `Write_Simple_Pairing_Mode`, etc.): run a scripted HCI command list through the current glue and log each Command Complete status.
 - Exp 2–3 as in phases above.
+
+## 8. Live log
+
+- 2026-11-24: FreeRTOS-Kernel V11.1.0 vendored (`third_party/freertos`), `RTOS=1` build links (+~7 KB flash, +~3 KB .bss).
+  Default `RTOS=0` build is byte-identical to baseline (FIRM CRC `0xBE11`). SysTick stays owned by `startup.c`;
+  `openfw_rtos_tick()` bridges to `xPortSysTickHandler()`. SVC/PendSV vectors wired under `OPENFW_RTOS`.
+- QEMU SL6801 emulator is used to validate scheduler start-up on the real Cortex-M4F code path.

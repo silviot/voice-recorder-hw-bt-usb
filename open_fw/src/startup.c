@@ -108,7 +108,12 @@ void fault_handler_c(const uint32_t *frame, uint32_t ipsr)
     uint32_t faddr = (uint32_t)(uintptr_t)frame;
     uint32_t lr    = 0xDEAD57ACu;
     uint32_t pc    = 0xDEAD57ACu;
+#if OPENFW_RTOS
+    /* Task stacks live in the .rtos_heap region (up to 0x00880000), not only below _estack. */
+    if ((faddr & 3u) == 0u && faddr >= 0x00800000u && faddr <= (0x00880000u - 28u)) {
+#else
     if ((faddr & 3u) == 0u && faddr >= 0x00800000u && faddr <= (0x0086AC08u - 28u)) {
+#endif
         lr = frame[5];
         pc = frame[6];
     }
