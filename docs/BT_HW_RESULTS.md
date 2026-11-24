@@ -218,6 +218,25 @@ Bench images `ac4a61e` (run 2, `secs=360 pair_every=60`) and `ac4a61e` + the `BT
 | Memory | heap free min 61,608 B, `mallocfail 0`; lowest stack headroom bt_dlv 313 words, hciT 425 words |
 | ROM link bytes | LC state per slot: `00` free ↔ `03` scanning (flaps at the scan rate — filtered for logging after run 2 flooded the 8 KiB bench log, `lost=60858`), `0A`/`62`/`29`/`3A`/`82` connection setup, `6A` pairing, `05` connected, `26` during L2CAP/RFCOMM teardown; LD `01` connected, `FF` free; `rep` `01` while a link exists |
 
+## Session 6 (2026-11-24): confirm prompt with a person at the device — PASS
+
+Release `BT=1` image at `488da72` (FIRM CRC-16 0x4E20), entered through the Bluetooth tile, window opened with ENTER;
+laptop BlueZ `agent DisplayYesNo`. A person pressed the keys and read the screen.
+
+| Test | Result |
+|---|---|
+| Window | first ENTER... screen `Cassini_1D` but no PIN and the laptop could not find the device (the tile only shows the name; the window needs ENTER) → ENTER: XREC PIN `213197` shown, device discoverable |
+| Accept (ENTER) | device prompt `333198` = laptop passkey; peer shown as **address, no name**; ENTER → laptop `Paired: yes, Bonded: yes`; XREC `--pair 213197` bound; screen `verbunden` |
+| Reject (BACK) | prompt `194890` = laptop; BACK → laptop `AuthenticationFailed`, device **stays in BT mode** |
+| Timeout | prompt `987079`; `Pair?` countdown to 0 → laptop `AuthenticationFailed`; screen back to the window with the PIN, which disappeared when the 60 s window ended |
+| REC slide in BT mode | leaves BT mode and records (`REC_0028.cwx`, 83 KB for ~5 s) |
+| BACK without a prompt | leaves BT mode (expected; the operator pressed it before the laptop had started pairing) |
+
+Findings (to fix): (1) the prompt showed the laptop's address, not its name: the first-pairing remote-name request
+evidently fails or comes too late on silicon (patch 0028 already copes with the failure; check the `0419` path / ROM
+name request). (2) After the rejected pairing the status line still said `verbunden` although the laptop had
+disconnected. The ring log was lost to a power cycle (the operator rebooted to get USB), so neither has device logs yet.
+
 Open: why the ROM sometimes keeps a dead link for ~40 s after a remote detach (H1/H2 in `docs/BT_ROM_HCI_MAP.md` §11).
 The next occurrence on a filtered-log bench image will show the LC/LD bytes and which command hit `fwd_to`.
 Not yet on silicon: the on-device confirm prompt (needs a person: ENTER/BACK), the mismatched-public-key image
