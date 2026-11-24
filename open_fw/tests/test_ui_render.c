@@ -740,7 +740,7 @@ int main(int argc, char **argv)
          * Polish, Czech, Hungarian, Romanian, German, Italian) to verify zero layout/heap issues */
         static const uint8_t sample_langs[] = {
             UI_LANG_IT, UI_LANG_FR, UI_LANG_DE, UI_LANG_PL,
-            UI_LANG_CS, UI_LANG_HU, UI_LANG_BG, UI_LANG_RO
+            UI_LANG_CS, UI_LANG_HU, UI_LANG_BG, UI_LANG_RO, UI_LANG_RU
         };
         for (size_t li = 0u; li < sizeof(sample_langs) / sizeof(sample_langs[0]); li++) {
             m.cfg.lang   = sample_langs[li];
