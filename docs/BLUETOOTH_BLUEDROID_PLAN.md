@@ -679,6 +679,47 @@ secret of ~33 predictable bits: bench-only waiver, see the review-round entry be
   scan_refused notes_lost`) at a fault, at stop and in every BENCH status, for the hypothesis that `bt_ctrl` dropped an
   E458. (g) `BT ROM links` change logging is bench-image only and keyed on LC/LD bytes. (h) §11's `0406` mapping
   fixed: a silent ROM shows as `st=0x22 local` after 7 s, not `0x02`.
+- 2026-11-24 (silicon session 6 follow-up, host-only; release `BT=1` at `488da72`, laptop BlueZ, first pairing, no
+  device log: the ring log was lost to a power cycle). (1) **Prompt showed the address, not "martianbfg".** Code path
+  (proven on the host, not on silicon): on an incoming link whose name is unknown BTM sends its own `0419` at Connection
+  Complete (`btm_sec_connected` -> `btm_sec_execute_procedure` -> `btm_sec_start_get_name`, origin SEC: its answer goes
+  to BTM only, never to BTA/BTC). BlueZ authenticates at once; when the User Confirmation Request comes while that
+  request still runs, BTA's own `0419` (`bta_dm_sp_cback`, patch 0028 path) and the session's (`request_name`) are
+  refused by the ROM with CS `0x0C` (RNR already running, `0x3F348`, env `+0x217`, `BT_ROM_HCI_MAP.md` §2): the prompt
+  comes nameless and nobody asks again, so the late success never reaches the screen. Unproven on silicon: whether
+  BTM's request was late (this path) or failed outright (no name ever; the address is then correct), or the ROM SAVED
+  it (`st=0x22 local` after 7 s). **Fix:** `bt_ctrl` notes every `0419` answer and every Remote Name Request Complete
+  and keeps the newest successful name (`bt_ctrl_peer_name`, BD_ADDR order); the session takes it on the note and the
+  prompt's peer line changes from the address to the name in place (digits unchanged). Inquiry/EIR names are
+  irrelevant: the device never inquires. (2) **"verbunden" after BACK.** The screen's "connected" was `acl_links > 0`
+  (GAP link events) or SPP open. After a rejected comparison BTM disconnects the link itself (`btm_simple_pair_complete`
+  -> `0406` reason `0x05`; host log `BT HCI disconnect cmd`), and the laptop drops at the same time: a link-end with
+  a late or missing Disconnection Complete (`BT_ROM_HCI_MAP.md` §11 H1/H2, open) keeps `acl_links` at 1. Proven on the
+  host that such a link stays "connected" indefinitely; unproven that this is what happened on silicon (no log).
+  **Fix:** a link whose `0406` the host sent (bt_ctrl DISC_CMD note, any answer) no longer counts as connected for the
+  screen (`bt_xrec_get_ui().connected`, `bt_status_t.acl_connected`); `acl_links` (scan-mode rule) is unchanged until
+  the link-down event. **Tests** (each fails without its fix, checked): phone P16b (fake ROM: `fake_peer.name_hold` /
+  `fake_peer_name_release`, `0x0C` while one is held; BACK with `defer_detach`), `test_bt_xrec` [22],
+  `test_bt_ctrl name_notes`; `test_ui_render` BT=1 checks the in-place name update and the waiting line after BACK.
+  **New session-log lines:** `BT HCI name request st=.. rom|local`, `BT HCI name complete st=.. len=N`, `BT SSP prompt
+  shows the peer name, ms after the prompt N`, `BT SSP prompt ended without the peer name (address shown)`. Next
+  silicon run: first pairing with a laptop the device has not seen (`bluetoothctl remove` on both sides) and read the
+  order of `connection complete` / `name request` / `name complete` / `waiting for the user`; after BACK expect
+  `disconnect cmd` and then (or never) `disconnection complete`, while the screen already shows the window line.
+- 2026-11-24 (review of the session 6 follow-up, host-only). (a) A `0406` note drained before its own GAP link-up
+  event (both in one poll, notes first) is kept for that handle and applied when the link comes up; the handle's next
+  Connection Complete note or its link-down clears it (`test_bt_xrec` [23]). (b) `bt_ctrl` stores the remote name
+  before it queues the name note, so a task popping the note always finds it (`test_bt_ctrl name_before_note`). (c) a
+  successful name complete with an empty name no longer applies the older stored name to the current peer. (d) the
+  "ended without the peer name" line is not written when the name reached the screen through the poll's last note
+  drain. (e) `bt_ctrl` link-note ring 8 -> 16 (a pairing adds up to four name notes). (f) `BENCH status` keeps
+  `acl=` (now the screen's "connected", which hides a link the host is closing) and adds `links=` / `closing=` (raw
+  ACL count, links with `0406` sent), so the H1/H2 check reads `links=1 closing=1` where it read `acl=1`. **Choice:**
+  the closing mark is set whatever the `0406` answer; a refused `0406` (`0x0C`) or a local deadline answer (`0x22`) can
+  then show a live link as not connected until it is reported down or SPP opens. **Not covered:** if the laptop drops
+  first and BTM's `0406` is refused (`0x02`, marked) or never sent, and the Disconnection Complete is also lost, the
+  screen still shows "connected". **Silicon check list:** after BACK read `disconnect cmd` (status, rom/local), the
+  `BENCH status` `links=` / `closing=`, and `notes_lost` in the ctrl stats line (a lost note silently undoes (a)-(c)).
 
 ## 11. Round-1 traceability
 

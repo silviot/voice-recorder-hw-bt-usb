@@ -1755,6 +1755,72 @@ int bth_phone_scenario(const char *img_path)
         PCHECK(WAIT(S().d.acl_links == 0u && !S().ui.connected, 3000), "B link not down");
     }
 
+    /* ---- 16b ---- */
+    /* Silicon session 6 (docs/BT_HW_RESULTS.md): first pairing with a laptop the device knew no name for. (1) the prompt
+     * showed its address: BTM's own name request at link set-up (btm_sec_connected -> btm_sec_start_get_name) was
+     * still running when the User Confirmation Request came, so BTA's request (bta_dm_sp_cback) and the session's were
+     * refused (ROM: RNR already running -> CS 0x0C) and the late answer reached BTM only. (2) after BACK the screen kept
+     * "verbunden": BTM disconnects a link whose pairing failed (0406 after Simple Pairing Complete), and no
+     * Disconnection Complete came while the user looked (modelled: the ROM never reports the link's end). */
+    bth_log("[P16b] laptop E (name unknown) pairs; BTM's link set-up name request answers only during the prompt (later "
+            "requests refused 0x0C): address first, then the name in place; BACK, the device disconnects and the ROM "
+            "never reports the end: not \"connected\"\n");
+    {
+        PCHECK(S().d.ssp_window, "window closed before E");
+        fake_peer_cfg_t e;
+        peer_cfg(&e, 0xE5u, 0x01u, 0x05u, 0x05u, "laptop-E");
+        peer_attach(&e, NULL);
+        bth_rom_lock();
+        fake_peer.name_hold = true;
+        bth_rom_unlock();
+        if (!peer_page_and_connect()) {
+            goto out;
+        }
+        PCHECK(fake_peer.name_held, "no name request at link set-up");
+        PCHECK(S().ui.connected && S().st.acl_connected, "E's link not shown as connected");
+        char want[8];
+        snprintf(want, sizeof(want), "%06u", (unsigned)(e.numeric % 1000000u));
+        peer_authenticate();
+        PCHECK(WAIT(S().ui.prompt && strcmp(S().ui.digits, want) == 0, 3000), "prompt with E's value %s ('%s')", want,
+               S().ui.digits);
+        vTaskDelay(pdMS_TO_TICKS(300));                /* the session's own name request is refused meanwhile */
+        bthx_snap_t s1 = S();
+        PCHECK(s1.ui.prompt && !s1.ui.peer_is_name && strchr(s1.ui.peer, ':') != NULL, "prompt peer before the name "
+               "'%s', want the address", s1.ui.peer);
+        PCHECK(fake_peer.name_refused >= 2u && s1.d.name_failed >= 1u, "later name requests not refused (%u, session "
+               "failures %u)", fake_peer.name_refused, s1.d.name_failed);
+        bth_rom_lock();
+        fake_peer_name_release();                      /* the link set-up request completes, prompt still up */
+        bth_rom_unlock();
+        bth_ctrl_kick();
+        PCHECK(WAIT(S().ui.prompt && strcmp(S().ui.peer, "laptop-E") == 0, 2000), "prompt peer '%s' after the late "
+               "name, want laptop-E in place of the address", S().ui.peer);
+        PCHECK(S().ui.prompt && strcmp(S().ui.digits, want) == 0, "prompt digits changed under the name update");
+        vTaskDelay(pdMS_TO_TICKS(BT_XREC_SSP_ARM_MS + 50u));
+        bth_rom_lock();
+        fake_peer.defer_detach = true;                 /* the device's 0406 gets CS 0, no Disconnection Complete */
+        bth_rom_unlock();
+        PCHECK(bthx_call(BTHX_SSP_ANSWER, 0u, 2000u) == 0, "BACK on E's prompt");
+        PCHECK(WAIT(fake_peer.host_rejects == 1u, 3000) && fake_peer.pairings == 0u, "E: no negative reply");
+        PCHECK(WAIT(fake_peer.detach_deferred >= 1u, 3000), "the device did not disconnect E after the rejection");
+        PCHECK(WAIT(!S().ui.connected && !S().st.acl_connected, 2000), "screen still \"connected\" after BACK (ui %u "
+               "status %u, acl_links %u)", S().ui.connected, S().st.acl_connected, S().d.acl_links);
+        PCHECK(S().d.acl_links == 1u && S().d.acl_closing == 1u, "link counted until reported down (acl %u closing %u)",
+               S().d.acl_links, S().d.acl_closing);
+        bth_rom_lock();
+        fake_peer.defer_detach = false;
+        fake_peer_disconnect(0x08u);                   /* the ROM's supervision timeout ends it */
+        bth_rom_unlock();
+        bth_ctrl_kick();
+        PCHECK(WAIT(S().d.acl_links == 0u && S().d.acl_closing == 0u && !S().ui.connected, 3000), "E link not down "
+               "(acl %u closing %u)", S().d.acl_links, S().d.acl_closing);
+        PCHECK(S().d.ssp_window && S().bonds == 1, "after E: window %u, bonds %d (want only A)", S().d.ssp_window,
+               S().bonds);
+    }
+    if (p_fail) {
+        goto out;
+    }
+
     /* ---- 17 ---- */
     bth_log("[P17] BENCH autoconfirm (SD:/BTBENCH.RUN autoconfirm=1): laptop D accepted without the user; D: XREC "
             "CHAL/AUTH twice, GETS\n");

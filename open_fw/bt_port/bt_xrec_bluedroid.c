@@ -104,6 +104,17 @@ static struct {
     uint32_t ssp_deadline;
     bda_slot_t cfm_ok, auth_ok, reject;    /* accepted numeric comparison, accepted MITM bond, policy reject */
     uint32_t acl_links;
+    /* ACL handles from the GAP link events; closing = the host sent 0406 for it (bt_ctrl DISC_CMD note). Silicon
+     * session 6: after a rejected pairing BTM disconnected the link but the screen kept "connected": a link the host is
+     * ending is not shown as connected even while its Disconnection Complete is late or missing (BT_ROM_HCI_MAP §11). */
+    struct {
+        uint16_t h;
+        uint8_t  used, closing;
+    } links[4];
+    /* a 0406 note for a handle whose GAP link-up is still queued (notes drain first): applied by link_up(); cleared by
+     * the handle's next Connection Complete note (a new link) or its link-down */
+    uint16_t disc_early_h;
+    uint8_t  disc_early;
     bda_slot_t acl_peer;                   /* newest ACL peer (UI) */
     bda_slot_t name_asked;                 /* esp_bt_gap_read_remote_name() already sent for this peer */
     /* local numeric-comparison prompt (plan M4) */
@@ -111,6 +122,7 @@ static struct {
     uint8_t  cfm_bda[6];
     char     cfm_digits[8];
     uint32_t cfm_val, cfm_t0;
+    uint8_t  cfm_named;                    /* the prompt peer's name became known (logged once per prompt) */
     uint8_t  cfm_ended;                    /* a prompt ended (answered, rejected, withdrawn) at cfm_end_t */
     uint32_t cfm_end_t;
     /* A pairing this session accepted (cfm_ok) that then failed: the peer saw the result of the DHKey check, which the
@@ -416,6 +428,10 @@ static void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *p)
     case ESP_BT_GAP_READ_REMOTE_NAME_EVT:
         if (p->read_rmt_name.stat == ESP_BT_STATUS_SUCCESS) {
             name_put(p->read_rmt_name.bda, p->read_rmt_name.rmt_name, sizeof(p->read_rmt_name.rmt_name));
+        } else {
+            bt_xrec_plat_lock();
+            s.d.name_failed++;
+            bt_xrec_plat_unlock();
         }
         return;
     case ESP_BT_GAP_ACL_CONN_CMPL_STAT_EVT:
@@ -690,6 +706,78 @@ static void request_name(const uint8_t bda[6])
     }
 }
 
+/* Silicon session 6: the prompt showed the address, the name never came. One line per prompt says whether and when
+ * the name became known (with the HCI "name request" / "name complete" notes this shows which request failed). */
+static void prompt_name_poll(uint32_t now)
+{
+    if (s.cfm_pending && !s.cfm_named && name_known(s.cfm_bda)) {
+        s.cfm_named = 1u;
+        bt_xrec_plat_log_u32("BT SSP prompt shows the peer name, ms after the prompt", now - s.cfm_t0);
+    }
+}
+
+static void prompt_end_log(void)
+{
+    if (!s.cfm_named && !name_known(s.cfm_bda)) {   /* a name drained at the end of the poll is already shown */
+        bt_xrec_plat_log("BT SSP prompt ended without the peer name (address shown)");
+    }
+}
+
+static int link_find(uint16_t h)
+{
+    for (int i = 0; i < (int)(sizeof(s.links) / sizeof(s.links[0])); i++) {
+        if (s.links[i].used && s.links[i].h == h) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void link_up(uint16_t h)
+{
+    int i = link_find(h);
+    for (int j = 0; i < 0 && j < (int)(sizeof(s.links) / sizeof(s.links[0])); j++) {
+        if (!s.links[j].used) {
+            i = j;
+        }
+    }
+    if (i >= 0) {                          /* more links than slots: the extra ones always count as connected */
+        s.links[i].used = 1u;
+        s.links[i].h = h;
+        s.links[i].closing = 0u;
+        if (s.disc_early && s.disc_early_h == h) {
+            s.links[i].closing = 1u;       /* the host's 0406 for this link was noted before its link-up event */
+            s.disc_early = 0u;
+        }
+    }
+}
+
+static void link_down(uint16_t h)
+{
+    int i = link_find(h);
+    if (i >= 0) {
+        s.links[i].used = 0u;
+    }
+    if (s.disc_early && s.disc_early_h == h) {
+        s.disc_early = 0u;
+    }
+}
+
+static uint32_t links_closing(void)
+{
+    uint32_t n = 0u;
+    for (uint32_t i = 0u; i < sizeof(s.links) / sizeof(s.links[0]); i++) {
+        n += (s.links[i].used && s.links[i].closing) ? 1u : 0u;
+    }
+    return n;
+}
+
+/* What the screen calls "connected": SPP open, or an ACL link the host is not ending. */
+static bool ui_connected(void)
+{
+    return s.acl_links > links_closing() || (s.conn_open && !s.conn_closing);
+}
+
 static void cfm_reply(const uint8_t bda[6], bool accept)
 {
     esp_err_t r = esp_bt_gap_ssp_confirm_reply((uint8_t *)bda, accept);
@@ -716,6 +804,7 @@ static void prompt_withdraw(const char *why)
     s.cfm_end_t = bt_xrec_plat_now_ms();
     s.d.ssp_withdrawn++;
     bt_xrec_plat_log(why);
+    prompt_end_log();
 }
 
 /* The pending prompt ends with a negative reply. */
@@ -731,6 +820,7 @@ static void prompt_reject(const char *why)
     s.cfm_ended = 1u;
     s.cfm_end_t = bt_xrec_plat_now_ms();
     bt_xrec_plat_log(why);
+    prompt_end_log();
 }
 
 static void on_cfm_req(const ev_t *e)
@@ -780,12 +870,14 @@ static void on_cfm_req(const ev_t *e)
         return;
     }
     s.cfm_pending = 1u;
+    s.cfm_named = 0u;
     memcpy(s.cfm_bda, e->bda, 6u);
     s.cfm_val = e->val % 1000000u;
     digits6(s.cfm_digits, e->val);
     s.cfm_t0 = bt_xrec_plat_now_ms();
     bt_xrec_plat_log_u32("BT SSP numeric comparison waiting for the user (ENTER/BACK, 30 s), value", s.cfm_val);
     request_name(e->bda);
+    prompt_name_poll(s.cfm_t0);
 }
 
 /* Window closed or prompt timed out (bt_xrec_poll). */
@@ -794,6 +886,7 @@ static void prompt_poll(uint32_t now)
     if (!s.cfm_pending) {
         return;
     }
+    prompt_name_poll(now);
     if (!s.ssp_window || s.state != BT_XREC_ST_READY) {
         prompt_reject("BT SSP numeric comparison rejected: pairing window closed while waiting for the user");
     } else if (now - s.cfm_t0 >= BT_XREC_SSP_PROMPT_MS) {
@@ -869,6 +962,7 @@ static void on_gap_event(const ev_t *e)
     case EV_ACL_CONN:
         if (e->status == ESP_BT_STATUS_SUCCESS) {
             s.acl_links++;
+            link_up((uint16_t)e->handle);
             slot_set(&s.acl_peer, e->bda);
         }
         break;
@@ -876,6 +970,7 @@ static void on_gap_event(const ev_t *e)
         if (s.acl_links > 0u) {
             s.acl_links--;
         }
+        link_down((uint16_t)e->handle);
         if (s.scan_refused) {
             s.scan_retry_at = bt_xrec_plat_now_ms();   /* apply_scan_mode() sends the wanted mode again this poll */
         }
@@ -1159,13 +1254,43 @@ static void ctrl_notes_drain(void)
 {
     char line[BT_XREC_NOTE_LINE];
     for (int i = 0; i < 8; i++) {
-        uint8_t arg = 0u;
-        int kind = bt_xrec_plat_ctrl_note(line, sizeof(line), &arg);
+        bt_xrec_note_t n = { 0 };
+        int kind = bt_xrec_plat_ctrl_note(line, sizeof(line), &n);
         if (kind == 0) {
             return;
         }
+        uint8_t arg = n.arg;
         s.d.ctrl_notes++;
         bt_xrec_plat_log(line);
+        if (kind == (int)BT_XREC_NOTE_DISC_CMD) {
+            /* the host is ending this link (a rejected or failed pairing, idle, policy): whatever the controller
+             * answered, the screen stops calling it connected; the GAP link-down event removes it. Any status on
+             * purpose (BT_ROM_HCI_MAP §11 H1/H2: 0x02 = the link is already gone). A refused 0406 (0x0C) or a local
+             * deadline answer (0x22) may leave a live link shown as not connected until it is reported down or SPP
+             * opens: preferred over a "connected" that may never clear. */
+            int li = link_find(n.handle);
+            if (li >= 0) {
+                s.links[li].closing = 1u;
+            } else {                       /* its GAP link-up is still queued behind this note (same poll) */
+                s.disc_early_h = n.handle;
+                s.disc_early = 1u;
+            }
+        } else if (kind == (int)BT_XREC_NOTE_CONN) {
+            if (s.disc_early && s.disc_early_h == n.handle) {
+                s.disc_early = 0u;         /* a new link on that handle: an older 0406 mark is stale */
+            }
+        } else if (kind == (int)BT_XREC_NOTE_NAME && n.status == 0u && arg != 0u) {
+            /* any successful name request (BTM's own at link set-up answers late on silicon, and only BTM sees it):
+             * the prompt shows the name in place of the address from now on. An empty name is not kept by bt_ctrl,
+             * whose newest stored name then belongs to an older peer: skipped (arg = name length). Two queued name
+             * notes both apply the newest name; the session keeps one name slot, so the end state is the same. */
+            uint8_t bda[6];
+            char nm[BT_XREC_PEER_NAME_MAX];
+            if (bt_xrec_plat_ctrl_name(bda, nm, sizeof(nm))) {
+                name_put(bda, (const uint8_t *)nm, sizeof(nm));
+                s.d.names_from_ctrl++;
+            }
+        }
         if (kind == (int)BT_XREC_NOTE_SCAN_REFUSED) {
             s.d.scan_refused++;
             s.scan_refused = 1u;
@@ -1299,6 +1424,7 @@ int bt_shutdown(void)
     s.scan_applied = 0u;
     s.scan_refused = s.scan_failsafe = s.scan_disc_sent = s.scan_want_sent = 0u;
     s.acl_links = 0u;
+    memset(s.links, 0, sizeof(s.links));
     s.cfm_ok.valid = s.auth_ok.valid = s.reject.valid = s.acl_peer.valid = s.name_asked.valid = 0u;
     free_session();
     if (reason != BT_XREC_FAULT_NONE) {
@@ -1565,7 +1691,7 @@ void bt_xrec_get_status(bt_status_t *out)
     memset(out, 0, sizeof(*out));
     out->active = (uint8_t)(s.state == BT_XREC_ST_UP || s.state == BT_XREC_ST_CONFIG || s.state == BT_XREC_ST_READY);
     out->hci_ready = (uint8_t)(s.state == BT_XREC_ST_READY);
-    out->acl_connected = (uint8_t)(s.acl_links > 0u || s.conn_open);
+    out->acl_connected = (uint8_t)ui_connected();   /* the BT screen's "connected" (main.c bt_state) */
     out->spp_open = (uint8_t)(s.conn_open && !s.conn_closing);
     if (s.b != NULL) {
         out->xrec_bound = s.b->xrec.bound;
@@ -1612,6 +1738,7 @@ void bt_xrec_get_debug(bt_xrec_debug_t *out)
     out->tx_used = s.tx_head - s.tx_tail;
     out->inflight = s.inflight;
     out->acl_links = s.acl_links;
+    out->acl_closing = links_closing();
     out->mtu = s.mtu;
     out->last_fault = s.last_fault;
     bt_xrec_plat_lock();
@@ -1658,7 +1785,7 @@ void bt_xrec_get_ui(bt_xrec_ui_t *out)
     }
     out->window_open = s.window_open;
     out->window_s_left = s.window_open ? (uint16_t)secs_left(now, s.window_deadline) : 0u;
-    out->connected = (uint8_t)(s.acl_links > 0u || s.conn_open);
+    out->connected = (uint8_t)ui_connected();
     if (peer != NULL) {
         memcpy(out->peer_bda, peer, 6u);
         out->bonded = (uint8_t)(!s.cfm_pending && (slot_is(&s.auth_ok, peer) ||
@@ -1703,6 +1830,7 @@ int bt_xrec_ssp_answer(int accept)
         s.cfm_ended = 1u;
         s.cfm_end_t = now;
         bt_xrec_plat_log_u32("BT SSP numeric comparison accepted by the user, value", s.cfm_val);
+        prompt_end_log();
     } else {
         s.d.ssp_user_rejected += accept ? 0u : 1u;
         prompt_reject(accept ? "BT SSP numeric comparison rejected: pairing window closed"

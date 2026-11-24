@@ -176,17 +176,29 @@ static void log_ctrl_line(uint16_t (*fmt)(char *buf, uint16_t cap))
     openfw_log_putc('\n');
 }
 
+_Static_assert(BT_XREC_NOTE_CONN == BT_CTRL_NOTE_CONN, "note kind seen by the session");
+_Static_assert(BT_XREC_NOTE_DISC == BT_CTRL_NOTE_DISC, "note kind seen by the session");
+_Static_assert(BT_XREC_NOTE_CONN_REQ == BT_CTRL_NOTE_CONN_REQ, "note kind seen by the session");
 _Static_assert(BT_XREC_NOTE_SCAN_REFUSED == BT_CTRL_NOTE_SCAN_REFUSED, "note kind seen by the session");
+_Static_assert(BT_XREC_NOTE_DISC_CMD == BT_CTRL_NOTE_DISC_CMD, "note kind seen by the session");
+_Static_assert(BT_XREC_NOTE_NAME == BT_CTRL_NOTE_NAME, "note kind seen by the session");
 _Static_assert(BT_XREC_NOTE_LINE == BT_CTRL_NOTE_LINE, "note line buffer");
-int bt_xrec_plat_ctrl_note(char *line, uint16_t cap, uint8_t *arg)
+int bt_xrec_plat_ctrl_note(char *line, uint16_t cap, bt_xrec_note_t *info)
 {
     bt_ctrl_note_t n;
     if (!bt_ctrl_note_pop(&n)) {
         return 0;
     }
-    *arg = n.reason;
+    info->status = n.status;
+    info->arg = n.reason;
+    info->handle = n.handle;
     (void)bt_ctrl_note_format(&n, line, cap);
     return n.kind;
+}
+
+int bt_xrec_plat_ctrl_name(uint8_t bda[6], char *name, uint16_t cap)
+{
+    return bt_ctrl_peer_name(bda, name, cap);
 }
 
 int bt_xrec_plat_start_allowed(void)

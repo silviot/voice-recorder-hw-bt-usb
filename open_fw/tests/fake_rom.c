@@ -414,7 +414,17 @@ static bool peer_handle(msg_t *m)
         uint8_t r[255];
         memset(r, 0, sizeof(r));
         memcpy(&r[1], p, 6u);
+        if (fake_peer.name_held) {
+            fake_peer.name_refused++;
+            peer_status1(0xE0CBu, BT_ROM_TASK_LM, 0x0Cu);                /* RNR already running (+0x217) */
+            return true;
+        }
         peer_status1(0xE0CBu, BT_ROM_TASK_LM, 0u);
+        if (fake_peer.name_hold && peer_addr_is(p)) {
+            fake_peer.name_hold = false;
+            fake_peer.name_held = true;                                  /* E0D3 at fake_peer_name_release() */
+            return true;
+        }
         if (!peer_addr_is(p)) {
             r[0] = 0x04u;                                                /* Page Timeout: nobody answers */
         } else if (fake_peer.name_fail_n != 0u) {
@@ -612,6 +622,20 @@ void fake_peer_disconnect(uint8_t reason)
     if (fake_peer.connected) {
         peer_link_down(reason);
     }
+}
+
+void fake_peer_name_release(void)
+{
+    if (!fake_peer.name_held) {
+        return;
+    }
+    fake_peer.name_held = false;
+    uint8_t r[255];
+    memset(r, 0, sizeof(r));
+    memcpy(&r[1], s_peer.addr, 6u);
+    memcpy(&r[7], s_peer.name, strnlen(s_peer.name, sizeof(s_peer.name)));
+    peer_emit(0xE0D3u, BT_ROM_TASK_LM, r, 255u);
+    fake_peer.name_requests++;
 }
 
 int fake_peer_page_again(uint32_t link)

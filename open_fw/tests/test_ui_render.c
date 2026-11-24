@@ -185,6 +185,31 @@ static void check_bt_ui(ui_model_t *m)
     l1 = lv_label_get_text(objects.bt_l1_lbl);
     assert(strstr(l1, "44:55:66") != NULL && strstr(l1, "...") == NULL);  /* a short peer is shown whole */
 
+    /* Silicon session 6: the prompt's peer is the address until the name arrives, then the name in the same place
+     * (the digits stay); after the prompt a link that is not connected shows the waiting line, not "connected". */
+    b.bt_prompt = 1u;
+    b.bt_prompt_s = 27u;
+    strcpy(b.bt_digits, "333198");
+    strcpy(b.bt_peer, "00:5B:1A:51:7E:E5");
+    ui_render_screen(UI_SCR_BT, &b);
+    assert(strcmp(lv_label_get_text(objects.bt_l1_lbl), "00:5B:1A:51:7E:E5") == 0);
+    assert(strcmp(lv_label_get_text(objects.bt_name_lbl), "333198") == 0);
+    strcpy(b.bt_peer, "martianbfg");
+    ui_render_screen(UI_SCR_BT, &b);
+    printf("BT=1 prompt peer after the late name: [%s] value [%s]\n", lv_label_get_text(objects.bt_l1_lbl),
+           lv_label_get_text(objects.bt_name_lbl));
+    assert(strcmp(lv_label_get_text(objects.bt_l1_lbl), "martianbfg") == 0);
+    assert(strcmp(lv_label_get_text(objects.bt_name_lbl), "333198") == 0);
+    char connected_line[52];
+    lv_snprintf(connected_line, sizeof(connected_line), ui_tr(UI_STR_BT_CONNECTED_FMT), "martianbfg");
+    b.bt_prompt = 0u;
+    b.bt_digits[0] = '\0';
+    b.bt_state = 0u;                                  /* BACK: the host is ending the link */
+    b.bt_bonded = 0u;
+    ui_render_screen(UI_SCR_BT, &b);
+    assert(strcmp(lv_label_get_text(objects.bt_l1_lbl), connected_line) != 0);
+    assert(strcmp(lv_label_get_text(objects.bt_l1_lbl), ui_tr(UI_STR_BT_WAITING)) == 0);
+
     static const char *const msgs[] = { "Pairing unavailable", "PIN 246810", "Saved" };
     b.bt_state = 0u;
     b.bt_bonded = 0u;

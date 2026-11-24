@@ -85,6 +85,11 @@ P. **Phone mode end to end** (`test_bt_host phone IMG`, its own process; IMG = a
    - P16 window open, laptop B pairs, the test answers BACK on the prompt (`BTHX_SSP_ANSWER 0`): negative reply, no
      bond, window still open, an ENTER right after it is swallowed (-3), one 1 s later finds no prompt (-1); the
      phone build is a bench build (`-DOPENFW_BT_BENCH_IMAGE=1`, for P17-P19);
+   - P16b (silicon session 6) laptop E, name unknown: BTM's link set-up name request is held (`fake_peer.name_hold`)
+     and every later one refused `0x0C` (ROM: RNR already running), so the prompt shows E's address; the held answer
+     (`fake_peer_name_release`) puts "laptop-E" on the prompt in place, digits unchanged; BACK with `defer_detach`
+     (the device's `0406` accepted, no Disconnection Complete): the screen stops saying connected at once
+     (`ui.connected`, `bt_status_t.acl_connected`) while the link stays counted until its supervision timeout;
    - P17 bench autoconfirm (`BTHX_BENCH_AUTOCONFIRM`, as `SD:/BTBENCH.RUN autoconfirm=1`): laptop D's comparison is
      accepted without the user, MITM bond, SSP part closed; D runs CHAL/AUTH twice (distinct, non-zero nonces), GETS;
    - P18 restart with the session's entropy withheld (`bthx_withhold_entropy`: a BT-mode entry whose mic collection

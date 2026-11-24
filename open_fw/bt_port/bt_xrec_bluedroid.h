@@ -94,6 +94,9 @@ typedef struct {
     uint8_t  ssp_prompt;         /* a numeric comparison waits for the local user */
     uint32_t ssp_user_accepted, ssp_user_rejected, ssp_timeouts, ssp_withdrawn, ssp_bench_autoconfirmed;
     uint32_t name_requests;      /* esp_bt_gap_read_remote_name() calls */
+    uint32_t name_failed;        /* ESP_BT_GAP_READ_REMOTE_NAME_EVT with a failure status */
+    uint32_t names_from_ctrl;    /* remote names taken from a Remote Name Request Complete (bt_xrec_plat_ctrl_name) */
+    uint32_t acl_closing;        /* ACL links the host is disconnecting (0406 answered), not yet reported down */
     uint8_t  ssp_pending;        /* window opened before READY: the M2.3 gate decides its SSP part once READY */
     uint32_t ssp_gate_refused;   /* SSP part of a pairing window refused by the M2.3 gate (open, or deferred to READY) */
     uint8_t  ssp_burned;         /* a pairing this session accepted then failed: SSP refused until the next BT entry */
@@ -123,7 +126,7 @@ typedef struct {
     uint8_t  peer_is_name;                 /* peer holds the remote name (else the address text) */
     uint8_t  window_open;                  /* the user-opened pairing window (XREC PIN and/or SSP) */
     uint16_t window_s_left;
-    uint8_t  connected;                    /* ACL or SPP link up */
+    uint8_t  connected;                    /* SPP open, or an ACL link up that the host is not disconnecting */
     uint8_t  bonded;                       /* that peer holds a MITM bond (just bonded, or authorized SPP link) */
 } bt_xrec_ui_t;
 void bt_xrec_get_ui(bt_xrec_ui_t *out);
@@ -193,10 +196,23 @@ void     bt_xrec_plat_session_end(void);     /* final bond-store flush; release 
 void     bt_xrec_plat_reboot(uint8_t mode);  /* 1 reboot, 2 SD OTA, 3 USB DFU (legacy F:2138-2147) */
 uint32_t bt_xrec_plat_irq_count(void);
 /* App task: the next controller link note (bt_ctrl_note_t: connection request / complete, disconnection complete,
- * the 0406 answer, a refused scan enable) formatted as one log line into line[cap]; *arg gets its reason byte (for a
- * refused scan enable: the refused scan value). Returns its kind (BT_XREC_NOTE_*), 0 when there is none. */
+ * the 0406 answer, a refused scan enable, the 0419 answer, a remote name complete) formatted as one log line into
+ * line[cap]; *info gets its status, reason byte (for a refused scan enable: the refused scan value) and handle.
+ * Returns its kind (BT_XREC_NOTE_*), 0 when there is none. */
+#define BT_XREC_NOTE_CONN         1u        /* == BT_CTRL_NOTE_CONN */
+#define BT_XREC_NOTE_DISC         2u        /* == BT_CTRL_NOTE_DISC */
+#define BT_XREC_NOTE_CONN_REQ     3u        /* == BT_CTRL_NOTE_CONN_REQ */
 #define BT_XREC_NOTE_SCAN_REFUSED 4u        /* == BT_CTRL_NOTE_SCAN_REFUSED */
+#define BT_XREC_NOTE_DISC_CMD     5u        /* == BT_CTRL_NOTE_DISC_CMD */
+#define BT_XREC_NOTE_NAME         7u        /* == BT_CTRL_NOTE_NAME */
 #define BT_XREC_NOTE_LINE         64u       /* == BT_CTRL_NOTE_LINE */
-int      bt_xrec_plat_ctrl_note(char *line, uint16_t cap, uint8_t *arg);
+typedef struct {
+    uint8_t  status, arg;
+    uint16_t handle;
+} bt_xrec_note_t;
+int      bt_xrec_plat_ctrl_note(char *line, uint16_t cap, bt_xrec_note_t *info);
+/* App task: the newest remote name a successful Remote Name Request Complete carried (bt_ctrl_peer_name), whoever
+ * asked for it. 1 with bda and a NUL-terminated name, 0 when none. */
+int      bt_xrec_plat_ctrl_name(uint8_t bda[6], char *name, uint16_t cap);
 
 #endif /* BT_XREC_BLUEDROID_H */

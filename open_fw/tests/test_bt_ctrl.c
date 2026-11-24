@@ -35,7 +35,18 @@ static int t_crit, t_crit_max;
 static bool t_stop;
 static uint32_t t_wake_ctrl, t_wake_isr, t_wake_dlv, t_faults, t_fault_last;
 static void p_enter(void) { t_crit++; if (t_crit > t_crit_max) t_crit_max = t_crit; }
-static void p_exit(void) { t_crit--; }
+/* Optional hook run after each lock release (outside the lock): another task popping a note in that gap. */
+static void (*t_exit_hook)(void);
+static void p_exit(void)
+{
+    t_crit--;
+    if (t_crit == 0 && t_exit_hook != NULL) {
+        void (*h)(void) = t_exit_hook;
+        t_exit_hook = NULL;                  /* not re-entered by the hook's own enter()/exit() */
+        h();
+        t_exit_hook = h;
+    }
+}
 static void p_wake_ctrl(void) { t_wake_ctrl++; }
 static void p_wake_isr(void) { t_wake_isr++; }
 /* Plan §3 rule (e): wake_dlv and fault are FreeRTOS calls, never made while the ROM lock (PRIMASK) is held. */
@@ -2680,6 +2691,92 @@ static void test_link_notes(void)
     shutdown_and_check();
 }
 
+/* Silicon session 6: the prompt showed the laptop's address; no log said whether a name request failed or its answer
+ * came late. The 0419 answer and every Remote Name Request Complete are noted (status, name length), and the newest
+ * successful name is kept for the session (bt_ctrl_peer_name): BTM's own link set-up request is answered to BTM only. */
+static void test_name_notes(void)
+{
+    setup();
+    bring_up();
+    bt_ctrl_note_t n;
+    while (bt_ctrl_note_pop(&n)) {
+    }
+    uint8_t bda[6];
+    char nm[BT_CTRL_PEER_NAME_MAX];
+    CHECK(!bt_ctrl_peer_name(bda, nm, sizeof(nm)), "no name before any name complete");
+    uint8_t rnr[10] = { 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x01, 0, 0, 0 };
+    const pkt_t *r = roundtrip(0x0419u, rnr, 10u);
+    if (r) CHECK(status_of(r) == 0x00u, "0419 CS %02X", status_of(r));
+    fake_rom_set_reply_status(0xE00Cu, 0x0Cu);       /* ROM: a name request already running (env +0x217) */
+    r = roundtrip(0x0419u, rnr, 10u);
+    if (r) CHECK(status_of(r) == 0x0Cu, "second 0419 CS %02X", status_of(r));
+    fake_rom_set_reply_status(0xE00Cu, 0x00u);
+    static uint8_t ev[255];
+    memset(ev, 0, sizeof(ev));
+    ev[0] = 0x22u;                                   /* failed name complete */
+    memcpy(&ev[1], rnr, 6u);
+    fake_rom_inject(0xE0D3u, ev, 255u);
+    pump();
+    CHECK(!bt_ctrl_peer_name(bda, nm, sizeof(nm)), "a failed name complete keeps no name");
+    ev[0] = 0x00u;                                   /* the late answer, with a name longer than the kept part */
+    const char *longname = "martianbfg-with-a-very-long-host-name";
+    memcpy(&ev[7], longname, strlen(longname));
+    fake_rom_inject(0xE0D3u, ev, 255u);
+    pump();
+    static const uint8_t bda_msb[6] = { 0x06, 0x05, 0x04, 0x03, 0x02, 0x01 };   /* wire order reversed */
+    CHECK(bt_ctrl_peer_name(bda, nm, sizeof(nm)) && memcmp(bda, bda_msb, 6u) == 0 &&
+          strlen(nm) == BT_CTRL_PEER_NAME_MAX - 1u && strncmp(nm, longname, BT_CTRL_PEER_NAME_MAX - 1u) == 0,
+          "peer name '%s'", nm);
+    char small[6];
+    CHECK(bt_ctrl_peer_name(bda, small, sizeof(small)) && strcmp(small, "marti") == 0, "cut to the caller's buffer");
+    CHECK(note_line_is("BT HCI name request st=0x00 rom"), "0419 CS note");
+    CHECK(note_line_is("BT HCI name request st=0x0C rom"), "0419 refused note");
+    CHECK(note_line_is("BT HCI name complete st=0x22 len=0"), "failed name complete note");
+    CHECK(note_line_is("BT HCI name complete st=0x00 len=37"), "name complete note");
+    CHECK(!bt_ctrl_note_pop(&n), "no further note");
+    shutdown_and_check();
+    CHECK(bt_ctrl_open() == 0, "reopen");
+    bring_up();
+    CHECK(!bt_ctrl_peer_name(bda, nm, sizeof(nm)), "a new session starts without the old name");
+    shutdown_and_check();
+}
+
+/* Review of the session 6 fix: a task that pops the name note right when bt_ctrl releases the lock must already find
+ * the name (bt_ctrl stores the name before it queues the note). */
+static int t_gap_name_notes, t_gap_name_ok;
+static void gap_pop_name(void)
+{
+    bt_ctrl_note_t n;
+    while (bt_ctrl_note_pop(&n)) {
+        if (n.kind == BT_CTRL_NOTE_NAME && n.status == 0u && n.reason != 0u) {
+            uint8_t bda[6];
+            char nm[BT_CTRL_PEER_NAME_MAX];
+            t_gap_name_notes++;
+            t_gap_name_ok += (bt_ctrl_peer_name(bda, nm, sizeof(nm)) && strcmp(nm, "zed") == 0) ? 1 : 0;
+        }
+    }
+}
+static void test_name_before_note(void)
+{
+    setup();
+    bring_up();
+    bt_ctrl_note_t n;
+    while (bt_ctrl_note_pop(&n)) {
+    }
+    static uint8_t ev[255];
+    memset(ev, 0, sizeof(ev));
+    memcpy(&ev[1], (const uint8_t[6]){ 1, 2, 3, 4, 5, 6 }, 6u);
+    memcpy(&ev[7], "zed", 3u);
+    t_gap_name_notes = t_gap_name_ok = 0;
+    fake_rom_inject(0xE0D3u, ev, 255u);
+    t_exit_hook = gap_pop_name;
+    pump();
+    t_exit_hook = NULL;
+    CHECK(t_gap_name_notes == 1 && t_gap_name_ok == 1, "name stored before its note (%d notes, %d with the name)",
+          t_gap_name_notes, t_gap_name_ok);
+    shutdown_and_check();
+}
+
 /* Session log lines (bt_xrec_fw.c): the fault line takes code, site and values from this session together (review:
  * the firmware printed bt_ctrl_rtos's per-boot first code next to this session's site), and the stats line carries
  * the silent-drop counters that tell "the ROM never sent E458" from "bt_ctrl dropped it". */
@@ -2737,6 +2834,8 @@ int main(void)
 
     struct { const char *name; void (*fn)(void); } tests[] = {
         { "table", test_table },
+        { "name_notes", test_name_notes },
+        { "name_before_note", test_name_before_note },
         { "golden_vectors", test_golden_vectors },
         { "startup_and_param_rules", test_startup_and_param_rules },
         { "tx_admission", test_tx_admission },

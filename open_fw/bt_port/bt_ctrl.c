@@ -156,6 +156,8 @@ static struct {
     uint8_t scratch[BT_CTRL_EVT_MAX_H4];
     bt_ctrl_note_t notes[BT_CTRL_NOTES];     /* link notes: bt_ctrl context adds, any task pops (both under enter()) */
     uint32_t note_head, note_n;
+    uint8_t peer_name_ok, peer_bda[6];       /* newest successful remote name (under enter(), bt_ctrl_peer_name) */
+    char peer_name[BT_CTRL_PEER_NAME_MAX];
     bt_ctrl_stats_t st;
 } g;
 
@@ -376,11 +378,36 @@ static void note_add(uint8_t kind, uint16_t handle, uint8_t status, uint8_t reas
     g.p.exit();
 }
 
+/* Remote Name Request Complete (ROM layout {s@0, bdaddr@1, name[248]@7}, param_len >= 7 checked by the packer):
+ * noted with the name length, and a successful name kept for bt_ctrl_peer_name(). */
+static void rmt_name_seen(const uint8_t *param, uint16_t param_len)
+{
+    uint16_t n = 0u;
+    while (7u + n < param_len && n < BT_CTRL_NAME_LEN && param[7u + n] != 0u) {
+        n++;
+    }
+    if (param[0] == BT_HCI_OK && n != 0u) {
+        /* stored before the note is queued: a task that pops the note finds this name (review of session 6) */
+        uint16_t c = n < BT_CTRL_PEER_NAME_MAX - 1u ? n : (uint16_t)(BT_CTRL_PEER_NAME_MAX - 1u);
+        g.p.enter();
+        for (uint32_t i = 0u; i < 6u; i++) {
+            g.peer_bda[i] = param[6u - i];   /* wire (LSB first) -> BD_ADDR / esp_bd_addr_t order (MSB first) */
+        }
+        memcpy(g.peer_name, &param[7], c);
+        g.peer_name[c] = '\0';
+        g.peer_name_ok = 1u;
+        g.p.exit();
+    }
+    note_add(BT_CTRL_NOTE_NAME, 0u, param[0], (uint8_t)(n > 255u ? 255u : n), 0u);
+}
+
 /* ------------------------------------------------------------------------------------------------------------- */
 /* ROM upcalls                                                                                                    */
 /* ------------------------------------------------------------------------------------------------------------- */
 #define BT_HCI_EVT_CONN_CMP 0x03u
 #define BT_HCI_EVT_CONN_REQ 0x04u
+#define BT_HCI_EVT_RMT_NAME 0x07u
+#define BT_CTRL_OP_RMT_NAME 0x0419u
 #define BT_CTRL_OP_DISCONNECT 0x0406u
 #define BT_CTRL_OP_WRITE_SCAN_ENABLE 0x0C1Au
 
@@ -547,6 +574,8 @@ static bt_rom_msg_ret_t up_on_hci_msg(void *ctx, uint16_t id, uint8_t *param, ui
         /* Reply to the forwarded command: its slot was reserved when the command was admitted. */
         if (info.opcode == BT_CTRL_OP_DISCONNECT) {
             note_add(BT_CTRL_NOTE_DISC_CMD, g.fwd_handle, info.status, 0u, 0u);
+        } else if (info.opcode == BT_CTRL_OP_RMT_NAME) {
+            note_add(BT_CTRL_NOTE_NAME_CMD, 0u, info.status, 0u, 0u);
         }
         g.fwd_pending = 0u;
         g.fwd_orphan = 0u;
@@ -592,6 +621,8 @@ static bt_rom_msg_ret_t up_on_hci_msg(void *ctx, uint16_t id, uint8_t *param, ui
         note_add(BT_CTRL_NOTE_CONN, (uint16_t)(info.handle & 0x0FFFu), info.status, 0u, 0u);
     } else if (info.evt_code == BT_HCI_EVT_CONN_REQ) {
         note_add(BT_CTRL_NOTE_CONN_REQ, 0u, 0u, 0u, 0u);
+    } else if (info.evt_code == BT_HCI_EVT_RMT_NAME) {
+        rmt_name_seen(param, param_len);
     }
     apply_event_side_effects(&info);
     return accept_general(id, param, param_len, g.scratch, len, seq);
@@ -891,6 +922,8 @@ static void fwd_local_reply(uint8_t status)
 {
     if (g.fwd_opcode == BT_CTRL_OP_DISCONNECT) {
         note_add(BT_CTRL_NOTE_DISC_CMD, g.fwd_handle, status, 0u, 1u);
+    } else if (g.fwd_opcode == BT_CTRL_OP_RMT_NAME) {
+        note_add(BT_CTRL_NOTE_NAME_CMD, 0u, status, 0u, 1u);
     }
     const bt_ctrl_cmd_row_t *row = bt_ctrl_cmds_lookup(g.fwd_opcode);
     uint16_t len = bt_ctrl_cmds_reply_fail(row, g.fwd_opcode, g.fwd_params, g.fwd_plen, status, g.scratch);
@@ -1004,6 +1037,8 @@ static void process_cmd(uint32_t idx)
         g.st.cmd_local_fail++;
         if (op == BT_CTRL_OP_DISCONNECT) {
             note_add(BT_CTRL_NOTE_DISC_CMD, plen >= 2u ? (uint16_t)(rd16(prm) & 0x0FFFu) : 0u, s, 0u, 1u);
+        } else if (op == BT_CTRL_OP_RMT_NAME) {
+            note_add(BT_CTRL_NOTE_NAME_CMD, 0u, s, 0u, 1u);
         }
         if (row->cls == BTC_M) {
             g.st.invariant++;                /* class M must not fail */
@@ -1737,6 +1772,7 @@ int bt_ctrl_open(void)
     g.fault_raised = 0u;
     g.pending_rom_fault = BT_CTRL_FAULT_NONE;   /* a new session never inherits a fault of the previous one */
     g.note_head = g.note_n = 0u;
+    g.peer_name_ok = 0u;
     g.need_dlv = 0u;
     g.admission_open = 1u;
     g.dlv_open = 1u;
@@ -1830,6 +1866,26 @@ int bt_ctrl_note_pop(bt_ctrl_note_t *out)
         *out = g.notes[g.note_head];
         g.note_head = (g.note_head + 1u) % BT_CTRL_NOTES;
         g.note_n--;
+        got = 1;
+    }
+    g.p.exit();
+    return got;
+}
+
+int bt_ctrl_peer_name(uint8_t bda[6], char *name, uint16_t cap)
+{
+    int got = 0;
+    if (bda == NULL || name == NULL || cap == 0u) {
+        return 0;
+    }
+    g.p.enter();
+    if (g.peer_name_ok) {
+        memcpy(bda, g.peer_bda, 6u);
+        uint16_t i = 0u;
+        for (; i + 1u < cap && g.peer_name[i] != '\0'; i++) {
+            name[i] = g.peer_name[i];
+        }
+        name[i] = '\0';
         got = 1;
     }
     g.p.exit();
@@ -1934,6 +1990,12 @@ uint16_t bt_ctrl_note_format(const bt_ctrl_note_t *n, char *buf, uint16_t cap)
         at = put_hex(buf, cap, put_str(buf, cap, at, "disconnect cmd"), " h=", n->handle, 4u);
         at = put_hex(buf, cap, at, " st=", n->status, 2u);
         return put_str(buf, cap, at, n->local ? " local" : " rom");
+    case BT_CTRL_NOTE_NAME_CMD:
+        at = put_hex(buf, cap, put_str(buf, cap, at, "name request"), " st=", n->status, 2u);
+        return put_str(buf, cap, at, n->local ? " local" : " rom");
+    case BT_CTRL_NOTE_NAME:
+        at = put_hex(buf, cap, put_str(buf, cap, at, "name complete"), " st=", n->status, 2u);
+        return put_dec(buf, cap, at, " len=", n->reason);
     default:
         return put_hex(buf, cap, put_str(buf, cap, at, "note"), " ", n->kind, 2u);
     }

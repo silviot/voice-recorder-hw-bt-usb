@@ -10,6 +10,7 @@
 #include "openfw.h"
 #include "bt_bench.h"
 #include "bt_ctrl.h"
+#include "bt_xrec_bluedroid.h"
 
 /* SRAM_HI (.bss_hi, zeroed at boot) like hci_probe.c's log copy: .bt_bss would come out of the RTOS heap region. */
 #define BENCH_HI           __attribute__((section(".bss_hi"), aligned(4)))
@@ -140,6 +141,10 @@ static void log_status(uint32_t el_ms)
     lku("rx", st.rx_acl_pkts);
     lku("tx", st.tx_acl_pkts);
     lku("pairs", s_run.pairs);
+    static bt_xrec_debug_t dbg BENCH_HI;    /* app task only, off the stack */
+    bt_xrec_get_debug(&dbg);
+    lku("links", dbg.acl_links);             /* acl= is the screen's "connected" (hides links the host is closing): */
+    lku("closing", dbg.acl_closing);         /* links= / closing= keep the raw ACL picture (BT_ROM_HCI_MAP §11 H1/H2) */
     lemit();
     static char cl[BT_CTRL_STATS_LINE] BENCH_HI;
     (void)bt_ctrl_stats_format(cl, (uint16_t)sizeof(cl));

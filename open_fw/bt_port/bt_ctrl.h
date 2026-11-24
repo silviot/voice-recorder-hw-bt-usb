@@ -75,14 +75,21 @@ enum {
 };
 
 /* ---- link notes: one record per link-level controller event, for the session log (bt_ctrl_note_pop) ---- */
-#define BT_CTRL_NOTES 8u
+#define BT_CTRL_NOTES 16u          /* a pairing adds up to 4 name notes to the link notes (session 6 review) */
 enum {
     BT_CTRL_NOTE_CONN = 1,         /* Connection Complete from the ROM: handle, status */
     BT_CTRL_NOTE_DISC,             /* Disconnection Complete from the ROM: handle, status, reason */
     BT_CTRL_NOTE_CONN_REQ,         /* Connection Request from the ROM (a peer paged us) */
     BT_CTRL_NOTE_SCAN_REFUSED,     /* 0C1A Write Scan Enable refused by the ROM: status, reason = scan byte */
     BT_CTRL_NOTE_DISC_CMD,         /* the host's 0406 Disconnect answered: handle, status; local = not by the ROM */
+    BT_CTRL_NOTE_NAME_CMD,         /* the host's 0419 Remote Name Request answered (CS): status; local = not by the ROM */
+    BT_CTRL_NOTE_NAME,             /* Remote Name Request Complete from the ROM: status, reason = name length (<= 248) */
 };
+
+/* Newest remote name a successful Remote Name Request Complete carried (any request: BTM's security name request at
+ * link set-up, BTA's, the session's), cut to BT_CTRL_PEER_NAME_MAX - 1 bytes. Silicon session 6: the first one is
+ * BTM's own and only BTM sees its result; this lets the session show the name when it arrives late. */
+#define BT_CTRL_PEER_NAME_MAX 32u
 
 typedef struct {
     uint8_t  kind, status, reason, local;
@@ -191,6 +198,10 @@ void bt_ctrl_get_debug(bt_ctrl_debug_t *out);
 /* Oldest link note (any task; recorded by bt_ctrl context, BT_CTRL_NOTES deep, overflow counted in notes_lost).
  * Returns 1 if one was popped. bt_ctrl_note_format() writes one log line (no newline) and returns its length. */
 int      bt_ctrl_note_pop(bt_ctrl_note_t *out);
+/* The newest remote name (see BT_CTRL_PEER_NAME_MAX): 1 with bda (Bluedroid BD_ADDR / esp_bd_addr_t order: most
+ * significant byte first, i.e. the wire bytes reversed) and a NUL-terminated name, 0 when none this session.
+ * Any task. */
+int      bt_ctrl_peer_name(uint8_t bda[6], char *name, uint16_t cap);
 uint16_t bt_ctrl_note_format(const bt_ctrl_note_t *n, char *buf, uint16_t cap);
 
 /* Session log lines (no newline; return the length; truncated within cap). Fault: "BT bt_ctrl fault, first code N

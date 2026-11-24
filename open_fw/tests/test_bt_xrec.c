@@ -79,22 +79,48 @@ void bt_xrec_plat_log_u32(const char *msg, uint32_t v)
     }
 }
 /* Controller link notes (bt_ctrl_note_pop + bt_ctrl_note_format on target): a scripted queue. */
-static struct { int kind; uint8_t arg; char line[64]; } m_notes[8];
+static struct { int kind; uint8_t arg, status; uint16_t handle; char line[64]; } m_notes[24];
 static int m_notes_n;
-int bt_xrec_plat_ctrl_note(char *line, uint16_t cap, uint8_t *arg)
+int bt_xrec_plat_ctrl_note(char *line, uint16_t cap, bt_xrec_note_t *info)
 {
     if (m_notes_n == 0) {
         return 0;
     }
     int kind = m_notes[0].kind;
-    *arg = m_notes[0].arg;
+    info->arg = m_notes[0].arg;
+    info->status = m_notes[0].status;
+    info->handle = m_notes[0].handle;
     snprintf(line, cap, "%s", m_notes[0].line);
     memmove(&m_notes[0], &m_notes[1], sizeof(m_notes[0]) * (size_t)(m_notes_n - 1));
     m_notes_n--;
     return kind;
 }
+/* bt_ctrl_peer_name on target: the newest remote name a Remote Name Request Complete carried */
+static uint8_t m_ctrl_name_bda[6];
+static char m_ctrl_name[32];
+static int m_ctrl_name_ok;
+int bt_xrec_plat_ctrl_name(uint8_t bda[6], char *name, uint16_t cap)
+{
+    if (!m_ctrl_name_ok) {
+        return 0;
+    }
+    memcpy(bda, m_ctrl_name_bda, 6u);
+    snprintf(name, cap, "%s", m_ctrl_name);
+    return 1;
+}
+static void note_push_ex(int kind, uint8_t status, uint8_t arg, uint16_t handle, const char *line)
+{
+    m_notes[m_notes_n].status = status;
+    m_notes[m_notes_n].handle = handle;
+    m_notes[m_notes_n].kind = kind;
+    m_notes[m_notes_n].arg = arg;
+    snprintf(m_notes[m_notes_n].line, sizeof(m_notes[0].line), "%s", line);
+    m_notes_n++;
+}
 static void note_push(int kind, uint8_t arg, const char *line)
 {
+    m_notes[m_notes_n].status = 0u;
+    m_notes[m_notes_n].handle = 0u;
     m_notes[m_notes_n].kind = kind;
     m_notes[m_notes_n].arg = arg;
     snprintf(m_notes[m_notes_n].line, sizeof(m_notes[0].line), "%s", line);
@@ -494,6 +520,34 @@ static void acl_disc(const uint8_t bda[6])
     gap_evt(ESP_BT_GAP_ACL_DISCONN_CMPL_STAT_EVT, &p);
 }
 
+static void acl_conn_h(const uint8_t bda[6], uint16_t h)
+{
+    esp_bt_gap_cb_param_t p;
+    memset(&p, 0, sizeof(p));
+    memcpy(p.acl_conn_cmpl_stat.bda, bda, 6u);
+    p.acl_conn_cmpl_stat.stat = ESP_BT_STATUS_SUCCESS;
+    p.acl_conn_cmpl_stat.handle = h;
+    gap_evt(ESP_BT_GAP_ACL_CONN_CMPL_STAT_EVT, &p);
+}
+
+static void acl_disc_h(const uint8_t bda[6], uint16_t h)
+{
+    esp_bt_gap_cb_param_t p;
+    memset(&p, 0, sizeof(p));
+    memcpy(p.acl_disconn_cmpl_stat.bda, bda, 6u);
+    p.acl_disconn_cmpl_stat.handle = h;
+    gap_evt(ESP_BT_GAP_ACL_DISCONN_CMPL_STAT_EVT, &p);
+}
+
+static void remote_name_fail(const uint8_t bda[6])
+{
+    esp_bt_gap_cb_param_t p;
+    memset(&p, 0, sizeof(p));
+    memcpy(p.read_rmt_name.bda, bda, 6u);
+    p.read_rmt_name.stat = ESP_BT_STATUS_FAIL;
+    gap_evt(ESP_BT_GAP_READ_REMOTE_NAME_EVT, &p);
+}
+
 static void remote_name(const uint8_t bda[6], const char *name)
 {
     esp_bt_gap_cb_param_t p;
@@ -580,6 +634,7 @@ static void mocks_reset(void)
     m_scan_calls = 0;
     m_scan_c = m_scan_d = -1;
     m_notes_n = 0;
+    m_ctrl_name_ok = 0;
     m_last_log[0] = '\0';
     m_cfm_logged = 0xFFFFFFFFu;
     m_cfm_calls = m_pin_calls = m_passkey_calls = m_remove_calls = m_disc_calls = 0;
@@ -1808,6 +1863,157 @@ static void t_ssp_key_spent(void)
     stop_ok();
 }
 
+/* Silicon session 6 (BT_HW_RESULTS.md): (1) first pairing with a laptop whose name the device did not know: the
+ * prompt showed its address for the whole prompt. BTM's own name request (link set-up) answered after the prompt
+ * came, and only BTM saw that answer; the session's request failed (the ROM refuses a second one while the first
+ * runs). A successful name complete passing through bt_ctrl now updates the prompt in place. (2) after BACK the
+ * screen kept "connected": BTM disconnects a link whose pairing failed (0406), but the link's end was not reported
+ * while the user looked. A link the host is ending is no longer "connected" on the screen. */
+static void t_session6_name_and_link(void)
+{
+    printf("[22] silicon session 6: late peer name shown in place on the prompt; a link the host disconnects is not "
+           "\"connected\"\n");
+    mocks_reset();
+    bring_up();
+    bt_xrec_open_pairing(60000u);
+    bt_xrec_poll();
+    acl_conn_h(PEER, 0x0080u);
+    bt_xrec_poll();
+    CHECK(ui().connected && status().acl_connected && dbg().acl_links == 1u, "link up: connected");
+    cfm_req(PEER, 333198u);
+    bt_xrec_poll();
+    CHECK(ui().prompt && !ui().peer_is_name && strchr(ui().peer, ':') != NULL, "prompt shows the address first ('%s')",
+          ui().peer);
+    remote_name_fail(PEER);                                  /* the session's own request: refused (0x0C on silicon) */
+    note_push_ex(6, 0x0Cu, 0u, 0u, "BT HCI name request st=0x0C rom");
+    bt_xrec_poll();
+    CHECK(!ui().peer_is_name && dbg().name_failed == 1u, "failed name request counted (%u)", dbg().name_failed);
+    m_now += 2000u;
+    memcpy(m_ctrl_name_bda, PEER, 6u);                      /* BTM's link set-up request completes late */
+    snprintf(m_ctrl_name, sizeof(m_ctrl_name), "martianbfg");
+    m_ctrl_name_ok = 1;
+    note_push_ex(BT_XREC_NOTE_NAME, 0x00u, 10u, 0u, "BT HCI name complete st=0x00 len=10");
+    bt_xrec_poll();
+    CHECK(ui().prompt && ui().peer_is_name && strcmp(ui().peer, "martianbfg") == 0, "prompt peer '%s' after the "
+          "late name, want martianbfg", ui().peer);
+    CHECK(dbg().names_from_ctrl == 1u, "name taken from the controller note (%u)", dbg().names_from_ctrl);
+    CHECK(strcmp(m_last_log, "BT SSP prompt shows the peer name, ms after the prompt 2000") == 0, "log '%s'",
+          m_last_log);
+    CHECK(user_answer(0) == 0 && !ui().prompt, "BACK");
+    CHECK(ui().connected, "still connected right after BACK (nothing disconnected yet)");
+    note_push_ex(BT_XREC_NOTE_DISC_CMD, 0x00u, 0u, 0x0080u, "BT HCI disconnect cmd h=0x0080 st=0x00 rom");   /* BTM ends the link */
+    bt_xrec_poll();
+    CHECK(!ui().connected && !status().acl_connected, "link being disconnected shown as connected (ui %u status %u)",
+          ui().connected, status().acl_connected);
+    CHECK(dbg().acl_links == 1u && dbg().acl_closing == 1u, "link still counted until it is reported down (%u %u)",
+          dbg().acl_links, dbg().acl_closing);
+    acl_disc_h(PEER, 0x0080u);
+    bt_xrec_poll();
+    CHECK(dbg().acl_links == 0u && dbg().acl_closing == 0u && !ui().connected, "link down (%u %u)", dbg().acl_links,
+          dbg().acl_closing);
+    acl_conn_h(PEER2, 0x0080u);                             /* same handle again: a new link, connected */
+    bt_xrec_poll();
+    CHECK(ui().connected && dbg().acl_closing == 0u, "new link on a reused handle is connected");
+    note_push_ex(BT_XREC_NOTE_DISC_CMD, 0x00u, 0u, 0x0081u, "BT HCI disconnect cmd h=0x0081 st=0x00 rom");   /* another handle */
+    bt_xrec_poll();
+    CHECK(ui().connected, "a disconnect of another handle does not hide this link");
+    acl_disc_h(PEER2, 0x0080u);
+    bt_xrec_poll();
+    /* a prompt whose peer name never comes says so when it ends */
+    cfm_req(PEER2, 111111u);
+    bt_xrec_poll();
+    CHECK(user_answer(0) == 0, "BACK (no name)");
+    CHECK(strcmp(m_last_log, "BT SSP prompt ended without the peer name (address shown)") == 0, "log '%s'",
+          m_last_log);
+    stop_ok();
+}
+
+/* Review of the session 6 fix: (1) the 0406 note can be drained before the GAP link-up event of its own link (same
+ * poll, notes first): the closing mark must still apply when the link comes up; a stale mark must not hide a later
+ * link on the same handle. (2) a successful name complete with an empty name must not apply the older stored name to
+ * the current peer. (3) a name drained by the poll's last note drain is already on screen: the prompt end log must
+ * not say the address was shown. */
+static void t_session6_review(void)
+{
+    printf("[23] session 6 review: early 0406 note, empty name complete, end-of-poll name\n");
+    mocks_reset();
+    bring_up();
+    bt_xrec_open_pairing(60000u);
+    bt_xrec_poll();
+    /* (1) Connection Complete, the host's 0406 and the GAP link-up all reach the same poll, notes first */
+    note_push_ex(BT_XREC_NOTE_CONN, 0x00u, 0u, 0x0080u, "BT HCI connection complete h=0x0080 st=0x00");
+    note_push_ex(BT_XREC_NOTE_DISC_CMD, 0x00u, 0u, 0x0080u, "BT HCI disconnect cmd h=0x0080 st=0x00 rom");
+    acl_conn_h(PEER, 0x0080u);
+    bt_xrec_poll();
+    CHECK(dbg().acl_links == 1u && dbg().acl_closing == 1u && !ui().connected && !status().acl_connected,
+          "0406 noted before its link-up: link closing, not connected (links %u closing %u ui %u)", dbg().acl_links,
+          dbg().acl_closing, ui().connected);
+    acl_disc_h(PEER, 0x0080u);
+    bt_xrec_poll();
+    CHECK(dbg().acl_links == 0u && dbg().acl_closing == 0u, "link down");
+    note_push_ex(BT_XREC_NOTE_CONN, 0x00u, 0u, 0x0080u, "BT HCI connection complete h=0x0080 st=0x00");
+    acl_conn_h(PEER2, 0x0080u);
+    bt_xrec_poll();
+    CHECK(ui().connected && dbg().acl_closing == 0u, "a later link on the same handle is connected");
+    acl_disc_h(PEER2, 0x0080u);
+    bt_xrec_poll();
+    /* a 0406 for a handle whose link-up never came, then a new link on that handle: the mark does not carry over */
+    note_push_ex(BT_XREC_NOTE_DISC_CMD, 0x02u, 0u, 0x0090u, "BT HCI disconnect cmd h=0x0090 st=0x02 rom");
+    bt_xrec_poll();
+    note_push_ex(BT_XREC_NOTE_CONN, 0x00u, 0u, 0x0090u, "BT HCI connection complete h=0x0090 st=0x00");
+    acl_conn_h(PEER, 0x0090u);
+    bt_xrec_poll();
+    CHECK(ui().connected && dbg().acl_closing == 0u, "stale 0406 mark cleared by the next Connection Complete");
+    acl_disc_h(PEER, 0x0090u);
+    bt_xrec_poll();
+    CHECK(dbg().acl_links == 0u && !ui().connected, "all links down");
+
+    /* (2) PEER2's name is known; a successful name complete with no name (PEER2's) while the controller still holds
+     * PEER's older name must not rename PEER2 */
+    acl_conn_h(PEER2, 0x0081u);
+    remote_name(PEER2, "bob");
+    bt_xrec_poll();
+    cfm_req(PEER2, 222222u);
+    bt_xrec_poll();
+    CHECK(ui().prompt && ui().peer_is_name && strcmp(ui().peer, "bob") == 0, "prompt shows bob ('%s')", ui().peer);
+    memcpy(m_ctrl_name_bda, PEER, 6u);
+    snprintf(m_ctrl_name, sizeof(m_ctrl_name), "alice");
+    m_ctrl_name_ok = 1;
+    note_push_ex(BT_XREC_NOTE_NAME, 0x00u, 0u, 0u, "BT HCI name complete st=0x00 len=0");
+    bt_xrec_poll();
+    CHECK(ui().prompt && ui().peer_is_name && strcmp(ui().peer, "bob") == 0, "empty name complete keeps bob ('%s')",
+          ui().peer);
+    CHECK(dbg().names_from_ctrl == 0u, "empty name not taken (%u)", dbg().names_from_ctrl);
+    CHECK(user_answer(0) == 0 && !ui().prompt, "BACK");
+    acl_disc_h(PEER2, 0x0081u);
+    bt_xrec_poll();
+
+    /* (3) the name arrives through the last note drain of a poll and the user answers before the next poll */
+    m_ctrl_name_ok = 0;
+    acl_conn_h(PEER, 0x0082u);
+    bt_xrec_poll();
+    cfm_req(PEER, 333333u);
+    bt_xrec_poll();
+    CHECK(ui().prompt && !ui().peer_is_name, "prompt shows the address");
+    memcpy(m_ctrl_name_bda, PEER, 6u);
+    snprintf(m_ctrl_name, sizeof(m_ctrl_name), "carol");
+    m_ctrl_name_ok = 1;
+    for (int i = 0; i < 8; i++) {                            /* the first drain of the poll takes these */
+        note_push_ex(BT_XREC_NOTE_CONN_REQ, 0x00u, 0u, 0u, "BT HCI connection request");
+    }
+    note_push_ex(BT_XREC_NOTE_NAME, 0x00u, 5u, 0u, "BT HCI name complete st=0x00 len=5");   /* the last drain */
+    bt_xrec_poll();
+    CHECK(m_notes_n == 0 && ui().peer_is_name && strcmp(ui().peer, "carol") == 0, "name on screen ('%s', %d left)",
+          ui().peer, m_notes_n);
+    m_last_log[0] = '\0';
+    m_now += BT_XREC_SSP_ARM_MS;
+    CHECK(bt_xrec_ssp_answer(0) == 0, "BACK before the next poll");
+    CHECK(strcmp(m_last_log, "BT SSP prompt ended without the peer name (address shown)") != 0, "log '%s'",
+          m_last_log);
+    bt_xrec_poll();
+    stop_ok();
+}
+
 int main(int argc, char **argv)
 {
     m_verbose = argc > 1 && strcmp(argv[1], "-v") == 0;
@@ -1830,6 +2036,8 @@ int main(int argc, char **argv)
     t_ssp_key_spent();
     t_scan_refused();
     t_scan_refused_retry();
+    t_session6_name_and_link();
+    t_session6_review();
     bt_xrec_test_reset();
     printf("test_bt_xrec: %d checks, %d failures\n", g_checks, g_fails);
     return g_fails == 0 ? 0 : 1;

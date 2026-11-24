@@ -321,7 +321,8 @@ uint32_t bt_rf_init_calibrated(uint32_t freq_drift, uint32_t clk6_hz);
 typedef struct {
     uint8_t  active;
     uint8_t  hci_ready;
-    uint8_t  acl_connected;
+    uint8_t  acl_connected;   /* bt_hci.c: an ACL link is up. Bluedroid port: the screen's "connected" (a link the
+                                * host is disconnecting, 0406 sent, is not counted: bt_xrec_debug_t acl_closing) */
     uint8_t  spp_open;
     uint8_t  xrec_bound;
     uint8_t  xrec_auth;

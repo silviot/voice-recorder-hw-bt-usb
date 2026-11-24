@@ -142,6 +142,13 @@ typedef struct {
     bool defer_detach;
     /* Runtime knob (under bth_rom_lock): the next name_fail_n remote name requests fail (E0D3 status 0x22). */
     uint32_t name_fail_n;
+    /* Runtime knob (under bth_rom_lock): the next remote name request is accepted (CS 0) but its Remote Name Request
+     * Complete is held until fake_peer_name_release(); while one is held the ROM refuses another with CS 0x0C (RNR
+     * already running, env +0x217: BT_ROM_HCI_MAP.md §2, 0419). Silicon session 6: BTM's own name request at link
+     * set-up was still running when the confirmation request came, so BTA's and the session's requests failed. */
+    bool name_hold;
+    bool name_held;
+    uint32_t name_refused;          /* requests refused 0x0C while one was held */
     /* Ghost page (fake_peer_page_again): the peer pages again while the ROM still holds its first link (a detach the
      * ROM never reported). The host's 040A gets its CS; the rejected link stays counted as an ACL link (LD) and no
      * Connection Complete comes until fake_peer_ghost_end() (its own detach stalls like the first: silicon bench
@@ -165,6 +172,7 @@ void fake_peer_disconnect(uint8_t reason);           /* the peer drops the link:
 int  fake_peer_send_acl(const uint8_t *data, uint16_t len);   /* peer -> host ACL start fragment (PB 10) */
 int  fake_peer_page_again(uint32_t link);            /* ghost page while connected (see ghost_pending); -1 if not */
 void fake_peer_ghost_end(uint8_t status);            /* the rejected link ends: E0D2 Connection Complete(status) */
+void fake_peer_name_release(void);                   /* the held name request completes (E0D3 with the name) */
 
 uint32_t fake_rom_em_rx_in_use(void);
 uint32_t fake_rom_em_tx_in_use(void);

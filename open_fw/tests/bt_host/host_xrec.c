@@ -105,16 +105,19 @@ void bt_xrec_plat_identity(uint8_t bd[6]) { memcpy(bd, k_bd_addr, 6u); }
 void bt_xrec_plat_service(void) {}
 void bt_xrec_plat_wait(void) { vTaskDelay(1); }
 uint32_t bt_xrec_plat_irq_count(void) { return 0u; }
-int bt_xrec_plat_ctrl_note(char *line, uint16_t cap, uint8_t *arg)
+int bt_xrec_plat_ctrl_note(char *line, uint16_t cap, bt_xrec_note_t *info)
 {
     bt_ctrl_note_t n;
     if (!bt_ctrl_note_pop(&n)) {
         return 0;
     }
-    *arg = n.reason;
+    info->status = n.status;
+    info->arg = n.reason;
+    info->handle = n.handle;
     (void)bt_ctrl_note_format(&n, line, cap);
     return n.kind;
 }
+int bt_xrec_plat_ctrl_name(uint8_t bda[6], char *name, uint16_t cap) { return bt_ctrl_peer_name(bda, name, cap); }
 void bt_xrec_plat_reboot(uint8_t mode) { s_reboot_mode = mode; }
 
 /* Entropy as the session sees it on target (bt_xrec_fw.c). The DRBG itself is always seeded on the host (host_glue.c
