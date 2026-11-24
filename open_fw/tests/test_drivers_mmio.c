@@ -1224,6 +1224,61 @@ static void test_keys_driver(void)
     printf("[OK] keys SARADC + PB6/PB11 + 1kHz scanner/debounce/SPSC MMIO\n");
 }
 
+/* Screen idle policy + key activity stamp (main.c backlight_update()). */
+static void test_screen_idle_policy(void)
+{
+    uint8_t pct = 0u;
+    /* 30 s timeout: full, dim to 15% from 15 s, sleep at 30 s. */
+    assert(screen_idle_level(1000u, 1000u, 30000u, 80u, &pct) == SCREEN_IDLE_FULL && pct == 80u);
+    assert(screen_idle_level(15999u, 1000u, 30000u, 80u, &pct) == SCREEN_IDLE_FULL && pct == 80u);
+    assert(screen_idle_level(16000u, 1000u, 30000u, 80u, &pct) == SCREEN_IDLE_DIM && pct == 15u);
+    assert(screen_idle_level(16000u, 1000u, 30000u, 10u, &pct) == SCREEN_IDLE_DIM && pct == 10u);
+    assert(screen_idle_level(31000u, 1000u, 30000u, 80u, &pct) == SCREEN_IDLE_SLEEP && pct == 0u);
+    /* 15 s timeout never dims; "never" never sleeps. */
+    assert(screen_idle_level(15999u, 1000u, 15000u, 60u, &pct) == SCREEN_IDLE_FULL && pct == 60u);
+    assert(screen_idle_level(16000u, 1000u, 15000u, 60u, &pct) == SCREEN_IDLE_SLEEP);
+    assert(screen_idle_level(UINT32_MAX, 0u, 0u, 60u, &pct) == SCREEN_IDLE_FULL && pct == 60u);
+    /* Activity stamped after the caller sampled its clock is fresh, not 49 days old. */
+    assert(screen_idle_level(5000u, 5003u, 30000u, 80u, &pct) == SCREEN_IDLE_FULL && pct == 80u);
+    /* Wrap-safe. */
+    assert(screen_idle_level(100u, UINT32_MAX - 100u, 30000u, 80u, &pct) == SCREEN_IDLE_FULL);
+
+    /* Regression: an hour of playback (player loop never touches the idle timer),
+     * then BACK. The last backlight_wake() was entering the player at t=1000. */
+    soc_reset();
+    g_soc.saradc_ch1_data = 4095u;
+    keys_init();
+    uint32_t k = 0u;
+    assert(keys_last_activity(&k) == 0);
+    uint32_t wake_ms = 1000u, t = wake_ms + 3600000u;
+    g_soc.saradc_ch1_data = 2550u; /* KEY_BACK */
+    for (int i = 0; i < 8; i++) keys_scan_tick(t++);
+    uint32_t press_ms = t - 1u;
+    g_soc.saradc_ch1_data = 4095u;
+    for (int i = 0; i < 8; i++) keys_scan_tick(t++);
+    uint32_t release_ms = t - 1u;
+    keys_flush_events(); /* consumed by the player */
+    uint32_t now = t + 20u;
+    /* Old backlight_update(): idle measured from wake_ms -> immediate sleep. */
+    assert(screen_idle_level(now, wake_ms, 30000u, 80u, &pct) == SCREEN_IDLE_SLEEP);
+    /* Fixed: the last key edge counts as activity -> full brightness. */
+    assert(keys_last_activity(&k) == 1 && k == release_ms && k > press_ms);
+    uint32_t last = ((int32_t)(k - wake_ms) > 0) ? k : wake_ms;
+    assert(screen_idle_level(now, last, 30000u, 80u, &pct) == SCREEN_IDLE_FULL && pct == 80u);
+    assert(screen_idle_level(release_ms + 15000u, last, 30000u, 80u, &pct) == SCREEN_IDLE_DIM);
+    assert(screen_idle_level(release_ms + 30000u, last, 30000u, 80u, &pct) == SCREEN_IDLE_SLEEP);
+    /* An edge on a resync-ignored (held across a transition) key still counts. */
+    g_soc.saradc_ch1_data = 2850u;
+    for (int i = 0; i < 8; i++) keys_scan_tick(t++);
+    keys_ignore_held();
+    g_soc.saradc_ch1_data = 4095u;
+    for (int i = 0; i < 8; i++) keys_scan_tick(t++);
+    assert(keys_last_activity(&k) == 1 && k == t - 1u);
+    assert(!keys_event_pending());
+
+    printf("[OK] screen idle policy + key activity stamp (player exit regression)\n");
+}
+
 static int exp_test_blk_read(void *ctx, uint32_t lba, uint32_t count, void *buf)
 {
     uint8_t *img = (uint8_t *)ctx;
@@ -1827,6 +1882,7 @@ int main(int argc, char **argv)
     test_rtc_driver();
     test_pmu_driver();
     test_keys_driver();
+    test_screen_idle_policy();
     test_exp_runner_guards(argv[1]);
     test_lcd_driver();
     test_sdio_exfat_and_usb_msc(argv[1]);
