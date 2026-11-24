@@ -353,6 +353,25 @@ int main(int argc, char **argv)
         ui_render_screen(UI_SCR_FILES, &m);
     }
 
+    /* Verify European glyph coverage (Latin-1, Latin Ext-A, Greek, Cyrillic) across all 3 fonts */
+    {
+        static const uint32_t euro_cps[] = {
+            0x00E4u, 0x00F6u, 0x00FCu, 0x00C4u, 0x00D6u, 0x00DFu, /* ä ö ü Ä Ö ß */
+            0x0142u, 0x0159u, 0x0219u,                             /* ł ř ș */
+            0x0394u, 0x03B1u, 0x03C9u, 0x03ACu,                    /* Δ α ω ά */
+            0x0414u, 0x0416u, 0x044Fu, 0x0451u, 0x0491u,           /* Д Ж я ё ґ */
+            0x20ACu,                                               /* € */
+        };
+        const lv_font_t *fonts[3] = { &ui_font_sm, &ui_font_md, &ui_font_lg };
+        for (int f = 0; f < 3; f++) {
+            for (size_t i = 0; i < sizeof(euro_cps) / sizeof(euro_cps[0]); i++) {
+                lv_font_glyph_dsc_t gd;
+                bool ok = lv_font_get_glyph_dsc(fonts[f], &gd, euro_cps[i], 0u);
+                assert(ok && gd.box_w > 0u && gd.box_h > 0u);
+            }
+        }
+    }
+
     /* 5: Player (Time-first) */
     m.play_file           = demo_files[0];
     m.play_pos_sec        = 120;

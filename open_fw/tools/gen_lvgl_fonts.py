@@ -52,35 +52,38 @@ DEFAULT_SYMBOL = [
     "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
 ]
 
+# Contiguous Unicode ranges emitted as O(1) FORMAT0_TINY cmaps:
+#   - Printable ASCII (U+0020..U+007E)
+#   - Latin-1 Supplement (U+00A0..U+00FF): German (äöüÄÖÜß), French, Spanish, Italian, Portuguese, Nordic («»±·×)
+#   - Latin Extended-A (U+0100..U+017F): Polish, Czech, Slovak, Hungarian, Turkish, Croatian, Baltic, Œœ
+#   - Greek & Coptic (U+0386..U+03CE): Modern Greek uppercase/lowercase + tonos/dialytika
+#   - Cyrillic (U+0400..U+045F): Russian, Ukrainian, Belarusian, Bulgarian, Serbian, Macedonian
+CONTIGUOUS_RANGES = [
+    (0x0020, 0x007E),
+    (0x00A0, 0x00FF),
+    (0x0100, 0x017F),
+    (0x0386, 0x03CE),
+    (0x0400, 0x045F),
+]
+
 # Sorted ascending by Unicode codepoint (required for LVGL sparse cmap binary search)
 EXTRA_CODEPOINTS = [
-    0x00AB,  # «
-    0x00B1,  # ±
-    0x00B7,  # ·
-    0x00BB,  # »
-    0x00C0,  # À
-    0x00C1,  # Á
-    0x00C8,  # È
-    0x00C9,  # É
-    0x00CC,  # Ì
-    0x00CD,  # Í
-    0x00D2,  # Ò
-    0x00D3,  # Ó
-    0x00D7,  # ×
-    0x00D9,  # Ù
-    0x00DA,  # Ú
-    0x00E0,  # à
-    0x00E1,  # á
-    0x00E8,  # è
-    0x00E9,  # é
-    0x00EC,  # ì
-    0x00ED,  # í
-    0x00F2,  # ò
-    0x00F3,  # ó
-    0x00F9,  # ù
-    0x00FA,  # ú
-    0x2026,  # …
-    0x2212,  # −
+    0x0218,  # Ș (Romanian S-comma)
+    0x0219,  # ș
+    0x021A,  # Ț (Romanian T-comma)
+    0x021B,  # ț
+    0x0490,  # Ґ (Ukrainian Ghe with upturn)
+    0x0491,  # ґ
+    0x2013,  # – en dash
+    0x2014,  # — em dash
+    0x2018,  # ‘ left single quote
+    0x2019,  # ’ right single quote
+    0x201C,  # “ left double quote
+    0x201D,  # ” right double quote
+    0x201E,  # „ German low double quote
+    0x2026,  # … ellipsis
+    0x20AC,  # € euro sign
+    0x2212,  # − minus
     0x25A0,  # ■
     0x25B2,  # ▲
     0x25B6,  # ▶
@@ -166,16 +169,20 @@ def build_font(name: str, ttf_path: str, sym_path: str, px_size: int, gamma: flo
     bitmap = bytearray()
     dscs = [(0, 0, 0, 0, 0, 0)]  # (bitmap_index, adv_w_fp4, box_w, box_h, ofs_x, ofs_y)
 
-    # Range 1: ASCII 0x20..0x7E (95 glyphs, gid 1..95)
-    for cp in range(0x20, 0x7F):
-        gw, gh, ox, oy, adv, data = render_glyph(
-            font, sym_font, cp, px_size, ascent, line_height, digit_adv, gamma
-        )
-        bidx = len(bitmap)
-        bitmap.extend(data)
-        dscs.append((bidx, adv * 16, gw, gh, ox, oy))
+    # Contiguous European + ASCII ranges (FORMAT0_TINY cmaps)
+    contig_cmaps: list[tuple[int, int, int]] = []
+    for r_start, r_end in CONTIGUOUS_RANGES:
+        gid_start = len(dscs)
+        for cp in range(r_start, r_end + 1):
+            gw, gh, ox, oy, adv, data = render_glyph(
+                font, sym_font, cp, px_size, ascent, line_height, digit_adv, gamma
+            )
+            bidx = len(bitmap)
+            bitmap.extend(data)
+            dscs.append((bidx, adv * 16, gw, gh, ox, oy))
+        contig_cmaps.append((r_start, r_end - r_start + 1, gid_start))
 
-    # Range 2: Sparse extra Unicode codepoints (gid 96..)
+    # Final sparse cmap for punctuation & UI symbols
     extra_gid_start = len(dscs)
     extra_min = EXTRA_CODEPOINTS[0]
     extra_max = EXTRA_CODEPOINTS[-1]
@@ -190,7 +197,7 @@ def build_font(name: str, ttf_path: str, sym_path: str, px_size: int, gamma: flo
         dscs.append((bidx, adv * 16, gw, gh, ox, oy))
 
     lines: list[str] = []
-    lines.append(f"/* {name}: {Path(ttf_path).name} {px_size}px, 4-bit AA, {len(bitmap)} B bitmap */")
+    lines.append(f"/* {name}: {Path(ttf_path).name} {px_size}px, 4-bit AA, {len(dscs) - 1} glyphs, {len(bitmap)} B bitmap */")
     lines.append(f"static LV_ATTRIBUTE_LARGE_CONST const uint8_t {name}_bitmap[] = {{")
     for i in range(0, len(bitmap), 16):
         chunk = ", ".join(f"0x{b:02X}u" for b in bitmap[i:i + 16])
@@ -212,15 +219,16 @@ def build_font(name: str, ttf_path: str, sym_path: str, px_size: int, gamma: flo
     lines.append("")
 
     lines.append(f"static const lv_font_fmt_txt_cmap_t {name}_cmaps[] = {{")
-    lines.append("    {")
-    lines.append("        .range_start = 0x20u,")
-    lines.append("        .range_length = 95u,")
-    lines.append("        .glyph_id_start = 1u,")
-    lines.append("        .unicode_list = NULL,")
-    lines.append("        .glyph_id_ofs_list = NULL,")
-    lines.append("        .list_length = 0u,")
-    lines.append("        .type = LV_FONT_FMT_TXT_CMAP_FORMAT0_TINY,")
-    lines.append("    },")
+    for r_start, r_len, gid_start in contig_cmaps:
+        lines.append("    {")
+        lines.append(f"        .range_start = 0x{r_start:04X}u,")
+        lines.append(f"        .range_length = {r_len}u,")
+        lines.append(f"        .glyph_id_start = {gid_start}u,")
+        lines.append("        .unicode_list = NULL,")
+        lines.append("        .glyph_id_ofs_list = NULL,")
+        lines.append("        .list_length = 0u,")
+        lines.append("        .type = LV_FONT_FMT_TXT_CMAP_FORMAT0_TINY,")
+        lines.append("    },")
     lines.append("    {")
     lines.append(f"        .range_start = 0x{extra_min:04X}u,")
     lines.append(f"        .range_length = {extra_max - extra_min + 1}u,")
@@ -233,13 +241,14 @@ def build_font(name: str, ttf_path: str, sym_path: str, px_size: int, gamma: flo
     lines.append("};")
     lines.append("")
 
+    cmap_count = len(contig_cmaps) + 1
     lines.append(f"static const lv_font_fmt_txt_dsc_t {name}_dsc = {{")
     lines.append(f"    .glyph_bitmap = {name}_bitmap,")
     lines.append(f"    .glyph_dsc = {name}_glyph_dsc,")
     lines.append(f"    .cmaps = {name}_cmaps,")
     lines.append("    .kern_dsc = NULL,")
     lines.append("    .kern_scale = 0u,")
-    lines.append("    .cmap_num = 2u,")
+    lines.append(f"    .cmap_num = {cmap_count}u,")
     lines.append("    .bpp = 4u,")
     lines.append("    .kern_classes = 0u,")
     lines.append("    .bitmap_format = 0u,")
