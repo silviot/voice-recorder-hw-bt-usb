@@ -70,6 +70,31 @@ Follow-ups: `FreeRTOSConfig.h` now states `configPRIO_BITS 4` with the syscall c
 V11 port reads the implemented bits from hardware). Stage B (verified writes 0C56/0C01/0C24/0C13/0C1A) and the
 "needs disassembly" rows are next; ACL/connection traffic (stage C) also repeats the Exp 0 memory check.
 
+## Session 3 (2026-11-24): Exp 1 stage B — PASS, discoverable from a laptop
+
+Image: `BT=1 HCI_PROBE=1` at `977819a` (probe FIRM CRC-16 0x45B0), request `HCIPROBE.RUN` = `B` (consumed). Full log
+from `SD:/HCIPROBE.LOG` (4,830 B, `lost=0`). Result: `END st=DONE fails=0 vfail=0` in 38.8 s; afterwards `legacy=allowed`.
+Stage A repeated cleanly (Reset 205 ms, 5/5 restarts, BD_ADDR match).
+
+| Item | Result |
+|---|---|
+| Five V-B writes, forwarded to the ROM (`fwd=1 romd=1`) | 0C56, 0C01, 0C24, 0C13, 0C1A all CC status 0 in **530–619 µs** (vs 150–330 µs for locally answered reads) |
+| Read-backs | SSP host bit `01` (1004 p1); event mask `FF…FF` after Bluedroid's mask; name `Cassini-Probe-011D` via 0C14 (248 B match); zero-mask write reads back exactly the mandatory bits `00600400F80740E2`, then `FF…FF` again: **the ROM stores the mask we write, ORed with the mandatory bits** (and it is all-ones after Bluedroid's mask, since `BF 1D` sits on top of mandatory bits) |
+| **Over-the-air** | Laptop (BlueZ, `bluetoothctl scan on`) saw `02:CA:55:00:01:1D` at RSSI −67…−75 dBm and resolved the name **`Cassini-Probe-011D`**: inquiry scan, inquiry response and the remote-name page/LMP exchange all run inside the ROM with no host involvement and no HCI events |
+| IRQ 26 while discoverable (30 s) | 1607.6 Hz: bit 0 at 1600 Hz as at idle, plus **bit 1 at 7.5 Hz and bit 10 at 2.3 Hz** (scan-window activity; both serviced, 0 coalesced, `unh=0`). After `0C1A 00` only bit 0 remains |
+| `bt_ctrl` CPU | idle 7.43 %, discoverable 7.40 %, scan off 7.29 % — scanning costs ~nothing on top of the 1600 Hz slot tick; per-100 ms peak 9.3 % (`cpu_pk` is in **permille**). Session 2 measured 5.3 % on the stage-A-only image; the slot tick, not radio activity, is the power cost to attack |
+| Latency | IRQ→BH max 179 µs (avg 14), `bt_ctrl_run` max 287 µs while discoverable (plan bound 1 ms) |
+| `g_bt_heap` | high-water **304 B** (the 248 B name message), 48 B in use during scan, 0 after teardown, `fail=0` |
+| Free stack | bt_ctrl 2,936 of 4,096 B (1,160 used, same as QEMU), bt_dlv 1,372, probe 1,100 |
+| RTOS heap free | 102,584 B |
+| Unsolicited events | none (`evts=0`, `evt_unsol=0`) — inquiry scan produces no host events, as expected |
+
+Also seen (not BT): `SDW_MDTO`/`SDW_MFAIL` once while writing `HCIPROBE.LOG` — the existing SD driver's multi-block
+timeout falling back to single-sector writes; the log file was complete.
+
+Next: the 22 G-B/G-C opcodes now have static mappings in `docs/BT_ROM_HCI_MAP.md` and need a stage that exercises them
+(inquiry 0401/0402, remote name 0419, connection 0405, …); stage C (ACL) repeats the Exp 0 memory check.
+
 ## Exp 1 stages A and B: how to run
 
 Probe image for plan M5 Exp 1 stage A and stage B (step 4): `bt_ctrl` (plan M1) drives the real RW-BT ROM through
