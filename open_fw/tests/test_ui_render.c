@@ -714,6 +714,39 @@ int main(int argc, char **argv)
     ui_render_screen(UI_SCR_BT, &m);
     assert(g_written_pixels == before);
 
+    /* Headset button probe screen (About layout) incl. prompt + unknown plug, then About
+     * must render exactly as before (probe binder must not leak label state). */
+    {
+        ui_render_screen(UI_SCR_ABOUT, &m);
+        capture_shot(0);
+        static uint16_t about_ref[80][160];
+        memcpy(about_ref, g_fb, sizeof(about_ref));
+        m.hsp_secs_left = 27; m.hsp_phase = 1; m.hsp_prompt = 0; m.hsp_plug = 1;
+        ui_render_screen(UI_SCR_HSPROBE, &m);
+        capture_shot(0);
+        m.hsp_prompt = 2; m.hsp_phase = 2;
+        ui_render_screen(UI_SCR_HSPROBE, &m);
+        capture_shot(0);
+        {
+            int amber = 0;
+            for (int y = 14; y < 34; y++)
+                for (int x = 0; x < 160; x++)
+                    if (g_fb[y][x] == UI_COL_AMBER) amber++;
+            assert(amber > 20); /* "PRESS button now" highlighted */
+        }
+        m.hsp_prompt = 0; m.hsp_phase = 3; m.hsp_plug = -1;
+        ui_render_screen(UI_SCR_HSPROBE, &m);
+        sample_heap("hsprobe");
+        ui_render_screen(UI_SCR_ABOUT, &m);
+        capture_shot(0);
+        assert(memcmp(g_fb, about_ref, sizeof(about_ref)) == 0);
+        int saved_sel = m.set_sel, saved_scroll = m.set_scroll;
+        m.set_sel = UI_SET_HSPROBE; m.set_scroll = UI_SET_COUNT - 3;
+        ui_render_screen(UI_SCR_SETTINGS, &m);
+        sample_heap("settings_hsprobe");
+        m.set_sel = saved_sel; m.set_scroll = saved_scroll;
+    }
+
     /* Exercise extra sub-screens for heap measurement */
     ui_render_screen(UI_SCR_CHARGE, &m);
     sample_heap("charge");

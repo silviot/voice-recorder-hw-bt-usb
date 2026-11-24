@@ -27,6 +27,7 @@
 #include "openfw_wav.h"
 #include "openfw_player.h"
 #include "openfw_apmem.h"
+#include "openfw_hsprobe.h"
 #include "cassini_splash.h"
 
 #define MENU_MAX_FILES 96
@@ -1488,6 +1489,66 @@ static void run_bt_xrec_mode(void)
     reload_files_and_sd_stats();
 }
 
+/* Settings > Headset button test (diagnostic, see hsprobe.c). Modal. */
+static int hsprobe_poll_cb(uint32_t now_ms)
+{
+    int show = ui_poll_power_button(UI_SCR_HSPROBE, &g_ui, now_ms);
+    /* Key scanning is paused during the probe, so keep the idle timer fresh
+     * (but never cancel a manual POWER sleep or its fade-out). */
+    if (g_screen_off == SCREEN_AWAKE && g_fade_out_reason == SCREEN_AWAKE) {
+        g_last_activity_ms = now_ms;
+    }
+    backlight_update();
+    return show;
+}
+
+static void hsprobe_render_cb(uint8_t secs_left, uint8_t phase, uint8_t prompt, int8_t plug)
+{
+    g_ui.hsp_secs_left = secs_left;
+    g_ui.hsp_phase     = phase;
+    g_ui.hsp_prompt    = prompt;
+    g_ui.hsp_plug      = plug;
+    if (!g_screen_off && g_ui_screen != UI_SCR_POWER) {
+        g_ui_screen = UI_SCR_HSPROBE;
+        ui_render_screen(UI_SCR_HSPROBE, &g_ui);
+    }
+}
+
+static void run_headset_probe(uint32_t now_ms)
+{
+    hsprobe_ctx_t ctx;
+    ctx.vol        = &g_exfat_vol;
+    ctx.sd_mounted = g_sd_mounted;
+    ctx.poll       = hsprobe_poll_cb;
+    ctx.render     = hsprobe_render_cb;
+
+    g_ui.toast_msg[0] = '\0';
+    backlight_wake(now_ms);
+    hsprobe_render_cb((uint8_t)(HSP_T_END / 1000u), 1u, 0u, (int8_t)keys_read_hp_detect());
+    int rc = hsprobe_run(&ctx);
+    if (rc == HSP_RC_SAVED) {
+        (void)sd_flush(&g_sd_card);
+    }
+    keys_ignore_held();
+    refresh_telemetry();
+    backlight_wake(millis());
+    /* TODO(i18n): probe toasts are English-only */
+    switch (rc) {
+    case HSP_RC_SAVED:
+        ui_show_toast(ui_tr(UI_STR_HSP_SAVED), UI_COL_GREEN, millis(), 3000u);
+        break;
+    case HSP_RC_NO_SD:
+        ui_show_toast(ui_tr(UI_STR_HSP_NO_SD), UI_COL_RED, millis(), 3000u);
+        break;
+    case HSP_RC_BUSY:
+        ui_show_toast(ui_tr(UI_STR_HSP_BUSY), UI_COL_AMBER, millis(), 2000u);
+        break;
+    default:
+        ui_show_toast(ui_tr(UI_STR_TOAST_SAVE_FAILED), UI_COL_RED, millis(), 3000u);
+        break;
+    }
+}
+
 static void play_boot_animation(void)
 {
     /*
@@ -2668,7 +2729,7 @@ int openfw_main(void)
                                     dirty = 1;
                                 }
                             } else if (key == KEY_RIGHT) {
-                                if (g_ui.set_sel < 10) {
+                                if (g_ui.set_sel < UI_SET_COUNT - 1) {
                                     g_ui.set_sel++;
                                     if (g_ui.set_sel >= g_ui.set_scroll + 3) {
                                         g_ui.set_scroll = g_ui.set_sel - 2;
@@ -2700,6 +2761,11 @@ int openfw_main(void)
                                         dirty       = 1;
                                         modal_done  = 1;
                                     }
+                                } else if (g_ui.set_sel == UI_SET_HSPROBE) {
+                                    run_headset_probe(t);
+                                    g_ui_screen = (uint32_t)scr;
+                                    dirty       = 1;
+                                    modal_done  = 1;
                                 } else if (g_ui.set_sel == 10) {
                                     enter_press_ms = 0u;
                                     about_armed    = 0;

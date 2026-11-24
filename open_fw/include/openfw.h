@@ -189,6 +189,7 @@ int         keys_read_hp_detect(void);
 key_id_t    keys_decode(uint16_t adc);
 const char *keys_name(key_id_t key);
 void        keys_scan_tick(uint32_t now_ms);
+void        keys_pause_scan(int pause); /* 1 = stop debounced scanning (diagnostics) */
 int         keys_peek_event(key_event_t *out);
 int         keys_pop_event(key_event_t *out);
 int         keys_event_pending(void);
