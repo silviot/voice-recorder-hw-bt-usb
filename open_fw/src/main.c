@@ -429,6 +429,7 @@ static void load_persisted_state(void)
     }
 
     apply_cfg_to_recorder();
+    ui_i18n_set_lang(g_ui.cfg.lang);
     backlight_apply(user_bl_pct());
 
     if (has_last && last_name[0] != '\0') {
@@ -1489,6 +1490,10 @@ static void adjust_setting(int idx, int delta, uint32_t now_ms)
     case 7: /* Skip */
         g_ui.cfg.skip_mode = (uint8_t)((g_ui.cfg.skip_mode + (delta > 0 ? 1u : 2u)) % 3u);
         break;
+    case 8: /* Language */
+        g_ui.cfg.lang = (uint8_t)((g_ui.cfg.lang + (delta > 0 ? 1u : ((uint32_t)UI_LANG_COUNT - 1u))) % (uint32_t)UI_LANG_COUNT);
+        ui_i18n_set_lang(g_ui.cfg.lang);
+        break;
     default:
         break;
     }
@@ -1588,9 +1593,9 @@ static void delete_selected_file(uint32_t now_ms)
             g_ui.last_file.has_transcript = 0u;
             save_persisted_state();
         }
-        ui_show_toast("Deleted", UI_COL_GREEN, now_ms, 1500u);
+        ui_show_toast(ui_tr(UI_STR_TOAST_DELETED), UI_COL_GREEN, now_ms, 1500u);
     } else {
-        ui_show_toast("Delete failed", UI_COL_AMBER, now_ms, 1500u);
+        ui_show_toast(ui_tr(UI_STR_TOAST_DEL_FAILED), UI_COL_AMBER, now_ms, 1500u);
     }
 }
 
@@ -1724,6 +1729,7 @@ int openfw_main(void)
     }
 
     ui_settings_defaults(&g_ui.cfg);
+    ui_i18n_set_lang(g_ui.cfg.lang);
     g_ui.home_focus = 1u; /* Default focus: Files */
     g_ui.spec       = &g_spec;
     copy_cstr(g_ui.bt_name, (int)sizeof(g_ui.bt_name), "HW_76");
@@ -1910,14 +1916,14 @@ int openfw_main(void)
                     rec_active = 0;
                 } else if (low_batt_cutoff) {
                     g_ui.rec_stopped = 1u;
-                    copy_cstr(g_ui.rec_stop_reason, (int)sizeof(g_ui.rec_stop_reason), "Low battery");
+                    copy_cstr(g_ui.rec_stop_reason, (int)sizeof(g_ui.rec_stop_reason), ui_tr(UI_STR_LOW_BATTERY));
                     rec_active = 0;
                 } else if (recorder_start(&g_exfat_vol, g_sd_mounted) == 0) {
                     rec_active = 1;
                     copy_cstr(g_ui.rec_filename, (int)sizeof(g_ui.rec_filename), recorder_get_filename());
                 } else {
                     g_ui.rec_stopped = 1u;
-                    copy_cstr(g_ui.rec_stop_reason, (int)sizeof(g_ui.rec_stop_reason), "Start failed");
+                    copy_cstr(g_ui.rec_stop_reason, (int)sizeof(g_ui.rec_stop_reason), ui_tr(UI_STR_START_FAILED));
                     rec_active = 0;
                 }
                 dirty = 1;
@@ -1949,7 +1955,7 @@ int openfw_main(void)
                 } else {
                     reload_files_and_sd_stats();
                     if (was_saving || recorder_has_error()) {
-                        ui_show_toast("Save failed \xC2\xB7 card error", UI_COL_RED, now_ms, 2500u);
+                        ui_show_toast(ui_tr(UI_STR_TOAST_SAVE_FAILED), UI_COL_RED, now_ms, 2500u);
                     }
                     scr = (prev_scr == UI_SCR_REC || prev_scr == UI_SCR_SAVED) ? UI_SCR_HOME : prev_scr;
                 }
@@ -1967,9 +1973,9 @@ int openfw_main(void)
                 rec_active       = 0;
                 g_ui.rec_stopped = 1u;
                 uint32_t fmb = 1u, tmb = 0u;
-                const char *reason = "Write error";
+                const char *reason = ui_tr(UI_STR_WRITE_ERROR);
                 if (g_sd_mounted && exfat_stat_fs(&g_exfat_vol, &fmb, &tmb) == 0 && fmb == 0u) {
-                    reason = "Storage full";
+                    reason = ui_tr(UI_STR_STORAGE_FULL);
                 }
                 copy_cstr(g_ui.rec_stop_reason, (int)sizeof(g_ui.rec_stop_reason), reason);
                 backlight_wake(now_ms);
@@ -2168,7 +2174,7 @@ int openfw_main(void)
                                     dirty       = 1;
                                     modal_done  = 1;
                                 } else {
-                                    ui_show_toast("Nothing played yet", UI_COL_AMBER, t, 1500u);
+                                    ui_show_toast(ui_tr(UI_STR_NOTHING_PLAYED), UI_COL_AMBER, t, 1500u);
                                     dirty = 1;
                                 }
                             } else if (g_ui.home_focus == 1u) {
@@ -2377,7 +2383,7 @@ int openfw_main(void)
                                 dt.second = 0u;
                                 rtc_set(&dt);
                                 g_ui.set_edit_clock = 0u;
-                                ui_show_toast("Clock saved", UI_COL_GREEN, t, 1200u);
+                                ui_show_toast(ui_tr(UI_STR_TOAST_CLOCK_SAVED), UI_COL_GREEN, t, 1200u);
                                 dirty = 1;
                             }
                         } else {
@@ -2395,7 +2401,7 @@ int openfw_main(void)
                                     dirty = 1;
                                 }
                             } else if (key == KEY_RIGHT) {
-                                if (g_ui.set_sel < 9) {
+                                if (g_ui.set_sel < 10) {
                                     g_ui.set_sel++;
                                     if (g_ui.set_sel >= g_ui.set_scroll + 3) {
                                         g_ui.set_scroll = g_ui.set_sel - 2;
@@ -2415,9 +2421,9 @@ int openfw_main(void)
                                     g_ui.set_edit_m     = g_ui.now.minute;
                                     g_ui.set_edit_clock = 1u;
                                     dirty = 1;
-                                } else if (g_ui.set_sel == 8) {
+                                } else if (g_ui.set_sel == 9) {
                                     if (!pmu_is_vbus_present()) {
-                                        ui_show_toast("Plug in USB cable", UI_COL_AMBER, t, 1500u);
+                                        ui_show_toast(ui_tr(UI_STR_TOAST_PLUG_USB), UI_COL_AMBER, t, 1500u);
                                         dirty = 1;
                                     } else {
                                         save_persisted_state();
@@ -2427,7 +2433,7 @@ int openfw_main(void)
                                         dirty       = 1;
                                         modal_done  = 1;
                                     }
-                                } else if (g_ui.set_sel == 9) {
+                                } else if (g_ui.set_sel == 10) {
                                     enter_press_ms = 0u;
                                     about_armed    = 0;
                                     scr            = UI_SCR_ABOUT;
@@ -2458,7 +2464,7 @@ int openfw_main(void)
                             (void)recorder_stop();
                             save_persisted_state();
                             (void)sd_flush(&g_sd_card);
-                            ui_show_toast("Entering update mode", UI_COL_CYAN, t, 1000u);
+                            ui_show_toast(ui_tr(UI_STR_TOAST_UPDATE_MODE), UI_COL_CYAN, t, 1000u);
                             ui_render_screen(UI_SCR_ABOUT, &g_ui);
                             cpu1_ui_sync(100u);
                             mdelay(150u);
@@ -2533,7 +2539,7 @@ int openfw_main(void)
                     (void)recorder_stop();
                     rec_active       = 0;
                     g_ui.rec_stopped = 1u;
-                    copy_cstr(g_ui.rec_stop_reason, (int)sizeof(g_ui.rec_stop_reason), "Low battery");
+                    copy_cstr(g_ui.rec_stop_reason, (int)sizeof(g_ui.rec_stop_reason), ui_tr(UI_STR_LOW_BATTERY));
                     dirty = 1;
                 }
             } else if (g_ui.batt_mv >= 3550u) {
