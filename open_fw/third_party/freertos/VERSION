@@ -1,0 +1,5 @@
+FreeRTOS-Kernel V11.1.0
+https://github.com/FreeRTOS/FreeRTOS-Kernel
+commit dbf70559b27d39c1fdb68dfb9a32140b6a6777a0
+License: MIT (LICENSE.md)
+Files are pristine copies; local config lives in open_fw/src/rtos/.

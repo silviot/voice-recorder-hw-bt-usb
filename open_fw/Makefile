@@ -24,12 +24,23 @@ else
 BUILD_DIR ?= /tmp/sl6801_openfw
 endif
 
+# RTOS=1: run the app as a FreeRTOS task (prerequisite for Bluedroid). Default 0 until validated.
+RTOS ?= 0
+FREERTOS_DIR := third_party/freertos
+ifeq ($(RTOS),1)
+RTOS_INC   := -Isrc/rtos -Isrc/rtos/shim -I$(FREERTOS_DIR)/include -I$(FREERTOS_DIR)/portable/GCC/ARM_CM4F
+RTOS_DEFS  := -DOPENFW_RTOS=1
+else
+RTOS_INC   :=
+RTOS_DEFS  := -DOPENFW_RTOS=0
+endif
+
 LVGL_INC := -I$(LVGL_DIR) -DLV_CONF_INCLUDE_SIMPLE=1
 
 CFLAGS   := --target=thumbv7em-none-eabi -mcpu=cortex-m4 -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb \
             -Os -Wall -Wextra -ffreestanding -fno-builtin -fno-stack-protector \
             -ffunction-sections -fdata-sections \
-            -Iinclude -Isrc/ui -Isrc/ui/eez $(LVGL_INC) -I$(BUILD_DIR)
+            -Iinclude -Isrc/ui -Isrc/ui/eez $(LVGL_INC) $(RTOS_INC) $(RTOS_DEFS) -I$(BUILD_DIR)
 ifeq ($(DEV_EXP),1)
 CFLAGS   += -DOPENFW_ENABLE_USB_EXP=1 -DOPENFW_UNATTENDED_DEV=1
 else ifeq ($(UNATTENDED_DEV),1)
@@ -86,6 +97,18 @@ SRCS      := src/startup.c src/wdt_timer.c src/rtc.c src/uart.c src/pmu.c \
              src/persist.c src/main.c
 OBJS      := $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(SRCS))
 
+# FreeRTOS kernel + glue (ARM link only; not part of WASM/host builds)
+RTOS_SRCS := $(FREERTOS_DIR)/tasks.c $(FREERTOS_DIR)/queue.c $(FREERTOS_DIR)/list.c \
+             $(FREERTOS_DIR)/timers.c $(FREERTOS_DIR)/event_groups.c $(FREERTOS_DIR)/stream_buffer.c \
+             $(FREERTOS_DIR)/portable/GCC/ARM_CM4F/port.c $(FREERTOS_DIR)/portable/MemMang/heap_5.c \
+             src/rtos/rtos_port.c src/rtos/libc_min.c
+RTOS_OBJS := $(patsubst %.c,$(BUILD_DIR)/rtos/%.o,$(RTOS_SRCS))
+ifeq ($(RTOS),1)
+ARM_OBJS  := $(OBJS) $(RTOS_OBJS)
+else
+ARM_OBJS  := $(OBJS)
+endif
+
 SPLASH_PNG  := ../assets/cassini_welcome_80x40.png
 SPLASH_HDR  := $(BUILD_DIR)/cassini_splash.h
 STOCK_DUMP  := ../dumps/firmware_2M.bin
@@ -136,9 +159,13 @@ $(BUILD_DIR)/%.o: src/%.c $(CONFIG_STAMP) include/sl6801_regs.h include/sl6801_r
 	@mkdir -p $(dir $@)
 	$(CLANG) $(CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/open_fw.elf: $(OBJS) $(BUILD_DIR)/liblvgl.a sl6801_firm.ld
+$(BUILD_DIR)/rtos/%.o: %.c $(CONFIG_STAMP) src/rtos/FreeRTOSConfig.h include/openfw_rtos.h | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	$(CLANG) $(filter-out -Wextra,$(CFLAGS)) -Wno-unused-parameter -c $< -o $@
+
+$(BUILD_DIR)/open_fw.elf: $(ARM_OBJS) $(BUILD_DIR)/liblvgl.a sl6801_firm.ld
 	@test -n "$(LLD)" || (echo "Error: ld.lld not found (set LLD=/path/to/ld.lld)" >&2; exit 1)
-	$(LLD) --gc-sections -T sl6801_firm.ld $(OBJS) $(BUILD_DIR)/liblvgl.a -o $@
+	$(LLD) --gc-sections -T sl6801_firm.ld $(ARM_OBJS) $(BUILD_DIR)/liblvgl.a -o $@
 
 $(BUILD_DIR)/ram_boot.bin: $(BUILD_DIR)/open_fw.elf
 	@test -n "$(OBJCOPY)" || (echo "Error: llvm-objcopy not found (set OBJCOPY=/path/to/llvm-objcopy)" >&2; exit 1)

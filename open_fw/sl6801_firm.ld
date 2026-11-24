@@ -20,6 +20,9 @@ MEMORY
     EXP_ARENA (rwx) : ORIGIN = 0x00850000, LENGTH = 0x00008000
     EXP_OUT   (rw)  : ORIGIN = 0x00858000, LENGTH = 0x00004000
     SRAM_HI   (rwx) : ORIGIN = 0x0085C000, LENGTH = 0x0000B000
+    /* Physical SRAM extends to 0x0087FFFF (stock FIRM used it for heaps). Unused by open_fw
+     * unless built with OPENFW_RTOS=1; heap_5 region, NOT zeroed at boot. Verify on hardware. */
+    RTOS_HEAP (rw)  : ORIGIN = 0x0086B000, LENGTH = 0x00015000
 }
 
 _estack = 0x0086AC08;
@@ -106,6 +109,12 @@ SECTIONS
     } > SRAM_HI
 
     ASSERT(_ebss_hi <= 0x00867000, ".bss_hi overflowed into main stack")
+
+    .rtos_heap (NOLOAD) : ALIGN(8) {
+        _srtos_heap0 = .;
+        . += LENGTH(RTOS_HEAP);
+        _ertos_heap0 = .;
+    } > RTOS_HEAP
 
     /DISCARD/ : {
         *(.ARM.exidx* .ARM.extab* .comment .note*)

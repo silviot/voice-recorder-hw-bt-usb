@@ -38,6 +38,11 @@ void Default_Handler(void);
 void Fault_Handler_Asm(void);
 void fault_handler_c(const uint32_t *frame, uint32_t ipsr);
 void SysTick_Handler(void);
+#if OPENFW_RTOS
+#include "openfw_rtos.h"
+void SVC_Handler(void);
+void PendSV_Handler(void);
+#endif
 void RWBT_IRQHandler(void) __attribute__((weak, alias("Default_Handler")));
 void DMAC_CH0_IRQHandler(void) __attribute__((weak, alias("Default_Handler")));
 void DMAC_CH1_IRQHandler(void) __attribute__((weak, alias("Default_Handler")));
@@ -52,10 +57,18 @@ const uint32_t g_isr_vector[96] = {
     (uint32_t)(uintptr_t)Fault_Handler_Asm, /* 5: BusFault */
     (uint32_t)(uintptr_t)Fault_Handler_Asm, /* 6: UsageFault */
     0, 0, 0, 0,
+#if OPENFW_RTOS
+    (uint32_t)(uintptr_t)SVC_Handler,      /* 11: SVCall (FreeRTOS) */
+#else
     (uint32_t)(uintptr_t)Default_Handler,  /* 11: SVCall */
+#endif
     (uint32_t)(uintptr_t)Default_Handler,  /* 12: DebugMon */
     0,
+#if OPENFW_RTOS
+    (uint32_t)(uintptr_t)PendSV_Handler,   /* 14: PendSV (FreeRTOS) */
+#else
     (uint32_t)(uintptr_t)Default_Handler,  /* 14: PendSV */
+#endif
     (uint32_t)(uintptr_t)SysTick_Handler,  /* 15: SysTick */
     [16 ... 41] = (uint32_t)(uintptr_t)Default_Handler,
     [42]        = (uint32_t)(uintptr_t)RWBT_IRQHandler,     /* IRQ 26: RW-BT Baseband */
@@ -171,6 +184,9 @@ void SysTick_Handler(void)
         system_reboot();
     }
     keys_scan_tick(now);
+#if OPENFW_RTOS
+    openfw_rtos_tick();
+#endif
 }
 
 __attribute__((section(".ramtext"), naked, used))
@@ -364,7 +380,11 @@ void reset_c_entry(void)
     /* Enable interrupts (Stage-1 entered with cpsid i) */
     __asm__ volatile ("dsb\nisb\ncpsie i");
 
+#if OPENFW_RTOS
+    openfw_rtos_start(openfw_main); /* never returns */
+#else
     (void)openfw_main();
+#endif
 
     /* Reboot cleanly if main ever returns */
     __asm__ volatile ("cpsid i\ndsb" ::: "memory");
