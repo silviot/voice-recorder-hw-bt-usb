@@ -104,6 +104,18 @@ void keys_init(void)
     /* PB6 = GPIO input for Record slide switch */
     gpio_set_mux(GPIO_PORT_B, 6u, 0u);
 
+    /* Enable codec analog bias for PB11 3.5 mm jack detect (matches stock /dev/exti ioctl 0x81) */
+    openfw_mmio_set32(CRU_RST_SET1_ADDR, (1u << 5));
+    openfw_mmio_set32(CRU_RST_STAT1_ADDR, (1u << 5));
+    for (uint32_t wait = 0u;
+         wait < 100000u && (openfw_mmio_rd32(CRU_RST_STAT1_ADDR) & (1u << 5)) == 0u;
+         wait++) {
+    }
+    openfw_mmio_set32(CRU_CLK_EN_AUDIO_ADDR, 1u);
+    openfw_mmio_set32(CODEC_GLB_ADDR, 1u);
+    openfw_mmio_set32(CODEC_DAC_ANA_CFG0_ADDR, 0x200u);
+    openfw_mmio_set32(CODEC_ANA_CTRL0_ADDR, 0x22u);
+
     /* PB11 = GPIO input with pull-up for Earphone jack detect (active-low: 0=inserted) */
     gpio_set_mux(GPIO_PORT_B, 11u, 0u);
     openfw_mmio_rmw32(GPIOB_BASE + 0x24u, 3u << 22, 2u << 22);

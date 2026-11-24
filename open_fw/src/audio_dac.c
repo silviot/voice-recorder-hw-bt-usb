@@ -428,7 +428,10 @@ void audio_dac_stop(void)
     openfw_mmio_clr32(CODEC_DAC0_PWR_ADDR, 0x30000000u);
     openfw_mmio_clr32(CODEC_DAC1_PWR_ADDR, 0x30000000u);
     openfw_mmio_clr32(CODEC_DAC2_PWR_ADDR, 0x30000000u);
-    openfw_mmio_clr32(CODEC_DAC_ANA_CFG0_ADDR, 0x200u);
+    /* Keep CODEC_DAC_ANA_CFG0[9] (0x200) and CODEC_ANA_CTRL0 (0x22) asserted so
+     * PB11 3.5 mm headphone jack detection stays biased while idle (matches stock /dev/exti). */
+    openfw_mmio_set32(CODEC_DAC_ANA_CFG0_ADDR, 0x200u);
+    openfw_mmio_set32(CODEC_ANA_CTRL0_ADDR, 0x22u);
     openfw_mmio_clr32(CODEC_DAC2_ANA_VOL_ADDR, 0x001F0000u);
     openfw_mmio_clr32(CODEC_DAC_FIFO_CTRL_ADDR, 0x80u);
     openfw_mmio_clr32(CODEC_DAC0_DIG_EN_ADDR, 0x3u);

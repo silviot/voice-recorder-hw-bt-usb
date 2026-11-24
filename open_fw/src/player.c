@@ -644,6 +644,16 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
     if (audio_dac_start(winfo.sample_rate, volume) != 0) {
         return 0;
     }
+    /* Re-sample PB11 after codec analog bias is enabled by audio_dac_start() */
+    int hp_post = keys_read_hp_detect();
+    if (hp_post != hp_in) {
+        hp_in  = hp_post;
+        volume = hp_in ? m->cfg.hp_vol : m->cfg.spk_vol;
+        if (volume > 31u) {
+            volume = 18u;
+        }
+        audio_dac_set_volume(volume, 0x1FFu);
+    }
     /* Route audio to built-in speaker PA (PB30) when no 3.5 mm jack is inserted */
     audio_pa_set(!hp_in);
 
@@ -686,6 +696,8 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
     uint32_t last_tr_sig     = 0u;
     uint32_t last_vol_ms     = 0u;
     uint32_t toast_until     = 0u;
+    int      hp_cand         = hp_in;
+    uint32_t hp_cand_since   = millis();
     int      ui_dirty        = 1;
     int      ret_code        = 0;
 
@@ -732,7 +744,12 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
                 act = player_keys_tick(&keys, now);
             }
         }
-        int cur_hp = keys_read_hp_detect();
+        int raw_hp = keys_read_hp_detect();
+        if (raw_hp != hp_cand) {
+            hp_cand       = raw_hp;
+            hp_cand_since = now;
+        }
+        int cur_hp = ((uint32_t)(now - hp_cand_since) >= 30u) ? hp_cand : hp_in;
         int unplug = hp_in && !cur_hp;
         if (scrub.speed && (!keys.hold_active || unplug ||
                             (!keys_event_pending() && keys_state(NULL) != keys.held))) {
