@@ -949,12 +949,34 @@ static void t_rx_overflow(void)
     bt_xrec_poll();
     static uint8_t junk[1000];
     memset(junk, 'x', sizeof(junk));
+
+    /* Secondary (refused) SPP handle flooding DATA_IND before CLOSE_EVT must not starve or close H1 */
+    srv_open(H2, PEER2);
+    bt_xrec_poll();
+    CHECK(m_disc_calls == 1 && m_disc_handle == H2, "H2 refused");
+    rx_raw(H2, junk, sizeof(junk));
+    rx_raw(H2, junk, sizeof(junk));
+    rx_raw(H2, junk, sizeof(junk));
+    rx(H1, "+XREC:PING\r\n");
+    CHECK(dbg().conn_open && !dbg().conn_closing && dbg().rx_overflows == 0u && wire_has("+XREC:PONG"),
+          "secondary handle DATA_IND flood must not overflow or close active session H1");
+    spp_close(H2);
+    bt_xrec_poll();
+    wire_clear();
+
+    /* Burst of >32 overflowing frames on H1 before poll must close H1 without overflowing evq into ST_FAULTED */
     rx_raw(H1, junk, sizeof(junk));
     rx_raw(H1, junk, sizeof(junk));
     rx_raw(H1, junk, sizeof(junk));   /* 3000 > 2048: the third frame overflows */
+    for (int i = 0; i < 40; i++) {
+        rx_raw(H1, junk, 100u);              /* 100 B frames: ring full, so the EVQ fault path is exercised */
+    }
     bt_xrec_poll();
-    CHECK(dbg().rx_overflows == 1u, "overflow counted");
-    CHECK(m_disc_calls == 1 && dbg().conn_closing, "connection closed");
+    CHECK(dbg().rx_overflows == 41u, "overflows counted (%u)", dbg().rx_overflows);
+    CHECK(dbg().state == BT_XREC_ST_READY && dbg().evq_lost == 0u,
+          "repeated RX overflows must coalesce instead of faulting EVQ (state %u, lost %u)",
+          dbg().state, dbg().evq_lost);
+    CHECK(m_disc_calls == 2 && m_disc_handle == H1 && dbg().conn_closing, "connection H1 closed");
     stop_ok();
 }
 

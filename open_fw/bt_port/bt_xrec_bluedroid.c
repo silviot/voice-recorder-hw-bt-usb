@@ -70,12 +70,14 @@ typedef struct {
 static struct {
     /* ---- shared with the BTC callbacks: only under bt_xrec_plat_lock() ---- */
     uint8_t  cb_open;          /* callbacks may touch b->rx and the queue */
+    uint8_t  cb_rx_bound, cb_rx_closing, cb_rx_overflow;
+    uint32_t cb_rx_handle;
     uint8_t  evq_lost;
     ev_t     evq[BT_XREC_EVQ_SLOTS];
     uint32_t ev_head, ev_tail; /* free-running */
     uint32_t rx_head, rx_tail; /* free-running byte counters into b->rx */
     uint32_t rx_frames;        /* ESP_SPP_DATA_IND_EVT count (status rx_acl_pkts) */
-    uint32_t rx_overflows, evq_lost_n;
+    uint32_t rx_overflows, rx_dropped_cb, evq_lost_n;
     bufs_t  *b;
     uint8_t  nm_valid;         /* last remote name Bluedroid reported (READ_REMOTE_NAME / AUTH_CMPL), for the UI */
     uint8_t  nm_bda[6];
@@ -170,6 +172,14 @@ static void slot_set(bda_slot_t *sl, const uint8_t bda[6])
     memcpy(sl->bda, bda, 6u);
 }
 
+static void wipe_mem(void *p, size_t n)
+{
+    volatile uint8_t *v = (volatile uint8_t *)p;
+    for (size_t i = 0u; i < n; i++) {
+        v[i] = 0u;
+    }
+}
+
 static bool time_reached(uint32_t now, uint32_t at) { return (int32_t)(now - at) >= 0; }
 
 static void set_state(uint8_t st)
@@ -260,10 +270,29 @@ static bool push_locked(const ev_t *e)
             return true;
         }
     }
+    if (e->type == EV_RX_OVERFLOW) {
+        for (uint32_t i = s.ev_tail; i != s.ev_head; i++) {
+            const ev_t *q = &s.evq[i % BT_XREC_EVQ_SLOTS];
+            if (q->type == EV_RX_OVERFLOW && q->handle == e->handle) {
+                return true;
+            }
+        }
+    }
     if (s.ev_head - s.ev_tail >= BT_XREC_EVQ_SLOTS) {
         s.evq_lost = 1u;
         s.evq_lost_n++;
         return false;
+    }
+    if (e->type == EV_SRV_OPEN && e->status == ESP_SPP_SUCCESS && !s.cb_rx_bound) {
+        s.cb_rx_bound = 1u;
+        s.cb_rx_closing = 0u;
+        s.cb_rx_overflow = 0u;
+        s.cb_rx_handle = e->handle;
+    } else if (e->type == EV_CLOSE && s.cb_rx_bound && e->handle == s.cb_rx_handle) {
+        s.cb_rx_bound = 0u;
+        s.cb_rx_closing = 0u;
+        s.cb_rx_overflow = 0u;
+        s.cb_rx_handle = 0u;
     }
     s.evq[s.ev_head % BT_XREC_EVQ_SLOTS] = *e;
     s.ev_head++;
@@ -304,30 +333,35 @@ static void on_data_ind(uint32_t handle, const uint8_t *data, uint16_t len)
     bool queued = false;
     bt_xrec_plat_lock();
     if (s.cb_open && s.b != NULL && data != NULL && len > 0u) {
-        s.rx_frames++;
-        uint32_t used = s.rx_head - s.rx_tail;
-        ev_t e = { 0 };
-        e.handle = handle;
-        if ((uint32_t)len > BT_XREC_RX_RING - used) {
-            /* No backpressure exists in ESP_SPP_MODE_CB: never drop silently, the app closes this connection. */
-            s.rx_overflows++;
-            e.type = EV_RX_OVERFLOW;
-            (void)push_locked(&e);
+        if (!s.cb_rx_bound || s.cb_rx_closing || handle != s.cb_rx_handle) {
+            s.rx_dropped_cb += len;
         } else {
-            uint32_t off = s.rx_head & (BT_XREC_RX_RING - 1u);
-            uint32_t first = BT_XREC_RX_RING - off;
-            if (first > len) {
-                first = len;
+            s.rx_frames++;
+            uint32_t used = s.rx_head - s.rx_tail;
+            ev_t e = { 0 };
+            e.handle = handle;
+            if (s.cb_rx_overflow || (uint32_t)len > BT_XREC_RX_RING - used) {
+                /* No backpressure exists in ESP_SPP_MODE_CB: never drop silently, the app closes this connection. */
+                s.cb_rx_overflow = 1u;
+                s.rx_overflows++;
+                e.type = EV_RX_OVERFLOW;
+                (void)push_locked(&e);
+            } else {
+                uint32_t off = s.rx_head & (BT_XREC_RX_RING - 1u);
+                uint32_t first = BT_XREC_RX_RING - off;
+                if (first > len) {
+                    first = len;
+                }
+                memcpy(&s.b->rx[off], data, first);
+                memcpy(&s.b->rx[0], data + first, (size_t)len - first);
+                e.type = EV_DATA;
+                e.val = len;
+                if (push_locked(&e)) {
+                    s.rx_head += len;
+                }
             }
-            memcpy(&s.b->rx[off], data, first);
-            memcpy(&s.b->rx[0], data + first, (size_t)len - first);
-            e.type = EV_DATA;
-            e.val = len;
-            if (push_locked(&e)) {
-                s.rx_head += len;
-            }
+            queued = true;
         }
-        queued = true;
     }
     bt_xrec_plat_unlock();
     if (queued) {
@@ -468,6 +502,11 @@ static void conn_close_request(const char *why)
         return;
     }
     s.conn_closing = 1u;
+    bt_xrec_plat_lock();
+    if (s.cb_rx_bound && s.cb_rx_handle == s.conn_handle) {
+        s.cb_rx_closing = 1u;
+    }
+    bt_xrec_plat_unlock();
     tx_drop();
     if (s.b != NULL) {
         s.b->xrec.auth = 0u;
@@ -490,6 +529,17 @@ static void xrec_reset_flush(void)
 
 static void conn_reset(void)
 {
+    uint32_t old_handle = s.conn_handle;
+    if (s.conn_open) {
+        bt_xrec_plat_lock();
+        if (s.cb_rx_bound && s.cb_rx_handle == old_handle) {
+            s.cb_rx_bound = 0u;
+            s.cb_rx_closing = 0u;
+            s.cb_rx_overflow = 0u;
+            s.cb_rx_handle = 0u;
+        }
+        bt_xrec_plat_unlock();
+    }
     if (s.b != NULL) {
         xrec_on_disconnect(&s.b->xrec);
     }
@@ -585,7 +635,7 @@ static void xo_entropy(void *user, uint8_t out[16])
     (void)user;
     if (bt_xrec_plat_entropy(out, 16u) != 0) {
         /* Fail closed (plan M2): no fixed fallback. The reply is never sent and the link is closed by the next poll. */
-        memset(out, 0, 16u);
+        wipe_mem(out, 16u);
         if (!s.entropy_fail) {
             bt_xrec_plat_log("BT XREC CHAL refused: entropy not ready");
         }
@@ -1150,7 +1200,7 @@ static void rx_feed(const uint8_t *p, uint32_t n)
         i += seg;
         if (s.entropy_fail) {
             s.b->xrec.chal_active = 0u;
-            memset(s.b->xrec.nonce, 0, sizeof(s.b->xrec.nonce));
+            wipe_mem(s.b->xrec.nonce, sizeof(s.b->xrec.nonce));
             conn_close_request("BT XREC close: entropy not ready");
             s.d.rx_dropped += n - i;
             return;
@@ -1173,7 +1223,7 @@ static void drain_events(void)
         bt_xrec_plat_lock();
         if (s.ev_head == s.ev_tail || s.b == NULL) {
             bt_xrec_plat_unlock();
-            return;
+            break;
         }
         ev_t *head = &s.evq[s.ev_tail % BT_XREC_EVQ_SLOTS];
         e = *head;
@@ -1204,7 +1254,7 @@ static void drain_events(void)
             }
             xrec_reset_flush();
             if (budget <= n) {
-                return;
+                break;
             }
             budget -= n;
         } else if (e.type >= EV_CFM_REQ) {
@@ -1214,9 +1264,10 @@ static void drain_events(void)
         }
         xrec_reset_flush();
         if (s.state == BT_XREC_ST_OFF || s.state == BT_XREC_ST_FAULTED || s.state == BT_XREC_ST_DEAD) {
-            return;
+            break;
         }
     }
+    wipe_mem(chunk, sizeof(chunk));
 }
 
 static void config_begin(void)
@@ -1352,10 +1403,7 @@ static void apply_scan_mode(void)
  * (review finding). volatile: the stores are not dropped as dead before the free. */
 static void wipe_free(bufs_t *b)
 {
-    volatile uint8_t *v = (volatile uint8_t *)b;
-    for (size_t i = 0u; i < sizeof(*b); i++) {
-        v[i] = 0u;
-    }
+    wipe_mem(b, sizeof(*b));
     bt_xrec_plat_free(b);
 }
 
@@ -1364,6 +1412,8 @@ static void free_session(void)
     bufs_t *b;
     bt_xrec_plat_lock();
     s.cb_open = 0u;
+    s.cb_rx_bound = s.cb_rx_closing = s.cb_rx_overflow = 0u;
+    s.cb_rx_handle = 0u;
     b = s.b;
     s.b = NULL;
     s.ev_head = s.ev_tail = 0u;
@@ -1561,7 +1611,7 @@ void bt_xrec_open_pairing(uint32_t duration_ms)
 #endif
         xrec_open_pairing(&s.b->xrec, pin);
         s.xrec_pin_issued = 1u;
-        memset(pin, 0, sizeof(pin));
+        wipe_mem(pin, sizeof(pin));
     } else if (why == NULL) {
         bt_xrec_plat_log(defer ? "BT XREC PIN unavailable: entropy not ready (SSP pairing window once READY)"
                                : "BT XREC PIN unavailable: entropy not ready (SSP pairing window open)");
@@ -1746,6 +1796,7 @@ void bt_xrec_get_debug(bt_xrec_debug_t *out)
     out->evq_used = s.ev_head - s.ev_tail;
     out->rx_frames = s.rx_frames;
     out->rx_overflows = s.rx_overflows;
+    out->rx_dropped = s.d.rx_dropped + s.rx_dropped_cb;
     out->evq_lost = s.evq_lost_n;
     bt_xrec_plat_unlock();
 }
