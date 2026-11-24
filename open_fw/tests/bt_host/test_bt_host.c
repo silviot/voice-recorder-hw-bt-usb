@@ -521,6 +521,56 @@ static void scenario_alarm_preempt_revalidate(const baseline_t *base)
           now.bytes, now.blocks, (unsigned long)now.tasks, now.timers);
 }
 
+/* Patch 0030: if hci_host_thread is sleeping in openfw_hcif_handoff_alloc()'s OOM retry loop when
+ * esp_bluedroid_deinit() enters hci_shut_down(), hci_shut_down() must stop hci_host_thread BEFORE tearing down
+ * hal/rx_q and hci_layer_deinit_env() (commands_pending_response_lock, command_queue). */
+static void scenario_deinit_hcif_handoff_oom(const baseline_t *base)
+{
+    bth_log("[0c] patch 0030: hci_shut_down() stops hci_host_thread before freeing HCI env\n");
+    rom_log_clear();
+    CHECK(do_init() == ESP_OK, "p30 init");
+    CHECK(do_enable() == ESP_OK, "p30 enable");
+    bth_rom_lock();
+    fake_rom.hold_replies = true;
+    bth_rom_unlock();
+    uint32_t e025_before = rom_cmd_count(0xE025u);
+    CHECK(esp_bt_gap_set_device_name("p30-hold") == ESP_OK, "p30 set name");
+    for (int i = 0; i < 400 && rom_cmd_count(0xE025u) == e025_before; i++) {
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    CHECK(rom_cmd_count(0xE025u) == e025_before + 1u, "p30 0C13 not held");
+    bth_step("p30 disable", 20000u);
+    CHECK(esp_bluedroid_disable() == ESP_OK, "p30 disable");
+    bth_step_done();
+
+    /* Let host_recv_pkt_cb's 2 allocations (BT_HDR + list node) succeed, then stall openfw_hcif_handoff_alloc. */
+    bth_heap_fail_arm(3u, true);
+    bth_rom_lock();
+    fake_rom.hold_replies = false;
+    fake_rom_release_held();
+    bth_rom_unlock();
+    bth_ctrl_kick();
+    bth_heap_stats_t hs;
+    for (int i = 0; i < 200; i++) {
+        bth_heap_stats(&hs);
+        if (hs.injected >= 1u) {
+            break;
+        }
+        vTaskDelay(1);
+    }
+    bth_heap_fail_disarm();
+    CHECK(bth_ctrl_close(4000u) == BT_CTRL_STOP_OK, "p30 bt_ctrl close");
+    /* Allow esp_bluedroid_deinit()'s 3 entry allocs (future + btc msg), keep openfw_hcif_handoff_alloc failing. */
+    bth_heap_fail_arm(4u, true);
+    bth_step("p30 deinit", 20000u);
+    CHECK(esp_bluedroid_deinit() == ESP_OK, "p30 deinit");
+    bth_step_done();
+    bth_heap_fail_disarm();
+    baseline_t now;
+    CHECK(settle_to(base, &now), "after patch 0030: heap %zu/%zu, tasks %lu, timers %u",
+          now.bytes, now.blocks, (unsigned long)now.tasks, now.timers);
+}
+
 /* Allocation-failure sweep (plan M1 "general rule"; run_sweep.py). One mode per lifecycle call: the stack is brought
  * to the state before that call, the N-th allocation attempt made while the call runs (all tasks) fails, then:
  *   - the call returned ESP_OK, or an error with the API state unchanged (a clean failure);
@@ -702,6 +752,9 @@ void bth_test_task(void *arg)
     } else if (strcmp(mode, "patch29") == 0) {
         scenario_alarm_preempt_revalidate(&base);
         rc = g_fail ? 1 : 0;
+    } else if (strcmp(mode, "patch30") == 0) {
+        scenario_deinit_hcif_handoff_oom(&base);
+        rc = g_fail ? 1 : 0;
     } else if (strcmp(mode, "noack") == 0) {
         scenario_noack_zero_credits(&base);
         rc = g_fail ? 1 : 0;
@@ -714,6 +767,9 @@ void bth_test_task(void *arg)
         scenario_fixed_queue_slot();
         if (g_fail == 0) {
             scenario_alarm_preempt_revalidate(&base);
+        }
+        if (g_fail == 0) {
+            scenario_deinit_hcif_handoff_oom(&base);
         }
         if (g_fail == 0) {
             scenario_enable_gap_disable(&base);

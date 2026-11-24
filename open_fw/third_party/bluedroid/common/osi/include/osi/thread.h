@@ -136,4 +136,9 @@ void osi_dynamic_event_delete(struct osi_dynamic_event *event);
 int osi_thread_event_init(void);
 void osi_thread_event_deinit(void);
 
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+void osi_thread_stop(osi_thread_t *thread);
+bool osi_thread_is_stopping(const osi_thread_t *thread);
+#endif
+
 #endif /* __THREAD_H__ */

@@ -64,9 +64,16 @@
 #endif
 static BT_HDR *openfw_hcif_handoff_alloc(size_t size)
 {
+    if (osi_thread_is_stopping(hci_get_current_thread())) {
+        return NULL;
+    }
     BT_HDR *event = osi_calloc(size);
-    for (int i = 0; event == NULL && i < OPENFW_HCIF_HANDOFF_RETRIES; i++) {
+    for (int i = 0; event == NULL && i < OPENFW_HCIF_HANDOFF_RETRIES &&
+                    !osi_thread_is_stopping(hci_get_current_thread()); i++) {
         vTaskDelay(1);
+        if (osi_thread_is_stopping(hci_get_current_thread())) {
+            break;
+        }
         event = osi_calloc(size);
     }
     return event;
@@ -1651,7 +1658,9 @@ static void btu_hcif_command_complete_evt(BT_HDR *response, void *context)
         uint16_t opcode = openfw_hcif_cmd_opcode(response->data + response->offset + 3);
         HCI_TRACE_ERROR("%s: no memory, Command Complete 0x%04x dropped", __func__, opcode);
         osi_free(response);
-        bt_port_on_hci_command_timeout(opcode);
+        if (!osi_thread_is_stopping(hci_get_current_thread())) {
+            bt_port_on_hci_command_timeout(opcode);
+        }
         return;
     }
 #else
@@ -2011,7 +2020,9 @@ static void btu_hcif_command_status_evt(uint8_t status, BT_HDR *command, void *c
         uint16_t opcode = openfw_hcif_cmd_opcode(command->data + command->offset);
         HCI_TRACE_ERROR("%s: no memory, Command Status 0x%04x dropped", __func__, opcode);
         HCI_FREE_CMD_BUF(command); /* open_fw patch 0016: the status callback owns the command */
-        bt_port_on_hci_command_timeout(opcode);
+        if (!osi_thread_is_stopping(hci_get_current_thread())) {
+            bt_port_on_hci_command_timeout(opcode);
+        }
         return;
     }
 #else

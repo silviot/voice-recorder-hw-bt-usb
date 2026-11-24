@@ -215,6 +215,13 @@ void hci_shut_down(void)
     hci_c2h_credit_close();
 #endif
 
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+    /* open_fw patch 0030: stop and join hci_host_thread before tearing down hal->close() (rx_q) and
+     * hci_layer_deinit_env() (commands_pending_response_lock, command_queue), so an in-flight upstream item
+     * (e.g. patch 0016's hand-off OOM retry) cannot wake into freed queues/mutexes. */
+    osi_thread_stop(hci_host_thread);
+#endif
+
     /* Close HAL and cleanup before freeing thread: hal->open() and osi_event_bind()
      * stored references to hci_host_thread; they must not use it after osi_thread_free(). */
     if (hci_host_thread != NULL) {
