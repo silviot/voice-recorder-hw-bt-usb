@@ -647,6 +647,34 @@ static void scenario_config_parse_and_shrink(const baseline_t *base)
     CHECK(settle_to(base, &now), "after patch 0032: heap %zu/%zu", now.bytes, now.blocks);
 }
 
+/* Patch 0033: a valid 4-byte zero-payload L2CAP frame (p_msg->len == 8: 4 B HCI ACL hdr + 4 B L2CAP hdr) arriving
+ * for an unknown handle (e.g. racing ahead of Connection Complete or late on a detached handle) caused
+ * l2c_rcv_acl_data() to read a 9th byte (cmd_code) past the end of the heap-allocated BT_HDR while still needing to
+ * return the C2H ACL credit. */
+static void scenario_short_acl_unknown_handle(const baseline_t *base)
+{
+    bth_log("[0f] patch 0033: 4-byte zero-payload L2CAP ACL on unknown handle returns C2H credit without over-read\n");
+    CHECK(do_init() == ESP_OK, "p33 init");
+    CHECK(do_enable() == ESP_OK, "p33 enable");
+    bth_rom_lock();
+    fake_rom_link(0, true);
+    uint8_t empty_l2c[4] = { 0x00, 0x00, 0x01, 0x00 };   /* L2CAP len=0, CID=0x0001 (signalling), no cmd_code byte */
+    bt_ctrl_stats_t s0 = ctrl_stats();
+    for (int i = 0; i < 4; i++) {
+        CHECK(fake_rom_inject_acl(0x80u, 2u, empty_l2c, sizeof(empty_l2c)) == 0, "p33 inject 4 B ACL %d", i);
+    }
+    bth_rom_unlock();
+    bth_ctrl_kick();
+    CHECK(wait_c2h_returned(s0.c2h_returned + 4u, 3000u), "p33 C2H credits not returned for 4-byte ACL frames");
+    bth_rom_lock();
+    fake_rom_link(0, false);
+    bth_rom_unlock();
+    do_teardown();
+    baseline_t now;
+    CHECK(settle_to(base, &now), "after patch 0033: heap %zu/%zu, tasks %lu, timers %u",
+          now.bytes, now.blocks, (unsigned long)now.tasks, now.timers);
+}
+
 /* Allocation-failure sweep (plan M1 "general rule"; run_sweep.py). One mode per lifecycle call: the stack is brought
  * to the state before that call, the N-th allocation attempt made while the call runs (all tasks) fails, then:
  *   - the call returned ESP_OK, or an error with the API state unchanged (a clean failure);
@@ -837,6 +865,9 @@ void bth_test_task(void *arg)
     } else if (strcmp(mode, "patch32") == 0) {
         scenario_config_parse_and_shrink(&base);
         rc = g_fail ? 1 : 0;
+    } else if (strcmp(mode, "patch33") == 0) {
+        scenario_short_acl_unknown_handle(&base);
+        rc = g_fail ? 1 : 0;
     } else if (strcmp(mode, "noack") == 0) {
         scenario_noack_zero_credits(&base);
         rc = g_fail ? 1 : 0;
@@ -858,6 +889,9 @@ void bth_test_task(void *arg)
         }
         if (g_fail == 0) {
             scenario_config_parse_and_shrink(&base);
+        }
+        if (g_fail == 0) {
+            scenario_short_acl_unknown_handle(&base);
         }
         if (g_fail == 0) {
             scenario_enable_gap_disable(&base);
