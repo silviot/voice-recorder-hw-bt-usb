@@ -1,9 +1,9 @@
-# Bluetooth Classic for open_fw — Integration Plan (v15, for joint review)
+# Bluetooth Classic for open_fw — Integration Plan (v16, for joint review)
 
 Branch `feat/freertos-bluedroid` (worktree `../voice-recorder-hw-bt-usb-bt`). Hardware: Smartlink SL6801 `HW_76`
 (dual Cortex-M4F @ 96 MHz, 512 KB SRAM, 2 MB SPI NOR XIP, **BR/EDR-only** RivieraWaves `RW-BT` controller in mask ROM,
 no BLE). This document is the single source of truth: it is reviewed by Codex and agy until both agree, then executed.
-v3–v15 address rounds 1–13 (§11 traceability).
+v3–v16 address rounds 1–14 (§11 traceability).
 
 ## 0. Goals, non-goals
 
@@ -196,7 +196,13 @@ Acceptance budget per mode: minimum free heap under traffic ≥ 8 KB and largest
   TCB/stack in `.rtos_static`, created once at first BT enable and reused, so it exists without heap; priority 2).
   The app never calls into Bluedroid during recovery: it notifies the worker and then **keeps running its recorder
   service loop** (`recorder_poll()` at the normal cadence; the DMA ring holds only 3 × 128 ms of audio) while checking
-  worker completion with `ulTaskNotifyTake(…, 1 tick)` against **one absolute 2 s deadline**. Every
+  worker completion against **one absolute 2 s deadline** (it waits in `ulTaskNotifyTake(…, 1 tick)` but decides
+  only on an explicit `bt_recover` done/status variable, since other tasks may notify the app too).
+  **BT silencing does not depend on the app**: when recovery starts, the app arms a deadline that the SysTick ISR
+  enforces (no heap, no task): at 2 s it masks IRQ 26 and sets a `bt_stop` flag that `bt_ctrl` checks before every ROM
+  call, so the controller is silenced on time even if the app is inside a long synchronous SD write (card-ready wait
+  up to 500 ms plus per-sector retries). Recording finalisation and the reboot stay with the app, which reaches them
+  when its current call returns. Every
   upstream wait inside disable/deinit (`btc_transfer_context` posts with `OSI_THREAD_MAX_TIMEOUT`, `future_await`) may
   block the worker forever without affecting the app, so no timed variants are needed; (2) if the worker reports an
   error (e.g. `ESP_ERR_NO_MEM`) or the deadline passes, the app runs a **hard path that needs no heap and no BT task**: mask IRQ 26, stop the recorder
@@ -213,7 +219,8 @@ Acceptance budget per mode: minimum free heap under traffic ≥ 8 KB and largest
   next boot BT off, and identifiable PCM fed throughout is continuous in the finalised file (no silence substitution);
   (b) host: worker stalled at each blocking point (BTC queue full with its consumer stalled before the
   disable post; disable completion withheld; deinit post blocked; deinit completion withheld) → app reaches the hard
-  path within 2 s and finalises the recording with continuous audio; (c) target (QEMU +
+  path, IRQ 26 is masked by the ISR at 2 s (also when an SD write crossing the deadline is injected), and the app
+  then finalises the recording with continuous audio; (c) target (QEMU +
   silicon): exhaust the real heap_5 allocator with a recording active → no `0xF1` reboot, recording finalised, BT
   fault record `0xB1`.
 
@@ -374,7 +381,7 @@ telemetry: heap/stack watermarks, largest free block, IRQ-26 latency and multipl
 
 ## 9. Open questions for reviewers (round 3)
 
-1. Does v15 (app keeps servicing the recorder during the recovery wait) resolve round 13?
+1. Does v16 (ISR-enforced BT-silencing deadline independent of the app) resolve round 14?
 2. Any remaining blocker to starting steps 1–3?
 
 ## 10. Live log
@@ -398,7 +405,8 @@ telemetry: heap/stack watermarks, largest free block, IRQ-26 latency and multipl
   unbounded posts before/after the timed wait (disable and deinit). Plan v14 moves graceful recovery into a worker
   whose blocking cannot affect the app. Code so far: step 1 complete; step 2 entropy/DRBG, `bt_alarm`, non-rebooting
   malloc hook committed with host/QEMU tests. Round 13: agy APPROVE; Codex 1 item (recovery wait starves the
-  recorder). Plan v15.
+  recorder). Plan v15. Round 14: agy APPROVE; Codex 1 item (app cannot enforce its deadline during a long SD
+  write). Plan v16. Exp 0 probes (`exp/exp_sram_fill.c`, `exp/exp_sram_check.c`) written.
 
 ## 11. Round-1 traceability
 
@@ -461,3 +469,6 @@ telemetry: heap/stack watermarks, largest free block, IRQ-26 latency and multipl
 | **Round 13** | |
 | Codex N1 (recovery wait drops audio) | app keeps calling `recorder_poll()` while waiting; continuity test with identifiable PCM |
 | agy NB (bt_recover memory; wording) | static in `.rtos_static`, created once; hook wording fixed |
+| **Round 14** | |
+| Codex N1 (deadline unenforceable during long SD write) | SysTick-ISR deadline masks IRQ 26 + `bt_stop` flag checked by bt_ctrl; app finalises when its call returns; SD-write-crossing-deadline test |
+| agy NB (any notification wakes the app) | explicit `bt_recover` done/status variable |
