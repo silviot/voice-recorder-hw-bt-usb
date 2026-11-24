@@ -1,9 +1,9 @@
-# Bluetooth Classic for open_fw — Integration Plan (v10, for joint review)
+# Bluetooth Classic for open_fw — Integration Plan (v11, for joint review)
 
 Branch `feat/freertos-bluedroid` (worktree `../voice-recorder-hw-bt-usb-bt`). Hardware: Smartlink SL6801 `HW_76`
 (dual Cortex-M4F @ 96 MHz, 512 KB SRAM, 2 MB SPI NOR XIP, **BR/EDR-only** RivieraWaves `RW-BT` controller in mask ROM,
 no BLE). This document is the single source of truth: it is reviewed by Codex and agy until both agree, then executed.
-v3–v10 address rounds 1–8 (§11 traceability).
+v3–v11 address rounds 1–9 (§11 traceability).
 
 ## 0. Goals, non-goals
 
@@ -159,9 +159,18 @@ Acceptance budget per mode: minimum free heap under traffic ≥ 8 KB and largest
   Whether the ROM's `eif_write` stream lets events overtake a deferred ACL fragment is an Exp 1 stage-C question; if it
   does not, ACL-ring saturation is handled as a controlled link disconnect, not assumed impossible.
   `bt_dlv` delivers to the host callback and is the only context that may block in Bluedroid's queues; it checks the
-  session id before each delivery and holds no lock across the callback. The host callback (`hci_hal_h4.c`) allocates
-  a second copy and asserts on failure: per-mode heap budgets reserve `window × (len + header)` for it, and a host test
-  injects allocation failure at that site (documented patch to fail soft if the assert is reachable).
+  session id before each delivery and holds no lock across the callback.
+  **No silent loss in host RX**: upstream `host_recv_pkt_cb()` (`hci_hal_h4.c`) copies the packet (asserting on
+  allocation failure) and then ignores `fixed_queue_enqueue()`'s result, whose `list_append()` node allocation can fail
+  after a slot was taken, leaking the copy and dropping the packet (a lost Command Complete stalls command dispatch).
+  Documented patch: the copy allocation fails soft, an enqueue failure frees the copy and restores the slot
+  (`fixed_queue.c`), and the callback returns failure to the driver. `bt_dlv` keeps ownership of the ring entry on
+  failure and retries with a 1-tick backoff; after N consecutive failures it starts a controlled stack restart (M1
+  teardown), never a silent drop. Per-mode heap budgets reserve `window × (len + header)` for these copies.
+  **General rule (steps 2–3)**: every allocation on the HCI/OSI/BTC paths that Bluedroid uses must either propagate
+  failure or be covered by a documented patch; enforced by an **allocation-failure sweep** in the host harness that
+  reruns each scenario failing the Nth allocation for every N up to the scenario's allocation count, and requires: no
+  lost CC/CS/NOCP, no leak (heap returns to baseline), and either completion or a controlled restart.
 - **TX admission (driver `send()` returns void)**: `check_send_available(void)` carries no packet type and hciT picks
   a command, ACL packet or pending fragment only after it returns true; it may also not send at all (`hci_layer.c`
   loop exit, `packet_fragmenter.c` bounce). So TX uses **one unified ring whose slots fit any H4 packet** (≤ 1026 B),
@@ -334,7 +343,7 @@ telemetry: heap/stack watermarks, largest free block, IRQ-26 latency and multipl
 
 ## 9. Open questions for reviewers (round 3)
 
-1. Does the v10 NOACK path for `0C35` resolve the round-8 item?
+1. Does v11 (fail-soft H4 RX with retained retry + allocation-failure sweep) resolve the round-9 item?
 2. Any remaining blocker to starting steps 1–3?
 
 ## 10. Live log
@@ -351,7 +360,8 @@ telemetry: heap/stack watermarks, largest free block, IRQ-26 latency and multipl
   Round 7: agy APPROVE; Codex 1 item (FreeRTOS timer command lag lets an old expiry carry the new generation). Plan v9
   replaces FreeRTOS software timers for BT alarms with the `bt_alarm` service. Step 1 build plumbing committed
   (`fc8402e`: BT=1 links Bluedroid, `.bt_data`/`.bt_bss`, link roots, QEMU 12/12). Round 8: agy APPROVE; Codex 1 item
-  (`0C35` blocked by hciT command credits). Plan v10.
+  (`0C35` blocked by hciT command credits). Plan v10. Round 9: agy APPROVE; Codex 1 item (H4 RX enqueue
+  failure drops packet). Plan v11 adds the fail-soft RX patch and a general allocation-failure sweep.
 
 ## 11. Round-1 traceability
 
@@ -400,3 +410,5 @@ telemetry: heap/stack watermarks, largest free block, IRQ-26 latency and multipl
 | **Round 8** | |
 | Codex N1 (`0C35` cannot leave hciT at zero command credits) | `hci_layer.c` NOACK queue ahead of the credit check; local `0C35` in bt_ctrl; through-hciT test |
 | agy NB (sub-tick busy spin) | wait rounded up to ≥ 1 tick |
+| **Round 9** | |
+| Codex N1 (enqueue node allocation failure drops packet) | fail-soft `host_recv_pkt_cb` + slot restore; `bt_dlv` retains/retries/restarts; allocation-failure sweep over all scenarios |
