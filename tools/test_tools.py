@@ -100,6 +100,36 @@ def test_bt_sync_transport_detection() -> None:
     print("[PASS] bt_sync.py native-SPP (OpenFW) vs stock HFP start-up detection")
 
 
+def test_bt_sync_split_error_and_keyfile_perms() -> None:
+    # 1. Split +XREC:ERR frame must raise RuntimeError immediately instead of misparsing "XREC:ERR,NOE" as binary
+    c, _ = _run_handshake([], transport="native")
+    assert c.sock is not None
+    c.sock.script = [b"+XREC:", b"ERR,NOENT\r\n"]  # type: ignore[attr-defined]
+    got_err = ""
+    try:
+        c.get_chunk("MISSING.WAV", 0, 64)
+    except RuntimeError as exc:
+        got_err = str(exc)
+    assert "NOENT" in got_err, f"Expected NOENT RuntimeError on split error frame, got {got_err!r}"
+
+    # 2. save_device_key must create keyfile atomically with 0600 permissions even under permissive umask / stale .tmp
+    with tempfile.TemporaryDirectory(prefix="test_bt_key_") as td:
+        kf = Path(td) / "keys.json"
+        stale_tmp = kf.with_suffix(".json.tmp")
+        old_umask = bt_sync.os.umask(0o000)
+        try:
+            stale_tmp.write_text("stale\n", encoding="utf-8")
+            bt_sync.os.chmod(stale_tmp, 0o666)
+            bt_sync.save_device_key(kf, "02:ca:55:00:01:1d", bytes(range(32)))
+        finally:
+            bt_sync.os.umask(old_umask)
+        mode = kf.stat().st_mode & 0o777
+        assert mode == 0o600, f"Expected keyfile mode 0o600, got {oct(mode)}"
+        assert not stale_tmp.exists(), "Expected .tmp file to be atomically replaced"
+        assert bt_sync.load_device_key(kf, "02:CA:55:00:01:1D") == bytes(range(32))
+    print("[PASS] bt_sync.py split +XREC:ERR frame handling & 0600 atomic keyfile write")
+
+
 def test_usb_sync_collisions() -> None:
     with tempfile.TemporaryDirectory(prefix="test_usb_sync_") as td:
         root = Path(td)
@@ -224,6 +254,7 @@ def test_fix_exfat_boundary() -> None:
 def main() -> int:
     test_bt_sync_path_traversal()
     test_bt_sync_transport_detection()
+    test_bt_sync_split_error_and_keyfile_perms()
     test_usb_sync_collisions()
     test_fix_exfat_boundary()
     print("ALL HOST TOOL SAFETY TESTS PASSED")
