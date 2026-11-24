@@ -1,7 +1,8 @@
 /* Host unit tests for bt_port/bt_xrec_bluedroid.c (plan M4 XREC session): the real session code and the real
  * xrec_proto against mocked esp_spp / esp_bt_gap APIs and a mocked platform (tests drive the BTC callbacks directly,
  * single-threaded). Scenarios: bring-up/config, data path, congestion, partial writes and the in-flight window, write
- * errors, disconnect mid-transfer, pairing-window policy (numeric comparison, Just Works, legacy PIN, passkey),
+ * errors, disconnect mid-transfer, pairing-window policy (numeric comparison, Just Works, legacy PIN, passkey), the local
+ * numeric-comparison prompt (accept, reject, timeout, window closing, peer gone, second request, bench autoconfirm),
  * bonded reconnect, stop during transfer, deferred reboot behind congestion, entropy fail-closed, event-queue
  * overflow, platform faults, bring-up/config failures and timeouts, the shutdown deadline / latch hard paths.
  * Built by make test-bt-xrec (bt/host_tests.mk) with ASan/UBSan.
@@ -117,6 +118,19 @@ void bt_xrec_plat_identity(uint8_t bd[6])
     static const uint8_t k[6] = { 0x1D, 0x01, 0x00, 0x55, 0xCA, 0x02 };
     memcpy(bd, k, 6u);
 }
+/* plan M2.3 pairing gate (firmware: bt_xrec_fw.c): entropy, ROM P-192 key, ROM RNG pool. m_pair_block models the
+ * non-entropy reasons (key not replaced, pool ran dry). */
+static const char *m_pair_block;
+static int m_pair_block_calls;
+const char *bt_xrec_plat_pairing_block(void)
+{
+    m_pair_block_calls++;
+    if (m_entropy_fail) {
+        return "entropy not credited (mock)";
+    }
+    return m_pair_block;
+}
+
 int bt_xrec_plat_entropy(void *out, size_t n)
 {
     if (m_entropy_fail) {
@@ -205,6 +219,9 @@ static esp_spp_start_srv_cfg_t m_srv_cfg;
 static char m_srv_name[32];
 static int m_scan_calls, m_scan_c = -1, m_scan_d = -1;
 static int m_cfm_calls, m_cfm_accept = -1, m_pin_calls, m_pin_accept = -1, m_passkey_calls, m_passkey_accept = -1;
+static uint8_t m_cfm_bda[6];
+static int m_name_calls;
+static uint8_t m_name_bda[6];
 static int m_remove_calls, m_disc_calls;
 static uint32_t m_disc_handle;
 static esp_err_t m_spp_init_ret = ESP_OK, m_srv_ret = ESP_OK;
@@ -252,9 +269,15 @@ esp_err_t esp_bt_gap_set_scan_mode(esp_bt_connection_mode_t c, esp_bt_discovery_
 }
 esp_err_t esp_bt_gap_ssp_confirm_reply(esp_bd_addr_t bda, bool accept)
 {
-    (void)bda;
+    memcpy(m_cfm_bda, bda, 6u);
     m_cfm_calls++;
     m_cfm_accept = accept;
+    return ESP_OK;
+}
+esp_err_t esp_bt_gap_read_remote_name(esp_bd_addr_t bda)
+{
+    memcpy(m_name_bda, bda, 6u);
+    m_name_calls++;
     return ESP_OK;
 }
 esp_err_t esp_bt_gap_pin_reply(esp_bd_addr_t bda, bool accept, uint8_t len, esp_bt_pin_code_t pin)
@@ -434,6 +457,40 @@ static void auth_cmpl(const uint8_t bda[6], esp_bt_status_t st, uint8_t lk)
     gap_evt(ESP_BT_GAP_AUTH_CMPL_EVT, &p);
 }
 
+static void acl_disc(const uint8_t bda[6])
+{
+    esp_bt_gap_cb_param_t p;
+    memset(&p, 0, sizeof(p));
+    memcpy(p.acl_disconn_cmpl_stat.bda, bda, 6u);
+    gap_evt(ESP_BT_GAP_ACL_DISCONN_CMPL_STAT_EVT, &p);
+}
+
+static void remote_name(const uint8_t bda[6], const char *name)
+{
+    esp_bt_gap_cb_param_t p;
+    memset(&p, 0, sizeof(p));
+    memcpy(p.read_rmt_name.bda, bda, 6u);
+    p.read_rmt_name.stat = ESP_BT_STATUS_SUCCESS;
+    snprintf((char *)p.read_rmt_name.rmt_name, sizeof(p.read_rmt_name.rmt_name), "%s", name);
+    gap_evt(ESP_BT_GAP_READ_REMOTE_NAME_EVT, &p);
+}
+
+static bt_xrec_ui_t ui(void)
+{
+    bt_xrec_ui_t u;
+    bt_xrec_get_ui(&u);
+    return u;
+}
+
+/* The local user answers the pending prompt (after the arming delay), like ENTER / BACK on the BT screen. */
+static int user_answer(int accept)
+{
+    m_now += BT_XREC_SSP_ARM_MS;
+    int r = bt_xrec_ssp_answer(accept);
+    bt_xrec_poll();
+    return r;
+}
+
 static void add_bond_type(const uint8_t bda[6], int mitm)
 {
     m_bond_mitm[m_nbonds] = (uint8_t)mitm;
@@ -477,6 +534,8 @@ static void mocks_reset(void)
     m_alloc_fail = 0;
     m_start_allowed = 1;
     m_entropy_fail = 0;
+    m_pair_block = NULL;
+    m_pair_block_calls = 0;
     m_up_calls = m_down_calls = m_hold_up = m_hold_down = m_up_result = m_down_result = m_job_kind = 0;
     m_job_pending = 0;
     m_dl_latched = m_hard_reason = m_service = m_session_end = m_reboot_mode = m_saved_key = m_poll_fault = 0;
@@ -493,6 +552,9 @@ static void mocks_reset(void)
     m_scan_c = m_scan_d = -1;
     m_cfm_calls = m_pin_calls = m_passkey_calls = m_remove_calls = m_disc_calls = 0;
     m_cfm_accept = m_pin_accept = m_passkey_accept = -1;
+    memset(m_cfm_bda, 0, sizeof(m_cfm_bda));
+    m_name_calls = 0;
+    memset(m_name_bda, 0, sizeof(m_name_bda));
     m_disc_handle = 0u;
     m_spp_init_ret = m_srv_ret = ESP_OK;
     m_nbonds = m_purges = 0;
@@ -544,6 +606,7 @@ static void pair_and_auth(void)
     bt_xrec_open_pairing(60000u);
     cfm_req(PEER, 123456u);
     bt_xrec_poll();
+    CHECK(ui().prompt && user_answer(1) == 0 && m_cfm_accept == 1, "user confirmed the numeric comparison");
     auth_cmpl(PEER, ESP_BT_STATUS_SUCCESS, ESP_BT_LINK_KEY_AUTHED_COMB_P192);
     add_bond(PEER);
     srv_open(H1, PEER);
@@ -614,15 +677,26 @@ static void t_pairing_and_data(void)
     CHECK(st.pair_active && strlen(st.pair_pin) == 6u, "XREC PIN shown");
     cfm_req(PEER, 42u);
     bt_xrec_poll();
-    CHECK(m_cfm_calls == 1 && m_cfm_accept == 1, "numeric comparison accepted inside the window");
+    CHECK(m_cfm_calls == 0, "numeric comparison inside the window waits for the user");
+    bt_xrec_ui_t u = ui();
+    CHECK(u.prompt && strcmp(u.digits, "000042") == 0 && memcmp(u.peer_bda, PEER, 6u) == 0,
+          "prompt shows the value and the peer (prompt %u, '%s')", u.prompt, u.digits);
+    CHECK(strcmp(u.peer, "11:22:33:44:55:66") == 0 && !u.peer_is_name, "peer address while no name is known, got '%s'",
+          u.peer);
+    CHECK(m_name_calls == 1 && memcmp(m_name_bda, PEER, 6u) == 0, "remote name requested for the prompt");
+    remote_name(PEER, "laptop-A");
+    CHECK(strcmp(ui().peer, "laptop-A") == 0 && ui().peer_is_name, "remote name shown once Bluedroid has it, got '%s'",
+          ui().peer);
     st = status();
-    CHECK(strcmp(st.pair_pin, "000042") == 0, "comparison value shown through pair_pin (INTERIM), got '%s'",
-          st.pair_pin);
+    CHECK(strcmp(st.pair_pin, "000042") != 0 && strlen(st.pair_pin) == 6u, "bt_status_t keeps the XREC PIN");
+    CHECK(user_answer(1) == 0 && m_cfm_calls == 1 && m_cfm_accept == 1 && memcmp(m_cfm_bda, PEER, 6u) == 0,
+          "ENTER: numeric comparison accepted");
+    CHECK(!ui().prompt && dbg().ssp_accepted == 1u && dbg().ssp_user_accepted == 1u, "prompt closed after the answer");
     auth_cmpl(PEER, ESP_BT_STATUS_SUCCESS, ESP_BT_LINK_KEY_AUTHED_COMB_P256);
     add_bond(PEER);
     bt_xrec_poll();
-    st = status();
-    CHECK(strcmp(st.pair_pin, "000042") != 0 && strlen(st.pair_pin) == 6u, "back to the XREC PIN after AUTH_CMPL");
+    u = ui();
+    CHECK(u.bonded && strcmp(u.peer, "laptop-A") == 0, "UI: bonded with laptop-A (bonded %u, '%s')", u.bonded, u.peer);
     CHECK(m_remove_calls == 0, "MITM bond kept");
     /* one bond per window (review finding): discoverability and numeric comparison end with the first MITM bond, the
      * XREC PIN stays for the phone's PAIR */
@@ -630,12 +704,16 @@ static void t_pairing_and_data(void)
           "SSP window closed after the first bond (discoverable %d, ssp_window %u)", m_scan_d, dbg().ssp_window);
     cfm_req(PEER2, 77u);
     bt_xrec_poll();
-    CHECK(m_cfm_calls == 2 && m_cfm_accept == 0, "a second device's numeric comparison rejected in the same window");
+    CHECK(m_cfm_calls == 2 && m_cfm_accept == 0 && !ui().prompt,
+          "a second device's numeric comparison rejected in the same window, no prompt");
     auth_cmpl(PEER2, ESP_BT_STATUS_AUTH_FAILURE, 0u);
     bt_xrec_poll();
     srv_open(H1, PEER);
     bt_xrec_poll();
     CHECK(dbg().conn_authorized && dbg().mtu == 660u, "SPP open, authorized, mtu %u", dbg().mtu);
+    u = ui();
+    CHECK(u.connected && u.bonded && strcmp(u.peer, "laptop-A") == 0 && m_name_calls == 1,
+          "UI: connected + bonded laptop-A, name not asked again (%d)", m_name_calls);
     CHECK(status().spp_open == 1u && status().acl_connected == 1u, "status spp_open/acl_connected");
     uint32_t rx0 = status().rx_acl_pkts;
     rx(H1, "+XREC:PING\r\n");
@@ -710,12 +788,16 @@ static void t_policy(void)
 
     /* comparison accepted, but the key came out unauthenticated (peer said no MITM): removed */
     cfm_req(PEER, 5u);
+    bt_xrec_poll();
+    user_answer(1);
     auth_cmpl(PEER, ESP_BT_STATUS_SUCCESS, ESP_BT_LINK_KEY_UNAUTHED_COMB_P256);
     bt_xrec_poll();
     CHECK(m_cfm_accept == 1 && m_remove_calls == 3, "accepted comparison with an unauthenticated key removed");
 
     /* failed pairing: nothing removed */
     cfm_req(PEER, 6u);
+    bt_xrec_poll();
+    user_answer(1);
     auth_cmpl(PEER, ESP_BT_STATUS_AUTH_FAILURE, 0u);
     bt_xrec_poll();
     CHECK(m_remove_calls == 3, "failed pairing leaves no bond to remove");
@@ -990,15 +1072,19 @@ static void t_deferred_reboot(void)
 
 static void t_entropy_fail_closed(void)
 {
-    printf("[11] entropy not ready: XREC PIN refused, CHAL refused and the link closed\n");
+    printf("[11] entropy not ready: pairing window refused (plan M2.3), XREC PIN refused, CHAL refused, link closed\n");
     mocks_reset();
     add_bond(PEER);
     bring_up();
     m_entropy_fail = 1;
     bt_xrec_open_pairing(60000u);
     bt_xrec_poll();
-    CHECK(status().pair_active && status().pair_pin[0] == '\0', "SSP window open, no XREC PIN");
-    CHECK(m_scan_d == ESP_BT_GENERAL_DISCOVERABLE, "discoverable for SSP");
+    CHECK(!status().pair_active && status().pair_pin[0] == '\0' && !dbg().ssp_window && !dbg().window_open,
+          "no window at all without entropy (pair_active %u, ssp_window %u)", status().pair_active, dbg().ssp_window);
+    CHECK(m_scan_d != ESP_BT_GENERAL_DISCOVERABLE, "not discoverable without entropy");
+    cfm_req(PEER2, 4242u);
+    bt_xrec_poll();
+    CHECK(m_cfm_calls == 1 && m_cfm_accept == 0 && !ui().prompt, "numeric comparison rejected, no prompt");
     srv_open(H1, PEER);
     rx(H1, "+XREC:PAIR,000000,000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\r\n");
     CHECK(wire_has("+XREC:ERR,PAIRCLOSED"), "XREC PAIR closed without a PIN");
@@ -1138,6 +1224,455 @@ static void t_hard_paths(void)
     CHECK(m_hard_reason == BT_XREC_FAULT_DOWN_FAIL, "teardown error -> hard path (%d)", m_hard_reason);
 }
 
+static void t_ssp_prompt(void)
+{
+    printf("[14] local numeric-comparison prompt: accept, reject, timeout, window closing, peer gone, second request\n");
+    mocks_reset();
+    bring_up();
+    bt_xrec_ui_t u = ui();
+    CHECK(!u.prompt && !u.window_open && !u.connected && u.peer[0] == '\0', "idle UI state");
+    cfm_req(PEER, 1u);
+    bt_xrec_poll();
+    CHECK(m_cfm_calls == 1 && m_cfm_accept == 0 && !ui().prompt && m_name_calls == 0,
+          "outside the window: rejected without a prompt, no name request");
+    bt_xrec_open_pairing(60000u);
+    bt_xrec_poll();
+    u = ui();
+    CHECK(u.window_open && u.window_s_left == 60u, "window open, %u s left", u.window_s_left);
+    m_now += 15000u;
+    CHECK(ui().window_s_left == 45u, "window countdown (%u s)", ui().window_s_left);
+
+    printf("    accept (ENTER), with the arming delay\n");
+    m_cfm_calls = 0;
+    cfm_req(PEER, 654321u);
+    bt_xrec_poll();
+    u = ui();
+    CHECK(u.prompt && !u.prompt_armed && u.prompt_s_left == 30u && strcmp(u.digits, "654321") == 0 && !u.bonded,
+          "prompt up: armed %u, %u s, '%s'", u.prompt_armed, u.prompt_s_left, u.digits);
+    CHECK(dbg().ssp_prompt == 1u, "debug: prompt pending");
+    m_now += 100u;
+    CHECK(bt_xrec_ssp_answer(1) == -2 && m_cfm_calls == 0 && ui().prompt, "a key in the first 0.5 s is no answer");
+    m_now += BT_XREC_SSP_ARM_MS;
+    CHECK(ui().prompt_armed, "armed after 0.5 s");
+    CHECK(bt_xrec_ssp_answer(1) == 0 && m_cfm_calls == 1 && m_cfm_accept == 1, "accepted");
+    CHECK(bt_xrec_ssp_answer(1) == -3 && m_cfm_calls == 1, "a second answer is swallowed (not 'open a window')");
+    m_now += BT_XREC_SSP_AFTER_MS;
+    CHECK(bt_xrec_ssp_answer(1) == -1 && m_cfm_calls == 1, "1 s after the answer a key is a normal key again");
+    auth_cmpl(PEER, ESP_BT_STATUS_SUCCESS, ESP_BT_LINK_KEY_AUTHED_COMB_P256);
+    add_bond(PEER);
+    bt_xrec_poll();
+    CHECK(m_remove_calls == 0 && dbg().ssp_user_accepted == 1u && ui().bonded, "MITM bond kept, UI bonded");
+    stop_ok();
+
+    printf("    reject (BACK)\n");
+    mocks_reset();
+    bring_up();
+    bt_xrec_open_pairing(60000u);
+    cfm_req(PEER, 111111u);
+    bt_xrec_poll();
+    CHECK(user_answer(0) == 0 && m_cfm_calls == 1 && m_cfm_accept == 0 && memcmp(m_cfm_bda, PEER, 6u) == 0,
+          "BACK: rejected");
+    CHECK(!ui().prompt && dbg().ssp_user_rejected == 1u && dbg().ssp_rejected == 1u && dbg().ssp_accepted == 0u,
+          "counted as a user rejection");
+    auth_cmpl(PEER, ESP_BT_STATUS_AUTH_FAILURE, 0u);
+    bt_xrec_poll();
+    CHECK(m_remove_calls == 0 && m_nbonds == 0, "no bond");
+    /* a key that came out of a rejected comparison anyway (cannot happen with a conforming controller) is removed */
+    auth_cmpl(PEER, ESP_BT_STATUS_SUCCESS, ESP_BT_LINK_KEY_AUTHED_COMB_P192);
+    bt_xrec_poll();
+    CHECK(m_remove_calls == 1 && dbg().ssp_window, "unconfirmed MITM key removed; window still open");
+    stop_ok();
+
+    printf("    timeout (30 s without an answer)\n");
+    mocks_reset();
+    bring_up();
+    bt_xrec_open_pairing(60000u);
+    cfm_req(PEER, 222222u);
+    bt_xrec_poll();
+    m_now += 10200u;
+    bt_xrec_poll();
+    CHECK(ui().prompt && ui().prompt_s_left == 20u, "countdown (%u s left)", ui().prompt_s_left);
+    m_now += BT_XREC_SSP_PROMPT_MS - 10200u - 1u;
+    bt_xrec_poll();
+    CHECK(ui().prompt && m_cfm_calls == 0, "still waiting 1 ms before the timeout");
+    m_now += 1u;
+    bt_xrec_poll();
+    CHECK(!ui().prompt && m_cfm_calls == 1 && m_cfm_accept == 0 && dbg().ssp_timeouts == 1u, "rejected at 30 s");
+    CHECK(bt_xrec_ssp_answer(1) == -3 && m_cfm_calls == 1, "a late ENTER is swallowed, nothing sent");
+    CHECK(bt_xrec_ssp_answer(0) == -3 && m_cfm_calls == 1, "a late BACK is swallowed (does not leave BT mode)");
+    m_now += BT_XREC_SSP_AFTER_MS - 1u;
+    CHECK(bt_xrec_ssp_answer(0) == -3, "still swallowed 1 ms before the end of the guard");
+    m_now += 1u;
+    CHECK(bt_xrec_ssp_answer(0) == -1, "after 1 s BACK is BACK again");
+    stop_ok();
+
+    printf("    window closing mid-prompt\n");
+    mocks_reset();
+    bring_up();
+    bt_xrec_open_pairing(20000u);
+    m_now += 15000u;
+    cfm_req(PEER, 333333u);
+    bt_xrec_poll();
+    CHECK(ui().prompt, "prompt 5 s before the window ends");
+    m_now += 5000u;
+    bt_xrec_poll();
+    CHECK(!ui().prompt && !ui().window_open && m_cfm_calls == 1 && m_cfm_accept == 0 && dbg().ssp_timeouts == 0u,
+          "rejected when the window closed");
+    CHECK(m_scan_d == ESP_BT_NON_DISCOVERABLE, "not discoverable");
+    CHECK(bt_xrec_ssp_answer(1) == -3 && m_cfm_calls == 1, "ENTER right after the window closed is swallowed");
+    stop_ok();
+
+    printf("    peer disconnect / peer gives up mid-prompt\n");
+    mocks_reset();
+    bring_up();
+    bt_xrec_open_pairing(60000u);
+    cfm_req(PEER, 444444u);
+    bt_xrec_poll();
+    acl_disc(PEER2);
+    bt_xrec_poll();
+    CHECK(ui().prompt, "another peer's link going down leaves the prompt");
+    acl_disc(PEER);
+    bt_xrec_poll();
+    CHECK(!ui().prompt && m_cfm_calls == 0 && dbg().ssp_withdrawn == 1u, "withdrawn without a reply");
+    CHECK(user_answer(0) == -3 && m_cfm_calls == 0, "BACK 0.5 s after the peer left: swallowed, nothing sent");
+    cfm_req(PEER, 555555u);
+    bt_xrec_poll();
+    auth_cmpl(PEER, ESP_BT_STATUS_AUTH_FAILURE, 0u);   /* the phone's user said no / LMP response timeout */
+    bt_xrec_poll();
+    CHECK(!ui().prompt && m_cfm_calls == 0 && dbg().ssp_withdrawn == 2u && m_remove_calls == 0,
+          "withdrawn when the peer's pairing failed");
+    stop_ok();
+
+    printf("    second request while one is pending\n");
+    mocks_reset();
+    bring_up();
+    bt_xrec_open_pairing(60000u);
+    cfm_req(PEER, 123123u);
+    bt_xrec_poll();
+    m_now += 2000u;
+    cfm_req(PEER2, 999999u);
+    bt_xrec_poll();
+    u = ui();
+    CHECK(m_cfm_calls == 1 && m_cfm_accept == 0 && memcmp(m_cfm_bda, PEER2, 6u) == 0, "the newcomer is rejected");
+    CHECK(u.prompt && strcmp(u.digits, "123123") == 0 && memcmp(u.peer_bda, PEER, 6u) == 0 && u.prompt_s_left == 28u,
+          "the pending prompt is unchanged ('%s', %u s)", u.digits, u.prompt_s_left);
+    CHECK(user_answer(1) == 0 && m_cfm_calls == 2 && m_cfm_accept == 1 && memcmp(m_cfm_bda, PEER, 6u) == 0,
+          "the first one is accepted");
+    auth_cmpl(PEER, ESP_BT_STATUS_SUCCESS, ESP_BT_LINK_KEY_AUTHED_COMB_P192);
+    add_bond(PEER);
+    bt_xrec_poll();
+    CHECK(!dbg().ssp_window && !dbg().ssp_burned, "first one bonded: SSP part closed, key not spent");
+    bt_xrec_open_pairing(60000u);
+    bt_xrec_poll();
+    cfm_req(PEER, 1u);
+    bt_xrec_poll();
+    cfm_req(PEER, 2u);                                  /* the same peer again: its first pairing is gone */
+    bt_xrec_poll();
+    CHECK(!ui().prompt && m_cfm_calls == 3 && m_cfm_accept == 0 && dbg().ssp_withdrawn == 1u,
+          "same peer again: rejected, stale prompt withdrawn");
+    stop_ok();
+
+    printf("    BT stop with a prompt up; name handling\n");
+    mocks_reset();
+    bring_up();
+    bt_xrec_open_pairing(60000u);
+    cfm_req(PEER, 7u);
+    bt_xrec_poll();
+    remote_name(PEER, "Pixel\x01 7");
+    CHECK(strcmp(ui().peer, "Pixel? 7") == 0, "control bytes replaced, got '%s'", ui().peer);
+    remote_name(PEER2, "other");
+    CHECK(strcmp(ui().peer, "11:22:33:44:55:66") == 0, "another peer's name is not shown, got '%s'", ui().peer);
+    remote_name(PEER, "ABCDEFGHIJKLMNOPQRSTUV\xC3\xA9xyz");   /* 22 ASCII + 'e acute' (2 bytes): cut inside it */
+    CHECK(strcmp(ui().peer, "ABCDEFGHIJKLMNOPQRSTUV") == 0, "cut at a character boundary, got '%s'", ui().peer);
+    remote_name(PEER, "ABCDEFGHIJKLMNOPQRSTU\xC3\xA9xyz");    /* 21 + 2 = 23 bytes: fits */
+    CHECK(strcmp(ui().peer, "ABCDEFGHIJKLMNOPQRSTU\xC3\xA9") == 0, "whole character kept, got '%s'", ui().peer);
+    stop_ok();
+    CHECK(!ui().prompt && m_cfm_calls == 0 && dbg().ssp_withdrawn == 1u, "stop withdraws the prompt");
+    m_stopped = 0;
+    bring_up();
+    CHECK(!ui().prompt && ui().peer[0] == '\0', "nothing left after a restart");
+    stop_ok();
+}
+
+static void t_pairing_gate(void)
+{
+    printf("[16] plan M2.3 pairing gate: SSP part refused / closed while the platform cannot back a pairing\n");
+    /* entropy credited but the ROM key was not replaced (e.g. collection deferred at BT start): XREC PIN only */
+    mocks_reset();
+    bring_up();
+    m_pair_block = "ROM P-192 key not replaced (mock)";
+    bt_xrec_open_pairing(60000u);
+    bt_xrec_poll();
+    bt_status_t st = status();
+    CHECK(st.pair_active && strlen(st.pair_pin) == 6u && !dbg().ssp_window, "XREC PIN window only (ssp_window %u)",
+          dbg().ssp_window);
+    CHECK(m_scan_d == ESP_BT_NON_DISCOVERABLE, "not discoverable (%d)", m_scan_d);
+    cfm_req(PEER, 1234u);
+    bt_xrec_poll();
+    CHECK(m_cfm_calls == 1 && m_cfm_accept == 0 && !ui().prompt, "numeric comparison rejected without a prompt");
+    stop_ok();
+
+    /* gate holds when the window opens, then fails during a pairing (ROM RNG pool ran dry at the nonce): the SSP part
+     * closes on the next poll and the pending prompt is rejected with it */
+    mocks_reset();
+    bring_up();
+    bt_xrec_open_pairing(60000u);
+    bt_xrec_poll();
+    CHECK(dbg().ssp_window && m_scan_d == ESP_BT_GENERAL_DISCOVERABLE, "SSP window open with the gate holding");
+    cfm_req(PEER, 4321u);
+    bt_xrec_poll();
+    CHECK(ui().prompt && m_cfm_calls == 0, "prompt up");
+    int calls = m_pair_block_calls;
+    m_pair_block = "ROM RNG pool ran dry this session (mock)";
+    bt_xrec_poll();
+    CHECK(m_pair_block_calls > calls, "gate re-checked while the SSP part is open");
+    CHECK(!dbg().ssp_window && m_scan_d == ESP_BT_NON_DISCOVERABLE, "SSP part closed");
+    CHECK(!ui().prompt && m_cfm_calls == 1 && m_cfm_accept == 0, "pending prompt rejected with the window");
+    CHECK(user_answer(1) == -3 && m_cfm_calls == 1, "a late ENTER changes nothing (swallowed)");
+    stop_ok();
+
+    /* window opened right after bt_xrec_start (SD bench run, pair=1 at t=0; or ENTER during bring-up): the ROM key is
+     * installed only by the controller start inside the up job, so the gate is decided once READY, not refused early */
+    for (int c = 0; c < 3; c++) {
+        mocks_reset();
+        m_pair_block = "ROM P-192 key not replaced (mock: controller not started)";
+        CHECK(bt_xrec_start(NULL, 0) == 0, "start");
+        bt_xrec_open_pairing(60000u);
+        CHECK(dbg().state == BT_XREC_ST_UP && dbg().ssp_pending && !dbg().ssp_window && dbg().ssp_gate_refused == 0u,
+              "gate deferred before READY (state %u pending %u window %u refused %u)", dbg().state, dbg().ssp_pending,
+              dbg().ssp_window, dbg().ssp_gate_refused);
+        CHECK(status().pair_active && strlen(status().pair_pin) == 6u, "XREC PIN issued at once");
+        m_pair_block = c == 0 ? NULL : "ROM P-192 key slots not as traced (mock)";  /* start() installed it, or not */
+        m_entropy_fail = c == 2;                 /* c 2: no credit at all (the PIN is already out: kept) */
+        bt_xrec_poll();
+        esp_spp_cb_param_t p;
+        memset(&p, 0, sizeof(p));
+        p.init.status = ESP_SPP_SUCCESS;
+        spp_evt(ESP_SPP_INIT_EVT, &p);
+        bt_xrec_poll();
+        CHECK(!dbg().ssp_window, "no SSP part before READY");
+        memset(&p, 0, sizeof(p));
+        p.start.status = ESP_SPP_SUCCESS;
+        p.start.scn = 1u;
+        spp_evt(ESP_SPP_START_EVT, &p);
+        bt_xrec_poll();
+        CHECK(dbg().state == BT_XREC_ST_READY && !dbg().ssp_pending, "READY, gate decided");
+        if (c == 0) {
+            CHECK(dbg().ssp_window && m_scan_d == ESP_BT_GENERAL_DISCOVERABLE && dbg().ssp_gate_refused == 0u,
+                  "SSP part opened at READY (window %u scan %d)", dbg().ssp_window, m_scan_d);
+            cfm_req(PEER, 777u);
+            bt_xrec_poll();
+            CHECK(ui().prompt && m_cfm_calls == 0, "deferred window prompts like any other");
+        } else {
+            CHECK(!dbg().ssp_window && m_scan_d == ESP_BT_NON_DISCOVERABLE && dbg().ssp_gate_refused == 1u,
+                  "refused at READY, counted once (window %u scan %d refused %u)", dbg().ssp_window, m_scan_d,
+                  dbg().ssp_gate_refused);
+            CHECK(dbg().window_open && status().pair_active, "XREC PIN window kept");
+        }
+        m_entropy_fail = 0;
+        stop_ok();
+    }
+    /* no entropy at all when the window was opened early: no PIN, and the deferred gate refusal closes everything */
+    mocks_reset();
+    m_entropy_fail = 1;
+    CHECK(bt_xrec_start(NULL, 0) == 0, "start");
+    bt_xrec_open_pairing(60000u);
+    CHECK(dbg().window_open && status().pair_pin[0] == '\0' && dbg().ssp_pending, "window pending, no PIN");
+    bt_xrec_poll();
+    {
+        esp_spp_cb_param_t p;
+        memset(&p, 0, sizeof(p));
+        p.init.status = ESP_SPP_SUCCESS;
+        spp_evt(ESP_SPP_INIT_EVT, &p);
+        bt_xrec_poll();
+        memset(&p, 0, sizeof(p));
+        p.start.status = ESP_SPP_SUCCESS;
+        p.start.scn = 1u;
+        spp_evt(ESP_SPP_START_EVT, &p);
+        bt_xrec_poll();
+    }
+    CHECK(!dbg().window_open && !dbg().ssp_window && dbg().ssp_gate_refused == 1u && m_scan_d == ESP_BT_NON_DISCOVERABLE,
+          "nothing opens (window %u ssp %u refused %u)", dbg().window_open, dbg().ssp_window, dbg().ssp_gate_refused);
+    m_entropy_fail = 0;
+    stop_ok();
+}
+
+static void t_bench_autoconfirm(void)
+{
+    printf("[15] BENCH autoconfirm override (bt_xrec_set_bench_autoconfirm)\n");
+    mocks_reset();
+    bt_xrec_set_bench_autoconfirm(1);   /* before start: survives bt_xrec_start */
+    bring_up();
+    cfm_req(PEER, 5u);
+    bt_xrec_poll();
+    CHECK(m_cfm_calls == 1 && m_cfm_accept == 0, "outside the window still rejected");
+    bt_xrec_open_pairing(60000u);
+    cfm_req(PEER, 4242u);
+    bt_xrec_poll();
+    CHECK(m_cfm_calls == 2 && m_cfm_accept == 1 && !ui().prompt && dbg().ssp_bench_autoconfirmed == 1u,
+          "accepted at once without a prompt");
+    CHECK(strcmp(status().pair_pin, "004242") == 0, "value shown through pair_pin, got '%s'", status().pair_pin);
+    auth_cmpl(PEER, ESP_BT_STATUS_SUCCESS, ESP_BT_LINK_KEY_AUTHED_COMB_P192);
+    add_bond(PEER);
+    bt_xrec_poll();
+    CHECK(m_remove_calls == 0 && !dbg().ssp_window, "MITM bond kept, SSP window closed after it");
+    bt_xrec_set_bench_autoconfirm(0);
+    bt_xrec_open_pairing(60000u);
+    cfm_req(PEER2, 1u);
+    bt_xrec_poll();
+    CHECK(m_cfm_calls == 2 && ui().prompt, "off again: the prompt is back");
+    stop_ok();
+    mocks_reset();
+    bring_up();
+    bt_xrec_open_pairing(60000u);
+    cfm_req(PEER, 1u);
+    bt_xrec_poll();
+    CHECK(m_cfm_calls == 0 && ui().prompt && dbg().ssp_bench_autoconfirmed == 0u, "default off");
+    stop_ok();
+
+    /* bench XREC PIN (SD:/BTBENCH.RUN xrec_pin=): survives start, every window uses it, still fails closed without
+     * entropy, bad values switch it off, and off means DRBG PINs again */
+    mocks_reset();
+    bt_xrec_set_bench_xrec_pin("012345");
+    bring_up();
+    bt_xrec_open_pairing(60000u);
+    CHECK(strcmp(status().pair_pin, "012345") == 0, "bench PIN shown ('%s')", status().pair_pin);
+    bt_xrec_open_pairing(60000u);
+    CHECK(strcmp(status().pair_pin, "012345") == 0, "bench PIN on a re-opened window");
+    stop_ok();
+    mocks_reset();
+    m_entropy_fail = 1;
+    bring_up();
+    bt_xrec_open_pairing(60000u);
+    CHECK(status().pair_pin[0] == '\0' && !dbg().window_open, "no entropy: no bench PIN either");
+    m_entropy_fail = 0;
+    stop_ok();
+    mocks_reset();
+    bt_xrec_set_bench_xrec_pin("12345x");
+    bring_up();
+    bt_xrec_open_pairing(60000u);
+    CHECK(strlen(status().pair_pin) == 6u && strcmp(status().pair_pin, "012345") != 0, "bad value: off (DRBG PIN '%s')",
+          status().pair_pin);
+    stop_ok();
+    bt_xrec_set_bench_xrec_pin("654321");
+    bt_xrec_set_bench_xrec_pin(NULL);
+    mocks_reset();
+    bring_up();
+    bt_xrec_open_pairing(60000u);
+    CHECK(strcmp(status().pair_pin, "654321") != 0, "NULL: off again");
+    stop_ok();
+}
+
+
+/* Review findings (2026-11-24): the ROM never validates the peer's P-192 key, so an accepted pairing that fails tells
+ * the peer the result of a DHKey check with this session's key (invalid-curve oracle): such a key is spent until the
+ * next BT-mode entry. The gate is re-checked when a request arrives and when the user accepts (not only by the poll
+ * after the event drain). */
+static void t_ssp_key_spent(void)
+{
+    printf("[17] accepted pairing that fails: P-192 key spent, SSP refused until the next BT-mode entry\n");
+    for (int variant = 0; variant < 3; variant++) {   /* 0 bench autoconfirm + AUTH_CMPL fail, 1 user + fail, 2 ACL drop */
+        mocks_reset();
+        if (variant == 0) {
+            bt_xrec_set_bench_autoconfirm(1);
+        }
+        bring_up();
+        bt_xrec_open_pairing(60000u);
+        bt_xrec_poll();
+        CHECK(dbg().ssp_window && m_scan_d == ESP_BT_GENERAL_DISCOVERABLE, "v%d: SSP window open", variant);
+        cfm_req(PEER, 4242u);
+        bt_xrec_poll();
+        if (variant != 0) {
+            CHECK(user_answer(1) == 0, "v%d: user accepts", variant);
+        }
+        CHECK(m_cfm_accept == 1 && !dbg().ssp_burned, "v%d: accepted, key not spent yet", variant);
+        if (variant == 2) {
+            acl_disc(PEER);
+        } else {
+            auth_cmpl(PEER, ESP_BT_STATUS_AUTH_FAILURE, 0u);   /* DHKey check failed (wrong guess of d * P') */
+        }
+        bt_xrec_poll();
+        CHECK(dbg().ssp_burned && !dbg().ssp_window && m_scan_d == ESP_BT_NON_DISCOVERABLE,
+              "v%d: key spent, SSP part closed (burned %u window %u scan %d)", variant, dbg().ssp_burned,
+              dbg().ssp_window, m_scan_d);
+        CHECK(dbg().window_open && status().pair_active, "v%d: the XREC PIN part of the window stays", variant);
+        int calls = m_cfm_calls;
+        cfm_req(PEER2, 1u);
+        bt_xrec_poll();
+        CHECK(m_cfm_calls == calls + 1 && m_cfm_accept == 0 && !ui().prompt, "v%d: next comparison rejected", variant);
+        uint32_t refused = dbg().ssp_gate_refused;
+        bt_xrec_open_pairing(60000u);
+        bt_xrec_poll();
+        CHECK(!dbg().ssp_window && dbg().ssp_gate_refused == refused + 1u && m_scan_d == ESP_BT_NON_DISCOVERABLE,
+              "v%d: re-opened window: SSP refused, counted (toast)", variant);
+        stop_ok();
+        m_stopped = 0;
+        bring_up();                                    /* next BT-mode entry: a new key */
+        bt_xrec_open_pairing(60000u);
+        bt_xrec_poll();
+        CHECK(dbg().ssp_window && !dbg().ssp_burned, "v%d: next session offers SSP again", variant);
+        stop_ok();
+        if (variant == 0) {
+            bt_xrec_set_bench_autoconfirm(0);
+        }
+    }
+    /* a rejected (never accepted) comparison that fails spends nothing: the peer never reached the DHKey check */
+    mocks_reset();
+    bring_up();
+    bt_xrec_open_pairing(60000u);
+    cfm_req(PEER, 1u);
+    bt_xrec_poll();
+    CHECK(user_answer(0) == 0, "BACK");
+    auth_cmpl(PEER, ESP_BT_STATUS_AUTH_FAILURE, 0u);
+    bt_xrec_poll();
+    CHECK(!dbg().ssp_burned && dbg().ssp_window, "rejected then failed: key not spent, window still open");
+    stop_ok();
+
+    printf("[18] M2.3 gate re-checked at the request and at the answer (pool ran dry between two polls)\n");
+    mocks_reset();
+    bt_xrec_set_bench_autoconfirm(1);
+    bring_up();
+    bt_xrec_open_pairing(60000u);
+    bt_xrec_poll();
+    CHECK(dbg().ssp_window, "SSP window open");
+    m_pair_block = "ROM RNG pool ran dry this session (mock)";   /* the poll has not seen it yet */
+    cfm_req(PEER, 999u);
+    bt_xrec_poll();                                    /* drain_events() runs before the poll's own gate check */
+    CHECK(m_cfm_calls == 1 && m_cfm_accept == 0 && dbg().ssp_bench_autoconfirmed == 0u && dbg().ssp_accepted == 0u,
+          "bench autoconfirm does not accept a comparison the gate refuses (accept %d)", m_cfm_accept);
+    CHECK(dbg().ssp_gate_cfm_rejects == 1u && !dbg().ssp_window, "counted, SSP part closed");
+    bt_xrec_set_bench_autoconfirm(0);
+    stop_ok();
+    mocks_reset();
+    bring_up();
+    bt_xrec_open_pairing(60000u);
+    cfm_req(PEER, 31337u);
+    bt_xrec_poll();
+    CHECK(ui().prompt, "prompt up with the gate holding");
+    m_pair_block = "ROM RNG pool ran dry this session (mock)";
+    m_now += BT_XREC_SSP_ARM_MS;
+    CHECK(bt_xrec_ssp_answer(1) == 0, "ENTER before the next poll");
+    CHECK(m_cfm_calls == 1 && m_cfm_accept == 0 && dbg().ssp_user_accepted == 0u && !ui().prompt &&
+          dbg().ssp_gate_cfm_rejects == 1u, "ENTER rejects when the gate stopped holding (accept %d)", m_cfm_accept);
+    stop_ok();
+
+    printf("[19] re-opening a window that is still well open keeps its XREC PIN\n");
+    mocks_reset();
+    bring_up();
+    bt_xrec_open_pairing(60000u);
+    char pin1[8];
+    snprintf(pin1, sizeof(pin1), "%s", status().pair_pin);
+    m_now += 5000u;
+    bt_xrec_open_pairing(60000u);                      /* ENTER again 5 s later */
+    CHECK(strcmp(status().pair_pin, pin1) == 0 && ui().window_s_left == 60u, "PIN kept ('%s' vs '%s'), deadline moved "
+          "(%u s)", status().pair_pin, pin1, ui().window_s_left);
+    m_now += 50000u + 1u;                              /* 9.999 s left: the next ENTER draws a new PIN */
+    bt_xrec_open_pairing(60000u);
+    CHECK(strlen(status().pair_pin) == 6u && strcmp(status().pair_pin, pin1) != 0, "new PIN near the end ('%s')",
+          status().pair_pin);
+    stop_ok();
+}
+
 int main(int argc, char **argv)
 {
     m_verbose = argc > 1 && strcmp(argv[1], "-v") == 0;
@@ -1154,6 +1689,10 @@ int main(int argc, char **argv)
     t_entropy_fail_closed();
     t_evq_overflow_and_faults();
     t_hard_paths();
+    t_ssp_prompt();
+    t_bench_autoconfirm();
+    t_pairing_gate();
+    t_ssp_key_spent();
     bt_xrec_test_reset();
     printf("test_bt_xrec: %d checks, %d failures\n", g_checks, g_fails);
     return g_fails == 0 ? 0 : 1;

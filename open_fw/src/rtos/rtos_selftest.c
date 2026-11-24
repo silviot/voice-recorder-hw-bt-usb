@@ -193,6 +193,7 @@ extern int esp_timer_create(const st_timer_args_t *a, void **h);
 extern int esp_timer_start_once(void *h, unsigned long long us);
 extern _Bool esp_timer_is_active(void *h);
 extern int esp_timer_delete(void *h);
+extern long long esp_timer_get_time(void);
 extern void bt_port_alarm_drain(void);
 extern int bt_entropy_get(void *out, unsigned n);
 static volatile uint32_t g_bt_timer_hits;
@@ -344,10 +345,16 @@ static void selftest_main(void *arg)
         st_timer_args_t a = { bt_timer_cb, NULL, 0 /* ESP_TIMER_TASK */, "st", 0 };
         if (bt_port_init(NULL) == 0) step = 1u;
         if (step == 1u && bt_entropy_get(rnd, sizeof(rnd)) == -1 /* BT_ENT_NOT_READY */) step = 2u;
+        long long t_arm = esp_timer_get_time();      /* before the start: t_arm + 5000 <= the timer's deadline */
         if (step == 2u && esp_timer_create(&a, &t) == 0 && esp_timer_start_once(t, 5000u) == 0) step = 3u;
         if (step == 3u) {
             vTaskDelay(pdMS_TO_TICKS(3));
-            if (esp_timer_is_active(t) && g_bt_timer_hits == 0u) step = 4u;   /* not early */
+            /* Not early: still armed while less than 5 ms passed. The 3 ms delay can overrun when a higher-priority
+             * task holds the CPU (HCI probe image: bt_ctrl's first Reset busy-waits 0.3-0.5 s in RF calibration;
+             * QEMU under host load); then the timer may legitimately have expired already, and "not early" cannot be
+             * judged from this sample. Callbacks still only run from bt_port_alarm_drain(), so hits stays 0. */
+            int overrun = esp_timer_get_time() - t_arm >= 5000;
+            if ((esp_timer_is_active(t) || overrun) && g_bt_timer_hits == 0u) step = 4u;
         }
         if (step == 4u) {
             vTaskDelay(pdMS_TO_TICKS(10));

@@ -45,11 +45,12 @@ make -C open_fw test-bt-host-tsan   # ThreadSanitizer variant (scenarios, 50 cyc
 P. **Phone mode end to end** (`test_bt_host phone IMG`, its own process; IMG = a 4096-sector exFAT image, created by
    the make target): the real BT=1 XREC backend (`bt_port/bt_xrec_bluedroid.c`, `src/xrec_proto.c`, `src/exfat.c` on
    a RAM copy of IMG with `/record/REC0001.WAV` 40000 B and `/record/BIG0002.WAV` 300000 B) over this stack and the
-   fake ROM's scripted peer (`fake_peer_*`), driven as a laptop. 383 checks, ~8 s:
+   fake ROM's scripted peer (`fake_peer_*`), driven as a laptop. 527 checks:
    - warm-up start/stop (no peer): only btc_spp's 2 resident objects stay; the baseline is taken after it;
    - P1 `bt_xrec_start` -> READY (connectable only), pairing window -> discoverable (`0C1A 0x03` at the ROM), PIN;
    - P2 laptop A (DisplayYesNo) pages and authenticates: Bluedroid's set-up reads, link key request -> negative
-     reply -> IO capabilities (ours: DisplayYesNo) -> numeric comparison accepted inside the window (value logged) ->
+     reply -> IO capabilities (ours: DisplayYesNo) -> numeric comparison inside the window held on the device prompt
+     (digits and the remote name "laptop-A" checked), answered ENTER (`BTHX_SSP_ANSWER 1`; value logged) ->
      link key notification -> bond -> `bt_store` flush -> `/bt_bonds.bin` holds the key; A encrypts;
    - P3 SDP ServiceSearchAttribute 0x1101: "Cassini", RFCOMM channel 1; P4 RFCOMM mux, PN (CFC accepted, N1 990),
      DLC, MSC -> SPP open and authorized, MTU 990; no bytes from the device before the first command (bt_sync.py's
@@ -81,7 +82,19 @@ P. **Phone mode end to end** (`test_bt_host phone IMG`, its own process; IMG = a
    - P15 a stale Just Works bond of C planted in `/bt_bonds.bin` (`plant_bond`), the card failing every write
      (`bthx_fail_bond_writes`) while the session removes it at start; once the card recovers the bounded retry
      rewrites the file without C (`bt_store` stays dirty until `bt_store_mark_saved()`); C never authorized;
-   - P16 stop: baseline; `/bt_bonds.bin` holds A only; the scenario's heap peak (`bth_heap_peak_reset()` after the
+   - P16 window open, laptop B pairs, the test answers BACK on the prompt (`BTHX_SSP_ANSWER 0`): negative reply, no
+     bond, window still open, an ENTER right after it is swallowed (-3), one 1 s later finds no prompt (-1); the
+     phone build is a bench build (`-DOPENFW_BT_BENCH_IMAGE=1`, for P17-P19);
+   - P17 bench autoconfirm (`BTHX_BENCH_AUTOCONFIRM`, as `SD:/BTBENCH.RUN autoconfirm=1`): laptop D's comparison is
+     accepted without the user, MITM bond, SSP part closed; D runs CHAL/AUTH twice (distinct, non-zero nonces), GETS;
+   - P18 restart with the session's entropy withheld (`bthx_withhold_entropy`: a BT-mode entry whose mic collection
+     credited nothing; `host_xrec.c` models the firmware gate: key staged only with credit, "installed" when
+     `esp_bluedroid_enable()` returned): nothing opens even with autoconfirm on, B rejected without a prompt, D's CHAL
+     fails closed and the link closes; a later credit gives the XREC PIN but the SSP part stays refused (ROM key);
+   - P19 bench-style start (`BTHX_START_PAIR` with the up job held by `bthx_hold_bringup`, bench XREC PIN 246810):
+     the gate is deferred while UP and decided at READY (SSP part opens, `0C1A 0x03`); D: XREC PAIR with the bench PIN
+     and a new key, CHAL/AUTH with it, LS, GETS; bench PIN off: DRBG PIN again;
+   - P20 stop: baseline; `/bt_bonds.bin` holds A (and D) but never B or C; the scenario's heap peak (`bth_heap_peak_reset()` after the
      warm-up) under a host regression ceiling (x86-64 sizes; the target budget is read from the firmware's `BT mem`
      lines). Every stop also checks: no fake-ROM contract error, unknown opcode, ROM id without a packer,
      forwarded-command deadline, BT fault, HCI command timeout, XREC hard path.

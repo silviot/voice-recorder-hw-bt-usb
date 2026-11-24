@@ -87,4 +87,23 @@ void bt_rom_real_evt_mask(uint8_t out[8]);
 /* What the legacy hook 0x00803BBC[7] stores for a Set Event Mask parameter: mask | these mandatory bits (F:481-488). */
 #define BT_ROM_REAL_EVT_MASK_MANDATORY { 0x00u, 0x60u, 0x04u, 0x00u, 0xF8u, 0x07u, 0x40u, 0xE2u }
 
+/* ---- SSP key material (plan M2.1, docs/BT_ROM_INTERFACE.md §2.3) ----
+ * The ROM's local P-192 key pair is a constant copied from ROM by the LM bring-up; start() replaces it with the pair
+ * staged here (after checking the RAM slots hold exactly that constant) and stop() wipes the private key again.
+ * Nothing staged (HCI probe image, or no credited entropy): the ROM pair stays and key_installed is 0, which the
+ * phone-mode platform treats as "pairing refused". The RNG hook at 0x00803C24 serves security call sites from the
+ * bt_rom_rng pool (bt_rom_rng.h); its counters are reported here. */
+#include "bt_rom_rng.h"
+typedef struct {
+    uint8_t  key_staged;       /* a pair is staged for the next start() */
+    uint8_t  key_installed;    /* the running controller uses the staged pair (0 after stop()) */
+    uint32_t key_installs;     /* successful installs since boot */
+    uint32_t key_unexpected;   /* start() found something other than the ROM pair in the slots: not installed */
+    bt_rom_rng_stats_t rng;
+} bt_rom_real_sec_t;
+/* App task, while bt_ctrl is not inside start() (before the session's bring-up job / after it ended). NULLs clear and
+ * wipe the staged pair. The pair must be valid (bt_p192_keygen); it is copied. */
+void bt_rom_real_stage_p192(const uint8_t priv_le[24], const uint8_t pub_le[48]);
+void bt_rom_real_sec(bt_rom_real_sec_t *out);
+
 #endif /* BT_ROM_REAL_H */

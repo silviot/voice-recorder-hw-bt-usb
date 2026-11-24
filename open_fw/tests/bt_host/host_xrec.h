@@ -10,11 +10,16 @@
 #include "openfw.h"
 #include "bt_xrec_bluedroid.h"
 
-enum { BTHX_START = 1, BTHX_STOP, BTHX_OPEN_PAIRING };
+/* SSP_ANSWER(arg 1 = ENTER, 0 = BACK); START_PAIR(arg ms) = bt_xrec_start + bt_xrec_open_pairing in one app-task step
+ * (the SD bench run's pair=1 at t=0, before READY); BENCH_AUTOCONFIRM(arg 0/1) = bt_xrec_set_bench_autoconfirm;
+ * BENCH_XREC_PIN(arg 0..999999, larger = off) = bt_xrec_set_bench_xrec_pin. */
+enum { BTHX_START = 1, BTHX_STOP, BTHX_OPEN_PAIRING, BTHX_SSP_ANSWER, BTHX_START_PAIR, BTHX_BENCH_AUTOCONFIRM,
+       BTHX_BENCH_XREC_PIN };
 
 typedef struct {
     bt_status_t st;               /* bt_xrec_get_status() as the UI sees it */
     bt_xrec_debug_t d;            /* bt_xrec_get_debug() */
+    bt_xrec_ui_t ui;              /* bt_xrec_get_ui(): the BT screen's pairing prompt / link state */
     int bonds;                    /* esp_bt_gap_get_bond_device_num() while enabled, else -1 */
     uint32_t polls;
 } bthx_snap_t;
@@ -22,7 +27,7 @@ typedef struct {
 /* Create the app task, the worker and the deadline timer (once; before the heap/task baseline). vol = the mounted
  * RAM exFAT volume the session uses as its SD card. */
 int  bthx_init(exfat_vol_t *vol);
-/* Run one bt_xrec_* call in the app task and wait for it (BTHX_START / STOP / OPEN_PAIRING(arg ms)). */
+/* Run one bt_xrec_* call in the app task and wait for it (BTHX_START / STOP / OPEN_PAIRING(arg ms) / SSP_ANSWER). */
 int  bthx_call(int op, uint32_t arg, uint32_t timeout_ms);
 /* The same without blocking the caller (the scenario keeps the fake laptop answering while a stop runs). */
 uint32_t bthx_post(int op, uint32_t arg);
@@ -35,6 +40,12 @@ void bthx_fail_bond_writes(int on);       /* every /bt_bonds.bin write fails whi
 uint32_t bthx_bond_write_fails(void);
 uint32_t bthx_key_writes(void);          /* /cassini.key replaced */
 uint32_t bthx_reboot_mode(void);
+/* TEST knob: the session's entropy as after a BT-mode entry whose mic collection credited nothing (XREC PIN / CHAL fail
+ * closed, M2.3 gate refuses). Read at stack_up_begin for the ROM key model, and live for everything else. */
+void bthx_withhold_entropy(int on);
+/* TEST knob: the next up job waits while on (the worker outranks the app task, and the fake ROM answers at once, so
+ * without it the bring-up always finishes before the app task runs again; on target the ROM bring-up does not). */
+void bthx_hold_bringup(int on);
 uint32_t bthx_ssp_value_logged(void);    /* value of the last "numeric comparison accepted" log line */
 /* Read a root file of the RAM SD card (test task, only while the session is OFF or idle). Returns bytes or -1. */
 int  bthx_read_root_file(const char *name, uint8_t *buf, uint32_t cap);

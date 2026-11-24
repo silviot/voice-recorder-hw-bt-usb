@@ -14,8 +14,9 @@
  *   - bt_xrec_stop (F:2151-2176) = bt_shutdown(): graceful Bluedroid/bt_ctrl teardown with the M1 recovery ladder.
  *   - bt_xrec_get_status (F:2178-2197): same fields, equivalent meaning (see bt_xrec_get_status below).
  * Deliberate differences (plan M4 pairing policy): IO capability DisplayYesNo instead of NoInputNoOutput (F:1674),
- * numeric comparison accepted only inside the pairing window, legacy PIN pairing rejected instead of answering "0000"
- * (F:1636-1647), Just Works / passkey bonds removed, XREC traffic only on MITM-authenticated, encrypted links.
+ * numeric comparison accepted only inside the pairing window and only after the local user confirmed it on the BT
+ * screen (ENTER; BACK or 30 s rejects), legacy PIN pairing rejected instead of answering "0000" (F:1636-1647), Just
+ * Works / passkey bonds removed, XREC traffic only on MITM-authenticated, encrypted links.
  * SPDX-License-Identifier: MIT */
 #include <stdbool.h>
 #include <stdint.h>
@@ -26,6 +27,12 @@
 #include "esp_gap_bt_api.h"
 #include "esp_spp_api.h"
 #include "bt_xrec_bluedroid.h"
+
+#if defined(OPENFW_BT_BENCH_IMAGE) && OPENFW_BT_BENCH_IMAGE
+#define BENCH_IMAGE 1   /* make BT=1 BENCH=1: SD:/BTBENCH.RUN overrides compiled in (bt_bench.h) */
+#else
+#define BENCH_IMAGE 0   /* release BT=1 image: no autoconfirm / fixed-PIN code at all (review finding) */
+#endif
 
 _Static_assert((BT_XREC_RX_RING & (BT_XREC_RX_RING - 1u)) == 0u, "RX ring size must be a power of two");
 _Static_assert((BT_XREC_TX_RING & (BT_XREC_TX_RING - 1u)) == 0u, "TX ring size must be a power of two");
@@ -70,6 +77,9 @@ static struct {
     uint32_t rx_frames;        /* ESP_SPP_DATA_IND_EVT count (status rx_acl_pkts) */
     uint32_t rx_overflows, evq_lost_n;
     bufs_t  *b;
+    uint8_t  nm_valid;         /* last remote name Bluedroid reported (READ_REMOTE_NAME / AUTH_CMPL), for the UI */
+    uint8_t  nm_bda[6];
+    char     nm[BT_XREC_PEER_NAME_MAX];
 
     /* ---- app task only ---- */
     uint8_t  state;
@@ -79,6 +89,7 @@ static struct {
     uint8_t  spp_inited;
     uint8_t  window_open, xrec_pin_issued;
     uint8_t  ssp_window;               /* numeric comparison accepted + discoverable: closes at the first MITM bond */
+    uint8_t  ssp_deferred;             /* window opened before READY: the M2.3 gate is evaluated once READY */
     uint32_t window_deadline;
     uint8_t  scan_disc, scan_applied;      /* scan_applied: 0 none, 1 connectable, 2 connectable+discoverable */
     uint8_t  ssp_showing;
@@ -86,6 +97,19 @@ static struct {
     uint32_t ssp_deadline;
     bda_slot_t cfm_ok, auth_ok, reject;    /* accepted numeric comparison, accepted MITM bond, policy reject */
     uint32_t acl_links;
+    bda_slot_t acl_peer;                   /* newest ACL peer (UI) */
+    bda_slot_t name_asked;                 /* esp_bt_gap_read_remote_name() already sent for this peer */
+    /* local numeric-comparison prompt (plan M4) */
+    uint8_t  cfm_pending;
+    uint8_t  cfm_bda[6];
+    char     cfm_digits[8];
+    uint32_t cfm_val, cfm_t0;
+    uint8_t  cfm_ended;                    /* a prompt ended (answered, rejected, withdrawn) at cfm_end_t */
+    uint32_t cfm_end_t;
+    /* A pairing this session accepted (cfm_ok) that then failed: the peer saw the result of the DHKey check, which the
+     * ROM computes with this session's P-192 key and a peer key it never validates (BT_ROM_INTERFACE.md §2.3, invalid-
+     * curve class). No further SSP until the next BT-mode entry, which draws a new key: one such query per key. */
+    uint8_t  ssp_burned;
     /* connection */
     uint8_t  conn_open, conn_authorized, conn_closing, cong, entropy_fail, xrec_reset_pending;
     uint32_t conn_handle;
@@ -100,6 +124,10 @@ static struct {
 } s;
 
 static volatile uint8_t s_spp_uninit_seen;
+#if BENCH_IMAGE
+static volatile uint8_t s_bench_autoconfirm;   /* BENCH ONLY (bt_xrec_set_bench_autoconfirm); outside s: survives start */
+static char s_bench_pin[8];                     /* BENCH ONLY (bt_xrec_set_bench_xrec_pin): "" = DRBG PIN; app task */
+#endif
 
 #if defined(BT_XREC_TEST_HOOKS) && BT_XREC_TEST_HOOKS
 /* Host tests only: an in-flight window above BTC's ring, so esp_spp_write() reaches ESP_ERR_NO_MEM against the real
@@ -131,6 +159,78 @@ static void set_state(uint8_t st)
     s.t_state = bt_xrec_plat_now_ms();
 }
 
+/* "<prefix><reason>" as one log line (plan M2.3 gate messages). */
+static void log_gate(const char *prefix, const char *why)
+{
+    char line[128];
+    size_t n = 0u;
+    for (const char *p = prefix; *p != '\0' && n + 1u < sizeof(line); p++) {
+        line[n++] = *p;
+    }
+    for (const char *p = why; *p != '\0' && n + 1u < sizeof(line); p++) {
+        line[n++] = *p;
+    }
+    line[n] = '\0';
+    bt_xrec_plat_log(line);
+}
+
+/* Plan M2.3 gate plus the session's own refusal (ssp_burned). NULL = an SSP pairing may be offered or accepted. */
+static const char *ssp_block(void)
+{
+    if (s.ssp_burned) {
+        return "a failed pairing used this session's P-192 key (re-enter BT mode)";
+    }
+    return bt_xrec_plat_pairing_block();
+}
+
+/* An accepted numeric comparison whose pairing then failed or vanished (see s.ssp_burned). */
+static void ssp_burn(void)
+{
+    if (!s.ssp_burned) {
+        s.ssp_burned = 1u;
+        bt_xrec_plat_log("BT SSP key spent: an accepted pairing failed; no SSP until the next BT-mode entry");
+    }
+    if (s.ssp_window) {
+        s.ssp_window = 0u;                 /* apply_scan_mode() drops discoverability; prompt_poll() rejects a prompt */
+        bt_xrec_plat_log("BT SSP pairing window closed: a failed pairing used this session's P-192 key");
+    }
+}
+
+/* Remote name for the screen: at most BT_XREC_PEER_NAME_MAX - 1 bytes, control bytes replaced, never ending inside a
+ * UTF-8 sequence (the cut or a malformed name would leave the font a broken character). */
+static void name_copy(char out[BT_XREC_PEER_NAME_MAX], const uint8_t *in, size_t in_max)
+{
+    size_t n = 0u;
+    while (n < in_max && n < BT_XREC_PEER_NAME_MAX - 1u && in[n] != 0u) {
+        uint8_t c = in[n];
+        out[n] = (c < 0x20u || c == 0x7Fu) ? '?' : (char)c;
+        n++;
+    }
+    size_t k = n;
+    while (k > 0u && ((uint8_t)out[k - 1u] & 0xC0u) == 0x80u) {
+        k--;                                      /* back over continuation bytes to the lead byte */
+    }
+    if (k > 0u && ((uint8_t)out[k - 1u] & 0x80u) != 0u) {
+        uint8_t lead = (uint8_t)out[k - 1u];
+        size_t need = lead >= 0xF0u ? 4u : lead >= 0xE0u ? 3u : lead >= 0xC0u ? 2u : 1u;
+        if (n - (k - 1u) < need || (lead & 0xC0u) != 0xC0u) {
+            n = k - 1u;                           /* incomplete (or stray) sequence at the end: drop it */
+        }
+    }
+    out[n] = '\0';
+}
+
+static void bda_text(char out[BT_XREC_PEER_NAME_MAX], const uint8_t bda[6])
+{
+    static const char hex[] = "0123456789ABCDEF";
+    size_t o = 0u;
+    for (int i = 0; i < 6; i++) {                 /* esp_bd_addr_t: most significant byte first */
+        out[o++] = hex[bda[i] >> 4];
+        out[o++] = hex[bda[i] & 0x0Fu];
+        out[o++] = i < 5 ? ':' : '\0';
+    }
+}
+
 /* ============================================ BTC side (copy + notify only) ===================================== */
 static bool push_locked(const ev_t *e)
 {
@@ -149,6 +249,21 @@ static bool push_locked(const ev_t *e)
     s.evq[s.ev_head % BT_XREC_EVQ_SLOTS] = *e;
     s.ev_head++;
     return true;
+}
+
+/* BTC context: keep the newest remote name (short copy under the lock; nothing queued, the UI reads it on demand). */
+static void name_put(const uint8_t bda[6], const uint8_t *name, size_t max)
+{
+    if (name == NULL || name[0] == 0u) {
+        return;
+    }
+    bt_xrec_plat_lock();
+    if (s.cb_open) {
+        memcpy(s.nm_bda, bda, 6u);
+        name_copy(s.nm, name, max);
+        s.nm_valid = s.nm[0] != '\0';
+    }
+    bt_xrec_plat_unlock();
 }
 
 static void post(const ev_t *e)
@@ -289,7 +404,13 @@ static void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *p)
         memcpy(e.bda, p->auth_cmpl.bda, 6u);
         e.status = (uint8_t)p->auth_cmpl.stat;
         e.extra = p->auth_cmpl.lk_type;
+        name_put(p->auth_cmpl.bda, p->auth_cmpl.device_name, sizeof(p->auth_cmpl.device_name));
         break;
+    case ESP_BT_GAP_READ_REMOTE_NAME_EVT:
+        if (p->read_rmt_name.stat == ESP_BT_STATUS_SUCCESS) {
+            name_put(p->read_rmt_name.bda, p->read_rmt_name.rmt_name, sizeof(p->read_rmt_name.rmt_name));
+        }
+        return;
     case ESP_BT_GAP_ACL_CONN_CMPL_STAT_EVT:
         e.type = EV_ACL_CONN;
         e.status = (uint8_t)p->acl_conn_cmpl_stat.stat;
@@ -453,6 +574,7 @@ static void window_close(void)
 {
     s.window_open = 0u;
     s.ssp_window = 0u;
+    s.ssp_deferred = 0u;
     s.xrec_pin_issued = 0u;
     if (s.b != NULL) {
         xrec_close_pairing(&s.b->xrec);
@@ -538,36 +660,148 @@ static void digits6(char out[8], uint32_t v)
     out[7] = '\0';
 }
 
+static bool name_known(const uint8_t bda[6])
+{
+    bt_xrec_plat_lock();
+    bool k = s.nm_valid && bda_eq(s.nm_bda, bda);
+    bt_xrec_plat_unlock();
+    return k;
+}
+
+/* Ask Bluedroid for the peer's name once per peer (an HCI Remote Name Request on the existing ACL, the same request
+ * BTA DM / BTM already send before a confirmation request or a secured connection). No answer = the address shows. */
+static void request_name(const uint8_t bda[6])
+{
+    if (name_known(bda) || slot_is(&s.name_asked, bda)) {
+        return;
+    }
+    slot_set(&s.name_asked, bda);
+    s.d.name_requests++;
+    esp_err_t r = esp_bt_gap_read_remote_name((uint8_t *)bda);
+    if (r != ESP_OK) {
+        bt_xrec_plat_log_u32("BT read_remote_name failed", (uint32_t)r);
+    }
+}
+
+static void cfm_reply(const uint8_t bda[6], bool accept)
+{
+    esp_err_t r = esp_bt_gap_ssp_confirm_reply((uint8_t *)bda, accept);
+    if (r != ESP_OK) {
+        bt_xrec_plat_log_u32("BT SSP confirm_reply failed", (uint32_t)r);
+    }
+}
+
+static void cfm_accepted(const uint8_t bda[6])
+{
+    s.d.ssp_accepted++;
+    slot_set(&s.cfm_ok, bda);
+}
+
+/* The pending prompt ends without a reply (its pairing is gone, or BT stops). */
+static void prompt_withdraw(const char *why)
+{
+    if (!s.cfm_pending) {
+        return;
+    }
+    s.cfm_pending = 0u;
+    memset(s.cfm_digits, 0, sizeof(s.cfm_digits));
+    s.cfm_ended = 1u;
+    s.cfm_end_t = bt_xrec_plat_now_ms();
+    s.d.ssp_withdrawn++;
+    bt_xrec_plat_log(why);
+}
+
+/* The pending prompt ends with a negative reply. */
+static void prompt_reject(const char *why)
+{
+    if (!s.cfm_pending) {
+        return;
+    }
+    cfm_reply(s.cfm_bda, false);
+    s.d.ssp_rejected++;
+    s.cfm_pending = 0u;
+    memset(s.cfm_digits, 0, sizeof(s.cfm_digits));
+    s.cfm_ended = 1u;
+    s.cfm_end_t = bt_xrec_plat_now_ms();
+    bt_xrec_plat_log(why);
+}
+
+static void on_cfm_req(const ev_t *e)
+{
+    if (!s.ssp_window || s.state != BT_XREC_ST_READY) {
+        cfm_reply(e->bda, false);
+        s.d.ssp_rejected++;
+        bt_xrec_plat_log("BT SSP numeric comparison rejected: pairing window closed");
+        return;
+    }
+    /* The gate is re-checked here, not only by the poll after drain_events(): the request may come from a pairing
+     * whose nonce the ROM drew while the RNG pool ran dry since the last poll (review finding). */
+    const char *why = ssp_block();
+    if (why != NULL) {
+        cfm_reply(e->bda, false);
+        s.d.ssp_rejected++;
+        s.d.ssp_gate_cfm_rejects++;
+        s.ssp_window = 0u;
+        log_gate("BT SSP numeric comparison rejected, pairing window closed: ", why);
+        return;
+    }
+#if BENCH_IMAGE
+    if (s_bench_autoconfirm) {
+        /* BENCH ONLY (bt_xrec_set_bench_autoconfirm): the old interim behaviour, the device does not verify the value;
+         * shown through bt_status_t.pair_pin until AUTH_CMPL. Logged loudly on every use. */
+        cfm_reply(e->bda, true);
+        cfm_accepted(e->bda);
+        s.d.ssp_bench_autoconfirmed++;
+        digits6(s.ssp_digits, e->val);
+        s.ssp_showing = 1u;
+        s.ssp_deadline = bt_xrec_plat_now_ms() + BT_XREC_SSP_SHOW_MS;
+        bt_xrec_plat_log("BT SSP BENCH autoconfirm: numeric comparison accepted WITHOUT the user (bench only)");
+        bt_xrec_plat_log_u32("BT SSP numeric comparison accepted (BENCH autoconfirm), value", e->val % 1000000u);
+        return;
+    }
+#endif
+    if (s.cfm_pending) {
+        /* One prompt at a time: the digits on screen never change under the user's finger. The same peer asking again
+         * means its first pairing is gone, so that prompt goes too (BTM pairs one peer at a time: one reply). */
+        bool same = bda_eq(s.cfm_bda, e->bda);
+        cfm_reply(e->bda, false);
+        s.d.ssp_rejected++;
+        bt_xrec_plat_log("BT SSP numeric comparison rejected: another one waits for the user");
+        if (same) {
+            prompt_withdraw("BT SSP prompt withdrawn: the peer asked again");
+        }
+        return;
+    }
+    s.cfm_pending = 1u;
+    memcpy(s.cfm_bda, e->bda, 6u);
+    s.cfm_val = e->val % 1000000u;
+    digits6(s.cfm_digits, e->val);
+    s.cfm_t0 = bt_xrec_plat_now_ms();
+    bt_xrec_plat_log_u32("BT SSP numeric comparison waiting for the user (ENTER/BACK, 30 s), value", s.cfm_val);
+    request_name(e->bda);
+}
+
+/* Window closed or prompt timed out (bt_xrec_poll). */
+static void prompt_poll(uint32_t now)
+{
+    if (!s.cfm_pending) {
+        return;
+    }
+    if (!s.ssp_window || s.state != BT_XREC_ST_READY) {
+        prompt_reject("BT SSP numeric comparison rejected: pairing window closed while waiting for the user");
+    } else if (now - s.cfm_t0 >= BT_XREC_SSP_PROMPT_MS) {
+        s.d.ssp_timeouts++;
+        prompt_reject("BT SSP numeric comparison rejected: no answer within 30 s");
+    }
+}
+
 static void on_gap_event(const ev_t *e)
 {
     esp_err_t r;
     switch (e->type) {
-    case EV_CFM_REQ: {
-        bool accept = s.ssp_window && s.state == BT_XREC_ST_READY;
-        /* INTERIM (plan M4 needs a local accept/reject prompt with a 30 s timeout; its strings belong to step 8; a
-         * release blocker): auto-confirm inside the user-opened pairing window only, show the value through
-         * bt_status_t.pair_pin (the BT screen's existing "PIN" toast) and log it. The DEVICE side does not verify the
-         * value: only the phone's user compares digits, so a relay between phone and device would still bond. The SSP
-         * part of the window therefore closes at the first MITM bond (review finding: XREC PAIR, which closed it in
-         * the legacy flow, cannot succeed without entropy, so a second device could pair silently in the rest of the
-         * 60 s). */
-        r = esp_bt_gap_ssp_confirm_reply((uint8_t *)e->bda, accept);
-        if (r != ESP_OK) {
-            bt_xrec_plat_log_u32("BT SSP confirm_reply failed", (uint32_t)r);
-        }
-        if (accept) {
-            s.d.ssp_accepted++;
-            slot_set(&s.cfm_ok, e->bda);
-            digits6(s.ssp_digits, e->val);
-            s.ssp_showing = 1u;
-            s.ssp_deadline = bt_xrec_plat_now_ms() + BT_XREC_SSP_SHOW_MS;
-            bt_xrec_plat_log_u32("BT SSP numeric comparison accepted (pairing window), value", e->val % 1000000u);
-        } else {
-            s.d.ssp_rejected++;
-            bt_xrec_plat_log("BT SSP numeric comparison rejected: pairing window closed");
-        }
+    case EV_CFM_REQ:
+        on_cfm_req(e);
         break;
-    }
     case EV_PIN_REQ: {
         esp_bt_pin_code_t pin;
         memset(pin, 0, sizeof(pin));
@@ -597,6 +831,11 @@ static void on_gap_event(const ev_t *e)
         if (s.ssp_showing && slot_is(&s.cfm_ok, e->bda)) {
             s.ssp_showing = 0u;
         }
+        if (s.cfm_pending && bda_eq(s.cfm_bda, e->bda)) {
+            /* the peer's pairing ended before the user answered (its user said no, or it timed out): nothing was
+             * accepted, so a key that came out of it anyway is removed below */
+            prompt_withdraw("BT SSP prompt withdrawn: pairing ended by the peer");
+        }
         if (e->status == ESP_BT_STATUS_SUCCESS) {
             bool mitm = e->extra == ESP_BT_LINK_KEY_AUTHED_COMB_P192 || e->extra == ESP_BT_LINK_KEY_AUTHED_COMB_P256;
             if (mitm && slot_is(&s.cfm_ok, e->bda) && !slot_is(&s.reject, e->bda)) {
@@ -612,6 +851,9 @@ static void on_gap_event(const ev_t *e)
             }
         } else {
             bt_xrec_plat_log_u32("BT SSP pairing failed, status", e->status);
+            if (slot_is(&s.cfm_ok, e->bda)) {
+                ssp_burn();                /* accepted, then failed: the peer saw the DHKey check (s.ssp_burned) */
+            }
         }
         if (slot_is(&s.cfm_ok, e->bda)) {
             s.cfm_ok.valid = 0u;
@@ -620,11 +862,18 @@ static void on_gap_event(const ev_t *e)
     case EV_ACL_CONN:
         if (e->status == ESP_BT_STATUS_SUCCESS) {
             s.acl_links++;
+            slot_set(&s.acl_peer, e->bda);
         }
         break;
     case EV_ACL_DISC:
         if (s.acl_links > 0u) {
             s.acl_links--;
+        }
+        if (slot_is(&s.acl_peer, e->bda)) {
+            s.acl_peer.valid = 0u;
+        }
+        if (s.cfm_pending && bda_eq(s.cfm_bda, e->bda)) {
+            prompt_withdraw("BT SSP prompt withdrawn: peer disconnected");
         }
         if (slot_is(&s.reject, e->bda)) {
             s.reject.valid = 0u;
@@ -633,6 +882,7 @@ static void on_gap_event(const ev_t *e)
             s.auth_ok.valid = 0u;
         }
         if (slot_is(&s.cfm_ok, e->bda)) {
+            ssp_burn();                    /* accepted, then the link went down before AUTH_CMPL */
             s.cfm_ok.valid = 0u;
             s.ssp_showing = 0u;
         }
@@ -739,6 +989,7 @@ static void on_spp_event(const ev_t *e)
             s.conn_authorized = 1u;
             s.d.conns_authorized++;
             bt_xrec_plat_log_u32("BT XREC SPP open, mtu", s.mtu);
+            request_name(e->bda);
         } else {
             s.d.conns_rejected++;
             conn_close_request("BT XREC close: peer not bonded with MITM");
@@ -930,6 +1181,8 @@ static void free_session(void)
     s.ev_head = s.ev_tail = 0u;
     s.rx_head = s.rx_tail = 0u;
     s.evq_lost = 0u;
+    s.nm_valid = 0u;
+    memset(s.nm, 0, sizeof(s.nm));
     bt_xrec_plat_unlock();
     if (b != NULL) {
         wipe_free(b);
@@ -953,7 +1206,8 @@ int bt_shutdown(void)
         xrec_on_disconnect(&s.b->xrec);
     }
     conn_reset();
-    s.window_open = s.xrec_pin_issued = s.ssp_showing = s.ssp_window = 0u;
+    s.window_open = s.xrec_pin_issued = s.ssp_showing = s.ssp_window = s.ssp_deferred = 0u;
+    prompt_withdraw("BT SSP prompt withdrawn: BT stopping");
     s.reboot_mode = 0u;
     /* 2. graceful teardown in the worker; the app keeps the recorder serviced and enforces one absolute deadline. */
     s_spp_uninit_seen = 0u;
@@ -981,7 +1235,7 @@ int bt_shutdown(void)
     s.spp_inited = 0u;
     s.scan_applied = 0u;
     s.acl_links = 0u;
-    s.cfm_ok.valid = s.auth_ok.valid = s.reject.valid = 0u;
+    s.cfm_ok.valid = s.auth_ok.valid = s.reject.valid = s.acl_peer.valid = s.name_asked.valid = 0u;
     free_session();
     if (reason != BT_XREC_FAULT_NONE) {
         s.last_fault = reason;
@@ -1067,9 +1321,33 @@ void bt_xrec_open_pairing(uint32_t duration_ms)
     if (s.state != BT_XREC_ST_UP && s.state != BT_XREC_ST_CONFIG && s.state != BT_XREC_ST_READY) {
         return;
     }
+    /* Plan M2.3 gate: no SSP part (discoverable, numeric comparison) while the platform cannot back a new pairing with
+     * credited entropy (DRBG seeded, ROM P-192 key replaced, ROM RNG pool fed); without any entropy nothing opens.
+     * Before READY the controller has not started yet, so the ROM key cannot have been replaced: the gate is evaluated
+     * once READY (bt_xrec_poll), e.g. for the SD bench run that opens the window right after bt_xrec_start. */
+    const char *why = NULL;
+    uint8_t defer = (uint8_t)(s.state != BT_XREC_ST_READY);
+    if (!defer) {
+        why = ssp_block();
+        if (why != NULL) {
+            s.d.ssp_gate_refused++;
+            log_gate("BT SSP pairing window refused: ", why);
+        }
+    }
+    uint32_t now = bt_xrec_plat_now_ms();
+    /* ENTER again while a window with its PIN is still well open (a bounce, an impatient user): the deadline moves,
+     * the PIN stays, so a phone typing it is not cut off by a new one (review finding). */
+    bool keep_pin = s.window_open && s.xrec_pin_issued && s.b != NULL && s.b->xrec.pair_active &&
+                    !time_reached(now, s.window_deadline) && s.window_deadline - now > BT_XREC_PIN_KEEP_MS;
     s.window_open = 1u;
-    s.ssp_window = 1u;
-    s.window_deadline = bt_xrec_plat_now_ms() + (duration_ms ? duration_ms : 60000u);
+    s.ssp_window = (!defer && why == NULL) ? 1u : 0u;
+    s.ssp_deferred = defer;
+    s.window_deadline = now + (duration_ms ? duration_ms : 60000u);
+    if (keep_pin) {
+        bt_xrec_plat_log("BT XREC pairing window extended, PIN kept");
+        apply_scan_mode();
+        return;
+    }
     /* XREC PIN from the DRBG (rejection sampling: no modulo bias). Fails closed: the SSP window still opens, but
      * XREC PAIR answers PAIRCLOSED until entropy is credited. */
     uint32_t v = 0u;
@@ -1085,11 +1363,21 @@ void bt_xrec_open_pairing(uint32_t duration_ms)
     if (ok && s.b != NULL) {
         char pin[8];
         digits6(pin, v);
+#if BENCH_IMAGE
+        if (s_bench_pin[0] != '\0') {           /* BENCH ONLY: the operator's fixed PIN (still only with entropy) */
+            memcpy(pin, s_bench_pin, sizeof(pin));
+            bt_xrec_plat_log("BT XREC BENCH PIN: fixed PIN from SD:/BTBENCH.RUN for this window (bench only)");
+        }
+#endif
         xrec_open_pairing(&s.b->xrec, pin);
         s.xrec_pin_issued = 1u;
         memset(pin, 0, sizeof(pin));
+    } else if (why == NULL) {
+        bt_xrec_plat_log(defer ? "BT XREC PIN unavailable: entropy not ready (SSP pairing window once READY)"
+                               : "BT XREC PIN unavailable: entropy not ready (SSP pairing window open)");
     } else {
-        bt_xrec_plat_log("BT XREC PIN unavailable: entropy not ready (SSP pairing window open)");
+        bt_xrec_plat_log("BT XREC PIN unavailable: entropy not ready (no pairing window)");
+        s.window_open = 0u;                     /* nothing to offer */
     }
     apply_scan_mode();
 }
@@ -1143,6 +1431,31 @@ void bt_xrec_poll(void)
     if (s.ssp_showing && time_reached(now, s.ssp_deadline)) {
         s.ssp_showing = 0u;
     }
+    if (s.ssp_deferred && s.state == BT_XREC_ST_READY) {
+        s.ssp_deferred = 0u;                    /* window opened before READY: its SSP part is decided now */
+        if (s.window_open) {
+            const char *why = ssp_block();
+            if (why == NULL) {
+                s.ssp_window = 1u;
+                bt_xrec_plat_log("BT SSP pairing window open (opened before READY)");
+            } else {
+                s.d.ssp_gate_refused++;
+                log_gate("BT SSP pairing window refused: ", why);
+                if (!s.xrec_pin_issued) {
+                    bt_xrec_plat_log("BT XREC PIN unavailable: entropy not ready (no pairing window)");
+                    window_close();             /* nothing to offer */
+                }
+            }
+        }
+    }
+    if (s.ssp_window) {                        /* plan M2.3: the SSP part closes when the gate stops holding (e.g. */
+        const char *why = ssp_block();          /* the ROM RNG pool ran dry during a pairing); a pending */
+        if (why != NULL) {                      /* prompt is rejected with it (prompt_poll) */
+            s.ssp_window = 0u;
+            log_gate("BT SSP pairing window closed: ", why);
+        }
+    }
+    prompt_poll(now);
     apply_scan_mode();
 
     if (s.entropy_fail && s.conn_open && !s.conn_closing) {
@@ -1194,7 +1507,7 @@ void bt_xrec_get_status(bt_status_t *out)
     }
     out->pair_active = s.window_open;
     if (s.ssp_showing) {
-        memcpy(out->pair_pin, s.ssp_digits, sizeof(out->pair_pin));   /* numeric comparison value (INTERIM) */
+        memcpy(out->pair_pin, s.ssp_digits, sizeof(out->pair_pin));   /* BENCH autoconfirm: value accepted */
     } else if (s.window_open && s.b != NULL && s.b->xrec.pair_active) {
         memcpy(out->pair_pin, s.b->xrec.pair_pin, sizeof(out->pair_pin));
     }
@@ -1226,6 +1539,9 @@ void bt_xrec_get_debug(bt_xrec_debug_t *out)
     out->entropy_fail = s.entropy_fail;
     out->reboot_mode = s.reboot_mode;
     out->ssp_window = s.ssp_window;
+    out->ssp_pending = s.ssp_deferred;
+    out->ssp_prompt = s.cfm_pending;
+    out->ssp_burned = s.ssp_burned;
     out->conn_handle = s.conn_handle;
     out->tx_used = s.tx_head - s.tx_tail;
     out->inflight = s.inflight;
@@ -1240,6 +1556,117 @@ void bt_xrec_get_debug(bt_xrec_debug_t *out)
     out->evq_lost = s.evq_lost_n;
     bt_xrec_plat_unlock();
 }
+
+static uint32_t secs_left(uint32_t now, uint32_t at)
+{
+    if (time_reached(now, at)) {
+        return 0u;
+    }
+    return (at - now + 999u) / 1000u;
+}
+
+void bt_xrec_get_ui(bt_xrec_ui_t *out)
+{
+    if (out == NULL) {
+        return;
+    }
+    memset(out, 0, sizeof(*out));
+    if (s.state != BT_XREC_ST_UP && s.state != BT_XREC_ST_CONFIG && s.state != BT_XREC_ST_READY) {
+        return;
+    }
+    uint32_t now = bt_xrec_plat_now_ms();
+    const uint8_t *peer = NULL;
+    if (s.cfm_pending) {
+        uint32_t el = now - s.cfm_t0;
+        out->prompt = 1u;
+        out->prompt_armed = (uint8_t)(el >= BT_XREC_SSP_ARM_MS);
+        out->prompt_s_left = (uint8_t)secs_left(now, s.cfm_t0 + BT_XREC_SSP_PROMPT_MS);
+        memcpy(out->digits, s.cfm_digits, sizeof(out->digits));
+        peer = s.cfm_bda;
+    } else if (s.conn_open && !s.conn_closing) {
+        peer = s.conn_bda;
+    } else if (s.auth_ok.valid) {
+        peer = s.auth_ok.bda;                     /* just bonded, SPP not open yet */
+    } else if (s.acl_peer.valid) {
+        peer = s.acl_peer.bda;
+    }
+    out->window_open = s.window_open;
+    out->window_s_left = s.window_open ? (uint16_t)secs_left(now, s.window_deadline) : 0u;
+    out->connected = (uint8_t)(s.acl_links > 0u || s.conn_open);
+    if (peer != NULL) {
+        memcpy(out->peer_bda, peer, 6u);
+        out->bonded = (uint8_t)(!s.cfm_pending && (slot_is(&s.auth_ok, peer) ||
+                                (s.conn_open && s.conn_authorized && !s.conn_closing && bda_eq(s.conn_bda, peer))));
+        bt_xrec_plat_lock();
+        bool named = s.nm_valid && bda_eq(s.nm_bda, peer);
+        if (named) {
+            memcpy(out->peer, s.nm, sizeof(out->peer));
+            out->peer_is_name = 1u;
+        }
+        bt_xrec_plat_unlock();
+        if (!named) {
+            bda_text(out->peer, peer);
+        }
+    }
+}
+
+int bt_xrec_ssp_answer(int accept)
+{
+    uint32_t now = bt_xrec_plat_now_ms();
+    if (!s.cfm_pending) {
+        /* the prompt ended by itself (timeout, peer gave up, window/gate closed) or was just answered: a key within
+         * BT_XREC_SSP_AFTER_MS was meant for it, not for "leave BT mode" / "open a new window" (review finding) */
+        return (s.cfm_ended && now - s.cfm_end_t < BT_XREC_SSP_AFTER_MS) ? -3 : -1;
+    }
+    if (now - s.cfm_t0 < BT_XREC_SSP_ARM_MS) {
+        return -2;                                /* a key pressed as the prompt appeared: not an answer */
+    }
+    const char *why = (accept && s.ssp_window && s.state == BT_XREC_ST_READY) ? ssp_block() : NULL;
+    if (why != NULL) {
+        /* the gate stopped holding since the last poll (e.g. the ROM RNG pool ran dry at this pairing's nonce) */
+        s.ssp_window = 0u;
+        s.d.ssp_gate_cfm_rejects++;
+        log_gate("BT SSP pairing window closed: ", why);
+        prompt_reject("BT SSP numeric comparison rejected: pairing gate closed");
+    } else if (accept && s.ssp_window && s.state == BT_XREC_ST_READY) {
+        cfm_reply(s.cfm_bda, true);
+        cfm_accepted(s.cfm_bda);
+        s.d.ssp_user_accepted++;
+        s.cfm_pending = 0u;
+        memset(s.cfm_digits, 0, sizeof(s.cfm_digits));
+        s.cfm_ended = 1u;
+        s.cfm_end_t = now;
+        bt_xrec_plat_log_u32("BT SSP numeric comparison accepted by the user, value", s.cfm_val);
+    } else {
+        s.d.ssp_user_rejected += accept ? 0u : 1u;
+        prompt_reject(accept ? "BT SSP numeric comparison rejected: pairing window closed"
+                             : "BT SSP numeric comparison rejected by the user");
+    }
+    return 0;
+}
+
+#if BENCH_IMAGE
+void bt_xrec_set_bench_autoconfirm(int on)
+{
+    s_bench_autoconfirm = on ? 1u : 0u;
+    bt_xrec_plat_log(on ? "BT SSP BENCH autoconfirm ON: numeric comparisons in the window accepted without the user"
+                        : "BT SSP BENCH autoconfirm off");
+}
+
+void bt_xrec_set_bench_xrec_pin(const char *pin6)
+{
+    bool ok = pin6 != NULL;
+    for (int i = 0; ok && i < 6; i++) {
+        ok = pin6[i] >= '0' && pin6[i] <= '9';
+    }
+    ok = ok && pin6[6] == '\0';
+    memset(s_bench_pin, 0, sizeof(s_bench_pin));
+    if (ok) {
+        memcpy(s_bench_pin, pin6, 6u);
+    }
+    bt_xrec_plat_log(ok ? "BT XREC BENCH PIN ON: pairing windows use the bench PIN" : "BT XREC BENCH PIN off");
+}
+#endif
 
 /* The teardown job (bt_xrec_fw.c) waits for ESP_SPP_UNINIT_EVT before esp_bluedroid_disable(). */
 int bt_xrec_spp_uninit_seen(void)
@@ -1257,5 +1684,9 @@ void bt_xrec_test_reset(void)
     }
     memset(&s, 0, sizeof(s));
     s_spp_uninit_seen = 0u;
+#if BENCH_IMAGE
+    s_bench_autoconfirm = 0u;
+    memset(s_bench_pin, 0, sizeof(s_bench_pin));
+#endif
 }
 #endif

@@ -151,6 +151,70 @@ static void capture_shot(int idx)
     memcpy(g_shots[idx], g_fb, sizeof(g_fb));
 }
 
+
+#if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID
+/* BT=1 phone-mode UI checks (review findings): the toast label shows its text (not "..."), a long peer name on the BT
+ * status line ends in "..." on one line instead of wrapping out of the 12 px label. */
+static lv_obj_t *toast_label(void)
+{
+    lv_obj_t *top = lv_layer_top();
+    for (uint32_t i = 0; i < lv_obj_get_child_count(top); i++) {
+        lv_obj_t *c = lv_obj_get_child(top, (int32_t)i);
+        if (!lv_obj_has_flag(c, LV_OBJ_FLAG_HIDDEN) && lv_obj_get_child_count(c) > 0u) {
+            return lv_obj_get_child(c, 0);
+        }
+    }
+    return NULL;
+}
+
+static void check_bt_ui(ui_model_t *m)
+{
+    ui_model_t b = *m;
+    b.toast_msg[0] = '\0';
+    b.bt_state = 1u;
+    b.bt_bonded = 1u;
+    strcpy(b.bt_peer, "Silvio's Pixel 8 Pro");
+    ui_render_screen(UI_SCR_BT, &b);
+    for (int frame = 0; frame < 14; frame++) { s_now += 16u; ui_port_task_handler(); }
+    lv_obj_update_layout(objects.bt_l1_lbl);
+    const char *l1 = lv_label_get_text(objects.bt_l1_lbl);
+    printf("BT=1 status line: [%s] h=%d\n", l1, (int)lv_obj_get_height(objects.bt_l1_lbl));
+    assert(strstr(l1, "Silvio") != NULL && strstr(l1, "...") != NULL);   /* dotted, not wrapped away */
+    strcpy(b.bt_peer, "44:55:66");
+    ui_render_screen(UI_SCR_BT, &b);
+    l1 = lv_label_get_text(objects.bt_l1_lbl);
+    assert(strstr(l1, "44:55:66") != NULL && strstr(l1, "...") == NULL);  /* a short peer is shown whole */
+
+    static const char *const msgs[] = { "Pairing unavailable", "PIN 246810", "Saved" };
+    b.bt_state = 0u;
+    b.bt_bonded = 0u;
+    for (unsigned k = 0; k < sizeof(msgs) / sizeof(msgs[0]); k++) {
+        strcpy(b.toast_msg, msgs[k]);
+        b.toast_col = UI_COL_AMBER;
+        ui_render_screen(UI_SCR_BT, &b);
+        for (int frame = 0; frame < 14; frame++) { s_now += 16u; ui_port_task_handler(); }
+        lv_obj_t *tl = toast_label();
+        assert(tl != NULL);
+        lv_obj_update_layout(tl);
+        printf("BT=1 toast: [%s] w=%d\n", lv_label_get_text(tl), (int)lv_obj_get_width(tl));
+        assert(strcmp(lv_label_get_text(tl), msgs[k]) == 0);
+    }
+    strcpy(b.toast_msg, "Long warning toast clipped cleanly!!!");
+    ui_render_screen(UI_SCR_HOME, &b);
+    for (int frame = 0; frame < 14; frame++) { s_now += 16u; ui_port_task_handler(); }
+    lv_obj_t *tl = toast_label();
+    assert(tl != NULL);
+    lv_obj_update_layout(tl);
+    printf("BT=1 long toast: [%s] w=%d h=%d\n", lv_label_get_text(tl), (int)lv_obj_get_width(tl),
+           (int)lv_obj_get_height(tl));
+    assert(strstr(lv_label_get_text(tl), "Long warning") != NULL && strstr(lv_label_get_text(tl), "...") != NULL &&
+           lv_obj_get_width(tl) == 136 && lv_obj_get_height(tl) == lv_font_get_line_height(lv_obj_get_style_text_font(tl, 0)));
+    b.toast_msg[0] = '\0';
+    ui_render_screen(UI_SCR_HOME, &b);
+    for (int frame = 0; frame < 14; frame++) { s_now += 16u; ui_port_task_handler(); }
+}
+#endif
+
 int main(int argc, char **argv)
 {
     const char *out_ppm = (argc > 1) ? argv[1] : "/tmp/sl6801_openfw/ui_all_screens.ppm";
@@ -584,6 +648,9 @@ int main(int argc, char **argv)
     sample_heap("files_empty");
     m.file_count = 4;
 
+#if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID
+    check_bt_ui(&m);
+#endif
     /* Verify visible toast (including long truncated toast) is a compact bottom pill
      * (never a full-screen 160x160 default-sized circle) and produces 0 redraw pixels when unchanged */
     strcpy(m.toast_msg, "Long warning toast clipped cleanly!!!");

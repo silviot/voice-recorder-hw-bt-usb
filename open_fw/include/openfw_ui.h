@@ -255,6 +255,14 @@ typedef struct {
     uint16_t       bt_sent;
     uint16_t       bt_total;
     uint8_t        bt_pct;
+#if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID
+    /* BT=1 phone mode (bt_xrec_get_ui): SSP numeric-comparison prompt and pairing state; bt_peer = prompt peer */
+    uint8_t        bt_prompt;       /* 1: show bt_digits, ENTER accepts, BACK rejects */
+    uint8_t        bt_prompt_s;     /* seconds until the prompt rejects by itself */
+    uint8_t        bt_bonded;       /* the shown peer holds a MITM bond */
+    uint16_t       bt_window_s;     /* pairing window seconds left (0 = closed) */
+    char           bt_digits[8];
+#endif
 
     /* Power off */
     uint8_t        power_hold_pct;  /* 0..100 */

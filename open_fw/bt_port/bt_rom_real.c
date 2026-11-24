@@ -28,6 +28,7 @@
 #include "sl6801_regs.h"
 #include "sl6801_rom.h"
 #include "bt_rom_real.h"
+#include "bt_rom_rng.h"
 
 /* ---- legacy symbols reused (bt_hci.c exports them, from its end, only with OPENFW_HCI_PROBE=1; bt_rf.c always) ---- */
 extern uint32_t *const bt_hci_shared_heap;                    /* = g_bt_heap, F:239, BT_HEAP_WORDS (F:233) words */
@@ -205,7 +206,10 @@ static inline void raw_irq_restore(uint32_t pm)
     __asm__ volatile ("msr primask, %0" :: "r"(pm) : "memory");
 }
 
-/* ---- PRNG hook 0x00803C24 (F:293-309 verbatim; plan M2: ROM RNG trace decides what feeds it) ---- */
+/* ---- PRNG hook 0x00803C24 (BT_ROM_INTERFACE §2.3, bt_rom_rng.h) ----
+ * rr_rand80 is the legacy generator (F:293-309 verbatim): it still serves the radio-timing call sites and any
+ * untraced one, so they keep the exact 0..79 behaviour tested on silicon. rr_rand_hook is what the slot holds: it
+ * routes the SSP nonce, LMP random and passkey sites to DRBG bytes the app pre-filled (bt_rom_rng_feed). */
 static uint32_t rr_rand80(void)
 {
     uint32_t x = s_prng ^ (uint32_t)us_timer_now();
@@ -217,6 +221,65 @@ static uint32_t rr_rand80(void)
     }
     s_prng = x;
     return x % 80u;
+}
+
+__attribute__((noinline)) static uint32_t rr_rand_hook(void)
+{
+    /* Entered by `bx r3` from the thunk at ROM 0x3DE98, which every caller reaches with `bl`: LR is the ROM call
+     * site + 4 (test_bt_rom_rng re-derives the 11 sites from the ROM image). */
+    uint32_t lr = (uint32_t)(uintptr_t)__builtin_return_address(0);
+    return bt_rom_rng_hook(lr, (volatile uint8_t *)(uintptr_t)BT_ROM_NONCE_BLOCK_ADDR, rr_rand80);
+}
+
+/* ---- local P-192 key pair (BT_ROM_INTERFACE §2.3): rom_lm_sec_p192_init (0x31DE4, run by the LM bring-up) copies
+ * the ROM's FIXED pair into RAM; nothing in the ROM writes these slots again. The private key is read from RAM at
+ * the start of every DHKey computation (0x32574), the public key whenever it is sent or hashed (0x319B8), both only
+ * while debug mode (byte 0x00803348, zeroed by the same init; HCI 0x1804 is not forwarded by bt_ctrl) is off. ---- */
+#define P192_PRIV_RAM   0x00803798u    /* 0x00803348 + 0x450, 24 B little-endian */
+#define P192_PUB_RAM    0x0080334Cu    /* 0x00803348 + 0x4, X || Y, 48 B little-endian */
+#define P192_PRIV_ROM   0x0000D7ECu    /* 0xD72C + 0xC0: the fixed private key */
+#define P192_PUB_ROM    0x0000D84Cu    /* 0xD72C + 0x120: its public key */
+static uint8_t           s_p192[72];   /* staged by the app: priv (24) || pub (48) */
+static volatile uint8_t  s_p192_staged;
+static bt_rom_real_sec_t s_sec;
+
+static int mem_eq(uint32_t a, uint32_t b, uint32_t n)
+{
+    uint8_t diff = 0u;
+    for (uint32_t i = 0u; i < n; i++) {
+        diff |= (uint8_t)(*(volatile const uint8_t *)(uintptr_t)(a + i) ^ *(volatile const uint8_t *)(uintptr_t)(b + i));
+    }
+    return diff == 0u;
+}
+
+static void mem_put(uint32_t dst, const uint8_t *src, uint32_t n)
+{
+    volatile uint8_t *d = (volatile uint8_t *)(uintptr_t)dst;
+    for (uint32_t i = 0u; i < n; i++) {
+        d[i] = src[i];
+    }
+}
+
+/* After the LM bring-up, before any ROM event runs (start(), bt_ctrl task). */
+static void rr_install_p192(void)
+{
+    s_sec.key_installed = 0u;
+    if (!s_p192_staged) {
+        return;
+    }
+    /* The slots must hold exactly what the trace says the init copied; anything else means another ROM revision or a
+     * misread, and the key is not touched (pairing stays refused: bt_rom_real_sec().key_installed == 0). */
+    if (!mem_eq(P192_PRIV_RAM, P192_PRIV_ROM, 24u) || !mem_eq(P192_PUB_RAM, P192_PUB_ROM, 48u)) {
+        s_sec.key_unexpected++;
+        return;
+    }
+    mem_put(P192_PRIV_RAM, s_p192, 24u);
+    mem_put(P192_PUB_RAM, &s_p192[24], 48u);
+    if (mem_eq(P192_PRIV_RAM, (uint32_t)(uintptr_t)s_p192, 24u) &&
+        mem_eq(P192_PUB_RAM, (uint32_t)(uintptr_t)&s_p192[24], 48u)) {
+        s_sec.key_installed = 1u;
+        s_sec.key_installs++;
+    }
 }
 
 static void raise_fault_locked_ok(uint32_t code)
@@ -449,7 +512,7 @@ static void rr_install_kernel_hooks(void)                     /* F:1048-1079 */
 {
     REG32(0x00803C1Cu) = (uint32_t)(uintptr_t)rr_lock;
     REG32(0x00803C20u) = (uint32_t)(uintptr_t)rr_unlock;
-    REG32(0x00803C24u) = (uint32_t)(uintptr_t)rr_rand80;
+    REG32(0x00803C24u) = (uint32_t)(uintptr_t)rr_rand_hook;
     REG32(0x008041CCu) = (uint32_t)(uintptr_t)rr_malloc;
     REG32(0x008041D0u) = (uint32_t)(uintptr_t)rr_free;
 
@@ -596,6 +659,7 @@ static int rr_start(const uint8_t bd_addr[6], const bt_rom_upcalls_t *up)   /* F
     bt_hci_shared_init_ld_layer(bd_addr);                     /* F:1370 legacy: hooks, constants, EM, RWBTEN */
     bt_hci_shared_init_lc_layer();                            /* F:1371 legacy */
     bt_hci_shared_init_lm_layer();                            /* F:1372 legacy */
+    rr_install_p192();                                        /* BT_ROM_INTERFACE §2.3: replace the fixed pair */
 
     RWBT_TIMING      = (RWBT_TIMING & 0x8000F000u) | 0x1B460846u;   /* F:1374-1375 */
     RWBT_REG(0x02Cu) = 0x000001FFu;
@@ -617,6 +681,11 @@ static int rr_stop(void)                                      /* F:2151-2162 bt_
     for (uint32_t t = 0u; t < SOFT_RESET_POLLS && (RWBT_CNTL & (1u << 29)); t++) {
     }
     int rc = (RWBT_CNTL & (1u << 29)) ? -1 : 0;               /* reported (legacy has no error path) */
+    if (s_sec.key_installed) {                                /* the session's private key does not outlive it */
+        static const uint8_t z[24] = { 0u };
+        mem_put(P192_PRIV_RAM, z, 24u);
+        s_sec.key_installed = 0u;
+    }
     nvic_clear_pending(IRQ_BT);
     if (s_ipr_saved) {
         nvic_set_priority(IRQ_BT, s_ipr_orig);                /* IRQ 26 is masked: legacy priority back */
@@ -837,4 +906,35 @@ void bt_rom_real_evt_mask(uint8_t out[8])
     for (uint32_t i = 0u; i < 8u; i++) {
         out[i] = ((volatile uint8_t *)HCI_TL_ENV->evt_msk)[i];
     }
+}
+
+void bt_rom_real_stage_p192(const uint8_t priv_le[24], const uint8_t pub_le[48])
+{
+    s_p192_staged = 0u;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    for (uint32_t i = 0u; i < sizeof(s_p192); i++) {
+        ((volatile uint8_t *)s_p192)[i] = 0u;
+    }
+    if (priv_le != NULL && pub_le != NULL) {
+        for (uint32_t i = 0u; i < 24u; i++) {
+            s_p192[i] = priv_le[i];
+        }
+        for (uint32_t i = 0u; i < 48u; i++) {
+            s_p192[24u + i] = pub_le[i];
+        }
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        s_p192_staged = 1u;
+    }
+}
+
+void bt_rom_real_sec(bt_rom_real_sec_t *out)
+{
+    if (out == NULL) {
+        return;
+    }
+    out->key_staged = s_p192_staged;
+    out->key_installed = s_sec.key_installed;
+    out->key_installs = s_sec.key_installs;
+    out->key_unexpected = s_sec.key_unexpected;
+    bt_rom_rng_stats(&out->rng);
 }

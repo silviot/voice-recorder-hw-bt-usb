@@ -88,6 +88,9 @@ $(OUT)/third_party/bluedroid/host/bluedroid/btc/profile/std/spp/btc_spp.o: CFLAG
 $(OUT)/tests/fake_rom.o: CFLAGS_HOST += -include $(HT)/real_alloc.h
 # Test hooks of the XREC session (bt_xrec_test_set_inflight_max: phone scenario step P5b).
 $(OUT)/bt_port/bt_xrec_bluedroid.o: CFLAGS_PORT += -DBT_XREC_TEST_HOOKS=1
+# The phone scenario drives the bench overrides (P17-P19): built as a bench image (make BT=1 BENCH=1) would be.
+$(OUT)/bt_port/bt_xrec_bluedroid.o: CFLAGS_PORT += -DOPENFW_BT_BENCH_IMAGE=1
+$(OUT)/tests/bt_host/host_xrec.o: CFLAGS_HOST += -DOPENFW_BT_BENCH_IMAGE=1
 # bt_osal_time_t is uint32_t while the POSIX port's TickType_t is 64-bit: portMAX_DELAY truncates to 0xFFFFFFFF (an
 # "infinite" osal wait becomes 49.7 days). Host-only difference (the firmware tick is 32-bit); bt_osal is not on the
 # Classic data path.

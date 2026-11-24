@@ -69,8 +69,14 @@
 #define PROBE_STACK_WORDS   384u     /* 1.5 KiB: big buffers are static; watermark logged */
 #define PROBE_PRIO          OPENFW_PRIO_APP
 #define CMD_DEADLINE_US     500000u
-#define RESET_DEADLINE_US   2000000u /* 0C03 = real reset: RF calibration (~0.3 s in QEMU) + ROM start, then the CC */
-#define HANG_LIMIT_US       3000000u /* one bt_ctrl_run() longer than this = stuck in a ROM busy-wait */
+/* QEMU-only images (HCI_PROBE_AUTORUN / _WAIVE_LIVENESS, below; never run on silicon) get 5x the Reset, hang and
+ * teardown deadlines: QEMU paces the emulated clock by host wall time, and under host load (parallel builds) the
+ * Reset's RF calibration has taken 0.53 s instead of ~0.3 s; a slower host must not turn the expected IRQ-26 liveness
+ * TIMEOUT into a Reset timeout, a HANG demotion or a HARDSTOP. Silicon images keep 2 s / 3 s / 1 s (BEGIN logs them). */
+#define HCI_PROBE_QEMU_SLACK ((HCI_PROBE_AUTORUN || HCI_PROBE_WAIVE_LIVENESS) ? 5u : 1u)
+#define RESET_DEADLINE_US   (HCI_PROBE_QEMU_SLACK * 2000000u) /* 0C03 = real reset: RF calibration (~0.3 s in QEMU)
+                                                               * + ROM start, then the CC */
+#define HANG_LIMIT_US       (HCI_PROBE_QEMU_SLACK * 3000000u) /* one bt_ctrl_run() longer = stuck in a ROM busy-wait */
 #define GUARD_PERIOD_MS     100u
 #define PROBE_FAULT_MARK    (OPENFW_FAULT_MAGIC_BASE | 0xB2u)   /* AON fault record while the probe runs */
 /* QEMU full-path check only (make test-qemu-hciprobe-full): QEMU has no RW-BT model, so IRQ 26 never fires and the
@@ -85,7 +91,7 @@
 #define HCI_PROBE_AUTORUN 0
 #endif
 #define LIVE_DEADLINE_US    500000u
-#define TEARDOWN_DEADLINE_US 1000000u
+#define TEARDOWN_DEADLINE_US (HCI_PROBE_QEMU_SLACK * 1000000u)
 #define IDLE_WINDOW_MS      5000u
 #define RESTARTS            5u
 #define MAX_FAILURES        2u

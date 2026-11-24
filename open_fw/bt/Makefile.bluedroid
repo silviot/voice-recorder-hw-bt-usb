@@ -62,12 +62,26 @@ PROBE_OBJS := $(patsubst $(ROOT)/%.c,$(BUILD_DIR)/%.o,$(PROBE_SRCS))
 # bt_xrec_spp_mtu.c and bt_xrec_bond.c include Bluedroid internals, so it gets the vendored-code warning set only.
 XREC_SRCS := $(ROOT)/bt_port/bt_rom_real.c $(ROOT)/bt_port/bt_ctrl_rtos.c $(ROOT)/bt_port/bt_xrec_bluedroid.c \
              $(ROOT)/bt_port/bt_xrec_fw.c
+# Unattended bench runs from SD:/BTBENCH.RUN (bt_port/bt_bench.h; hooks in src/main.c run_bt_xrec_mode): bench images
+# only (make BT=1 BENCH=1, which also compiles the session's autoconfirm / fixed-PIN overrides in). The stamp rebuilds
+# the session objects when BENCH changes in the same BUILD_DIR.
+BENCH ?= 0
+BENCH_FLAGS := -DOPENFW_BT_BENCH_IMAGE=$(BENCH)
+ifeq ($(BENCH),1)
+XREC_SRCS += $(ROOT)/bt_port/bt_bench.c $(ROOT)/bt_port/bt_bench_fw.c
+endif
+BENCH_STAMP := $(BUILD_DIR)/.bench_flags
+# ROM RNG hook pool (bt_rom_real.c, both ROM images); phone mode also gets the mic entropy source and the P-192 session
+# key that replaces the ROM's fixed SSP key (docs/BT_ROM_INTERFACE.md §2.3).
+PROBE_SRCS += $(ROOT)/bt_port/bt_rom_rng.c
+XREC_SRCS += $(ROOT)/bt_port/bt_rom_rng.c $(ROOT)/bt_port/bt_entropy_mic.c $(ROOT)/bt_port/bt_p192.c
 XREC_OBJS := $(patsubst $(ROOT)/%.c,$(BUILD_DIR)/%.o,$(XREC_SRCS))
 ifeq ($(HCI_PROBE),1)
 FW_PORT_SRCS += $(PROBE_SRCS)
 else
 FW_PORT_SRCS += $(XREC_SRCS) $(ROOT)/bt_port/bt_xrec_spp_mtu.c $(ROOT)/bt_port/bt_xrec_bond.c
-$(XREC_OBJS): CFLAGS += -Wextra
+$(XREC_OBJS): CFLAGS += -Wextra $(BENCH_FLAGS)
+$(XREC_OBJS): $(BENCH_STAMP)
 endif
 FW_PORT_OBJS := $(patsubst $(ROOT)/%.c,$(BUILD_DIR)/%.o,$(FW_PORT_SRCS))
 # QEMU-only checks (open_fw/Makefile test-qemu-hciprobe*): waive the IRQ-26 liveness check / run without the SD request
@@ -81,6 +95,10 @@ $(PROBE_OBJS): CFLAGS += -Wextra -DOPENFW_HCI_PROBE=1 $(PROBE_FLAGS)
 $(PROBE_OBJS): $(PROBE_STAMP)
 endif
 .PHONY: probe-flags-force
+$(BENCH_STAMP): probe-flags-force
+	@mkdir -p $(dir $@)
+	@printf '%s\n' '$(BENCH_FLAGS)' > $@.tmp
+	@if cmp -s $@.tmp $@ 2>/dev/null; then rm -f $@.tmp; else mv $@.tmp $@; fi
 $(PROBE_STAMP): probe-flags-force
 	@mkdir -p $(dir $@)
 	@printf '%s\n' '$(PROBE_FLAGS)' > $@.tmp

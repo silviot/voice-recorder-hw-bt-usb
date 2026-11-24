@@ -12,11 +12,18 @@ test-bt-all: test-bt-ctrl test-bt-host test-bt-port test-bt-xrec
 BT_PORT_TEST_DIR ?= /tmp/sl6801_bt_port_tests
 BT_PORT_TEST_CFLAGS := -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-frame-pointer \
                        -Iinclude -Ibt_port -Itests
+# ROM RNG / P-192 facts re-derived from the mask ROM when the gitignored dump is present (skipped otherwise).
+BT_ROM_DUMP ?= $(wildcard ../dumps/bootrom_384K.bin)
 test-bt-port:
 	@mkdir -p $(BT_PORT_TEST_DIR)
 	$(HOST_CC) $(BT_PORT_TEST_CFLAGS) tests/test_bt_entropy.c bt_port/bt_entropy.c bt_port/bt_drbg.c src/crypto.c \
 		-lm -o $(BT_PORT_TEST_DIR)/test_bt_entropy
 	$(BT_PORT_TEST_DIR)/test_bt_entropy
+	$(HOST_CC) $(BT_PORT_TEST_CFLAGS) tests/test_bt_p192.c bt_port/bt_p192.c -o $(BT_PORT_TEST_DIR)/test_bt_p192
+	$(BT_PORT_TEST_DIR)/test_bt_p192
+	$(HOST_CC) $(BT_PORT_TEST_CFLAGS) tests/test_bt_rom_rng.c bt_port/bt_rom_rng.c bt_port/bt_p192.c \
+		-o $(BT_PORT_TEST_DIR)/test_bt_rom_rng
+	$(BT_PORT_TEST_DIR)/test_bt_rom_rng $(BT_ROM_DUMP)
 	$(HOST_CC) $(BT_PORT_TEST_CFLAGS) tests/test_bt_alarm.c bt_port/bt_alarm.c -o $(BT_PORT_TEST_DIR)/test_bt_alarm
 	$(BT_PORT_TEST_DIR)/test_bt_alarm
 	$(HOST_CC) $(BT_PORT_TEST_CFLAGS) tests/test_bt_store.c bt_port/bt_store.c src/crypto.c -o $(BT_PORT_TEST_DIR)/test_bt_store
@@ -26,6 +33,9 @@ test-bt-port:
 	dd if=/dev/zero of=$(BT_PORT_TEST_DIR)/hcip_exfat.img bs=512 count=4096 status=none
 	/usr/sbin/mkfs.exfat -q -b 4096 -c 4096 $(BT_PORT_TEST_DIR)/hcip_exfat.img
 	$(BT_PORT_TEST_DIR)/test_hci_probe $(BT_PORT_TEST_DIR)/hcip_exfat.img
+	$(HOST_CC) $(BT_PORT_TEST_CFLAGS) tests/test_bt_bench.c bt_port/bt_bench.c src/exfat.c \
+		-o $(BT_PORT_TEST_DIR)/test_bt_bench
+	$(BT_PORT_TEST_DIR)/test_bt_bench $(BT_PORT_TEST_DIR)/hcip_exfat.img
 
 # ---- test-bt-ctrl: controller shim against the fake ROM (plan M1, step 3). Host build, sanitizers on. ----
 # Bluedroid's hci_packet_parser.c is compiled in (unmodified) so the mandatory-success replies are proven against the
@@ -88,6 +98,13 @@ BT_XREC_TEST_DIR ?= /tmp/sl6801_bt_xrec_tests
 test-bt-xrec:
 	@mkdir -p $(BT_XREC_TEST_DIR)
 	$(HOST_CC) $(BT_CTRL_TEST_CFLAGS) $(BT_CTRL_BD_DEFS) $(BT_CTRL_BD_INCS) -DBT_XREC_TEST_HOOKS=1 \
+		-DOPENFW_BT_BENCH_IMAGE=1 \
 		tests/test_bt_xrec.c bt_port/bt_xrec_bluedroid.c src/xrec_proto.c src/crypto.c src/exfat.c \
 		-o $(BT_XREC_TEST_DIR)/test_bt_xrec
 	$(BT_XREC_TEST_DIR)/test_bt_xrec
+	@# A release BT=1 session (no BENCH=1) must not contain the SD bench overrides (autoconfirm, fixed XREC PIN).
+	$(HOST_CC) $(BT_CTRL_TEST_CFLAGS) $(BT_CTRL_BD_DEFS) $(BT_CTRL_BD_INCS) -c bt_port/bt_xrec_bluedroid.c \
+		-o $(BT_XREC_TEST_DIR)/bt_xrec_release.o
+	@if nm $(BT_XREC_TEST_DIR)/bt_xrec_release.o | grep -i bench; then \
+		echo "FAIL: release bt_xrec_bluedroid.o has bench override symbols (above)" >&2; exit 1; \
+	else echo "release session object: no bench overrides"; fi

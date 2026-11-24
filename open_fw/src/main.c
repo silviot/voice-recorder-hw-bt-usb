@@ -27,6 +27,9 @@
 #include "openfw_wav.h"
 #include "openfw_player.h"
 #include "cassini_splash.h"
+#if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID && !(defined(OPENFW_HCI_PROBE) && OPENFW_HCI_PROBE)
+#include "../bt_port/bt_xrec_bluedroid.h" /* plan M2.3: pairing-window gate feedback (bt_xrec_get_debug) */
+#endif
 
 #define MENU_MAX_FILES 96
 #define MENU_MAX_CWX   192
@@ -1259,6 +1262,64 @@ static int run_usb_msc_mode(int auto_mode)
     return manual_exit;
 }
 
+#if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID && !(defined(OPENFW_HCI_PROBE) && OPENFW_HCI_PROBE) && \
+    defined(OPENFW_BT_BENCH_IMAGE) && OPENFW_BT_BENCH_IMAGE
+/* bt_port/bt_bench_fw.c: one-shot SD:/BTBENCH.RUN unattended phone-mode run (bench images only: make BT=1 BENCH=1;
+ * bt_bench.h). A release BT=1 image never reads the file. */
+#define OPENFW_BT_BENCH 1
+int  bt_bench_boot(exfat_vol_t *vol, int sd_mounted);
+void bt_bench_begin(void);
+int  bt_bench_tick(uint32_t now_ms);
+int  bt_bench_end(exfat_vol_t *vol, int sd_mounted);
+#else
+#define OPENFW_BT_BENCH 0
+#endif
+
+#if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID && !(defined(OPENFW_HCI_PROBE) && OPENFW_HCI_PROBE)
+/* BT=1 phone mode: SSP numeric-comparison prompt on the BT screen (plan M4; bt_xrec_get_ui / bt_xrec_ssp_answer). */
+#include "../bt_port/bt_xrec_bluedroid.h"
+#define OPENFW_BT_PROMPT 1
+
+static uint32_t g_bt_gate_seen;     /* bt_xrec_debug_t.ssp_gate_refused already shown */
+static uint32_t g_bt_gate_toast_at; /* when "Pairing unavailable" went up (the XREC PIN toast waits 2.5 s) */
+static uint8_t  g_bt_gate_toast;
+
+static void bt_prompt_ui_update(uint32_t now)
+{
+    /* Plan M2.3: the window's SSP part was refused (no credited entropy / ROM key not replaced; reason logged). Also
+     * when the gate was deferred to READY (window opened during bring-up, e.g. by the SD bench run). */
+    bt_xrec_debug_t gate;
+    bt_xrec_get_debug(&gate);
+    if (gate.ssp_gate_refused != g_bt_gate_seen) {
+        g_bt_gate_seen     = gate.ssp_gate_refused;
+        g_bt_gate_toast    = 1u;
+        g_bt_gate_toast_at = now;
+        ui_show_toast("Pairing unavailable", UI_COL_AMBER, now, 2500u); /* TODO(i18n) */
+    } else if (g_bt_gate_toast && (uint32_t)(now - g_bt_gate_toast_at) >= 2500u) {
+        g_bt_gate_toast = 0u;
+    }
+    bt_xrec_ui_t bu;
+    bt_xrec_get_ui(&bu);
+    if (bu.prompt && g_screen_off != SCREEN_MANUALLY_OFF) {
+        backlight_wake(now); /* the value must stay readable for the whole prompt */
+    }
+    g_ui.bt_prompt   = bu.prompt;
+    g_ui.bt_prompt_s = bu.prompt_s_left;
+    g_ui.bt_bonded   = bu.bonded;
+    g_ui.bt_window_s = bu.window_s_left;
+    copy_cstr(g_ui.bt_digits, (int)sizeof(g_ui.bt_digits), bu.digits);
+    if (bu.peer[0] == '\0') {
+        g_ui.bt_peer[0] = '\0'; /* bind_bt shows the translated "Phone" */
+    } else if (bu.prompt || bu.peer_is_name) {
+        copy_cstr(g_ui.bt_peer, (int)sizeof(g_ui.bt_peer), bu.peer);
+    } else {
+        copy_cstr(g_ui.bt_peer, (int)sizeof(g_ui.bt_peer), &bu.peer[9]); /* "44:55:66": fits "Connected · %s" */
+    }
+}
+#else
+#define OPENFW_BT_PROMPT 0
+#endif
+
 static void run_bt_xrec_mode(void)
 {
     g_ui_screen   = UI_SCR_BT;
@@ -1267,6 +1328,15 @@ static void run_bt_xrec_mode(void)
     g_ui.bt_total = 0u;
     g_ui.bt_pct   = 0u;
     copy_cstr(g_ui.bt_peer, (int)sizeof(g_ui.bt_peer), "Phone");
+#if OPENFW_BT_PROMPT
+    /* The previous session may have ended with a prompt or a window up (REC slide, bench time-up, BT stop): its digits
+     * must not show while this one starts (mic collection, key generation, RF calibration: up to ~1.7 s). */
+    g_ui.bt_prompt    = 0u;
+    g_ui.bt_prompt_s  = 0u;
+    g_ui.bt_bonded    = 0u;
+    g_ui.bt_window_s  = 0u;
+    g_ui.bt_digits[0] = '\0';
+#endif
     refresh_telemetry();
     ui_render_screen(UI_SCR_BT, &g_ui);
     backlight_wake(millis());
@@ -1274,6 +1344,18 @@ static void run_bt_xrec_mode(void)
     wdt_feed();
     (void)bt_rf_init_calibrated(0x53u, 32000000u);
     (void)bt_xrec_start(&g_exfat_vol, g_sd_mounted);
+#if OPENFW_BT_PROMPT
+    {
+        /* Snapshot, not 0: a start that failed early ("no memory") keeps the previous session's counters. */
+        bt_xrec_debug_t d0;
+        bt_xrec_get_debug(&d0);
+        g_bt_gate_seen = d0.ssp_gate_refused;
+    }
+    g_bt_gate_toast = 0u;
+#endif
+#if OPENFW_BT_BENCH
+    bt_bench_begin(); /* SD:/BTBENCH.RUN run only (no-op otherwise): pairing schedule, autoconfirm */
+#endif
 
     uint32_t last_ui     = 0u;
     uint32_t prev_rx     = 0u;
@@ -1319,11 +1401,23 @@ static void run_bt_xrec_mode(void)
             while (keys_pop_event(&kev)) {
                 if (kev.pressed) {
                     backlight_wake(kev.t_ms);
+#if OPENFW_BT_PROMPT
+                    /* A pairing prompt is up: ENTER accepts, BACK rejects (and does not leave BT mode); a key in its
+                     * first 0.5 s (-2) or within 1 s after it ended by itself or was answered (-3) is swallowed. */
+                    if ((kev.key == KEY_BACK || kev.key == KEY_ENTER) &&
+                        bt_xrec_ssp_answer(kev.key == KEY_ENTER) != -1) {
+                        last_ui = 0u;
+                        continue;
+                    }
+#endif
                     if (kev.key == KEY_BACK) {
                         bt_exit = 1;
                         break;
                     } else if (kev.key == KEY_ENTER) {
                         bt_xrec_open_pairing(60000u);
+#if OPENFW_BT_PROMPT
+                        last_ui = 0u; /* M2.3 gate refusal -> "Pairing unavailable" (bt_prompt_ui_update) */
+#endif
                     }
                 }
             }
@@ -1331,12 +1425,20 @@ static void run_bt_xrec_mode(void)
         if (bt_exit) {
             break;
         }
+#if OPENFW_BT_BENCH
+        if (bt_bench_tick(now)) { /* bench time up: leave as if BACK was pressed */
+            break;
+        }
+#endif
         if ((uint32_t)(now - last_ui) >= 150u || last_ui == 0u) {
             last_ui = now;
             pmu_poll_charge_manage();
 
             bt_status_t st;
             bt_xrec_get_status(&st);
+#if OPENFW_BT_PROMPT
+            bt_prompt_ui_update(now);
+#endif
 
             if (st.dev_name[0] != '\0') {
                 copy_cstr(g_ui.bt_name, (int)sizeof(g_ui.bt_name), st.dev_name);
@@ -1365,6 +1467,13 @@ static void run_bt_xrec_mode(void)
                 g_ui.bt_state = 0u;
             }
 
+#if OPENFW_BT_PROMPT
+            if (g_ui.bt_prompt) {
+                g_ui.toast_msg[0] = '\0'; /* the prompt's own digits only: no XREC PIN toast over them */
+            } else if (g_bt_gate_toast) {
+                (void)ui_poll_toast_expire(now); /* "Pairing unavailable" first, then the XREC PIN (if any) */
+            } else
+#endif
             if (st.pair_active && st.pair_pin[0] != '\0') {
                 char pmsg[24];
                 int p = 0;
@@ -1870,6 +1979,19 @@ int openfw_main(void)
     dirty = 0;
 #if defined(OPENFW_HCI_PROBE) && OPENFW_HCI_PROBE
     hci_probe_start(&g_exfat_vol, g_sd_mounted); /* runs only if SD:/HCIPROBE.RUN exists (deleted first) */
+#endif
+#if OPENFW_BT_BENCH
+    /* Unattended phone-mode run: only if SD:/BTBENCH.RUN exists (deleted first). BT mode, then the normal boot. */
+    if (bt_bench_boot(&g_exfat_vol, g_sd_mounted)) {
+        run_bt_xrec_mode();
+        clear_boot_strikes_once(); /* this boot reached BT mode and left it: reboot=1 is no boot-loop strike */
+        if (bt_bench_end(&g_exfat_vol, g_sd_mounted)) {
+            (void)sd_flush(&g_sd_card);
+            system_reboot();
+        }
+        g_ui_screen = (uint32_t)scr;
+        dirty       = 1;
+    }
 #endif
 
     while (1) {

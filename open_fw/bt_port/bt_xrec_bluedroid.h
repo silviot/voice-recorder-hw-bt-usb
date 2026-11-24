@@ -40,7 +40,14 @@
 #define BT_XREC_CONFIG_DEADLINE_MS   5000u   /* SPP INIT + START events after enable */
 #define BT_XREC_REBOOT_DELAY_MS      250u    /* legacy F:1827: deferred reboot / OTA / DFU */
 #define BT_XREC_REBOOT_DRAIN_MAX_MS  2000u   /* longest wait for the final reply to leave before rebooting anyway */
-#define BT_XREC_SSP_SHOW_MS          30000u  /* numeric-comparison value shown at most this long */
+#define BT_XREC_SSP_SHOW_MS          30000u  /* numeric-comparison value shown at most this long (bench autoconfirm) */
+#define BT_XREC_SSP_PROMPT_MS        30000u  /* plan M4: local accept/reject prompt, rejected when it runs out */
+#define BT_XREC_SSP_ARM_MS           500u    /* answers in the first 0.5 s are ignored (a key meant for something else) */
+#define BT_XREC_SSP_AFTER_MS         1000u   /* ENTER/BACK within 1 s after a prompt ended are swallowed (-3), not
+                                              * taken as "open a window" / "leave BT mode" (the prompt can end by
+                                              * itself just before the key, and the screen lags up to 150 ms) */
+#define BT_XREC_PIN_KEEP_MS          10000u  /* re-opening a window with more than this left keeps its XREC PIN */
+#define BT_XREC_PEER_NAME_MAX        24u     /* bytes incl. NUL: remote name (UTF-8, cut at a character) or address */
 
 /* ---- BT fault reasons (logged; code of the hard-path fault record 0xB1) ---- */
 enum {
@@ -83,8 +90,52 @@ typedef struct {
     uint32_t write_evts, write_evt_bytes, cong_evts, evq_lost, stale_events;
     uint32_t ssp_accepted, ssp_rejected, pin_rejected, passkey_rejected, bonds_removed, conns_rejected;
     uint32_t conns_authorized;   /* SPP connections marked authorized for XREC */
+    uint8_t  ssp_prompt;         /* a numeric comparison waits for the local user */
+    uint32_t ssp_user_accepted, ssp_user_rejected, ssp_timeouts, ssp_withdrawn, ssp_bench_autoconfirmed;
+    uint32_t name_requests;      /* esp_bt_gap_read_remote_name() calls */
+    uint8_t  ssp_pending;        /* window opened before READY: the M2.3 gate decides its SSP part once READY */
+    uint32_t ssp_gate_refused;   /* SSP part of a pairing window refused by the M2.3 gate (open, or deferred to READY) */
+    uint8_t  ssp_burned;         /* a pairing this session accepted then failed: SSP refused until the next BT entry */
+    uint32_t ssp_gate_cfm_rejects;  /* numeric comparisons rejected because the gate stopped holding (request/answer) */
 } bt_xrec_debug_t;
 void bt_xrec_get_debug(bt_xrec_debug_t *out);
+
+/* ---- local pairing prompt (plan M4 "Pairing security policy"; replaces interim deviation 1) ----
+ * An SSP numeric comparison that arrives inside the user-opened pairing window is held for the local user: the BT
+ * screen shows the 6-digit value and the peer, ENTER accepts, BACK rejects, BT_XREC_SSP_PROMPT_MS without an answer
+ * rejects. It is also rejected when the window closes first (deadline, XREC PAIR, first MITM bond), withdrawn without a
+ * reply when the peer's pairing ends first (AUTH_CMPL, ACL down) or BT stops, and a second request while one is
+ * pending is rejected (same peer: the pending one is withdrawn too). Outside the window: rejected without a prompt.
+ * The reply goes through esp_bt_gap_ssp_confirm_reply() from the app task (BTC -> BTA DM -> BTM_ConfirmReqReply, which
+ * ignores a reply whose pairing is gone), the same path the interim auto-confirm used. App task only. */
+typedef struct {
+    uint8_t  prompt;                       /* 1: waiting for ENTER / BACK */
+    uint8_t  prompt_armed;                 /* answers are taken (BT_XREC_SSP_ARM_MS after it appeared) */
+    uint8_t  prompt_s_left;                /* seconds until the prompt rejects by itself */
+    char     digits[8];                    /* "123456" while prompt */
+    char     peer[BT_XREC_PEER_NAME_MAX];  /* prompt peer, else the connected/bonding peer: name, else address */
+    uint8_t  peer_bda[6];
+    uint8_t  peer_is_name;                 /* peer holds the remote name (else the address text) */
+    uint8_t  window_open;                  /* the user-opened pairing window (XREC PIN and/or SSP) */
+    uint16_t window_s_left;
+    uint8_t  connected;                    /* ACL or SPP link up */
+    uint8_t  bonded;                       /* that peer holds a MITM bond (just bonded, or authorized SPP link) */
+} bt_xrec_ui_t;
+void bt_xrec_get_ui(bt_xrec_ui_t *out);
+/* The local user's answer: accept != 0 accepts. 0 = applied, -1 no prompt pending, -2 not armed yet (ignored),
+ * -3 no prompt pending but one ended less than BT_XREC_SSP_AFTER_MS ago (swallowed: the key was meant for it).
+ * The caller treats every value but -1 as consumed. Accepting re-checks the M2.3 gate first (rejects if it fails). */
+int  bt_xrec_ssp_answer(int accept);
+#if defined(OPENFW_BT_BENCH_IMAGE) && OPENFW_BT_BENCH_IMAGE
+/* Bench images only (make BT=1 BENCH=1; a release BT=1 image has neither function nor the code behind them).
+ * BENCH ONLY (default off; survives bt_xrec_start): numeric comparisons inside the pairing window are accepted without
+ * the user, like interim deviation 1, and every use logs "BENCH autoconfirm". Never enabled by the UI. Any task. */
+void bt_xrec_set_bench_autoconfirm(int on);
+/* BENCH ONLY (default off; survives bt_xrec_start; SD:/BTBENCH.RUN xrec_pin=): the XREC PIN of every later pairing
+ * window is pin6 ("NNNNNN") instead of a DRBG draw; still only issued when the DRBG draw succeeds (entropy credited).
+ * NULL or anything but 6 digits switches it off. Logged on every use. App task. */
+void bt_xrec_set_bench_xrec_pin(const char *pin6);
+#endif
 
 /* 1 once ESP_SPP_UNINIT_EVT arrived after the last bt_shutdown() began (the teardown job waits for it). Any task. */
 int bt_xrec_spp_uninit_seen(void);
@@ -111,6 +162,10 @@ void     bt_xrec_plat_free(void *p);
 int      bt_xrec_plat_start_allowed(void);   /* 0 after a BT-fault reboot (fault record 0xB1): BT stays off this boot */
 void     bt_xrec_plat_identity(uint8_t bd_addr[6]);
 int      bt_xrec_plat_entropy(void *out, size_t n);   /* 0 = OK; anything else fails closed (plan M2) */
+/* Plan M2.3 pairing gate: NULL when a new SSP pairing may be offered (entropy credited, ROM P-192 key replaced, ROM
+ * RNG pool never ran dry this session), else a short reason for the log. Checked when the window opens and on every
+ * poll while its SSP part is open. */
+const char *bt_xrec_plat_pairing_block(void);
 const xrec_ops_t *bt_xrec_plat_device_ops(void);       /* stat, rtc, recorder, log, audio cfg, exp (legacy F:1733-1966) */
 void     bt_xrec_plat_load_bound_key(xrec_ctx_t *ctx);  /* SD:/cassini.key (legacy F:1968, same CSK5 format) */
 void     bt_xrec_plat_save_bound_key(const uint8_t key[32]);

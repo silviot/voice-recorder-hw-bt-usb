@@ -71,6 +71,16 @@ $(BUILD_DIR)/bt_hci.o: CFLAGS += -DRWBT_IRQHandler=bt_hci_legacy_irq_top -Dbt_xr
 	-Dbt_xrec_poll=bt_legacy_xrec_poll -Dbt_xrec_stop=bt_legacy_xrec_stop \
 	-Dbt_xrec_open_pairing=bt_legacy_xrec_open_pairing -Dbt_xrec_get_status=bt_legacy_xrec_get_status
 endif
+# BENCH=1 (BT=1 phone images only): the bench image for unattended silicon tests (docs/BT_HW_RESULTS.md "Phone mode
+# (BT=1) on silicon"): the one-shot SD:/BTBENCH.RUN trigger and its overrides (SSP autoconfirm, fixed XREC PIN). A
+# release BT=1 image has neither, so card or USB-disk access alone cannot arm an unattended pairing (review finding).
+BENCH ?= 0
+ifeq ($(BENCH),1)
+ifneq ($(BT)$(HCI_PROBE),10)
+$(error BENCH=1 requires BT=1 without HCI_PROBE=1)
+endif
+CFLAGS   += -DOPENFW_BT_BENCH_IMAGE=1
+endif
 
 LVGL_CFLAGS := --target=thumbv7em-none-eabi -mcpu=cortex-m4 -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb \
                -O2 -ffreestanding -fno-builtin -fno-stack-protector \
@@ -237,6 +247,14 @@ test-host: $(LVGL_DIR)/lvgl.h $(BUILD_DIR)/liblvgl_host.a tests/test_core.c src/
 		$(BUILD_DIR)/liblvgl_host.a \
 		-lm -o $(BUILD_DIR)/test_ui_render
 	$(BUILD_DIR)/test_ui_render $(BUILD_DIR)/ui_all_screens.ppm
+	@# BT=1 phone-mode UI (prompt, peer line, toasts): the same renderer with OPENFW_BT_BLUEDROID
+	$(HOST_CC) $(HOST_CFLAGS) -DOPENFW_HOST_MMIO -DOPENFW_BT_BLUEDROID=1 tests/test_ui_render.c \
+		src/lcd_st7735s.c src/cpu1_ui.c src/ui_spectrogram.c src/cwx.c \
+		src/ui/ui_port.c src/ui/ui_theme.c src/ui/ui_fonts.c src/ui/ui_i18n.c src/ui/ui_screens.c \
+		$(EEZ_SRCS) \
+		$(BUILD_DIR)/liblvgl_host.a \
+		-lm -o $(BUILD_DIR)/test_ui_render_bt
+	$(BUILD_DIR)/test_ui_render_bt $(BUILD_DIR)/ui_all_screens_bt.ppm
 	$(HOST_CC) $(HOST_CFLAGS) tests/test_audio_dsp.c src/audio_dsp.c -lm -o $(BUILD_DIR)/test_audio_dsp
 	$(BUILD_DIR)/test_audio_dsp
 	$(HOST_CC) $(HOST_CFLAGS) -DOPENFW_HOST_MMIO tests/test_player.c src/player.c src/ui/ui_i18n.c src/wav.c src/cwx.c -o $(BUILD_DIR)/test_player

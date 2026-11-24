@@ -1337,9 +1337,46 @@ static void bind_bt(const ui_model_t *m)
                     objects.bt_bar_r, objects.bt_bar_hp, objects.bt_batt,
                     objects.bt_batt_fill, objects.bt_batt_nub,
                     m, UI_COL_BAR, UI_COL_TEXT, UI_ICON_NONE, UI_COL_TEXT, ui_tr(UI_STR_BT_SYNC), NULL, NULL, 0);
+#if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID
+    /* SSP numeric comparison waiting for the local user (plan M4): value in the name's place, peer, countdown, keys.
+     * Each label is set once per bind with its final text and colour (a re-render of the same model draws nothing). */
+    if (objects.bt_l1_lbl != NULL && lv_label_get_long_mode(objects.bt_l1_lbl) != LV_LABEL_LONG_DOT) {
+        /* a long remote name ("Connected · <name>", the prompt's peer) ends in "..." instead of wrapping into the
+         * clipped second line (the label is 120 x 12 px); set_changed_text() handles DOT labels */
+        lv_label_set_long_mode(objects.bt_l1_lbl, LV_LABEL_LONG_DOT);
+    }
+    char l2s[32];
+    const char *l2 = ui_tr(UI_STR_BT_OPEN_APP);
+    uint32_t l2_col = UI_HEX_MUTE;
+    if (m->bt_prompt) {
+        lv_snprintf(l2s, sizeof(l2s), "Pair? %u s", (unsigned)m->bt_prompt_s); /* TODO(i18n) */
+        set_changed_text(objects.bt_name_lbl, m->bt_digits);
+        set_changed_text(objects.bt_l1_lbl, m->bt_peer);
+        set_changed_text_color(objects.bt_l1_lbl, lv_color_hex(UI_HEX_TEXT));
+        set_changed_text(objects.bt_l2_lbl, l2s);
+        set_changed_text_color(objects.bt_l2_lbl, lv_color_hex(UI_HEX_AMBER));
+        set_changed_text(objects.bt_footer, "ENTER Yes \xC2\xB7 BACK No"); /* TODO(i18n) */
+        set_hidden(objects.bt_l2_lbl, false);
+        set_hidden(objects.bt_prog, true);
+        return;
+    }
+    if (m->bt_state == 0u && m->bt_window_s > 0u) {
+        lv_snprintf(l2s, sizeof(l2s), "Pairing open %u s", (unsigned)m->bt_window_s); /* TODO(i18n) */
+        l2 = l2s;
+        l2_col = UI_HEX_CYAN;
+    } else if (m->bt_state == 1u && m->bt_bonded) {
+        l2 = "Bonded"; /* TODO(i18n) */
+        l2_col = UI_HEX_GREEN;
+    }
+    set_changed_text(objects.bt_name_lbl, m->bt_name[0] ? m->bt_name : "HW_76");
+    set_changed_text(objects.bt_l2_lbl, l2);
+    set_changed_text_color(objects.bt_l2_lbl, lv_color_hex(l2_col));
+    set_changed_text(objects.bt_footer, ui_tr(UI_STR_BT_FOOTER));
+#else
     set_changed_text(objects.bt_name_lbl, m->bt_name[0] ? m->bt_name : "HW_76");
     set_changed_text(objects.bt_l2_lbl, ui_tr(UI_STR_BT_OPEN_APP));
     set_changed_text(objects.bt_footer, ui_tr(UI_STR_BT_FOOTER));
+#endif
     if (m->bt_state == 0u) {
         set_changed_text(objects.bt_l1_lbl, ui_tr(UI_STR_BT_WAITING));
         set_changed_text_color(objects.bt_l1_lbl, lv_color_hex(UI_HEX_DIM));
@@ -1350,7 +1387,11 @@ static void bind_bt(const ui_model_t *m)
         lv_snprintf(cs, sizeof(cs), ui_tr(UI_STR_BT_CONNECTED_FMT), m->bt_peer[0] ? m->bt_peer : ui_tr(UI_STR_PHONE));
         set_changed_text(objects.bt_l1_lbl, cs);
         set_changed_text_color(objects.bt_l1_lbl, lv_color_hex(UI_HEX_GREEN));
+#if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID
+        set_hidden(objects.bt_l2_lbl, !m->bt_bonded);   /* "Bonded" */
+#else
         set_hidden(objects.bt_l2_lbl, true);
+#endif
         set_hidden(objects.bt_prog, true);
     } else {
         char ss[40];

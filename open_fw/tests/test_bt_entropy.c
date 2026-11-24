@@ -11,6 +11,7 @@
 
 #include "bt_drbg.h"
 #include "bt_entropy.h"
+#include "bt_entropy_mic.h"
 #include "vectors/hmac_drbg_sha256_cavp.h"
 
 static int g_fail;
@@ -94,6 +95,25 @@ static void test_cutoffs(void)
               "APT cutoff for H=%u/16 not minimal", hs[i]);
         printf("  H=%5.2f bits/sample: RCT cutoff %u, APT cutoff %u (W=512)\n", hs[i] / 16.0, rct_cutoff(hs[i]), c);
     }
+}
+
+/* The firmware mic source (bt_entropy_mic.h): its constants are the definition's cutoffs for its claimed H, a first
+ * collection seeds the DRBG and every later one is a reseed, and a stuck ADC (constant symbol) is caught by the RCT
+ * well inside one collection. */
+static void test_mic_cfg(void)
+{
+    static const bt_ent_source_cfg_t mic = BT_ENT_MIC_CFG_INIT;
+    CHECK(mic.rct_cutoff == rct_cutoff(BT_ENT_MIC_H_X16) && mic.apt_cutoff == apt_cutoff(BT_ENT_MIC_H_X16),
+          "mic cutoffs %u/%u, definition %u/%u", mic.rct_cutoff, mic.apt_cutoff, rct_cutoff(BT_ENT_MIC_H_X16),
+          apt_cutoff(BT_ENT_MIC_H_X16));
+    CHECK(BT_ENT_MIC_H_X16 <= 8u, "mic credit above 0.5 bit/symbol needs the NIST assessment first");
+    CHECK((BT_ENT_MIC_SAMPLES - BT_ENT_STARTUP_SAMPLES) * BT_ENT_MIC_H_X16 / 16u >= BT_ENT_SEED_BITS,
+          "first collection does not seed the DRBG");
+    CHECK(BT_ENT_MIC_SAMPLES * BT_ENT_MIC_H_X16 / 16u >= BT_ENT_RESEED_BITS, "later collection does not reseed");
+    CHECK(BT_ENT_MIC_RCT_CUTOFF < BT_ENT_MIC_SAMPLES / 4u, "RCT cannot fire within a collection");
+    printf("  mic source: H=%.2f bits/symbol, RCT %u, APT %u; first collection credits %u bits\n",
+           BT_ENT_MIC_H_X16 / 16.0, mic.rct_cutoff, mic.apt_cutoff,
+           (BT_ENT_MIC_SAMPLES - BT_ENT_STARTUP_SAMPLES) * BT_ENT_MIC_H_X16 / 16u);
 }
 
 /* ---- entropy pool ---- */
@@ -205,6 +225,59 @@ static void test_apt(void)
     CHECK(st.failed_test == 2, "APT failure not recorded (test=%u)", st.failed_test);
 }
 
+
+/* Source sanity gate (bt_entropy_mic_frame_check; review finding): saturation alternating between the two full-scale
+ * codes passes the SP 800-90B health tests at H = 0.5 (each symbol run below the RCT cutoff, ~50 % in the APT window),
+ * so without the gate a clipped capture would be credited in full. */
+static void test_mic_frame_gate(void)
+{
+    static int16_t f[2048];
+    uint32_t pk = 0u;
+    uint32_t r = 12345u;
+    for (uint32_t i = 0; i < 2048u; i++) {          /* quiet electronic noise: a few tens of LSB */
+        r = r * 1103515245u + 12345u;
+        f[i] = (int16_t)((int32_t)((r >> 16) % 81u) - 40);
+    }
+    CHECK(bt_entropy_mic_frame_check(f, 2048u, &pk) == BT_ENT_MIC_OK && pk <= 40u, "quiet noise refused (peak %u)",
+          pk);
+    f[100] = 31999;
+    CHECK(bt_entropy_mic_frame_check(f, 2048u, &pk) == BT_ENT_MIC_OK && pk == 31999u, "31999 is not full scale");
+    f[100] = -32000;
+    CHECK(bt_entropy_mic_frame_check(f, 2048u, &pk) == BT_ENT_MIC_CLIPPED && pk == 32000u, "-32000 not clipped (%u)",
+          pk);
+    f[100] = 0;
+    /* hard clipping of a loud tone: runs of 0x7FFF / 0x8000 (symbols 3 / 0) of 3..37 samples */
+    static uint8_t sym[2048];
+    uint32_t i = 0u, run = 3u;
+    int hi = 1;
+    while (i < 2048u) {
+        for (uint32_t k = 0; k < run && i < 2048u; k++, i++) {
+            f[i] = hi ? 32767 : -32768;
+            sym[i] = (uint8_t)((uint16_t)f[i] & BT_ENT_MIC_SYMBOL_MASK);
+        }
+        hi = !hi;
+        run = 3u + (run * 7u + 5u) % 35u;
+    }
+    static const bt_ent_source_cfg_t mic = BT_ENT_MIC_CFG_INIT;
+    bt_entropy_init(NULL);
+    int id = bt_entropy_register_source(&mic);
+    CHECK(bt_entropy_add_samples(id, sym, 2048u) == BT_ENT_OK, "precondition: the health tests pass clipped input");
+    bt_ent_stats_t st;
+    bt_entropy_get_stats(&st);
+    CHECK(st.credited_bits_total > 0u, "precondition: clipped input would be credited (%u bits)",
+          st.credited_bits_total);
+    CHECK(bt_entropy_mic_frame_check(f, 2048u, &pk) == BT_ENT_MIC_CLIPPED && pk == 32768u,
+          "clipped frame not refused by the gate (peak %u)", pk);
+    for (i = 0; i < 2048u; i++) {                   /* dead analogue path: only +-1..2 LSB of digital dither */
+        f[i] = (int16_t)((int32_t)(i % 5u) - 2);
+    }
+    CHECK(bt_entropy_mic_frame_check(f, 2048u, &pk) == BT_ENT_MIC_FLAT && pk == 2u, "flat frame not refused");
+    f[7] = 6;                                         /* peak-to-peak 8: plausible noise again */
+    CHECK(bt_entropy_mic_frame_check(f, 2048u, NULL) == BT_ENT_MIC_OK, "ptp 8 refused");
+    CHECK(bt_entropy_mic_frame_check(f, 0u, &pk) == BT_ENT_MIC_OK && pk == 0u, "empty slice");
+    printf("  mic frame gate: clip >= %d, peak-to-peak >= %d\n", BT_ENT_MIC_CLIP_LEVEL, BT_ENT_MIC_PTP_MIN);
+}
+
 static void test_bad_args(void)
 {
     static bt_ent_source_cfg_t bad = { "bad", 0, 2, 2 };
@@ -221,10 +294,12 @@ int main(void)
     test_cavp(k_hmac_drbg_pr_false, sizeof(k_hmac_drbg_pr_false) / sizeof(k_hmac_drbg_pr_false[0]), "pr_false");
     test_drbg_api();
     test_cutoffs();
+    test_mic_cfg();
     test_gate();
     test_rct();
     test_apt();
     test_bad_args();
+    test_mic_frame_gate();
     if (g_fail) {
         printf("test_bt_entropy: %d FAILURE(S)\n", g_fail);
         return 1;

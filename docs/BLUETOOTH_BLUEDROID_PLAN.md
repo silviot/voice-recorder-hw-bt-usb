@@ -458,7 +458,8 @@ telemetry: heap/stack watermarks, largest free block, IRQ-26 latency and multipl
   surface: name `Cassini_XX`, CoD 0x200404, SPP channel 1 "Cassini" with SDP 0x1101 (bt_sync.py connects to ch 1).
   `make test-bt-xrec`: 221 checks (data path, congestion, partial writes / in-flight window, write error, disconnect
   mid-transfer, policy, stop during transfer, deferred reboot behind congestion, faults, hard paths), mutation-checked.
-  **Interim deviations** (to close in step 8 / follow-ups): (1) no local accept prompt yet (needs i18n strings): a
+  **Interim deviations** (to close in step 8 / follow-ups): (1) *[resolved: "pairing prompt" entry below]* no local
+  accept prompt yet (needs i18n strings): a
   numeric comparison is auto-confirmed only inside the user-opened pairing window, its value is shown through
   `bt_status_t.pair_pin` (the BT screen's existing "PIN" toast) and logged; outside the window it is rejected.
   (2) Just Works cannot be refused at the request (`btc_dm.c` auto-confirms it without an app event): the bond is
@@ -466,13 +467,15 @@ telemetry: heap/stack watermarks, largest free block, IRQ-26 latency and multipl
   display/entry likewise rejected. XREC bytes flow only on links bonded that way. (3) The teardown deadline is a
   FreeRTOS timer-daemon one-shot (priority 9; preempts the app even in an SD write), not a SysTick-ISR hook, to keep
   `startup.c` untouched. (4) `bt_recover` stack/TCB live in SRAM_HI (`.bss_hi`) instead of `.rtos_static`: with
-  bt_ctrl's rings and stacks linked, RTOS_HEAP would fall below the 32 KiB heap floor. (5) No credited entropy source
+  bt_ctrl's rings and stacks linked, RTOS_HEAP would fall below the 32 KiB heap floor. (5) *[closed on the host, silicon
+  check pending: "entropy + ROM key hardening" entry below]* No credited entropy source
   is registered in firmware yet, so `bt_entropy_get()` fails: the SSP window still opens, but XREC PAIR answers
   PAIRCLOSED and CHAL closes the link (fail closed) until Exp 2's source is wired. (6) Without eFuse the BD_ADDR is a
   fixed fallback (probe scheme), never timer-derived; NOR-UID derivation pending. (7) `main.c` still calls
   `bt_rf_init_calibrated()` before `bt_xrec_start()`, so RF is calibrated twice per BT-mode entry (bt_rom_real
-  calibrates again at HCI Reset). (8) SSP pairing without credited entropy on a ROM-generated P-192 secret of ~33
-predictable bits: bench-only waiver, see the review-round entry below.
+  calibrates again at HCI Reset). (8) *[closed on the host, silicon check pending: "entropy + ROM key hardening" entry below; the ROM key
+turned out to be a constant, worse than stated here]* SSP pairing without credited entropy on a ROM-generated P-192
+secret of ~33 predictable bits: bench-only waiver, see the review-round entry below.
 - 2026-11-24 (integration: bt_ctrl phone path + 0011-0023 + XREC backend, step 6 host gate): **phone mode end to end
   on the host**: `make test-bt-host` now also runs `test_bt_host phone` (`tests/bt_host/test_phone.c`, 228 checks):
   the real BT=1 XREC backend (`bt_xrec_bluedroid.c` + `xrec_proto.c` + `exfat.c` on a RAM exFAT card, platform
@@ -531,7 +534,116 @@ predictable bits: bench-only waiver, see the review-round entry below.
   pairing can recover the link key. Release blockers: credited source; DRBG through the hook and into the unwritten
   bytes of the hashed block (or replace the secret at a hookable point; trace the other users of `0x0080340C` first);
   the SSP nonce source traced; the SSP window closed until `bt_entropy` reports credit; the local accept/reject prompt
-  with its 30 s timeout (deviation (1)).
+  with its 30 s timeout (deviation (1); done, next entry).
+- 2026-11-24 (pairing prompt, M4 "Pairing security policy"; **interim deviation (1) resolved**; host only, not yet on
+  silicon): an SSP numeric comparison inside the user-opened window is no longer auto-confirmed. The session holds it
+  (`bt_xrec_get_ui()` / `bt_xrec_ssp_answer()` in `bt_xrec_bluedroid.h`) and the BT screen shows the six digits in the
+  device-name slot, the peer (remote name, else its address), "Pair? N s" and "ENTER Yes · BACK No"; ENTER accepts,
+  BACK rejects and does not leave BT mode for that press, 30 s without an answer rejects. Also rejected: the window
+  closing first (deadline, XREC PAIR, first MITM bond); a second request while one is pending (same peer: the stale
+  prompt is withdrawn too, so the digits never change under the user's finger). Withdrawn without a reply: the peer's
+  `AUTH_CMPL` (its user said no, LMP response timeout) or ACL down for that peer, BT stop. Outside the window:
+  rejected without a prompt, as before. A key in the prompt's first 0.5 s is swallowed (`BT_XREC_SSP_ARM_MS`): an
+  ENTER meant to re-open the window cannot accept a comparison that appeared at the same moment. The screen also
+  shows "Pairing open N s" (window, no link), "Connected · <name or last 3 address bytes>" and "Bonded" (the shown
+  peer just bonded with MITM, or its SPP link is authorized). The new strings are English literals marked
+  `TODO(i18n)` (M4 i18n batch). **Bench override:** `bt_xrec_set_bench_autoconfirm(1)` (default off, survives
+  `bt_xrec_start`, used only by the `SD:/BTBENCH.RUN` trigger) restores the old auto-confirm inside the window and logs
+  `BENCH autoconfirm` on every use. Tests: `test-bt-xrec` [14]/[15] (accept, reject, timeout, window closing,
+  peer disconnect / AUTH_CMPL mid-prompt, second request, stop, name handling, bench override; mutation-checked);
+  `test-bt-host` phone step P2 now answers the prompt through the app task (`BTHX_SSP_ANSWER`) after checking the
+  digits and the remote name the fake laptop reported. Lessons: (a) `ESP_BT_GAP_CFM_REQ_EVT` carries no name although
+  BTA DM ran a Remote Name Request right before it (`bta_dm_sp_cback`); the session asks again with
+  `esp_bt_gap_read_remote_name()` (once per peer, also for an authorized SPP link whose name is unknown), and
+  `bta_dm_read_rmt_name()` drops the callback when BTM is busy, so "no answer" must mean "show the address", never
+  wait. A successful `AUTH_CMPL` carries `device_name`, but a reconnect with a stored key raises no `AUTH_CMPL`.
+  (b) A late `esp_bt_gap_ssp_confirm_reply()` is harmless: `BTM_ConfirmReqReply()` ignores a reply unless BTM still
+  waits for that peer's numeric confirmation, so the prompt needs no cancel call when the pairing dies first.
+  (c) The peer's LM gives up after the 30 s LMP response timeout, the same as the prompt's, so on silicon a slow
+  answer may meet `AUTH_CMPL` failure first (prompt withdrawn, logged).
+- 2026-11-24 (entropy + ROM key hardening, M2.1/M2.3/M2.5; **interim deviations (5) and (8) closed on the host**,
+  silicon check: `docs/BT_HW_RESULTS.md` phone-mode recipe steps 4, 7 and 9): (1) **Correction of the ROM trace** (`docs/BT_ROM_INTERFACE.md`
+  §2.3, re-derived from the ROM image by `test-bt-port`): `0x31D6C` builds the 128-bit SSP *nonce* (per-link Na/Nb,
+  and the OOB R), not the P-192 secret; the local **P-192 key pair is a constant** that `rom_lm_sec_p192_init` copies
+  from ROM `0xD7EC`/`0xD84C` into RAM `0x00803798`/`0x0080334C` and never regenerates (`d * G` checks; same on every
+  SL6801). With it, a passive observer of any pairing computed the link key, whatever the nonces. (2) **Fix:** a fresh
+  P-192 pair per BT-mode entry (`bt_port/bt_p192.c`, FIPS 186-4 B.4.2 scalar from the DRBG, constant-time ladder,
+  on-curve self-check) is staged before the bring-up job and installed by `bt_rom_real` start() right after the LM
+  bring-up, only if both slots still hold the ROM constant (`key_unexpected` otherwise: nothing written, pairing
+  refused); stop() wipes the private slot. (3) **RNG hook per call site** (`bt_port/bt_rom_rng.c`): all 11 ROM call
+  sites classified by return address; nonce / LMP-random / passkey sites take DRBG bytes from a 512-byte SPSC pool the
+  app refills, and the first nonce call fills the whole 28-byte hash block (17 residue bytes + 4 hook bytes = 168 DRBG
+  bits -> full 128-bit nonces); timing sites and unknown addresses keep the legacy `% 80` exactly (every caller masks
+  or reduces the value: the `0..79` "contract" was never load-bearing for memory safety). (4) **Credited source**
+  (`bt_port/bt_entropy_mic.c`): mic ADC 2 LSBs at gain 8 through the recorder's own capture path at each BT-mode
+  entry, 2048 warm-up samples discarded, 4096 symbols through RCT/APT, **credit 0.5 bit/symbol** (a quarter of Exp 2's
+  quick estimate; raise only from `ea_non_iid` on >= 1M symbols, recipe in BT_HW_RESULTS Exp 2; dumps: exp source
+  5/6, `tools/bt_entropy_unpack.py`). Never touches a running recording (defers; defensive: BT mode is never entered
+  while recording). (5) **Gate (M2.3):** `bt_xrec_plat_pairing_block()`: the SSP part of the window opens only with
+  credited entropy, the key installed by this session's start() and no pool starvation; it is re-checked every poll
+  while open (a pending prompt is rejected with it); without any entropy no window opens (screen "Pairing unavailable",
+  `TODO(i18n)`). Tests: `test-bt-port` (P-192 vectors incl. the ROM and debug pairs + 400 random scalars cross-checked
+  offline; hook/pool; ROM re-derivation: exactly 11 thunk calls, all tabled; mic cutoffs), `test-bt-xrec` [11] and
+  [16]. Lessons: (a) read what the ROM does *after* the RNG: the first trace stopped at "SHA-256 -> 16 bytes -> 0x31A00"
+  and called it the key; 0x31A00 is HMAC (ipad/opad 0x36/0x5C over the same block), i.e. f1, which identifies the
+  value as a nonce, and the real key slot is a plain ROM copy. (b) An RNG hook routed by return address works because
+  the ROM reaches it only through one `bl`'d thunk ending in `bx r3` (LR is the call site); `test_bt_rom_rng`
+  re-checks that from the image so a different ROM revision fails the test instead of silently mis-routing.
+  Residual: P-192 is the ROM's only curve (~96-bit level); the peer's nonce quality is the peer's; the key is per
+  BT-mode entry, not per pairing; credit rests on Exp 2's quick estimate until the NIST run.
+- 2026-11-24 (integration: entropy/ROM key + prompt + bench trigger; host and QEMU only, silicon recipe in
+  `docs/BT_HW_RESULTS.md` "Phone mode (BT=1) on silicon: how to test", steps 1-10): (1) **Gate vs. bring-up order
+  (bug found in integration):** `bt_xrec_open_pairing()` evaluated the M2.3 gate at once, but the session key is
+  installed by `bt_rom_real` start() inside the asynchronous up job (HCI Reset in `esp_bluedroid_enable`), so a window
+  opened in state UP/CONFIG was refused with "ROM P-192 key not replaced". The bench run opens its first window right
+  after `bt_xrec_start()` (`pair=1`, t=0), and a user's ENTER during the ~1-3 s bring-up hit the same. Now the gate of
+  a window opened before READY is decided once READY (`ssp_deferred`, debug `ssp_pending`; `BT SSP pairing window
+  open (opened before READY)`); its XREC PIN is issued at once, and a deferred refusal with no PIN closes the window.
+  "Pairing unavailable" is now driven by a refusal counter (`bt_xrec_debug_t.ssp_gate_refused`) in the BT screen's UI
+  update, so it also appears for a deferred refusal, and holds the XREC PIN toast back for its 2.5 s. (2) **Bench XREC
+  PIN** (`xrec_pin=NNNNNN` in `SD:/BTBENCH.RUN`, `bt_xrec_set_bench_xrec_pin()`): the operator cannot see the screen
+  and the ring log is unreachable while BT mode runs (no USB), so an unattended `+XREC:PAIR` needs a PIN known in
+  advance. Bench-only like `autoconfirm`, cleared at `bt_bench_end()`, logged per window, and still only issued when
+  the DRBG draw succeeds (no entropy, no PIN). (3) **Host harness models the firmware gate:** `host_xrec.c` stages the
+  key only with credited entropy at `stack_up_begin`, "installs" it when `esp_bluedroid_enable()` returned and wipes it
+  at stop; `bthx_withhold_entropy()` models a BT-mode entry whose mic collection credited nothing;
+  `bthx_hold_bringup()` holds the up job so the app task runs in state UP. New phone steps P16 (BACK on the prompt),
+  P17 (bench autoconfirm accepts without the user; CHAL/AUTH twice, distinct nonces), P18 (no entropy: nothing opens
+  even with autoconfirm on, B rejected without a prompt, CHAL fails closed; a later credit gives the XREC PIN but not
+  the SSP part), P19 (bench-style start with the bench PIN: gate deferred to READY, XREC PAIR, CHAL/AUTH, LS, GETS);
+  mutation-checked (no deferral: P19 and `test-bt-xrec` [16] fail; autoconfirm bypassing the gate: P18 fails).
+  Lessons: (a) **the host hid the race:** the worker (priority 2) outranks the app task (priority 1) and the fake ROM
+  answers synchronously, so on the host the whole bring-up finishes before the app task runs again and a window opened
+  "right after start" already saw the key installed; on silicon the ROM bring-up yields. Any host test of "something
+  the app does right after an async job is posted" needs an explicit hold of that job. (b) The ring log cannot be the
+  channel for anything the operator needs *during* a BT run (USB is down); bench inputs go in the request file,
+  results in `BTBENCH.LOG`. (c) `run_bt_xrec_mode()` in `src/main.c` is also the default image's (legacy) BT mode:
+  every added line there needs the `OPENFW_BT_PROMPT` / `OPENFW_BT_BENCH` guard, or the default FIRM CRC moves (one
+  unguarded `last_ui = 0u;` did, caught by the 0xC786 gate).
+- 2026-11-24 (review round on the phone-mode / entropy / ROM-key work; host only, silicon recipe updated in
+  `docs/BT_HW_RESULTS.md`): (1) **Invalid-curve oracle:** the ROM never checks the peer's P-192 key (no curve `b` in
+  the image; `docs/BT_ROM_INTERFACE.md` §2.3 item 4), so an accepted pairing that fails tells the peer the result of
+  a DHKey check with the session key. An accepted comparison whose pairing fails or whose link drops first now
+  **spends the key** (`ssp_burned`): SSP refused until the next BT-mode entry (one query per key; the "~96-bit
+  limit" claim now says passive only). (2) **Gate re-checked at the request and at the answer**, not only by the poll
+  after the event drain: a CFM_REQ whose nonce met a dry pool between two polls was auto-confirmed by the bench path.
+  (3) **Bench code only in bench images** (`make BT=1 BENCH=1` -> `OPENFW_BT_BENCH_IMAGE`): release `BT=1` images have
+  no `BTBENCH.RUN` trigger, no autoconfirm, no fixed PIN (card / USB-disk access could arm them); `test-bt-xrec`
+  checks the release session object for bench symbols. (4) **Mic source sanity gate** (`bt_entropy_mic_frame_check`):
+  frames with a sample at >= 32000 or a peak-to-peak < 8 LSB are not credited (clipping passes RCT/APT at H = 0.5; the
+  test shows it); peak logged; the radio-on retry collection is gone; the REC switch aborts the collection and skips
+  keygen; the mic PGA / ADC analogue enables go off again afterwards (jack-detect bias kept). (5) **Exp 2 controls:**
+  `exp_entropy_dump.c` bits 17/18 (PGA off / analogue path off) and 19 (literal gain, gain 0); restart rows across
+  boots. (6) **UI:** prompt keys within 1 s after the prompt ended are swallowed (`bt_xrec_ssp_answer` -3); ENTER on a
+  window with > 10 s left keeps its XREC PIN; stale prompt fields cleared at BT entry; gate-toast counter snapshot
+  after start; BT status line `LONG_DOT`; toast label sized to its text (BT=1 only). Lessons: (a) **every toast in
+  every image renders as a "..." pill** (`LV_LABEL_LONG_DOT` on a `LV_SIZE_CONTENT` label dots against the pre-layout
+  0 px width) and the old render test only checked the pill's bounds: fixed under `OPENFW_BT_BLUEDROID` here (the
+  default image must not move), **the same fix belongs on main**; `make test-host` now also renders the BT=1 UI and
+  asserts label texts. (b) The ADC analogue state is shared with the PB11 jack detect (`ANA_CTRL0 0x22`, keys.c):
+  "power the codec down" must stop at what the capture added. (c) Health tests sized for H = 0.5 on 2-bit symbols
+  are blind to anything but a stuck value; a source-specific plausibility check on the raw samples has to sit in
+  front of the credit.
 
 ## 11. Round-1 traceability
 

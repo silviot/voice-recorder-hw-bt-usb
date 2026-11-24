@@ -6,7 +6,8 @@
  *
  * Steps (each one CHECKed; any failure stops the scenario):
  *   1. bt_xrec_start -> READY (SPP server on channel 1); pairing window opened -> discoverable (0C1A 0x03).
- *   2. Laptop A pages, authenticates: SSP numeric comparison (A DisplayYesNo) accepted inside the window; the link key
+ *   2. Laptop A pages, authenticates: SSP numeric comparison (A DisplayYesNo) inside the window waits on the device's
+ *      prompt (value + remote name "laptop-A"), the test answers ENTER (BTHX_SSP_ANSWER); the link key
  *      is notified, stored through bt_store and written to /bt_bonds.bin; A encrypts.
  *   3. SDP: ServiceSearchAttribute for 0x1101 finds "Cassini" on RFCOMM channel 1.
  *   4. RFCOMM: mux SABM, PN (CFC), DLC SABM, MSC -> ESP_SPP_SRV_OPEN, link authorized for XREC.
@@ -29,7 +30,19 @@
  *  14. Restart; C reconnects with that key: never authorized for XREC.
  *  15. A stale Just Works bond of C planted in /bt_bonds.bin, the card refusing writes meanwhile: removed at start
  *      (and the removal written once the card recovers), C never authorized.
- *  16. bt_xrec_stop: baseline restored, no fake-ROM contract error, no unknown opcode, no BT fault, no HCI timeout;
+ *  16. Window open, laptop B pairs; the user presses BACK on the prompt (BTHX_SSP_ANSWER 0): negative reply, no bond,
+ *      window still open, an ENTER right after it is swallowed (-3), one 1 s later finds no prompt (-1).
+ *  17. BENCH autoconfirm (bt_xrec_set_bench_autoconfirm, as SD:/BTBENCH.RUN autoconfirm=1): laptop D's comparison is
+ *      accepted without the user, MITM bond, the window's SSP part closes; D: CHAL/AUTH twice (distinct DRBG nonces),
+ *      GETS.
+ *  18. Restart with the session's entropy withheld (host model of a BT-mode entry whose mic collection credited
+ *      nothing; host_xrec.c): the plan M2.3 gate refuses, nothing opens even with the bench override on, B is
+ *      rejected without a prompt, D's CHAL fails closed (no nonce, link closed); a later credit gives the XREC PIN but
+ *      the SSP part stays refused (the ROM P-192 key is only replaced at a controller start).
+ *  19. Bench-style start: window opened right after bt_xrec_start, before READY (main.c bt_bench_begin, pair=1 at
+ *      t=0; bench XREC PIN xrec_pin=246810): the gate is decided at READY and the SSP part opens; D: XREC PAIR with
+ *      the bench PIN and a new key, CHAL/AUTH with it, LS, GETS of a small range; bench PIN off: DRBG PIN again.
+ *  20. bt_xrec_stop: baseline restored, no fake-ROM contract error, no unknown opcode, no BT fault, no HCI timeout;
  *      the scenario's heap peak against a host regression ceiling.
  * SPDX-License-Identifier: MIT */
 #include <stdbool.h>
@@ -1048,6 +1061,7 @@ static bool gets_verify(const char *name, uint32_t seed, uint32_t off, uint32_t 
     return true;
 }
 
+static uint8_t s_chal_nonce[16];       /* the last CHAL nonce (DRBG output on the device) */
 static bool xrec_auth_chal(const uint8_t key[32])
 {
     char line[160];
@@ -1064,6 +1078,7 @@ static bool xrec_auth_chal(const uint8_t key[32])
         }
         nonce[i] = (uint8_t)v;
     }
+    memcpy(s_chal_nonce, nonce, 16u);
     uint8_t mac[32];
     openfw_hmac_sha256(key, 32u, nonce, 16u, mac);
     char cmd[96] = "+XREC:AUTH,";
@@ -1189,6 +1204,16 @@ static bool step_pair_window_and_bond(uint8_t key_out[16])
     snprintf(want, sizeof(want), "%06u", (unsigned)(a.numeric % 1000000u));
     bth_step("SSP numeric comparison", 10000u);
     peer_authenticate();
+    /* plan M4: the device shows the value and the peer and waits for the local user (ENTER) */
+    bool prompt = WAIT(S().ui.prompt, 3000);
+    bthx_snap_t ps = S();
+    PCHECK(prompt && strcmp(ps.ui.digits, want) == 0, "prompt %u digits '%s', want %s", ps.ui.prompt, ps.ui.digits,
+           want);
+    PCHECK(fake_peer.host_confirms == 0u && fake_peer.pairings == 0u, "confirmed before the user answered");
+    PCHECK(WAIT(strcmp(S().ui.peer, "laptop-A") == 0, 2000), "prompt peer '%s', want the remote name laptop-A",
+           S().ui.peer);
+    vTaskDelay(pdMS_TO_TICKS(BT_XREC_SSP_ARM_MS + 50u));
+    PCHECK(bthx_call(BTHX_SSP_ANSWER, 1u, 2000u) == 0, "ENTER on the prompt");
     bool paired = WAIT(fake_peer.pairings == 1u && fake_peer.encrypted, 5000);
     bth_step_done();
     PCHECK(paired, "pairing (pairings %u, encrypted %u, confirms %u, rejects %u)", fake_peer.pairings,
@@ -1198,8 +1223,7 @@ static bool step_pair_window_and_bond(uint8_t key_out[16])
     bool seen = WAIT(S().d.ssp_accepted == 1u && S().bonds == 1, 3000);
     bthx_snap_t s = S();
     PCHECK(seen, "session: ssp_accepted %u, bonds %d", s.d.ssp_accepted, s.bonds);
-    /* the value the user compares: logged and shown in bt_status_t.pair_pin from the confirmation request until the
-     * bond completes (the fake laptop's user confirms at once, so the screen window is not sampled here) */
+    /* the value the user compared: shown on the prompt (checked above) and logged with the user's accept */
     PCHECK(bthx_ssp_value_logged() == a.numeric % 1000000u, "numeric comparison value %u logged, want %s",
            (unsigned)bthx_ssp_value_logged(), want);
     memcpy(key_out, fake_peer.key, 16u);
@@ -1385,8 +1409,8 @@ int bth_phone_scenario(const char *img_path)
     PCHECK(x_send("+XREC:PING\r") && x_line(line, sizeof(line), 3000u), "PING");
     PCHECK(strncmp(line, "+XREC:PONG,openfw_v5,v5,bound=0,auth=0,pair=1", 45) == 0, "PONG '%s'", line);
     {
-        /* bt_status_t.pair_pin shows the numeric comparison value until the bond completes, then the XREC PIN (the
-         * user reads it off the screen and types it into the app / bt_sync.py --pair) */
+        /* bt_status_t.pair_pin shows the XREC PIN (the user reads it off the screen and types it into the app /
+         * bt_sync.py --pair); the numeric comparison value only ever appears on the prompt */
         char k[80], cmd[128];
         hex(k, xkey, 32u);
         PCHECK(!S().d.ssp_showing, "numeric comparison value still shown after the bond");
@@ -1694,7 +1718,237 @@ int bth_phone_scenario(const char *img_path)
     }
 
     /* ---- 16 ---- */
-    bth_log("[P16] bt_xrec_stop\n");
+    bth_log("[P16] window open, laptop B pairs; the user presses BACK on the prompt: rejected, no bond\n");
+    {
+        bthx_call(BTHX_OPEN_PAIRING, 60000u, 2000u);
+        PCHECK(WAIT(S().d.scan_disc == 1u && S().d.ssp_window, 2000), "window not opened (ssp %u)", S().d.ssp_window);
+        fake_peer_cfg_t b;
+        peer_cfg(&b, 0xB2u, 0x01u, 0x05u, 0x05u, "laptop-B");
+        peer_attach(&b, NULL);
+        bthx_snap_t s0 = S();
+        if (!peer_page_and_connect()) {
+            goto out;
+        }
+        char want[8];
+        snprintf(want, sizeof(want), "%06u", (unsigned)(b.numeric % 1000000u));
+        peer_authenticate();
+        PCHECK(WAIT(S().ui.prompt && strcmp(S().ui.digits, want) == 0, 3000), "prompt with B's value %s ('%s')", want,
+               S().ui.digits);
+        PCHECK(WAIT(strcmp(S().ui.peer, "laptop-B") == 0, 2000), "prompt peer '%s', want laptop-B", S().ui.peer);
+        vTaskDelay(pdMS_TO_TICKS(BT_XREC_SSP_ARM_MS + 50u));
+        PCHECK(bthx_call(BTHX_SSP_ANSWER, 0u, 2000u) == 0, "BACK on the prompt");
+        PCHECK(WAIT(fake_peer.host_rejects == 1u || fake_peer.auth_fail > 0u, 3000), "no negative confirmation reply");
+        PCHECK(fake_peer.pairings == 0u && fake_peer.host_confirms == 0u, "B paired after BACK (pairings %u confirms "
+               "%u)", fake_peer.pairings, fake_peer.host_confirms);
+        (void)WAIT(S().d.ssp_user_rejected != s0.d.ssp_user_rejected, 2000);   /* snapshot can trail the reply */
+        bthx_snap_t s1 = S();
+        PCHECK(s1.d.ssp_user_rejected == s0.d.ssp_user_rejected + 1u && !s1.ui.prompt, "user reject not counted "
+               "(%u -> %u, prompt %u)", s0.d.ssp_user_rejected, s1.d.ssp_user_rejected, s1.ui.prompt);
+        /* a second key right after the answer is swallowed (-3: not "leave BT mode" / "open a window") */
+        PCHECK(bthx_call(BTHX_SSP_ANSWER, 1u, 2000u) == -3, "a late ENTER was not swallowed after BACK");
+        vTaskDelay(pdMS_TO_TICKS(BT_XREC_SSP_AFTER_MS + 50u));
+        PCHECK(bthx_call(BTHX_SSP_ANSWER, 1u, 2000u) == -1, "ENTER 1 s after BACK found a prompt");
+        vTaskDelay(pdMS_TO_TICKS(100));
+        PCHECK(S().d.ssp_window && S().bonds == 1, "after BACK: window %u (want still open), bonds %d (want only A)",
+               S().d.ssp_window, S().bonds);
+        peer_drop(0x13u);
+        PCHECK(WAIT(S().d.acl_links == 0u && !S().ui.connected, 3000), "B link not down");
+    }
+
+    /* ---- 17 ---- */
+    bth_log("[P17] BENCH autoconfirm (SD:/BTBENCH.RUN autoconfirm=1): laptop D accepted without the user; D: XREC "
+            "CHAL/AUTH twice, GETS\n");
+    uint8_t dkey[16];
+    {
+        PCHECK(bthx_call(BTHX_BENCH_AUTOCONFIRM, 1u, 2000u) == 0, "bench autoconfirm on");
+        PCHECK(S().d.ssp_window, "window closed before D");
+        fake_peer_cfg_t d;
+        peer_cfg(&d, 0xD4u, 0x01u, 0x05u, 0x05u, "laptop-D");
+        peer_attach(&d, NULL);
+        bthx_snap_t s0 = S();
+        if (!peer_page_and_connect()) {
+            goto out;
+        }
+        peer_authenticate();
+        bool paired = WAIT(fake_peer.pairings == 1u && fake_peer.encrypted, 5000);
+        PCHECK(paired && fake_peer.host_confirms == 1u && fake_peer.host_rejects == 0u, "D not paired by the bench "
+               "override (pairings %u confirms %u rejects %u)", fake_peer.pairings, fake_peer.host_confirms,
+               fake_peer.host_rejects);
+        (void)WAIT(S().d.ssp_bench_autoconfirmed != s0.d.ssp_bench_autoconfirmed, 2000);   /* snapshot can trail */
+        bthx_snap_t s1 = S();
+        PCHECK(s1.d.ssp_bench_autoconfirmed == s0.d.ssp_bench_autoconfirmed + 1u &&
+               s1.d.ssp_user_accepted == s0.d.ssp_user_accepted && !s1.ui.prompt,
+               "bench accept counters (bench %u -> %u, user %u -> %u, prompt %u)", s0.d.ssp_bench_autoconfirmed,
+               s1.d.ssp_bench_autoconfirmed, s0.d.ssp_user_accepted, s1.d.ssp_user_accepted, s1.ui.prompt);
+        PCHECK(WAIT(S().bonds == 2 && !S().d.ssp_window && S().d.scan_applied == 1u, 3000), "D's MITM bond: bonds %d, "
+               "SSP part %u, scan %u (one bond per window)", S().bonds, S().d.ssp_window, S().d.scan_applied);
+        memcpy(dkey, fake_peer.key, 16u);
+        PCHECK(bthx_call(BTHX_BENCH_AUTOCONFIRM, 0u, 2000u) == 0, "bench autoconfirm off");
+        if (!step_rfcomm_open()) {
+            goto out;
+        }
+        PCHECK(x_send("+XREC:PING\r") && x_line(line, sizeof(line), 3000u), "PING (D)");
+        PCHECK(strncmp(line, "+XREC:PONG,openfw_v5,v5,bound=1,auth=0", 38) == 0, "PONG (D) '%s'", line);
+        uint8_t n1[16];
+        PCHECK(xrec_auth_chal(xkey), "CHAL/AUTH (D)");
+        memcpy(n1, s_chal_nonce, 16u);
+        PCHECK(xrec_auth_chal(xkey), "second CHAL/AUTH (D)");
+        static const uint8_t zero16[16] = { 0 };
+        PCHECK(memcmp(n1, s_chal_nonce, 16u) != 0 && memcmp(n1, zero16, 16u) != 0, "CHAL nonces repeat or are zero");
+        PCHECK(gets_verify("REC0001.WAV", 1u, 2000u, 4000u, 640u, -1, NULL), "GETS (D)");
+        peer_drop(0x13u);
+        PCHECK(WAIT(!S().d.conn_open && S().d.acl_links == 0u, 3000), "D link not down");
+    }
+    if (p_fail) {
+        goto out;
+    }
+
+    /* ---- 18 ---- */
+    bth_log("[P18] BT-mode entry without credited entropy: nothing opens (bench override on), B rejected without a "
+            "prompt, D's CHAL fails closed; a later credit gives the XREC PIN but no SSP (ROM key)\n");
+    stop_session(&base, "stop before the no-entropy session");
+    bthx_withhold_entropy(1);
+    rom_cmds_clear();
+    if (!wait_ready()) {
+        bthx_withhold_entropy(0);
+        goto out;
+    }
+    {
+        PCHECK(bthx_call(BTHX_BENCH_AUTOCONFIRM, 1u, 2000u) == 0, "bench autoconfirm on");
+        uint32_t r0 = S().d.ssp_gate_refused;
+        bthx_call(BTHX_OPEN_PAIRING, 60000u, 2000u);
+        PCHECK(WAIT(S().d.ssp_gate_refused == r0 + 1u, 1000), "gate refusal not counted (%u)", S().d.ssp_gate_refused);
+        s = S();
+        PCHECK(!s.d.window_open && !s.d.ssp_window && !s.ui.window_open && s.d.scan_applied == 1u &&
+               s.st.pair_pin[0] == '\0', "no entropy: window %u ssp %u ui %u scan %u PIN '%s' (want nothing open)",
+               s.d.window_open, s.d.ssp_window, s.ui.window_open, s.d.scan_applied, s.st.pair_pin);
+        fake_peer_cfg_t b;
+        peer_cfg(&b, 0xB2u, 0x01u, 0x05u, 0x05u, "laptop-B");
+        peer_attach(&b, NULL);
+        uint32_t rej0 = S().d.ssp_rejected;
+        if (!peer_page_and_connect()) {
+            bthx_withhold_entropy(0);
+            goto out;
+        }
+        peer_authenticate();
+        PCHECK(WAIT(fake_peer.host_rejects == 1u || fake_peer.auth_fail > 0u, 3000), "no negative confirmation reply");
+        PCHECK(WAIT(S().d.ssp_rejected == rej0 + 1u, 2000), "rejection not counted");
+        s = S();
+        PCHECK(fake_peer.pairings == 0u && s.d.ssp_bench_autoconfirmed == 0u && !s.ui.prompt && s.bonds == 2,
+               "B with no entropy: pairings %u bench accepts %u prompt %u bonds %d", fake_peer.pairings,
+               s.d.ssp_bench_autoconfirmed, s.ui.prompt, s.bonds);
+        peer_drop(0x13u);
+        PCHECK(WAIT(S().d.acl_links == 0u, 3000), "B link not down");
+
+        fake_peer_cfg_t d;
+        peer_cfg(&d, 0xD4u, 0x01u, 0x05u, 0x05u, "laptop-D");
+        peer_attach(&d, dkey);
+        if (!peer_page_and_connect()) {
+            bthx_withhold_entropy(0);
+            goto out;
+        }
+        peer_authenticate();
+        PCHECK(WAIT(fake_peer.authenticated && fake_peer.encrypted, 3000), "D authentication with its stored key");
+        if (!step_rfcomm_open()) {
+            bthx_withhold_entropy(0);
+            goto out;
+        }
+        PCHECK(x_send("+XREC:CHAL\r"), "CHAL (no entropy)");
+        bool reply = x_line(line, sizeof(line), 800u);
+        PCHECK(!reply || strncmp(line, "+XREC:CHAL,", 11) != 0, "CHAL answered without entropy: '%s'", line);
+        PCHECK(WAIT(!S().d.conn_open && S().st.xrec_auth == 0u, 3000), "link not closed after the refused CHAL (open "
+               "%u auth %u)", S().d.conn_open, S().st.xrec_auth);
+        peer_drop(0x13u);
+        PCHECK(WAIT(S().d.acl_links == 0u && !S().d.conn_open, 3000), "D link not down");
+
+        /* deferred mic collection credits later in the session: the DRBG serves the XREC PIN again, but the ROM key
+         * is only replaced at a controller start: the SSP part stays refused until the next BT-mode entry */
+        bthx_withhold_entropy(0);
+        r0 = S().d.ssp_gate_refused;
+        bthx_call(BTHX_OPEN_PAIRING, 60000u, 2000u);
+        PCHECK(WAIT(S().d.ssp_gate_refused == r0 + 1u, 1000), "gate refusal (ROM key) not counted");
+        s = S();
+        PCHECK(s.d.window_open && strlen(s.st.pair_pin) == 6u && !s.d.ssp_window && s.d.scan_applied == 1u,
+               "late credit: window %u PIN '%s' ssp %u scan %u (want XREC PIN only)", s.d.window_open, s.st.pair_pin,
+               s.d.ssp_window, s.d.scan_applied);
+        PCHECK(bthx_call(BTHX_BENCH_AUTOCONFIRM, 0u, 2000u) == 0, "bench autoconfirm off");
+    }
+    stop_session(&base, "stop after the no-entropy session");
+    if (p_fail) {
+        goto out;
+    }
+
+    /* ---- 19 ---- */
+    bth_log("[P19] bench-style start (window opened right after bt_xrec_start, before READY): SSP part opens at READY; "
+            "D: XREC PAIR with the PIN (new key), CHAL/AUTH, LS, GETS\n");
+    rom_cmds_clear();
+    {
+        bth_step("bt_xrec_start + open_pairing -> READY", 20000u);
+        PCHECK(bthx_call(BTHX_BENCH_XREC_PIN, 246810u, 2000u) == 0, "bench XREC PIN (xrec_pin=246810)");
+        bthx_hold_bringup(1);            /* the controller has not started when the window opens (as on target) */
+        PCHECK(bthx_call(BTHX_START_PAIR, 60000u, 3000u) == 0, "bt_xrec_start + bt_xrec_open_pairing");
+        bool up = WAIT(S().d.state == BT_XREC_ST_UP && S().d.window_open, 1000);
+        vTaskDelay(pdMS_TO_TICKS(200));
+        bthx_snap_t s0 = S();
+        bthx_hold_bringup(0);
+        PCHECK(up && s0.d.state == BT_XREC_ST_UP && s0.d.ssp_pending && !s0.d.ssp_window && s0.d.ssp_gate_refused == 0u &&
+               strlen(s0.st.pair_pin) == 6u, "before READY: state %u pending %u ssp %u refused %u PIN '%s' (want the gate "
+               "deferred, the XREC PIN out)", s0.d.state, s0.d.ssp_pending, s0.d.ssp_window, s0.d.ssp_gate_refused,
+               s0.st.pair_pin);
+        bool ok = WAIT(S().d.state == BT_XREC_ST_READY || S().d.state == BT_XREC_ST_FAULTED, 15000);
+        bth_step_done();
+        PCHECK(ok && S().d.state == BT_XREC_ST_READY, "session not READY (state %u)", S().d.state);
+        PCHECK(WAIT(S().d.ssp_window && S().d.scan_disc == 1u, 2000), "SSP part not opened at READY (ssp %u pending %u "
+               "refused %u)", S().d.ssp_window, S().d.ssp_pending, S().d.ssp_gate_refused);
+        s = S();
+        PCHECK(s.d.ssp_gate_refused == 0u && !s.d.ssp_pending && s.d.window_open && strlen(s.st.pair_pin) == 6u,
+               "deferred gate: refused %u pending %u window %u PIN '%s'", s.d.ssp_gate_refused, s.d.ssp_pending,
+               s.d.window_open, s.st.pair_pin);
+        PCHECK(WAIT(rom_cmd_last_byte0(0xE02Cu, &found) == 0x03u, 2000), "0C1A 0x03 (inquiry + page scan) not sent");
+
+        fake_peer_cfg_t d;
+        peer_cfg(&d, 0xD4u, 0x01u, 0x05u, 0x05u, "laptop-D");
+        peer_attach(&d, dkey);
+        if (!peer_page_and_connect()) {
+            goto out;
+        }
+        peer_authenticate();
+        PCHECK(WAIT(fake_peer.authenticated && fake_peer.encrypted, 3000), "D authentication with its stored key");
+        if (!step_rfcomm_open()) {
+            goto out;
+        }
+        PCHECK(x_send("+XREC:PING\r") && x_line(line, sizeof(line), 3000u), "PING");
+        PCHECK(strncmp(line, "+XREC:PONG,openfw_v5,v5,bound=1,auth=0,pair=1", 45) == 0, "PONG '%s'", line);
+        static const uint8_t xkey2[32] = { 0xA5, 0x5A, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 31, 30, 29, 28,
+                                           27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10 };
+        char k[80], cmd[128];
+        hex(k, xkey2, 32u);
+        uint32_t kw0 = bthx_key_writes();
+        s = S();
+        PCHECK(strcmp(s.st.pair_pin, "246810") == 0, "window PIN '%s', want the bench PIN 246810", s.st.pair_pin);
+        snprintf(cmd, sizeof(cmd), "+XREC:PAIR,%s,%s\r", "246810", k);   /* the operator knows it in advance */
+        PCHECK(x_send(cmd) && x_line(line, sizeof(line), 3000u), "PAIR");
+        PCHECK(strcmp(line, "+XREC:OK,PAIR") == 0, "PAIR reply '%s'", line);
+        PCHECK(WAIT(!S().d.window_open && S().d.scan_applied == 1u, 2000), "window/discoverability not closed by PAIR");
+        PCHECK(WAIT(bthx_key_writes() == kw0 + 1u, 2000), "/cassini.key not rewritten");
+        PCHECK(xrec_auth_chal(xkey2), "CHAL/AUTH with the new key");
+        PCHECK(x_send("+XREC:LS\r"), "LS");
+        int files = 0;
+        while (x_line(line, sizeof(line), 3000u) && strcmp(line, "+XREC:END") != 0) {
+            files++;
+        }
+        PCHECK(strcmp(line, "+XREC:END") == 0 && files == 2, "LS listing (%d files, last '%s')", files, line);
+        PCHECK(gets_verify("REC0001.WAV", 1u, 0u, 3000u, 640u, -1, NULL), "GETS (small file)");
+        peer_drop(0x13u);
+        PCHECK(WAIT(!S().d.conn_open && S().d.acl_links == 0u, 3000), "D link not down");
+        PCHECK(bthx_call(BTHX_BENCH_XREC_PIN, 0xFFFFFFFFu, 2000u) == 0, "bench XREC PIN off (bt_bench_end)");
+        bthx_call(BTHX_OPEN_PAIRING, 60000u, 2000u);
+        PCHECK(WAIT(S().d.window_open && strlen(S().st.pair_pin) == 6u, 1000) &&
+               strcmp(S().st.pair_pin, "246810") != 0, "after the bench run: DRBG PIN again ('%s')", S().st.pair_pin);
+    }
+
+    /* ---- 20 ---- */
+    bth_log("[P20] bt_xrec_stop\n");
     stop_session(&base, "final stop");
     {
         static uint8_t img[BT_STORE_IMAGE_MAX];

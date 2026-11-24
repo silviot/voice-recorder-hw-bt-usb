@@ -41,6 +41,82 @@ Provisional source config: mic ADC at gain 8, the 2 low bits of each sample as o
 Still required before crediting in a release: NIST SP 800-90B `ea_non_iid` on longer dumps, cold-start and quiet-room
 repeats, and confirmation that the noise is electronic (it is present at low gain).
 
+**Wired (2026-11-24, BT=1 phone images): `open_fw/bt_port/bt_entropy_mic.c`, credited at 0.5 bit/symbol** (a quarter
+of the quick estimate, half the provisional figure, until the NIST run below says more): at every BT-mode entry the app
+captures through the recorder's own path (gain 8, mono), discards the first 2048 samples (128 ms), feeds 4096 2-bit
+symbols through the SP 800-90B RCT (cutoff 41) / APT (410 of 512) health tests into `bt_entropy` and mixes the full
+frames with zero credit: first collection 1024 start-up + 3072 x 0.5 = 1536 credited bits (seed needs 384), later ones
+2048 (reseed). About 0.4 s added to BT start. A health failure latches until reboot. If the recorder holds the ADC
+(recording, VOR wait) nothing is captured and the session gets **no** new credit (no retry: see below); the ROM key
+is then not replaced unless an earlier session of the same boot already seeded the DRBG, so SSP pairing stays
+refused until the next BT-mode entry.
+
+**Review fixes (2026-11-24, host only):**
+- *Source sanity gate* (`bt_entropy_mic_frame_check`, host-tested in `tests/test_bt_entropy.c`): the RCT/APT at
+  H = 0.5 catch only a source stuck on one symbol. Hard clipping (runs of `0x7FFF` = symbol 3 and `0x8000` = symbol 0,
+  each run under the RCT cutoff, ~50 % in the APT window) passes them and would be credited in full (the test shows
+  it). So each DMA frame's used samples are checked before any is credited: a sample with `|x| >= 32000` ends the
+  collection (`... rejected: input at full scale ...`), and so does a frame with a peak-to-peak below 8 LSB (no
+  analogue noise; Exp 2's near-uniform bit 2 at gain 8 implies a spread far above that). The log line now carries
+  the collection's peak: `BT entropy mic: 4096 symbols (0:a 1:b 2:c 3:d) peak P in T ms, ok`. **Calibrate on
+  silicon:** P in a quiet room at gain 8 (expected: tens to a few hundred LSB) tells how much headroom the 32000
+  limit has; a quiet-room `rejected` means the limits are wrong, not the room.
+- *No collection with the radio on.* The old retry every 5 s from the session poll sampled while the controller ran
+  its 1600 Hz slot tick, a condition Exp 2 never measured, and blocked the poll for up to ~0.55 s each time. It is
+  gone: the only collection is the one at BT-mode entry, before the controller starts.
+- *REC switch:* the collection polls the REC switch and stops at once (`BT entropy mic: skipped (REC switch on), no
+  credit this session`); key generation is skipped too (`BT P-192 key generation skipped: REC switch on`), so the
+  BT-mode loop hands over to the recorder right away. Entry latency otherwise = mic T + keygen N + RF calibration:
+  report T and N from step 7.
+- *Power:* after the collection the AMIC1 PGA enables (`CODEC_AMIC01_PGA 0x20430000`) and `ANA_CTRL0`'s high
+  enables (`0xC0000000`) are cleared again; the boot-time jack-detect bias (`ANA_CTRL0 0x22`, codec clock, global
+  enable, `DAC_ANA_CFG0[9]`, keys.c) stays, and so does the APLL (as after a playback: its power-down is not
+  traced). Unmeasured on silicon: compare idle current after a BT session with a fresh boot (step 9).
+
+### Entropy source assessment (NIST SP 800-90B) — recipe for the lead
+Raw data exactly as the firmware sees it: `open_fw/exp/exp_entropy_dump.c` **source 5** (sequential: 65,536 symbols per
+run, packed 4 per byte) and **source 6** (restart rows: 16 x (capture start, discard 2048, 1000 symbols, stop) per run).
+`arg = 5 | gain << 8` (gain 0 = the firmware's 8, unless `| 1 << 19`: gain field literal, so gain 0 can be
+captured), `| 1 << 16` keeps the warm-up samples (start-up behaviour). **Control flags** (is the noise analogue?
+Exp 2 listed this as still required and could not run it): `| 1 << 17` clears the AMIC1 PGA enables right after the
+capture starts (unamplified, unbiased input), `| 1 << 18` additionally clears `ANA_CTRL0 0xC3000022` (analogue core
+and MICBIAS; `0x22` is restored after the capture for the jack detect). The log line `control=` shows 0 / 1 / 2.
+```bash
+mkdir -p /tmp/ent                                          # any image with the exp runner; repo root as cwd
+EXP="sudo env LLD=$(command -v ld.lld-20 || command -v ld.lld) OBJCOPY=$(command -v llvm-objcopy-20 || command -v llvm-objcopy) CLANG=$(command -v clang) python3 tools/dev_cycle.py exp"
+for i in $(seq -w 1 16); do                                # 16 x 65536 = 1,048,576 symbols (>= 1M for ea_non_iid)
+  $EXP open_fw/exp/exp_entropy_dump.c --arg 5 --dump-out /tmp/ent/seq_$i.bin
+done                                                       # each log: symbols=65536 overruns=0 (discard a run with overruns)
+for i in $(seq -w 1 63); do                                # 63 x 16 rows >= 1000 restart rows, one boot per run
+  sudo python3 tools/dev_cycle.py dfu && sudo python3 tools/dev_cycle.py boot   # reset first: rows span 63 boots
+  $EXP open_fw/exp/exp_entropy_dump.c --arg 6 --dump-out /tmp/ent/rst_$i.bin
+done                                                       # (16 rows of one run share a boot; a codec dither LFSR
+                                                           #  that survives capture stop/start would pass within one)
+# Controls, gain 8: PGA off, then analogue path off; then gain 0 (literal) with the path on
+$EXP open_fw/exp/exp_entropy_dump.c --arg $((5 | 1 << 17)) --dump-out /tmp/ent/ctl_pga_off.bin
+$EXP open_fw/exp/exp_entropy_dump.c --arg $((5 | 1 << 18)) --dump-out /tmp/ent/ctl_ana_off.bin
+$EXP open_fw/exp/exp_entropy_dump.c --arg $((5 | 1 << 19)) --dump-out /tmp/ent/ctl_gain0.bin
+for c in pga_off ana_off gain0; do python3 tools/bt_entropy_unpack.py seq /tmp/ent/ctl_$c.sym /tmp/ent/ctl_$c.bin; done
+python3 tools/bt_entropy_unpack.py seq /tmp/ent/mic_seq.bin /tmp/ent/seq_*.bin          # also prints a quick MCV
+python3 tools/bt_entropy_unpack.py restart /tmp/ent/mic_restart.bin /tmp/ent/rst_*.bin
+# NIST tool (C++; Ubuntu deps: sudo apt-get install libbz2-dev libdivsufsort-dev libjsoncpp-dev libssl-dev libmpfr-dev libgmp-dev)
+git clone --depth 1 https://github.com/usnistgov/SP800-90B_EntropyAssessment.git /tmp/ea && make -C /tmp/ea/cpp non_iid restart
+cd /tmp/ent && /tmp/ea/cpp/ea_non_iid -i -a -v mic_seq.bin 2         # -> H_I (min of H_original, 2 x H_bitstring)
+/tmp/ea/cpp/ea_restart -n -v mic_restart.bin 2 <H_I>                   # -n = non-IID (-i would mean IID here)
+```
+(The tools want a relative file name. `ea_restart` must pass its sanity check; its validated value is the one to use.)
+**Controls, expected:** with the analogue path off (`ctl_ana_off`) the low bits must collapse (quick MCV far below
+the gain-8 run, or a constant / short cycle). If they stay near the gain-8 value, the "noise" is generated on the
+digital side (codec dither or idle tones): do **not** credit the source until that is understood, even if
+`ea_non_iid` passes (a deterministic generator can pass it). PGA off and gain 0 show how much of the noise comes from
+the microphone path versus the ADC front end (both are electronic; report the MCVs).
+Repeat on a second day / after a cold start, in a quiet room and with speech near the mic, and once at the user's
+usual recording gain (`--arg $((5 | 20 << 8))`) to see how much the signal moves the low bits. **Decision rule:**
+`BT_ENT_MIC_H_X16` (`bt_entropy_mic.h`, 1/16 bit per symbol) must stay <= half of the smallest assessed min-entropy,
+and never above 16 (1 bit/symbol) without a written reason; the RCT/APT cutoffs in the same header are recomputed by
+`tests/test_bt_entropy.c` (`make -C open_fw test-bt-port` fails if they no longer match the claim). Record the results
+here.
+
 ### Other observations
 - eFuse words: `w0=0x1510011D w1=0x003D4000 w2=0x00000600 w3=0xC0000440`; the legacy BD_ADDR `02:CA:55:00:01:1D`
   ends with w0's low bytes — candidate stable device-identity input (plan M1 "Local identity").
@@ -302,125 +378,302 @@ Lessons from building stage B (QEMU, 2026-11-24):
   (RF-calibration busy-wait at `bt_ctrl` priority) under QEMU. Re-run before suspecting the port. The same `btport`
   step-3 failure also showed up once in plain `test-qemu-bt` (no probe linked; the next three runs passed) while the
   host was building in parallel: the check depends on QEMU's wall-clock pacing, not only on the probe.
+  **Fixed (2026-11-24):** a reported `test-qemu-hciprobe` failure "with `HCIP TIMEOUT what=irq26` after a 514 ms
+  Reset" was this same step 3 (`[FAIL] btport (detail=3)` / "RTOS selftest reported failures"; the TIMEOUT line is the
+  *expected* QEMU outcome and only happened to be printed next to it): reproduced with the first Reset at `lat=534897`.
+  Step 3 now measures the elapsed time with `esp_timer_get_time()` and judges "not early" only when less than 5 ms
+  passed (`src/rtos/rtos_selftest.c`, QEMU self-test images only). The QEMU-only probe images (`HCI_PROBE_AUTORUN` /
+  `_WAIVE_LIVENESS`) also get 5x the Reset / hang / teardown deadlines (`HCI_PROBE_QEMU_SLACK` in `hci_probe.c`,
+  `BEGIN ... dl_reset=10000000 hang=15000000`), so a slow host cannot turn the expected liveness TIMEOUT into a Reset
+  timeout, HANG or HARDSTOP; the silicon probe image is unchanged (identical object code, 2 s / 3 s / 1 s).
 
 ## Phone mode (BT=1) on silicon: how to test
 
-What runs: every `BT=1` image without `HCI_PROBE` replaces the legacy phone mode with the Bluedroid session
-(`open_fw/bt_port/bt_xrec_bluedroid.c` + `bt_xrec_fw.c`, plan M4). Host status (2026-11-24): `make -C open_fw
-test-bt-host` runs the whole path end to end against the fake ROM (`tests/bt_host/README.md` scenario P), including
-SSP numeric comparison, bond store, SDP, RFCOMM, XREC, reconnect, restart and teardown with a connected peer. Nothing
-of it has run on silicon yet: the ROM's answers to the newly forwarded commands (`docs/BT_ROM_HCI_MAP.md` §10) are the
-first thing this test checks.
+One ordered recipe for the lead: steps 1-8 need **no key press on the device** (the `SD:/BTBENCH.RUN` bench trigger
+of a **bench image**, `make BT=1 BENCH=1`, enters BT mode, opens the pairing windows, confirms the numeric comparison
+and supplies a known XREC PIN), step 9 lists the few checks that need a person at the device, step 10 is the entropy
+assessment. Nothing of phone mode has
+run on silicon yet; the host runs the same path end to end (`make -C open_fw test-bt-host`, `tests/bt_host/README.md`
+scenario P, steps P1-P20, against the fake ROM).
 
-**Known limit until an entropy source is registered in firmware** (plan live log, interim deviation 5):
-`bt_entropy_get()` fails closed, so the XREC PIN is not issued (`+XREC:PAIR` answers `+XREC:ERR,PAIRCLOSED`) and
-`+XREC:CHAL` closes the link. Everything below the XREC authentication (radio, Bluedroid over `bt_ctrl`/ROM, pairing,
-bonds, SDP, RFCOMM, `+XREC:PING`, `+XREC:ERR,LOCKED` for privileged commands, reconnect, BT exit) is testable now.
-Bluedroid's Classic host paths never ask for randomness (only BLE code calls `esp_random()`), so pairing does not hit
-the `0xB0` entropy fatal.
+### What the image does (2026-11-24)
 
-**Bench-only waiver: pairing keys are weak on this build** (plan live log, review round on the phone path; plan M2.1 /
-M2.3 deviation). The ROM, not Bluedroid, generates the SSP P-192 secret, from SHA-256 over the BD_ADDR, one CLKN byte
-and four bytes of the `0x00803C24` hook, which is still the legacy timer xorshift returning 0..79
-(`docs/BT_ROM_INTERFACE.md` §2.3): roughly 33 predictable bits. An observer of the pairing can recover the link key
-offline. Pair only bench devices, in a quiet place, and treat the bond and its traffic as unprotected; delete the
-bonds (`SD:/bt_bonds.bin`, the laptop's `remove`) after the session. Release blockers: a credited entropy source, DRBG
-output through the hook plus more entropy into that SHA-256 block, the SSP window closed until `bt_entropy` reports
-credit, and the local accept/reject prompt below.
+- **Session:** every `BT=1` image without `HCI_PROBE` replaces the legacy phone mode with the Bluedroid session
+  (`open_fw/bt_port/bt_xrec_bluedroid.c` + `bt_xrec_fw.c`, plan M4). Name `Cassini_1D` (eFuse address
+  `02:CA:55:00:01:1D` on the bench unit), CoD 0x200404, SPP "Cassini" on RFCOMM channel 1, connectable; discoverable
+  only while the SSP part of a pairing window is open. The ROM's answers to the newly forwarded commands
+  (`docs/BT_ROM_HCI_MAP.md` §10) are the first thing this test checks.
+- **Entropy** (deviation 5 closed pending this test): at every BT-mode entry `bt_entropy_mic.c` captures 4096 2-bit
+  mic symbols (Exp 2 section above, 0.5 bit/symbol credit) and seeds/reseeds the DRBG (~0.4 s). The XREC PIN,
+  `+XREC:CHAL` nonces and everything below come from the DRBG; without credit all of them fail closed (no PIN:
+  `+XREC:PAIR` answers `ERR,PAIRCLOSED`; `CHAL` closes the link).
+- **SSP key material** (deviation 8 closed pending this test; `docs/BT_ROM_INTERFACE.md` §2.3): the ROM's own P-192
+  key pair is a constant, the same on every SL6801. Each BT-mode entry generates a fresh pair from the DRBG and
+  `bt_rom_real` installs it at HCI Reset (only if the RAM slots hold exactly the ROM constant); the RNG hook gives the
+  nonce, LMP-random and passkey call sites DRBG bytes (full 128-bit Na/Nb). Until step 4 has passed on silicon, treat
+  bonds as bench-only (delete them afterwards: `SD:/bt_bonds.bin`, the laptop's `remove`).
+- **Pairing gate (M2.3):** the SSP part of a window (discoverable + numeric comparison) opens only when entropy is
+  credited, this session installed the key and the hook's pool never ran dry; re-checked on every poll, and again
+  when a comparison arrives and when the user (or the bench autoconfirm) accepts it, so a pairing whose nonce met a
+  dry pool between two polls is rejected (`BT SSP numeric comparison rejected, pairing window closed: <reason>`).
+  **Spent key:** an accepted comparison whose pairing then fails (or whose link drops first) closes SSP for the rest
+  of the BT session (`BT SSP key spent: ...`; the ROM never validates the peer's key, so each failed accepted pairing
+  is one invalid-curve query against this session's key: `docs/BT_ROM_INTERFACE.md` §2.3 item 4); leave and re-enter
+  BT mode for a new key. A window
+  opened before the session is READY (the bench run opens it right after `bt_xrec_start()`; the controller, and with
+  it the key install, starts later) is decided at READY (`BT SSP pairing window open (opened before READY)`), not
+  refused early. Refused: `BT SSP pairing window refused: <reason>` and the screen toast "Pairing unavailable"; without
+  any entropy nothing opens.
+- **Prompt** (deviation 1 resolved): a numeric comparison inside the window shows the six digits, the peer (remote
+  name, else address), `Pair? N s` and `ENTER Yes · BACK No`; ENTER accepts, BACK rejects (stays in BT mode), 30 s
+  without an answer rejects, keys in the first 0.5 s are ignored, the window closing or the peer giving up ends it.
+  ENTER / BACK within 1 s **after** a prompt ended (answered, timed out, withdrawn) are swallowed, so a late "No"
+  does not leave BT mode and a double ENTER does not re-open the window. ENTER while a window still has more than
+  10 s left extends it and **keeps** its XREC PIN (`BT XREC pairing window extended, PIN kept`).
+  The SSP part closes at the **first** MITM bond; the XREC PIN stays for the rest of the window.
+- **Bench overrides** (bench images only: `make BT=1 BENCH=1`; `SD:/BTBENCH.RUN` only, both off by default, switched
+  off again when the run ends, logged on every use; never set by the UI). A **release** `BT=1` image contains neither
+  the trigger nor the overrides (review finding: card or USB-disk access alone could arm an unattended pairing;
+  `make test-bt-xrec` checks the release session object for bench symbols): `autoconfirm=1` accepts numeric comparisons inside the window without the user
+  (`BT SSP BENCH autoconfirm: ...`), `xrec_pin=NNNNNN` makes every window of the run issue that XREC PIN instead of a
+  DRBG draw (`BT XREC BENCH PIN: ...`; still only with credited entropy). Neither bypasses the gate: with the gate
+  refusing, a comparison is rejected even with `autoconfirm=1` (host step P18).
 
-**The device side does not verify the numeric-comparison value** (interim, plan M4 prompt not built yet): inside the
-user-opened window the device auto-confirms; only the laptop's user compares the digits. The SSP part of the window
-(discoverability, numeric comparison) therefore closes at the **first** MITM bond; the XREC PIN stays for the rest of
-the 60 s.
+### The bench trigger `SD:/BTBENCH.RUN`
 
-**Build and flash** (as the probe recipe above; `update-up` writes `dumps/firmware_2M_openfw.bin`, which QEMU gates
-overwrite, so build right before flashing):
+The laptop side can be driven remotely, the device's buttons cannot, and USB is not serviced while BT mode runs.
+A **bench image** (`make BT=1 BENCH=1`; not with `HCI_PROBE=1`) therefore takes a **one-shot request file** in the SD
+root (release `BT=1` images ignore it: no `BENCH` code and no `BENCH` log line at all)
+(`open_fw/bt_port/bt_bench.h`, `bt_bench.c`, `bt_bench_fw.c`; hooks in `src/main.c`): after the SD mount and the first
+UI render, before the home loop, the boot reads `BTBENCH.RUN`, **deletes it and verifies the deletion before BT
+starts** (a hang, WDT cold reset, BT-fault reboot or `reboot=1` never runs it twice; an undeletable request does not
+run: `BENCH OFF trig=stuck`), enters BT mode exactly as the Bluetooth tile does (`run_bt_xrec_mode()`), opens the
+pairing window on schedule, and after `secs` leaves BT mode through the normal exit (`bt_xrec_stop()`, as BACK). Then
+the boot continues normally: USB disk mode comes up by itself (VBUS) and the log can be read. BACK / REC slide on the
+device still end the run early (`BENCH end why=user`).
+
+Content: `key=value` tokens separated by spaces, newlines, `,` or `;`; `#` comments; case-insensitive; BOM/CRLF ok.
+Empty file = all defaults. Unknown or repeated keys and out-of-range values are **refused** (the file is still
+consumed): `BENCH OFF trig=bad_content err=key|value|dup|conflict|char at=<byte offset>`.
+
+| key | values (default) | effect |
+|---|---|---|
+| `secs` | 10..3600 (180) | time in BT mode, counted from `bt_xrec_start()` |
+| `pair` | 0/1 (0) | open the pairing window at once (`bt_xrec_open_pairing`; its SSP part opens at READY, ~2-5 s later) |
+| `pair_every` | 0 or 10..3600 (0) | re-open the window every N s (needs `pair=1`) |
+| `pair_secs` | 10..600 (60) | length of each window |
+| `autoconfirm` | 0/1 (0) | bench override: numeric comparisons inside the window accepted without ENTER. With 0 the comparison waits for ENTER on the device and is rejected after 30 s |
+| `xrec_pin` | 6 digits (none) | bench override: the XREC PIN of every window of the run (needs `pair=1`); none = a fresh DRBG PIN per window, shown only on the screen |
+| `exit` | `auto` | the only mode (leave after `secs`); accepted for readability |
+| `reboot` | 0/1 (0) | after BT mode and `BTBENCH.LOG`: `sd_flush` + reboot |
+
+Log (ring and file): `BENCH start secs=.. pair=.. pair_every=.. pair_secs=.. autoconfirm=.. xrec_pin=0|1 exit=auto
+reboot=.. prev_fault=0x........ log=BTBENCH.LOG` · `BENCH pair n=N t=S secs=W` per window · `BENCH status t=S acl=
+spp= bound= auth= pair= rx= tx= pairs=` every 30 s and at the end · `BENCH exit why=time ms=..` · (`BT stopped` etc.)
+· `BENCH end why=time|user ms=.. pairs=.. reboot=..` · ring only: `BENCH LOGFILE file=BTBENCH.LOG st=OK|FAIL bytes=
+lost=`. Without a request every bench-image boot logs `BENCH OFF trig=absent file=BTBENCH.RUN`. An image without the
+session's overrides logs `BENCH autoconfirm st=unavailable` / `BENCH xrec_pin st=unavailable` (weak no-op defaults).
+`SD:/BTBENCH.LOG` (replaced each run) holds every ring line from `BENCH start` to `BENCH end` (drained from the 4 KiB
+ring on every BT-loop pass into an 8 KiB SRAM_HI buffer), followed by `BENCH LOGCAP bytes= lost= resets=`: `lost` > 0
+means the buffer filled (the file keeps the head, the ring keeps the tail); `resets` counts XREC log resets. A run that
+crashes or takes the BT hard path loses the file (SRAM, zeroed at boot): read the ring and `dev_cycle.py status`.
+RAM: the buffer, writer and state live in `.bss_hi` (8.9 KiB; `.bt_bss` would come out of the RTOS heap): the BT=1
+phone image ends `.bss_hi` 7.4 KiB below the `0x00867000` main-stack limit (`sl6801_firm.ld` ASSERT).
+
+### Recipe
+
+Shell variables used throughout (repo root as cwd; bench unit address):
 ```bash
-B=/tmp/sl6801_openfw_bt_phone
-make -C open_fw BT=1 BUILD_DIR=$B update-up        # "Packed hybrid FIRM ... 732,000 B" (2026-11-24), 0 warnings
+MAC=02:CA:55:00:01:1D
+PIN=246810                                          # the run's XREC PIN (any 6 digits)
+B=/tmp/sl6801_openfw_bt_bench
+```
+
+**1. Build and flash the bench image** (`BENCH=1`: the trigger below; `update-up` writes `dumps/firmware_2M_openfw.bin`,
+which the QEMU gates overwrite: build right before flashing):
+```bash
+make -C open_fw BT=1 BENCH=1 BUILD_DIR=$B update-up   # 0 warnings; "Packed hybrid FIRM ..."
 sudo env OPENFW_FIRM_BIN=$B/open_fw_firm.bin python3 tools/dev_cycle.py flash
 ```
+The boot after flashing has no request: its ring log ends with `BENCH OFF trig=absent` and USB disk mode comes up.
 
-**On the device:** Home -> the fourth tile (Bluetooth) -> ENTER opens the BT screen and starts the session
-(`run_bt_xrec_mode()`, `src/main.c`). Name `Cassini_1D` (eFuse address `02:CA:55:00:01:1D` on the bench unit), CoD
-0x200404, connectable but not discoverable. **ENTER on the BT screen** opens the 60 s pairing window
-(`bt_xrec_open_pairing(60000)`: discoverable; the numeric-comparison value is shown in the BT screen's "PIN" toast while
-a pairing waits). **BACK** leaves BT mode (`bt_xrec_stop()`: graceful teardown, 2 s hard deadline). Sliding REC on also
-leaves it.
-
-**Laptop (BlueZ):**
+**2. Prepare the card** (device in USB disk mode: home screen + cable). A small known file under `record/` is the GETS
+test object; `bt_bonds.bin` / `cassini.key` are removed for a clean first pairing:
 ```bash
-sudo btmon -w /tmp/phone.btsnoop &                  # HCI trace of the laptop side, for any failure
-bluetoothctl
-  remove 02:CA:55:00:01:1D                          # forget an old bond (the device's bond store starts empty)
-  agent DisplayYesNo                                # numeric comparison needs a display + yes/no agent on both sides
-  default-agent
-  scan on                                           # press ENTER on the device's BT screen first: Cassini_1D appears
-  pair 02:CA:55:00:01:1D                            # "[agent] Confirm passkey NNNNNN (yes/no)": the device shows the
-                                                    # same NNNNNN in its PIN toast and confirms by itself inside the
-                                                    # window; answer yes
-  trust 02:CA:55:00:01:1D
-  info 02:CA:55:00:01:1D                            # Paired: yes, Bonded: yes, UUID: Serial Port (00001101-...)
-  scan off
-  quit
-python3 tools/bt_sync.py --mac 02:CA:55:00:01:1D --ping            # native-SPP path (no HFP handshake)
-python3 tools/bt_sync.py --mac 02:CA:55:00:01:1D --pair 000000     # expected for now: "+XREC:ERR,PAIRCLOSED"
-python3 - <<'PY'                                    # raw RFCOMM channel 1 (what the Android app does with UUID 0x1101)
-import socket
-s = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
-s.settimeout(5); s.connect(("02:CA:55:00:01:1D", 1))
-for c in (b"+XREC:PING\r", b"+XREC:LS\r"):
-    s.send(c); print(s.recv(512))
-s.close()
-PY
+lsblk -o NAME,MODEL,FSTYPE,SIZE,MOUNTPOINT          # the exFAT partition, e.g. /dev/sda1
+udisksctl mount -b /dev/sda1                        # "Mounted /dev/sda1 at /media/$USER/<label>"
+M=/media/$USER/<label>
+rm -f $M/BTBENCH.LOG $M/bt_bonds.bin $M/cassini.key
+mkdir -p $M/record && head -c 3000 /dev/urandom > $M/record/BTTEST.WAV && sha256sum $M/record/BTTEST.WAV
+printf 'secs=300 pair=1 pair_every=60 pair_secs=60 autoconfirm=1 xrec_pin=%s exit=auto\n' $PIN > $M/BTBENCH.RUN
+sync && udisksctl unmount -b /dev/sda1
 ```
-Expected: `bt_sync.py` prints `Native SPP (OpenFW): device silent after connect, skipping the HFP handshake.` and
-`Ping response: +XREC:PONG,openfw_v5,v5,bound=0,auth=0,pair=0` (`pair=1` needs the XREC PIN, i.e. entropy; on the
-host, with its TEST-ONLY source, it is 1 inside the window); the raw socket gets the same PONG, then
-`+XREC:ERR,LOCKED` for LS (no XREC authentication without entropy).
 
-**Then, in order:**
-1. *Reconnect with the stored key:* `bluetoothctl disconnect 02:CA:55:00:01:1D`, wait for the window to close (60 s)
-   or leave and re-enter BT mode, run `--ping` again: it must connect with no pairing prompt.
-2. *Bond persistence:* BACK (BT off), reboot the device (`sudo python3 tools/dev_cycle.py dfu`, then `boot`), re-enter
-   BT mode, `--ping`: still no pairing prompt (bond loaded from `SD:/bt_bonds.bin` before `esp_bluedroid_init()`).
-3. *Exit with a link up:* keep the raw socket open (`s.connect` then `input()`), press BACK on the device: the
-   device must leave BT mode in about a second with no reboot (host: ~0.64 s with data outstanding, patch 0026), and
-   the laptop sees the link drop.
-3b. *Exit while the peer is gone* (the LMP detach can never complete: phone out of range): with the raw socket open,
-   cut the laptop's radio without a clean disconnect (`sudo btmgmt power off`, or walk the device out of range), then
-   press BACK within a few seconds (before the supervision timeout drops the link by itself). The device must leave
-   BT mode in under a second, **no reboot, no fault record** (`dev_cycle.py status`: previous fault unchanged), and the
-   ring log shows `BT stopped`. Before patch 0027 this crashed inside `esp_bluedroid_deinit()` (host harness: assert
-   in `osi_thread_post`, step P12). Power the laptop radio back on (`btmgmt power on`) before the next step.
-4. *Pairing refused with the window closed:* from a second laptop/phone, pair while the window is closed: refused.
-   Also *one bond per window:* open the window, pair laptop A (step above), then try a second device inside the same
-   60 s: the device is no longer discoverable and refuses the numeric comparison (`BT SSP window closed after the
-   first bond`, then `... rejected: pairing window closed`).
-5. *Just Works refused:* `bluetoothctl` with `agent NoInputNoOutput`, window open, `pair`: BlueZ reports success
-   briefly, then the device removes the bond and drops the link. Then, from that laptop, `--ping` (or the raw socket)
-   must get **no** `+XREC:PONG`: the link is dropped or the SPP open refused (`BT XREC close: peer not bonded with
-   MITM`). Repeat after BACK + re-entering BT mode: still no PONG, and `SD:/bt_bonds.bin` never contains that
-   laptop's address (the session purges the key from the store when it refuses it, and at every start drops stored
-   bonds whose key is not MITM-authenticated: `BT stored bond removed: not MITM-authenticated`).
-6. *SPP with `ESP_SPP_SEC_MITM`:* the SPP server now requires MITM (esp_spp_api.h advises against that flag "due to
-   certain limitations"; the host harness runs bonded, re-paired and Just Works peers with it). If laptop A pairs but
-   its RFCOMM connect is then refused or re-paired, suspect this flag first: capture btmon and the ring log.
-7. *RAM under traffic:* during a long `GETS` (`bt_sync.py` download of a large recording), and after BACK, read the
-   `BT mem` lines: `min` (lowest free heap since boot) must stay >= 8192, `largest` >= the largest single allocation,
-   `mallocfail` 0; record the `BT stack free words` per task (a value near 0 is a stack about to overflow).
+**3. Start the run.** USB stays away for `secs` (BT mode), so wait for the boot in the background:
+```bash
+bluetoothctl remove $MAC                            # the laptop forgets any old bond (the device's store is empty)
+sudo btmon -w /tmp/bench.btsnoop > /dev/null 2>&1 &
+sudo python3 tools/dev_cycle.py dfu
+sudo python3 tools/dev_cycle.py boot --timeout 400 > /tmp/bench_boot.txt 2>&1 & BOOT=$!
+sleep 15                                            # BT mode + entropy (~0.4 s) + bring-up; window 1 runs t=0..60 s
+```
 
-**Device log** (`g_openfw_log`; read it after BACK, with USB up: `sudo python3 tools/dev_cycle.py log >
-/tmp/bt_phone_ring.log`). Expected lines, in order: `BT start (Bluedroid):` `Cassini_1D` · `BT XREC READY (SPP
-channel 1)` · `BT XREC PIN unavailable: entropy not ready (SSP pairing window open)` · `BT SSP numeric comparison
-accepted (pairing window), value NNNNNN` · `BT SSP bonded (numeric comparison, MITM)` · `BT SSP window closed after
-the first bond` · `BT XREC SPP open, mtu N` · `BT mem run heap free F min M largest L mallocfail N` and `BT stack free
-words BTU_TASK=w BTC_TASK=w hciT=w bt_ctrl=w bt_dlv=w bt_recover=w app=w` (every 30 s while BT runs) · `BT XREC SPP
-closed` · the same two lines as `BT mem stop ...` · `BT stopped` (`-` = that task did not run this session; the old
-`BT bt_recover stack free words N` line is now part of `BT stack free words`). Refusals: `BT SSP numeric comparison
-rejected: pairing window closed`, `BT SSP bond removed: Just Works / unauthenticated key`, `BT stored bond removed: not
-MITM-authenticated`, `BT XREC close: peer not bonded with MITM`, `BT XREC CHAL refused: entropy not ready` followed by
-`BT XREC close: entropy not ready`, `BT bonds not saved (SD write failed, retrying)` (retried every second, up to 8
+**4. SSP pairing (laptop BlueZ; the device confirms by itself).** Scripted `bluetoothctl` (untested as a pipe on this
+bench; if it misbehaves, type the same commands interactively and answer `yes` to the passkey question):
+```bash
+{ echo 'agent DisplayYesNo'; echo 'default-agent'; echo 'scan on'; sleep 8; echo "pair $MAC"; sleep 4; echo 'yes';
+  sleep 6; echo "trust $MAC"; echo "info $MAC"; echo 'scan off'; echo 'quit'; } | bluetoothctl | tee /tmp/bench_pair.txt
+grep -E 'Confirm passkey|Paired:|Bonded:|Serial Port' /tmp/bench_pair.txt
+```
+Expected: `Cassini_1D` found by the scan, `[agent] Confirm passkey NNNNNN`, `Pairing successful`, `Paired: yes`,
+`Bonded: yes`, UUID `Serial Port (00001101-...)`. NNNNNN must equal the value in the device log line `BT SSP numeric
+comparison accepted (BENCH autoconfirm), value NNNNNN` (step 7). A refused pairing (`AuthenticationFailed`,
+`Failed to pair`) with `BT SSP pairing window refused: <reason>` in the log is the M2.3 gate: report the reason.
+
+**5. XREC, in this order (all expected to pass now; window 1 is still open, or wait for the next one at 60/120 s):**
+```bash
+python3 tools/bt_sync.py --mac $MAC --ping          # (a)
+python3 tools/bt_sync.py --mac $MAC --pair $PIN     # (b) PAIR with the run's XREC PIN
+python3 tools/bt_sync.py --mac $MAC --ping          # (c)
+python3 tools/bt_sync.py --mac $MAC --list          # (d) CHAL/AUTH + LS
+python3 - "$MAC" <<'PY'                             # (e) GETS of the small file, byte-exact
+import hashlib, sys; sys.path.insert(0, "tools")
+from pathlib import Path
+from bt_sync import XRecRFCOMMClient, load_device_key, DEFAULT_KEY_FILE
+mac = sys.argv[1]
+c = XRecRFCOMMClient(mac)
+c.connect_and_handshake(); print(c.ping())
+c.authenticate(load_device_key(DEFAULT_KEY_FILE, mac)); print("AUTH ok")
+files = dict(c.list_files()); print(files)
+print("sha256", c.download_file("BTTEST.WAV", files["BTTEST.WAV"], Path("/tmp/BTTEST.WAV")))
+c.close()
+PY
+python3 tools/bt_sync.py --mac $MAC --stat          # (f)
+python3 tools/bt_sync.py --mac $MAC --pair 000000   # (g) negative: window closed by (b)
+```
+Expected: (a) `Native SPP (OpenFW): device silent after connect, skipping the HFP handshake.` and `Ping response:
++XREC:PONG,openfw_v5,v5,bound=0,auth=0,pair=1` (`pair=1`: the window's PIN exists, i.e. entropy was credited; `pair=0`
+here means no PIN: check the entropy lines of step 7). (b) `Paired & bound ... successfully!`; the PAIR closes the
+window and discoverability (`BT XREC PAIRED`, `/cassini.key` written). (c) `bound=1,auth=0,pair=0`. (d)
+`Authenticated (HMAC-SHA256 challenge-response OK).` and a listing that contains `BTTEST.WAV (3,000 bytes)`. (e) the
+same SHA-256 as step 2. (f) battery / SD line. (g) `ERR,PAIRCLOSED` until the next window opens (at 60 s / 120 s it
+opens again with the same PIN; inside a window a wrong PIN gives `ERR,PIN`, five of them close the window).
+Then *reconnect with the stored keys*: `bluetoothctl disconnect $MAC; sleep 3; python3 tools/bt_sync.py --mac $MAC
+--list`: no pairing, CHAL/AUTH again.
+
+**6. Optional checks in the same run** (no key press; while `secs` lasts):
+- *Exit with a link up:* about 20 s before the run ends, keep a raw socket open
+  (`python3 -c 'import socket,time;s=socket.socket(socket.AF_BLUETOOTH,socket.SOCK_STREAM,socket.BTPROTO_RFCOMM);s.connect(("'$MAC'",1));time.sleep(60)'`):
+  at `secs` the device must leave BT mode in about a second with no reboot (host: ~0.64 s, patch 0026) and the laptop
+  sees the link drop.
+- *Exit while the peer is gone* (instead of the previous one, in a separate run): with the socket open, cut the laptop
+  radio without a clean disconnect (`sudo btmgmt power off`) a few seconds before `secs`; the device must leave BT mode
+  in under a second, **no reboot, no fault record** (before patch 0027 this crashed in `esp_bluedroid_deinit()`).
+  `sudo btmgmt power on` afterwards.
+- *One bond per window:* from a second laptop/phone inside the same window after step 4: not discoverable any more,
+  numeric comparison refused (`BT SSP window closed after the first bond`, `... rejected: pairing window closed`).
+- *Just Works refused:* a second run with `bluetoothctl` `agent NoInputNoOutput`: BlueZ reports success briefly, then
+  the device removes the bond and drops the link (`BT SSP bond removed: Just Works / unauthenticated key`); `--ping`
+  from that laptop gets **no** `+XREC:PONG`; `SD:/bt_bonds.bin` never contains its address.
+- *Prompt timeout:* a run with `autoconfirm=0`: `pair` from the laptop; nobody answers on the device: `Failed to pair`
+  after 30 s, `BT SSP numeric comparison rejected: no answer within 30 s` (or `BT SSP prompt withdrawn: pairing ended
+  by the peer` if BlueZ gives up first). Note whether the laptop's name or its address showed on the prompt.
+
+**7. Read the results** (after `secs` the device leaves BT mode and enumerates over USB):
+```bash
+wait $BOOT; cat /tmp/bench_boot.txt                 # dev_cycle snapshot (previous fault, if any)
+sudo python3 tools/dev_cycle.py log > /tmp/bench_ring.log            # ring first, before anything else logs
+udisksctl mount -b /dev/sda1 && cp $M/BTBENCH.LOG $M/bt_bonds.bin $M/cassini.key /tmp/ ; udisksctl unmount -b /dev/sda1
+grep -E '^BENCH|^BT ' /tmp/BTBENCH.LOG
+sudo pkill btmon
+```
+Must be present, in this order (`BTBENCH.LOG`):
+- `BENCH start secs=300 pair=1 pair_every=60 pair_secs=60 autoconfirm=1 xrec_pin=1 exit=auto reboot=0 ...`,
+  `BT start (Bluedroid):` `Cassini_1D`.
+- **Entropy and ROM key** (inside `bt_xrec_start()`, before the bring-up): `BT entropy mic: 4096 symbols (0:a 1:b 2:c
+  3:d) peak P in T ms, ok` (a..d each roughly 1000; a count near 0 or 4096 means stuck bits; T about 300-500; **report
+  P**: the quiet-room peak at gain 8 calibrates the sanity gate, whose limit is 32000; `rejected: input at full
+  scale` / `rejected: no analogue noise` in a quiet room means the gate's limits are wrong) and `BT P-192 session key
+  generated (replaces the ROM's fixed key), ms N, public X hhhhhhhh...` (report N; X must not be the ROM constant's
+  `FA2B96D3` and must change between runs). T + N is the extra delay before a REC slide right after entering BT mode
+  takes effect (the collection itself stops at once on REC).
+- `BT SSP BENCH autoconfirm ON ...`, `BT XREC BENCH PIN ON ...`, `BT XREC BENCH PIN: fixed PIN ...`, `BENCH pair n=1
+  t=0 secs=60`, then `BT XREC READY (SPP channel 1)` and `BT SSP pairing window open (opened before READY)`.
+- `BT SSP BENCH autoconfirm: numeric comparison accepted WITHOUT the user (bench only)`, `BT SSP numeric comparison
+  accepted (BENCH autoconfirm), value NNNNNN` (= the laptop's passkey), `BT SSP bonded (numeric comparison, MITM)`,
+  `BT SSP window closed after the first bond`, `BT XREC SPP open, mtu N`, `BT XREC PAIRED`.
+- `BT mem run heap free F min M largest L mallocfail 0` and `BT stack free words ...` every 30 s (`min` >= 8192,
+  `mallocfail` 0; a stack value near 0 is about to overflow), `BENCH status ...` every 30 s, `BENCH pair n=2 t=60`,
+  `n=3 t=120` ...
+- `BENCH exit why=time`, `BT XREC SPP closed` (if a link was up), `BT mem stop ...`, **`BT ROM keys: installed 1
+  unexpected 0 rng drbg D nonces K legacy L unknown 0 starved 0`** (I counts the key installs since boot: 1 in a
+  fresh boot; **unexpected 0**, else the ROM's RAM slots did not hold the traced constant and the key was NOT
+  replaced; K >= 1 after a pairing; **unknown 0**, else an untraced ROM call site; starved 0), `BT stopped`,
+  `BT SSP BENCH autoconfirm off`, `BT XREC BENCH PIN off`, `BENCH end why=time ... pairs=5`, `BENCH LOGCAP ...
+  lost=0`; in the ring `BENCH LOGFILE ... st=OK`. `BTBENCH.RUN` is gone from the card; `bt_bonds.bin` holds the
+  laptop's address, `cassini.key` exists.
+- Never in this run: `BT SSP pairing window refused`, `BT SSP key spent`, `BT SSP numeric comparison rejected,
+  pairing window closed`, `BT XREC PIN unavailable`, `BT XREC CHAL refused: entropy not ready`, `BT fault`, `BT
+  platform fault`, `BT shutdown: hard path`. (A failed laptop pairing **after** the autoconfirm, e.g. a timeout on the
+  laptop side, spends the session's key by design: every later window of the run then refuses SSP. Restart the run.)
+
+**8. Bond persistence** (second request, no window): put `printf 'secs=60\n' > $M/BTBENCH.RUN` on the card (step 2
+without the other changes), `dfu` + `boot --timeout 160 &`, then `python3 tools/bt_sync.py --mac $MAC --list` inside the
+60 s: no pairing (bond loaded from `SD:/bt_bonds.bin` before `esp_bluedroid_init()`, XREC key from `SD:/cassini.key`),
+CHAL/AUTH ok. Its `BT ROM keys` line shows `installed 1` again (a fresh boot) with a different `public X` at entry.
+
+**9. Checks that need a person at the device** (Home -> fourth tile (Bluetooth) -> ENTER starts BT mode; ENTER on the
+BT screen opens a 60 s window, BACK leaves BT mode; while a prompt is up ENTER / BACK answer it):
+- ENTER on the prompt accepts (`BT SSP numeric comparison accepted by the user, value NNNNNN`); BACK rejects (`...
+  rejected by the user`, the laptop reports `Failed to pair`, the device stays in BT mode); a key in the prompt's
+  first 0.5 s does nothing; `no` on the laptop while the prompt is up withdraws it; a window that ends during the
+  prompt rejects it (`... window closed while waiting for the user`).
+- The XREC PIN on the screen (`PIN NNNNNN` toast, a fresh DRBG value per window without the bench override) works for
+  `--pair`. The toast must show the text, not a `...` pill (fixed for BT=1 images, `make test-host` renders and
+  checks it; the default image on main still has the bug, its toasts show `...`). ENTER again within the first
+  ~50 s of a window keeps the same PIN.
+- *Keys around the prompt:* `no` on the laptop and BACK on the device at the same moment: the device stays in BT
+  mode (a BACK within 1 s after the prompt ended is swallowed); ENTER twice on the prompt: no new window, no new PIN.
+- *Long peer name:* pair a phone whose name is longer than ~12 characters: the connected line shows `Connected ·
+  <name>...` on one line (not cut after the first word).
+- *Stale prompt:* slide REC on while a prompt is up, slide it off, open Bluetooth again: no old digits / "Pair? N s"
+  while BT mode starts.
+- *Idle current after BT* (if a meter is at hand): fresh boot idle on Home vs. after one BT session and back to Home;
+  the mic PGA is now switched off again after the entropy collection (APLL still on, as after a playback).
+- *REC slide right after entering BT mode:* the recording starts within ~0.2 s plus the RF calibration (the
+  collection aborts on REC; log `BT entropy mic: skipped (REC switch on) ...` or the `aborted (REC switch)` status).
+- *Recording after BT:* a remote recording started over XREC (`--rec-start`, `--rec-stop`) after the pairing records
+  at the configured gain (the mic collection's gain 8 must not stick).
+- *Decisive check that the ROM uses the RAM key slots* (one-off image, never shipped): in `bt_xrec_fw.c
+  session_entropy_begin`, after `bt_p192_keygen`, stage a public key that does not belong to `d` (e.g. generate a
+  second pair and stage `d` with the second pair's public key). Pairing (step 4) must then FAIL at the DHKey check
+  (laptop: authentication failure). If it still succeeds, the ROM is not reading the slots this build replaces: stop
+  and report. No key press needed with the bench trigger.
+
+**10. Entropy assessment (NIST SP 800-90B; raises or confirms the 0.5 bit/symbol credit).** Run the block in "Entropy
+source assessment (NIST SP 800-90B) — recipe for the lead" (Exp 2, above): 16 runs of `exp_entropy_dump.c` source 5
+(`--arg 5`, 65,536 symbols each, `overruns=0`) and 63 runs of source 6 (`--arg 6`, 16 restart rows each),
+`tools/bt_entropy_unpack.py seq|restart`, then `ea_non_iid -i -a -v mic_seq.bin 2` and `ea_restart -n -v
+mic_restart.bin 2 <H_I>` (`-n`: non-IID; `-i` means IID in `ea_restart`). Repeat after a cold start, in a quiet room,
+with speech near the mic and once at the usual recording gain. Decision rule and where to change the credit: same
+section. Record the numbers there.
+
+**Device log reference.** Refusals: `BT SSP numeric comparison rejected: pairing window closed`, `... rejected by the
+user`, `... rejected: no answer within 30 s`, `... rejected: pairing window closed while waiting for the user`, `...
+rejected: another one waits for the user`, `BT SSP prompt withdrawn: pairing ended by the peer` / `: peer
+disconnected`, `BT SSP pairing window refused: <reason>` / `closed: <reason>` (reasons: `entropy source failed its
+health test (until reboot)`, `entropy not credited`, `ROM P-192 key slots not as traced (key not replaced)`, `ROM
+P-192 key not replaced (re-enter BT mode)`, `ROM RNG pool ran dry this session`), `BT XREC PIN unavailable: entropy
+not ready (...)`, `BT entropy mic: skipped (recorder owns the ADC), no credit this session` (defensive only: BT mode
+is never entered while recording), `BT entropy mic: skipped (REC switch on), no credit this session`, `BT entropy
+mic: ... rejected: input at full scale (loud sound / saturation), frame not credited` / `... rejected: no analogue
+noise in a frame, frame not credited` (sanity gate: no credit from that frame on; SSP refused unless an earlier
+session of the boot seeded the DRBG), `BT SSP key spent: an accepted pairing failed; no SSP until the next BT-mode
+entry` + `BT SSP pairing window closed: a failed pairing used this session's P-192 key`, `BT SSP numeric comparison
+rejected, pairing window closed: <gate reason>`, `BT SSP numeric comparison rejected: pairing gate closed` (ENTER
+after the gate failed), `BT SSP bond removed: Just Works / unauthenticated key`, `BT stored bond removed: not
+MITM-authenticated`, `BT XREC close: peer not bonded with MITM`, `BT XREC CHAL refused: entropy not ready` followed
+by `BT XREC close: entropy not ready`, `BT bonds not saved (SD write failed, retrying)` (retried every second, up to 8
 times per session, and at BT stop). Faults: `BT bring-up failed, code N` (1 `bt_ctrl_open`, 2 HCI driver attach, 3
 `esp_bluedroid_init`, 4 `esp_bluedroid_enable`: the HCI Reset .. init chain through the ROM), `BT fault, reason N` /
 `BT shutdown: hard path, reason N` (`BT_XREC_FAULT_*` in `bt_xrec_bluedroid.h`: 2 bring-up timeout, 4 SPP config
@@ -428,9 +681,12 @@ timeout, 6 platform, 7 teardown deadline), `BT platform fault N` (1 `bt_ctrl_run
 3 HCI command timeout), `BT bt_ctrl fault, first code N`. The hard path reboots and leaves fault record `0xFA0170B1`
 (`dev_cycle.py` "previous fault"; `AON_BACKUP(1)` = reason); BT stays refused for that boot.
 
-**Capture on failure:** the ring log (above, before anything else logs), `/tmp/phone.btsnoop` (laptop HCI), the
-`bluetoothctl` transcript, `SD:/bt_bonds.bin` and `SD:/cassini.key` (USB disk mode), the `dev_cycle.py status`
-output (previous fault), and the BT screen state. A first failure in pairing or connection set-up is most likely a ROM
-message the host has not seen yet: compare the laptop's btmon trace with `docs/BT_ROM_HCI_MAP.md` §10 (which ROM reply
-or event each step needs) and check the opcode-table rows of the commands around the failure. Per the hardware-access
-rule, leave the latest BT-branch build on the device afterwards.
+**Capture on failure:** the ring log (before anything else logs), `BTBENCH.LOG`, `/tmp/bench.btsnoop` (laptop HCI),
+the `bluetoothctl` transcript, `SD:/bt_bonds.bin` and `SD:/cassini.key`, the `dev_cycle.py status` output (previous
+fault), and the BT screen state if someone can see it. A first failure in pairing or connection set-up is most likely
+a ROM message the host has not seen yet: compare the laptop's btmon trace with `docs/BT_ROM_HCI_MAP.md` §10 (which ROM
+reply or event each step needs) and check the opcode-table rows of the commands around the failure. If the laptop
+pairs but its RFCOMM connect is then refused or re-paired, suspect the SPP server's `ESP_SPP_SEC_MITM` flag first
+(esp_spp_api.h advises against it "due to certain limitations"; the host harness runs bonded, re-paired and Just
+Works peers with it). Per the hardware-access rule, leave the latest BT-branch build on the device afterwards
+(preferably the release `make -C open_fw BT=1` image: a bench image honours `SD:/BTBENCH.RUN`).

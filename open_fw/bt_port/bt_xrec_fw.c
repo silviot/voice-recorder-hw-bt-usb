@@ -33,6 +33,9 @@
 #include "bt_port.h"
 #include "bt_store.h"
 #include "bt_entropy.h"
+#include "bt_entropy_mic.h"
+#include "bt_p192.h"
+#include "bt_rom_rng.h"
 #include "bt_ctrl.h"
 #include "bt_ctrl_rtos.h"
 #include "bt_rom_real.h"
@@ -92,6 +95,9 @@ static uint8_t s_bond_fails;             /* consecutive failed bond-file writes 
 static uint32_t s_bond_retry_at;
 static uint32_t s_last_check, s_faults_base, s_hci_to_base, s_irq_cache;
 
+/* ---- entropy + ROM key material (plan M2; BT_ROM_INTERFACE §2.3) ---- */
+#define ROM_RNG_TOPUP_MIN       64u       /* refill the ROM RNG pool once this much room is free */
+
 /* ============================================ small helpers ===================================================== */
 uint32_t bt_xrec_plat_now_ms(void) { return millis(); }
 void bt_xrec_plat_lock(void) { taskENTER_CRITICAL(); }
@@ -150,6 +156,110 @@ void bt_xrec_plat_identity(uint8_t bd[6])
 int bt_xrec_plat_entropy(void *out, size_t n)
 {
     return bt_entropy_get(out, n) == BT_ENT_OK ? 0 : -1;
+}
+
+/* ============================================ entropy + ROM key material (app task) ============================= */
+static int drbg_rng(void *ctx, void *out, size_t n)
+{
+    (void)ctx;
+    return bt_entropy_get(out, n) == BT_ENT_OK ? 0 : -1;
+}
+
+/* Keep the ROM RNG hook's pool (bt_rom_rng.h) full of DRBG bytes. Without credited entropy bt_entropy_get() fails, the
+ * pool stays empty and the security call sites count as starved (pairing refused by the gate). */
+static void rom_rng_top_up(void)
+{
+    size_t room = bt_rom_rng_space();
+    if (room < ROM_RNG_TOPUP_MIN) {
+        return;
+    }
+    uint8_t buf[128];
+    while (room >= ROM_RNG_TOPUP_MIN) {
+        size_t k = room < sizeof(buf) ? room : sizeof(buf);
+        if (bt_entropy_get(buf, k) != BT_ENT_OK) {
+            break;                   /* fail closed: the hook counts starvation, the pairing gate refuses */
+        }
+        (void)bt_rom_rng_feed(buf, k);
+        room = bt_rom_rng_space();
+    }
+    for (size_t i = 0; i < sizeof(buf); i++) {
+        ((volatile uint8_t *)buf)[i] = 0u;
+    }
+}
+
+/* Mic collection (seed, later reseed) and, once credited, the session's P-192 key pair for the ROM. Runs before the
+ * bring-up job (radio off), so bt_rom_real's start() (HCI Reset inside esp_bluedroid_enable) installs the pair. This
+ * is the only collection of a session: none runs while the radio is on (its effect on the mic LSBs is not measured),
+ * so a collection the recorder or the REC switch prevented leaves the session without new credit (review findings). */
+static void session_entropy_begin(const uint8_t bd_addr[6])
+{
+    bt_rom_real_stage_p192(NULL, NULL);
+    bt_rom_rng_reset();              /* the ROM is stopped here: nothing can call the hook */
+    uint32_t t = millis();
+    bt_entropy_mix_uncredited(bd_addr, 6u);
+    bt_entropy_mix_uncredited(&t, sizeof(t));
+    int st = bt_entropy_mic_collect();
+    if (st == BT_ENT_MIC_BUSY || st == BT_ENT_MIC_ABORTED) {
+        bt_xrec_plat_log(st == BT_ENT_MIC_BUSY ? "BT entropy mic: skipped (recorder owns the ADC), no credit this session"
+                                               : "BT entropy mic: skipped (REC switch on), no credit this session");
+    }
+    if (keys_read_rec_switch()) {
+        /* the BT-mode loop leaves for the recorder at its first pass: no key generation in the way */
+        bt_xrec_plat_log("BT P-192 key generation skipped: REC switch on");
+        return;
+    }
+    if (!bt_entropy_ready()) {
+        bt_xrec_plat_log("BT entropy not credited: SSP pairing window refused this session");
+        return;
+    }
+    uint8_t d[BT_P192_BYTES], q[2u * BT_P192_BYTES];
+    uint32_t t0 = millis();
+    if (bt_p192_keygen(drbg_rng, NULL, d, q) == 0) {
+        bt_rom_real_stage_p192(d, q);
+        /* public value only: the top word of X, to compare across sessions and with the ROM's FA2B96D3... */
+        uint32_t xhi = (uint32_t)q[20] | ((uint32_t)q[21] << 8) | ((uint32_t)q[22] << 16) | ((uint32_t)q[23] << 24);
+        openfw_log_puts("BT P-192 session key generated (replaces the ROM's fixed key), ms ");
+        openfw_log_u32(millis() - t0);
+        openfw_log_puts(", public X ");
+        openfw_log_hex(xhi);
+        openfw_log_puts("...\n");
+    } else {
+        bt_xrec_plat_log("BT P-192 key generation failed: SSP pairing window refused this session");
+    }
+    for (size_t i = 0; i < sizeof(d); i++) {
+        ((volatile uint8_t *)d)[i] = 0u;
+    }
+    rom_rng_top_up();
+}
+
+/* While the session runs: keep the ROM RNG hook's pool full (no mic collection with the radio on, see above). */
+static void session_entropy_poll(uint32_t now)
+{
+    (void)now;
+    rom_rng_top_up();
+}
+
+/* Plan M2.3 pairing gate: NULL when a new pairing may be offered, else the reason (logged by the session). */
+const char *bt_xrec_plat_pairing_block(void)
+{
+    bt_ent_stats_t es;
+    bt_entropy_get_stats(&es);
+    if (es.health_failures != 0u) {
+        return "entropy source failed its health test (until reboot)";
+    }
+    if (!bt_entropy_ready()) {
+        return "entropy not credited";
+    }
+    bt_rom_real_sec_t sec;
+    bt_rom_real_sec(&sec);
+    if (!sec.key_installed) {
+        return sec.key_unexpected ? "ROM P-192 key slots not as traced (key not replaced)"
+                                  : "ROM P-192 key not replaced (re-enter BT mode)";
+    }
+    if (sec.rng.starved != 0u) {
+        return "ROM RNG pool ran dry this session";
+    }
+    return NULL;
 }
 
 /* ============================================ files (app task) ================================================== */
@@ -691,6 +801,7 @@ int bt_xrec_plat_stack_up_begin(exfat_vol_t *vol, int sd_mounted, const uint8_t 
         return -1;
     }
     bonds_load();                                        /* before esp_bluedroid_init() (plan M2) */
+    session_entropy_begin(bd_addr);                      /* mic seed/reseed + ROM P-192 key, before start() */
     if (once_init() != 0) {
         return -2;
     }
@@ -742,6 +853,7 @@ void bt_xrec_plat_hard_path(uint32_t reason)
 uint32_t bt_xrec_plat_poll(void)
 {
     uint32_t now = millis();
+    session_entropy_poll(now);
     if (s_store_flush_req) {
         s_store_flush_req = 0u;
         bonds_write();
@@ -788,6 +900,25 @@ void bt_xrec_plat_session_end(void)
     s_bond_fails = 0u;
     mem_sample();                                        /* the Bluedroid tasks are gone: their last samples */
     mem_log("stop");
+    bt_rom_real_sec_t sec;
+    bt_rom_real_sec(&sec);
+    openfw_log_puts("BT ROM keys: installed ");
+    openfw_log_u32(sec.key_installs);
+    openfw_log_puts(" unexpected ");
+    openfw_log_u32(sec.key_unexpected);
+    openfw_log_puts(" rng drbg ");
+    openfw_log_u32(sec.rng.drbg_calls);
+    openfw_log_puts(" nonces ");
+    openfw_log_u32(sec.rng.nonce_fills);
+    openfw_log_puts(" legacy ");
+    openfw_log_u32(sec.rng.legacy_calls);
+    openfw_log_puts(" unknown ");
+    openfw_log_u32(sec.rng.unknown_calls);
+    openfw_log_puts(" starved ");
+    openfw_log_u32(sec.rng.starved);
+    openfw_log_putc('\n');
+    bt_rom_real_stage_p192(NULL, NULL);                  /* the controller is stopped: staged key wiped */
+    bt_rom_rng_reset();
     s_vol = NULL;
     s_sd = 0;
 }

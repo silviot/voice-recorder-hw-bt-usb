@@ -107,9 +107,41 @@ void bt_xrec_plat_wait(void) { vTaskDelay(1); }
 uint32_t bt_xrec_plat_irq_count(void) { return 0u; }
 void bt_xrec_plat_reboot(uint8_t mode) { s_reboot_mode = mode; }
 
+/* Entropy as the session sees it on target (bt_xrec_fw.c). The DRBG itself is always seeded on the host (host_glue.c
+ * TEST ONLY source, which Bluedroid's esp_random also uses); bthx_withhold_entropy() models a BT-mode entry whose mic
+ * collection credited nothing: the XREC PIN and the CHAL nonce fail closed and the M2.3 gate refuses. */
+static volatile uint8_t s_withhold;
+static volatile uint8_t s_key_staged, s_key_installed;   /* bt_rom_real_stage_p192 / start() install, modelled */
+
+static bool session_entropy_ready(void) { return !s_withhold && bt_entropy_ready(); }
+
 int bt_xrec_plat_entropy(void *out, size_t n)
 {
+    if (!session_entropy_ready()) {
+        return -1;
+    }
     return bt_entropy_get(out, n) == BT_ENT_OK ? 0 : -1;
+}
+
+/* Plan M2.3 gate in bt_xrec_fw.c's order. The fake ROM has no P-192 key slots or RNG hook, so the ROM part is modelled
+ * on the firmware's sequence: the key is staged at stack_up_begin only with credited entropy (session_entropy_begin)
+ * and "installed" when esp_bluedroid_enable() returned (bt_rom_real start() runs inside its HCI Reset); stop wipes it.
+ * A credit arriving later in the session (deferred mic collection) does not install it: SSP stays refused until the
+ * next start, exactly as on target. The RNG-pool reason (starved) has no host model (test_bt_rom_rng covers it). */
+const char *bt_xrec_plat_pairing_block(void)
+{
+    bt_ent_stats_t es;
+    bt_entropy_get_stats(&es);
+    if (es.health_failures != 0u) {
+        return "entropy source failed its health test (until reboot)";
+    }
+    if (!session_entropy_ready()) {
+        return "entropy not credited";
+    }
+    if (!s_key_installed) {
+        return "ROM P-192 key not replaced (re-enter BT mode)";
+    }
+    return NULL;
 }
 
 /* ============================================ files (app task) ================================================== */
@@ -249,8 +281,13 @@ static const xrec_ops_t k_dev_ops = { .get_stat = dev_get_stat, .get_rtc = dev_g
 const xrec_ops_t *bt_xrec_plat_device_ops(void) { return &k_dev_ops; }
 
 /* ============================================ worker ============================================================ */
+static volatile uint8_t s_hold_up;    /* test knob: the up job waits (the app task keeps running, state UP) */
+
 static int job_up(void)
 {
+    while (s_hold_up) {              /* on target the ROM bring-up takes long enough for the app task to run */
+        vTaskDelay(1);
+    }
     if (bth_ctrl_open() != 0) {      /* bt_ctrl_open + esp_bluedroid_attach_hci_driver */
         return 1;
     }
@@ -260,6 +297,7 @@ static int job_up(void)
     if (esp_bluedroid_enable() != ESP_OK) {
         return 4;
     }
+    s_key_installed = s_key_staged;  /* firmware: bt_rom_real start() installed the staged P-192 pair (HCI Reset) */
     return 0;
 }
 
@@ -375,6 +413,8 @@ int bt_xrec_plat_stack_up_begin(exfat_vol_t *vol, int sd_mounted, const uint8_t 
     s_vol = vol;
     s_sd = sd_mounted;
     bonds_load();                    /* before esp_bluedroid_init() (plan M2) */
+    s_key_installed = 0u;            /* bt_xrec_fw.c session_entropy_begin: key staged only with credited entropy */
+    s_key_staged = (uint8_t)session_entropy_ready();
     s_faults_base = bth_ctrl_faults();
     s_hci_to_base = bth_hci_cmd_timeouts();
     s_flush_seen = bth_store_flush_requests();
@@ -384,6 +424,7 @@ int bt_xrec_plat_stack_up_begin(exfat_vol_t *vol, int sd_mounted, const uint8_t 
 
 void bt_xrec_plat_stack_down_begin(void)
 {
+    s_key_installed = 0u;            /* the controller stops: bt_rom_real stop() wipes the session key */
     taskENTER_CRITICAL();
     s_dl_fired = 0u;
     s_dl_armed = 1u;
@@ -424,6 +465,7 @@ void bt_xrec_plat_session_end(void)
 {
     bonds_write();                   /* final flush of the bond store */
     s_bond_fails = 0u;
+    s_key_staged = s_key_installed = 0u;
     s_vol = NULL;
     s_sd = 0;
 }
@@ -435,6 +477,7 @@ static void snapshot(void)
     memset(&n, 0, sizeof(n));
     bt_xrec_get_status(&n.st);
     bt_xrec_get_debug(&n.d);
+    bt_xrec_get_ui(&n.ui);
     n.bonds = esp_bluedroid_get_status() == ESP_BLUEDROID_STATUS_ENABLED ? esp_bt_gap_get_bond_device_num() : -1;
     taskENTER_CRITICAL();
     n.polls = s_snap.polls + 1u;
@@ -453,6 +496,25 @@ static void app_task(void *arg)
             case BTHX_START: r = bt_xrec_start(s_card, 1); break;
             case BTHX_STOP: bt_xrec_stop(); r = (int)bthx_hard_path_reason(); break;
             case BTHX_OPEN_PAIRING: bt_xrec_open_pairing(s_req_arg); break;
+            case BTHX_SSP_ANSWER: r = bt_xrec_ssp_answer((int)s_req_arg); break;
+            case BTHX_START_PAIR:            /* main.c with SD:/BTBENCH.RUN pair=1: bt_bench_begin() right after start */
+                r = bt_xrec_start(s_card, 1);
+                if (r == 0) {
+                    bt_xrec_open_pairing(s_req_arg);
+                }
+                break;
+            case BTHX_BENCH_AUTOCONFIRM: bt_xrec_set_bench_autoconfirm((int)s_req_arg); break;
+            case BTHX_BENCH_XREC_PIN: {     /* arg 0..999999 -> "NNNNNN"; anything larger switches it off */
+                char pin[8];
+                uint32_t v = s_req_arg;
+                for (int i = 5; i >= 0; i--) {
+                    pin[i] = (char)('0' + v % 10u);
+                    v /= 10u;
+                }
+                pin[6] = '\0';
+                bt_xrec_set_bench_xrec_pin(s_req_arg <= 999999u ? pin : NULL);
+                break;
+            }
             case BTHX_READ_FILE: r = read_root_file(s_card, s_rd_name, s_rd_buf, s_rd_cap); break;
             default: r = -1; break;
             }
@@ -545,3 +607,5 @@ void bthx_fail_bond_writes(int on) { s_fail_bond_writes = on ? 1u : 0u; }
 uint32_t bthx_bond_write_fails(void) { return s_bond_write_fails; }
 uint32_t bthx_key_writes(void) { return s_key_writes; }
 uint32_t bthx_reboot_mode(void) { return s_reboot_mode; }
+void bthx_withhold_entropy(int on) { s_withhold = on ? 1u : 0u; }
+void bthx_hold_bringup(int on) { s_hold_up = on ? 1u : 0u; }

@@ -72,7 +72,7 @@ holds (ke_msgs, EM buffers) before the restart.
 | RAM slot | Installed value | ROM consumer (disassembly) |
 |---|---|---|
 | `0x00803C1C` / `0x00803C20` | `bt_irq_lock` / `bt_irq_unlock` (F:1050–1051) | ROM `0x3DE80` / `0x3DE8C` (`bt_int_disable/restore`, H:116–117) are 3-instruction thunks through these slots; every ROM critical section uses them. |
-| `0x00803C24` | `bt_rand80` (returns `0..79`, F:306–309) | thunk ROM `0x3DE98` |
+| `0x00803C24` | `bt_rand80` (returns `0..79`, F:306–309); BT=1 phone/probe images: `rr_rand_hook` (DRBG pool per call site, §2.3) | thunk ROM `0x3DE98` |
 | `0x008041CC` / `0x008041D0` | `bt_malloc(size,type)` / `bt_free(ptr)` (F:1053–1054) | `ke_malloc` ROM `0x3DEA4`, `ke_free` ROM `0x3DEB0` (thunks) |
 | `0x008041D4..E0` | ROM `ke_timer_hw_set/set/clear/active` (F:1056–1059) | — |
 | `0x008041A8/AC/B0` | ROM `ke_msg_alloc/send/forward` bodies `0x30A01/0x30A3D/0x30A7D` (F:1061–1063) | public entries `0x309EC/0x30A30/0x30A70` are thunks through these |
@@ -89,39 +89,108 @@ The ROM also uses `0x00803C28` as a **base pointer for LM fields far beyond `hci
 ROM `0x41778`, `0x420F4`, `0x3F414`); open_fw's `hci_tl_env` struct only covers `0x803C28..0x803D0B`.
 `bt_ctrl` must not reuse anything in `0x00800000..0x00804BFF` (FA:609).
 
-### 2.3 ROM RNG trace: what seeds SSP P-192 (plan M2.1; static, 2026-11-24, not yet confirmed on silicon)
+### 2.3 SSP key material: RNG hook, nonces, the fixed P-192 key (plan M2.1; static, 2026-11-24, re-derived by `make test-bt-port`; silicon check pending)
 
-Disassembly recipe: `docs/BT_ROM_HCI_MAP.md` §8 (`rom.dis`, base 0). The `0x00803C24` hook (`bt_rand80`,
-`bt_rom_real.c rr_rand80`, legacy F:293-309: timer xorshift, returns `0..79`) is reached only through the thunk
-`0x3DE98` (`ldr r3,=0x00803C1C; ldr r3,[r3,#8]; bx r3`). Its 11 call sites:
+Disassembly recipe: `docs/BT_ROM_HCI_MAP.md` §8 (`rom.dis`, base 0). `open_fw/tests/test_bt_rom_rng.c` re-derives the
+load-bearing facts below from `dumps/bootrom_384K.bin` whenever the dump is present (call sites, thunk, key pair).
 
-| Call site(s) | Function | Use of the result |
-|---|---|---|
-| `0x31D72/7C/84/8C` | `0x31D6C` (called by `rom_lm_sec_p192_init` `0x31DE4`, and by `0x31E54`) | **one byte each** (`strb`) into the 28-byte block at `0x0080340C` (offsets `+0x0C/+0x10/+0x14/+0x18`) |
-| `0x31EE4` | `0x31EE2` | `rand % 1000000` (literal `0x000F4240`): the SSP **passkey** (passkey display; open_fw rejects passkey pairing, M4) |
-| `0x312FA`, `0x313FC`, `0x3577C`, `0x39C2C`, `0x42F74`, `0x4414E` | not traced yet | `udiv`/`mls` (modulo) or compares: backoff / slot choices, judging by their shape |
+**Correction to the first trace (same day).** `0x31D6C` does not build the P-192 private key, it builds the 128-bit
+**SSP nonce**; the P-192 key pair is a **constant in the mask ROM**. Details:
 
-`0x31D6C` builds the P-192 secret: after the four hook bytes it samples CLKN (`0x4002001C` = 1, poll for 0, low byte
-of `0x40020020` stored at `0x00803414`, i.e. block offset `+0x08`), copies 6 bytes of the device's own identity from
-`0x00802C14` (`0x3BA68`: the BD_ADDR) to block offset `+0x00`, runs **SHA-256** over the 28-byte block (`0x40ABA`:
-`0x80` padding, bit length at `+0xBE/+0xBF`, 8-word IV) and keeps the **first 16 bytes** as the 128-bit secret that
-`rom_lm_sec_p192_init` hands to `0x31A00` (the P-192 key set-up). The block's other bytes are never written there
-(zero, or whatever the other users of the `0x00803348` SSP control block left: `0x0080340C` has 6 literal references,
-`0x31B58 .. 0x3253C`).
+*The local P-192 key pair is fixed.* `rom_lm_sec_p192_init` (`0x31DE4`, run once per bring-up by the LM layer,
+F:1338) copies 24 bytes from ROM `0xD7EC` (`0xD72C + 0xC0`) to RAM `0x00803798` (`0x00803348 + 0x450`, the private
+key) and 48 bytes from ROM `0xD84C` (`0xD72C + 0x120`) to `0x0080334C` (`+0x4`, public X || Y), all little-endian, and
+zeroes the debug-mode byte `0x00803348`. Nothing else in the ROM writes `0x00803798..AF` (no other literal or base
+offset reaches it). `d = 0x703CF5EE9C075F7726D0BB36D131C664F5534A6E6305D631` and `d * G` equals the stored public key
+(checked with independent Python arithmetic and by `bt_p192`). Every SL6801 therefore pairs with the same private key,
+readable from any ROM dump. Readers: the DHKey computation (`0x32558`) copies the private key from RAM at its start
+(the Bluetooth P-192 **debug** private key at ROM `0xD90C` instead when the debug byte is set; HCI `0x1804` is not in
+`bt_ctrl`'s table, so it stays 0), and `0x319B8` copies the public key from RAM whenever it is sent or hashed (debug
+public key from ROM `0xD72C` in debug mode). ROM `0xD72C` holds the spec's debug public key; `0x31C94` compares a
+peer's key with it (debug-key detection). The ROM has P-192 only (no P-256 prime in the image): no Secure Connections.
 
-**Consequence.** The ROM's P-192 secret has at most `4 x log2(range of the hook) + 8` bits of entropy, the rest being
-public (BD_ADDR) or constant: with the legacy hook (0..79, timer-derived) about 25 + 8 bits, all of them predictable
-from the boot time and CLKN; with DRBG bytes through the hook (0..255) at most 32 + 8 = 40 bits. The device's public
-key goes over the air in every SSP exchange, so an observer can search that space offline (one P-192 point
-multiplication per candidate), recover the secret, derive the DHKey and with it the link key: **a passive attack on
-the pairing**, and on all later traffic of that bond. Feeding the DRBG through `0x00803C24` (plan M2.1 "covered
-hooks") is necessary but cannot reach 128 bits by itself. Candidates, each needing a trace of the other `0x0080340C`
-users and a silicon check: fill the block's unwritten bytes (`+0x06/07, +0x09..0B, +0x0D..0F, +0x11..13, +0x15..17,
-+0x19..1B`, 17 bytes) from a pre-filled DRBG pool inside the hook (it runs in ROM context, possibly with the ROM lock
-held: no FreeRTOS call, no blocking); or replace the 16-byte secret after `0x31D6C` returns if a hookable point exists
-between it and `0x31A00`. Not traced yet: where the SSP **nonces** (Na/Nb, 128 bits each) come from; if they share
-this source, the numeric comparison's protection weakens too. Open_fw's position until then: bench-only waiver
-(plan live log, "review round on the phone path"; `docs/BT_HW_RESULTS.md` phone-mode recipe).
+*Consequence of the fixed key (before the fix):* the link key is `f2(DHKey, N_master, N_slave, "btlk", A, B)` with
+`DHKey = d * PK_peer`; the peer's public key and both nonces cross the air in clear, so **anyone who records a pairing
+computes the link key with one point multiplication**, whatever the nonces' quality: every bond and all of its traffic
+were passively readable. The nonce weakness (below) also let an active attacker who can search ~2^33..2^40 HMACs during
+the pairing defeat numeric comparison.
+
+*SSP nonces.* `0x31D6C(out)` fills a 28-byte block at `0x0080340C` (four hook bytes at `+0x0C/+0x10/+0x14/+0x18`, one
+CLKN byte at `+0x08` (`0x4002001C` = 1, poll, low byte of `0x40020020`), 6 bytes of BD_ADDR at `+0x00` via `0x3BA68`),
+SHA-256s it (`0x40ABA`, which pads in place and zeroes `+0x1C..+0xBF`) and copies 16 bytes to `out`. Callers: five LM
+pairing paths with `out = link env (0x208 per link) + 0x17C` (`0x23A32`, `0x24830` (20 rounds: passkey entry),
+`0x2B5FE`, `0x2D466`, `0x2D788`): the per-link **Na/Nb**; and `0x31DE4` / `0x31E54` (HCI Read Local OOB Data, `0x41AD2`)
+with `out = 0x008037F8`: the OOB **R**, whose commitment `C = f1(PKx, PKx, R, 0)` `0x31A00` writes to `0x00803808`.
+`0x31A00` and `0x31F6C` are f1 (HMAC-SHA-256 keyed by the nonce: ipad block + `U || V || Z` = 113 bytes into the inner hash), `0x32102`
+is g, `0x321F4` f2 (link key), `0x323B8` f3; all of them use the `0x0080340C` block as scratch and finish with it inside
+the same call. The block's other 17 bytes are residue of the previous hash. With the legacy hook (timer xorshift,
+`0..79`) a nonce carried about 25 + 8 predictable bits.
+
+*Link keys:* computed by the ROM with f2 from the DHKey and the two nonces; Bluedroid only stores them
+(`bt_store`). LMP 128-bit random numbers (AU_RAND / EN_RAND / IN_RAND / combination-key randoms) come from `0x313F4`:
+16 hook calls, one `strb` each (11 LMP callers, not individually traced).
+
+*All 11 RNG hook call sites* (thunk `0x3DE98`: `ldr r3,=0x00803C1C; ldr r3,[r3,#8]; bx r3`, reached only by `bl`; no
+other code loads the slot): `0x312FA` (`lo + r % (hi - lo)`, `<< 7`, a timer value for `0x424D4`), `0x313FC` (LMP
+random byte), `0x31D72/7C/84/8C` (nonce bytes), `0x31EE4` (`r % 1000000`: the SSP passkey; open_fw rejects passkey
+pairing), `0x3577C` (`(r + k) & 0x3FF` slot/backoff), `0x39C2C` (`r & 0x7F` folded to `0..78`: AFH channel pick),
+`0x42F74` (`r & 0xF`, `(r & 0xFFFFFF) >> 16`: PDU fields), `0x4414E` (`((r & 0xF) + 1) & 0x1E`: slot offset). Every
+caller masks, reduces or byte-stores the value: **no ROM path depends on the legacy `0..79` range** for memory
+safety; it only shapes the timing sites' distributions (e.g. `0x42F74`'s byte 2 is always 0 with `0..79`).
+
+**What open_fw does now (BT=1 phone images)** — `bt_port/bt_rom_rng.c`, `bt_rom_real.c`, `bt_p192.c`, `bt_xrec_fw.c`:
+1. *Fresh P-192 key per BT session.* After the mic collection credits the DRBG (`bt_entropy_mic.c`), the app draws a
+   scalar (FIPS 186-4 B.4.2) and computes `d * G` (`bt_p192.c`: fixed 192-step double-and-add-always ladder,
+   constant-time selects, on-curve self-check; vectors incl. the ROM pair and the debug pair) and stages the pair.
+   `bt_rom_real` start() installs it right after the LM bring-up, **only if** both RAM slots still hold exactly the ROM
+   constants (else `key_unexpected`, nothing written), reads it back, and stop() wipes the private key slot. Unpredict-
+   ability of the private key: 0 bits (public constant) -> a uniformly random scalar from a 384-bit-seeded HMAC-DRBG.
+   Against a **passive** recorder P-192's ~96-bit level is then the limit; against an **active** peer it is not,
+   because the ROM never validates the peer's public key (item 4 below). Emulated check (2026-11-24, temporary instrumentation of
+   `rr_install_p192` in a `test-qemu-hciprobe` run; QEMU executes the real ROM image): after the LM bring-up both
+   slots held exactly the ROM constants (`unexpected=0`) and the staged bytes were written and read back
+   (`installed=1`).
+2. *Hook routed per call site* by the caller's return address (LR at hook entry): nonce, LMP-random and passkey sites
+   take DRBG bytes from a 512-byte single-producer/single-consumer pool the app refills from `bt_entropy` (the hook runs
+   in ROM context, possibly under the ROM's PRIMASK lock: it never blocks or calls bt_entropy); timing sites and any
+   unknown return address keep the legacy xorshift `% 80` bit for bit. At the first nonce call (return address
+   `0x31D76`) the hook overwrites the whole 28-byte block with pool bytes before the ROM writes its own fields: the
+   hash input then carries 17 x 8 + 4 x 8 = 168 DRBG bits, so **Na/Nb and the OOB R are full 128-bit values** (before:
+   ~33 predictable bits). LMP randoms: 16 DRBG bytes (before: 16 timer-derived values in `0..79`).
+3. *Fail closed by policy.* The hook cannot fail; a security site that finds the pool short gets the legacy value and
+   counts `starved`. `bt_xrec_plat_pairing_block()` refuses the SSP part of the pairing window unless entropy is
+   credited, the key was installed by this session's start() and `starved == 0`, and the session re-checks it on every
+   poll while the window is open (a pending prompt is rejected when it fails). `BT ROM keys: installed N unexpected N
+   rng drbg N nonces N legacy N unknown N starved N` is logged at every BT stop.
+
+4. *No peer-key validation in the ROM (invalid-curve class, CVE-2018-5383; review finding, re-derived 2026-11-24).*
+   The curve coefficient `b` appears nowhere in `dumps/bootrom_384K.bin` (not as 24 bytes LE/BE, not in Montgomery
+   form, not as any of its 32-bit words), while `p`, `Gx`, `Gy` and `p-3` are there (`0xDD80`, `0xDEBC`, `0xDED8`,
+   `0xDF10`): the point code uses `a = -3` and never needs `b`, i.e. never checks `y^2 = x^3 - 3x + b`. The DHKey
+   routine `0x32558` only zero-tests the peer's X and Y (`0x40668`, an is-zero check on the bignum at `0x0080361C`,
+   X at `+0x04`, Y at `+0x20`) before the point multiplication `0x40E70`. A peer that sends a point of small order r on
+   another curve learns from the device's reaction to its DHKey check `Ea` (accepted -> `Eb`, else failure) whether
+   its guess of `d * P'` was right: each such pairing leaks `d mod r` with probability 1/r, and enough of them recover
+   `d`, which decrypts every bond made with it. In the SSP protocol the responder checks `Ea` only after its own host
+   confirmed the comparison (not traced in the ROM's LM, protocol order), so an unconfirmed or rejected comparison is
+   no oracle; the session treats an accepted one whose link merely drops as spent anyway.
+   *Mitigation in the session* (`bt_xrec_bluedroid.c`, `ssp_burned`): one query per key. A numeric comparison this
+   session accepted (ENTER, or the bench autoconfirm) whose pairing then fails (`AUTH_CMPL` status != success) or
+   whose link drops before `AUTH_CMPL` **spends the key**: the SSP part of the window closes and stays refused
+   (`BT SSP pairing window refused: a failed pairing used this session's P-192 key (re-enter BT mode)`, toast
+   "Pairing unavailable") until the next BT-mode entry draws a new pair. A successful bond closes the window anyway
+   (one bond per window); a later window of the same session reuses the key, but each further query again needs an
+   accepted comparison and its first failure ends SSP. Residual risk: a single query per session (`log2 r` bits of
+   `d` with probability 1/r), and a peer that guesses right gets the bond it would get with a valid key anyway.
+
+Still not covered: nonces of the **peer** (its business); the passkey (rejected anyway); timing-site randomness
+(legacy on purpose); a controller restart inside a session reinstalls the same staged pair (new pair per BT-mode
+entry, not per pairing); **peer public keys are not validated** (item 4: only the one-query-per-key limit, no point
+check: the host never sees the peer's key, it stays inside the ROM's LM); several **successful** bonds of one
+session share its key (a window per bond, each one confirmed). Not yet shown on silicon: that the ROM really accepts
+an off-curve key (needs a peer that can send one, e.g. a patched BlueZ or a raw-HCI tool; the static trace above is
+the evidence). Silicon checks: `docs/BT_HW_RESULTS.md` "Phone mode (BT=1) on silicon", step "Entropy and
+ROM keys".
 
 ## 3. Host → controller: HCI commands
 
