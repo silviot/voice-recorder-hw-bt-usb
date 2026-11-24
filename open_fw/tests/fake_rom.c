@@ -12,13 +12,14 @@
 #define EM_BLOCK   0x40Cu
 #define EM_HDR     12u
 
-enum { M_FREE = 0, M_ALLOC, M_QUEUED, M_KEPT };
+enum { M_FREE = 0, M_ALLOC, M_QUEUED, M_KEPT, M_SAVED };
 
 typedef struct {
     uint8_t *block;         /* MSG_HDR + len bytes; param = block + MSG_HDR */
     uint16_t id, dst, src, len;
     uint8_t state;
     uint8_t internal;       /* allocated by the fake itself (reply/injection) */
+    uint8_t rerun;          /* re-dispatched from the saved queue (already in the command log) */
 } msg_t;
 
 typedef struct {
@@ -27,7 +28,7 @@ typedef struct {
 } reply_t;
 
 typedef struct {
-    uint16_t handle;
+    uint16_t handle, len;
     uint8_t *em;
 } air_t;
 
@@ -52,6 +53,14 @@ static struct {
     bt_rom_upcalls_t up, stale_up;
     bool have_stale;
     uint32_t in_call;
+    /* headphones path */
+    uint32_t saved_q[MAX_MSGS];
+    uint32_t saved_n;
+    fake_dev_t devs[FAKE_ROM_DEVS];
+    uint32_t n_devs;
+    bool paging;
+    uint8_t page_addr[6];
+    uint32_t page_link;
 } f;
 
 static void err(const char *fmt, ...)
@@ -290,6 +299,7 @@ static void peer_link_down(uint8_t reason)
     fake_peer.connected = fake_peer.encrypted = fake_peer.authenticated = false;
     fake_peer.origin = FAKE_PEER_ORIGIN_NONE;
     fake_peer.last_disc_reason = reason;
+    fake_peer.we_paged = false;
 }
 
 static void peer_auth_done(uint8_t status)
@@ -674,6 +684,364 @@ int fake_peer_send_acl(const uint8_t *data, uint16_t len)
     return fake_peer.connected ? fake_rom_inject_acl(fake_peer.handle, 0x2u, data, len) : -1;
 }
 
+/* ---- headphones path: inquiry, page, LM states (docs/BT_ROM_HCI_MAP.md §2, §3; docs/BT_A2DP_DESIGN.md §8.2) ----
+ * The fake TASK_LM: 0401 (E000), 0402 (E001), 0405 (E004), 0408 (E005), 0C45 (E047), and the LM-state rule for 0419
+ * (E00C). Replies use the ROM ids and aligned layouts; LM replies come from TASK_LM (0x38), the Connection Complete of
+ * a successful page from the new link's LC instance like E456 on the accept path. */
+static void lm_rerun_saved(void)
+{
+    uint32_t n = f.saved_n;
+    f.saved_n = 0u;
+    for (uint32_t i = 0u; i < n; i++) {
+        msg_t *m = &f.msgs[f.saved_q[i]];
+        m->rerun = 1u;
+        fake_rom.saved_reruns++;
+        queue_msg(m);                        /* the ROM's ke_task saved queue runs again after a state change */
+    }
+}
+
+static void lm_set(uint8_t st)
+{
+    if (fake_rom.lm_state != st) {
+        fake_rom.lm_state = st;
+        lm_rerun_saved();
+    }
+}
+
+static bool lm_save(msg_t *m)
+{
+    if (f.saved_n >= MAX_MSGS) {
+        err("saved queue full");
+        return false;
+    }
+    m->state = M_SAVED;
+    f.saved_q[f.saved_n++] = (uint32_t)(m - f.msgs);
+    fake_rom.saved++;
+    return true;
+}
+
+static void lm_status(uint16_t id, uint8_t status)
+{
+    send_internal(id, BT_ROM_TASK_HCI, BT_ROM_TASK_LM, &status, 1u);
+}
+
+static void lm_s_addr(uint16_t id, uint8_t status, const uint8_t *addr)   /* CC {s, bdaddr} (7) */
+{
+    uint8_t p[7];
+    p[0] = status;
+    memcpy(&p[1], addr, 6u);
+    send_internal(id, BT_ROM_TASK_HCI, BT_ROM_TASK_LM, p, 7u);
+}
+
+/* One inquiry response per message, id by inquiry mode (map §3). */
+static void inq_result(const uint8_t addr[6], const uint8_t cod[3], uint8_t psrm, uint16_t clk_off, int8_t rssi,
+                       const char *name)
+{
+    uint8_t r[256];
+    memset(r, 0, sizeof(r));
+    r[0] = 1u;
+    memcpy(&r[1], addr, 6u);
+    r[7] = psrm;
+    if (fake_rom.inq_mode == 0u) {           /* E0D1: num, bdaddr, psrm, rsvd, rsvd, cod@0xA, pad, clkoff@0xE */
+        memcpy(&r[0xA], cod, 3u);
+        r[0xD] = 0xEEu;                      /* pad byte: the packer must drop it */
+        memcpy(&r[0xE], &clk_off, 2u);
+        send_internal(0xE0D1u, BT_ROM_TASK_HCI, BT_ROM_TASK_LM, r, 16u);
+    } else {                                 /* E0D6/E0D7: num, bdaddr, psrm, rsvd, cod@9, clkoff@0xC, rssi@0xE */
+        memcpy(&r[9], cod, 3u);
+        memcpy(&r[0xC], &clk_off, 2u);
+        r[0xE] = (uint8_t)rssi;
+        if (fake_rom.inq_mode == 1u) {
+            send_internal(0xE0D6u, BT_ROM_TASK_HCI, BT_ROM_TASK_LM, r, 16u);
+        } else {
+            size_t n = strnlen(name, 31u);   /* EIR: Complete Local Name */
+            r[0xF] = (uint8_t)(n + 1u);
+            r[0x10] = 0x09u;
+            memcpy(&r[0x11], name, n);
+            send_internal(0xE0D7u, BT_ROM_TASK_HCI, BT_ROM_TASK_LM, r, 256u);
+        }
+    }
+    fake_rom.inq_results_sent++;
+}
+
+static void inq_complete(uint8_t status)
+{
+    lm_status(0xE0D0u, status);
+    fake_rom.inq_completes++;
+    lm_set(0u);
+}
+
+static const fake_dev_t *dev_by_addr(const uint8_t *a)
+{
+    for (uint32_t i = 0u; i < f.n_devs; i++) {
+        if (memcmp(f.devs[i].addr, a, 6u) == 0) {
+            return &f.devs[i];
+        }
+    }
+    return NULL;
+}
+
+static void page_fail(uint8_t status)
+{
+    uint8_t c[13];                           /* E0D2 {s, pad, h, pad, bdaddr, type, enc} from LM */
+    memset(c, 0, sizeof(c));
+    c[0] = status;
+    memcpy(&c[5], f.page_addr, 6u);
+    c[11] = 1u;
+    send_internal(0xE0D2u, BT_ROM_TASK_HCI, BT_ROM_TASK_LM, c, 13u);
+    f.paging = false;
+    lm_set(0u);
+}
+
+/* The page reached the scripted peer: link up, we are master (until the peer switches). */
+static void page_success(void)
+{
+    f.links[f.page_link] = true;
+    fake_peer.link = f.page_link;
+    fake_peer.connected = true;
+    fake_peer.encrypted = fake_peer.authenticated = false;
+    fake_peer.origin = FAKE_PEER_ORIGIN_NONE;
+    fake_peer.handle = (uint16_t)(0x80u + f.page_link);
+    fake_peer.we_paged = true;
+    fake_peer.conn_count++;
+    fake_rom.pages_ok++;
+    uint8_t c[13];
+    memset(c, 0, sizeof(c));
+    c[2] = (uint8_t)fake_peer.handle;
+    memcpy(&c[5], s_peer.addr, 6u);
+    c[11] = 1u;
+    peer_emit(0xE456u, peer_lc_src(), c, 13u);
+    f.paging = false;
+    lm_set(0u);
+    if (s_peer.role_switch_on_connect) {
+        fake_peer_role_switch(1u);           /* the headset becomes master: we are slave */
+    }
+    if (s_peer.max_slots_on_connect != 0u) {
+        fake_peer_max_slots(s_peer.max_slots_on_connect);
+    }
+}
+
+static void page_resolve(void)
+{
+    if (fake_peer.enabled && !s_peer.ignores_pages && memcmp(f.page_addr, s_peer.addr, 6u) == 0) {
+        page_success();
+    } else {
+        fake_rom.page_timeouts++;
+        page_fail(0x04u);                    /* Page Timeout (0C18's 0x2000 slots on silicon) */
+    }
+}
+
+static bool hp_handle(msg_t *m)
+{
+    const uint8_t *p = m->block + MSG_HDR;
+    uint8_t st = fake_rom.lm_state;
+    if ((m->dst & 0xFFu) != BT_ROM_TASK_LM) {
+        return false;
+    }
+    switch (m->id) {
+    case 0xE000u: {                                                      /* 0401 Inquiry, ROM 0x3ED44 */
+        if (!peer_need(m, 5u)) return true;
+        if (st == 1u || (st == 2u && !fake_rom.lm_state2_err)) {
+            (void)lm_save(m);
+            return true;
+        }
+        if (st == 2u) {
+            fake_rom.inq_refused++;
+            lm_status(0xE0C7u, 0x3Au);
+            return true;
+        }
+        if (st >= 3u) {
+            fake_rom.inq_refused++;
+            lm_status(0xE0C7u, 0x0Cu);
+            return true;
+        }
+        if (p[3] == 0u || p[3] > 0x30u) {
+            lm_status(0xE0C7u, 0x12u);
+            return true;
+        }
+        lm_status(0xE0C7u, 0u);
+        fake_rom.inquiries++;
+        fake_rom.lm_state = 4u;              /* no saved re-run: they would be saved again in state 4 */
+        uint32_t limit = p[4] != 0u ? p[4] : 0xFFFFFFFFu, sent = 0u;
+        if (fake_peer.enabled && s_peer.discoverable && !fake_peer.connected && sent < limit) {
+            inq_result(s_peer.addr, s_peer.cod, s_peer.psrm, s_peer.clk_off, s_peer.rssi, s_peer.name);
+            sent++;
+        }
+        for (uint32_t i = 0u; i < f.n_devs && sent < limit; i++, sent++) {
+            inq_result(f.devs[i].addr, f.devs[i].cod, f.devs[i].psrm, f.devs[i].clk_off, f.devs[i].rssi,
+                       f.devs[i].name);
+        }
+        if (fake_rom.inq_auto_complete) {
+            inq_complete(0u);
+        }
+        return true;
+    }
+    case 0xE001u:                                                        /* 0402 Inquiry Cancel, ROM 0x3F2BC */
+        if (st != 4u) {
+            lm_status(0xE066u, 0x0Cu);       /* no inquiry running */
+            return true;
+        }
+        fake_rom.inq_cancels++;
+        fake_rom.lm_state = 7u;              /* LD cancel requested: the CC comes when the LD has stopped */
+        if (!fake_rom.inq_cancel_hold) {
+            lm_status(0xE066u, 0u);          /* deferred CC (EC07 handler 0x3EF8E); no E0D0 after a cancel */
+            lm_set(0u);
+        }
+        return true;
+    case 0xE004u: {                                                      /* 0405 Create Connection, ROM 0x318BC */
+        if (!peer_need(m, 14u)) return true;
+        fake_peer.host_creates++;
+        if (st == 1u || st == 2u) {
+            (void)lm_save(m);
+            return true;
+        }
+        if (st >= 3u) {
+            fake_rom.page_refused++;
+            lm_status(0xE0C8u, 0x0Cu);       /* paging or inquiring: refused at once, not saved */
+            return true;
+        }
+        if (p[8] > 2u || p[12] > 1u) {
+            lm_status(0xE0C8u, 0x12u);
+            return true;
+        }
+        if ((fake_peer.connected || fake_peer.ghost_up) && memcmp(p, s_peer.addr, 6u) == 0) {
+            fake_rom.page_refused++;
+            lm_status(0xE0C8u, 0x0Bu);       /* ACL Connection Already Exists */
+            return true;
+        }
+        uint32_t link = 7u;
+        for (uint32_t i = 0u; i < 7u && link == 7u; i++) {
+            link = f.links[i] ? 7u : i;
+        }
+        if (link == 7u) {
+            lm_status(0xE0C8u, 0x09u);       /* no free link */
+            return true;
+        }
+        fake_peer.host_pkt_type = (uint16_t)(p[6] | (p[7] << 8));
+        fake_peer.host_psrm = p[8];
+        fake_peer.host_clk_off = (uint16_t)(p[10] | (p[11] << 8));
+        fake_peer.host_allow_rs = p[12];
+        lm_status(0xE0C8u, 0u);
+        fake_rom.pages++;
+        f.paging = true;
+        memcpy(f.page_addr, p, 6u);
+        f.page_link = link;
+        fake_rom.lm_state = 3u;
+        if (!fake_rom.page_hold) {
+            page_resolve();
+        }
+        return true;
+    }
+    case 0xE005u:                                                        /* 0408 Create Connection Cancel */
+        if (!peer_need(m, 6u)) return true;
+        fake_rom.create_cancels++;
+        if (f.paging && memcmp(p, f.page_addr, 6u) == 0) {
+            lm_s_addr(0xE069u, 0u, p);       /* LC 0x30E4C: status 0, then the page is cancelled */
+            fake_rom.page_cancels++;
+            page_fail(0x02u);                /* Connection Complete, Unknown Connection Identifier */
+        } else if (fake_peer.connected && memcmp(p, s_peer.addr, 6u) == 0) {
+            lm_s_addr(0xE069u, 0x0Bu, p);    /* the page won the race: already connected */
+        } else {
+            lm_s_addr(0xE069u, 0x02u, p);    /* LM 0x32734: no link for this address */
+        }
+        return true;
+    case 0xE047u:                                                        /* 0C45 Write Inquiry Mode, ROM 0x418C8 */
+        if (!peer_need(m, 1u)) return true;
+        if (p[0] <= 2u) {
+            fake_rom.inq_mode = p[0];
+            lm_status(0xE0A9u, 0u);
+        } else {
+            lm_status(0xE0A9u, 0x12u);
+        }
+        return true;
+    case 0xE00Cu: {                                                      /* 0419: SAVED while LM state != 0 */
+        if (!peer_need(m, 10u)) return true;
+        if (st != 0u) {
+            (void)lm_save(m);
+            return true;
+        }
+        const fake_dev_t *d = dev_by_addr(p);
+        if (d == NULL) {
+            return false;                    /* the scripted peer / default path */
+        }
+        uint8_t r[255];
+        memset(r, 0, sizeof(r));
+        memcpy(&r[1], p, 6u);
+        lm_status(0xE0CBu, 0u);
+        if (d->answers_name) {
+            memcpy(&r[7], d->name, strnlen(d->name, sizeof(d->name)));
+        } else {
+            r[0] = 0x04u;
+        }
+        send_internal(0xE0D3u, BT_ROM_TASK_HCI, BT_ROM_TASK_LM, r, 255u);
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
+void fake_peer_role_switch(uint8_t new_role)
+{
+    if (!fake_peer.connected) {
+        return;
+    }
+    uint8_t r[8];                            /* E461 {s, bdaddr, role} verbatim */
+    r[0] = 0u;
+    memcpy(&r[1], s_peer.addr, 6u);
+    r[7] = new_role;
+    peer_emit(0xE461u, peer_lc_src(), r, 8u);
+    fake_peer.role_changes++;
+}
+
+void fake_peer_max_slots(uint8_t slots)
+{
+    if (!fake_peer.connected) {
+        return;
+    }
+    uint8_t r[3] = { (uint8_t)fake_peer.handle, (uint8_t)(fake_peer.handle >> 8), slots };
+    peer_emit(0xE468u, peer_lc_src(), r, 3u);
+}
+
+int fake_rom_add_device(const fake_dev_t *d)
+{
+    if (f.n_devs >= FAKE_ROM_DEVS || d == NULL) {
+        return -1;
+    }
+    f.devs[f.n_devs++] = *d;
+    return 0;
+}
+
+void fake_rom_set_lm_state(uint8_t st)
+{
+    lm_set(st);
+}
+
+void fake_rom_inquiry_end(void)
+{
+    if (fake_rom.lm_state == 4u) {
+        inq_complete(0u);
+    } else if (fake_rom.lm_state == 7u) {
+        lm_status(0xE066u, 0u);              /* the deferred 0402 CC; no Inquiry Complete */
+        lm_set(0u);
+    }
+}
+
+void fake_rom_page_answer(void)
+{
+    if (f.paging) {
+        page_resolve();
+    }
+}
+
+void fake_rom_page_timeout(void)
+{
+    if (f.paging) {
+        fake_rom.page_timeouts++;
+        page_fail(0x04u);
+    }
+}
+
 /* ---- fake LM / LC ---- */
 static reply_t *find_reply(uint16_t req)
 {
@@ -697,7 +1065,10 @@ static void nocp_send(const uint16_t *handles, const uint16_t *counts, uint32_t 
     send_internal(BT_ROM_MSG_NOCP, BT_ROM_TASK_HCI, BT_ROM_TASK_LC, p, (uint16_t)(2u + 4u * n));
 }
 
-static void lmlc_handle(msg_t *m)
+static bool hp_handle(msg_t *m);
+
+/* Returns true when the message stays allocated (SAVED by the fake LM). */
+static bool lmlc_handle(msg_t *m)
 {
     if (m->src != BT_ROM_TASK_HCI) {
         err("command 0x%04X with src 0x%X", m->id, m->src);
@@ -706,12 +1077,12 @@ static void lmlc_handle(msg_t *m)
         bt_rom_acl_desc_t d;
         if (m->len < sizeof(d)) {
             err("short ACL_TX descriptor");
-            return;
+            return false;
         }
         memcpy(&d, m->block + MSG_HDR, sizeof(d));
         if (!em_range_ok(d.buf_ptr, d.length)) {
             err("ACL_TX buf_ptr not an allocated EM TX buffer");
-            return;
+            return false;
         }
         if (fake_rom.acl != NULL && fake_rom.n_acl < FAKE_ROM_LOG_MAX) {
             fake_acl_rec_t *r = &fake_rom.acl[fake_rom.n_acl++];
@@ -722,21 +1093,22 @@ static void lmlc_handle(msg_t *m)
         }
         if (f.air_n >= BT_ROM_EM_TX_BUFS) {
             err("more ACL in air than EM TX buffers");
-            return;
+            return false;
         }
         f.air[f.air_n].handle = d.conhdl;
+        f.air[f.air_n].len = d.length;
         f.air[f.air_n].em = d.buf_ptr;
         f.air_n++;
         fake_rom.acl_in_air = f.air_n;
         if (fake_rom.auto_ack_acl) {
             (void)fake_rom_ack_acl(1u);
         }
-        return;
+        return false;
     }
     if (fake_rom.lc_swallow && (m->dst & 0xFFu) == BT_ROM_TASK_LC) {
-        return;                              /* message discarded by a freed LC instance: no reply, ever */
+        return false;                        /* message discarded by a freed LC instance: no reply, ever */
     }
-    if (fake_rom.n_cmds < 64u) {
+    if (!m->rerun && fake_rom.n_cmds < 64u) {
         fake_cmd_rec_t *r = &fake_rom.cmds[fake_rom.n_cmds++];
         r->id = m->id;
         r->dst = m->dst;
@@ -747,14 +1119,17 @@ static void lmlc_handle(msg_t *m)
         if (f.held_n < MAX_MSGS) {
             f.held[f.held_n++] = ((uint32_t)m->id << 16) | m->len;   /* address echo comes from the cmds log */
         }
-        return;
+        return false;
+    }
+    if (hp_handle(m)) {
+        return m->state == M_SAVED;          /* headphones-path LM model (inquiry, page, LM states) */
     }
     if (peer_handle(m)) {
-        return;                              /* scripted remote peer answered with the ROM's own messages */
+        return false;                        /* scripted remote peer answered with the ROM's own messages */
     }
     reply_t *r = find_reply(m->id);
     if (r == NULL) {
-        return;                              /* the ROM handles it without a reply */
+        return false;                        /* the ROM handles it without a reply */
     }
     uint8_t p[64];
     memset(p, 0, sizeof(p));
@@ -778,6 +1153,7 @@ static void lmlc_handle(msg_t *m)
         memcpy(&p[1], m->block + MSG_HDR, m->len >= 6u ? 6u : m->len);
     }
     send_internal(r->rsp, m->src, (uint16_t)(m->dst & 0xFFu), p, r->ret_len);
+    return false;
 }
 
 void fake_rom_release_held(void)
@@ -831,8 +1207,9 @@ static void dispatch_one(void)
         return;
     }
     if (task == BT_ROM_TASK_LM || (task == BT_ROM_TASK_LC && (m->dst >> 8) < 7u)) {
-        lmlc_handle(m);
-        free_msg(m);
+        if (!lmlc_handle(m)) {
+            free_msg(m);
+        }
         return;
     }
     err("message 0x%04X to unregistered task 0x%04X (ROM udf)", m->id, m->dst);
@@ -863,6 +1240,10 @@ static void drop_all(void)
     f.air_n = 0u;
     fake_rom.acl_in_air = 0u;
     f.held_n = 0u;
+    f.saved_n = 0u;
+    f.paging = false;
+    fake_rom.lm_state = 0u;                  /* the LM task restarts idle */
+    fake_rom.air_budget = 0u;
     fake_rom.heap_used = 0u;
 }
 
@@ -1282,6 +1663,31 @@ uint32_t fake_rom_ack_acl(uint32_t n)
         nocp_send(hs, cs, nh);
     }
     return done;
+}
+
+uint32_t fake_rom_air_tick(uint32_t ms)
+{
+    fake_rom.air_ticks++;
+    if (fake_rom.air_stall || fake_rom.air_rate_Bps == 0u) {
+        return 0u;                           /* the baseband acknowledges nothing: no NOCP, no detach */
+    }
+    uint64_t add = (uint64_t)fake_rom.air_rate_Bps * ms / 1000u;
+    uint64_t b = (uint64_t)fake_rom.air_budget + add;
+    fake_rom.air_budget = (uint32_t)(b > fake_rom.air_rate_Bps ? fake_rom.air_rate_Bps : b);
+    uint32_t n = 0u;
+    for (uint32_t i = 0u; i < f.air_n && f.air[i].len <= fake_rom.air_budget; i++) {
+        fake_rom.air_budget -= f.air[i].len;
+        fake_rom.air_acked_bytes += f.air[i].len;
+        n++;
+    }
+    if (f.air_n == 0u) {
+        fake_rom.air_budget = 0u;            /* an idle link does not bank airtime */
+    }
+    if (n != 0u) {
+        fake_rom.air_acked += fake_rom_ack_acl(n);
+        fake_rom.air_nocp_events++;
+    }
+    return n;
 }
 
 int fake_rom_deliver_stale(uint16_t id, const uint8_t *param, uint16_t len)

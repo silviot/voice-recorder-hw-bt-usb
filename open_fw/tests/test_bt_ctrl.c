@@ -403,7 +403,7 @@ static void test_table(void)
         CHECK(!(rows[i].cls == BTC_M && eff == BTC_REJ), "class M row %04X is REJ", rows[i].op);
         if (eff == BTC_FWD) {
             CHECK(bt_ctrl_evt_reply_opcode(rows[i].rom_rsp) == rows[i].op, "FWD %04X reply id unmapped", rows[i].op);
-            CHECK(bt_ctrl_cmds_fwd_min_len(rows[i].op) != 0u, "FWD %04X has no ROM layout", rows[i].op);
+            CHECK(bt_ctrl_cmds_fwd_layout(rows[i].op, NULL), "FWD %04X has no ROM layout", rows[i].op);
         }
     }
     CHECK(bt_ctrl_cmds_lookup(0xFC57u) != NULL && bt_ctrl_cmds_lookup(0xFC57u)->act == BTC_REJ, "vendor OGF REJ");
@@ -484,7 +484,13 @@ static uint16_t golden(const bt_ctrl_cmd_row_t *r, const uint8_t *prm, uint8_t p
     case 0x1002: { static const uint8_t g[] = { 4, 0x0E, 68, 1, 0x02, 0x10, 0 };
         memcpy(out, g, sizeof(g));
         uint8_t *b = out + 7;  /* supported by the effective FWD/SYN/LOCAL rows of the default build */
-        b[0] = 0x20; b[1] = 0xBF; b[2] = 0xF9; b[3] = 0x01; b[5] = 0xD0; b[6] = 0x81; b[7] = 0xA3; b[9] = 0x02;
+        b[0] = 0x20; b[1] = 0xBF;
+        /* the headphones rows (BT_CTRL_HP_GATE_LIST) are set only in a build that passes their gates */
+        static const struct { uint16_t op; uint8_t bit; } hp[] = { { 0x0401, 0x01 }, { 0x0402, 0x02 },
+                                                                   { 0x0405, 0x10 }, { 0x0408, 0x80 } };
+        for (size_t k = 0; k < sizeof(hp) / sizeof(hp[0]); k++) {
+            if (bt_ctrl_cmds_eff(bt_ctrl_cmds_lookup(hp[k].op)) == BTC_FWD) b[0] |= hp[k].bit;
+        } b[2] = 0xF9; b[3] = 0x01; b[5] = 0xD0; b[6] = 0x81; b[7] = 0xA3; b[9] = 0x02;
         b[10] = 0xE0; b[14] = 0xD8; b[15] = 0x02; b[17] = 0x40; b[18] = 0x80; b[19] = 0x03; b[20] = 0x08;
         return 7 + 64; }
     case 0x1004: { static const uint8_t g[] = { 4, 0x0E, 14, 1, 0x04, 0x10, 0, 0, 1,
@@ -501,6 +507,8 @@ static uint16_t golden(const bt_ctrl_cmd_row_t *r, const uint8_t *prm, uint8_t p
     }
     uint8_t eff = bt_ctrl_cmds_eff(r);
     uint8_t status = eff == BTC_REJ ? 0x01 : 0x00;
+    if (eff == BTC_FWD && op == 0x0402) status = 0x0C;   /* ROM 0x3F2BC with no inquiry running (map §2) */
+    if (eff == BTC_FWD && op == 0x0408) status = 0x02;   /* ROM 0x32734: no link for the address (map §2) */
     if (r->rsp == BTC_CS) {
         uint8_t g[7] = { 4, 0x0F, 4, status, 1, lo, hi };
         memcpy(out, g, 7);
@@ -533,6 +541,7 @@ static void test_golden_vectors(void)
         uint16_t wlen = golden(r, prm, plen, want);
         uint32_t before = t_rx_n;
         uint32_t cmds_before = fake_rom.n_cmds;
+        fake_rom.page_hold = true;                     /* 0405: the CS only; the page outcome is test_hp_connect's */
         send_cmd(r->op, prm, plen);
         pump();
         uint32_t got = t_rx_n - before;
@@ -560,7 +569,8 @@ static void test_golden_vectors(void)
                   "%04X not forwarded as KE id %04X", r->op, r->rom_req);
             if (fake_rom.n_cmds == cmds_before + 1u) {
                 const fake_cmd_rec_t *c = &fake_rom.cmds[cmds_before];
-                uint8_t min = bt_ctrl_cmds_fwd_min_len(r->op);
+                uint8_t min = 0;
+                CHECK(bt_ctrl_cmds_fwd_layout(r->op, &min), "%04X FWD without a layout", r->op);
                 CHECK(c->len == (plen > min ? plen : min) && memcmp(c->data, prm, plen) == 0,
                       "%04X ROM payload", r->op);
                 uint16_t dst_task = (uint16_t)(c->dst & 0xFFu);
@@ -1732,6 +1742,9 @@ static const evt_vec_t k_evt_vecs[] = {
     { 0xE0D0, { 0x00 }, 1, { 4, 0x01, 1, 0x00 }, 4 },
     { 0xE0D1, { 0x05, A6, 0x01, 0x00, 0x00, 0x0C, 0x02, 0x5A, 0xEE, 0x34, 0x12 }, 16,
       { 4, 0x02, 15, 0x01, A6, 0x01, 0x00, 0x00, 0x0C, 0x02, 0x5A, 0x34, 0x12 }, 18 },
+    /* E0D6 (map §3, ROM senders only): {num, bdaddr, psrm, rsvd, cod@9, clkoff@0xC, rssi@0xE} = wire 0x22, num -> 1 */
+    { 0xE0D6, { 0x00, A6, 0x01, 0x00, 0x18, 0x04, 0x24, 0x34, 0x12, 0xC4 }, 15,
+      { 4, 0x22, 15, 0x01, A6, 0x01, 0x00, 0x18, 0x04, 0x24, 0x34, 0x12, 0xC4 }, 18 },
     { 0xE45B, { 0x00, 0xEE, 0x80, 0x00 }, 4, { 4, 0x09, 3, 0x00, 0x80, 0x00 }, 6 },
     { 0xE45C, { 0x00, 0xEE, 0x80, 0x00, 0x01 }, 5, { 4, 0x0A, 4, 0x00, 0x80, 0x00, 0x01 }, 7 },
     { 0xE45F, { 0x00, 0xEE, 0x80, 0x00, 0x01, 0x02, 0xEE, 0xEE, Q4(0x11), Q4(0x22), Q4(0x33), Q4(0x44) }, 24,
@@ -1819,8 +1832,21 @@ static void test_event_packers(void)
     for (int k = 17; k < 258; k++) zero_tail &= out[k] == 0;
     CHECK(n == 258u && memcmp(&out[3], rnr, 14) == 0 && zero_tail, "E0D3 short: name zero-filled to 248");
     CHECK(bt_ctrl_evt_pack(0xE0D3, rnr, 6, out, &info) == 0u && info.kind == BT_CTRL_EVK_SHORT, "E0D3 < 7 B SHORT");
+    /* E0D7 Extended Inquiry Result: E0D6's 15 bytes + eir[240] verbatim = 0x2F (255 B), num forced to 1, a short
+     * message zero-filled */
+    uint8_t eir[256];
+    for (int k = 0; k < 256; k++) eir[k] = (uint8_t)(k * 7 + 1);
+    eir[0] = 0;
+    n = bt_ctrl_evt_pack(0xE0D7, eir, 256, out, &info);
+    CHECK(n == 258u && out[1] == 0x2F && out[2] == 255 && out[3] == 1 && memcmp(&out[4], &eir[1], 254) == 0 &&
+          h4_rx_valid(out, n), "E0D7 -> event 0x2F, 255 B verbatim, num 1");
+    n = bt_ctrl_evt_pack(0xE0D7, eir, 20, out, &info);
+    zero_tail = 1;
+    for (int k = 3 + 20; k < 258; k++) zero_tail &= out[k] == 0;
+    CHECK(n == 258u && memcmp(&out[4], &eir[1], 19) == 0 && zero_tail, "E0D7 short: EIR zero-filled");
+    CHECK(bt_ctrl_evt_pack(0xE0D7, eir, 14, out, &info) == 0u && info.kind == BT_CTRL_EVK_SHORT, "E0D7 < 15 B SHORT");
     /* not packed on purpose (no stock packer / feature compiled out): counted as unknown, never mis-packed */
-    const uint16_t unknown[] = { 0xE0D6, 0xE0D7, 0xE46E, 0xE46F, 0xE470, 0xE454, 0xE455 };
+    const uint16_t unknown[] = { 0xE46E, 0xE46F, 0xE470, 0xE454, 0xE455 };
     for (size_t i = 0; i < sizeof(unknown) / sizeof(unknown[0]); i++) {
         CHECK(bt_ctrl_evt_pack(unknown[i], rnr, 255, out, &info) == 0u && info.kind == BT_CTRL_EVK_UNKNOWN,
               "%04X must stay unknown", unknown[i]);
@@ -2469,6 +2495,7 @@ static void test_fuzz_tx(void)
     for (uint32_t seed = 1; seed <= 6; seed++) {
         rng_state = 0x85EBCA6Bu * seed + 1u;
         setup();
+        fake_rom.inq_auto_complete = true;   /* HP gate build: a fuzzed 0401 must not SAVE every later 0419 for good */
         bring_up();
         link_up(0); link_up(1);
         uint32_t expect_replies = 0, got_replies = 0;
@@ -2823,6 +2850,600 @@ static void test_session_lines(void)
     shutdown_and_check();
 }
 
+/* ------------------------------------------------------------------------------------------------------------- */
+/* 13. headphones path (docs/BT_A2DP_DESIGN.md §7, §8.2, milestone H2): inquiry, inquiry cancel, create connection,  */
+/*     create connection cancel, link view, ACL pacing. The FWD cases run in the BT_CTRL_HP_GATE_LIST build          */
+/*     (make test-bt-ctrl builds both); the default build checks that the rows stay refused without touching the ROM.*/
+/* ------------------------------------------------------------------------------------------------------------- */
+static const uint8_t k_hp[6] = { 0x51, 0x52, 0x53, 0x54, 0x55, 0x56 };      /* the headset (wire order) */
+static const uint8_t k_dev1[6] = { 0x61, 0x62, 0x63, 0x64, 0x65, 0x66 };    /* a phone nearby */
+static const uint8_t k_dev2[6] = { 0x71, 0x72, 0x73, 0x74, 0x75, 0x76 };    /* a speaker that does not answer names */
+
+static int hp_gated_on(void)
+{
+    return bt_ctrl_cmds_eff(bt_ctrl_cmds_lookup(0x0401u)) == BTC_FWD;
+}
+
+static void hp_cfg(fake_peer_cfg_t *c)
+{
+    memset(c, 0, sizeof(*c));
+    memcpy(c->addr, k_hp, 6);
+    c->cod[0] = 0x18; c->cod[1] = 0x04; c->cod[2] = 0x24;   /* 0x240418: Audio+Rendering, AV / headphones */
+    c->io_cap = 0x03;                                       /* NoInputNoOutput */
+    c->key_type = 0x04;                                     /* unauthenticated combination (Just Works) */
+    static const uint8_t f0[8] = { 0xBF, 0xFE, 0xCF, 0xFE, 0xDB, 0xFF, 0x7B, 0x87 };
+    memcpy(c->features, f0, 8);
+    c->features_p1[0] = 0x01;
+    c->max_page = 1;
+    c->lmp_ver = 0x09;
+    c->manuf = 0x001D;
+    c->clk_off = 0x2468;
+    c->psrm = 1;
+    c->rssi = -52;
+    c->discoverable = true;
+    memcpy(c->name, "HP-Fake", 7);
+}
+
+static void hp_devices(void)
+{
+    fake_dev_t d;
+    memset(&d, 0, sizeof(d));
+    memcpy(d.addr, k_dev1, 6);
+    d.cod[0] = 0x0C; d.cod[1] = 0x02; d.cod[2] = 0x5A;     /* smartphone */
+    d.psrm = 1;
+    d.clk_off = 0x1111;
+    d.answers_name = true;
+    memcpy(d.name, "Phone-1", 7);
+    CHECK(fake_rom_add_device(&d) == 0, "add device 1");
+    memset(&d, 0, sizeof(d));
+    memcpy(d.addr, k_dev2, 6);
+    d.cod[0] = 0x14; d.cod[1] = 0x04; d.cod[2] = 0x24;     /* loudspeaker */
+    d.psrm = 2;
+    d.clk_off = 0x2222;
+    CHECK(fake_rom_add_device(&d) == 0, "add device 2");
+}
+
+static uint8_t hp_create_params(uint8_t *p, const uint8_t *addr)
+{
+    memset(p, 0, 13);
+    memcpy(p, addr, 6);
+    p[6] = 0x18; p[7] = 0xCC;          /* DM1/DH1/DM3/DH3/DM5/DH5, as btm_acl builds it with EDR not excluded */
+    p[8] = 0x01;                       /* page scan repetition mode R1 */
+    p[11] = 0x80;                      /* clock offset invalid */
+    p[12] = 0x00;                      /* allow role switch: no (page-0 bit 5 is masked) */
+    return 13;
+}
+
+static const uint8_t k_giac_8[5] = { 0x33, 0x8B, 0x9E, 0x08, 0x00 };          /* GIAC, 10.24 s, unlimited */
+
+static void hp_note_expect(uint8_t kind, uint8_t status, uint8_t local, const char *what)
+{
+    bt_ctrl_note_t n;
+    int found = 0;
+    while (bt_ctrl_note_pop(&n)) {
+        if (n.kind == kind) {
+            found = 1;
+            CHECK(n.status == status && n.local == local, "%s note: st %02X local %u", what, n.status, n.local);
+            break;
+        }
+    }
+    CHECK(found, "%s note missing", what);
+}
+
+/* Both builds: the default refuses the rows locally (no ROM contact) and keeps their 1002 bits clear; 040F/080B/080D
+ * and 0C45 stay refused in both (design §7). */
+static void test_hp_gates(void)
+{
+    setup();
+    bring_up();
+    uint8_t prm[16];
+    static const uint16_t hp_ops[] = { 0x0401u, 0x0402u, 0x0405u, 0x0408u };
+    const uint8_t *bits = bt_ctrl_cmds_supported();
+    static const uint8_t mask[] = { 0x01, 0x02, 0x10, 0x80 };
+    for (size_t i = 0; i < 4; i++) {
+        uint8_t eff = bt_ctrl_cmds_eff(bt_ctrl_cmds_lookup(hp_ops[i]));
+        CHECK(eff == (hp_gated_on() ? BTC_FWD : BTC_REJ), "%04X effective action %u", hp_ops[i], eff);
+        CHECK(((bits[0] & mask[i]) != 0) == (eff == BTC_FWD), "%04X 1002 bit follows the gate", hp_ops[i]);
+    }
+    if (!hp_gated_on()) {
+        uint32_t c0 = fake_rom.n_cmds;
+        const pkt_t *r = roundtrip(0x0401u, k_giac_8, 5);
+        CHECK(r && r->d[1] == BT_HCI_EVT_CS && status_of(r) == 0x01u, "0401 REJ CS 0x01");
+        r = roundtrip(0x0402u, NULL, 0);
+        CHECK(r && r->d[1] == BT_HCI_EVT_CC && r->d[2] == 4 && status_of(r) == 0x01u, "0402 REJ CC(4) 0x01");
+        r = roundtrip(0x0405u, prm, hp_create_params(prm, k_hp));
+        CHECK(r && r->d[1] == BT_HCI_EVT_CS && status_of(r) == 0x01u, "0405 REJ CS 0x01");
+        r = roundtrip(0x0408u, k_hp, 6);
+        CHECK(r && r->d[2] == 10 && status_of(r) == 0x01u && memcmp(&r->d[7], k_hp, 6) == 0, "0408 REJ CC(10) echo");
+        CHECK(fake_rom.n_cmds == c0, "gated rows reached the ROM");
+    }
+    CHECK(bt_ctrl_cmds_eff(bt_ctrl_cmds_lookup(0x040Fu)) == BTC_REJ &&
+          bt_ctrl_cmds_eff(bt_ctrl_cmds_lookup(0x080Bu)) == BTC_REJ &&
+          bt_ctrl_cmds_eff(bt_ctrl_cmds_lookup(0x080Du)) == BTC_REJ &&
+          bt_ctrl_cmds_eff(bt_ctrl_cmds_lookup(0x0C45u)) == BTC_REJ, "040F/080B/080D/0C45 stay REJ");
+    uint8_t p0[8];
+    bt_ctrl_cmds_features_p0(p0);
+    CHECK((p0[0] & 0x20u) == 0u && (p0[3] & 0x40u) == 0u, "no role switch, no RSSI inquiry advertised");
+    bool zl = false;
+    uint8_t ml = 0xFF;
+    zl = bt_ctrl_cmds_fwd_layout(0x0402u, &ml);
+    CHECK(zl && ml == 0u && bt_ctrl_cmds_fwd_min_len(0x0402u) == 0u, "0402 has a verified zero-length layout");
+    CHECK(!bt_ctrl_cmds_fwd_layout(0x0403u, NULL), "0403 has no layout");
+    shutdown_and_check();
+}
+
+/* Inquiry: results with the CoD and clock offset de-padded, 0405 refused 0x0C by the ROM while inquiring, a name
+ * request SAVED behind the inquiry and answered after Inquiry Complete, notes, page scan off around it (design §6.2). */
+static void test_hp_inquiry(void)
+{
+    if (!hp_gated_on()) return;
+    fake_peer_cfg_t c;
+    hp_cfg(&c);
+    setup();
+    bring_up();
+    fake_peer_init(&c);
+    hp_devices();
+    uint8_t v = 0x02;
+    (void)roundtrip(0x0C1Au, &v, 1);
+    CHECK(bt_ctrl_scan_enable() == 0x02u, "scan accessor: page scan");
+    v = 0x00;
+    (void)roundtrip(0x0C1Au, &v, 1);                         /* the session turns page scan off first */
+    CHECK(bt_ctrl_scan_enable() == 0x00u && fake_rom.scan_enable == 0u, "page scan off before the inquiry");
+    while (bt_ctrl_note_pop(&(bt_ctrl_note_t){0})) {}
+    uint32_t c0 = fake_rom.n_cmds;
+    send_cmd(0x0401u, k_giac_8, 5);
+    pump();
+    CHECK(fake_rom.n_cmds == c0 + 1u && fake_rom.cmds[c0].id == 0xE000u && fake_rom.cmds[c0].len == 5u &&
+          memcmp(fake_rom.cmds[c0].data, k_giac_8, 5) == 0, "0401 -> E000, 5 B wire layout");
+    const pkt_t *p = next_pkt();
+    CHECK(is_reply(p, 0x0401u) && p->d[1] == BT_HCI_EVT_CS && status_of(p) == 0u, "0401 CS 0");
+    static const uint8_t r_hp[] = { 4, 0x02, 15, 1, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x01, 0x00, 0x00,
+                                    0x18, 0x04, 0x24, 0x68, 0x24 };
+    static const uint8_t r_d1[] = { 4, 0x02, 15, 1, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x01, 0x00, 0x00,
+                                    0x0C, 0x02, 0x5A, 0x11, 0x11 };
+    static const uint8_t r_d2[] = { 4, 0x02, 15, 1, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x02, 0x00, 0x00,
+                                    0x14, 0x04, 0x24, 0x22, 0x22 };
+    p = next_pkt();
+    CHECK(p && same(p->d, p->len, r_hp, sizeof(r_hp)), "inquiry result: headset (CoD 240418, clkoff 2468)");
+    p = next_pkt();
+    CHECK(p && same(p->d, p->len, r_d1, sizeof(r_d1)), "inquiry result: phone");
+    p = next_pkt();
+    CHECK(p && same(p->d, p->len, r_d2, sizeof(r_d2)), "inquiry result: speaker");
+    CHECK(pending_pkts() == 0u && bt_ctrl_inquiry_active() == 1 && fake_rom.lm_state == 4u, "inquiry still running");
+    hp_note_expect(BT_CTRL_NOTE_INQ_CMD, 0u, 0u, "inquiry cmd");
+
+    /* 0405 while inquiring: the ROM refuses it at once (LM state 4 -> 0x0C, not SAVED) */
+    uint8_t prm[16];
+    const pkt_t *r = roundtrip(0x0405u, prm, hp_create_params(prm, k_hp));
+    CHECK(r && r->d[1] == BT_HCI_EVT_CS && status_of(r) == 0x0Cu, "0405 during inquiry: CS 0x0C from the ROM");
+    CHECK(fake_rom.page_refused == 1u && fake_rom.pages == 0u && !fake_peer.connected, "no page started");
+    hp_note_expect(BT_CTRL_NOTE_PAGE_CMD, 0x0Cu, 0u, "create connection (refused)");
+
+    /* 0419 while inquiring: SAVED (map §2), the one-command window stays shut until the inquiry ends */
+    uint8_t rnr[10] = { 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x01, 0x00, 0x00, 0x00 };
+    send_cmd(0x0419u, rnr, 10);
+    pump();
+    CHECK(pending_pkts() == 0u && dbg().fwd_pending == 1u && fake_rom.saved == 1u, "0419 SAVED behind the inquiry");
+    fake_rom_inquiry_end();
+    pump();
+    p = next_pkt();
+    CHECK(is_evt(p, 0x01) && p->d[3] == 0u, "Inquiry Complete first");
+    p = next_pkt();
+    CHECK(is_reply(p, 0x0419u) && status_of(p) == 0u, "then the saved name request's CS");
+    p = next_pkt();
+    CHECK(is_evt(p, 0x07) && p->d[3] == 0u && memcmp(&p->d[4], k_dev1, 6) == 0 && memcmp(&p->d[10], "Phone-1", 8) == 0,
+          "then its Remote Name Request Complete");
+    CHECK(bt_ctrl_inquiry_active() == 0 && fake_rom.saved_reruns == 1u, "inquiry over, saved message re-run once");
+    bt_ctrl_note_t n;
+    int done_seen = 0;
+    while (bt_ctrl_note_pop(&n)) {
+        if (n.kind == BT_CTRL_NOTE_INQ_DONE) {
+            done_seen = 1;
+            CHECK(n.status == 0u && n.reason == 3u, "inquiry complete note: %u results", n.reason);
+            char line[BT_CTRL_NOTE_LINE];
+            bt_ctrl_note_format(&n, line, sizeof(line));
+            CHECK(strcmp(line, "BT HCI inquiry complete st=0x00 results=3") == 0, "note line '%s'", line);
+        }
+    }
+    CHECK(done_seen, "inquiry complete note");
+    /* the speaker does not answer a name page: 0x04 */
+    memcpy(rnr, k_dev2, 6);
+    r = roundtrip(0x0419u, rnr, 10);
+    p = next_pkt();
+    CHECK(r == NULL || status_of(r) == 0u, "0419 CS 0");
+    /* roundtrip consumed the CS; the name complete is in the same pump */
+    CHECK(t_rx_n >= 2u && is_evt(&t_rx[t_rx_n - 1u], 0x07) && t_rx[t_rx_n - 1u].d[3] == 0x04u, "speaker: page timeout");
+    (void)p;
+    /* mode-1 inquiry result (E0D6 -> 0x22), as a 0C45 probe would see it (0C45 itself stays REJ) */
+    fake_rom.inq_mode = 1u;
+    t_rx_rd = t_rx_n;
+    send_cmd(0x0401u, k_giac_8, 5);
+    pump();
+    p = next_pkt();
+    CHECK(is_reply(p, 0x0401u), "0401 CS (mode 1)");
+    p = next_pkt();
+    CHECK(is_evt(p, 0x22) && p->d[2] == 15 && p->d[3] == 1 && memcmp(&p->d[4], k_hp, 6) == 0 && p->d[12] == 0x18 &&
+          (int8_t)p->d[17] == -52, "0x22 with RSSI -52");
+    fake_rom_inquiry_end();
+    pump();
+    CHECK(stats().rom_unknown_ids == 0u && stats().rom_short == 0u && stats().fwd_deadline == 0u, "nothing dropped");
+    shutdown_and_check();
+}
+
+/* Inquiry Cancel: zero-length E001; deferred CC; no Inquiry Complete after a cancel; refused when idle; a CC held past
+ * the deadline is answered 0x22 and the late CC consumed. */
+static void test_hp_inquiry_cancel(void)
+{
+    if (!hp_gated_on()) return;
+    fake_peer_cfg_t c;
+    hp_cfg(&c);
+    setup();
+    bt_ctrl_set_clock(clk);
+    t_now_ms = 5000u;
+    bring_up();
+    fake_peer_init(&c);
+    const pkt_t *r = roundtrip(0x0402u, NULL, 0);
+    CHECK(r && r->d[1] == BT_HCI_EVT_CC && r->d[2] == 4 && status_of(r) == 0x0Cu, "0402 while idle: CC 0x0C");
+    uint32_t c0 = fake_rom.n_cmds;
+    (void)roundtrip(0x0401u, k_giac_8, 5);
+    pump();
+    t_rx_rd = t_rx_n;
+    r = roundtrip(0x0402u, NULL, 0);
+    CHECK(fake_rom.cmds[c0 + 1u].id == 0xE001u && fake_rom.cmds[c0 + 1u].len == 0u, "0402 -> E001 with no payload");
+    CHECK(r && status_of(r) == 0u && bt_ctrl_inquiry_active() == 0 && fake_rom.inq_cancels == 1u, "0402 CC 0");
+    fake_rom_inquiry_end();                                  /* state 0 already: nothing */
+    pump();
+    CHECK(pending_pkts() == 0u && fake_rom.inq_completes == 0u, "no Inquiry Complete after a cancel");
+    /* the LD takes its time: CC held, then the deadline */
+    fake_rom.inq_cancel_hold = true;
+    (void)roundtrip(0x0401u, k_giac_8, 5);
+    pump();
+    t_rx_rd = t_rx_n;
+    send_cmd(0x0402u, NULL, 0);
+    pump();
+    CHECK(pending_pkts() == 0u && dbg().fwd_pending == 1u && fake_rom.lm_state == 7u, "deferred CC pending");
+    t_now_ms += BT_CTRL_FWD_DEADLINE_MS;
+    pump();
+    const pkt_t *p = next_pkt();
+    CHECK(is_reply(p, 0x0402u) && p->d[2] == 4 && status_of(p) == BT_HCI_ERR_LMP_TIMEOUT, "0402 answered 0x22 at 7 s");
+    fake_rom_inquiry_end();                                  /* the LD stops: the late CC */
+    pump();
+    CHECK(pending_pkts() == 0u && stats().fwd_late_reply == 1u && fake_rom.inq_completes == 0u,
+          "late CC consumed, no Inquiry Complete");
+    /* the host's next inquiry is not wedged */
+    r = roundtrip(0x0401u, k_giac_8, 5);
+    CHECK(r && status_of(r) == 0u, "next inquiry starts");
+    fake_rom_inquiry_end();
+    pump();
+    shutdown_and_check();
+}
+
+/* 0401 refusals: bad length (0x12), LM state 1 (SAVED -> 0x22 at the deadline, results arrive later as unsolicited
+ * events and the late CS is consumed), LM state 2 with env +0x4b (0x3A), paging (0x0C). */
+static void test_hp_inquiry_refusals(void)
+{
+    if (!hp_gated_on()) return;
+    fake_peer_cfg_t c;
+    hp_cfg(&c);
+    setup();
+    bt_ctrl_set_clock(clk);
+    t_now_ms = 100u;
+    bring_up();
+    fake_peer_init(&c);
+    uint8_t bad[5] = { 0x33, 0x8B, 0x9E, 0x00, 0x00 };
+    const pkt_t *r = roundtrip(0x0401u, bad, 5);
+    CHECK(r && status_of(r) == 0x12u, "0401 length 0: 0x12");
+    hp_note_expect(BT_CTRL_NOTE_INQ_CMD, 0x12u, 0u, "inquiry (bad length)");
+    fake_rom_set_lm_state(1u);
+    send_cmd(0x0401u, k_giac_8, 5);
+    pump();
+    CHECK(pending_pkts() == 0u && fake_rom.saved == 1u, "0401 SAVED in LM state 1");
+    t_now_ms += BT_CTRL_FWD_DEADLINE_MS;
+    pump();
+    const pkt_t *p = next_pkt();
+    CHECK(is_reply(p, 0x0401u) && status_of(p) == BT_HCI_ERR_LMP_TIMEOUT, "0x22 at the deadline");
+    hp_note_expect(BT_CTRL_NOTE_INQ_CMD, BT_HCI_ERR_LMP_TIMEOUT, 1u, "inquiry (deadline)");
+    fake_rom_set_lm_state(0u);                               /* the saved inquiry runs now */
+    pump();
+    p = next_pkt();
+    CHECK(is_evt(p, 0x02), "its result reaches the host as an event");
+    CHECK(stats().fwd_late_reply == 1u && stats().evt_unsolicited_reply == 0u, "late CS consumed");
+    fake_rom_inquiry_end();
+    pump();
+    t_rx_rd = t_rx_n;
+    fake_rom.lm_state2_err = true;
+    fake_rom_set_lm_state(2u);
+    r = roundtrip(0x0401u, k_giac_8, 5);
+    CHECK(r && status_of(r) == 0x3Au, "LM state 2 + env 0x4b: 0x3A");
+    fake_rom.lm_state2_err = false;
+    fake_rom_set_lm_state(3u);
+    r = roundtrip(0x0401u, k_giac_8, 5);
+    CHECK(r && status_of(r) == 0x0Cu, "LM state 3 (paging): 0x0C");
+    fake_rom_set_lm_state(0u);
+    pump();
+    shutdown_and_check();
+}
+
+static uint16_t hp_connect(uint16_t expect_h)
+{
+    uint8_t prm[16];
+    uint32_t c0 = fake_rom.n_cmds;
+    send_cmd(0x0405u, prm, hp_create_params(prm, k_hp));
+    pump();
+    CHECK(fake_rom.cmds[c0].id == 0xE004u && fake_rom.cmds[c0].len == 14u && memcmp(fake_rom.cmds[c0].data, prm, 13) == 0
+          && fake_rom.cmds[c0].data[13] == 0u, "0405 -> E004, 13 wire bytes zero-padded to 14");
+    const pkt_t *p = next_pkt();
+    CHECK(is_reply(p, 0x0405u) && status_of(p) == 0u, "0405 CS 0");
+    p = next_pkt();
+    CHECK(is_evt(p, 0x03) && p->d[2] == 11 && p->d[3] == 0u && (uint16_t)(p->d[4] | (p->d[5] << 8)) == expect_h &&
+          memcmp(&p->d[6], k_hp, 6) == 0 && p->d[12] == 1u, "Connection Complete h=%04X", expect_h);
+    CHECK(fake_peer.connected && fake_peer.we_paged && fake_peer.host_pkt_type == 0xCC18u &&
+          fake_peer.host_allow_rs == 0u && fake_peer.host_psrm == 1u, "the peer saw our page parameters");
+    return p ? (uint16_t)(p->d[4] | (p->d[5] << 8)) : 0u;
+}
+
+/* Create Connection as master to the headset: link view, set-up reads on the LC as master, refused link-policy
+ * commands, a peer role switch and max-slots change, paced ACL with NOCP, a credit stall, disconnect, reconnect. */
+static void test_hp_connect(void)
+{
+    if (!hp_gated_on()) return;
+    fake_peer_cfg_t c;
+    hp_cfg(&c);
+    setup();
+    bt_ctrl_set_clock(clk);
+    t_now_ms = 1000u;
+    bring_up();
+    fake_peer_init(&c);
+    uint16_t h = hp_connect(0x0080u);
+    bt_ctrl_link_info_t li;
+    CHECK(bt_ctrl_link_info(h, &li) == 1 && li.up && li.outgoing && li.role == BT_CTRL_ROLE_MASTER &&
+          li.bda[0] == k_hp[5] && li.bda[5] == k_hp[0], "link view: up, outgoing, master, BD_ADDR MSB first");
+    hp_note_expect(BT_CTRL_NOTE_PAGE_CMD, 0u, 0u, "create connection");
+    /* Bluedroid's set-up reads as master (btm_acl.c), then what it sends that stays refused */
+    uint8_t hh[4] = { (uint8_t)h, (uint8_t)(h >> 8), 0x01, 0x00 };
+    const pkt_t *r = roundtrip(0x041Bu, hh, 2);
+    CHECK(r && status_of(r) == 0u, "041B CS");
+    r = roundtrip(0x041Du, hh, 2);
+    CHECK(r && status_of(r) == 0u, "041D CS");
+    r = roundtrip(0x041Cu, hh, 3);
+    CHECK(r && status_of(r) == 0u, "041C CS");
+    uint32_t c0 = fake_rom.n_cmds;
+    uint8_t pt[4] = { (uint8_t)h, (uint8_t)(h >> 8), 0x18, 0xCC };
+    r = roundtrip(0x040Fu, pt, 4);
+    CHECK(r && r->d[1] == BT_HCI_EVT_CS && status_of(r) == 0x01u, "040F stays REJ (CS 0x01)");
+    uint8_t lp[4] = { (uint8_t)h, (uint8_t)(h >> 8), 0x05, 0x00 };
+    r = roundtrip(0x080Du, lp, 4);
+    CHECK(r && r->d[2] == 6 && status_of(r) == 0x01u && r->d[7] == (uint8_t)h, "080D REJ CC(6) echoing the handle");
+    uint8_t ls[4] = { (uint8_t)h, (uint8_t)(h >> 8), 0x00, 0x7D };
+    r = roundtrip(0x0C37u, ls, 4);
+    CHECK(r && r->d[2] == 6 && status_of(r) == 0x01u, "0C37 (master only) stays REJ");
+    CHECK(fake_rom.n_cmds == c0, "refused link-policy commands never reached the ROM");
+    /* the headset takes the master role and allows 5-slot packets */
+    fake_peer_role_switch(BT_CTRL_ROLE_SLAVE);
+    fake_peer_max_slots(5);
+    pump();
+    const pkt_t *p = next_pkt();
+    CHECK(is_evt(p, 0x12) && p->d[2] == 8 && p->d[3] == 0u && memcmp(&p->d[4], k_hp, 6) == 0 && p->d[10] == 1u,
+          "Role Change: slave");
+    p = next_pkt();
+    CHECK(is_evt(p, 0x1B) && p->d[2] == 3 && p->d[3] == (uint8_t)h && p->d[5] == 5u, "Max Slots Change: 5");
+    CHECK(bt_ctrl_link_info(h, &li) == 1 && li.role == BT_CTRL_ROLE_SLAVE && li.role_changes == 1u &&
+          li.max_slots == 5u, "link view follows the role change and slots");
+    bt_ctrl_note_t n;
+    int role_note = 0;
+    while (bt_ctrl_note_pop(&n)) {
+        if (n.kind == BT_CTRL_NOTE_ROLE) {
+            role_note = 1;
+            char line[BT_CTRL_NOTE_LINE];
+            bt_ctrl_note_format(&n, line, sizeof(line));
+            CHECK(n.handle == h && strcmp(line, "BT HCI role change h=0x0080 st=0x00 slave") == 0, "role note '%s'", line);
+        }
+    }
+    CHECK(role_note, "role change note");
+
+    /* media-like ACL: 600 B packets, air 30 kB/s, 20 ms ticks: one NOCP per completed packet batch, the 4-credit gate */
+    fake_rom.auto_ack_acl = false;
+    fake_rom.air_rate_Bps = 30000u;
+    uint32_t sent = 0, nocp = 0, ticks = 0, max_infl = 0;
+    for (; ticks < 200u && (sent < 24u || dbg().h2c_inflight != 0u); ticks++) {
+        while (sent < 24u && bt_ctrl_check_send_available()) {
+            send_acl(h, 2, 596, (uint8_t)sent);
+            sent++;
+        }
+        pump();
+        if (dbg().h2c_inflight > max_infl) max_infl = dbg().h2c_inflight;
+        t_now_ms += 20u;
+        (void)fake_rom_air_tick(20u);
+        pump();
+        const pkt_t *q;
+        while ((q = next_pkt()) != NULL) {
+            if (is_evt(q, BT_HCI_EVT_NOCP)) nocp += (uint32_t)(q->d[6] | (q->d[7] << 8));
+        }
+    }
+    CHECK(sent == 24u && nocp == 24u && fake_rom.air_acked == 24u, "24 packets paced to air (%u NOCP)", nocp);
+    CHECK(max_infl == BT_CTRL_H2C_ACL_CREDITS, "credit gate at %u", max_infl);
+    CHECK(ticks >= 24u && ticks <= 30u, "pacing: %u ticks of 20 ms for 24 x 600 B at 30 kB/s", ticks);
+    CHECK(bt_ctrl_link_info(h, &li) == 1 && li.acl_sent == 24u && li.acl_completed == 24u &&
+          li.nocp_last_ms > 1000u && li.nocp_last_ms <= t_now_ms, "link view counts sent/completed (%u/%u)",
+          li.acl_sent, li.acl_completed);
+    /* credit stall: the baseband stops acknowledging, nothing detaches (design §4.6 watchdog input) */
+    fake_rom.air_stall = true;
+    for (int i = 0; i < 6; i++) {
+        send_acl(h, 2, 596, (uint8_t)(100 + i));
+        pump();
+    }
+    uint32_t done0 = li.acl_completed;
+    for (int i = 0; i < 40; i++) {
+        t_now_ms += 20u;
+        (void)fake_rom_air_tick(20u);
+        pump();
+    }
+    CHECK(bt_ctrl_link_info(h, &li) == 1 && li.acl_completed == done0 && li.up && dbg().h2c_inflight == 4u &&
+          pending_pkts() == 0u, "stall: no NOCP for 800 ms, 4 in flight, link still up");
+    /* the session's 0406 after the stall: the ROM flushes the air with a NOCP before the Disconnection Complete */
+    uint8_t dc[3] = { (uint8_t)h, (uint8_t)(h >> 8), 0x13 };
+    send_cmd(0x0406u, dc, 3);
+    pump();
+    p = next_pkt();
+    CHECK(is_reply(p, 0x0406u) && status_of(p) == 0u, "0406 CS");
+    /* the ROM's flush NOCP (4) comes before the Disconnection Complete; the host reclaims those credits from the
+     * Disconnection Complete itself, so bt_ctrl drops the NOCP it still owed (apply_event_side_effects) */
+    while ((p = next_pkt()) != NULL && is_evt(p, BT_HCI_EVT_NOCP)) {}
+    CHECK(is_evt(p, 0x05) && p->d[6] == 0x16u && fake_peer.tx_flushed == 4u, "Disconnection Complete 0x16, 4 flushed");
+    fake_rom.air_stall = false;
+    pump();
+    while (next_pkt() != NULL) {}
+    CHECK(bt_ctrl_link_info(h, &li) == 1 && !li.up && dbg().h2c_inflight == 0u, "link down, credits back");
+    /* reconnect: a new record on the handle */
+    h = hp_connect(0x0080u);
+    CHECK(bt_ctrl_link_info(h, &li) == 1 && li.up && li.role == BT_CTRL_ROLE_MASTER && li.acl_sent == 0u &&
+          li.role_changes == 0u, "fresh link view after the reconnect");
+    /* the peer drops while we pause: link down */
+    fake_peer_disconnect(0x13);
+    pump();
+    p = next_pkt();
+    CHECK(is_evt(p, 0x05), "remote disconnect");
+    shutdown_and_check();
+}
+
+/* Create Connection failures: page timeout, already connected (0x0B), LM state 1 SAVED -> 0x22 at the deadline, the
+ * same opcode held while the late reply can still come (fwd_late_hold), and a role-switching headset. */
+static void test_hp_connect_fail(void)
+{
+    if (!hp_gated_on()) return;
+    fake_peer_cfg_t c;
+    hp_cfg(&c);
+    c.ignores_pages = true;
+    setup();
+    bt_ctrl_set_clock(clk);
+    t_now_ms = 77u;
+    bring_up();
+    fake_peer_init(&c);
+    uint8_t prm[16];
+    send_cmd(0x0405u, prm, hp_create_params(prm, k_hp));
+    pump();
+    const pkt_t *p = next_pkt();
+    CHECK(is_reply(p, 0x0405u) && status_of(p) == 0u, "CS 0");
+    p = next_pkt();
+    CHECK(is_evt(p, 0x03) && p->d[3] == 0x04u && memcmp(&p->d[6], k_hp, 6) == 0, "Connection Complete 0x04 (page TO)");
+    bt_ctrl_link_info_t li;
+    CHECK(bt_ctrl_link_info(0x80, &li) == 1 && !li.up && fake_rom.page_timeouts == 1u, "no link after a page timeout");
+    /* the headset in range now, role switch right after the page */
+    hp_cfg(&c);
+    c.role_switch_on_connect = true;
+    c.max_slots_on_connect = 5;
+    fake_peer_init(&c);
+    (void)hp_connect(0x0080u);
+    p = next_pkt();
+    CHECK(is_evt(p, 0x12) && p->d[10] == 1u, "Role Change right after the page");
+    p = next_pkt();
+    CHECK(is_evt(p, 0x1B) && p->d[5] == 5u, "Max Slots 5");
+    CHECK(bt_ctrl_link_info(0x80, &li) == 1 && li.outgoing && li.role == BT_CTRL_ROLE_SLAVE, "outgoing link, now slave");
+    const pkt_t *r = roundtrip(0x0405u, prm, hp_create_params(prm, k_hp));
+    CHECK(r && status_of(r) == 0x0Bu, "0405 to a connected peer: 0x0B");
+    fake_peer_disconnect(0x13);
+    pump();
+    while (next_pkt() != NULL) {}
+    /* LM state 1: SAVED, 0x22 at 7 s; a second 0405 waits for the late reply */
+    hp_cfg(&c);
+    fake_peer_init(&c);
+    fake_rom_set_lm_state(1u);
+    send_cmd(0x0405u, prm, hp_create_params(prm, k_hp));
+    pump();
+    CHECK(pending_pkts() == 0u && fake_rom.saved == 1u, "0405 SAVED in LM state 1");
+    t_now_ms += BT_CTRL_FWD_DEADLINE_MS;
+    pump();
+    p = next_pkt();
+    CHECK(is_reply(p, 0x0405u) && status_of(p) == BT_HCI_ERR_LMP_TIMEOUT, "0405 answered 0x22 at the deadline");
+    uint32_t e004 = rom_cmds_with(0xE004u);
+    send_cmd(0x0405u, prm, hp_create_params(prm, k_hp));       /* the host retries */
+    pump();
+    CHECK(rom_cmds_with(0xE004u) == e004 && stats().fwd_late_held == 1u, "retry held while the late reply can come");
+    fake_rom_set_lm_state(0u);                                /* the saved page runs: late CS (consumed) + link */
+    pump();
+    p = next_pkt();
+    CHECK(is_evt(p, 0x03) && p->d[3] == 0u, "the saved page's Connection Complete reaches the host");
+    p = next_pkt();
+    CHECK(is_reply(p, 0x0405u) && status_of(p) == 0x0Bu, "the held retry then gets its own reply (0x0B)");
+    CHECK(stats().fwd_late_reply == 1u && stats().evt_unsolicited_reply == 0u, "late CS consumed once");
+    CHECK(bt_ctrl_link_info(0x80, &li) == 1 && li.up && li.role == BT_CTRL_ROLE_UNKNOWN,
+          "a link from a deadline-answered page has an unknown role");
+    shutdown_and_check();
+}
+
+/* Create Connection Cancel: while paging (CC 0, then Connection Complete 0x02), after the page won (0x0B), with
+ * nothing to cancel (0x02); the CC always echoes the address (CC(10)). */
+static void test_hp_create_cancel(void)
+{
+    if (!hp_gated_on()) return;
+    fake_peer_cfg_t c;
+    hp_cfg(&c);
+    setup();
+    bring_up();
+    fake_peer_init(&c);
+    fake_rom.page_hold = true;
+    uint8_t prm[16];
+    const pkt_t *r = roundtrip(0x0405u, prm, hp_create_params(prm, k_hp));
+    CHECK(r && status_of(r) == 0u && fake_rom.lm_state == 3u, "paging");
+    uint32_t c0 = fake_rom.n_cmds;
+    send_cmd(0x0408u, k_hp, 6);
+    pump();
+    CHECK(fake_rom.cmds[c0].id == 0xE005u && fake_rom.cmds[c0].len == 6u, "0408 -> E005 (6 B)");
+    const pkt_t *p = next_pkt();
+    CHECK(is_reply(p, 0x0408u) && p->d[2] == 10 && status_of(p) == 0u && memcmp(&p->d[7], k_hp, 6) == 0,
+          "0408 CC 0 {s, addr}");
+    p = next_pkt();
+    CHECK(is_evt(p, 0x03) && p->d[3] == 0x02u && memcmp(&p->d[6], k_hp, 6) == 0, "then Connection Complete 0x02");
+    CHECK(fake_rom.lm_state == 0u && fake_rom.page_cancels == 1u && !fake_peer.connected, "page cancelled");
+    /* race: the page completes before the cancel reaches the ROM */
+    r = roundtrip(0x0405u, prm, hp_create_params(prm, k_hp));
+    fake_rom_page_answer();
+    send_cmd(0x0408u, k_hp, 6);
+    pump();
+    p = next_pkt();
+    CHECK(is_evt(p, 0x03) && p->d[3] == 0u, "Connection Complete 0 first");
+    p = next_pkt();
+    CHECK(is_reply(p, 0x0408u) && status_of(p) == 0x0Bu && memcmp(&p->d[7], k_hp, 6) == 0, "then 0408 CC 0x0B");
+    bt_ctrl_link_info_t li;
+    CHECK(bt_ctrl_link_info(0x80, &li) == 1 && li.up && li.outgoing, "the link stays (the host disconnects it)");
+    /* nothing to cancel */
+    r = roundtrip(0x0408u, k_dev1, 6);
+    CHECK(r && status_of(r) == 0x02u && memcmp(&r->d[7], k_dev1, 6) == 0, "0408 with no page: 0x02");
+    /* a held page that times out */
+    fake_peer_disconnect(0x13);
+    pump();
+    while (next_pkt() != NULL) {}
+    r = roundtrip(0x0405u, prm, hp_create_params(prm, k_hp));
+    fake_rom_page_timeout();
+    pump();
+    p = next_pkt();
+    CHECK(is_evt(p, 0x03) && p->d[3] == 0x04u, "held page times out: 0x04");
+    shutdown_and_check();
+}
+
+/* An accepted incoming link (phone mode's path) gets its role from the 0409 Role parameter. */
+static void test_hp_link_view_accept(void)
+{
+    fake_peer_cfg_t c;
+    phone_cfg(&c);
+    setup();
+    bring_up();
+    fake_peer_init(&c);
+    CHECK(fake_peer_page(2) == 0, "page");
+    pump();
+    t_rx_rd = t_rx_n;
+    uint8_t acc[7];
+    memcpy(acc, k_phone, 6);
+    acc[6] = 0x01;                                           /* remain slave */
+    send_cmd(0x0409u, acc, 7);
+    pump();
+    bt_ctrl_link_info_t li;
+    CHECK(bt_ctrl_link_info(0x82, &li) == 1 && li.up && !li.outgoing && li.role == BT_CTRL_ROLE_SLAVE,
+          "accepted link: slave, incoming");
+    CHECK(bt_ctrl_link_info(0x87, &li) == 0 && bt_ctrl_link_info(0x0001, &li) == 0, "non-ROM handles");
+    shutdown_and_check();
+}
+
 int main(void)
 {
     struct sigaction sa;
@@ -2870,6 +3491,14 @@ int main(void)
         { "session_lines", test_session_lines },
         { "fuzz_rx", test_fuzz_rx },
         { "fuzz_tx", test_fuzz_tx },
+        { "hp_gates", test_hp_gates },
+        { "hp_inquiry", test_hp_inquiry },
+        { "hp_inquiry_cancel", test_hp_inquiry_cancel },
+        { "hp_inquiry_refusals", test_hp_inquiry_refusals },
+        { "hp_connect", test_hp_connect },
+        { "hp_connect_fail", test_hp_connect_fail },
+        { "hp_create_cancel", test_hp_create_cancel },
+        { "hp_link_view_accept", test_hp_link_view_accept },
     };
     for (size_t i = 0; i < sizeof(tests) / sizeof(tests[0]); i++) {
         int before = g_fail;
@@ -2878,6 +3507,7 @@ int main(void)
     }
     fake_rom_shutdown();
     free(t_rx);
-    printf("test_bt_ctrl: %d checks, %d failures\n", g_checks, g_fail);
+    printf("test_bt_ctrl (%s): %d checks, %d failures\n", hp_gated_on() ? "BT_CTRL_HP_GATE_LIST" : "default gates",
+           g_checks, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

@@ -54,6 +54,13 @@ typedef struct {
 #define BT_CTRL_EXP1_PASSED_LIST 0x0000u
 #endif
 
+/* The headphones (A2DP source, initiator) rows: Inquiry, Inquiry Cancel, Create Connection, Create Connection Cancel
+ * (docs/BT_A2DP_DESIGN.md §7, milestone H2). Still gated: the default list is empty, so release images refuse them.
+ * Host tests and bench images opt in with -DBT_CTRL_EXP1_PASSED_LIST=BT_CTRL_HP_GATE_LIST (make test-bt-ctrl runs both
+ * builds; make BT=1 BENCH=1 HP_GATES=1 for silicon Exp 4a/4b). Each row flips to the default list only after its
+ * silicon experiment passed (one commit each, citing docs/BT_HW_RESULTS.md). 040F, 080B and 080D stay REJ (§7). */
+#define BT_CTRL_HP_GATE_LIST 0x0401u, 0x0402u, 0x0405u, 0x0408u
+
 /* HCI status codes used by bt_ctrl */
 #define BT_HCI_OK                    0x00u
 #define BT_HCI_ERR_UNKNOWN_CMD       0x01u
@@ -83,8 +90,12 @@ const bt_ctrl_cmd_row_t *bt_ctrl_cmds_table(uint32_t *count);
 const bt_ctrl_cmd_row_t *bt_ctrl_cmds_lookup(uint16_t opcode);
 /* Effective action after the Exp 1 gate list (BTC_FWD/SYN/REJ/LOCAL). */
 uint8_t bt_ctrl_cmds_eff(const bt_ctrl_cmd_row_t *row);
-/* ROM payload size for a FWD row (legacy g_openfw_cmd_tbl min_len, bt_hci.c:882-904); 0 = no verified layout. */
+/* ROM payload size for a FWD row (legacy g_openfw_cmd_tbl min_len, bt_hci.c:882-904); 0 = no verified layout, or a
+ * verified zero-length layout (bt_ctrl_cmds_fwd_layout tells the two apart). */
 uint8_t bt_ctrl_cmds_fwd_min_len(uint16_t opcode);
+/* true if `opcode` has a verified ROM payload layout; *min_len (may be NULL) gets its size, 0 for a parameterless KE
+ * message (0402 -> E001, sent by the stock firmware with ke_msg_send_basic: docs/BT_ROM_HCI_MAP.md §1, §2). */
+bool bt_ctrl_cmds_fwd_layout(uint16_t opcode, uint8_t *min_len);
 const uint8_t *bt_ctrl_cmds_supported(void);           /* 64-byte 1002 bitmap */
 void bt_ctrl_cmds_features_p0(uint8_t out[8]);          /* masked LMP page 0 as reported by 1004 page 0 */
 

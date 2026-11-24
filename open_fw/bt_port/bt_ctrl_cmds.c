@@ -114,8 +114,7 @@ static const bt_ctrl_cmd_row_t k_vendor_row = {
  * zero-padded to it, docs/BT_ROM_HCI_MAP.md §1.1). First block: legacy bt_hci.c:882-904 (g_openfw_cmd_tbl min_len,
  * driven on silicon by the legacy phone mode). Second block: stock opcode tables, BT_ROM_HCI_MAP.md §2 "Struct" column
  * (static, cross-checked against the ROM handler). A FWD row without an entry has no verified ROM layout
- * (BT_ROM_INTERFACE §3.2) and fails validation. 0402 (E001, no parameters, stock send_basic) has no entry on purpose:
- * a zero-length layout cannot be expressed here, so a 0402 gate fails validation until that is added. */
+ * (BT_ROM_INTERFACE §3.2) and fails validation. Parameterless KE messages are listed in k_fwd_zero_len below. */
 static const struct { uint16_t op; uint8_t min_len; } k_fwd_layout[] = {
     { 0x0C01u,   8u }, { 0x0C13u, 248u }, { 0x0C1Au,   1u }, { 0x0C24u,   3u }, { 0x0C52u, 241u },
     { 0x0C56u,   1u }, { 0x0401u,   5u }, { 0x0405u,  14u }, { 0x0406u,   4u }, { 0x0409u,   7u },
@@ -127,6 +126,11 @@ static const struct { uint16_t op; uint8_t min_len; } k_fwd_layout[] = {
     { 0x041Au,   6u }, { 0x041Bu,   2u }, { 0x041Cu,   4u }, { 0x041Du,   2u }, { 0x041Fu,   2u },
     { 0x0434u,   7u }, { 0x0C37u,   4u }, { 0x0C28u,   4u },
 };
+
+/* Verified zero-length ROM layouts: the stock firmware sends these KE ids with ke_msg_send_basic (no param struct,
+ * FW 0xD55970; docs/BT_ROM_HCI_MAP.md §1 "Stock zero-parameter commands"). 0402 -> E001: the ROM handler 0x3F2BC reads
+ * no parameter (map §2). bt_ctrl allocates max(plen, 0) bytes, so a conforming host (plen 0) sends exactly that. */
+static const uint16_t k_fwd_zero_len[] = { 0x0402u };
 
 /* Opcodes bt_ctrl_cmds_reply_syn() implements. */
 static const uint16_t k_syn_ops[] = {
@@ -160,6 +164,17 @@ uint8_t bt_ctrl_cmds_fwd_min_len(uint16_t opcode)
     return 0u;
 }
 
+bool bt_ctrl_cmds_fwd_layout(uint16_t opcode, uint8_t *min_len)
+{
+    uint8_t n = bt_ctrl_cmds_fwd_min_len(opcode);
+    bool ok = n != 0u ||
+              in_list(k_fwd_zero_len, (uint32_t)(sizeof(k_fwd_zero_len) / sizeof(k_fwd_zero_len[0])), opcode);
+    if (min_len != NULL) {
+        *min_len = n;
+    }
+    return ok;
+}
+
 int bt_ctrl_cmds_init(void)
 {
     if (s_ready) {
@@ -177,7 +192,7 @@ int bt_ctrl_cmds_init(void)
         }
         if (eff == BTC_FWD) {
             uint16_t dest = BT_ROM_MSG_DEST(r->rom_req);
-            err += (r->rom_req == 0u || r->rom_rsp == 0u || bt_ctrl_cmds_fwd_min_len(r->op) == 0u ||
+            err += (r->rom_req == 0u || r->rom_rsp == 0u || !bt_ctrl_cmds_fwd_layout(r->op, NULL) ||
                     (dest != BT_ROM_TASK_LM && dest != BT_ROM_TASK_LC));
         }
         if (eff == BTC_SYN) {
@@ -257,7 +272,9 @@ void bt_ctrl_cmds_features_p0(uint8_t out[8])
     if (eff_of(0x0C52u) != BTC_FWD) {
         out[BT_CTRL_FEAT_P0_EIR_BYTE] &= (uint8_t)~BT_CTRL_FEAT_P0_EIR_MASK;
     }
-    /* No 0x22/0x2F event packers exist, so inquiry-with-RSSI stays clear whatever the 0C45 gate says. */
+    /* The 0x22/0x2F packers (E0D6/E0D7, bt_ctrl_evt.c) are static layouts no firmware has ever exercised
+     * (docs/BT_ROM_HCI_MAP.md §3, §6 item 8): inquiry-with-RSSI stays clear whatever the 0C45 gate says, so Bluedroid
+     * never sends 0C45 and the inquiry stays in mode 0 (event 0x02 only). */
     out[BT_CTRL_FEAT_P0_INQRSSI_BYTE] &= (uint8_t)~BT_CTRL_FEAT_P0_INQRSSI_MASK;
 }
 

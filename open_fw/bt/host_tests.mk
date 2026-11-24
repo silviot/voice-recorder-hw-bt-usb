@@ -59,6 +59,13 @@ test-bt-ctrl:
 		bt_port/bt_ctrl_evt.c $(BT_CTRL_TEST_DIR)/hci_packet_parser.o $(BT_CTRL_TEST_DIR)/bt_ctrl_parser_shim.o \
 		-o $(BT_CTRL_TEST_DIR)/test_bt_ctrl
 	$(BT_CTRL_TEST_DIR)/test_bt_ctrl
+	@# The same tests with the headphones rows forwarded (BT_CTRL_HP_GATE_LIST: 0401 0402 0405 0408; design H2 gate
+	@# "green with and without the gate list"): the table validates, and the inquiry/page fake-ROM models run.
+	$(HOST_CC) $(BT_CTRL_TEST_CFLAGS) -DBT_CTRL_EXP1_PASSED_LIST=BT_CTRL_HP_GATE_LIST tests/test_bt_ctrl.c \
+		tests/fake_rom.c bt_port/bt_ctrl.c bt_port/bt_ctrl_cmds.c bt_port/bt_ctrl_evt.c \
+		$(BT_CTRL_TEST_DIR)/hci_packet_parser.o $(BT_CTRL_TEST_DIR)/bt_ctrl_parser_shim.o \
+		-o $(BT_CTRL_TEST_DIR)/test_bt_ctrl_hp
+	$(BT_CTRL_TEST_DIR)/test_bt_ctrl_hp
 
 # ---- test-bt-host: Bluedroid end-to-end on the FreeRTOS POSIX port (plan M3 path (b), step 5). ----
 # Real Bluedroid (patches 0001-0027) + bt_port + bt_ctrl + tests/fake_rom.c on FreeRTOS-Kernel V11.1.0's POSIX port,
