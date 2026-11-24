@@ -148,7 +148,7 @@ Acceptance budget per mode: minimum free heap under traffic ≥ 8 KB and largest
 - **RX path (backpressure never reaches the ROM owner):** `bt_ctrl` copies each complete H4 packet into a bounded ring
   before completing the ROM `eif_write` callback (copy-before-ack). The RX dispatcher (rewrite of today's
   `bt_hci.c` path, which checks `tx_state` first and advances the ACL fragment pointer before writing) is ordered:
-  (1) events first, always; (2) only then ACL, and the ACL branch checks for a host credit **before** mutating any
+  (1) events are never held behind ACL that waits for a host credit; (2) only then ACL, and the ACL branch checks for a host credit **before** mutating any
   fragment state or marking the transport busy — with zero credits ACL is simply not selected (data stays in EM) and
   events keep flowing; (3) a credit return (`0C35` from the host) kicks the dispatcher. Events have their own ring with
   reserved slots for CC/CS/NOCP. Test: event delivery with zero credits and an empty ACL ring; credit return resumes ACL.
@@ -426,6 +426,12 @@ telemetry: heap/stack watermarks, largest free block, IRQ-26 latency and multipl
 - 2026-11-24 (hardware session 1, `docs/BT_HW_RESULTS.md`): Exp 0 PASS (both regions intact after legacy BT, DMA,
   SD, USB, UI) → lower region enabled as heap_5 region 0; BT image free heap 34 KB → 118 KB. RTOS+BT self-test 14/14
   on silicon. Exp 2 first read: mic ADC low bits ≈ 0.95 bit/bit, SARADC and timer jitter unusable. Exp 0 probes (`exp/exp_sram_fill.c`, `exp/exp_sram_check.c`) written.
+- 2026-11-24 (step 3): `bt_ctrl` controller shim against a fake ROM (`bt_port/bt_ctrl*.c`, `tests/fake_rom.c`,
+  `tests/test_bt_ctrl.c`, 168,750 checks incl. Bluedroid's real reply parsers, fuzzing, a `bt_stop` sweep over every
+  ROM call). Specs: `docs/BT_ROM_INTERFACE.md`, `docs/BT_HCI_DRIVER_CONTRACT.md`, `docs/BT_CTRL_OPCODE_TABLE.md`.
+  Clarified M1 RX rule: credit gating happens before ACL enters its ring, so events never wait behind credit-blocked
+  ACL, but `bt_dlv` delivers events and ACL in arrival order — strict event priority at delivery would let an event
+  (e.g. Disconnection Complete) overtake ACL the ROM delivered earlier. Not yet wired into the firmware.
 
 ## 11. Round-1 traceability
 

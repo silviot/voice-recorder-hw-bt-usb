@@ -1,0 +1,1878 @@
+/* Host tests for bt_port/bt_ctrl.c against tests/fake_rom.c (plan docs/BLUETOOTH_BLUEDROID_PLAN.md M1, step 3).
+ *
+ * Bluedroid side: every reply bt_ctrl delivers is checked against the framing checks Bluedroid applies before parsing
+ * (replicated below, cited), and the controller.c start-up replies are fed to the REAL hci_packet_parser.c functions
+ * (linked in through tests/bt_ctrl_parser_shim.c). Parser assert() failures are caught (SIGABRT -> siglongjmp).
+ * SPDX-License-Identifier: MIT */
+#include <setjmp.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "bt_ctrl.h"
+#include "bt_ctrl_evt.h"
+#include "bt_ctrl_parser_shim.h"
+#include "fake_rom.h"
+
+static int g_fail, g_checks;
+static int t_quiet;
+#define CHECK(cond, ...)                                                                                              \
+    do {                                                                                                              \
+        g_checks++;                                                                                                   \
+        if (!(cond) && !t_quiet) {                                                                                    \
+            g_fail++;                                                                                                 \
+            printf("FAIL %s:%d: ", __FILE__, __LINE__);                                                               \
+            printf(__VA_ARGS__);                                                                                      \
+            printf("\n");                                                                                             \
+        }                                                                                                             \
+    } while (0)
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* fake platform                                                                                                  */
+/* ------------------------------------------------------------------------------------------------------------- */
+static int t_crit, t_crit_max;
+static bool t_stop;
+static uint32_t t_wake_ctrl, t_wake_isr, t_wake_dlv, t_faults, t_fault_last;
+static void p_enter(void) { t_crit++; if (t_crit > t_crit_max) t_crit_max = t_crit; }
+static void p_exit(void) { t_crit--; }
+static void p_wake_ctrl(void) { t_wake_ctrl++; }
+static void p_wake_isr(void) { t_wake_isr++; }
+/* Plan §3 rule (e): wake_dlv and fault are FreeRTOS calls, never made while the ROM lock (PRIMASK) is held. */
+static void p_wake_dlv(void)
+{
+    t_wake_dlv++;
+    CHECK(fake_rom.lock_depth == 0u, "wake_dlv() called with the ROM lock held");
+}
+static bool p_stop(void) { return t_stop; }
+static void p_fault(uint32_t code)
+{
+    t_faults++;
+    t_fault_last = code;
+    CHECK(fake_rom.lock_depth == 0u, "fault() posted with the ROM lock held");
+}
+static const bt_ctrl_platform_t k_plat = { p_enter, p_exit, p_wake_ctrl, p_wake_isr, p_wake_dlv, p_stop, p_fault };
+
+static const uint8_t k_addr[6] = { 0x11, 0x22, 0x33, 0x44, 0x55, 0xC6 };
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* fake Bluedroid host side                                                                                       */
+/* ------------------------------------------------------------------------------------------------------------- */
+#define MAX_PKTS 8192u
+typedef struct {
+    uint16_t len;
+    uint8_t d[1100];
+} pkt_t;
+static pkt_t *t_rx;
+static uint32_t t_rx_n, t_rx_rd;
+static int t_recv_fail;
+static int t_recv_ok_left = -1;     /* >= 0: that many more deliveries succeed, then notify_host_recv fails */
+static uint32_t t_send_avail, t_recv_calls;
+static void (*t_cb_hook)(void);
+
+/* Bluedroid's checks before an inbound packet is processed (silent drops otherwise):
+ *   hci_hal_h4.c:462-466 len >= 1; :470-483 type 0x3E dropped; :484-491 type in {2,3,4}; :492-503 preamble;
+ *   :504-523 length field == remaining; hci_layer.c:581 CC params >= 3, :614 CS params >= 4;
+ *   hci_hal_h4.c:668-672,703 LE meta event never; packet_fragmenter.c:221-226 PB 10 start / 01 continuation;
+ *   0C33 host ACL length 1021 (contract §7.1). */
+static int h4_rx_valid(const uint8_t *d, uint16_t len)
+{
+    if (len < 1u) return 0;
+    if (d[0] == BT_H4_EVT) {
+        if (len < 3u) return 0;
+        if (d[2] != len - 3u) return 0;
+        if (d[1] == BT_HCI_EVT_LE) return 0;
+        if (d[1] == BT_HCI_EVT_CC && d[2] < 3u) return 0;
+        if (d[1] == BT_HCI_EVT_CS && d[2] < 4u) return 0;
+        if ((d[1] == BT_HCI_EVT_CC && d[3] == 0u) || (d[1] == BT_HCI_EVT_CS && d[4] == 0u)) return 0; /* window 1 */
+        return 1;
+    }
+    if (d[0] == BT_H4_ACL) {
+        if (len < 5u) return 0;
+        uint16_t dl = (uint16_t)(d[3] | (d[4] << 8));
+        uint8_t pb = (uint8_t)((d[2] >> 4) & 3u);
+        return dl == len - 5u && dl <= 1021u && (pb == 1u || pb == 2u);
+    }
+    return 0;
+}
+
+static int h_recv(uint8_t *d, uint16_t len)
+{
+    t_recv_calls++;
+    CHECK(bt_ctrl_dlv_busy(), "notify_host_recv called without dlv_busy");
+    CHECK(t_crit == 0, "host callback called inside a critical section");
+    if (t_cb_hook != NULL) {
+        void (*h)(void) = t_cb_hook;
+        t_cb_hook = NULL;
+        h();
+    }
+    if (t_recv_fail > 0) {
+        t_recv_fail--;
+        return -1;
+    }
+    if (t_recv_ok_left == 0) {
+        return -1;
+    }
+    if (t_recv_ok_left > 0) {
+        t_recv_ok_left--;
+    }
+    CHECK(h4_rx_valid(d, len), "invalid H4 packet delivered (type %02X len %u)", d[0], len);
+    if (t_rx_n < MAX_PKTS) {
+        t_rx[t_rx_n].len = len;
+        memcpy(t_rx[t_rx_n].d, d, len < sizeof(t_rx[0].d) ? len : sizeof(t_rx[0].d));
+        t_rx_n++;
+    }
+    return 0;
+}
+
+static void h_send_avail(void)
+{
+    t_send_avail++;
+    CHECK(bt_ctrl_dlv_busy(), "notify_host_send_available called outside bt_dlv");
+    CHECK(t_crit == 0, "send-available called inside a critical section");
+}
+static const bt_ctrl_host_cb_t k_host = { h_send_avail, h_recv };
+
+static const pkt_t *next_pkt(void)
+{
+    return t_rx_rd < t_rx_n ? &t_rx[t_rx_rd++] : NULL;
+}
+
+static uint32_t pending_pkts(void)
+{
+    return t_rx_n - t_rx_rd;
+}
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* parser guard                                                                                                   */
+/* ------------------------------------------------------------------------------------------------------------- */
+static sigjmp_buf t_jmp;
+static volatile sig_atomic_t t_in_parse;
+static void on_abrt(int sig)
+{
+    if (t_in_parse) {
+        siglongjmp(t_jmp, 1);
+    }
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+#define PARSE_OK(expr)                                                                                                \
+    do {                                                                                                              \
+        t_in_parse = 1;                                                                                               \
+        if (sigsetjmp(t_jmp, 1) == 0) {                                                                               \
+            expr;                                                                                                     \
+            t_in_parse = 0;                                                                                           \
+        } else {                                                                                                      \
+            t_in_parse = 0;                                                                                           \
+            shim_free_last();                                                                                         \
+            CHECK(0, "Bluedroid parser asserted on: %s", #expr);                                                      \
+        }                                                                                                             \
+    } while (0)
+#define PARSE_ASSERTS(expr)                                                                                           \
+    do {                                                                                                              \
+        volatile int asserted_ = 0;                                                                                          \
+        t_in_parse = 1;                                                                                               \
+        if (sigsetjmp(t_jmp, 1) == 0) {                                                                               \
+            expr;                                                                                                     \
+        } else {                                                                                                      \
+            asserted_ = 1;                                                                                            \
+            shim_free_last();                                                                                         \
+        }                                                                                                             \
+        t_in_parse = 0;                                                                                               \
+        CHECK(asserted_, "expected a Bluedroid parser assert on: %s", #expr);                                         \
+    } while (0)
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* harness helpers                                                                                                */
+/* ------------------------------------------------------------------------------------------------------------- */
+static void setup(void)
+{
+    fake_rom_reset();
+    fake_rom.stop_flag = &t_stop;
+    t_stop = false;
+    t_crit = t_crit_max = 0;
+    t_wake_ctrl = t_wake_isr = t_wake_dlv = t_faults = t_fault_last = 0u;
+    t_rx_n = t_rx_rd = 0u;
+    t_recv_fail = 0;
+    t_recv_ok_left = -1;
+    t_send_avail = t_recv_calls = 0u;
+    t_cb_hook = NULL;
+    CHECK(bt_ctrl_init(&fake_rom_if, &k_plat, k_addr) == 0, "opcode/event table validation failed");
+    CHECK(bt_ctrl_open() == 0, "open");
+    CHECK(bt_ctrl_register_host_callback(&k_host) == 0, "register_host_callback must return ESP_OK");
+}
+
+static void pump(void)
+{
+    for (int i = 0; i < 4000; i++) {
+        uint32_t more = bt_ctrl_run();
+        int d = bt_ctrl_dlv_run();
+        if (more == 0u && d == BT_CTRL_DLV_IDLE && fake_rom_queue_len() == 0u) {
+            /* one more pass: a delivery may have freed space bt_ctrl was waiting for */
+            if (bt_ctrl_run() == 0u && bt_ctrl_dlv_run() == BT_CTRL_DLV_IDLE && fake_rom_queue_len() == 0u) {
+                return;
+            }
+        }
+    }
+    CHECK(0, "pump did not quiesce");
+}
+
+static uint16_t h4_cmd(uint8_t *buf, uint16_t op, const uint8_t *prm, uint8_t plen)
+{
+    buf[0] = BT_H4_CMD;
+    buf[1] = (uint8_t)op;
+    buf[2] = (uint8_t)(op >> 8);
+    buf[3] = plen;
+    if (plen != 0u) {
+        memcpy(&buf[4], prm, plen);
+    }
+    return (uint16_t)(4u + plen);
+}
+
+static void send_cmd(uint16_t op, const uint8_t *prm, uint8_t plen)
+{
+    uint8_t buf[300];
+    uint16_t n = h4_cmd(buf, op, prm, plen);
+    CHECK(bt_ctrl_check_send_available(), "no TX slot for command %04X", op);
+    bt_ctrl_send(buf, n);
+}
+
+static void send_acl(uint16_t handle, uint8_t pb, uint16_t len, uint8_t seed)
+{
+    static uint8_t buf[1100];
+    buf[0] = BT_H4_ACL;
+    uint16_t hdr = (uint16_t)(handle | ((uint16_t)pb << 12));
+    buf[1] = (uint8_t)hdr;
+    buf[2] = (uint8_t)(hdr >> 8);
+    buf[3] = (uint8_t)len;
+    buf[4] = (uint8_t)(len >> 8);
+    for (uint16_t i = 0; i < len; i++) {
+        buf[5 + i] = (uint8_t)(seed + i);
+    }
+    CHECK(bt_ctrl_check_send_available(), "no TX slot for ACL");
+    bt_ctrl_send(buf, (uint16_t)(5u + len));
+}
+
+static void host_nocp(uint16_t handle, uint16_t count)
+{
+    uint8_t p[5] = { 1, (uint8_t)handle, (uint8_t)(handle >> 8), (uint8_t)count, (uint8_t)(count >> 8) };
+    send_cmd(0x0C35u, p, 5u);
+}
+
+static int is_reply(const pkt_t *p, uint16_t op)
+{
+    if (p == NULL || p->d[0] != BT_H4_EVT) return 0;
+    if (p->d[1] == BT_HCI_EVT_CC) return (uint16_t)(p->d[4] | (p->d[5] << 8)) == op;
+    if (p->d[1] == BT_HCI_EVT_CS) return (uint16_t)(p->d[5] | (p->d[6] << 8)) == op;
+    return 0;
+}
+
+/* Send one command, pump, and return its (single) reply. */
+static const pkt_t *roundtrip(uint16_t op, const uint8_t *prm, uint8_t plen)
+{
+    uint32_t before = t_rx_n;
+    send_cmd(op, prm, plen);
+    pump();
+    const pkt_t *r = NULL;
+    uint32_t replies = 0u;
+    for (uint32_t i = before; i < t_rx_n; i++) {
+        if (is_reply(&t_rx[i], op)) {
+            r = &t_rx[i];
+            replies++;
+        }
+    }
+    CHECK(replies == 1u, "opcode %04X: %u replies (want exactly 1)", op, replies);
+    t_rx_rd = t_rx_n;
+    return r;
+}
+
+static uint8_t status_of(const pkt_t *p)
+{
+    return p->d[1] == BT_HCI_EVT_CC ? p->d[6] : p->d[3];
+}
+
+/* controller.c start_up() order (device/controller.c:251-478), each reply through the real parsers. */
+static void bring_up(void)
+{
+    const pkt_t *r;
+    uint8_t one = 1u;
+    r = roundtrip(0x0C03u, NULL, 0u);
+    if (r) PARSE_OK(shim_parse_generic(r->d, r->len));
+    if (r) CHECK(status_of(r) == 0u, "reset status");
+    r = roundtrip(0x1005u, NULL, 0u);
+    uint16_t acl_len = 0, acl_cnt = 0, sco_cnt = 0;
+    uint8_t sco_len = 0;
+    if (r) PARSE_OK(shim_parse_buffer_size(r->d, r->len, &acl_len, &acl_cnt, &sco_len, &sco_cnt));
+    CHECK(acl_len == 1021u && acl_cnt == BT_CTRL_H2C_ACL_CREDITS && sco_len == 0u && sco_cnt == 0u, "1005 content");
+    r = roundtrip(0x0C31u, &one, 1u);
+    if (r) PARSE_OK(shim_parse_generic(r->d, r->len));
+    uint8_t hbs[7] = { 0xFD, 0x03, 0xFF, 0x04, 0x00, 0x0A, 0x00 };   /* controller.c:274-288 values */
+    r = roundtrip(0x0C33u, hbs, 7u);
+    if (r) PARSE_OK(shim_parse_generic(r->d, r->len));
+    r = roundtrip(0x1001u, NULL, 0u);
+    uint8_t hv = 0, lv = 0;
+    uint16_t hr = 0, man = 0xFFFF, sub = 0;
+    if (r) PARSE_OK(shim_parse_local_version(r->d, r->len, &hv, &hr, &lv, &man, &sub));
+    CHECK(man == 0x0060u && man != 0x000Fu && hv == 6u && lv == 6u, "1001 content");
+    r = roundtrip(0x1009u, NULL, 0u);
+    uint8_t a[6] = { 0 };
+    if (r) PARSE_OK(shim_parse_bd_addr(r->d, r->len, a));
+    int rev_ok = 1;   /* STREAM_TO_BDADDR stores the wire (LSB-first) address reversed */
+    for (int i = 0; i < 6; i++) rev_ok &= a[i] == k_addr[5 - i];
+    CHECK(rev_ok, "1009 address");
+    r = roundtrip(0x1002u, NULL, 0u);
+    uint8_t sc[64] = { 0 };
+    if (r) PARSE_OK(shim_parse_supported_cmds(r->d, r->len, sc));
+    CHECK((sc[45] & 0x80u) == 0u && (sc[2] & 0x40u) == 0u, "1002: 0C84 / 041C bits must be clear");
+    uint8_t page = 0, max_page = 0, pages[3][8];
+    uint8_t pg = 0u;
+    r = roundtrip(0x1004u, &pg, 1u);
+    if (r) PARSE_OK(shim_parse_ext_features(r->d, r->len, &page, &max_page, pages));
+    CHECK(page == 0u && max_page == 1u, "1004 page 0 header");
+    CHECK((pages[0][6] & 0x08u) != 0u, "page 0 must keep SSP (bit 51) so controller.c sends 0C56");
+    CHECK((pages[0][0] & 0x20u) == 0u && (pages[0][0] & 0x80u) == 0u, "no role switch / sniff");
+    r = roundtrip(0x0C56u, &one, 1u);
+    if (r) PARSE_OK(shim_parse_generic(r->d, r->len));
+    if (r) CHECK(status_of(r) == 0u, "0C56 status");
+    /* controller.c:349-361: pages 1..max_page while page < 3; max_page = 1 so page 2 (SC, 0C7A) is never read. */
+    pg = 1u;
+    r = roundtrip(0x1004u, &pg, 1u);
+    if (r) PARSE_OK(shim_parse_ext_features(r->d, r->len, &page, &max_page, pages));
+    CHECK(page == 1u && max_page == 1u && pages[1][0] == BT_CTRL_FEAT_P1_SSP_HOST, "1004 page 1 (SSP host bit)");
+    CHECK((pages[1][0] & 0x08u) == 0u, "no SC host support on page 1");
+    uint8_t mask[8] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x9F, 0x00, 0x20 };
+    r = roundtrip(0x0C01u, mask, 8u);
+    if (r) PARSE_OK(shim_parse_generic(r->d, r->len));
+    if (r) CHECK(status_of(r) == 0u, "0C01 status");
+}
+
+static void link_up(uint32_t link)
+{
+    fake_rom_link(link, true);
+}
+
+static bt_ctrl_debug_t dbg(void)
+{
+    bt_ctrl_debug_t d;
+    bt_ctrl_get_debug(&d);
+    return d;
+}
+
+static bt_ctrl_stats_t stats(void)
+{
+    bt_ctrl_stats_t s;
+    bt_ctrl_get_stats(&s);
+    return s;
+}
+
+static void shutdown_and_check(void)
+{
+    bt_ctrl_shutdown_begin();
+    bt_ctrl_run();
+    CHECK(bt_ctrl_shutdown_status() == BT_CTRL_STOP_OK, "shutdown status %d", bt_ctrl_shutdown_status());
+    CHECK(fake_rom.kept_at_stop == 0u, "bt_ctrl still owned %u ROM messages at stop()", fake_rom.kept_at_stop);
+    CHECK(fake_rom.em_rx_held_at_stop == 0u, "bt_ctrl still held %u EM RX buffers at stop()",
+          fake_rom.em_rx_held_at_stop);
+    CHECK(fake_rom.errors == 0u, "fake ROM contract error: %s", fake_rom.first_error);
+}
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* 1. table validation                                                                                            */
+/* ------------------------------------------------------------------------------------------------------------- */
+static void test_table(void)
+{
+    setup();
+    uint32_t n = 0;
+    const bt_ctrl_cmd_row_t *rows = bt_ctrl_cmds_table(&n);
+    CHECK(n == 78u, "table has %u rows (doc: 78 Classic opcodes)", n);
+    for (uint32_t i = 0; i < n; i++) {
+        uint8_t eff = bt_ctrl_cmds_eff(&rows[i]);
+        CHECK(!(rows[i].cls == BTC_M && eff == BTC_REJ), "class M row %04X is REJ", rows[i].op);
+        if (eff == BTC_FWD) {
+            CHECK(bt_ctrl_evt_reply_opcode(rows[i].rom_rsp) == rows[i].op, "FWD %04X reply id unmapped", rows[i].op);
+            CHECK(bt_ctrl_cmds_fwd_min_len(rows[i].op) != 0u, "FWD %04X has no ROM layout", rows[i].op);
+        }
+    }
+    CHECK(bt_ctrl_cmds_lookup(0xFC57u) != NULL && bt_ctrl_cmds_lookup(0xFC57u)->act == BTC_REJ, "vendor OGF REJ");
+    CHECK(bt_ctrl_cmds_lookup(0x0C5Fu) == NULL, "0C5F is not linked: closed-table default");
+    CHECK(shim_l2cap_host_fc_acl_bufs() == BT_CTRL_C2H_ACL_CREDITS, "bt_port_prefix.h L2CAP_HOST_FC_ACL_BUFS mismatch");
+    CHECK(shim_l2cap_host_fc_acl_len() == BT_CTRL_C2H_ACL_LEN, "bt_port_prefix.h L2CAP_HOST_FC_ACL_DATA_LEN mismatch");
+    uint8_t p0[8];
+    bt_ctrl_cmds_features_p0(p0);
+    static const uint8_t want[8] = { 0x1F, 0x06, 0xC4, 0x0A, 0x98, 0x1D, 0x18, 0x85 };   /* §3.6, no-EIR variant */
+    CHECK(memcmp(p0, want, 8u) == 0, "page 0 features");
+}
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* 2. golden vector per opcode-table row                                                                          */
+/* ------------------------------------------------------------------------------------------------------------- */
+static const uint8_t k_peer[6] = { 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6 };
+
+static uint8_t gen_params(uint16_t op, uint8_t *p)
+{
+    memset(p, 0, 255);
+    switch (op) {
+    case 0x0C03: case 0x1005: case 0x1001: case 0x1009: case 0x1002: case 0x0C14: case 0x0402: case 0x0404:
+    case 0x0C57: case 0x1003: case 0x0C58:
+        return 0;
+    case 0x0C31: p[0] = 1; return 1;
+    case 0x0C33: { static const uint8_t h[7] = { 0xFD, 0x03, 0xFF, 0x04, 0x00, 0x0A, 0x00 }; memcpy(p, h, 7); return 7; }
+    case 0x1004: p[0] = 0; return 1;
+    case 0x0C56: p[0] = 1; return 1;
+    case 0x0C01: memset(p, 0xFF, 8); return 8;
+    case 0x0C18: p[0] = 0x00; p[1] = 0x20; return 2;
+    case 0x0C24: p[0] = 0x0C; p[1] = 0x02; p[2] = 0x5A; return 3;
+    case 0x080F: return 2;
+    case 0x0C13: memcpy(p, "open_fw", 7); return 248;
+    case 0x0C1A: p[0] = 3; return 1;
+    case 0x0C05: p[0] = 1; p[1] = 0; return 2;
+    case 0x0C35: p[0] = 1; p[1] = 0x80; p[2] = 0; p[3] = 0; p[4] = 0; return 5;
+    case 0x0C12: memcpy(p, k_peer, 6); p[6] = 1; return 7;
+    case 0x0406: p[0] = 0x80; p[1] = 0x00; p[2] = 0x13; return 3;
+    case 0x0409: memcpy(p, k_peer, 6); p[6] = 1; return 7;
+    case 0x040A: memcpy(p, k_peer, 6); p[6] = 0x0F; return 7;
+    case 0x040B: memcpy(p, k_peer, 6); memset(p + 6, 0x5C, 16); return 22;
+    case 0x040D: memcpy(p, k_peer, 6); p[6] = 4; memset(p + 7, '0', 16); return 23;
+    case 0x042B: memcpy(p, k_peer, 6); p[6] = 1; p[7] = 0; p[8] = 3; return 9;
+    case 0x0405: memcpy(p, k_peer, 6); p[6] = 0x18; p[7] = 0xCC; return 13;
+    case 0x0419: case 0x042E: memcpy(p, k_peer, 6); return 10;
+    case 0x0430: memcpy(p, k_peer, 6); return 38;
+    case 0x0434: memcpy(p, k_peer, 6); p[6] = 0x18; return 7;
+    case 0x040C: case 0x040E: case 0x042C: case 0x042D: case 0x041A: case 0x0408: case 0x042F: case 0x0433:
+        memcpy(p, k_peer, 6); return 6;
+    case 0x080B: memcpy(p, k_peer, 6); p[6] = 1; return 7;
+    case 0x0401: p[0] = 0x33; p[1] = 0x8B; p[2] = 0x9E; p[3] = 8; return 5;
+    case 0x0403: return 9;
+    case 0x0C52: return 241;
+    case 0x0C1C: case 0x0C1E: return 4;
+    case 0x0C3A: p[0] = 1; p[1] = 0x33; p[2] = 0x8B; p[3] = 0x9E; return 4;
+    case 0x0C3F: return 10;
+    case 0x0807: p[0] = 0x80; return 20;
+    case 0x0803: p[0] = 0x80; return 10;
+    case 0x0801: case 0x0805: p[0] = 0x80; return 6;
+    default:                                     /* first parameter is a connection handle */
+        p[0] = 0x80; p[1] = 0x00; p[2] = 0x11; p[3] = 0x22; return 4;
+    }
+}
+
+/* Expected reply computed from the documents, independently of bt_ctrl_cmds.c. */
+static uint16_t golden(const bt_ctrl_cmd_row_t *r, const uint8_t *prm, uint8_t plen, uint8_t *out)
+{
+    uint16_t op = r->op;
+    uint8_t lo = (uint8_t)op, hi = (uint8_t)(op >> 8);
+    memset(out, 0, 260);
+    switch (op) {     /* class M and SYN rows: literal vectors (BT_CTRL_OPCODE_TABLE §3, §4) */
+    case 0x1005: { static const uint8_t g[] = { 4, 0x0E, 11, 1, 0x05, 0x10, 0, 0xFD, 0x03, 0, 4, 0, 0, 0 };
+        memcpy(out, g, sizeof(g)); return sizeof(g); }
+    case 0x1001: { static const uint8_t g[] = { 4, 0x0E, 12, 1, 0x01, 0x10, 0, 6, 0, 0, 6, 0x60, 0, 0, 0 };
+        memcpy(out, g, sizeof(g)); return sizeof(g); }
+    case 0x1009: { static const uint8_t g[] = { 4, 0x0E, 10, 1, 0x09, 0x10, 0 };
+        memcpy(out, g, sizeof(g)); memcpy(out + 7, k_addr, 6); return 13; }
+    case 0x1002: { static const uint8_t g[] = { 4, 0x0E, 68, 1, 0x02, 0x10, 0 };
+        memcpy(out, g, sizeof(g));
+        uint8_t *b = out + 7;  /* supported by the effective FWD/SYN/LOCAL rows of the default build */
+        b[0] = 0x20; b[1] = 0x3F; b[5] = 0xD0; b[6] = 0x81; b[7] = 0xA3; b[9] = 0x02; b[10] = 0xE0;
+        b[14] = 0xD8; b[15] = 0x02; b[17] = 0x40; b[18] = 0x80; b[19] = 0x03;
+        return 7 + 64; }
+    case 0x1004: { static const uint8_t g[] = { 4, 0x0E, 14, 1, 0x04, 0x10, 0, 0, 1,
+                                                0x1F, 0x06, 0xC4, 0x0A, 0x98, 0x1D, 0x18, 0x85 };
+        memcpy(out, g, sizeof(g)); return sizeof(g); }
+    case 0x0C14: { static const uint8_t g[] = { 4, 0x0E, 252, 1, 0x14, 0x0C, 0 };
+        memcpy(out, g, sizeof(g)); return 7 + 248; }   /* name cache empty after Reset */
+    case 0x0C12: { static const uint8_t g[] = { 4, 0x0E, 6, 1, 0x12, 0x0C, 0, 0, 0 };
+        memcpy(out, g, sizeof(g)); return sizeof(g); }
+    case 0x0C35:
+        return 0;
+    default:
+        break;
+    }
+    uint8_t eff = bt_ctrl_cmds_eff(r);
+    uint8_t status = eff == BTC_REJ ? 0x01 : 0x00;
+    if (r->rsp == BTC_CS) {
+        uint8_t g[7] = { 4, 0x0F, 4, status, 1, lo, hi };
+        memcpy(out, g, 7);
+        return 7;
+    }
+    out[0] = 4; out[1] = 0x0E; out[2] = r->plen; out[3] = 1; out[4] = lo; out[5] = hi; out[6] = status;
+    uint8_t echo = r->echo == BTC_ECHO_BDADDR ? 6 : r->echo == BTC_ECHO_HANDLE ? 2 : 0;
+    if (echo > plen) echo = plen;
+    memcpy(out + 7, prm, echo);                    /* REJ echo; FWD: the fake ROM echoes BD_ADDR like the ROM */
+    return (uint16_t)(3u + r->plen);
+}
+
+static void test_golden_vectors(void)
+{
+    uint32_t n = 0;
+    const bt_ctrl_cmd_row_t *rows = bt_ctrl_cmds_table(&n);
+    static const bt_ctrl_cmd_row_t vendor = { 0xFC57u, BTC_O, BTC_REJ, BTC_REJ, BTC_CC, 4u, BTC_ECHO_NONE, 0, 0,
+                                              0xFF, 0, BTC_EXP_NONE };
+    for (uint32_t i = 0; i <= n; i++) {
+        const bt_ctrl_cmd_row_t *r = i < n ? &rows[i] : &vendor;
+        setup();
+        link_up(0);
+        uint8_t one = 1;
+        if (r->op != 0x0C03u) {
+            (void)roundtrip(0x0C03u, NULL, 0u);
+            (void)roundtrip(0x0C31u, &one, 1u);
+        }
+        uint8_t prm[255], want[260];
+        uint8_t plen = gen_params(r->op, prm);
+        uint16_t wlen = golden(r, prm, plen, want);
+        uint32_t before = t_rx_n;
+        uint32_t cmds_before = fake_rom.n_cmds;
+        send_cmd(r->op, prm, plen);
+        pump();
+        uint32_t got = t_rx_n - before;
+        if (wlen == 0u) {
+            CHECK(got == 0u, "%04X must produce no reply (got %u packets)", r->op, got);
+            CHECK(fake_rom.n_cmds == cmds_before, "%04X must not reach the ROM", r->op);
+            continue;
+        }
+        CHECK(got == 1u, "%04X: %u packets (want 1)", r->op, got);
+        if (got < 1u) continue;
+        const pkt_t *p = &t_rx[before];
+        CHECK(p->len == wlen && memcmp(p->d, want, wlen) == 0, "%04X golden vector mismatch (len %u want %u)",
+              r->op, p->len, wlen);
+        if (p->len != wlen || memcmp(p->d, want, wlen) != 0) {
+            printf("   got :");
+            for (uint16_t k = 0; k < p->len && k < 24; k++) printf(" %02X", p->d[k]);
+            printf("\n   want:");
+            for (uint16_t k = 0; k < wlen && k < 24; k++) printf(" %02X", want[k]);
+            printf("\n");
+        }
+        CHECK(p->d[2] == (r->rsp == BTC_CS ? 4u : r->plen), "%04X reply length vs table plen", r->op);
+        uint8_t eff = bt_ctrl_cmds_eff(r);
+        if (eff == BTC_FWD) {
+            CHECK(fake_rom.n_cmds == cmds_before + 1u && fake_rom.cmds[cmds_before].id == r->rom_req,
+                  "%04X not forwarded as KE id %04X", r->op, r->rom_req);
+            if (fake_rom.n_cmds == cmds_before + 1u) {
+                const fake_cmd_rec_t *c = &fake_rom.cmds[cmds_before];
+                uint8_t min = bt_ctrl_cmds_fwd_min_len(r->op);
+                CHECK(c->len == (plen > min ? plen : min) && memcmp(c->data, prm, plen) == 0,
+                      "%04X ROM payload", r->op);
+                uint16_t dst_task = (uint16_t)(c->dst & 0xFFu);
+                CHECK(dst_task == BT_ROM_MSG_DEST(r->rom_req), "%04X ROM destination task %04X", r->op, c->dst);
+            }
+        } else {
+            CHECK(fake_rom.n_cmds == cmds_before, "%04X (non-FWD) reached the ROM", r->op);
+        }
+        if (r->cls == BTC_M) {
+            CHECK(status_of(p) == 0u, "class M %04X status %02X", r->op, status_of(p));
+            switch (r->op) {   /* mandatory-success proof with the real Bluedroid parsers */
+            case 0x1005: { uint16_t a, b, d; uint8_t c; PARSE_OK(shim_parse_buffer_size(p->d, p->len, &a, &b, &c, &d)); break; }
+            case 0x1001: { uint8_t a, c; uint16_t b, d, e; PARSE_OK(shim_parse_local_version(p->d, p->len, &a, &b, &c, &d, &e)); break; }
+            case 0x1009: { uint8_t a[6]; PARSE_OK(shim_parse_bd_addr(p->d, p->len, a)); break; }
+            case 0x1002: { uint8_t s[64]; PARSE_OK(shim_parse_supported_cmds(p->d, p->len, s)); break; }
+            case 0x1004: { uint8_t pg, mp, f[3][8]; PARSE_OK(shim_parse_ext_features(p->d, p->len, &pg, &mp, f));
+                           CHECK(pg == 0u, "page_number"); break; }
+            default: PARSE_OK(shim_parse_generic(p->d, p->len)); break;
+            }
+        }
+        bt_ctrl_stats_t s = stats();
+        CHECK(s.cmd_unknown == 0u, "%04X hit the unknown-opcode default", r->op);
+        CHECK(fake_rom.errors == 0u, "%04X fake ROM error: %s", r->op, fake_rom.first_error);
+    }
+}
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* 3. start-up through the real parsers + parameter rules                                                         */
+/* ------------------------------------------------------------------------------------------------------------- */
+static void test_startup_and_param_rules(void)
+{
+    setup();
+    bring_up();
+    bt_ctrl_stats_t s = stats();
+    CHECK(s.c2h_config_mismatch == 0u && s.cmd_unknown == 0u && s.invariant == 0u, "start-up counters");
+    CHECK(dbg().c2h_fc == 1u && dbg().c2h_credits == 4u && dbg().c2h_len == 1021u, "0C31/0C33 applied");
+    /* page 2 is never requested by controller.c (max_page = 1); if it were, the parser must not assert. */
+    uint8_t pg = 2, page, max_page, pages[3][8];
+    const pkt_t *r = roundtrip(0x1004u, &pg, 1u);
+    if (r) { CHECK(status_of(r) == 0x12u && r->d[2] == 14u, "page 2: s=0x12, full length");
+             PARSE_OK(shim_parse_ext_features(r->d, r->len, &page, &max_page, pages)); }
+    /* name cache: 0C13 FWD success updates 0C14 */
+    uint8_t name[248] = { 0 };
+    memcpy(name, "Recorder", 8);
+    r = roundtrip(0x0C13u, name, 248u);
+    r = roundtrip(0x0C14u, NULL, 0u);
+    if (r) CHECK(r->len == 255u && memcmp(&r->d[7], name, 248u) == 0, "0C14 returns the 0C13 name");
+    /* 0C05: exact only for (01,00) and (00) */
+    uint8_t ef[3] = { 0x01, 0x00, 0x00 };
+    r = roundtrip(0x0C05u, ef, 1u);
+    if (r) CHECK(status_of(r) == 0x01u, "0C05 (01) alone is REJ");
+    ef[0] = 0;
+    r = roundtrip(0x0C05u, ef, 1u);
+    if (r) CHECK(status_of(r) == 0x00u, "0C05 (00) clear is SYN");
+    /* 0C33 mismatch: still s=0 (class M), min() enforced, counter */
+    uint8_t hbs[7] = { 0x64, 0x00, 0xFF, 0x08, 0x00, 0x0A, 0x00 };
+    r = roundtrip(0x0C33u, hbs, 7u);
+    if (r) CHECK(status_of(r) == 0u, "0C33 mismatch status");
+    CHECK(dbg().c2h_len == 100u && dbg().c2h_credits == 4u && stats().c2h_config_mismatch == 1u, "0C33 min()");
+    /* unknown opcode: CS 0x01 + counter; parser-negative: a short 1005 reply asserts in Bluedroid */
+    r = roundtrip(0x0C5Fu, NULL, 0u);
+    if (r) CHECK(r->d[1] == BT_HCI_EVT_CS && status_of(r) == 0x01u, "unknown opcode -> CS 0x01");
+    CHECK(stats().cmd_unknown == 1u && stats().unknown_opcode_last == 0x0C5Fu, "unknown counter");
+    printf("  (an expected Bluedroid parser assert message follows)\n");
+    fflush(stdout);
+    uint8_t bad[7] = { 4, 0x0E, 4, 1, 0x05, 0x10, 0 };
+    uint16_t a, b, d;
+    uint8_t c;
+    PARSE_ASSERTS(shim_parse_buffer_size(bad, 7u, &a, &b, &c, &d));
+    /* FWD before the controller runs (no Reset yet) is answered locally */
+    setup();
+    uint8_t one = 1;
+    r = roundtrip(0x0C1Au, &one, 1u);
+    if (r) CHECK(status_of(r) == BT_HCI_ERR_CMD_DISALLOWED, "FWD before Reset");
+    shutdown_and_check();
+}
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* 4. TX admission                                                                                                */
+/* ------------------------------------------------------------------------------------------------------------- */
+static void test_tx_admission(void)
+{
+    /* empty queue, check-then-no-send, full ring, send-available via bt_dlv */
+    setup();
+    bring_up();
+    link_up(0);
+    CHECK(bt_ctrl_check_send_available(), "empty ring must admit");
+    for (int i = 0; i < 100; i++) (void)bt_ctrl_check_send_available();   /* pure query: no reservation */
+    CHECK(dbg().tx_free == 3u, "check reserved something");
+    pump();
+    CHECK(dbg().tx_free == 3u && pending_pkts() == 0u, "check without send leaked");
+    uint32_t sa0 = t_send_avail;
+    send_acl(0x80, 2, 100, 1);
+    send_acl(0x80, 1, 100, 2);
+    send_acl(0x80, 1, 100, 3);
+    CHECK(!bt_ctrl_check_send_available(), "full ring must refuse");
+    pump();
+    CHECK(bt_ctrl_check_send_available() && dbg().tx_free == 3u, "ring drained");
+    CHECK(t_send_avail == sa0 + 1u, "exactly one send-available after full -> not full (got %u)", t_send_avail - sa0);
+    CHECK(fake_rom.n_acl == 3u && fake_rom.acl[0].len == 100u && fake_rom.acl[0].pb_bc == 2u &&
+          fake_rom.acl[1].pb_bc == 1u && fake_rom.acl[2].data[0] == 3u, "ACL reached the ROM intact and in order");
+    /* send on a full ring = contract violation, never a silent overwrite */
+    send_acl(0x80, 2, 10, 4);
+    send_acl(0x80, 2, 10, 5);
+    send_acl(0x80, 2, 10, 6);
+    uint8_t buf[16];
+    uint16_t n = h4_cmd(buf, 0x0C1Au, (const uint8_t *)"\x03", 1);
+    bt_ctrl_send(buf, n);
+    CHECK(stats().tx_contract_violation == 1u && t_faults == 1u && t_fault_last == BT_CTRL_FAULT_HOST_CONTRACT,
+          "send on a full ring");
+    pump();
+    /* malformed / SCO H4 from the host */
+    uint8_t sco[4] = { 0x03, 0x80, 0x00, 0x00 };
+    bt_ctrl_send(sco, 4);
+    uint8_t shortc[4] = { 0x01, 0x1A, 0x0C, 0x05 };
+    bt_ctrl_send(shortc, 4);
+    CHECK(stats().tx_malformed == 2u, "malformed H4 counted");
+    pump();
+    CHECK(dbg().tx_free == 3u && fake_rom.errors == 0u, "no slot leaked by rejected packets");
+    shutdown_and_check();
+
+    /* zero command credits: a second ordinary command waits for the ROM reply to the first */
+    setup();
+    bring_up();
+    fake_rom.hold_replies = true;
+    uint8_t one = 1, cod[3] = { 1, 2, 3 };
+    send_cmd(0x0C1Au, &one, 1);
+    pump();
+    CHECK(dbg().rom_cmd_credits == 0u && dbg().fwd_pending == 1u && dbg().evt_resv == 1u, "credit consumed");
+    uint32_t cmds_held = fake_rom.n_cmds;
+    send_cmd(0x0C24u, cod, 3);
+    pump();
+    CHECK(dbg().tx_free == 2u && fake_rom.n_cmds == cmds_held, "0C24 must wait for a ROM command credit");
+    fake_rom.hold_replies = false;
+    fake_rom_release_held();
+    pump();
+    const pkt_t *p1 = next_pkt(), *p2 = next_pkt();
+    CHECK(is_reply(p1, 0x0C1Au) && is_reply(p2, 0x0C24u), "replies in command order");
+    CHECK(dbg().rom_cmd_credits == 1u && dbg().tx_free == 3u, "credit restored");
+    shutdown_and_check();
+
+    /* zero ACL credits with a queued command: the command must still go out */
+    setup();
+    bring_up();
+    link_up(0);
+    fake_rom.auto_ack_acl = false;
+    for (int i = 0; i < 4; i++) {
+        send_acl(0x80, 2, 50, (uint8_t)i);
+        pump();
+    }
+    CHECK(dbg().h2c_inflight == 4u && fake_rom.acl_in_air == 4u, "4 ACL in flight");
+    send_acl(0x80, 2, 50, 9);           /* over the 1005 window: stays in the ring */
+    pump();
+    CHECK(dbg().tx_free == 2u && fake_rom.n_acl == 4u, "5th ACL credit-blocked");
+    const pkt_t *r = roundtrip(0x0C1Au, &one, 1);
+    CHECK(r != NULL && status_of(r) == 0u, "command overtook the credit-blocked ACL");
+    CHECK(dbg().tx_free == 2u, "ACL still blocked");
+    fake_rom_ack_acl(4);
+    pump();
+    const pkt_t *nocp = next_pkt();
+    CHECK(nocp != NULL && nocp->d[1] == BT_HCI_EVT_NOCP && nocp->d[3] == 1u && nocp->d[4] == 0x80u &&
+          nocp->d[6] == 4u, "NOCP (0x80, 4) forwarded to the host");
+    CHECK(fake_rom.n_acl == 5u && dbg().h2c_inflight == 1u && dbg().tx_free == 3u, "credit return resumed TX ACL");
+    shutdown_and_check();
+}
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* 5. RX: saturation, events with zero ACL credits, credit return, fragmentation                                  */
+/* ------------------------------------------------------------------------------------------------------------- */
+static void inject_conn_req(uint8_t tag)
+{
+    uint8_t p[10] = { 0xB0, 0xB1, 0xB2, 0xB3, 0xB4, tag, 0x0C, 0x02, 0x5A, 0x01 };
+    fake_rom_inject(0xE457u, p, 10);
+}
+
+static void test_rx_paths(void)
+{
+    /* event saturation: general area 6 slots, 4 deferred (KEEP), then overflow -> fault */
+    setup();
+    bring_up();
+    uint32_t mark = t_rx_n;
+    t_recv_fail = 1000000;                       /* bt_dlv cannot deliver */
+    for (int i = 0; i < 12; i++) inject_conn_req((uint8_t)i);
+    for (int i = 0; i < 20; i++) { bt_ctrl_run(); (void)bt_ctrl_dlv_run(); }
+    bt_ctrl_debug_t d = dbg();
+    CHECK(d.evt_used == BT_CTRL_EVT_SLOTS - BT_CTRL_EVT_RESERVED && d.evt_deferred == BT_CTRL_EVT_DEFER,
+          "event ring %u used, %u deferred", d.evt_used, d.evt_deferred);
+    CHECK(stats().evt_overflow == 2u && t_faults == 1u && t_fault_last == BT_CTRL_FAULT_EVT_OVERFLOW,
+          "overflow counted (%u), one fault posted (first: overflow)", stats().evt_overflow);
+    CHECK(fake_rom_msgs_owned_by_ctrl() == BT_CTRL_EVT_DEFER, "deferred events are KEEP'd ROM messages");
+    /* the general area is full and bt_dlv is stuck: a command (FWD and SYN) still gets its reserved reply slot */
+    uint8_t one = 1u;
+    send_cmd(0x0C1Au, &one, 1u);
+    for (int i = 0; i < 5; i++) bt_ctrl_run();
+    CHECK(dbg().evt_used == BT_CTRL_EVT_SLOTS - BT_CTRL_EVT_RESERVED + 1u && dbg().rom_cmd_credits == 1u,
+          "FWD reply took a reserved slot");
+    send_cmd(0x1005u, NULL, 0u);
+    for (int i = 0; i < 5; i++) bt_ctrl_run();
+    CHECK(dbg().evt_used == BT_CTRL_EVT_SLOTS && dbg().tx_free == BT_CTRL_TX_SLOTS, "SYN reply took the last slot");
+    send_cmd(0x1001u, NULL, 0u);
+    for (int i = 0; i < 5; i++) bt_ctrl_run();
+    CHECK(dbg().tx_free == BT_CTRL_TX_SLOTS - 1u, "no reply slot: the command waits in the ring");
+    t_recv_fail = 0;
+    pump();
+    uint32_t got = 0;
+    int last = -1, ordered = 1;
+    const pkt_t *p;
+    while ((p = next_pkt()) != NULL) {
+        if (p->d[1] == 0x04u) { got++; if (p->d[8] <= last) ordered = 0; last = p->d[8]; }
+    }
+    CHECK(got == 10u && ordered, "10 events delivered in order (%u)", got);
+    t_rx_rd = mark;
+    uint32_t r1a = 0, r1005 = 0, r1001 = 0;
+    while ((p = next_pkt()) != NULL) { r1a += is_reply(p, 0x0C1Au); r1005 += is_reply(p, 0x1005u); r1001 += is_reply(p, 0x1001u); }
+    CHECK(r1a == 1u && r1005 == 1u && r1001 == 1u, "every command answered exactly once after the stall");
+    CHECK(fake_rom_msgs_owned_by_ctrl() == 0u, "deferred messages freed");
+    shutdown_and_check();
+
+    /* ACL: window 4 x 1021, 8 EM RX buffers; events flow with zero credits; 0C35 resumes ACL */
+    setup();
+    bring_up();
+    link_up(0);
+    uint8_t data[1024];
+    for (int i = 0; i < 1024; i++) data[i] = (uint8_t)(i * 7);
+    for (int i = 0; i < 8; i++) CHECK(fake_rom_inject_acl(0x80, 2, data, 200) == 0, "inject %d", i);
+    CHECK(fake_rom_inject_acl(0x80, 2, data, 200) == -1, "9th RX: EM pool exhausted (baseband flow-stop)");
+    pump();
+    uint32_t acl = 0;
+    while ((p = next_pkt()) != NULL) acl += p->d[0] == BT_H4_ACL;
+    d = dbg();
+    CHECK(acl == 4u && d.c2h_outstanding == 4u && d.held_acl == 4u && d.acl_used == 0u,
+          "4 ACL delivered, 4 held (acl %u held %u)", acl, d.held_acl);
+    CHECK(stats().acl_rx_credit_blocked != 0u, "credit gate engaged");
+    inject_conn_req(1);
+    fake_rom_inject(0xE478u, (const uint8_t *)"\x80\x00\x40\x1F", 4);
+    pump();
+    uint32_t evts = 0;
+    acl = 0;
+    while ((p = next_pkt()) != NULL) { evts += p->d[0] == BT_H4_EVT; acl += p->d[0] == BT_H4_ACL; }
+    CHECK(evts == 2u && acl == 0u, "events delivered with zero ACL credits and an empty ACL ring");
+    host_nocp(0x80, 4);
+    pump();
+    acl = 0;
+    while ((p = next_pkt()) != NULL) { acl += p->d[0] == BT_H4_ACL; CHECK(p->d[0] != BT_H4_EVT || p->d[1] != 0x0E,
+                                                                         "0C35 produced a reply"); }
+    CHECK(acl == 4u && dbg().held_acl == 0u && fake_rom_em_rx_in_use() == 0u, "credit return resumed ACL");
+    CHECK(stats().c2h_returned == 4u && stats().c2h_invalid == 0u, "0C35 accounted");
+    host_nocp(0x80, 4);
+    host_nocp(0x81, 1);
+    pump();
+    CHECK(stats().c2h_invalid == 1u && stats().c2h_returned == 8u, "unknown handle 0C35 counted, not answered");
+    CHECK(pending_pkts() == 0u, "0C35 never answered");
+    shutdown_and_check();
+
+    /* fragmentation: credit checked before any fragment state changes */
+    setup();
+    bring_up();
+    link_up(1);
+    uint8_t hbs1[7] = { 0xFD, 0x03, 0xFF, 0x01, 0x00, 0x0A, 0x00 };   /* window of 1 */
+    (void)roundtrip(0x0C33u, hbs1, 7u);
+    CHECK(fake_rom_inject_acl(0x81, 2, data, 1024) == 0, "inject 1024");
+    pump();
+    p = next_pkt();
+    CHECK(p != NULL && p->len == 5u + 1021u && ((p->d[2] >> 4) & 3u) == 2u && memcmp(&p->d[5], data, 1021) == 0,
+          "first fragment 1021 B, PB=10");
+    CHECK(next_pkt() == NULL && dbg().held_acl == 1u && dbg().c2h_outstanding == 1u, "second fragment waits");
+    for (int i = 0; i < 5; i++) bt_ctrl_run();
+    CHECK(dbg().held_acl == 1u && pending_pkts() == 0u && stats().acl_rx_frags == 1u,
+          "no fragment state advanced without a credit");
+    host_nocp(0x81, 1);
+    pump();
+    p = next_pkt();
+    CHECK(p != NULL && p->len == 5u + 3u && ((p->d[2] >> 4) & 3u) == 1u && memcmp(&p->d[5], data + 1021, 3) == 0,
+          "continuation 3 B, PB=01");
+    CHECK(dbg().held_acl == 0u && fake_rom_em_rx_in_use() == 0u, "EM RX freed after the last fragment");
+    /* ROM PB 00 start is normalised to 10 (packet_fragmenter.c drops a PB=00 start) */
+    host_nocp(0x81, 1);
+    pump();
+    fake_rom_inject_acl(0x81, 0, data, 10);
+    pump();
+    p = next_pkt();
+    CHECK(p != NULL && ((p->d[2] >> 4) & 3u) == 2u && stats().acl_rx_pb_fixed == 1u, "PB 00 -> 10");
+    host_nocp(0x81, 1);
+    pump();
+    shutdown_and_check();
+
+    /* bt_dlv failure: entry kept, retried, fault after N, exactly-once delivery */
+    setup();
+    bring_up();
+    t_recv_fail = (int)BT_CTRL_DLV_FAULT_AFTER + 2;
+    inject_conn_req(7);
+    for (int i = 0; i < 30; i++) { bt_ctrl_run(); (void)bt_ctrl_dlv_run(); }
+    CHECK(t_faults == 1u && t_fault_last == BT_CTRL_FAULT_DLV, "one BT fault after N failures");
+    uint32_t c = 0;
+    while ((p = next_pkt()) != NULL) c += p->d[1] == 0x04u;
+    CHECK(c == 1u && stats().dlv_fail == BT_CTRL_DLV_FAULT_AFTER + 2u, "delivered exactly once after retries");
+    shutdown_and_check();
+}
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* 6. 0C35 at zero command credits (plan M1 test through bt_ctrl)                                                 */
+/* ------------------------------------------------------------------------------------------------------------- */
+static void test_0c35_zero_cmd_credits(void)
+{
+    setup();
+    bring_up();
+    link_up(0);
+    uint8_t data[64] = { 0 };
+    for (int i = 0; i < 6; i++) fake_rom_inject_acl(0x80, 2, data, 64);
+    pump();
+    t_rx_rd = t_rx_n;
+    CHECK(dbg().c2h_outstanding == 4u && dbg().held_acl == 2u, "window exhausted");
+    fake_rom.hold_replies = true;
+    uint8_t one = 1, cod[3] = { 1, 2, 3 };
+    send_cmd(0x0C1Au, &one, 1);
+    pump();
+    send_cmd(0x0C24u, cod, 3);          /* ordinary command queued ahead of the credit return */
+    pump();
+    CHECK(dbg().rom_cmd_credits == 0u && dbg().tx_free == 2u, "zero command credits, command queued");
+    uint32_t cmds = fake_rom.n_cmds;
+    host_nocp(0x80, 4);
+    pump();
+    uint32_t acl = 0, cc = 0;
+    const pkt_t *p;
+    while ((p = next_pkt()) != NULL) { acl += p->d[0] == BT_H4_ACL; cc += p->d[0] == BT_H4_EVT; }
+    CHECK(acl == 2u && cc == 0u, "0C35 processed at zero command credits; inbound ACL resumed; no reply");
+    CHECK(fake_rom.n_cmds == cmds && dbg().rom_cmd_credits == 0u && dbg().tx_free == 2u,
+          "0C35 used no ROM command credit and did not reach the ROM; 0C24 still waits");
+    fake_rom.hold_replies = false;
+    fake_rom_release_held();
+    pump();
+    host_nocp(0x80, 2);
+    pump();
+    shutdown_and_check();
+}
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* 7. NOCP accounting, disconnect, IRQ multiplicity                                                               */
+/* ------------------------------------------------------------------------------------------------------------- */
+static void test_nocp_disconnect_irq(void)
+{
+    setup();
+    bring_up();
+    link_up(0);
+    link_up(1);
+    fake_rom.auto_ack_acl = false;
+    send_acl(0x80, 2, 10, 0);
+    send_acl(0x81, 2, 10, 0);
+    send_acl(0x80, 2, 10, 0);
+    pump();
+    CHECK(dbg().h2c_inflight == 3u, "inflight 3");
+    fake_rom_ack_acl(1);
+    pump();
+    /* Disconnection Complete for 0x80: inflight for 0x80 released, pending NOCP dropped */
+    uint8_t disc[5] = { 0x00, 0x00, 0x80, 0x00, 0x13 };
+    fake_rom_link(0, false);
+    fake_rom_inject(0xE458u, disc, 5);
+    pump();
+    CHECK(dbg().h2c_inflight == 1u && dbg().nocp_pending == 0u, "disconnect released 0x80 (inflight %u)",
+          dbg().h2c_inflight);
+    const pkt_t *p;
+    int saw_disc = 0;
+    while ((p = next_pkt()) != NULL) {
+        if (p->d[1] == 0x05u) { saw_disc = 1; CHECK(p->d[2] == 4u && p->d[4] == 0x80u && p->d[6] == 0x13u, "0x05"); }
+    }
+    CHECK(saw_disc, "Disconnection Complete delivered");
+    /* stale NOCP for the released handle is clamped, not forwarded */
+    fake_rom_ack_acl(2);
+    pump();
+    uint32_t nocp_h80 = 0;
+    while ((p = next_pkt()) != NULL) if (p->d[1] == BT_HCI_EVT_NOCP && p->d[4] == 0x80u) nocp_h80++;
+    CHECK(nocp_h80 == 0u && stats().nocp_excess == 1u && dbg().h2c_inflight == 0u, "stale NOCP clamped");
+    /* ACL for a disconnected handle is dropped, never wedged */
+    send_acl(0x80, 2, 10, 0);
+    pump();
+    CHECK(dbg().tx_free == 3u && stats().acl_tx_dropped == 1u, "stale-handle ACL dropped");
+    /* IRQ: coalescing, loop-until-clear, unknown bits, budget */
+    uint32_t isr0 = t_wake_isr;
+    fake_rom_raise_irq(BT_ROM_IRQ_CSCNT);
+    fake_rom_raise_irq(BT_ROM_IRQ_CSCNT);
+    fake_rom_raise_irq(BT_ROM_IRQ_CSCNT);
+    CHECK(t_wake_isr == isr0 + 3u, "top half wakes bt_ctrl from ISR");
+    bt_ctrl_stats_t s0 = stats();
+    bt_ctrl_run();
+    bt_ctrl_stats_t s1 = stats();
+    CHECK(fake_rom.irq_count[0] == 3u && s1.bh_serviced[0] == s0.bh_serviced[0] + 1u, "3 IRQs coalesced into 1");
+    fake_rom.irq_rearm = 2;
+    fake_rom_raise_irq(BT_ROM_IRQ_RX | (1u << 5));
+    bt_ctrl_run();
+    bt_ctrl_stats_t s2 = stats();
+    CHECK(s2.bh_serviced[1] == s1.bh_serviced[1] + 3u && s2.bh_loops_max >= 3u, "bottom half looped until clear");
+    CHECK(s2.bh_unhandled[5] == s1.bh_unhandled[5] + 1u, "unknown IRQ bit counted");
+    fake_rom.irq_rearm = 100;
+    fake_rom_raise_irq(BT_ROM_IRQ_KE_TIMER);
+    CHECK(bt_ctrl_run() == 1u && stats().bh_budget_exhausted >= 1u, "bounded bottom half reports more work");
+    fake_rom.irq_rearm = 0;
+    pump();
+    shutdown_and_check();
+}
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* 8. teardown / restart ordering with traffic outstanding                                                        */
+/* ------------------------------------------------------------------------------------------------------------- */
+static void during_delivery_teardown(void)
+{
+    CHECK(bt_ctrl_dlv_busy(), "dlv busy inside callback");
+    bt_ctrl_shutdown_begin();
+    CHECK(bt_ctrl_open() == -1, "open must refuse while not OFF / dlv busy");
+}
+
+static void test_teardown_restart(void)
+{
+    for (int cycle = 0; cycle < 50; cycle++) {
+        if (cycle == 0) setup();
+        else {
+            CHECK(bt_ctrl_open() == 0, "reopen cycle %d", cycle);
+            fake_rom.calls = 0;
+        }
+        bring_up();
+        link_up(0);
+        fake_rom.auto_ack_acl = false;
+        uint8_t data[300];
+        memset(data, cycle, sizeof(data));
+        /* traffic outstanding in every direction */
+        for (int i = 0; i < 6; i++) fake_rom_inject_acl(0x80, 2, data, 300);          /* 4 delivered-ish, 2 held */
+        send_acl(0x80, 2, 100, 1);
+        send_acl(0x80, 2, 100, 2);
+        fake_rom.hold_replies = true;
+        uint8_t one = 1;
+        send_cmd(0x0C1Au, &one, 1);
+        for (int i = 0; i < 3; i++) bt_ctrl_run();                                     /* bt_dlv not run */
+        for (int i = 0; i < 8; i++) inject_conn_req((uint8_t)i);
+        for (int i = 0; i < 3; i++) bt_ctrl_run();
+        send_acl(0x80, 2, 100, 3);
+        fake_rom_raise_irq(BT_ROM_IRQ_RX);
+        bt_ctrl_debug_t d = dbg();
+        CHECK(d.held_acl != 0u && d.evt_used != 0u && d.fwd_pending == 1u && fake_rom_msgs_owned_by_ctrl() != 0u,
+              "traffic outstanding before teardown (held %u evt %u)", d.held_acl, d.evt_used);
+        uint32_t sess = d.session;
+        uint32_t rx_before = t_rx_n, sa_before = t_send_avail;
+        bt_ctrl_shutdown_begin();
+        d = dbg();
+        CHECK(d.session == sess + 1u && !d.admission_open && !d.dlv_open, "quiesced and admission closed first");
+        CHECK(!bt_ctrl_check_send_available(), "admission closed");
+        uint32_t dropped = stats().tx_dropped_closed;
+        uint8_t buf[8];
+        bt_ctrl_send(buf, h4_cmd(buf, 0x0C1Au, &one, 1));
+        CHECK(stats().tx_dropped_closed == dropped + 1u && t_faults == 0u, "late send dropped, not a fault");
+        CHECK(bt_ctrl_dlv_run() == BT_CTRL_DLV_IDLE && t_rx_n == rx_before && t_send_avail == sa_before,
+              "no delivery or send-available after quiesce");
+        fake_rom.call_log_n = 0u;
+        uint32_t log0 = 0u;
+        bt_ctrl_run();
+        CHECK(bt_ctrl_shutdown_status() == BT_CTRL_STOP_OK, "stop status");
+        CHECK(fake_rom.kept_at_stop == 0u && fake_rom.em_rx_held_at_stop == 0u, "all bt_ctrl ROM objects released"
+              " before stop (%u msgs, %u EM)", fake_rom.kept_at_stop, fake_rom.em_rx_held_at_stop);
+        /* order: releases ... stop -> irq_enable(0), nothing after */
+        uint32_t n = fake_rom.call_log_n;
+        CHECK(n >= log0 + 2u && fake_rom.call_log[n - 2u] == FR_STOP && fake_rom.call_log[n - 1u] == FR_IRQ_EN &&
+              fake_rom.irq_enabled == 0u, "stop then IRQ mask last");
+        for (uint32_t k = log0; k + 2u < n; k++) {
+            CHECK(fake_rom.call_log[k] == FR_EM_RX_FREE || fake_rom.call_log[k] == FR_MSG_FREE,
+                  "only releases before stop (call %u = %u)", k, fake_rom.call_log[k]);
+        }
+        d = dbg();
+        CHECK(d.state == 0u && d.evt_used == 0u && d.acl_used == 0u && d.tx_free == 3u && d.held_acl == 0u,
+              "rings freed");
+        CHECK(bt_ctrl_run() == 0u && fake_rom.call_log_n == n, "no ROM call after teardown");
+        /* late upcall from the stopped controller incarnation */
+        uint8_t ev[10] = { 0 };
+        uint32_t late = stats().late_upcalls;
+        fake_rom_deliver_stale(0xE457u, ev, 10);
+        CHECK(stats().late_upcalls == late + 1u, "late callback rejected");
+        CHECK(fake_rom.errors == 0u, "fake ROM error: %s", fake_rom.first_error);
+        fake_rom.hold_replies = false;
+        fake_rom.auto_ack_acl = true;
+        t_rx_rd = t_rx_n = 0;
+    }
+
+    /* stop failure is reported, not ignored */
+    CHECK(bt_ctrl_open() == 0, "reopen");
+    bring_up();
+    fake_rom.stop_result = 1;
+    bt_ctrl_shutdown_begin();
+    bt_ctrl_run();
+    CHECK(bt_ctrl_shutdown_status() == BT_CTRL_STOP_ERR, "stop failure reported");
+    fake_rom.stop_result = 0;
+
+    /* teardown while bt_dlv is inside a host callback; pending send-available dropped */
+    CHECK(bt_ctrl_open() == 0, "reopen 2");
+    bring_up();
+    inject_conn_req(1);
+    inject_conn_req(2);
+    bt_ctrl_run();
+    t_cb_hook = during_delivery_teardown;
+    uint32_t before = t_rx_n;
+    CHECK(bt_ctrl_dlv_run() == BT_CTRL_DLV_IDLE, "dlv stops after teardown inside the callback");
+    CHECK(t_rx_n == before + 1u, "the in-flight delivery completes, nothing after it");
+    CHECK(!bt_ctrl_dlv_busy(), "dlv not busy after return");
+    bt_ctrl_run();
+    CHECK(bt_ctrl_shutdown_status() == BT_CTRL_STOP_OK && fake_rom.kept_at_stop == 0u, "teardown completed");
+
+    /* real Reset in the middle of traffic: undelivered ACL of the old state is dropped by bt_dlv */
+    CHECK(bt_ctrl_open() == 0, "reopen 3");
+    bring_up();
+    link_up(0);
+    uint8_t data[32] = { 0 };
+    fake_rom_inject_acl(0x80, 2, data, 32);
+    fake_rom_inject_acl(0x80, 2, data, 32);
+    bt_ctrl_run();                       /* ACL in ring, not delivered */
+    CHECK(dbg().acl_used == 2u, "ACL queued");
+    send_cmd(0x0C03u, NULL, 0);
+    pump();
+    uint32_t acl = 0;
+    const pkt_t *p;
+    int reset_cc = 0;
+    while ((p = next_pkt()) != NULL) { acl += p->d[0] == BT_H4_ACL; reset_cc |= is_reply(p, 0x0C03u); }
+    CHECK(acl == 0u && reset_cc && stats().dlv_stale == 2u, "pre-Reset ACL dropped, Reset CC delivered");
+    CHECK(fake_rom.starts >= 2u && dbg().c2h_outstanding == 0u && dbg().c2h_fc == 0u, "controller really reset");
+    shutdown_and_check();
+}
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* 9. bt_stop expiry between the check and the ROM call: exactly that call completes, then none                    */
+/* ------------------------------------------------------------------------------------------------------------- */
+static void scenario_traffic(void)
+{
+    bring_up();
+    link_up(0);
+    uint8_t data[200];
+    memset(data, 0x5A, sizeof(data));
+    fake_rom_inject_acl(0x80, 2, data, 200);
+    fake_rom_inject_acl(0x80, 2, data, 200);
+    send_acl(0x80, 2, 100, 1);
+    uint8_t one = 1;
+    send_cmd(0x0C1Au, &one, 1);
+    inject_conn_req(3);
+    fake_rom_raise_irq(BT_ROM_IRQ_CSCNT | BT_ROM_IRQ_KE_TIMER);
+    pump();
+    host_nocp(0x80, 2);
+    pump();
+}
+
+static void test_bt_stop_sweep(void)
+{
+    setup();
+    scenario_traffic();
+    uint32_t total = fake_rom.calls;
+    CHECK(fake_rom.errors == 0u && total > 50u, "baseline scenario (%u ROM calls)", total);
+    printf("  bt_stop sweep over %u ROM-call expiry points\n", total);
+    uint32_t bad = 0;
+    for (uint32_t k = 1; k <= total; k++) {
+        t_quiet = 1;
+        setup();
+        fake_rom.stop_at_call = k;
+        scenario_traffic();
+        for (int i = 0; i < 3; i++) { bt_ctrl_run(); (void)bt_ctrl_dlv_run(); }
+        fake_rom_raise_irq(BT_ROM_IRQ_RX);
+        bt_ctrl_run();
+        bt_ctrl_shutdown_begin();
+        bt_ctrl_run();
+        t_quiet = 0;
+        if (fake_rom.stop_fired_at != k || !fake_rom.stop_call_completed || fake_rom.calls_after_stop != 0u ||
+            stats().parked != 1u || fake_rom.errors != 0u) {
+            bad++;
+            if (bad < 4) {
+                printf("  k=%u fired=%u completed=%u after=%u parked=%u err=%s\n", k, fake_rom.stop_fired_at,
+                       fake_rom.stop_call_completed, fake_rom.calls_after_stop, stats().parked, fake_rom.first_error);
+            }
+        }
+    }
+    CHECK(bad == 0u, "bt_stop sweep: %u of %u expiry points violated 'exactly one call completes, then none'", bad,
+          total);
+}
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* 10. faults: allocation refusal, class M failure, ROM fault upcall, lock depth                                  */
+/* ------------------------------------------------------------------------------------------------------------- */
+static void test_faults(void)
+{
+    setup();
+    bring_up();
+    fake_rom.heap_budget = fake_rom.heap_used;   /* next bt_ctrl allocation is refused */
+    uint8_t one = 1;
+    const pkt_t *r = roundtrip(0x0C1Au, &one, 1);
+    if (r) CHECK(status_of(r) == BT_HCI_ERR_MEM_FULL, "refused allocation -> local CC 0x07");
+    CHECK(stats().cmd_alloc_refused == 1u && t_fault_last == BT_CTRL_FAULT_INVARIANT, "class M local failure faults");
+    fake_rom.heap_budget = 8192;
+    fake_rom_set_reply_status(0xE01Cu, 0x0C);
+    uint8_t mask[8] = { 0 };
+    r = roundtrip(0x0C01u, mask, 8u);
+    if (r) CHECK(status_of(r) == 0x0Cu, "class M FWD status passed through unchanged");
+    CHECK(stats().mandatory_fwd_fail == 1u, "class M nonzero ROM status is an invariant violation");
+    /* ROM-internal allocation failure -> on_fault -> BT fault (outside the upcall) */
+    setup();
+    bring_up();
+    uint8_t cod[3] = { 0 };
+    send_cmd(0x0C24u, cod, 3);
+    fake_rom.heap_budget = fake_rom.heap_used + 24u;   /* bt_ctrl's 3-byte request (16 + 8) fits; the reply does not */
+    pump();
+    CHECK(stats().rom_faults == 1u && t_fault_last == BT_CTRL_FAULT_ROM, "ROM on_fault -> BT fault");
+    /* ROM calling TASK_HCI with its lock held */
+    setup();
+    bring_up();
+    fake_rom.lock_depth = 1;
+    inject_conn_req(1);
+    uint32_t wd = t_wake_dlv;
+    bt_ctrl_run();
+    CHECK(stats().lock_violations >= 1u && t_wake_dlv == wd, "lock held: violation counted, no FreeRTOS wake");
+    fake_rom.lock_depth = 0;
+    pump();
+    CHECK(t_crit == 0 && t_crit_max == 1, "critical sections balanced and never nested");
+}
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* 11. review regressions (one block per finding / surviving mutant)                                               */
+/* ------------------------------------------------------------------------------------------------------------- */
+static void inject_disc(uint16_t h, uint8_t reason)
+{
+    uint8_t p[5] = { 0x00, 0x00, (uint8_t)h, (uint8_t)(h >> 8), reason };
+    fake_rom_inject(0xE458u, p, 5);
+}
+
+static void inject_conn_cmp(uint16_t h)
+{
+    /* ROM layout (FIX_CONN_CMP): status, pad, u16 handle, pad, BD_ADDR[6], link type, encryption */
+    uint8_t p[13] = { 0x00, 0x00, (uint8_t)h, (uint8_t)(h >> 8), 0x00, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0x01, 0x00 };
+    fake_rom_inject(0xE456u, p, 13);
+}
+
+static int is_evt(const pkt_t *p, uint8_t code)
+{
+    return p != NULL && p->d[0] == BT_H4_EVT && p->d[1] == code;
+}
+
+/* bt_dlv order across the two RX rings: arrival order, events never behind credit-gated ACL (findings 1 and 9). */
+static void test_rx_order(void)
+{
+    uint8_t data[64];
+    memset(data, 0x33, sizeof(data));
+    const pkt_t *p1, *p2;
+
+    /* (a) an event that arrived before an ACL packet is delivered first (kills "ACL ring first") */
+    setup();
+    bring_up();
+    link_up(0);
+    t_rx_rd = t_rx_n;
+    inject_conn_req(0x41);
+    bt_ctrl_run();                               /* bt_dlv not run: both rings fill */
+    fake_rom_inject_acl(0x80, 2, data, 64);
+    bt_ctrl_run();
+    CHECK(dbg().evt_used == 1u && dbg().acl_used == 1u, "(a) both rings hold one entry (evt %u acl %u)",
+          dbg().evt_used, dbg().acl_used);
+    (void)bt_ctrl_dlv_run();
+    p1 = next_pkt();
+    p2 = next_pkt();
+    CHECK(is_evt(p1, 0x04u) && p1->d[8] == 0x41u && p2 != NULL && p2->d[0] == BT_H4_ACL,
+          "(a) event that arrived first is delivered first");
+    host_nocp(0x80, 1);
+    pump();
+    shutdown_and_check();
+
+    /* (b) ACL already in its ring, then the peer drops the link: the ACL reaches the host BEFORE Disconnection
+     *     Complete (Bluedroid drops ACL for a handle whose LCB is already released) */
+    setup();
+    bring_up();
+    link_up(0);
+    t_rx_rd = t_rx_n;
+    fake_rom_inject_acl(0x80, 2, data, 64);
+    bt_ctrl_run();
+    fake_rom_link(0, false);
+    inject_disc(0x80, 0x13);
+    bt_ctrl_run();
+    CHECK(dbg().evt_used == 1u && dbg().acl_used == 1u, "(b) both rings hold one entry");
+    (void)bt_ctrl_dlv_run();
+    p1 = next_pkt();
+    p2 = next_pkt();
+    CHECK(p1 != NULL && p1->d[0] == BT_H4_ACL && is_evt(p2, BT_HCI_EVT_DISC),
+          "(b) ACL delivered before the later Disconnection Complete");
+    pump();
+    shutdown_and_check();
+
+    /* (c) ACL_RX and Disconnection Complete in the same kernel run (ACL held during the upcall, copied after it) */
+    setup();
+    bring_up();
+    link_up(0);
+    t_rx_rd = t_rx_n;
+    fake_rom_inject_acl(0x80, 2, data, 64);
+    fake_rom_inject_acl(0x80, 1, data, 32);
+    fake_rom_link(0, false);
+    inject_disc(0x80, 0x13);
+    pump();
+    p1 = next_pkt();
+    p2 = next_pkt();
+    const pkt_t *p3 = next_pkt();
+    CHECK(p1 != NULL && p1->d[0] == BT_H4_ACL && p2 != NULL && p2->d[0] == BT_H4_ACL && is_evt(p3, BT_HCI_EVT_DISC),
+          "(c) same-run ACL kept ahead of Disconnection Complete");
+    shutdown_and_check();
+
+    /* (d) with zero host credits the held ACL does not hold the event back (plan M1 RX dispatcher (1)) */
+    setup();
+    bring_up();
+    link_up(0);
+    for (int i = 0; i < 5; i++) fake_rom_inject_acl(0x80, 2, data, 16);
+    pump();
+    t_rx_rd = t_rx_n;
+    CHECK(dbg().c2h_outstanding == 4u && dbg().held_acl == 1u, "(d) window exhausted, one ACL held");
+    inject_conn_req(0x42);
+    pump();
+    p1 = next_pkt();
+    CHECK(is_evt(p1, 0x04u) && next_pkt() == NULL && dbg().held_acl == 1u, "(d) event not blocked by held ACL");
+    host_nocp(0x80, 4);
+    pump();
+    host_nocp(0x80, 1);
+    pump();
+    shutdown_and_check();
+
+    /* (e) ACL arriving after an event that is still deferred (not yet in the event ring) waits for it */
+    setup();
+    bring_up();
+    link_up(0);
+    t_rx_rd = t_rx_n;
+    for (int i = 0; i < 7; i++) inject_conn_req((uint8_t)i);   /* 6 queued, #6 deferred */
+    fake_rom_inject_acl(0x80, 2, data, 16);
+    bt_ctrl_run();
+    CHECK(dbg().evt_deferred == 1u, "(e) one event deferred");
+    (void)bt_ctrl_dlv_run();                     /* bt_dlv drains the event ring before bt_ctrl runs again */
+    pump();
+    int i6 = -1, ia = -1, k = 0;
+    const pkt_t *p;
+    while ((p = next_pkt()) != NULL) {
+        if (is_evt(p, 0x04u) && p->d[8] == 6u) i6 = k;
+        if (p->d[0] == BT_H4_ACL) ia = k;
+        k++;
+    }
+    CHECK(i6 >= 0 && ia > i6, "(e) ACL delivered after the older deferred event (event %d, ACL %d)", i6, ia);
+    host_nocp(0x80, 1);
+    pump();
+    shutdown_and_check();
+
+    /* (f) a reserved reply queued ahead of an older (previously deferred) event in the event ring: an ACL that arrived
+     *     between them still waits for the older event, not just for the ring head */
+    setup();
+    bring_up();
+    link_up(0);
+    t_rx_rd = t_rx_n;
+    for (int i = 0; i < 7; i++) inject_conn_req((uint8_t)i);
+    bt_ctrl_run();                               /* 6 queued, #6 deferred */
+    fake_rom_inject_acl(0x80, 2, data, 16);      /* arrives after #6 */
+    send_cmd(0x1005u, NULL, 0u);                 /* its CC takes a reserved slot: newer than the ACL */
+    bt_ctrl_run();
+    t_recv_ok_left = 2;
+    (void)bt_ctrl_dlv_run();                     /* #0, #1 delivered */
+    t_recv_ok_left = -1;
+    bt_ctrl_run();                               /* #6 joins the ring behind the CC; the ACL enters its ring */
+    CHECK(dbg().evt_deferred == 0u && dbg().acl_used == 1u, "(f) setup: deferred event queued, ACL in its ring");
+    pump();
+    i6 = ia = -1;
+    k = 0;
+    while ((p = next_pkt()) != NULL) {
+        if (is_evt(p, 0x04u) && p->d[8] == 6u) i6 = k;
+        if (p->d[0] == BT_H4_ACL) ia = k;
+        k++;
+    }
+    CHECK(i6 >= 0 && ia > i6, "(f) ACL delivered after the older event behind the reply (event %d, ACL %d)", i6, ia);
+    host_nocp(0x80, 1);
+    pump();
+    shutdown_and_check();
+}
+
+/* Findings 2 and 6: nothing posted while the ROM lock is held; the pending fault and the bt_dlv wake survive. */
+static void test_lock_held_end_of_run(void)
+{
+    setup();
+    bring_up();
+    fake_rom.lock_depth = 1;                     /* upcall with the lock held AND the lock leaked past run() */
+    inject_conn_req(1);
+    uint32_t wd = t_wake_dlv, f0 = t_faults, lv0 = stats().lock_violations;
+    bt_ctrl_run();
+    CHECK(t_faults == f0 && t_wake_dlv == wd && stats().lock_violations > lv0, "lock held: nothing posted");
+    CHECK(dbg().evt_used == 1u, "event queued while the lock was held");
+    fake_rom.lock_depth = 0;
+    bt_ctrl_run();                               /* no new work: only what was withheld */
+    CHECK(t_wake_dlv == wd + 1u, "withheld bt_dlv wake delivered once the lock is free");
+    CHECK(t_faults == f0 + 1u && t_fault_last == BT_CTRL_FAULT_INVARIANT, "lock violation posted once the lock is free");
+    pump();
+    shutdown_and_check();
+}
+
+/* Finding 3: a ROM fault on the teardown path fails the stop; the next session does not inherit it. */
+static void test_fault_on_stop(void)
+{
+    setup();
+    bring_up();
+    fake_rom.fault_on_stop = true;
+    bt_ctrl_shutdown_begin();
+    bt_ctrl_run();
+    CHECK(bt_ctrl_shutdown_status() == BT_CTRL_STOP_ERR && stats().stop_faults == 1u, "fault during stop -> STOP_ERR");
+    fake_rom.fault_on_stop = false;
+    uint32_t f0 = t_faults;
+    CHECK(bt_ctrl_open() == 0, "reopen");
+    bring_up();
+    CHECK(t_faults == f0, "next session posted the previous session's fault (%u)", t_faults - f0);
+    shutdown_and_check();
+}
+
+/* Finding 4: deferred ROM events released by HCI Reset / teardown are counted. */
+static void test_reset_deferred_events(void)
+{
+    setup();
+    bring_up();
+    for (int i = 0; i < 10; i++) inject_conn_req((uint8_t)i);
+    for (int i = 0; i < 5; i++) bt_ctrl_run();
+    CHECK(dbg().evt_used == BT_CTRL_EVT_SLOTS - BT_CTRL_EVT_RESERVED && dbg().evt_deferred == BT_CTRL_EVT_DEFER,
+          "general area full, defer list full");
+    send_cmd(0x0C03u, NULL, 0u);
+    bt_ctrl_run();
+    CHECK(stats().evt_dropped_reset == BT_CTRL_EVT_DEFER && fake_rom.kept_at_stop == 0u,
+          "deferred events dropped by Reset are counted (%u)", stats().evt_dropped_reset);
+    uint32_t conn = 0, reset_cc = 0;
+    pump();
+    const pkt_t *p;
+    while ((p = next_pkt()) != NULL) { conn += is_evt(p, 0x04u); reset_cc += is_reply(p, 0x0C03u); }
+    CHECK(conn == 6u && reset_cc == 1u, "ring events kept and delivered before the Reset CC (%u)", conn);
+    /* teardown with deferred events */
+    for (int i = 0; i < 10; i++) inject_conn_req((uint8_t)i);
+    for (int i = 0; i < 5; i++) bt_ctrl_run();
+    CHECK(dbg().evt_deferred == BT_CTRL_EVT_DEFER, "deferred again");
+    shutdown_and_check();
+    CHECK(stats().evt_dropped_stop == BT_CTRL_EVT_DEFER, "deferred events released by teardown are counted");
+}
+
+/* Finding 5: a failed Reset (stop or start) leaves IRQ 26 masked. */
+static void test_reset_failure_masks_irq(void)
+{
+    setup();
+    bring_up();
+    CHECK(fake_rom.irq_enabled == 1u, "IRQ on after bring-up");
+    fake_rom.stop_result = 1;
+    const pkt_t *r = roundtrip(0x0C03u, NULL, 0u);
+    if (r) CHECK(status_of(r) == BT_HCI_ERR_HW_FAILURE, "re-Reset with stop failure -> 0x03");
+    CHECK(fake_rom.irq_enabled == 0u && dbg().rom_running == 0u, "IRQ 26 masked after the failed stop");
+    fake_rom.stop_result = 0;
+    r = roundtrip(0x0C03u, NULL, 0u);
+    if (r) CHECK(status_of(r) == 0u && fake_rom.irq_enabled == 1u, "Reset recovers");
+    fake_rom.start_result = 1;
+    r = roundtrip(0x0C03u, NULL, 0u);
+    if (r) CHECK(status_of(r) == BT_HCI_ERR_HW_FAILURE, "start failure -> 0x03");
+    CHECK(fake_rom.irq_enabled == 0u, "IRQ 26 masked after the failed start");
+    fake_rom.start_result = 0;
+    r = roundtrip(0x0C03u, NULL, 0u);
+    if (r) CHECK(status_of(r) == 0u && fake_rom.irq_enabled == 1u, "Reset recovers again");
+    shutdown_and_check();
+}
+
+/* Finding 7: a forwarded LC command whose LC instance was freed under it is answered locally. */
+static void test_fwd_orphan(void)
+{
+    setup();
+    bring_up();
+    link_up(0);
+    uint8_t dp[3] = { 0x80, 0x00, 0x13 };
+    fake_rom.lc_swallow = true;
+    send_cmd(0x0406u, dp, 3u);
+    pump();
+    CHECK(dbg().fwd_pending == 1u && dbg().rom_cmd_credits == 0u && pending_pkts() == 0u, "0406 swallowed by the ROM");
+    fake_rom.lc_swallow = false;
+    fake_rom_link(0, false);
+    inject_disc(0x80, 0x08);
+    pump();
+    const pkt_t *p1 = next_pkt(), *p2 = next_pkt();
+    CHECK(is_evt(p1, BT_HCI_EVT_DISC) && is_reply(p2, 0x0406u) && p2->d[1] == BT_HCI_EVT_CS &&
+          status_of(p2) == BT_HCI_ERR_UNKNOWN_CONN, "Disconnection Complete, then CS 0406 status 0x02");
+    CHECK(dbg().fwd_pending == 0u && dbg().rom_cmd_credits == 1u && dbg().evt_resv == 0u &&
+          stats().fwd_orphaned == 1u, "command window released");
+    uint8_t one = 1u;
+    const pkt_t *r = roundtrip(0x0C1Au, &one, 1u);
+    CHECK(r != NULL && status_of(r) == 0u, "next command not wedged");
+    /* the ROM's own reply, when it comes after the Disconnection Complete, is used and not duplicated */
+    link_up(0);
+    fake_rom.hold_replies = true;
+    send_cmd(0x0406u, dp, 3u);
+    pump();
+    fake_rom.hold_replies = false;
+    fake_rom_link(0, false);
+    inject_disc(0x80, 0x16);
+    fake_rom_release_held();                     /* ROM queue: Disconnection Complete, then CS 0406 */
+    pump();
+    uint32_t cs = 0;
+    const pkt_t *p;
+    while ((p = next_pkt()) != NULL) {
+        if (is_reply(p, 0x0406u)) { cs++; CHECK(status_of(p) == 0u, "ROM reply status kept"); }
+    }
+    CHECK(cs == 1u && stats().fwd_orphaned == 1u && stats().evt_unsolicited_reply == 0u, "exactly one 0406 reply");
+    CHECK(dbg().fwd_pending == 0u && dbg().rom_cmd_credits == 1u, "window released by the ROM reply");
+    shutdown_and_check();
+}
+
+/* Finding 8: host ACL queued for a handle that disconnects is flushed, never sent on the reused handle. */
+static void test_stale_tx_acl_flush(void)
+{
+    setup();
+    bring_up();
+    link_up(0);
+    fake_rom.auto_ack_acl = false;
+    uint32_t n0 = fake_rom.n_acl, d0 = stats().acl_tx_dropped;
+    send_acl(0x80, 2, 20, 1);                    /* READY, not yet drained */
+    fake_rom_link(0, false);
+    inject_disc(0x80, 0x13);
+    fake_rom_link(0, true);                      /* the ROM hands 0x80 to an incoming connection in the same run */
+    inject_conn_cmp(0x80);
+    pump();
+    CHECK(fake_rom.n_acl == n0 && dbg().h2c_inflight == 0u && stats().acl_tx_dropped == d0 + 1u &&
+          dbg().tx_free == BT_CTRL_TX_SLOTS, "stale ACL flushed by Disconnection Complete, not sent to the new link");
+    /* ACL the host sent for the old link after the disconnect, before the handle was reused */
+    fake_rom_link(0, false);
+    inject_disc(0x80, 0x13);
+    pump();
+    send_acl(0x80, 2, 20, 2);
+    fake_rom_link(0, true);
+    inject_conn_cmp(0x80);
+    pump();
+    CHECK(fake_rom.n_acl == n0 && stats().acl_tx_dropped == d0 + 2u, "stale ACL flushed by the new Connection Complete");
+    send_acl(0x80, 2, 20, 3);                    /* after Connection Complete: the new link's data goes out */
+    pump();
+    CHECK(fake_rom.n_acl == n0 + 1u && fake_rom.acl[n0].data[0] == 3u && dbg().h2c_inflight == 1u, "new link ACL sent");
+    fake_rom_ack_acl(1);
+    pump();
+    /* the ROM reassigns 0x80 before the new link's Connection Complete exists (setup still in progress): only the
+     * Disconnection Complete flush keeps the old link's data off the new peer */
+    uint32_t n1 = fake_rom.n_acl, d1 = stats().acl_tx_dropped;
+    send_acl(0x80, 2, 20, 4);
+    inject_disc(0x80, 0x13);                     /* conhdl_to_task(0x80) stays valid: handle already reused */
+    pump();
+    CHECK(fake_rom.n_acl == n1 && stats().acl_tx_dropped == d1 + 1u && dbg().h2c_inflight == 0u,
+          "stale ACL flushed by Disconnection Complete alone");
+    shutdown_and_check();
+}
+
+/* Finding 10: send-available only on a full -> not-full transition. */
+static void test_send_avail_only_when_full(void)
+{
+    setup();
+    bring_up();
+    link_up(0);
+    uint32_t sa0 = t_send_avail;
+    uint8_t one = 1u;
+    send_acl(0x80, 2, 10, 1);
+    pump();
+    send_cmd(0x0C1Au, &one, 1u);
+    pump();
+    CHECK(t_send_avail == sa0, "no send-available while the ring was never full (%u)", t_send_avail - sa0);
+    send_acl(0x80, 2, 10, 2);
+    send_acl(0x80, 2, 10, 3);                    /* 2 of 3 slots */
+    pump();
+    CHECK(t_send_avail == sa0 && dbg().tx_free == BT_CTRL_TX_SLOTS, "2 of 3 slots drained: no send-available");
+    shutdown_and_check();
+}
+
+/* Finding 11: a nonzero status on a forwarded class-M command posts a BT fault. */
+static void test_class_m_fwd_fault(void)
+{
+    setup();
+    bring_up();
+    fake_rom_set_reply_status(0xE01Cu, 0x0C);
+    uint32_t f0 = t_faults, inv0 = stats().invariant;
+    uint8_t mask[8] = { 0 };
+    const pkt_t *r = roundtrip(0x0C01u, mask, 8u);
+    if (r) CHECK(status_of(r) == 0x0Cu, "status passed through");
+    CHECK(t_faults == f0 + 1u && t_fault_last == BT_CTRL_FAULT_INVARIANT && stats().invariant == inv0 + 1u &&
+          stats().mandatory_fwd_fail == 1u, "class M FWD failure posted as an invariant fault");
+    fake_rom_set_reply_status(0xE01Cu, 0x00);
+    shutdown_and_check();
+}
+
+/* Finding 12: a slot bt_dlv freed goes to the oldest deferred event; a new event neither overtakes nor overflows. */
+static void test_deferred_order_after_free(void)
+{
+    setup();
+    bring_up();
+    t_rx_rd = t_rx_n;
+    for (int i = 0; i < 10; i++) inject_conn_req((uint8_t)i);
+    for (int i = 0; i < 5; i++) bt_ctrl_run();
+    CHECK(dbg().evt_used == 6u && dbg().evt_deferred == 4u && stats().evt_overflow == 0u, "6 queued, 4 deferred");
+    t_recv_ok_left = 1;
+    (void)bt_ctrl_dlv_run();                     /* exactly one event delivered */
+    t_recv_ok_left = -1;
+    CHECK(dbg().evt_used == 5u, "one slot freed");
+    inject_conn_req(10);
+    bt_ctrl_run();
+    CHECK(stats().evt_overflow == 0u && t_faults == 0u, "no overflow although a slot was free (%u)",
+          stats().evt_overflow);
+    pump();
+    int last = -1, ordered = 1;
+    uint32_t got = 0;
+    const pkt_t *p;
+    while ((p = next_pkt()) != NULL) {
+        if (is_evt(p, 0x04u)) { got++; if (p->d[8] != (uint8_t)(last + 1)) ordered = 0; last = p->d[8]; }
+    }
+    CHECK(got == 11u && ordered, "11 events in injection order (%u, ordered %d)", got, ordered);
+    shutdown_and_check();
+}
+
+/* Finding 13: NOCP uses a reserved slot while the general area is full and bt_dlv is stuck. */
+static void test_nocp_reserved_slot(void)
+{
+    setup();
+    bring_up();
+    link_up(0);
+    fake_rom.auto_ack_acl = false;
+    send_acl(0x80, 2, 10, 1);
+    pump();
+    CHECK(dbg().h2c_inflight == 1u, "one ACL in flight");
+    for (int i = 0; i < 6; i++) inject_conn_req((uint8_t)i);
+    for (int i = 0; i < 5; i++) bt_ctrl_run();   /* bt_dlv stuck: general area full */
+    CHECK(dbg().evt_used == BT_CTRL_EVT_SLOTS - BT_CTRL_EVT_RESERVED, "general area full");
+    fake_rom_ack_acl(1);
+    bt_ctrl_run();
+    CHECK(dbg().nocp_pending == 0u && dbg().evt_used == BT_CTRL_EVT_SLOTS - BT_CTRL_EVT_RESERVED + 1u &&
+          dbg().h2c_inflight == 0u, "NOCP took a reserved slot (pending %u used %u)", dbg().nocp_pending,
+          dbg().evt_used);
+    pump();
+    shutdown_and_check();
+}
+
+/* Finding 14: process_acl error paths. */
+static void test_acl_tx_error_paths(void)
+{
+    /* (a) ACL descriptor allocation refused: the EM TX buffer goes back, the packet waits and goes out later */
+    setup();
+    bring_up();
+    link_up(0);
+    uint32_t n0 = fake_rom.n_acl, ref0 = stats().cmd_alloc_refused;
+    fake_rom.heap_budget = fake_rom.heap_used;
+    send_acl(0x80, 2, 30, 7);
+    pump();
+    CHECK(stats().cmd_alloc_refused > ref0 && fake_rom_em_tx_in_use() == 0u && fake_rom.n_acl == n0 &&
+          dbg().tx_free == BT_CTRL_TX_SLOTS - 1u, "refused descriptor: EM TX buffer freed, ACL kept");
+    fake_rom.heap_budget = 8192u;
+    pump();
+    CHECK(fake_rom.n_acl == n0 + 1u && fake_rom.acl[n0].data[0] == 7u && dbg().tx_free == BT_CTRL_TX_SLOTS,
+          "ACL delivered once memory is back");
+    CHECK(fake_rom.errors == 0u, "fake ROM error: %s", fake_rom.first_error);
+    shutdown_and_check();
+    /* (b) EM TX allocation failure with a credit is an invariant violation */
+    setup();
+    bring_up();
+    link_up(0);
+    fake_rom.em_tx_fail = true;
+    send_acl(0x80, 2, 10, 1);
+    bt_ctrl_run();
+    CHECK(stats().acl_tx_em_fail == 1u && t_faults == 1u && t_fault_last == BT_CTRL_FAULT_INVARIANT,
+          "EM TX failure with a credit -> invariant fault");
+    fake_rom.em_tx_fail = false;
+    pump();
+    CHECK(fake_rom.n_acl == 1u && dbg().tx_free == BT_CTRL_TX_SLOTS, "ACL sent after EM TX recovers");
+    shutdown_and_check();
+}
+
+/* Finding 15: HCI Reset drops host ACL and 0C35 queued behind it. */
+static void test_reset_drops_queued_tx(void)
+{
+    setup();
+    bring_up();
+    link_up(0);
+    uint8_t data[16] = { 0 };
+    fake_rom_inject_acl(0x80, 2, data, 16);
+    pump();
+    CHECK(dbg().c2h_outstanding == 1u, "one C2H credit outstanding before Reset");
+    uint32_t n0 = fake_rom.n_acl, noack0 = stats().tx_noack;
+    send_cmd(0x0C03u, NULL, 0u);
+    send_acl(0x80, 2, 10, 1);
+    host_nocp(0x80, 1);
+    pump();
+    CHECK(fake_rom.n_acl == n0 && stats().tx_noack == noack0 && dbg().tx_free == BT_CTRL_TX_SLOTS,
+          "pre-Reset ACL and 0C35 dropped (acl %u noack %u)", fake_rom.n_acl - n0, stats().tx_noack - noack0);
+    shutdown_and_check();
+}
+
+/* Finding 16: connection-handle error paths. */
+static void test_handle_errors(void)
+{
+    setup();
+    bring_up();
+    uint8_t dp[3] = { 0x85, 0x00, 0x13 };
+    const pkt_t *r = roundtrip(0x0406u, dp, 3u);
+    if (r) CHECK(r->d[1] == BT_HCI_EVT_CS && status_of(r) == BT_HCI_ERR_UNKNOWN_CONN, "0406 unknown handle -> CS 0x02");
+    link_up(0);
+    fake_rom.conhdl_type_override = 2;           /* live handle that is not an ACL link */
+    uint32_t n0 = fake_rom.n_acl, d0 = stats().acl_tx_dropped;
+    send_acl(0x80, 2, 10, 1);
+    pump();
+    CHECK(stats().acl_tx_dropped == d0 + 1u && fake_rom.n_acl == n0, "ACL on a non-ACL handle dropped");
+    fake_rom.conhdl_type_override = -1;
+    shutdown_and_check();
+}
+
+/* Finding 17: 0C31 with flow control off. */
+static void test_c2h_fc_off(void)
+{
+    setup();
+    bring_up();
+    link_up(0);
+    uint8_t zero = 0u;
+    (void)roundtrip(0x0C31u, &zero, 1u);
+    CHECK(dbg().c2h_fc == 0u, "0C31(0) turns the C2H credit gate off");
+    uint8_t data[50];
+    memset(data, 0x44, sizeof(data));
+    for (int i = 0; i < 6; i++) fake_rom_inject_acl(0x80, 2, data, 50);
+    pump();
+    uint32_t acl = 0;
+    const pkt_t *p;
+    while ((p = next_pkt()) != NULL) acl += p->d[0] == BT_H4_ACL;
+    CHECK(acl == 6u && dbg().c2h_outstanding == 0u && dbg().held_acl == 0u, "no credit gate: %u of 6 delivered", acl);
+    uint32_t inv0 = stats().c2h_invalid;
+    host_nocp(0x80, 1);
+    pump();
+    CHECK(stats().c2h_invalid == inv0 + 1u, "0C35 with flow control off counted invalid");
+    shutdown_and_check();
+}
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* 12. fuzzing                                                                                                    */
+/* ------------------------------------------------------------------------------------------------------------- */
+static uint32_t rng_state;
+static uint32_t rnd(void)
+{
+    rng_state ^= rng_state << 13;
+    rng_state ^= rng_state >> 17;
+    rng_state ^= rng_state << 5;
+    return rng_state;
+}
+
+static void check_invariants(void)
+{
+    bt_ctrl_debug_t d = dbg();
+    CHECK(d.evt_used <= BT_CTRL_EVT_SLOTS && d.acl_used <= BT_CTRL_ACL_RX_SLOTS && d.held_acl <= BT_CTRL_HELD_ACL &&
+          d.h2c_inflight <= BT_CTRL_H2C_ACL_CREDITS + 0u && d.evt_resv <= 1u && d.tx_free <= BT_CTRL_TX_SLOTS,
+          "invariant: evt %u acl %u held %u inflight %u resv %u", d.evt_used, d.acl_used, d.held_acl, d.h2c_inflight,
+          d.evt_resv);
+    CHECK(!d.c2h_fc || d.c2h_outstanding <= d.c2h_credits, "c2h window exceeded");
+}
+
+static const uint16_t k_rom_ids[] = { 0xE0D2, 0xE456, 0xE457, 0xE458, 0xE459, 0xE45A, 0xE45D, 0xE45E, 0xE462, 0xE464,
+                                      0xE465, 0xE466, 0xE468, 0xE472, 0xE473, 0xE474, 0xE477, 0xE478, 0xE079, 0xE0C9,
+                                      0xE43A, 0xE06A, 0x1234, 0xE47D };
+
+static void return_all_c2h(void)
+{
+    /* the host returns every outstanding credit, one 0C35 per handle */
+    for (uint16_t h = 0x80; h <= 0x86; h++) {
+        if (bt_ctrl_check_send_available()) host_nocp(h, 0xFFFF);
+        pump();
+    }
+}
+
+static void test_fuzz_rx(void)
+{
+    for (uint32_t seed = 1; seed <= 6; seed++) {
+        rng_state = 0x9E3779B9u * seed;
+        setup();
+        bring_up();
+        link_up(0); link_up(1); link_up(2);
+        uint8_t buf[1024];
+        for (int it = 0; it < 4000; it++) {
+            for (uint32_t k = 0; k < sizeof(buf); k++) buf[k] = (uint8_t)rnd();
+            switch (rnd() % 9) {
+            case 0: case 1: {
+                uint16_t id = k_rom_ids[rnd() % (sizeof(k_rom_ids) / sizeof(k_rom_ids[0]))];
+                uint16_t len = (uint16_t)(rnd() % 40);
+                if (id == 0xE47D) {               /* raw descriptor with a NULL buffer: must be rejected */
+                    bt_rom_acl_desc_t dd; memset(&dd, 0, sizeof(dd)); dd.length = 10;
+                    fake_rom_inject(id, (const uint8_t *)&dd, (uint16_t)sizeof(dd));
+                } else {
+                    fake_rom_inject(id, buf, len);
+                }
+                break;
+            }
+            case 2: case 3:
+                (void)fake_rom_inject_acl((uint16_t)(0x80 + rnd() % 4), (uint8_t)(rnd() % 16), buf,
+                                          (uint16_t)(rnd() % 1025));
+                break;
+            case 4: {
+                if (bt_ctrl_check_send_available()) {
+                    uint8_t p[1 + 4 * 3];
+                    uint8_t nh = (uint8_t)(rnd() % 4);
+                    p[0] = nh;
+                    for (int i = 0; i < 3; i++) { p[1 + 4 * i] = (uint8_t)(0x80 + rnd() % 4); p[2 + 4 * i] = 0;
+                                                   p[3 + 4 * i] = (uint8_t)(rnd() % 3); p[4 + 4 * i] = 0; }
+                    send_cmd(0x0C35u, p, (uint8_t)(rnd() % 4 == 0 ? rnd() % 13 : 1u + 4u * nh));
+                }
+                break;
+            }
+            case 5: t_recv_fail = (int)(rnd() % 3); (void)bt_ctrl_dlv_run(); t_recv_fail = 0; break;
+            case 6: fake_rom_raise_irq(rnd()); break;
+            case 7: (void)bt_ctrl_dlv_run(); break;
+            default: (void)bt_ctrl_run(); break;
+            }
+            check_invariants();
+            if (fake_rom.errors != 0u) break;
+        }
+        t_recv_fail = 0;
+        pump();
+        return_all_c2h();
+        pump();
+        CHECK(fake_rom.errors == 0u, "RX fuzz seed %u: %s", seed, fake_rom.first_error);
+        CHECK(stats().cmd_unknown == 0u, "RX fuzz: unknown opcode");
+        shutdown_and_check();
+    }
+}
+
+static void test_fuzz_tx(void)
+{
+    uint32_t n = 0;
+    const bt_ctrl_cmd_row_t *rows = bt_ctrl_cmds_table(&n);
+    for (uint32_t seed = 1; seed <= 6; seed++) {
+        rng_state = 0x85EBCA6Bu * seed + 1u;
+        setup();
+        bring_up();
+        link_up(0); link_up(1);
+        uint32_t expect_replies = 0, got_replies = 0;
+        uint32_t rx0 = t_rx_n;
+        static uint8_t buf[1100];
+        for (int it = 0; it < 4000; it++) {
+            uint32_t a = rnd() % 10;
+            if (a < 6 && bt_ctrl_check_send_available()) {
+                uint32_t kind = rnd() % 20;
+                uint16_t len;
+                if (kind < 13) {                  /* command */
+                    uint16_t op;
+                    uint32_t pick = rnd() % 10;
+                    op = pick < 8 ? rows[rnd() % n].op : pick == 8 ? (uint16_t)(0xFC00 | (rnd() & 0x3FF))
+                                                                   : (uint16_t)rnd();
+                    if (op == 0x0C03u && rnd() % 4 != 0) op = 0x0C1Au;   /* fewer resets */
+                    uint8_t plen = (uint8_t)(rnd() % 256);
+                    if (rnd() % 2) plen = (uint8_t)(rnd() % 12);
+                    for (uint32_t k = 0; k < plen; k++) buf[4 + k] = (uint8_t)rnd();
+                    if (rnd() % 2) { buf[4] = (uint8_t)(0x80 + rnd() % 3); buf[5] = 0; }
+                    len = h4_cmd(buf, op, buf + 4, plen);
+                    bool malformed = rnd() % 25 == 0;
+                    if (malformed) len = (uint16_t)(len - 1u);
+                    else if (op != 0x0C35u) expect_replies++;
+                } else if (kind < 19) {           /* ACL */
+                    uint16_t dl = (uint16_t)(rnd() % 1022);
+                    if (rnd() % 30 == 0) dl = (uint16_t)(1022 + rnd() % 3);   /* oversize: host bug */
+                    uint16_t hdr = (uint16_t)((0x80 + rnd() % 4) | ((rnd() % 4) << 12));
+                    buf[0] = 2; buf[1] = (uint8_t)hdr; buf[2] = (uint8_t)(hdr >> 8);
+                    buf[3] = (uint8_t)dl; buf[4] = (uint8_t)(dl >> 8);
+                    len = (uint16_t)(5u + dl);
+                    if (len > 1026) len = 1026;
+                } else {                          /* garbage type */
+                    buf[0] = (uint8_t)(rnd() | 0x08);
+                    len = (uint16_t)(1 + rnd() % 30);
+                }
+                bt_ctrl_send(buf, len);
+            } else if (a == 6) {
+                (void)bt_ctrl_dlv_run();
+            } else if (a == 7) {
+                fake_rom_ack_acl(rnd() % 5);
+            } else {
+                (void)bt_ctrl_run();
+            }
+            check_invariants();
+            if (fake_rom.errors != 0u) break;
+        }
+        pump();
+        fake_rom_ack_acl(100);
+        pump();
+        for (uint32_t i = rx0; i < t_rx_n; i++) {
+            got_replies += t_rx[i].d[0] == BT_H4_EVT && (t_rx[i].d[1] == BT_HCI_EVT_CC || t_rx[i].d[1] == BT_HCI_EVT_CS);
+        }
+        CHECK(got_replies == expect_replies, "TX fuzz seed %u: %u replies for %u well-formed commands", seed,
+              got_replies, expect_replies);
+        CHECK(dbg().tx_free == BT_CTRL_TX_SLOTS, "TX fuzz: ring not drained (%u free)", dbg().tx_free);
+        CHECK(fake_rom.errors == 0u, "TX fuzz seed %u: %s", seed, fake_rom.first_error);
+        return_all_c2h();
+        shutdown_and_check();
+    }
+}
+
+int main(void)
+{
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_abrt;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGABRT, &sa, NULL);
+    t_rx = calloc(MAX_PKTS, sizeof(pkt_t));
+
+    struct { const char *name; void (*fn)(void); } tests[] = {
+        { "table", test_table },
+        { "golden_vectors", test_golden_vectors },
+        { "startup_and_param_rules", test_startup_and_param_rules },
+        { "tx_admission", test_tx_admission },
+        { "rx_paths", test_rx_paths },
+        { "0c35_zero_cmd_credits", test_0c35_zero_cmd_credits },
+        { "nocp_disconnect_irq", test_nocp_disconnect_irq },
+        { "teardown_restart", test_teardown_restart },
+        { "bt_stop_sweep", test_bt_stop_sweep },
+        { "faults", test_faults },
+        { "rx_order", test_rx_order },
+        { "lock_held_end_of_run", test_lock_held_end_of_run },
+        { "fault_on_stop", test_fault_on_stop },
+        { "reset_deferred_events", test_reset_deferred_events },
+        { "reset_failure_masks_irq", test_reset_failure_masks_irq },
+        { "fwd_orphan", test_fwd_orphan },
+        { "stale_tx_acl_flush", test_stale_tx_acl_flush },
+        { "send_avail_only_when_full", test_send_avail_only_when_full },
+        { "class_m_fwd_fault", test_class_m_fwd_fault },
+        { "deferred_order_after_free", test_deferred_order_after_free },
+        { "nocp_reserved_slot", test_nocp_reserved_slot },
+        { "acl_tx_error_paths", test_acl_tx_error_paths },
+        { "reset_drops_queued_tx", test_reset_drops_queued_tx },
+        { "handle_errors", test_handle_errors },
+        { "c2h_fc_off", test_c2h_fc_off },
+        { "fuzz_rx", test_fuzz_rx },
+        { "fuzz_tx", test_fuzz_tx },
+    };
+    for (size_t i = 0; i < sizeof(tests) / sizeof(tests[0]); i++) {
+        int before = g_fail;
+        tests[i].fn();
+        printf("%-28s %s\n", tests[i].name, g_fail == before ? "ok" : "FAILED");
+    }
+    fake_rom_shutdown();
+    free(t_rx);
+    printf("test_bt_ctrl: %d checks, %d failures\n", g_checks, g_fail);
+    return g_fail == 0 ? 0 : 1;
+}
