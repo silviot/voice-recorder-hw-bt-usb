@@ -26,10 +26,11 @@ endif
 
 # RTOS=1: run the app as a FreeRTOS task (prerequisite for Bluedroid). Default 0 until validated.
 RTOS ?= 0
+RTOS_SELFTEST ?= 0
 FREERTOS_DIR := third_party/freertos
 ifeq ($(RTOS),1)
 RTOS_INC   := -Isrc/rtos -Isrc/rtos/shim -I$(FREERTOS_DIR)/include -I$(FREERTOS_DIR)/portable/GCC/ARM_CM4F
-RTOS_DEFS  := -DOPENFW_RTOS=1
+RTOS_DEFS  := -DOPENFW_RTOS=1 -DOPENFW_RTOS_SELFTEST=$(RTOS_SELFTEST)
 else
 RTOS_INC   :=
 RTOS_DEFS  := -DOPENFW_RTOS=0
@@ -103,6 +104,9 @@ RTOS_SRCS := $(FREERTOS_DIR)/tasks.c $(FREERTOS_DIR)/queue.c $(FREERTOS_DIR)/lis
              $(FREERTOS_DIR)/portable/GCC/ARM_CM4F/port.c $(FREERTOS_DIR)/portable/MemMang/heap_5.c \
              src/rtos/rtos_port.c src/rtos/libc_min.c
 RTOS_OBJS := $(patsubst %.c,$(BUILD_DIR)/rtos/%.o,$(RTOS_SRCS))
+ifeq ($(RTOS_SELFTEST),1)
+RTOS_OBJS += $(BUILD_DIR)/rtos/src/rtos/rtos_selftest.o
+endif
 ifeq ($(RTOS),1)
 ARM_OBJS  := $(OBJS) $(RTOS_OBJS)
 else
@@ -115,7 +119,7 @@ STOCK_DUMP  := ../dumps/firmware_2M.bin
 OUT_BIN     := ../dumps/firmware_2M_openfw.bin
 OUT_UP      := ../dumps/update_openfw.up
 
-.PHONY: all test-host test-host-san test-qemu qemu-stub update-up wasm clean force-config fetch-lvgl
+.PHONY: all test-host test-host-san test-qemu test-qemu-rtos qemu-stub update-up wasm clean force-config fetch-lvgl
 
 CONFIG_STAMP := $(BUILD_DIR)/.config
 
@@ -234,6 +238,14 @@ $(BUILD_DIR)/qemu_boot_stub.bin: tools/qemu_boot_stub.S | $(BUILD_DIR)
 
 test-qemu: all update-up $(BUILD_DIR)/qemu_boot_stub.bin
 	python3 tools/run_qemu.py --elf $(BUILD_DIR)/open_fw.elf --stub $(BUILD_DIR)/qemu_boot_stub.bin --flash $(OUT_BIN)
+
+# FreeRTOS scheduler/primitives self-test + normal boot checks on the SL6801 QEMU model.
+# Usage: make -C open_fw test-qemu-rtos   (needs tools/setup_qemu.sh + ../dumps/*)
+RTOS_QEMU_DIR ?= /tmp/sl6801_openfw_rtos_selftest
+test-qemu-rtos:
+	$(MAKE) update-up qemu-stub RTOS=1 RTOS_SELFTEST=1 BUILD_DIR=$(RTOS_QEMU_DIR)
+	python3 tools/run_qemu.py --elf $(RTOS_QEMU_DIR)/open_fw.elf --stub $(RTOS_QEMU_DIR)/qemu_boot_stub.bin \
+		--flash $(OUT_BIN) --skip-keys --png-out $(RTOS_QEMU_DIR)/qemu_lcd.png
 
 WASM_BUILD_DIR := $(BUILD_DIR)_wasm
 WASM_OUT       := ../web_emu/openfw.wasm

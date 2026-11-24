@@ -406,8 +406,28 @@ def main() -> int:
         sd_img = tmp_path / "qemu_sd.img"
         prepare_sd_image(sd_img, size_mb=8)
 
+        selftest_result: dict = {}
+        selftest_names = ["delay", "queue", "mutex_pi", "timer", "notify", "eventgroup",
+                          "heap", "preempt", "from_isr", "stack"]
+
+        def read_selftest(client: GdbRspClient):
+            """FreeRTOS self-test (make RTOS=1 RTOS_SELFTEST=1): poll g_rtos_selftest until done."""
+            addr = syms["g_rtos_selftest"][0]
+            for _ in range(40):
+                raw = client.read_mem(addr, 16 * 4)
+                words = struct.unpack("<16I", raw)
+                if words[1] == 1:
+                    break
+                _ = client.continue_for(0.5)
+            selftest_result.update(
+                magic=words[0], done=words[1], pass_mask=words[2], fail_mask=words[3],
+                heap_free_start=words[4], heap_min_end=words[5], detail=list(words[6:16]),
+            )
+
         def inspect_boot(client: GdbRspClient):
             _ = client.continue_for(args.boot_seconds)
+            if "g_rtos_selftest" in syms:
+                read_selftest(client)
             systick_1 = client.read_u32(systick_addr)
             _ = client.continue_for(0.4)
             systick_2 = client.read_u32(systick_addr)
@@ -502,6 +522,22 @@ def main() -> int:
             failures.append(
                 f"LCD framebuffer appears blank or corrupted (nonblack={nonblack}, colors={n_colors})"
             )
+
+        if selftest_result:
+            n = len(selftest_names)
+            print(
+                f"RTOS selftest: done={selftest_result['done']} pass=0x{selftest_result['pass_mask']:03x} "
+                f"fail=0x{selftest_result['fail_mask']:03x} heap_free_start={selftest_result['heap_free_start']} "
+                f"heap_min_end={selftest_result['heap_min_end']}"
+            )
+            for i, name in enumerate(selftest_names):
+                ok = (selftest_result["pass_mask"] >> i) & 1
+                bad = (selftest_result["fail_mask"] >> i) & 1
+                print(f"  [{'PASS' if ok and not bad else 'FAIL'}] {name} (detail={selftest_result['detail'][i]})")
+            if selftest_result["magic"] != 0x52544F53 or selftest_result["done"] != 1:
+                failures.append("RTOS selftest did not complete")
+            if selftest_result["pass_mask"] != (1 << n) - 1 or selftest_result["fail_mask"] != 0:
+                failures.append("RTOS selftest reported failures")
 
         if not args.skip_keys:
             usb_active_addr = syms["g_usb_active"][0]

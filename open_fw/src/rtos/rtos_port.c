@@ -25,6 +25,11 @@ extern void xPortSysTickHandler(void);
 
 static openfw_rtos_entry_t g_app_entry;
 
+#if OPENFW_RTOS_SELFTEST
+void openfw_rtos_selftest_start(void);
+void openfw_rtos_selftest_tick_hook(void);
+#endif
+
 void vPortSetupTimerInterrupt(void)
 {
     /* SysTick already running at configTICK_RATE_HZ (1 kHz) from systick_init(). */
@@ -34,6 +39,9 @@ void openfw_rtos_tick(void)
 {
     if (xTaskGetSchedulerState() == taskSCHEDULER_RUNNING) {
         xPortSysTickHandler();
+#if OPENFW_RTOS_SELFTEST
+        openfw_rtos_selftest_tick_hook();
+#endif
     }
 }
 
@@ -127,6 +135,9 @@ void openfw_rtos_start(openfw_rtos_entry_t entry)
     if (xTaskCreate(app_task, "app", OPENFW_APP_STACK_WORDS, NULL, OPENFW_PRIO_APP, NULL) != pdPASS) {
         openfw_rtos_fatal(0xF1u, 0u, 0u);
     }
+#if OPENFW_RTOS_SELFTEST
+    openfw_rtos_selftest_start();
+#endif
     vTaskStartScheduler();
     openfw_rtos_fatal(0xF1u, 1u, 0u); /* scheduler returned: no memory for idle/timer task */
 }
