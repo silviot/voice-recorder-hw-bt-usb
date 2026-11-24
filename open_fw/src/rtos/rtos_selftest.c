@@ -19,7 +19,7 @@
 
 enum {
     T_DELAY = 0, T_QUEUE, T_MUTEX_PI, T_TIMER, T_NOTIFY, T_EVENTGROUP,
-    T_HEAP, T_PREEMPT, T_FROM_ISR, T_STACK, T_REAP, T_COUNT
+    T_HEAP, T_PREEMPT, T_FROM_ISR, T_STACK, T_REAP, T_BTDATA, T_COUNT
 };
 
 typedef struct {
@@ -291,6 +291,20 @@ static void selftest_main(void *arg)
         vTaskDelay(pdMS_TO_TICKS(50));
         uint32_t after = openfw_rtos_heap_free();
         report(T_REAP, g_reap_ran == 20 && after + 64u >= before, before - after);
+    }
+    /* T_BTDATA: BT=1 images keep Bluedroid/port/libc initialised data in .bt_data (RTOS region), copied by
+     * startup.c. g_bt_data_canary (bt_port_fw_stubs.c, libbt_port.a) must lie inside .bt_data and hold its
+     * initialiser. Trivially passes in non-BT images. */
+    {
+#if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID
+        extern uint32_t _sbt_data, _ebt_data;
+        extern volatile uint32_t g_bt_data_canary;
+        uintptr_t a = (uintptr_t)&g_bt_data_canary;
+        int ok = a >= (uintptr_t)&_sbt_data && a < (uintptr_t)&_ebt_data && g_bt_data_canary == 0xB7DA7A11u;
+        report(T_BTDATA, ok, (uint32_t)((uintptr_t)&_ebt_data - (uintptr_t)&_sbt_data));
+#else
+        report(T_BTDATA, 1, 0u);
+#endif
     }
     /* T_STACK: this task's high-water mark is sane (not overflowed, not untouched) */
     {

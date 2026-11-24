@@ -24,13 +24,18 @@ else
 BUILD_DIR ?= /tmp/sl6801_openfw
 endif
 
+# BT=1: Bluedroid host stack (docs/BLUETOOTH_BLUEDROID_PLAN.md); implies RTOS=1. Default 0 until parity.
+BT ?= 0
+ifeq ($(BT),1)
+override RTOS := 1
+endif
 # RTOS=1: run the app as a FreeRTOS task (prerequisite for Bluedroid). Default 0 until validated.
 RTOS ?= 0
 RTOS_SELFTEST ?= 0
 FREERTOS_DIR := third_party/freertos
 ifeq ($(RTOS),1)
 RTOS_INC   := -Isrc/rtos -Isrc/rtos/shim -I$(FREERTOS_DIR)/include -I$(FREERTOS_DIR)/portable/GCC/ARM_CM4F
-RTOS_DEFS  := -DOPENFW_RTOS=1 -DOPENFW_RTOS_SELFTEST=$(RTOS_SELFTEST)
+RTOS_DEFS  := -DOPENFW_RTOS=1 -DOPENFW_RTOS_SELFTEST=$(RTOS_SELFTEST) -DOPENFW_BT_BLUEDROID=$(BT)
 else
 RTOS_INC   :=
 RTOS_DEFS  := -DOPENFW_RTOS=0
@@ -102,7 +107,10 @@ OBJS      := $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(SRCS))
 RTOS_SRCS := $(FREERTOS_DIR)/tasks.c $(FREERTOS_DIR)/queue.c $(FREERTOS_DIR)/list.c \
              $(FREERTOS_DIR)/timers.c $(FREERTOS_DIR)/event_groups.c $(FREERTOS_DIR)/stream_buffer.c \
              $(FREERTOS_DIR)/portable/GCC/ARM_CM4F/port.c $(FREERTOS_DIR)/portable/MemMang/heap_5.c \
-             src/rtos/rtos_port.c src/rtos/libc_min.c
+             src/rtos/rtos_port.c
+ifneq ($(BT),1)
+RTOS_SRCS += src/rtos/libc_min.c   # BT=1 links picolibc instead
+endif
 RTOS_OBJS := $(patsubst %.c,$(BUILD_DIR)/rtos/%.o,$(RTOS_SRCS))
 ifeq ($(RTOS_SELFTEST),1)
 RTOS_OBJS += $(BUILD_DIR)/rtos/src/rtos/rtos_selftest.o
@@ -113,13 +121,15 @@ else
 ARM_OBJS  := $(OBJS)
 endif
 
+include bt/firmware.mk
+
 SPLASH_PNG  := ../assets/cassini_welcome_80x40.png
 SPLASH_HDR  := $(BUILD_DIR)/cassini_splash.h
 STOCK_DUMP  := ../dumps/firmware_2M.bin
 OUT_BIN     := ../dumps/firmware_2M_openfw.bin
 OUT_UP      := ../dumps/update_openfw.up
 
-.PHONY: all test-host test-host-san test-qemu test-qemu-rtos qemu-stub update-up wasm clean force-config fetch-lvgl
+.PHONY: all test-host test-host-san test-qemu test-qemu-rtos test-qemu-bt qemu-stub update-up wasm clean force-config fetch-lvgl
 
 CONFIG_STAMP := $(BUILD_DIR)/.config
 
@@ -167,9 +177,12 @@ $(BUILD_DIR)/rtos/%.o: %.c $(CONFIG_STAMP) src/rtos/FreeRTOSConfig.h include/ope
 	@mkdir -p $(dir $@)
 	$(CLANG) $(filter-out -Wextra,$(CFLAGS)) -Wno-unused-parameter -c $< -o $@
 
-$(BUILD_DIR)/open_fw.elf: $(ARM_OBJS) $(BUILD_DIR)/liblvgl.a sl6801_firm.ld
+$(BUILD_DIR)/open_fw.elf: $(ARM_OBJS) $(BUILD_DIR)/liblvgl.a $(BT_FW_INPUTS) sl6801_firm.ld
 	@test -n "$(LLD)" || (echo "Error: ld.lld not found (set LLD=/path/to/ld.lld)" >&2; exit 1)
-	$(LLD) --gc-sections -T sl6801_firm.ld $(ARM_OBJS) $(BUILD_DIR)/liblvgl.a -o $@
+	$(LLD) --gc-sections -T sl6801_firm.ld $(ARM_OBJS) $(BUILD_DIR)/liblvgl.a $(BT_FW_INPUTS) -o $@
+ifeq ($(BT),1)
+	tools/check_bt_link_roots.sh $@ bt/bt_link_roots.c
+endif
 
 $(BUILD_DIR)/ram_boot.bin: $(BUILD_DIR)/open_fw.elf
 	@test -n "$(OBJCOPY)" || (echo "Error: llvm-objcopy not found (set OBJCOPY=/path/to/llvm-objcopy)" >&2; exit 1)
@@ -177,7 +190,7 @@ $(BUILD_DIR)/ram_boot.bin: $(BUILD_DIR)/open_fw.elf
 
 $(BUILD_DIR)/xip.bin: $(BUILD_DIR)/open_fw.elf
 	@test -n "$(OBJCOPY)" || (echo "Error: llvm-objcopy not found (set OBJCOPY=/path/to/llvm-objcopy)" >&2; exit 1)
-	$(OBJCOPY) -O binary -j .text -j .data $< $@
+	$(OBJCOPY) -O binary -j .text -j .data -j .bt_data $< $@
 
 $(BUILD_DIR)/open_fw_firm.bin: $(BUILD_DIR)/ram_boot.bin $(BUILD_DIR)/xip.bin tools/pack_firm.py
 	python3 tools/pack_firm.py --ram-boot $(BUILD_DIR)/ram_boot.bin --xip $(BUILD_DIR)/xip.bin --out-firm $@
@@ -248,6 +261,13 @@ test-qemu-rtos:
 	$(MAKE) update-up qemu-stub RTOS=1 RTOS_SELFTEST=1 BUILD_DIR=$(RTOS_QEMU_DIR)
 	python3 tools/run_qemu.py --elf $(RTOS_QEMU_DIR)/open_fw.elf --stub $(RTOS_QEMU_DIR)/qemu_boot_stub.bin \
 		--flash $(OUT_BIN) --skip-keys --png-out $(RTOS_QEMU_DIR)/qemu_lcd.png
+
+# Same gate for the BT=1 image (Bluedroid linked, not started yet: plan step 1).
+BT_QEMU_DIR ?= /tmp/sl6801_openfw_bt_selftest
+test-qemu-bt:
+	$(MAKE) update-up qemu-stub BT=1 RTOS_SELFTEST=1 BUILD_DIR=$(BT_QEMU_DIR)
+	python3 tools/run_qemu.py --elf $(BT_QEMU_DIR)/open_fw.elf --stub $(BT_QEMU_DIR)/qemu_boot_stub.bin \
+		--flash $(OUT_BIN) --skip-keys --png-out $(BT_QEMU_DIR)/qemu_lcd.png
 
 WASM_BUILD_DIR := $(BUILD_DIR)_wasm
 WASM_OUT       := ../web_emu/openfw.wasm

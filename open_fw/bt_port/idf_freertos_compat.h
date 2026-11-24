@@ -8,7 +8,9 @@
 #include <queue.h>
 #include <semphr.h>
 
+#ifndef tskNO_AFFINITY /* FreeRTOS V11 task.h defines it; the value is ignored on single-core builds */
 #define tskNO_AFFINITY 0x7FFFFFFF
+#endif
 #define portNUM_PROCESSORS 1
 #define ESP_STATIC_ANALYZER_CHECK(cond, ret) ((void)0)
 

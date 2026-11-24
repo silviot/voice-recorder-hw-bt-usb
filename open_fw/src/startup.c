@@ -344,6 +344,22 @@ static uint8_t xip_enable_best(uint32_t pll_hz)
     return OPENFW_XIP_MODE_1WIRE_24M;
 }
 
+#if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID
+/* Bluedroid/port/libc static data lives in the RTOS region (sl6801_firm.ld .bt_data/.bt_bss). Runs from XIP,
+ * after xip_enable_best() and the .data copy in reset_c_entry(). */
+__attribute__((noinline)) static void bt_static_init(void)
+{
+    extern uint32_t _sibt_data, _sbt_data, _ebt_data, _sbt_bss, _ebt_bss;
+    const volatile uint32_t *src = &_sibt_data;
+    for (volatile uint32_t *dst = &_sbt_data; dst < &_ebt_data; dst++, src++) {
+        *dst = *src;
+    }
+    for (volatile uint32_t *dst = &_sbt_bss; dst < &_ebt_bss; dst++) {
+        *dst = 0u;
+    }
+}
+#endif
+
 __attribute__((section(".ramtext"), used, noreturn))
 void reset_c_entry(void)
 {
@@ -372,6 +388,9 @@ void reset_c_entry(void)
     for (volatile uint32_t *dst = &_sbss_hi; dst < &_ebss_hi; dst++) {
         *dst = 0u;
     }
+#if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID
+    bt_static_init(); /* XIP code (XIP is mapped above); keeps .ram_boot small */
+#endif
 
     g_openfw_xip_mode = xip_mode;
 

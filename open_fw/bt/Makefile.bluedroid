@@ -1,6 +1,7 @@
-# Self-contained build of Bluedroid (Classic only) for size measurement / future integration.
-# NOT included from open_fw/Makefile yet.
+# Self-contained build of Bluedroid (Classic only). Used by the firmware build (BT=1, via bt/firmware.mk ->
+# target `fw`) and for size measurement.
 #
+#   make -f bt/Makefile.bluedroid fw ...         # libbluedroid.a + libbt_port.a + bt_link_roots.o (firmware link)
 #   make -f bt/Makefile.bluedroid [PICOLIBC=/path/to/picolibc-install] [BT_LOGS=0|1]
 #   make -f bt/Makefile.bluedroid syntax     # compile-check only (-fsyntax-only)
 #   make -f bt/Makefile.bluedroid size       # per-directory size report (see tools/measure_bluedroid.sh)
@@ -35,11 +36,27 @@ CFLAGS    := $(CPU_FLAGS) -Os -std=gnu11 -ffunction-sections -fdata-sections -fn
              -Wno-address-of-packed-member -Wno-implicit-fallthrough -Wno-unused-const-variable \
              -Wno-pointer-sign -Wno-unterminated-string-initialization -Wno-missing-braces \
              -Wno-sometimes-uninitialized -Wno-unused-label -Wno-absolute-value -Wno-parentheses \
+             -Wno-gnu-variable-sized-type-not-at-end \
              -DESP_PLATFORM=1 -D__ESP_ATTR_H__ -DOPENFW_BLUEDROID=1 -DBT_LOGS=$(BT_LOGS) \
              -include $(ROOT)/bt_port/bt_port_prefix.h $(INCS)
 
-.PHONY: all syntax clean size
+.PHONY: all syntax clean size fw
 all: $(BUILD_DIR)/bluedroid.a
+
+# ---- firmware link inputs (BT=1) ---------------------------------------------------------------
+# Archive names matter: sl6801_firm.ld routes *libbluedroid.a: / *libbt_port.a: .data/.bss into .bt_data/.bt_bss.
+FW_PORT_SRCS := $(ROOT)/bt_port/bt_port_fw_stubs.c
+FW_PORT_OBJS := $(patsubst $(ROOT)/%.c,$(BUILD_DIR)/%.o,$(FW_PORT_SRCS))
+fw: $(BUILD_DIR)/libbluedroid.a $(BUILD_DIR)/libbt_port.a $(BUILD_DIR)/bt_link_roots.o
+$(BUILD_DIR)/libbluedroid.a: $(OBJS)
+	@rm -f $@
+	$(AR) rcs $@ $^
+$(BUILD_DIR)/libbt_port.a: $(FW_PORT_OBJS)
+	@rm -f $@
+	$(AR) rcs $@ $^
+$(BUILD_DIR)/bt_link_roots.o: $(ROOT)/bt/bt_link_roots.c
+	@mkdir -p $(dir $@)
+	$(CLANG) $(CFLAGS) -c $< -o $@
 syntax: $(OBJS:.o=.syn)
 
 $(BUILD_DIR)/%.syn: $(ROOT)/%.c

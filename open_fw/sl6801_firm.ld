@@ -58,6 +58,8 @@ SECTIONS
         ) .text .text.*)
         *(.rodata .rodata.*)
         . = ALIGN(4);
+        KEEP(*(.bt_link_roots))   /* BT=1 only: roots Bluedroid entry points against --gc-sections */
+        . = ALIGN(4);
     } > XIP
 
     .data : ALIGN(4) {
@@ -77,7 +79,8 @@ SECTIONS
         *lv_style.o(.text .text.*)
         *lv_tlsf.o(.text .text.*)
         . = ALIGN(4);
-        *(.data .data.*)
+        /* BT=1: Bluedroid/port/libc initialised data goes to .bt_data instead (main SRAM is nearly full) */
+        *(EXCLUDE_FILE(*libbluedroid.a:* *libbt_port.a:* *libc.a:* *libclang_rt_min.a:*) .data .data.*)
         . = ALIGN(4);
         _edata = .;
     } > SRAM AT > XIP
@@ -86,7 +89,7 @@ SECTIONS
 
     .bss (NOLOAD) : ALIGN(4) {
         _sbss = .;
-        *(.bss .bss.* COMMON)
+        *(EXCLUDE_FILE(*libbluedroid.a:* *libbt_port.a:* *libc.a:* *libclang_rt_min.a:*) .bss .bss.* COMMON)
         . = ALIGN(4);
         _ebss = .;
     } > SRAM
@@ -118,6 +121,31 @@ SECTIONS
         _ertos_static = .;
     } > RTOS_HEAP
 
+    /* BT=1 only (empty otherwise): Bluedroid + port + picolibc static data, placed at the start of the RTOS
+     * region (plan §4). .bt_data is loadable (LMA in XIP after .data) and copied by startup.c; .bt_bss is
+     * zeroed by startup.c. The section order here is the VMA order inside RTOS_HEAP. */
+    .bt_data : ALIGN(8) {
+        _sbt_data = .;
+        *libbluedroid.a:*(.data .data.*)
+        *libbt_port.a:*(.data .data.*)
+        *libc.a:*(.data .data.*)
+        *libclang_rt_min.a:*(.data .data.*)
+        . = ALIGN(4);
+        _ebt_data = .;
+    } > RTOS_HEAP AT > XIP
+
+    _sibt_data = LOADADDR(.bt_data);
+
+    .bt_bss (NOLOAD) : ALIGN(8) {
+        _sbt_bss = .;
+        *libbluedroid.a:*(.bss .bss.* COMMON)
+        *libbt_port.a:*(.bss .bss.* COMMON)
+        *libc.a:*(.bss .bss.* COMMON)
+        *libclang_rt_min.a:*(.bss .bss.* COMMON)
+        . = ALIGN(4);
+        _ebt_bss = .;
+    } > RTOS_HEAP
+
     .rtos_heap (NOLOAD) : ALIGN(8) {
         _srtos_heap0 = .;
         . = ORIGIN(RTOS_HEAP) + LENGTH(RTOS_HEAP);
@@ -126,6 +154,9 @@ SECTIONS
 
     ASSERT(_ertos_heap0 == ORIGIN(RTOS_HEAP) + LENGTH(RTOS_HEAP), ".rtos_heap must end at the RTOS_HEAP region end")
     ASSERT(_srtos_heap0 >= _ertos_static, ".rtos_heap overlaps .rtos_static")
+    ASSERT(_srtos_heap0 >= _ebt_bss, ".rtos_heap overlaps .bt_bss")
+    ASSERT(_sbt_bss >= _ebt_data && _sbt_data >= _ertos_static, "RTOS_HEAP static sections overlap")
+    ASSERT(_ertos_heap0 - _srtos_heap0 >= 0x8000, "heap_5 region below 32 KiB after BT static data")
 
     /DISCARD/ : {
         *(.ARM.exidx* .ARM.extab* .comment .note*)
