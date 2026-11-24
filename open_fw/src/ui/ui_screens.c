@@ -1471,6 +1471,10 @@ static enum ScreensEnum nav_family(enum ScreensEnum id)
     }
 }
 
+_Static_assert(UI_NAV_FORWARD == UI_TRANSITION_FORWARD && UI_NAV_BACK == UI_TRANSITION_BACK,
+               "UI_NAV_* must match ui_transition_t");
+static uint8_t s_nav_seq_seen;
+
 static ui_transition_t nav_transition(enum ScreensEnum from, enum ScreensEnum to)
 {
     int d_from = nav_depth(from);
@@ -1493,7 +1497,16 @@ void ui_render_screen_sync(ui_screen_id_t scr, const ui_model_t *m)
 
     enum ScreensEnum target = map_eez_screen(scr, m);
     bool entering = target != s_active_eez_scr;
-    if (entering) {
+    /* A new nav_seq (folder enter/leave) pushes even within one page family;
+     * plain refreshes, cursor moves and reloads keep nav_seq and never animate. */
+    bool nav = m->nav_seq != s_nav_seq_seen;
+    s_nav_seq_seen = m->nav_seq;
+    if (nav && (m->nav_dir == UI_NAV_FORWARD || m->nav_dir == UI_NAV_BACK) &&
+        (!entering || nav_family(s_active_eez_scr) == nav_family(target))) {
+        ui_transition((ui_transition_t)m->nav_dir);
+        /* Force a flush even if nothing changed, so the push starts now. */
+        if (!entering && lv_screen_active()) lv_obj_invalidate(lv_screen_active());
+    } else if (entering) {
         ui_transition(nav_transition(s_active_eez_scr, target));
     }
     loadScreen(target);

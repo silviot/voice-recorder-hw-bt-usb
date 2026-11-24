@@ -2520,6 +2520,7 @@ int openfw_main(void)
                                 g_ui.file_sel    = g_root_file_sel;
                                 g_ui.file_scroll = g_root_file_scroll;
                                 reload_files_and_sd_stats();
+                                ui_model_nav(&g_ui, UI_NAV_BACK);
                             } else {
                                 scr         = UI_SCR_HOME;
                                 g_ui_screen = (uint32_t)scr;
@@ -2571,6 +2572,7 @@ int openfw_main(void)
                                 g_ui.file_scroll = 0;
                                 reload_files_and_sd_stats();
                                 apm_focus_on_enter();
+                                ui_model_nav(&g_ui, UI_NAV_FORWARD);
                                 dirty = 1;
                             } else {
                                 play_file_at_index(g_ui.file_sel);

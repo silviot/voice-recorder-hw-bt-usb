@@ -808,6 +808,105 @@ int main(int argc, char **argv)
         assert(memcmp(g_fb, g_shots[incoming], sizeof(g_fb)) == 0);
     }
 
+    /* Folder navigation inside Files: enter = FORWARD, leave = BACK, driven by
+     * ui_model_nav(); cursor moves, reloads and refreshes must not animate. */
+    {
+        static uint16_t root_shot[80][160], sub_shot[80][160];
+        static ui_file_entry_t sub_files[2];
+        memset(sub_files, 0, sizeof(sub_files));
+        strcpy(sub_files[0].filename, "Chapter 01.mp3");
+        sub_files[0].dt = m.now;
+        sub_files[0].duration_sec = 1834;
+        sub_files[0].channels = 2;
+        strcpy(sub_files[1].filename, "Chapter 02.mp3");
+        sub_files[1].dt = m.now;
+        sub_files[1].duration_sec = 2101;
+        sub_files[1].channels = 2;
+        ui_model_t root = m, sub = m;
+        sub.files = sub_files;
+        sub.file_count = 2;
+        sub.file_sel = 0;
+        sub.file_scroll = 0;
+        strcpy(sub.files_title, "Audiobook");
+
+        /* Reference frames, switched without navigation (no push). */
+        ui_render_screen(UI_SCR_FILES, &root);
+        s_now += 300u;
+        ui_port_task_handler();
+        unsigned ssa0 = g_ssa_writes;
+        memcpy(root_shot, g_fb, sizeof(g_fb));
+        ui_render_screen(UI_SCR_FILES, &sub);
+        s_now += 300u;
+        ui_port_task_handler();
+        memcpy(sub_shot, g_fb, sizeof(g_fb));
+        ui_render_screen(UI_SCR_FILES, &root);
+        s_now += 300u;
+        ui_port_task_handler();
+        assert(g_ssa_writes == ssa0 && !ui_transition_busy());
+        assert(memcmp(g_fb, root_shot, sizeof(g_fb)) == 0);
+        assert(memcmp(root_shot, sub_shot, sizeof(g_fb)) != 0);
+
+        for (int enter = 1; enter >= 0; enter--) {
+            ui_model_t *to = enter ? &sub : &root;
+            to->nav_seq = root.nav_seq;
+            ui_model_nav(to, enter ? UI_NAV_FORWARD : UI_NAV_BACK);
+            root.nav_seq = sub.nav_seq = to->nav_seq;
+            g_tr_old  = enter ? root_shot : sub_shot;
+            g_tr_new  = enter ? sub_shot : root_shot;
+            g_tr_back = !enter;
+            g_tr_d    = 0;
+            g_ssa_hook = tr_check_hook;
+            unsigned w0 = g_ssa_writes;
+            ui_render_screen(UI_SCR_FILES, to);
+            assert(ui_transition_busy());
+            /* A live refresh mid-push (same nav_seq) must not restart it. */
+            s_now += 30u;
+            ui_port_task_handler();
+            ui_render_screen(UI_SCR_FILES, to);
+            for (int i = 0; i < 200; i++) {
+                s_now += 1u;
+                ui_port_task_handler();
+            }
+            g_ssa_hook = NULL;
+            assert(!ui_transition_busy() && g_ssa == 0u && g_tr_d == 162);
+            assert(g_ssa_writes - w0 == 81u);
+            assert(memcmp(g_fb, enter ? sub_shot : root_shot, sizeof(g_fb)) == 0);
+        }
+
+        /* Cursor move and same-folder reload after navigation: no push. */
+        unsigned w1 = g_ssa_writes;
+        root.file_sel = 1;
+        ui_render_screen(UI_SCR_FILES, &root);
+        ui_render_screen(UI_SCR_FILES, &root);
+        s_now += 300u;
+        ui_port_task_handler();
+        root.file_sel = 0;
+        ui_render_screen(UI_SCR_FILES, &root);
+        s_now += 300u;
+        ui_port_task_handler();
+        assert(g_ssa_writes == w1 && !ui_transition_busy());
+        assert(memcmp(g_fb, root_shot, sizeof(g_fb)) == 0);
+        m.nav_seq = root.nav_seq;
+
+        /* Entering an empty folder (Files -> empty-Files page) also pushes. */
+        ui_model_t empty = root;
+        empty.files = NULL;
+        empty.file_count = 0;
+        ui_model_nav(&empty, UI_NAV_FORWARD);
+        w1 = g_ssa_writes;
+        ui_render_screen(UI_SCR_FILES, &empty);
+        assert(ui_transition_busy());
+        s_now += 300u;
+        ui_port_task_handler();
+        assert(!ui_transition_busy() && g_ssa_writes - w1 == 81u);
+        ui_model_nav(&root, UI_NAV_BACK);
+        ui_render_screen(UI_SCR_FILES, &root);
+        s_now += 300u;
+        ui_port_task_handler();
+        assert(memcmp(g_fb, root_shot, sizeof(g_fb)) == 0);
+        m.nav_seq = root.nav_seq;
+    }
+
     /* Measure worst-case two-screen peak heap during HOME <-> REC transition */
     ui_render_screen(UI_SCR_HOME, &m);
     ui_render_screen(UI_SCR_REC, &m);
