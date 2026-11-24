@@ -196,6 +196,33 @@ burst. The fault-6 site was not logged (10 raise sites, no sub-code) — the fix
 (step 6) could not be run because BT was already down. Bonds from this run are bench-only (laptop `remove`,
 `SD:/bt_bonds.bin`).
 
+**Diagnosis (host, `ac4a61e`):** the ROM's `0C1A` handler refuses page-scan values (2/3) with `0x0C` while it counts
+more than one ACL link; the dead link plus the laptop's re-page made two, so the reopened window's `0C1A 03` came back
+`0x0C` and `bt_ctrl` treated that class-M failure as INVARIANT (site 4). Now passed to the host and retried every 3 s
+(fail-closed: scan off if a non-discoverable write is refused). Also patch 0028: the NC value was read before BTA set
+it (logged/displayed 0 or a stale value).
+
+## Session 5 (2026-11-24): phone mode re-run on `ac4a61e` — no fault, self-heals, exit with link up OK
+
+Bench images `ac4a61e` (run 2, `secs=360 pair_every=60`) and `ac4a61e` + the `BT ROM links` flap filter (run 3,
+`secs=200`). Laptop again streaming A2DP to a speaker.
+
+| Item | Result |
+|---|---|
+| SSP NC | runs 2/3: laptop `445414` / `960773`, device logs the **same** value (patch 0028 confirmed) |
+| Entropy / key | `(0:1031 1:1029 2:1015 3:1021) peak 152` / `(0:1042 1:1006 2:1046 3:1002) peak 137`, both `ok` in 419 ms; fresh public X each run (`BA2657F2…`, `84E270A6…`); `nonces 2 ... starved 0` |
+| XREC | PAIR, AUTH, LS, GETS 581,676 B byte-identical across runs; 22.9 KB/s (run 2), 32.3 KB/s (run 3) |
+| Stale link after an idle drop (run 2) | reproduced once: laptop Disconnect 22:38:28.9 → pages refused (`0x0F` / `Host is down` / timeout) until ~22:39:09, then every reconnect works. **No fault**; `fwd_to=1 late_reply=1` (one forwarded command answered late after the 7 s deadline), `scan_refused=0`. ~40 s self-heal |
+| Detach handling (run 3) | 12 laptop-initiated idle drops, each logged `BT HCI disconnection complete h=0x0080 st=0x00 reason=0x13` and followed by a clean `connection request/complete`; `fwd_to=0`, no fault. The stale link did not reproduce (2 of 3 runs so far, one occurrence each) |
+| Exit with a link up (run 2) | RFCOMM socket held open over `secs`: `BENCH exit` → `BENCH end` in **0.74 s**, laptop saw `Connection reset by peer`, no reboot, no fault record |
+| Memory | heap free min 61,608 B, `mallocfail 0`; lowest stack headroom bt_dlv 313 words, hciT 425 words |
+| ROM link bytes | LC state per slot: `00` free ↔ `03` scanning (flaps at the scan rate — filtered for logging after run 2 flooded the 8 KiB bench log, `lost=60858`), `0A`/`62`/`29`/`3A`/`82` connection setup, `6A` pairing, `05` connected, `26` during L2CAP/RFCOMM teardown; LD `01` connected, `FF` free; `rep` `01` while a link exists |
+
+Open: why the ROM sometimes keeps a dead link for ~40 s after a remote detach (H1/H2 in `docs/BT_ROM_HCI_MAP.md` §11).
+The next occurrence on a filtered-log bench image will show the LC/LD bytes and which command hit `fwd_to`.
+Not yet on silicon: the on-device confirm prompt (needs a person: ENTER/BACK), the mismatched-public-key image
+(step 6b), Just Works refusal, the peer-gone exit, NIST entropy runs.
+
 ## Exp 1 stages A and B: how to run
 
 Probe image for plan M5 Exp 1 stage A and stage B (step 4): `bt_ctrl` (plan M1) drives the real RW-BT ROM through

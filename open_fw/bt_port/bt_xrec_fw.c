@@ -139,7 +139,18 @@ static void rom_links_log(int force)
 {
     uint8_t v[3u * BT_ROM_REAL_LINKS];
     bt_rom_real_links(&v[0], &v[BT_ROM_REAL_LINKS], &v[2u * BT_ROM_REAL_LINKS]);
-    if (!force && memcmp(v, s_links_last, 2u * BT_ROM_REAL_LINKS) == 0) {
+    /* Silicon session 5: a free LC slot flaps 0x00 <-> 0x03 with every page/inquiry-scan window (several Hz), which
+     * flooded the 8 KiB bench log (lost=60858). Treat 0x00 and 0x03 as one state for the change test. */
+    int changed = force;
+    for (uint32_t i = 0u; !changed && i < 2u * BT_ROM_REAL_LINKS; i++) {
+        uint8_t a = v[i], b = s_links_last[i];
+        if (i < BT_ROM_REAL_LINKS) {
+            a = (a == 0x03u) ? 0x00u : a;
+            b = (b == 0x03u) ? 0x00u : b;
+        }
+        changed = (a != b);
+    }
+    if (!changed) {
         return;
     }
     memcpy(s_links_last, v, sizeof(v));
