@@ -159,7 +159,7 @@ void lcd_shutdown(void)
 
 uint64_t lcd_init_begin(void)
 {
-    /* Release LCDC reset & clock at 24 MHz HOSC (10.6 ms full-screen, ~1.1 ms per reveal slice) */
+    /* Release LCDC reset & clock at 24 MHz HOSC (10.6 ms full-screen, ~0.15 ms per 2-column push step) */
     if (!rom_rst_is_released(CRU_RST_LCDC)) {
         rom_rst_release(CRU_RST_LCDC);
     }
@@ -297,6 +297,41 @@ void lcd_set_rotation(int landscape)
         g_lcd_x_off = 26u;
         g_lcd_y_off = 1u; /* 162-row GRAM -> 1 px margin on top/bottom */
     }
+}
+
+/*
+ * Landscape horizontal hardware scroll (ST7735S VSCRDEF 33h / VSCSAD 37h).
+ *
+ * The ST7735S "vertical" scroll rotates the 162 gate lines of GRAM. With
+ * MADCTL MV=1 those gate lines are addressed by CASET, i.e. they run along the
+ * landscape X axis: column address a = x + 1 holds logical column x, and the
+ * two addresses 0 and 161 are hidden margin lines (cleared at init).
+ *
+ * lcd_hscroll_set(off) makes screen column x show address (x + 1 + off) % 162,
+ * so increasing off moves the picture left. MADCTL MY=1 reverses gate order
+ * relative to CASET, so the controller start address is 162 - off.
+ * Build with -DLCD_HSCROLL_SSA_INVERT=0 if a panel scrolls the other way.
+ */
+#ifndef LCD_HSCROLL_SSA_INVERT
+#define LCD_HSCROLL_SSA_INVERT 1
+#endif
+
+void lcd_hscroll_set(uint16_t offset)
+{
+    static uint8_t s_defined;
+    offset = (uint16_t)(offset % LCD_HSCROLL_LINES);
+    if (!s_defined) {
+        s_defined = 1u;
+        st7735s_write_cmd(0x33u); /* VSCRDEF: TFA=0, VSA=162, BFA=0 */
+        st7735s_write_data(pack_be16_pair(0u, LCD_HSCROLL_LINES), 4u);
+        st7735s_write_data(pack_be16_pair(0u, 0u) & 0xFFFFu, 2u);
+    }
+    uint16_t ssa = offset;
+    if (LCD_HSCROLL_SSA_INVERT && ssa != 0u) {
+        ssa = (uint16_t)(LCD_HSCROLL_LINES - ssa);
+    }
+    st7735s_write_cmd(0x37u); /* VSCSAD */
+    st7735s_write_data(pack_be16_pair(ssa, 0u) & 0xFFFFu, 2u);
 }
 
 uint16_t lcd_get_width(void)

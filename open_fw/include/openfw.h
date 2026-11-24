@@ -222,6 +222,9 @@ void     lcd_draw_char_2x(uint16_t x, uint16_t y, char c, uint16_t fg, uint16_t 
 void     lcd_draw_str_2x(uint16_t x, uint16_t y, const char *s, uint16_t fg, uint16_t bg);
 void     lcd_draw_u32(uint16_t x, uint16_t y, uint32_t v, uint16_t fg, uint16_t bg);
 void     lcd_draw_hex(uint16_t x, uint16_t y, uint32_t v, uint8_t digits, uint16_t fg, uint16_t bg);
+/* Landscape hardware scroll ring: 160 visible columns + 2 hidden GRAM lines. */
+#define LCD_HSCROLL_LINES 162u
+void     lcd_hscroll_set(uint16_t offset);
 
 /* 1-Bit SDIO / microSD Block Driver (sdio.c) */
 typedef struct {

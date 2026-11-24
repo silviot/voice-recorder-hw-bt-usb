@@ -18,7 +18,7 @@ The core recorder firmware is **working and verified on physical `HW_76` silicon
 | :--- | :---: | :--- |
 | **Dual-Mic Audio Recording & DSP** | Working | Instant `PB6` slide-switch capture to exFAT WAV, `AMIC1 + AMIC2` stereo/mono, clean-room `Voice Clarity` / `ASR Raw` / `Bypass` DSP, optional VOR (200 ms pre-roll + 500 ms hangover), live 128-pt FFT Mel spectrogram + markers |
 | **Audio Playback & Transcripts** | Working | On-device WAV (PCM & IMA-ADPCM) playback with 32-step log-dB volume, automatic speaker (`PB30` PA) / 3.5 mm headphone (`PB11`) switching, audible pitch-preserving `2×–5×` hold-scrubbing, and synced `.cwx` word-level captions |
-| **Dual-Core LVGL v9.2.2 UI** | Working | Dedicated **CPU1 (96 MHz)** UI worker with IPC Mailbox `WFE` sleep, 4-bit anti-aliased Noto Sans fonts, EEZ Studio screens, smooth strip reveals, and `289 ms` cold boot |
+| **Dual-Core LVGL v9.2.2 UI** | Working | Dedicated **CPU1 (96 MHz)** UI worker with IPC Mailbox `WFE` sleep, 4-bit anti-aliased Noto Sans fonts, EEZ Studio screens, hardware-scroll screen push transitions, and `289 ms` cold boot |
 | **Crash-Safe exFAT Storage** | Working | 1-bit SDIO (`CMD18`/`CMD25` bursts + fallback), periodic WAV checkpointing, atomic staged file replace, `fsck.exfat`-clean |
 | **USB-C Drive Mode & Telemetry** | Working | Clean-room Mentor MUSB USB Mass Storage (`1209:0001`, `~810 KB/s` via EP2 `2 KiB` FIFO, no Linux disconnect loop) + vendor SCSI `0xE0` live log, RTC sync & SRAM experiment runner |
 | **Bluetooth Connectivity (`+XREC v5`)** | **Next Milestone** | Clean-room RF/VCO/BPF calibration, `RW-BT` HCI controller glue, SPP framing, and `+XREC v5` protocol are written and unit-tested; end-to-end on-device BT pairing & sync soak is the next active work item |
