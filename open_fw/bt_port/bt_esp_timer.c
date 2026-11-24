@@ -15,8 +15,6 @@
 
 struct esp_timer {
     bt_alarm_t alarm;
-    esp_timer_cb_t cb;
-    void *arg;
     uint8_t in_use;
 };
 
@@ -27,12 +25,6 @@ void bt_esp_timer_init(bt_esp_timer_slot_lock_t lock)
 {
     s_lock = lock;
     memset(s_pool, 0, sizeof(s_pool)); /* zero before first bt_alarm_setup (bt_alarm.h contract) */
-}
-
-static void trampoline(void *p)
-{
-    struct esp_timer *t = (struct esp_timer *)p;
-    t->cb(t->arg);
 }
 
 esp_err_t esp_timer_create(const esp_timer_create_args_t *a, esp_timer_handle_t *h)
@@ -53,9 +45,9 @@ esp_err_t esp_timer_create(const esp_timer_create_args_t *a, esp_timer_handle_t 
     if (t == NULL) {
         return ESP_ERR_NO_MEM;
     }
-    t->cb = a->callback;
-    t->arg = a->arg;
-    bt_alarm_setup(&t->alarm, trampoline, t);
+    /* Register the caller's callback directly so bt_alarm_drain() snapshots (cb, arg) atomically under its
+     * critical section; a concurrent esp_timer_delete() preempting before invocation cannot zero cb/arg. */
+    bt_alarm_setup(&t->alarm, a->callback, a->arg);
     *h = t;
     return ESP_OK;
 }
@@ -67,19 +59,19 @@ static int valid(esp_timer_handle_t t)
 
 esp_err_t esp_timer_start_once(esp_timer_handle_t t, uint64_t us)
 {
-    if (!valid(t) || us > UINT32_MAX) {
+    if (!valid(t) || us > (uint64_t)INT64_MAX) {
         return ESP_ERR_INVALID_ARG;
     }
-    (void)bt_alarm_set(&t->alarm, (uint32_t)us, 0u);
+    (void)bt_alarm_set(&t->alarm, us, 0u);
     return ESP_OK;
 }
 
 esp_err_t esp_timer_start_periodic(esp_timer_handle_t t, uint64_t us)
 {
-    if (!valid(t) || us == 0u || us > UINT32_MAX) {
+    if (!valid(t) || us == 0u || us > (uint64_t)INT64_MAX) {
         return ESP_ERR_INVALID_ARG;
     }
-    (void)bt_alarm_set(&t->alarm, (uint32_t)us, (uint32_t)us);
+    (void)bt_alarm_set(&t->alarm, us, us);
     return ESP_OK;
 }
 
@@ -100,8 +92,6 @@ esp_err_t esp_timer_delete(esp_timer_handle_t t)
     }
     bt_alarm_free(&t->alarm);
     if (s_lock.enter) s_lock.enter();
-    t->cb = NULL;
-    t->arg = NULL;
     t->in_use = 0u;
     if (s_lock.exit) s_lock.exit();
     return ESP_OK;
@@ -119,7 +109,7 @@ int64_t esp_timer_get_time(void)
 
 int64_t esp_timer_get_expiry_time(esp_timer_handle_t t)
 {
-    return (valid(t) && bt_alarm_is_armed(&t->alarm)) ? (int64_t)t->alarm.deadline_us : 0;
+    return valid(t) ? (int64_t)bt_alarm_deadline_us(&t->alarm) : 0;
 }
 
 uint32_t bt_esp_timer_generation(esp_timer_handle_t t)

@@ -76,6 +76,12 @@ void bt_alarm_init(const bt_alarm_platform_t *platform)
     g.stats = (bt_alarm_stats_t){ 0 };
 }
 
+static uint32_t next_gen(uint32_t gen)
+{
+    gen++;
+    return gen == 0u ? 1u : gen;   /* 0 is reserved as the non-delivery / invalid sentinel */
+}
+
 void bt_alarm_setup(bt_alarm_t *a, bt_alarm_cb_t cb, void *arg)
 {
     g.p.enter();
@@ -88,7 +94,7 @@ void bt_alarm_setup(bt_alarm_t *a, bt_alarm_cb_t cb, void *arg)
     a->arg = arg;
     a->deadline_us = 0u;
     a->period_us = 0u;
-    a->generation = gen + 1u;
+    a->generation = next_gen(gen);
     a->stamp = 0u;
     a->coalesced = 0u;
     a->next_dl = a->next_pd = NULL;
@@ -98,15 +104,16 @@ void bt_alarm_setup(bt_alarm_t *a, bt_alarm_cb_t cb, void *arg)
     g.p.exit();
 }
 
-uint32_t bt_alarm_set(bt_alarm_t *a, uint32_t timeout_us, uint32_t period_us)
+uint32_t bt_alarm_set(bt_alarm_t *a, uint64_t timeout_us, uint64_t period_us)
 {
     g.p.enter();
     bt_alarm_t *old_first = g.deadlines;
     dl_remove(a);
     pd_remove(a);
-    a->generation++;
+    a->generation = next_gen(a->generation);
     a->period_us = period_us;
-    a->deadline_us = g.p.now_us() + timeout_us;
+    uint64_t now = g.p.now_us();
+    a->deadline_us = (timeout_us > UINT64_MAX - now) ? UINT64_MAX : (now + timeout_us);
     a->armed = 1u;
     dl_insert(a);
     uint32_t gen = a->generation;
@@ -124,7 +131,7 @@ uint32_t bt_alarm_cancel(bt_alarm_t *a)
     dl_remove(a);
     pd_remove(a);
     a->armed = 0u;
-    a->generation++;
+    a->generation = next_gen(a->generation);
     uint32_t gen = a->generation;
     g.p.exit();
     return gen;
@@ -136,7 +143,7 @@ void bt_alarm_free(bt_alarm_t *a)
     dl_remove(a);
     pd_remove(a);
     a->armed = 0u;
-    a->generation++;
+    a->generation = next_gen(a->generation);
     a->in_use = 0u;
     a->cb = NULL;
     a->arg = NULL;
@@ -151,6 +158,14 @@ bool bt_alarm_is_armed(const bt_alarm_t *a)
 uint32_t bt_alarm_generation(const bt_alarm_t *a)
 {
     return a->generation;
+}
+
+uint64_t bt_alarm_deadline_us(const bt_alarm_t *a)
+{
+    g.p.enter();
+    uint64_t d = a->armed ? a->deadline_us : 0u;
+    g.p.exit();
+    return d;
 }
 
 uint32_t bt_alarm_service(void)
@@ -171,11 +186,14 @@ uint32_t bt_alarm_service(void)
             pd_append(a);
         }
         if (a->period_us != 0u) {
-            uint64_t next = a->deadline_us + a->period_us;
-            while (next <= now) {     /* late: skip missed periods instead of bursting */
-                next += a->period_us;
-                a->coalesced++;
-                g.stats.coalesced++;
+            uint64_t next = (a->period_us > UINT64_MAX - a->deadline_us) ? UINT64_MAX : (a->deadline_us + a->period_us);
+            if (next <= now) {        /* late: skip missed periods in O(1) instead of bursting */
+                uint64_t skipped = (now - next) / a->period_us + 1u;
+                uint64_t adv = (skipped > (UINT64_MAX - next) / a->period_us) ? (UINT64_MAX - next) : (skipped * a->period_us);
+                next += adv;
+                uint32_t coal = skipped > UINT32_MAX ? UINT32_MAX : (uint32_t)skipped;
+                a->coalesced += coal;
+                g.stats.coalesced += coal;
             }
             a->deadline_us = next;
             dl_insert(a);
@@ -188,8 +206,9 @@ uint32_t bt_alarm_service(void)
         post = 1;
     }
     if (g.deadlines != NULL) {
-        uint64_t d = g.deadlines->deadline_us - now;
-        wait_us = d > UINT32_MAX ? UINT32_MAX : (uint32_t)d;
+        uint64_t d = g.deadlines->deadline_us > now ? (g.deadlines->deadline_us - now) : 0u;
+        /* Keep UINT32_MAX reserved for "no deadline" so wait_ticks() never sleeps forever when a >4295 s timer is due. */
+        wait_us = d >= UINT32_MAX ? (UINT32_MAX - 1u) : (uint32_t)d;
     }
     g.p.exit();
     if (post && g.p.post_drain() != 0) {

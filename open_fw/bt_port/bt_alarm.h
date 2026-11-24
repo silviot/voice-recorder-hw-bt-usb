@@ -28,7 +28,7 @@ typedef struct bt_alarm {
     bt_alarm_cb_t cb;
     void *arg;
     uint64_t deadline_us;
-    uint32_t period_us;        /* 0 = one-shot */
+    uint64_t period_us;        /* 0 = one-shot */
     uint32_t generation;       /* bumped by set / cancel / free; survives free */
     uint32_t stamp;            /* generation captured when the expiry moved to the pending list */
     uint32_t coalesced;        /* periodic expiries merged while one delivery was still pending */
@@ -61,7 +61,7 @@ void bt_alarm_init(const bt_alarm_platform_t *platform);
 void bt_alarm_setup(bt_alarm_t *a, bt_alarm_cb_t cb, void *arg);
 
 /* Arm (or re-arm) relative to now. period_us = 0 for one-shot. Returns the new generation. */
-uint32_t bt_alarm_set(bt_alarm_t *a, uint32_t timeout_us, uint32_t period_us);
+uint32_t bt_alarm_set(bt_alarm_t *a, uint64_t timeout_us, uint64_t period_us);
 
 /* Disarm; a pending (not yet delivered) expiry is discarded. Returns the new generation. */
 uint32_t bt_alarm_cancel(bt_alarm_t *a);
@@ -71,6 +71,7 @@ void bt_alarm_free(bt_alarm_t *a);
 
 bool bt_alarm_is_armed(const bt_alarm_t *a);
 uint32_t bt_alarm_generation(const bt_alarm_t *a);
+uint64_t bt_alarm_deadline_us(const bt_alarm_t *a);
 
 /* bt_alarm task: process due deadlines. Returns microseconds until the next deadline (UINT32_MAX if none). */
 uint32_t bt_alarm_service(void);

@@ -64,7 +64,8 @@ static TickType_t wait_ticks(uint32_t us)
     if (us == UINT32_MAX) {
         return portMAX_DELAY;
     }
-    TickType_t t = pdMS_TO_TICKS((us + 999u) / 1000u);
+    uint32_t ms = us / 1000u + ((us % 1000u) != 0u);
+    TickType_t t = pdMS_TO_TICKS(ms);
     return t == 0u ? 1u : t;
 }
 

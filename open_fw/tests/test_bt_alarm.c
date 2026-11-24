@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "bt_alarm.h"
+#include "bt_esp_timer.h"
 
 static int g_fail;
 #define CHECK(cond, ...) do { if (!(cond)) { g_fail++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
@@ -13,9 +14,18 @@ static int g_fail;
 /* ---- fake platform ---- */
 static uint64_t t_now;
 static int t_crit, t_crit_max, t_wakes, t_posts, t_post_fail;
+static void (*t_on_exit)(void);
 static uint64_t f_now(void) { return t_now; }
 static void f_enter(void) { t_crit++; if (t_crit > t_crit_max) t_crit_max = t_crit; }
-static void f_exit(void) { t_crit--; }
+static void f_exit(void)
+{
+    t_crit--;
+    if (t_crit == 0 && t_on_exit != NULL) {
+        void (*fn)(void) = t_on_exit;
+        t_on_exit = NULL;
+        fn();
+    }
+}
 static void f_wake(void) { t_wakes++; }
 static int f_post(void) { t_posts++; return t_post_fail ? -1 : 0; }
 static const bt_alarm_platform_t k_plat = { f_now, f_enter, f_exit, f_wake, f_post };
@@ -257,6 +267,81 @@ static void test_ordering_and_wake(void)
     CHECK(hits == 3, "not all due alarms delivered (%d)", hits);
 }
 
+static esp_timer_handle_t g_del_race_h;
+static int g_del_race_cb_hits, g_del_race_gen_matched, g_exits_left;
+static void del_on_drain_exit(void)
+{
+    /* Preempt BTC right after bt_alarm_drain() releases its critical section for the popped item. */
+    (void)esp_timer_delete(g_del_race_h);
+}
+static void step_exit_hook(void)
+{
+    if (--g_exits_left == 0) {
+        del_on_drain_exit();
+    } else {
+        t_on_exit = step_exit_hook;
+    }
+}
+static void del_race_cb(void *arg)
+{
+    int *cookie = (int *)arg;
+    if (cookie != NULL && *cookie == 0x55AA) {
+        g_del_race_cb_hits++;
+    }
+    if (bt_alarm_delivery_gen() == bt_esp_timer_generation(g_del_race_h)) {
+        g_del_race_gen_matched++;
+    }
+}
+
+static void test_esp_timer_delete_preempts_drain_and_64bit(void)
+{
+    reset();
+    bt_esp_timer_slot_lock_t lk = { f_enter, f_exit };
+    bt_esp_timer_init(lk);
+    int cookie = 0x55AA;
+    esp_timer_create_args_t args = {
+        .callback = del_race_cb,
+        .arg = &cookie,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "race",
+    };
+    CHECK(esp_timer_create(&args, &g_del_race_h) == ESP_OK, "esp_timer_create");
+    CHECK(esp_timer_start_once(g_del_race_h, 100u) == ESP_OK, "esp_timer_start_once");
+    t_now += 100u;
+    (void)bt_alarm_service();
+    /* bt_alarm_drain() does one enter/exit to clear drain_outstanding, then one enter/exit to pop the item. */
+    g_exits_left = 2;
+    t_on_exit = step_exit_hook;
+    g_del_race_cb_hits = 0;
+    g_del_race_gen_matched = 0;
+    bt_alarm_drain();
+    CHECK(g_del_race_cb_hits == 1, "esp_timer_delete preemption must not call NULL(NULL)");
+    CHECK(g_del_race_gen_matched == 0, "deleted esp_timer generation must not match delivery_gen");
+
+    /* 64-bit timeout > UINT32_MAX us (e.g. 5000 s L2CAP idle timer) and non-sentinel service wait */
+    esp_timer_handle_t h64 = NULL;
+    hits = 0;
+    esp_timer_create_args_t a64 = { .callback = cb_count, .arg = NULL, .dispatch_method = ESP_TIMER_TASK, .name = "t64" };
+    CHECK(esp_timer_create(&a64, &h64) == ESP_OK, "create 64-bit timer");
+    uint64_t five_thousand_s = 5000ULL * 1000000ULL;
+    CHECK(esp_timer_start_once(h64, five_thousand_s) == ESP_OK, "5000 s timeout rejected");
+    uint32_t w = bt_alarm_service();
+    CHECK(w == UINT32_MAX - 1u, "finite >UINT32_MAX deadline returned sentinel UINT32_MAX (%u)", w);
+    t_now += five_thousand_s;
+    CHECK(bt_alarm_service() == UINT32_MAX, "5000 s deadline should now be due");
+    bt_alarm_drain();
+    CHECK(hits == 1, "5000 s timer did not fire once (%d)", hits);
+    (void)esp_timer_delete(h64);
+
+    /* Generation wrap skips 0 sentinel */
+    static bt_alarm_t wrap_a;
+    memset(&wrap_a, 0, sizeof(wrap_a));
+    bt_alarm_setup(&wrap_a, cb_count, NULL);
+    wrap_a.generation = UINT32_MAX;
+    uint32_t wg = bt_alarm_set(&wrap_a, 10u, 0u);
+    CHECK(wg != 0u && bt_alarm_generation(&wrap_a) == wg, "generation wrapped to 0 sentinel");
+}
+
 int main(void)
 {
     test_one_shot();
@@ -266,6 +351,7 @@ int main(void)
     test_cancel_between_validation_and_lock();
     test_periodic();
     test_ordering_and_wake();
+    test_esp_timer_delete_preempts_drain_and_64bit();
     if (g_fail) {
         printf("test_bt_alarm: %d FAILURE(S)\n", g_fail);
         return 1;
