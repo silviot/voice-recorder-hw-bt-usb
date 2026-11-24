@@ -223,6 +223,24 @@ void btc_source_report_delay_value(UINT16 delay_value);
 *******************************************************************************/
 BOOLEAN btc_a2dp_source_enqueue_audio_frame(BT_HDR *p_buf);
 
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+/* open_fw patch 0034: ext-codec queue accounting (docs/BT_A2DP_DESIGN.md §4.4). Packet counts and SBC frame counts
+ * (number_frame of each buffer), cumulative and wrap-safe; qlen = packets in audio_tx_q now. */
+typedef struct {
+    uint32_t enq_pkts, enq_sbc;          /* accepted by btc_a2dp_source_enqueue_audio_frame (BTC) */
+    uint32_t deq_pkts, deq_sbc;          /* handed to BTA by btc_a2dp_source_audio_readbuf (BTU) */
+    uint32_t flushed_pkts, flushed_sbc;  /* freed from audio_tx_q by a tx flush or btc_a2dp_source_ext_txq_drop */
+    uint32_t rej_pkts;                   /* sends refused for the queue cap (or a failed enqueue) */
+    uint32_t qlen;
+} btc_a2dp_source_ext_txq_stat_t;
+void btc_a2dp_source_ext_txq_stat(btc_a2dp_source_ext_txq_stat_t *out);
+/* BTC context only: frees every packet in audio_tx_q; returns the SBC frames dropped (also added to flushed_sbc). */
+uint32_t btc_a2dp_source_ext_txq_drop(void);
+/* BTC context: the source is ON and not flushing (a suspend in progress), so an enqueue now would be accepted
+ * apart from the queue cap. */
+BOOLEAN btc_a2dp_source_ext_can_send(void);
+#endif
+
 #endif
 
 #endif /* #if BTC_AV_SRC_INCLUDED */
