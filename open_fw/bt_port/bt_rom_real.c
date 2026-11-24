@@ -194,6 +194,15 @@ static void rr_unlock(void)
     }
 }
 
+void bt_rom_real_force_unlock(void)
+{
+    if (s_nest > 0u) {
+        s_nest = 0u;
+        uint32_t pm = s_saved_primask;
+        __asm__ volatile ("msr primask, %0" :: "r"(pm) : "memory");
+    }
+}
+
 static inline uint32_t raw_irq_save(void)
 {
     uint32_t pm;
