@@ -122,6 +122,55 @@ static int make_cwx_path(char *out, int cap, const char *dir_path, const char *w
     return 0;
 }
 
+static int ascii_eq_ci(const char *a, const char *b)
+{
+    if (!a || !b) {
+        return 0;
+    }
+    while (*a != '\0' && *b != '\0') {
+        char ca = *a++, cb = *b++;
+        if (ca >= 'A' && ca <= 'Z') ca = (char)(ca + ('a' - 'A'));
+        if (cb >= 'A' && cb <= 'Z') cb = (char)(cb + ('a' - 'A'));
+        if (ca != cb) {
+            return 0;
+        }
+    }
+    return *a == '\0' && *b == '\0';
+}
+
+int player_dir_has_autoplay(exfat_vol_t *vol, const char *dir_path)
+{
+    if (!vol || !dir_path || dir_path[0] == '\0') {
+        return 0;
+    }
+    /* exFAT lookups compare names ASCII case-insensitively, so ".AUTOPLAY"
+     * or ".Autoplay" created on another OS match too. */
+    char path[EXFAT_MAX_NAME + 64];
+    build_path(path, (int)sizeof(path), dir_path, PLAYER_AUTOPLAY_MARKER);
+    exfat_entry_t ent;
+    return (exfat_find_path(vol, path, &ent) == 0 && !ent.is_dir) ? 1 : 0;
+}
+
+int player_autoplay_next_index(const ui_file_entry_t *files, const char *dirs,
+                               unsigned dir_stride, int count, int idx)
+{
+    if (!files || !dirs || idx < 0 || idx >= count) {
+        return -1;
+    }
+    int next = idx + 1;
+    while (next < count && files[next].is_dir) {
+        next++;
+    }
+    if (next >= count) {
+        return -1;
+    }
+    /* Only continue inside the same folder (the root Files view mixes folders) */
+    if (!ascii_eq_ci(dirs + (unsigned)idx * dir_stride, dirs + (unsigned)next * dir_stride)) {
+        return -1;
+    }
+    return next;
+}
+
 static uint32_t frames_to_ms(uint32_t frames, uint32_t sample_rate)
 {
     if (sample_rate == 0u || frames == 0u) {
@@ -669,6 +718,9 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
     m->play_vol_hi              = 0u;
     m->play_vu_l                = 0u;
     m->play_vu_r                = 0u;
+    /* Live position for a power-off mid-track (refreshed on every UI tick) */
+    m->play_pos_sec             = m->play_file.resume_sec;
+    m->play_state               = 0u;
 
     uint32_t data_off      = 0u;
     uint32_t played_frames = 0u;
@@ -877,6 +929,7 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
         }
 
         /* Refill PCM decode staging buffer & fill the DAC queue before doing display work */
+        int eof_before_refill = eof_reached;
         if (scrub.speed) {
             scrub_queue(&scrub, vol, &wav_ent, &winfo, pcm_buf, millis() - keys.held_since);
         } else if (!paused && !eof_reached) {
@@ -1008,6 +1061,13 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
                     played_frames += (uint32_t)sent;
                 }
             }
+        }
+
+        /* Folder marked with .autoplay: natural end of track (fully drained, not a
+         * seek or scrub to the end) moves straight on to the next track. */
+        if (!eof_before_refill && eof_reached && m->play_autoplay && m->play_has_next) {
+            ret_code = PLAYER_RC_AUTO_NEXT;
+            break;
         }
 
         /* Drive smooth LVGL animations on single-core / WASM / QEMU (no-op on dual-core CPU1) */

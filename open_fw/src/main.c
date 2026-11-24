@@ -79,6 +79,9 @@ static wav_loc_t        g_scan_locs[MENU_MAX_FILES] OPENFW_SRAM_HI;
 static uint64_t         g_scan_cwx_hashes[MENU_MAX_CWX] OPENFW_SRAM_HI;
 static char             g_last_dir[MENU_DIR_CAP] = "/record";
 static char             g_browse_dir[MENU_DIR_CAP] = "";
+/* One-entry cache of "does this folder contain .autoplay" (-1 = unknown) */
+static char             g_autoplay_dir[MENU_DIR_CAP];
+static int8_t           g_autoplay_state = -1;
 static int              g_root_file_sel = 0;
 static int              g_root_file_scroll = 0;
 static uint32_t         g_sd_free_mb   = 0u;
@@ -208,7 +211,8 @@ int ui_poll_power_button(ui_screen_id_t screen, ui_model_t *model, uint32_t now)
                 bt_xrec_stop();
             } else if (screen == UI_SCR_PLAYER) {
                 audio_dac_stop();
-                g_ui.last_file.resume_sec = g_ui.play_file.resume_sec;
+                /* last_file is the track being played (set before playback starts) */
+                g_ui.last_file.resume_sec = (g_ui.play_state == 2u) ? 0u : g_ui.play_pos_sec;
             }
             (void)recorder_stop();
             if (screen == UI_SCR_SETTINGS || screen == UI_SCR_PLAYER) {
@@ -619,7 +623,7 @@ static int count_dir_items_cb(const exfat_entry_t *entry, void *user)
         if (!is_ignored_dir_name(entry->name, 0)) {
             dc->sub_count++;
         }
-    } else if (name_ends_with_ci(entry->name, ".wav")) {
+    } else if (entry->name[0] != '.' && name_ends_with_ci(entry->name, ".wav")) {
         dc->wav_count++;
     }
     return 0;
@@ -672,7 +676,8 @@ static int menu_collect_cb(const exfat_entry_t *entry, void *user)
 {
     menu_list_ctx_t *ctx = (menu_list_ctx_t *)user;
     wdt_feed();
-    if (entry->is_dir) {
+    /* Hidden files (.autoplay marker, macOS ._* AppleDouble twins) are never tracks */
+    if (entry->is_dir || entry->name[0] == '.') {
         return 0;
     }
     if (name_ends_with_ci(entry->name, ".cwx")) {
@@ -740,6 +745,7 @@ static void reload_files_and_sd_stats(void)
     g_ui.files      = g_files;
     g_ui.file_count = 0;
     g_ui.files_title[0] = '\0';
+    g_autoplay_state = -1; /* USB/BT may have added or removed a .autoplay marker */
 
     if (!g_sd_mounted) {
         g_ui.sd_ok       = 0;
@@ -1499,6 +1505,18 @@ static void adjust_setting(int idx, int delta, uint32_t now_ms)
     }
 }
 
+static int dir_has_autoplay_cached(const char *dir)
+{
+    if (!g_sd_mounted || !dir || dir[0] == '\0') {
+        return 0;
+    }
+    if (g_autoplay_state < 0 || !str_eq_ci(g_autoplay_dir, dir)) {
+        copy_cstr(g_autoplay_dir, (int)sizeof(g_autoplay_dir), dir);
+        g_autoplay_state = (int8_t)player_dir_has_autoplay(&g_exfat_vol, dir);
+    }
+    return g_autoplay_state;
+}
+
 static void play_file_at_index(int start_idx)
 {
     int idx = start_idx;
@@ -1507,11 +1525,19 @@ static void play_file_at_index(int start_idx)
         while (prev_idx >= 0 && g_files[prev_idx].is_dir) prev_idx--;
         int next_idx = idx + 1;
         while (next_idx < g_ui.file_count && g_files[next_idx].is_dir) next_idx++;
+        int auto_idx = player_autoplay_next_index(g_files, &g_file_dirs[0][0], MENU_DIR_CAP,
+                                                  g_ui.file_count, idx);
 
         g_ui_screen = UI_SCR_PLAYER;
         g_ui.play_file     = g_files[idx];
         g_ui.play_has_prev = (prev_idx >= 0) ? 1u : 0u;
         g_ui.play_has_next = (next_idx < g_ui.file_count) ? 1u : 0u;
+        g_ui.play_autoplay = (auto_idx >= 0 && dir_has_autoplay_cached(g_file_dirs[idx])) ? 1u : 0u;
+        /* Record the track as "last played" before it starts so a power-off
+         * mid-track (also after an automatic advance) resumes this track. */
+        g_ui.last_file = g_files[idx];
+        copy_cstr(g_last_dir, (int)sizeof(g_last_dir), g_file_dirs[idx]);
+        g_ui.has_last  = 1;
         int rc = openfw_play_file_ui(&g_exfat_vol, g_file_dirs[idx], g_files[idx].filename, &g_ui);
         keys_ignore_held();
         g_files[idx].unplayed   = 0u;
@@ -1526,7 +1552,11 @@ static void play_file_at_index(int start_idx)
             g_ui.file_scroll = g_ui.file_sel - 2;
         }
 
-        if (rc == 1 && next_idx < g_ui.file_count) {
+        if (rc == PLAYER_RC_AUTO_NEXT && auto_idx >= 0) {
+            /* Continuous listening: the next chapter starts from its beginning */
+            g_files[auto_idx].resume_sec = 0u;
+            idx = auto_idx;
+        } else if (rc == 1 && next_idx < g_ui.file_count) {
             idx = next_idx;
         } else if (rc == -1 && prev_idx >= 0) {
             idx = prev_idx;
@@ -1551,10 +1581,37 @@ static void play_named_file(const char *dir, ui_file_entry_t *entry)
             return;
         }
     }
+    /* Resuming a track of an autoplay folder that the Files list is not showing:
+     * open that folder in the list so playback can continue through it. */
+    if (!(dir[0] == '/' && dir[1] == '\0') && !str_eq_ci(g_browse_dir, dir) &&
+        dir_has_autoplay_cached(dir)) {
+        if (g_browse_dir[0] == '\0') {
+            g_root_file_sel    = g_ui.file_sel;
+            g_root_file_scroll = g_ui.file_scroll;
+        }
+        uint32_t resume = entry->resume_sec;
+        char name[sizeof(entry->filename)];
+        copy_cstr(name, (int)sizeof(name), entry->filename);
+        copy_cstr(g_browse_dir, (int)sizeof(g_browse_dir), dir);
+        g_ui.file_sel    = 0;
+        g_ui.file_scroll = 0;
+        reload_files_and_sd_stats();
+        for (int i = 0; i < g_ui.file_count; i++) {
+            if (!g_files[i].is_dir && str_eq_ci(g_file_dirs[i], dir) &&
+                str_eq_ci(g_files[i].filename, name)) {
+                g_files[i].resume_sec = resume;
+                g_files[i].unplayed   = 0u;
+                play_file_at_index(i);
+                entry->resume_sec = g_ui.last_file.resume_sec;
+                return;
+            }
+        }
+    }
     g_ui_screen        = UI_SCR_PLAYER;
     g_ui.play_file     = *entry;
     g_ui.play_has_prev = 0u;
     g_ui.play_has_next = 0u;
+    g_ui.play_autoplay = 0u;
     (void)openfw_play_file_ui(&g_exfat_vol, dir, entry->filename, &g_ui);
     keys_ignore_held();
     entry->resume_sec = g_ui.play_file.resume_sec;

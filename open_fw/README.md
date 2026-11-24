@@ -84,6 +84,7 @@ The recorder uses a single exFAT partition on the microSD card with the followin
 │   └── <subfolder>/            # Optional nested folders (also surfaced in Files root)
 ├── audiobooks/                 # Recommended location for multi-chapter audiobooks / audio folders
 │   └── <Book_Name>/            # Surfaced as a folder row ("Book Name", "<N> ▶") in Files root
+│       ├── .autoplay           # Optional marker (any content, may be empty): continue to next chapter
 │       ├── 01_Cap1.wav         # Chapters listed ascending (A–Z) inside the folder
 │       └── 01_Cap1.cwx         # Optional synced UTF-8 transcript sidecar per chapter
 ├── cassini/                    # Firmware state & metadata
@@ -100,6 +101,8 @@ The recorder uses a single exFAT partition on the microSD card with the followin
 - **Inside a folder (`OK` to enter, `BACK` to return):** Shows any nested subfolders first, followed by `.wav` files sorted **ascending (A–Z)** so audiobook chapters play in order. Double-tap prev/next in the player navigates only within audio files and skips folder rows.
 - **Display titles:** Generic recorder names (`REC_*` or `YYYY*` timestamps) render as friendly dates (`Today 14:32`); custom names (folders and audiobook chapters) strip `.wav` and replace `_` with spaces (e.g., `Jekyll_Hyde` → `Jekyll Hyde`, `JH_01a_Cap1.wav` → `JH 01a Cap1`).
 - **Transcripts (`.cwx`):** Any `<stem>.cwx` sitting in the same directory as `<stem>.wav` is automatically matched and displayed as live karaoke captions during playback.
-- **Safety & resume:** Folder rows are protected from long-press delete; `settings.bin` resume lookup searches both loose files and discovered folders.
+- **Hidden files:** Names starting with `.` (the `.autoplay` marker, macOS `._*` AppleDouble twins) are never listed as tracks, counted as chapters, or returned by `+XREC:LS`.
+- **Autoplay (`.autoplay`):** If a folder contains a file named `.autoplay` (matched case-insensitively, any content), a track that plays to its natural end continues immediately with the next track **of the same folder** in Files-list order (next chapter starts at 0:00). The last track stops on the End screen as usual (no wrap); seeking or scrubbing to the end does not advance. The marker is looked up once per folder via `player_dir_has_autoplay()` and cached in `main.c` until the file list is reloaded (USB/BT exit, delete, folder change). Resuming such a track from Home opens its folder in Files so playback can continue through it. Without the marker nothing changes.
+- **Safety & resume:** The track being played is recorded as "last played" before it starts, and a power-off during playback saves the live position, so resume follows automatic advances. Folder rows are protected from long-press delete; `settings.bin` resume lookup searches both loose files and discovered folders.
 
 For deeper technical details, see **[../docs/LVGL_ARCHITECTURE.md](../docs/LVGL_ARCHITECTURE.md)**, **[../docs/SL6801_HW76_HARDWARE.md](../docs/SL6801_HW76_HARDWARE.md)**, and **[../docs/DEVELOPMENT_WORKFLOW.md](../docs/DEVELOPMENT_WORKFLOW.md)**.

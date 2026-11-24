@@ -265,7 +265,8 @@ static int ls_append(ls_ctx_t *lc, const char *line, int len, int is_file_entry)
 static int ls_dir_cb(const exfat_entry_t *entry, void *user)
 {
     ls_ctx_t *lc = (ls_ctx_t *)user;
-    if (entry->is_dir) {
+    /* Hidden files (e.g. a .autoplay folder marker) are not recordings */
+    if (entry->is_dir || entry->name[0] == '.') {
         return 0;
     }
     if (lc->seen_files < lc->ctx->ls_sent_cnt) {

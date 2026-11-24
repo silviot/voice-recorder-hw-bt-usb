@@ -2319,6 +2319,13 @@ static void test_bt_spp_and_xrec(void)
         assert(exfat_write(&w, wav_file, 64u) == 0);
         assert(exfat_close_file(&w) == 0);
     }
+    /* Empty per-folder autoplay marker: hidden from LS, found case-insensitively */
+    assert(exfat_create_file(&vol, "/record", ".autoplay", &w) == 0);
+    assert(exfat_close_file(&w) == 0);
+    {
+        exfat_entry_t ap;
+        assert(exfat_find_path(&vol, "/record/.AUTOPLAY", &ap) == 0 && !ap.is_dir && ap.size == 0u);
+    }
 
     bt_spp_t    spp;
     sim_phone_t sp;
@@ -2483,6 +2490,7 @@ static void test_bt_spp_and_xrec(void)
     assert(strstr((const char *)sp.rx_stream, "+XREC:F,1024,REC_0001.wav") != NULL);
     assert(strstr((const char *)sp.rx_stream, "+XREC:F,960,EXACT960.wav") != NULL);
     assert(strstr((const char *)sp.rx_stream, "+XREC:F,64,REC_0009.wav") != NULL);
+    assert(strstr((const char *)sp.rx_stream, ".autoplay") == NULL);
     assert(strstr((const char *)sp.rx_stream, "+XREC:END") != NULL);
 
     sp.rx_len = 0u;
