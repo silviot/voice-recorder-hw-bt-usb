@@ -192,10 +192,10 @@ int main(int argc, char **argv)
     }
 
     static const ui_file_entry_t demo_files[4] = {
-        { "REC_0043.wav", { 2026, 11, 20, 5, 14, 32, 0 }, 192,  65, 1, 1, 2 },
-        { "REC_0042.wav", { 2026, 11, 20, 5,  9,  5, 0 }, 1475, 0,  0, 1, 2 },
-        { "REC_0041.wav", { 2026, 11, 19, 4, 18, 47, 0 }, 38,   0,  1, 0, 1 },
-        { "REC_0040.wav", { 2026, 11, 16, 1,  8,  2, 0 }, 245,  0,  0, 0, 2 },
+        { "REC_0043.wav", { 2026, 11, 20, 5, 14, 32, 0 }, 192,  65, 1, 1, 2, 0 },
+        { "REC_0042.wav", { 2026, 11, 20, 5,  9,  5, 0 }, 1475, 0,  0, 1, 2, 0 },
+        { "REC_0041.wav", { 2026, 11, 19, 4, 18, 47, 0 }, 38,   0,  1, 0, 1, 0 },
+        { "REC_0040.wav", { 2026, 11, 16, 1,  8,  2, 0 }, 245,  0,  0, 0, 2, 0 },
     };
 
     ui_model_t m;
@@ -334,6 +334,24 @@ int main(int argc, char **argv)
     ui_render_screen(UI_SCR_FILES, &m);
     m.file_scroll = 0;
     ui_render_screen(UI_SCR_FILES, &m);
+
+    /* Exercise folder row + Italian accented audiobook title rendering */
+    {
+        static const ui_file_entry_t folder_files[2] = {
+            { "Jekyll_Hyde",     { 2026, 11, 20, 5, 14, 32, 0 }, 41,  0, 0, 0, 0, 1 },
+            { "JH_01a_Cap1.wav", { 2026, 11, 20, 5, 14, 32, 0 }, 185, 0, 1, 1, 1, 0 },
+        };
+        m.files = folder_files;
+        m.file_count = 2;
+        strcpy(m.files_title, "Jekyll Hyde");
+        ui_render_screen(UI_SCR_FILES, &m);
+        assert(strcmp(lv_label_get_text(objects.files_name_0), "Jekyll Hyde") == 0);
+        assert(strcmp(lv_label_get_text(objects.files_name_1), "JH 01a Cap1") == 0);
+        m.files = demo_files;
+        m.file_count = 4;
+        m.files_title[0] = '\0';
+        ui_render_screen(UI_SCR_FILES, &m);
+    }
 
     /* 5: Player (Time-first) */
     m.play_file           = demo_files[0];

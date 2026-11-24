@@ -54,9 +54,31 @@ DEFAULT_SYMBOL = [
 
 # Sorted ascending by Unicode codepoint (required for LVGL sparse cmap binary search)
 EXTRA_CODEPOINTS = [
+    0x00AB,  # «
     0x00B1,  # ±
     0x00B7,  # ·
+    0x00BB,  # »
+    0x00C0,  # À
+    0x00C1,  # Á
+    0x00C8,  # È
+    0x00C9,  # É
+    0x00CC,  # Ì
+    0x00CD,  # Í
+    0x00D2,  # Ò
+    0x00D3,  # Ó
     0x00D7,  # ×
+    0x00D9,  # Ù
+    0x00DA,  # Ú
+    0x00E0,  # à
+    0x00E1,  # á
+    0x00E8,  # è
+    0x00E9,  # é
+    0x00EC,  # ì
+    0x00ED,  # í
+    0x00F2,  # ò
+    0x00F3,  # ó
+    0x00F9,  # ù
+    0x00FA,  # ú
     0x2026,  # …
     0x2212,  # −
     0x25A0,  # ■

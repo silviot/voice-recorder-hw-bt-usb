@@ -27,9 +27,11 @@
 #ifdef OPENFW_HOST_MMIO
 #define OPENFW_RAMFUNC
 #define OPENFW_FASTFUNC
+#define OPENFW_SRAM_HI
 #else
 #define OPENFW_RAMFUNC  __attribute__((section(".ramtext")))
 #define OPENFW_FASTFUNC __attribute__((section(".fast_ramtext")))
+#define OPENFW_SRAM_HI  __attribute__((section(".bss_hi")))
 #endif
 
 /* SPI NOR XIP mode detected at boot (startup.c) */

@@ -149,6 +149,7 @@ typedef struct {
     uint8_t        unplayed;
     uint8_t        has_transcript;
     uint8_t        channels;
+    uint8_t        is_dir;
 } ui_file_entry_t;
 
 typedef struct {
@@ -202,6 +203,7 @@ typedef struct {
     int            file_count;
     int            file_sel;
     int            file_scroll;
+    char           files_title[24];
 
     /* Player */
     ui_file_entry_t play_file;

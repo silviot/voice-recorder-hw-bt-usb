@@ -19,6 +19,7 @@ MEMORY
     SRAM      (rwx) : ORIGIN = 0x0081A380, LENGTH = 0x00035C80
     EXP_ARENA (rwx) : ORIGIN = 0x00850000, LENGTH = 0x00008000
     EXP_OUT   (rw)  : ORIGIN = 0x00858000, LENGTH = 0x00004000
+    SRAM_HI   (rwx) : ORIGIN = 0x0085C000, LENGTH = 0x0000B000
 }
 
 _estack = 0x0086AC08;
@@ -96,6 +97,15 @@ SECTIONS
     .exp_out 0x00858000 (NOLOAD) : ALIGN(4) {
         KEEP(*(.exp_out))
     } > EXP_OUT
+
+    .bss_hi (NOLOAD) : ALIGN(4) {
+        _sbss_hi = .;
+        *(.bss_hi .bss_hi.*)
+        . = ALIGN(4);
+        _ebss_hi = .;
+    } > SRAM_HI
+
+    ASSERT(_ebss_hi <= 0x00867000, ".bss_hi overflowed into main stack")
 
     /DISCARD/ : {
         *(.ARM.exidx* .ARM.extab* .comment .note*)

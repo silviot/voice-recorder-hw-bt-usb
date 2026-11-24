@@ -15,6 +15,7 @@
 extern uint32_t _estack;
 extern uint32_t _sidata, _sdata, _edata;
 extern uint32_t _sbss, _ebss;
+extern uint32_t _sbss_hi, _ebss_hi;
 
 extern int openfw_main(void);
 
@@ -343,8 +344,11 @@ void reset_c_entry(void)
         *dst = *src;
     }
 
-    /* Zero .bss in SRAM */
+    /* Zero .bss and .bss_hi in SRAM */
     for (volatile uint32_t *dst = &_sbss; dst < &_ebss; dst++) {
+        *dst = 0u;
+    }
+    for (volatile uint32_t *dst = &_sbss_hi; dst < &_ebss_hi; dst++) {
         *dst = 0u;
     }
 

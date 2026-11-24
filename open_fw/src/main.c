@@ -28,8 +28,9 @@
 #include "openfw_player.h"
 #include "cassini_splash.h"
 
-#define MENU_MAX_FILES 32
-#define MENU_MAX_CWX   64
+#define MENU_MAX_FILES 96
+#define MENU_MAX_CWX   192
+#define MENU_DIR_CAP   48
 #define LIST_SCROLL_DELAY_MS  400u
 #define LIST_SCROLL_REPEAT_MS 100u
 
@@ -42,7 +43,7 @@ typedef struct {
 
 typedef struct {
     ui_file_entry_t *items;
-    char           (*dirs)[12];
+    char           (*dirs)[MENU_DIR_CAP];
     wav_loc_t       *locs;
     uint64_t        *cwx_hashes;
     int              cwx_count;
@@ -72,9 +73,14 @@ static void save_persisted_state(void);
 volatile uint32_t       g_ui_screen = UI_SCR_HOME;
 static ui_model_t       g_ui;
 static ui_spectrogram_t g_spec;
-static ui_file_entry_t  g_files[MENU_MAX_FILES];
-static char             g_file_dirs[MENU_MAX_FILES][12];
-static char             g_last_dir[12] = "/record";
+static ui_file_entry_t  g_files[MENU_MAX_FILES] OPENFW_SRAM_HI;
+static char             g_file_dirs[MENU_MAX_FILES][MENU_DIR_CAP] OPENFW_SRAM_HI;
+static wav_loc_t        g_scan_locs[MENU_MAX_FILES] OPENFW_SRAM_HI;
+static uint64_t         g_scan_cwx_hashes[MENU_MAX_CWX] OPENFW_SRAM_HI;
+static char             g_last_dir[MENU_DIR_CAP] = "/record";
+static char             g_browse_dir[MENU_DIR_CAP] = "";
+static int              g_root_file_sel = 0;
+static int              g_root_file_scroll = 0;
 static uint32_t         g_sd_free_mb   = 0u;
 static uint32_t         g_sd_total_mb  = 0u;
 
@@ -428,7 +434,7 @@ static void load_persisted_state(void)
     if (has_last && last_name[0] != '\0') {
         int found = 0;
         for (int i = 0; i < g_ui.file_count; i++) {
-            if (str_eq_ci(g_files[i].filename, last_name)) {
+            if (!g_files[i].is_dir && str_eq_ci(g_files[i].filename, last_name)) {
                 g_files[i].resume_sec = (last_resume < g_files[i].duration_sec) ? last_resume : 0u;
                 g_files[i].unplayed   = 0u;
                 g_ui.last_file        = g_files[i];
@@ -439,7 +445,32 @@ static void load_persisted_state(void)
             }
         }
         if (!found) {
-            char full[48];
+            /* Also search discovered folders (e.g. /audiobooks/Jekyll_Hyde) and /record */
+            char full[96];
+            exfat_entry_t ent;
+            for (int i = 0; i < g_ui.file_count && !found; i++) {
+                if (!g_files[i].is_dir) continue;
+                int p = 0;
+                append_str(full, &p, (int)sizeof(full), g_file_dirs[i]);
+                append_str(full, &p, (int)sizeof(full), "/");
+                append_str(full, &p, (int)sizeof(full), last_name);
+                full[p] = '\0';
+                if (exfat_find_path(&g_exfat_vol, full, &ent) == 0 && !ent.is_dir) {
+                    copy_cstr(g_ui.last_file.filename, (int)sizeof(g_ui.last_file.filename), last_name);
+                    g_ui.last_file.dt             = file_datetime(&ent);
+                    fill_wav_metadata(&ent, &g_ui.last_file);
+                    g_ui.last_file.resume_sec     = (last_resume < g_ui.last_file.duration_sec) ? last_resume : 0u;
+                    g_ui.last_file.unplayed       = 0u;
+                    g_ui.last_file.has_transcript = 0u;
+                    g_ui.last_file.is_dir         = 0u;
+                    copy_cstr(g_last_dir, (int)sizeof(g_last_dir), g_file_dirs[i]);
+                    g_ui.has_last = 1;
+                    found = 1;
+                }
+            }
+        }
+        if (!found) {
+            char full[64];
             int p = 0;
             append_str(full, &p, (int)sizeof(full), "/record/");
             append_str(full, &p, (int)sizeof(full), last_name);
@@ -452,6 +483,7 @@ static void load_persisted_state(void)
                 g_ui.last_file.resume_sec     = (last_resume < g_ui.last_file.duration_sec) ? last_resume : 0u;
                 g_ui.last_file.unplayed       = 0u;
                 g_ui.last_file.has_transcript = 0u;
+                g_ui.last_file.is_dir         = 0u;
                 copy_cstr(g_last_dir, (int)sizeof(g_last_dir), "/record");
                 g_ui.has_last = 1;
             }
@@ -487,7 +519,41 @@ static uint64_t hash_dir_stem_ci(const char *dir, const char *name)
     return h;
 }
 
-static void reverse_file_range(ui_file_entry_t *items, char (*dirs)[12], wav_loc_t *locs,
+static int str_cmp_ci(const char *a, const char *b)
+{
+    if (!a) a = "";
+    if (!b) b = "";
+    while (*a != '\0' && *b != '\0') {
+        char ca = *a++, cb = *b++;
+        if (ca >= 'A' && ca <= 'Z') ca = (char)(ca + ('a' - 'A'));
+        if (cb >= 'A' && cb <= 'Z') cb = (char)(cb + ('a' - 'A'));
+        if (ca != cb) return (int)(uint8_t)ca - (int)(uint8_t)cb;
+    }
+    return (int)(uint8_t)*a - (int)(uint8_t)*b;
+}
+
+static void sort_file_range_asc(ui_file_entry_t *items, char (*dirs)[MENU_DIR_CAP], wav_loc_t *locs,
+                                int lo, int hi)
+{
+    for (int i = lo + 1; i <= hi; i++) {
+        ui_file_entry_t kf = items[i];
+        char kd[MENU_DIR_CAP];
+        copy_cstr(kd, MENU_DIR_CAP, dirs[i]);
+        wav_loc_t kl = locs[i];
+        int j = i - 1;
+        while (j >= lo && str_cmp_ci(items[j].filename, kf.filename) > 0) {
+            items[j + 1] = items[j];
+            copy_cstr(dirs[j + 1], MENU_DIR_CAP, dirs[j]);
+            locs[j + 1] = locs[j];
+            j--;
+        }
+        items[j + 1] = kf;
+        copy_cstr(dirs[j + 1], MENU_DIR_CAP, kd);
+        locs[j + 1] = kl;
+    }
+}
+
+static void reverse_file_range(ui_file_entry_t *items, char (*dirs)[MENU_DIR_CAP], wav_loc_t *locs,
                                int lo, int hi)
 {
     while (lo < hi) {
@@ -495,10 +561,10 @@ static void reverse_file_range(ui_file_entry_t *items, char (*dirs)[12], wav_loc
         items[lo] = items[hi];
         items[hi] = tf;
 
-        char td[12];
-        copy_cstr(td, 12, dirs[lo]);
-        copy_cstr(dirs[lo], 12, dirs[hi]);
-        copy_cstr(dirs[hi], 12, td);
+        char td[MENU_DIR_CAP];
+        copy_cstr(td, MENU_DIR_CAP, dirs[lo]);
+        copy_cstr(dirs[lo], MENU_DIR_CAP, dirs[hi]);
+        copy_cstr(dirs[hi], MENU_DIR_CAP, td);
 
         wav_loc_t tl = locs[lo];
         locs[lo] = locs[hi];
@@ -507,6 +573,98 @@ static void reverse_file_range(ui_file_entry_t *items, char (*dirs)[12], wav_loc
         lo++;
         hi--;
     }
+}
+
+static void join_dir_path(char *dst, int cap, const char *parent, const char *child)
+{
+    int p = 0;
+    if (!parent || parent[0] == '\0' || (parent[0] == '/' && parent[1] == '\0')) {
+        append_str(dst, &p, cap, "/");
+    } else {
+        append_str(dst, &p, cap, parent);
+        if (p > 0 && dst[p - 1] != '/') {
+            append_str(dst, &p, cap, "/");
+        }
+    }
+    append_str(dst, &p, cap, child);
+    dst[p] = '\0';
+}
+
+static int is_ignored_dir_name(const char *name, int is_root)
+{
+    if (!name || name[0] == '\0' || name[0] == '.') {
+        return 1;
+    }
+    if (str_eq_ci(name, "System Volume Information") || str_eq_ci(name, "$RECYCLE.BIN")) {
+        return 1;
+    }
+    if (is_root && (str_eq_ci(name, "record") || str_eq_ci(name, "cassini") ||
+                    str_eq_ci(name, "audiobooks"))) {
+        return 1;
+    }
+    return 0;
+}
+
+typedef struct {
+    uint32_t wav_count;
+    uint32_t sub_count;
+} dir_count_ctx_t;
+
+static int count_dir_items_cb(const exfat_entry_t *entry, void *user)
+{
+    dir_count_ctx_t *dc = (dir_count_ctx_t *)user;
+    wdt_feed();
+    if (entry->is_dir) {
+        if (!is_ignored_dir_name(entry->name, 0)) {
+            dc->sub_count++;
+        }
+    } else if (name_ends_with_ci(entry->name, ".wav")) {
+        dc->wav_count++;
+    }
+    return 0;
+}
+
+typedef struct {
+    ui_file_entry_t *items;
+    char           (*dirs)[MENU_DIR_CAP];
+    wav_loc_t       *locs;
+    int              count;
+    int              max_items;
+    const char      *parent_path;
+    int              is_root;
+} dir_collect_ctx_t;
+
+static int menu_collect_dirs_cb(const exfat_entry_t *entry, void *user)
+{
+    dir_collect_ctx_t *ctx = (dir_collect_ctx_t *)user;
+    wdt_feed();
+    if (!entry->is_dir || ctx->count >= ctx->max_items) {
+        return 0;
+    }
+    if (is_ignored_dir_name(entry->name, ctx->is_root)) {
+        return 0;
+    }
+    dir_count_ctx_t dc = { 0u, 0u };
+    (void)exfat_list_dir_entry(&g_exfat_vol, entry, count_dir_items_cb, &dc);
+    if (dc.wav_count == 0u && dc.sub_count == 0u) {
+        return 0; /* Skip empty folders */
+    }
+    int idx = ctx->count++;
+    ui_file_entry_t *dst = &ctx->items[idx];
+    join_dir_path(ctx->dirs[idx], MENU_DIR_CAP, ctx->parent_path, entry->name);
+    copy_cstr(dst->filename, (int)sizeof(dst->filename), entry->name);
+    dst->dt             = file_datetime(entry);
+    dst->duration_sec   = dc.wav_count;
+    dst->resume_sec     = 0u;
+    dst->unplayed       = 0u;
+    dst->has_transcript = 0u;
+    dst->channels       = 0u;
+    dst->is_dir         = 1u;
+    ctx->locs[idx].size          = 0u;
+    ctx->locs[idx].valid_data_len = 0u;
+    ctx->locs[idx].first_cluster = entry->first_cluster;
+    ctx->locs[idx].no_fat_chain  = entry->no_fat_chain;
+    return 0;
 }
 
 static int menu_collect_cb(const exfat_entry_t *entry, void *user)
@@ -534,13 +692,14 @@ static int menu_collect_cb(const exfat_entry_t *entry, void *user)
         ctx->count++;
     }
     ui_file_entry_t *dst = &ctx->items[idx];
-    copy_cstr(ctx->dirs[idx], 12, ctx->dir_path);
+    copy_cstr(ctx->dirs[idx], MENU_DIR_CAP, ctx->dir_path);
     copy_cstr(dst->filename, (int)sizeof(dst->filename), entry->name);
     dst->dt             = file_datetime(entry);
     dst->resume_sec     = 0u;
     dst->unplayed       = 1u;
     dst->has_transcript = 0u;
     dst->channels       = 1u;
+    dst->is_dir         = 0u;
     dst->duration_sec   = (entry->size > 44u) ? ((uint32_t)(entry->size - 44u) / 32000u) : 0u;
 
     ctx->locs[idx].valid_data_len = entry->valid_data_len;
@@ -550,64 +709,180 @@ static int menu_collect_cb(const exfat_entry_t *entry, void *user)
     return 0;
 }
 
+static void format_browse_title(char *dst, int cap, const char *path)
+{
+    if (!dst || cap <= 0) return;
+    if (!path || path[0] == '\0') {
+        dst[0] = '\0';
+        return;
+    }
+    const char *base = path;
+    for (const char *p = path; *p != '\0'; p++) {
+        if (*p == '/' && p[1] != '\0') {
+            base = p + 1;
+        }
+    }
+    int out = 0;
+    for (int i = 0; base[i] != '\0' && out < cap - 1; i++) {
+        char c = base[i];
+        if (c == '_') c = ' ';
+        if (c == ' ' && (out == 0 || dst[out - 1] == ' ')) continue;
+        dst[out++] = c;
+    }
+    dst[out] = '\0';
+}
+
 static void reload_files_and_sd_stats(void)
 {
     g_sd_free_mb  = 0u;
     g_sd_total_mb = 0u;
     g_ui.files      = g_files;
     g_ui.file_count = 0;
+    g_ui.files_title[0] = '\0';
 
     if (!g_sd_mounted) {
         g_ui.sd_ok       = 0;
         g_ui.sd_total_mb = 0u;
         g_ui.sd_free_sec = 0u;
+        g_browse_dir[0]  = '\0';
         return;
     }
 
     wdt_feed();
     (void)exfat_stat_fs(&g_exfat_vol, &g_sd_free_mb, &g_sd_total_mb);
 
-    wav_loc_t locs[MENU_MAX_FILES];
-    uint64_t  cwx_hashes[MENU_MAX_CWX];
-    menu_list_ctx_t ctx;
-    ctx.items        = g_files;
-    ctx.dirs         = g_file_dirs;
-    ctx.locs         = locs;
-    ctx.cwx_hashes   = cwx_hashes;
-    ctx.cwx_count    = 0;
-    ctx.cwx_cap      = MENU_MAX_CWX;
-    ctx.cwx_overflow = 0;
-    ctx.count        = 0;
-    ctx.total_seen   = 0;
-    ctx.max_items    = MENU_MAX_FILES;
+    wav_loc_t *locs       = g_scan_locs;
+    uint64_t  *cwx_hashes = g_scan_cwx_hashes;
+    int total_count = 0;
+    int cwx_count   = 0;
+    int cwx_overflow = 0;
 
-    exfat_entry_t dir_ent;
-    if (exfat_find_path(&g_exfat_vol, "/record", &dir_ent) == 0 && dir_ent.is_dir) {
-        ctx.dir_path = "/record";
-        (void)exfat_list_dir_entry(&g_exfat_vol, &dir_ent, menu_collect_cb, &ctx);
+    exfat_entry_t browse_ent;
+    if (g_browse_dir[0] != '\0' &&
+        (exfat_find_path(&g_exfat_vol, g_browse_dir, &browse_ent) != 0 || !browse_ent.is_dir)) {
+        g_browse_dir[0] = '\0';
     }
-    if (exfat_find_path(&g_exfat_vol, "/cassini", &dir_ent) == 0 && dir_ent.is_dir) {
-        ctx.dir_path = "/cassini";
-        (void)exfat_list_dir_entry(&g_exfat_vol, &dir_ent, menu_collect_cb, &ctx);
-    }
-    ctx.dir_path = "/";
-    (void)exfat_list_dir(&g_exfat_vol, g_exfat_vol.root_dir_cluster, 0u,
-                         menu_collect_cb, &ctx);
 
-    /* Unwrap ring buffer in-place into reverse chronological order (newest first) */
-    if (ctx.count > 1) {
-        int head = (ctx.total_seen > ctx.max_items) ? (ctx.total_seen % ctx.max_items) : 0;
-        if (head > 1) {
-            reverse_file_range(g_files, g_file_dirs, locs, 0, head - 1);
+    if (g_browse_dir[0] != '\0') {
+        /* Inside a folder: show any nested subfolders first, then WAVs sorted ascending */
+        format_browse_title(g_ui.files_title, (int)sizeof(g_ui.files_title), g_browse_dir);
+
+        dir_collect_ctx_t dctx = {
+            .items       = g_files,
+            .dirs        = g_file_dirs,
+            .locs        = locs,
+            .count       = 0,
+            .max_items   = MENU_MAX_FILES,
+            .parent_path = g_browse_dir,
+            .is_root     = 0,
+        };
+        (void)exfat_list_dir_entry(&g_exfat_vol, &browse_ent, menu_collect_dirs_cb, &dctx);
+        if (dctx.count > 1) {
+            sort_file_range_asc(g_files, g_file_dirs, locs, 0, dctx.count - 1);
         }
-        if (head < ctx.count - 1) {
-            reverse_file_range(g_files, g_file_dirs, locs, head, ctx.count - 1);
+        total_count = dctx.count;
+
+        if (total_count < MENU_MAX_FILES) {
+            menu_list_ctx_t ctx = {
+                .items        = &g_files[total_count],
+                .dirs         = &g_file_dirs[total_count],
+                .locs         = &locs[total_count],
+                .cwx_hashes   = cwx_hashes,
+                .cwx_count    = 0,
+                .cwx_cap      = MENU_MAX_CWX,
+                .cwx_overflow = 0,
+                .count        = 0,
+                .total_seen   = 0,
+                .max_items    = MENU_MAX_FILES - total_count,
+                .dir_path     = g_browse_dir,
+            };
+            (void)exfat_list_dir_entry(&g_exfat_vol, &browse_ent, menu_collect_cb, &ctx);
+            if (ctx.count > 1) {
+                sort_file_range_asc(ctx.items, ctx.dirs, ctx.locs, 0, ctx.count - 1);
+            }
+            cwx_count    = ctx.cwx_count;
+            cwx_overflow = ctx.cwx_overflow;
+            total_count += ctx.count;
+        }
+    } else {
+        /* Top-level Files view: show non-empty subfolders (sorted A-Z), then loose WAVs newest-first */
+        dir_collect_ctx_t dctx = {
+            .items       = g_files,
+            .dirs        = g_file_dirs,
+            .locs        = locs,
+            .count       = 0,
+            .max_items   = 24,
+            .parent_path = "/audiobooks",
+            .is_root     = 0,
+        };
+        exfat_entry_t dir_ent;
+        if (exfat_find_path(&g_exfat_vol, "/audiobooks", &dir_ent) == 0 && dir_ent.is_dir) {
+            (void)exfat_list_dir_entry(&g_exfat_vol, &dir_ent, menu_collect_dirs_cb, &dctx);
+        }
+        if (exfat_find_path(&g_exfat_vol, "/cassini", &dir_ent) == 0 && dir_ent.is_dir) {
+            dctx.parent_path = "/cassini";
+            (void)exfat_list_dir_entry(&g_exfat_vol, &dir_ent, menu_collect_dirs_cb, &dctx);
+        }
+        if (exfat_find_path(&g_exfat_vol, "/record", &dir_ent) == 0 && dir_ent.is_dir) {
+            dctx.parent_path = "/record";
+            (void)exfat_list_dir_entry(&g_exfat_vol, &dir_ent, menu_collect_dirs_cb, &dctx);
+        }
+        dctx.parent_path = "/";
+        dctx.is_root     = 1;
+        (void)exfat_list_dir(&g_exfat_vol, g_exfat_vol.root_dir_cluster, 0u,
+                             menu_collect_dirs_cb, &dctx);
+        if (dctx.count > 1) {
+            sort_file_range_asc(g_files, g_file_dirs, locs, 0, dctx.count - 1);
+        }
+        total_count = dctx.count;
+
+        if (total_count < MENU_MAX_FILES) {
+            menu_list_ctx_t ctx = {
+                .items        = &g_files[total_count],
+                .dirs         = &g_file_dirs[total_count],
+                .locs         = &locs[total_count],
+                .cwx_hashes   = cwx_hashes,
+                .cwx_count    = 0,
+                .cwx_cap      = MENU_MAX_CWX,
+                .cwx_overflow = 0,
+                .count        = 0,
+                .total_seen   = 0,
+                .max_items    = MENU_MAX_FILES - total_count,
+                .dir_path     = "/record",
+            };
+            if (exfat_find_path(&g_exfat_vol, "/record", &dir_ent) == 0 && dir_ent.is_dir) {
+                ctx.dir_path = "/record";
+                (void)exfat_list_dir_entry(&g_exfat_vol, &dir_ent, menu_collect_cb, &ctx);
+            }
+            if (exfat_find_path(&g_exfat_vol, "/cassini", &dir_ent) == 0 && dir_ent.is_dir) {
+                ctx.dir_path = "/cassini";
+                (void)exfat_list_dir_entry(&g_exfat_vol, &dir_ent, menu_collect_cb, &ctx);
+            }
+            ctx.dir_path = "/";
+            (void)exfat_list_dir(&g_exfat_vol, g_exfat_vol.root_dir_cluster, 0u,
+                                 menu_collect_cb, &ctx);
+
+            if (ctx.count > 1) {
+                int head = (ctx.total_seen > ctx.max_items) ? (ctx.total_seen % ctx.max_items) : 0;
+                if (head > 1) {
+                    reverse_file_range(ctx.items, ctx.dirs, ctx.locs, 0, head - 1);
+                }
+                if (head < ctx.count - 1) {
+                    reverse_file_range(ctx.items, ctx.dirs, ctx.locs, head, ctx.count - 1);
+                }
+            }
+            cwx_count    = ctx.cwx_count;
+            cwx_overflow = ctx.cwx_overflow;
+            total_count += ctx.count;
         }
     }
 
-    /* Read 512 B WAV headers & match .cwx transcripts only for the selected files */
-    for (int i = 0; i < ctx.count; i++) {
+    /* Read 512 B WAV headers & match .cwx transcripts only for audio files */
+    for (int i = 0; i < total_count; i++) {
         wdt_feed();
+        if (g_files[i].is_dir) {
+            continue;
+        }
         exfat_entry_t wav_ent = {
             .size = locs[i].size,
             .valid_data_len = locs[i].valid_data_len,
@@ -617,16 +892,16 @@ static void reload_files_and_sd_stats(void)
         fill_wav_metadata(&wav_ent, &g_files[i]);
 
         int has_cwx = 0;
-        if (ctx.cwx_count > 0) {
+        if (cwx_count > 0) {
             uint64_t h = hash_dir_stem_ci(g_file_dirs[i], g_files[i].filename);
-            for (int c = 0; c < ctx.cwx_count; c++) {
+            for (int c = 0; c < cwx_count; c++) {
                 if (cwx_hashes[c] == h) {
                     has_cwx = 1;
                     break;
                 }
             }
         }
-        if (!has_cwx && ctx.cwx_overflow) {
+        if (!has_cwx && cwx_overflow) {
             char cpath[96];
             int p = 0;
             if (!(g_file_dirs[i][0] == '/' && g_file_dirs[i][1] == '\0')) {
@@ -648,17 +923,22 @@ static void reload_files_and_sd_stats(void)
         g_files[i].has_transcript = has_cwx ? 1u : 0u;
     }
 
-    g_ui.file_count = ctx.count;
-    if (g_ui.file_sel >= ctx.count) {
-        g_ui.file_sel = (ctx.count > 0) ? (ctx.count - 1) : 0;
+    g_ui.file_count = total_count;
+    if (g_ui.file_sel >= total_count) {
+        g_ui.file_sel = (total_count > 0) ? (total_count - 1) : 0;
     }
     if (g_ui.file_scroll > g_ui.file_sel) {
         g_ui.file_scroll = g_ui.file_sel;
     }
-    if (g_ui.file_count > 0 && !g_ui.has_last) {
-        g_ui.last_file = g_files[0];
-        copy_cstr(g_last_dir, (int)sizeof(g_last_dir), g_file_dirs[0]);
-        g_ui.has_last = 1;
+    if (g_ui.file_count > 0 && !g_ui.has_last && g_browse_dir[0] == '\0') {
+        for (int i = 0; i < g_ui.file_count; i++) {
+            if (!g_files[i].is_dir) {
+                g_ui.last_file = g_files[i];
+                copy_cstr(g_last_dir, (int)sizeof(g_last_dir), g_file_dirs[i]);
+                g_ui.has_last = 1;
+                break;
+            }
+        }
     }
     refresh_telemetry();
 }
@@ -704,10 +984,21 @@ static void probe_microsd_internal(int log_uart)
 static void prepend_saved_recording_fast(const char *saved_name, uint32_t rec_s,
                                          uint8_t rec_ch, uint32_t committed_bytes)
 {
+    if (g_browse_dir[0] != '\0') {
+        g_browse_dir[0] = '\0';
+        reload_files_and_sd_stats();
+        return;
+    }
+    /* Insert right after any leading folder entries */
+    int insert_at = 0;
+    while (insert_at < g_ui.file_count && g_files[insert_at].is_dir) {
+        insert_at++;
+    }
     /* Remove any pre-existing entry with the same name in /record */
     int existing = -1;
-    for (int i = 0; i < g_ui.file_count; i++) {
-        if (str_eq_ci(g_file_dirs[i], "/record") && str_eq_ci(g_files[i].filename, saved_name)) {
+    for (int i = insert_at; i < g_ui.file_count; i++) {
+        if (!g_files[i].is_dir && str_eq_ci(g_file_dirs[i], "/record") &&
+            str_eq_ci(g_files[i].filename, saved_name)) {
             existing = i;
             break;
         }
@@ -716,16 +1007,19 @@ static void prepend_saved_recording_fast(const char *saved_name, uint32_t rec_s,
     if (shift_end >= MENU_MAX_FILES) {
         shift_end = MENU_MAX_FILES - 1;
     }
-    for (int i = shift_end; i > 0; i--) {
+    if (insert_at >= MENU_MAX_FILES) {
+        return;
+    }
+    for (int i = shift_end; i > insert_at; i--) {
         g_files[i] = g_files[i - 1];
-        copy_cstr(g_file_dirs[i], 12, g_file_dirs[i - 1]);
+        copy_cstr(g_file_dirs[i], MENU_DIR_CAP, g_file_dirs[i - 1]);
     }
     if (existing < 0 && g_ui.file_count < MENU_MAX_FILES) {
         g_ui.file_count++;
     }
 
-    ui_file_entry_t *f = &g_files[0];
-    copy_cstr(g_file_dirs[0], 12, "/record");
+    ui_file_entry_t *f = &g_files[insert_at];
+    copy_cstr(g_file_dirs[insert_at], MENU_DIR_CAP, "/record");
     copy_cstr(f->filename, (int)sizeof(f->filename), saved_name);
     f->dt             = rtc_from_dos_timestamp(recorder_get_created_timestamp());
     f->duration_sec   = rec_s;
@@ -733,6 +1027,7 @@ static void prepend_saved_recording_fast(const char *saved_name, uint32_t rec_s,
     f->unplayed       = 1u;
     f->has_transcript = 0u;
     f->channels       = rec_ch ? rec_ch : 1u;
+    f->is_dir         = 0u;
 
     uint32_t used_mb = (committed_bytes + 0xFFFFFu) >> 20;
     if (g_sd_free_mb > used_mb) {
@@ -1202,11 +1497,16 @@ static void adjust_setting(int idx, int delta, uint32_t now_ms)
 static void play_file_at_index(int start_idx)
 {
     int idx = start_idx;
-    while (idx >= 0 && idx < g_ui.file_count) {
+    while (idx >= 0 && idx < g_ui.file_count && !g_files[idx].is_dir) {
+        int prev_idx = idx - 1;
+        while (prev_idx >= 0 && g_files[prev_idx].is_dir) prev_idx--;
+        int next_idx = idx + 1;
+        while (next_idx < g_ui.file_count && g_files[next_idx].is_dir) next_idx++;
+
         g_ui_screen = UI_SCR_PLAYER;
         g_ui.play_file     = g_files[idx];
-        g_ui.play_has_prev = (idx > 0) ? 1u : 0u;
-        g_ui.play_has_next = (idx + 1 < g_ui.file_count) ? 1u : 0u;
+        g_ui.play_has_prev = (prev_idx >= 0) ? 1u : 0u;
+        g_ui.play_has_next = (next_idx < g_ui.file_count) ? 1u : 0u;
         int rc = openfw_play_file_ui(&g_exfat_vol, g_file_dirs[idx], g_files[idx].filename, &g_ui);
         keys_ignore_held();
         g_files[idx].unplayed   = 0u;
@@ -1221,10 +1521,10 @@ static void play_file_at_index(int start_idx)
             g_ui.file_scroll = g_ui.file_sel - 2;
         }
 
-        if (rc == 1 && idx + 1 < g_ui.file_count) {
-            idx++;
-        } else if (rc == -1 && idx > 0) {
-            idx--;
+        if (rc == 1 && next_idx < g_ui.file_count) {
+            idx = next_idx;
+        } else if (rc == -1 && prev_idx >= 0) {
+            idx = prev_idx;
         } else {
             break;
         }
@@ -1944,9 +2244,17 @@ int openfw_main(void)
                 case UI_SCR_FILES:
                     if (rising || repeat) {
                         if (key == KEY_BACK) {
-                            scr         = UI_SCR_HOME;
-                            g_ui_screen = (uint32_t)scr;
-                            dirty       = 1;
+                            if (g_browse_dir[0] != '\0') {
+                                /* Return from subfolder to parent / root Files list */
+                                g_browse_dir[0]  = '\0';
+                                g_ui.file_sel    = g_root_file_sel;
+                                g_ui.file_scroll = g_root_file_scroll;
+                                reload_files_and_sd_stats();
+                            } else {
+                                scr         = UI_SCR_HOME;
+                                g_ui_screen = (uint32_t)scr;
+                            }
+                            dirty = 1;
                         } else if ((key == KEY_LEFT || key == KEY_VOL_UP) && g_ui.file_count > 0) {
                             if (g_ui.file_sel > 0) {
                                 g_ui.file_sel--;
@@ -1970,21 +2278,35 @@ int openfw_main(void)
                     } else if (enter_press_ms != 0u && !enter_long_fired &&
                                (key == KEY_ENTER || prev_key == KEY_ENTER) &&
                                (uint32_t)(t - enter_press_ms) >= 600u) {
-                        enter_long_fired = 1;
-                        enter_press_ms   = 0u;
-                        del_armed        = key == KEY_NONE;
-                        g_ui.del_hold_pct = 0u;
-                        g_ui.del_holding  = 0u;
-                        scr               = UI_SCR_DELETE;
-                        g_ui_screen       = (uint32_t)scr;
-                        dirty             = 1;
+                        if (g_ui.file_count > 0 && !g_files[g_ui.file_sel].is_dir) {
+                            enter_long_fired = 1;
+                            enter_press_ms   = 0u;
+                            del_armed        = key == KEY_NONE;
+                            g_ui.del_hold_pct = 0u;
+                            g_ui.del_holding  = 0u;
+                            scr               = UI_SCR_DELETE;
+                            g_ui_screen       = (uint32_t)scr;
+                            dirty             = 1;
+                        }
                     } else if (key != KEY_ENTER && prev_key == KEY_ENTER && enter_press_ms != 0u && !enter_long_fired) {
                         enter_press_ms = 0u;
                         if (g_ui.file_count > 0) {
-                            play_file_at_index(g_ui.file_sel);
-                            g_ui_screen = (uint32_t)scr;
-                            dirty       = 1;
-                            modal_done  = 1;
+                            if (g_files[g_ui.file_sel].is_dir) {
+                                if (g_browse_dir[0] == '\0') {
+                                    g_root_file_sel    = g_ui.file_sel;
+                                    g_root_file_scroll = g_ui.file_scroll;
+                                }
+                                copy_cstr(g_browse_dir, (int)sizeof(g_browse_dir), g_file_dirs[g_ui.file_sel]);
+                                g_ui.file_sel    = 0;
+                                g_ui.file_scroll = 0;
+                                reload_files_and_sd_stats();
+                                dirty = 1;
+                            } else {
+                                play_file_at_index(g_ui.file_sel);
+                                g_ui_screen = (uint32_t)scr;
+                                dirty       = 1;
+                                modal_done  = 1;
+                            }
                         }
                     }
                     break;

@@ -24,7 +24,7 @@
 
 #define CPU1_CMD_RENDER        1u
 #define CPU1_CMD_REC_LIVE      2u
-#define CPU1_MAX_FILES         32u
+#define CPU1_MAX_FILES         96u
 
 typedef struct {
     ui_screen_id_t  scr;
@@ -61,7 +61,7 @@ volatile uint32_t g_ui_heap_used      = 0u;
 #define CPU1_STACK_WORDS 768u /* 3 KiB stack for LVGL + EEZ rendering */
 
 static uint32_t       g_cpu1_stack[CPU1_STACK_WORDS] __attribute__((aligned(8)));
-static cpu1_ui_slot_t s_slots[2];
+static cpu1_ui_slot_t s_slots[2] OPENFW_SRAM_HI;
 
 static volatile uint32_t s_req_word          = 0u;    /* (seq << 1) | slot_idx */
 static volatile uint32_t s_ack_seq           = 0u;
@@ -434,12 +434,13 @@ int cpu1_ui_start(void)
     }
 
     /* Enable SL6801 Hardware IPC Mailbox (0x40070000) ch0 CPU0 -> CPU1 for WFE wakeups */
+    rom_rst_hold(CRU_RST_IPC_MBOX);
     rom_rst_release(CRU_RST_IPC_MBOX);
     rom_clk_enable(CRU_CLK_IPC_MBOX);
     MBOX_CFG         = (MBOX_CFG & ~0x10u) | 0x01u;
     MBOX_CPU0_IRQ_EN &= ~0x03u;
     MBOX_CPU1_IRQ_EN = (MBOX_CPU1_IRQ_EN & ~0x02u) | 0x01u;
-    while ((MBOX_CH_CNT(0u) & 7u) >= 2u) {
+    for (int d = 0; d < 8 && (MBOX_CH_CNT(0u) & 7u) >= 2u; d++) {
         (void)MBOX_CH_DATA(0u);
         (void)MBOX_CH_DATA(0u);
     }

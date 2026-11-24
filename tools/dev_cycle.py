@@ -204,9 +204,16 @@ def cmd_flash(args: argparse.Namespace) -> int:
         print("Building open_fw + 2M image...")
         subprocess.run(["make", "-C", str(OPENFW_DIR), "all", "update-up"], check=True)
 
-    firm_len = FIRM_BIN.stat().st_size
-    start_off, length = compute_openfw_flash_range(firm_len)
     image_bytes = IMAGE_2M.read_bytes()
+    # Read exact FIRM length from the partition table inside IMAGE_2M (offset 0x00D018)
+    # so flashing DEV_EXP=1 images under sudo never truncates based on a stale FIRM_BIN path.
+    import struct as _struct
+    pt_magic, pt_off, pt_len = _struct.unpack_from("<4sII", image_bytes, PARTITION_TABLE_OFF + 0x10)
+    if pt_magic == b"FIRM" and pt_off == FIRM_PART_OFF and pt_len > 0:
+        firm_len = pt_len
+    else:
+        firm_len = FIRM_BIN.stat().st_size
+    start_off, length = compute_openfw_flash_range(firm_len)
     print(
         f"Safe partial flash range: 0x{start_off:06X}..0x{start_off + length:06X} "
         f"({length:,} B, preserving HLKJ & PSMP)"

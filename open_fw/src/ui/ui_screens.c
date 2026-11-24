@@ -76,6 +76,45 @@ static const char *screen_off_name(uint8_t idx)
     return (idx < 5u) ? names[idx] : "30s";
 }
 
+static int is_generic_recording_name(const char *name)
+{
+    if (!name || name[0] == '\0') return 1;
+    /* "REC_..." (case-insensitive) or timestamp "202..." -> show friendly date label */
+    char c0 = name[0], c1 = name[1], c2 = name[2], c3 = name[3];
+    if (c0 >= 'a' && c0 <= 'z') c0 = (char)(c0 - ('a' - 'A'));
+    if (c1 >= 'a' && c1 <= 'z') c1 = (char)(c1 - ('a' - 'A'));
+    if (c2 >= 'a' && c2 <= 'z') c2 = (char)(c2 - ('a' - 'A'));
+    if (c0 == 'R' && c1 == 'E' && c2 == 'C' && c3 == '_') return 1;
+    if (c0 >= '0' && c0 <= '9' && c1 >= '0' && c1 <= '9' &&
+        c2 >= '0' && c2 <= '9' && c3 >= '0' && c3 <= '9') {
+        return 1;
+    }
+    return 0;
+}
+
+static void format_file_title(char *dst, int cap,
+                              const rtc_datetime_t *now, const ui_file_entry_t *f)
+{
+    if (!dst || cap <= 0) return;
+    if (!f || is_generic_recording_name(f->filename)) {
+        ui_format_date_label(dst, cap, now, f ? &f->dt : now);
+        return;
+    }
+    int len = 0;
+    while (f->filename[len] != '\0') len++;
+    if (len >= 4 && f->filename[len - 4] == '.') {
+        len -= 4;
+    }
+    int out = 0;
+    for (int i = 0; i < len && out < cap - 1; i++) {
+        char c = f->filename[i];
+        if (c == '_') c = ' ';
+        if (c == ' ' && (out == 0 || dst[out - 1] == ' ')) continue;
+        dst[out++] = c;
+    }
+    dst[out] = '\0';
+}
+
 void ui_settings_defaults(ui_settings_t *cfg)
 {
     cfg->reserved0      = 0u;
@@ -409,8 +448,8 @@ static void bind_home_detail(const ui_model_t *m, unsigned page, lv_obj_t *title
             lv_snprintf(l1, sizeof(l1), "Nothing played yet");
             col1 = UI_HEX_DIM;
         } else {
-            char dt_s[24], dur_s[12], res_s[12];
-            ui_format_date_label(dt_s, (int)sizeof(dt_s), &m->now, &m->last_file.dt);
+            char dt_s[28], dur_s[12], res_s[12];
+            format_file_title(dt_s, (int)sizeof(dt_s), &m->now, &m->last_file);
             ui_format_duration(dur_s, (int)sizeof(dur_s), m->last_file.duration_sec);
             lv_snprintf(l1, sizeof(l1), "%s \xC2\xB7 %s", dt_s, dur_s);
             if (m->last_file.resume_sec > 0u) {
@@ -691,7 +730,8 @@ static void bind_files(const ui_model_t *m)
     bind_status_bar(objects.files_bar, objects.files_bar_ic, objects.files_bar_l, objects.files_bar_sub,
                     objects.files_bar_r, objects.files_bar_hp, objects.files_batt,
                     objects.files_batt_fill, objects.files_batt_nub,
-                    m, UI_COL_BAR, UI_COL_TEXT, UI_ICON_NONE, UI_COL_TEXT, "Files", sub, NULL, 0);
+                    m, UI_COL_BAR, UI_COL_TEXT, UI_ICON_NONE, UI_COL_TEXT,
+                    m->files_title[0] ? m->files_title : "Files", sub, NULL, 0);
 
     lv_obj_t *rows[3]   = { objects.files_row_0, objects.files_row_1, objects.files_row_2 };
     lv_obj_t *dots[3]   = { objects.files_dot_0, objects.files_dot_1, objects.files_dot_2 };
@@ -710,21 +750,33 @@ static void bind_files(const ui_model_t *m)
         int sel = (idx == m->file_sel);
         set_changed_bg_opa(rows[r], sel ? LV_OPA_COVER : LV_OPA_TRANSP);
 
-        if (f->unplayed) {
+        if (f->is_dir) {
+            set_changed_bg_opa(dots[r], LV_OPA_COVER);
+            set_changed_bg_color(dots[r], lv_color_hex(sel ? UI_HEX_TEXT : UI_HEX_AMBER));
+        } else if (f->unplayed) {
             set_changed_bg_opa(dots[r], LV_OPA_COVER);
             set_changed_bg_color(dots[r], lv_color_hex(sel ? UI_HEX_TEXT : UI_HEX_CYAN));
         } else {
             set_changed_bg_opa(dots[r], LV_OPA_TRANSP);
         }
 
-        char dt_lbl[28], dur[14];
-        ui_format_date_label(dt_lbl, (int)sizeof(dt_lbl), &m->now, &f->dt);
-        ui_format_duration(dur, (int)sizeof(dur), f->duration_sec);
+        char dt_lbl[28], dur[16];
+        format_file_title(dt_lbl, (int)sizeof(dt_lbl), &m->now, f);
+        if (f->is_dir) {
+            if (f->duration_sec > 0u) {
+                lv_snprintf(dur, sizeof(dur), "%u \xE2\x96\xB6", (unsigned)f->duration_sec);
+            } else {
+                lv_snprintf(dur, sizeof(dur), "DIR \xE2\x96\xB6");
+            }
+        } else {
+            ui_format_duration(dur, (int)sizeof(dur), f->duration_sec);
+        }
         set_changed_text(names[r], dt_lbl);
         set_changed_text(durs[r], dur);
-        set_changed_text_color(durs[r], lv_color_hex(sel ? UI_HEX_CYAN : UI_HEX_DIM));
+        set_changed_text_color(durs[r], lv_color_hex(f->is_dir ? (sel ? UI_HEX_TEXT : UI_HEX_AMBER)
+                                                               : (sel ? UI_HEX_CYAN : UI_HEX_DIM)));
 
-        if (f->has_transcript) {
+        if (!f->is_dir && f->has_transcript) {
             set_hidden(badges[r], false);
             set_changed_bg_color(badges[r], lv_color_hex(sel ? UI_HEX_TEXT : UI_HEX_FAINT));
             set_changed_text_color(badges[r], lv_color_hex(sel ? UI_HEX_PILL : UI_HEX_TEXT));
@@ -1048,7 +1100,7 @@ static void bind_player(const ui_model_t *m, bool entering)
                     m, UI_COL_BAR, st_c, st_ic, st_c, st_t, NULL, NULL, 0);
 
     char dt_s[28], vbuf[16], pos_s[14], tmp[12], tot_s[16], ftxt[48];
-    ui_format_date_label(dt_s, (int)sizeof(dt_s), &m->now, &m->play_file.dt);
+    format_file_title(dt_s, (int)sizeof(dt_s), &m->now, &m->play_file);
     set_changed_text(objects.player_date, dt_s);
 
     uint8_t  vol    = m->hp_plugged ? m->cfg.hp_vol : m->cfg.spk_vol;
@@ -1093,7 +1145,7 @@ static void bind_delete(const ui_model_t *m)
     const ui_file_entry_t *f = &m->play_file;
     if (m->files && m->file_sel >= 0 && m->file_sel < m->file_count) f = &m->files[m->file_sel];
     char dt_s[28], dur_s[12], sub[52];
-    ui_format_date_label(dt_s, (int)sizeof(dt_s), &m->now, &f->dt);
+    format_file_title(dt_s, (int)sizeof(dt_s), &m->now, f);
     ui_format_duration(dur_s, (int)sizeof(dur_s), f->duration_sec);
     lv_snprintf(sub, sizeof(sub), "%s \xC2\xB7 %s", dur_s, f->filename);
     set_changed_text(objects.del_date, dt_s);
