@@ -106,6 +106,22 @@ P. **Phone mode end to end** (`test_bt_host phone IMG`, its own process; IMG = a
    Debug aids: `BTH_PHONE_DUMP=1` (bond file text, down-job step times on a failed stop), `BTH_HEAP_TRACE=1` (call
    stacks of leaked blocks: `bth_heap_dump_since()`, symbolise with `addr2line -f -e test_bt_host`).
 
+H. **Headphones-path smoke** (`test_bt_host_hp hp`, docs/BT_A2DP_DESIGN.md milestone H2): the same harness linked
+   with `bt_ctrl_cmds.c` built with `-DBT_CTRL_EXP1_PASSED_LIST=BT_CTRL_HP_GATE_LIST` (0401 0402 0405 0408 forwarded;
+   only that object differs, `bt_ctrl_cmds_hpgates.o`). The fake ROM's scripted peer is a discoverable headset (CoD
+   0x240418, "HP-Fake") next to a phone and a speaker that does not answer names (`fake_rom_add_device`). 84 checks:
+   - H1 enable + SPP (client side only), page scan on then off (`bt_ctrl_scan_enable()` 0x02 -> 0x00, design §6.2);
+   - H2 `esp_bt_gap_start_discovery`: one `0401`, three results, one Inquiry Complete, BTA's name pass (three `0419`,
+     all after Inquiry Complete, none SAVED), the headset's name and CoD and the phone's name reach the GAP callback,
+     the speaker stays nameless (page timeout);
+   - H3 discovery cancelled while the inquiry runs: `0402` reaches the ROM as `E001` with no payload, the deferred
+     CC ends the discovery, no Inquiry Complete;
+   - H4 `esp_spp_start_discovery(headset)`: `0405` (allow role switch 0, R1, Bluedroid's packet types), ACL up as
+     master (`bt_ctrl_link_info`: outgoing, master), set-up reads `041F 041D 041B 041C` forwarded, `080D 0C37 040F`
+     refused locally, the headset refuses the SDP channel (PSM not supported), Bluedroid drops the idle link (`0406`);
+   - H5 teardown back to the heap / task / esp_timer baseline (taken after a warm-up cycle: btc_spp keeps resident
+     objects after its first init); no unknown opcode, ROM id without packer, deadline, BT fault or HCI timeout.
+
 **Allocation-failure sweeps** (`run_sweep.py --mode M`, `test_bt_host sweep-count|sweep-one N M`): one per lifecycle
 call `esp_bluedroid_<M>()`, M = init, enable, disable, deinit. The stack is brought to the state before the call, the
 call's allocation attempts (all tasks) are counted, and each is failed in turn in its own process. A point passes when

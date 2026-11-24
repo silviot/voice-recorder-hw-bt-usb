@@ -18,7 +18,7 @@ $(PICOLIBC)/lib/libc.a $(PICOLIBC)/lib/libclang_rt_min.a: tools/build_picolibc.s
 $(BT_BUILD)/bt_link_roots.o $(BT_BUILD)/libbluedroid.a $(BT_BUILD)/libbt_port.a: bt-fw-libs ; @:
 .PHONY: bt-fw-libs check-bt-link-roots
 bt-fw-libs: $(PICOLIBC)/lib/libc.a
-	$(MAKE) -f bt/Makefile.bluedroid fw BUILD_DIR=$(BT_BUILD) PICOLIBC=$(PICOLIBC) HCI_PROBE=$(HCI_PROBE) BENCH=$(or $(BENCH),0) \
+	$(MAKE) -f bt/Makefile.bluedroid fw BUILD_DIR=$(BT_BUILD) PICOLIBC=$(PICOLIBC) HCI_PROBE=$(HCI_PROBE) BENCH=$(or $(BENCH),0) HP_GATES=$(or $(HP_GATES),0) \
 		HCI_PROBE_WAIVE_LIVENESS=$(or $(HCI_PROBE_WAIVE_LIVENESS),0) HCI_PROBE_AUTORUN=$(or $(HCI_PROBE_AUTORUN),0)
 
 check-bt-link-roots: $(BUILD_DIR)/open_fw.elf

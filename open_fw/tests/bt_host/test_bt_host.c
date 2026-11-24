@@ -9,6 +9,8 @@
  *   test_bt_host cycles N        the leak loop with N cycles
  *   test_bt_host phone IMG       phone mode end to end (tests/bt_host/test_phone.c): the BT=1 XREC backend over this
  *                                stack and the fake ROM's scripted laptop; IMG = a 4096-sector exFAT image (SD card)
+ *   test_bt_host_hp hp           headphones-path smoke (tests/bt_host/test_hp_link.c): inquiry, names, cancel, page,
+ *                                disconnect, with bt_ctrl's BT_CTRL_HP_GATE_LIST rows forwarded
  *   test_bt_host sweep-count [M] prints "SWEEP_ALLOCS <M> <n>": allocation attempts made while the call under test
  *                                runs; M = init | enable (default) | disable | deinit (esp_bluedroid_<M>())
  *   test_bt_host sweep-one N [M] one cycle with the N-th allocation attempt of that call failing; exit 0 when the call
@@ -601,6 +603,7 @@ static int sweep_one(const baseline_t *base, sweep_mode_t m, uint64_t n)
 int s_argc;
 char **s_argv;
 int bth_phone_scenario(const char *img_path);   /* test_phone.c */
+int bth_hp_scenario(void);                      /* test_hp_link.c (test_bt_host_hp: headphones rows forwarded) */
 
 extern char _end[];   /* end of .bss (GNU ld) */
 
@@ -640,6 +643,13 @@ void bth_test_task(void *arg)
         rc = g_fail ? 1 : 0;
     } else if (strcmp(mode, "phone") == 0 && s_argc > 2) {
         rc = bth_phone_scenario(s_argv[2]) == 0 ? 0 : 1;
+    } else if (strcmp(mode, "hp") == 0) {
+        if (bt_ctrl_cmds_eff(bt_ctrl_cmds_lookup(0x0401u)) != BTC_FWD) {
+            bth_log("hp: this binary refuses the headphones rows (run test_bt_host_hp)\n");
+            rc = 2;
+        } else {
+            rc = bth_hp_scenario() == 0 ? 0 : 1;
+        }
     } else if (strcmp(mode, "cycles") == 0 && s_argc > 2) {
         scenario_cycles(&base, atoi(s_argv[2]));
         rc = g_fail ? 1 : 0;
