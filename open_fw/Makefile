@@ -81,6 +81,12 @@ $(error BENCH=1 requires BT=1 without HCI_PROBE=1)
 endif
 CFLAGS   += -DOPENFW_BT_BENCH_IMAGE=1
 endif
+# HP_GATES=1 (with BENCH=1): bt_ctrl forwards the headphones rows 0401 0402 0405 0408 (bt/Makefile.bluedroid).
+ifeq ($(HP_GATES),1)
+ifneq ($(BENCH),1)
+$(error HP_GATES=1 requires BENCH=1)
+endif
+endif
 
 LVGL_CFLAGS := --target=thumbv7em-none-eabi -mcpu=cortex-m4 -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb \
                -O2 -ffreestanding -fno-builtin -fno-stack-protector \

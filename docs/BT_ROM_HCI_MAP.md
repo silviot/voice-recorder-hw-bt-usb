@@ -163,7 +163,12 @@ These two layouts are therefore read from the ROM senders only (ROM `0x3F01E`, `
 Status of these items in `bt_ctrl` (2026-11-24): 1 → dead-handle rule and forwarded-command deadline
 (`BT_CTRL_OPCODE_TABLE.md` §2 rules 8–9); 2 → the deadline is 7 s, so a command SAVED for longer (an RNR behind a
 long inquiry) is answered `0x22`, which Bluedroid would otherwise turn into an 8 s command timeout and a BT fault;
-3 → `0402`/`0C37` stay gated; 5 → `0434` is FWD; 6 → `040F` stays gated; 8 → still open (inquiry mode 0 only).
+3 → `0402`/`0C37` stay gated (`0402` has its zero-length layout since 2026-11-25 and forwards with
+`BT_CTRL_HP_GATE_LIST`); 5 → `0434` is FWD; 6 → `040F` stays gated; 8 → the `E0D6`/`E0D7` packers exist since
+2026-11-25 (layouts from §3, never exercised by any firmware), inquiry stays in mode 0 (page-0 bit 30 masked, `0C45`
+REJ). The fake ROM (`tests/fake_rom.c` `hp_handle`) models the §2 LM-state rules of `0401 0402 0405 0408 0419`
+(SAVED in states 1/2, `0x3A`, `0x0C` while paging or inquiring, the deferred `0402` CC without `E0D0`, `0408`
+before and after the page completes) for `test_bt_ctrl` `hp_*` and `test_bt_host_hp hp`.
 Follow-up to 2 (review finding, same day): replies are matched on the opcode alone, so after a `0x22` deadline reply
 a NEW command with the same opcode must not reach the ROM while the old one's late reply can still come (the late
 reply would be delivered as the new command's, and the new command's own reply swallowed as "late": the realistic case

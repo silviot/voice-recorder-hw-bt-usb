@@ -76,6 +76,21 @@ ifeq ($(BENCH),1)
 XREC_SRCS += $(ROOT)/bt_port/bt_bench.c $(ROOT)/bt_port/bt_bench_fw.c
 endif
 BENCH_STAMP := $(BUILD_DIR)/.bench_flags
+# HP_GATES=1 (bench images only): bt_ctrl forwards the headphones rows 0401 0402 0405 0408 (BT_CTRL_HP_GATE_LIST,
+# docs/BT_A2DP_DESIGN.md §7) for silicon Exp 4a/4b. Release images keep them refused. The stamp rebuilds bt_ctrl_cmds.o
+# when it changes in the same BUILD_DIR.
+HP_GATES ?= 0
+ifeq ($(HP_GATES),1)
+ifneq ($(BENCH),1)
+$(error HP_GATES=1 requires BENCH=1)
+endif
+GATE_FLAGS := -DBT_CTRL_EXP1_PASSED_LIST=BT_CTRL_HP_GATE_LIST
+else
+GATE_FLAGS :=
+endif
+GATE_STAMP := $(BUILD_DIR)/.gate_flags
+$(BUILD_DIR)/bt_port/bt_ctrl_cmds.o: CFLAGS += $(GATE_FLAGS)
+$(BUILD_DIR)/bt_port/bt_ctrl_cmds.o: $(GATE_STAMP)
 # ROM RNG hook pool (bt_rom_real.c, both ROM images); phone mode also gets the mic entropy source and the P-192 session
 # key that replaces the ROM's fixed SSP key (docs/BT_ROM_INTERFACE.md §2.3).
 PROBE_SRCS += $(ROOT)/bt_port/bt_rom_rng.c
@@ -103,6 +118,10 @@ endif
 $(BENCH_STAMP): probe-flags-force
 	@mkdir -p $(dir $@)
 	@printf '%s\n' '$(BENCH_FLAGS)' > $@.tmp
+	@if cmp -s $@.tmp $@ 2>/dev/null; then rm -f $@.tmp; else mv $@.tmp $@; fi
+$(GATE_STAMP): probe-flags-force
+	@mkdir -p $(dir $@)
+	@printf '%s\n' '$(GATE_FLAGS)' > $@.tmp
 	@if cmp -s $@.tmp $@ 2>/dev/null; then rm -f $@.tmp; else mv $@.tmp $@; fi
 $(PROBE_STAMP): probe-flags-force
 	@mkdir -p $(dir $@)

@@ -6,7 +6,7 @@
 
 enum {
     FIX_NONE = 0, FIX_S_H, FIX_S_H_B, FIX_CONN_CMP, FIX_REM_FEAT, FIX_REM_VER, FIX_USER_CONF, FIX_CC_S_H, FIX_S_H_W,
-    FIX_MODE, FIX_EXT_FEAT, FIX_QOS, FIX_FLOW, FIX_RNR, FIX_INQ_RES,
+    FIX_MODE, FIX_EXT_FEAT, FIX_QOS, FIX_FLOW, FIX_RNR, FIX_INQ_RES, FIX_INQ_RSSI, FIX_INQ_EIR,
 };
 
 typedef struct {
@@ -24,9 +24,12 @@ typedef struct {
  *   S = stock reply tables RAM 0x8178E0 (LM, E065..E0D4) / 0x817628 (LC, E427..E47C) and the stock packer each entry
  *       points to (FW 0xD5860C generic CC, 0xD59189 generic CS, 0xD591E0..0xD596AC events), static only.
  * ROM reply structs are naturally aligned (BT_ROM_INTERFACE §5.1): every FIX_* below is the stock packer's de-padding.
- * Not packed (counted in rom_unknown_ids if they ever arrive): E0D6/E0D7 (RSSI/EIR inquiry results: no stock packer,
- * inquiry mode stays 0), E46E/E46F (0x2C/0x2D synchronous links: no SCO/eSCO in the build), E470 (0x2E sniff subrating:
- * no sniff), E454/E455 (stock-synthesised TASK_HCI -> TASK_HCI replies, never sent by the ROM). */
+ *   R = read from the ROM senders only (docs/BT_ROM_HCI_MAP.md §3): E0D6/E0D7, the inquiry results of modes 1/2. The
+ *       stock firmware has no packer for them and never sent 0C45; they stay unreachable while page-0 bit 30 is masked
+ *       (bt_ctrl_cmds_features_p0), and are packed here so a peer-independent probe of 0C45 has them.
+ * Not packed (counted in rom_unknown_ids if they ever arrive): E46E/E46F (0x2C/0x2D synchronous links: no SCO/eSCO in
+ * the build), E470 (0x2E sniff subrating: no sniff), E454/E455 (stock-synthesised TASK_HCI -> TASK_HCI replies, never
+ * sent by the ROM). */
 static const evt_row_t k_evt[] = {
     /* Command Complete (status first, then return parameters) */
     { 0xE079u, BT_CTRL_EVK_CC, 0u, 0x0C01u, 1u, 1u, FIX_NONE },      /* L */
@@ -73,6 +76,8 @@ static const evt_row_t k_evt[] = {
     /* Events */
     { 0xE0D0u, BT_CTRL_EVK_EVT, 0x01u, 0u,  1u,  1u, FIX_NONE },      /* S: Inquiry Complete */
     { 0xE0D1u, BT_CTRL_EVK_EVT, 0x02u, 0u, 15u, 16u, FIX_INQ_RES },   /* S: Inquiry Result (mode 0), map §3 */
+    { 0xE0D6u, BT_CTRL_EVK_EVT, 0x22u, 0u, 15u, 15u, FIX_INQ_RSSI },  /* R: Inquiry Result with RSSI (mode 1/2) */
+    { 0xE0D7u, BT_CTRL_EVK_EVT, 0x2Fu, 0u, 255u, 15u, FIX_INQ_EIR },  /* R: Extended Inquiry Result (mode 2 + EIR) */
     { 0xE0D2u, BT_CTRL_EVK_EVT, 0x03u, 0u, 11u, 13u, FIX_CONN_CMP },  /* L */
     { 0xE456u, BT_CTRL_EVK_EVT, 0x03u, 0u, 11u, 13u, FIX_CONN_CMP },  /* L */
     { 0xE457u, BT_CTRL_EVK_EVT, 0x04u, 0u, 10u, 10u, FIX_NONE },      /* L */
@@ -255,6 +260,17 @@ uint16_t bt_ctrl_evt_pack(uint16_t id, const uint8_t *param, uint16_t param_len,
         o[13] = param[14];
         o[14] = param[15];
         break;
+    case FIX_INQ_RSSI:                  /* {num, bdaddr, psrm, rsvd, cod[3], u16 clkoff@0xC, i8 rssi@0xE} = wire 0x22 */
+        memcpy(o, param, 15u);
+        o[0] = 1u;                      /* one response per message; the EC05 mode-0 path leaves num 0 (map §3) */
+        break;
+    case FIX_INQ_EIR: {                 /* as E0D6, then eir[240]@0xF = wire 0x2F; a short message is zero-filled */
+        uint16_t n = param_len < 255u ? param_len : 255u;
+        memcpy(o, param, n);
+        memset(&o[n], 0, 255u - n);
+        o[0] = 1u;
+        break;
+    }
     default:
         memcpy(o, param, r->out_len);
         break;

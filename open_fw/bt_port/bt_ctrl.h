@@ -84,6 +84,11 @@ enum {
     BT_CTRL_NOTE_DISC_CMD,         /* the host's 0406 Disconnect answered: handle, status; local = not by the ROM */
     BT_CTRL_NOTE_NAME_CMD,         /* the host's 0419 Remote Name Request answered (CS): status; local = not by the ROM */
     BT_CTRL_NOTE_NAME,             /* Remote Name Request Complete from the ROM: status, reason = name length (<= 248) */
+    /* headphones path (docs/BT_A2DP_DESIGN.md §7; the host only sends these with the BT_CTRL_HP_GATE_LIST rows): */
+    BT_CTRL_NOTE_INQ_CMD,          /* the host's 0401 Inquiry answered (CS): status; local = not by the ROM */
+    BT_CTRL_NOTE_INQ_DONE,         /* Inquiry Complete from the ROM: status, reason = results seen (<= 255) */
+    BT_CTRL_NOTE_PAGE_CMD,         /* the host's 0405 Create Connection answered (CS): status; local = not by the ROM */
+    BT_CTRL_NOTE_ROLE,             /* Role Change from the ROM: handle (0 if unknown), status, reason = new role */
 };
 
 /* Newest remote name a successful Remote Name Request Complete carried (any request: BTM's security name request at
@@ -97,6 +102,27 @@ typedef struct {
 } bt_ctrl_note_t;
 
 #define BT_CTRL_NOTE_LINE 64u      /* bt_ctrl_note_format() buffer size that always fits */
+
+/* ---- per-link controller view (bt_ctrl_link_info), for the headphones session's linkinfo line and credit-stall
+ * watchdog (docs/BT_A2DP_DESIGN.md §4.4, §4.6, §10.2). Kept per ROM handle 0x80..0x86, from the events bt_ctrl packs;
+ * reset with the controller (HCI Reset) and when a new link takes the handle. ---- */
+#define BT_CTRL_ROLE_MASTER  0x00u  /* HCI role values (Role Change event, 0409 Role parameter) */
+#define BT_CTRL_ROLE_SLAVE   0x01u
+#define BT_CTRL_ROLE_UNKNOWN 0xFFu
+typedef struct {
+    uint8_t  up;                   /* successful Connection Complete seen, no Disconnection Complete since */
+    uint8_t  outgoing;             /* the link came from the host's 0405 (we paged) */
+    uint8_t  role;                 /* BT_CTRL_ROLE_*: master for an outgoing link, the 0409 Role parameter for an
+                                      accepted one, then every successful Role Change */
+    uint8_t  role_changes;         /* Role Change events (any status) */
+    uint8_t  max_slots;            /* last Max Slots Change (0 = none seen) */
+    uint8_t  mode;                 /* last successful Mode Change: 0 active, 1 hold, 2 sniff */
+    uint16_t pkt_type;             /* last successful Connection Packet Type Changed (0 = none seen) */
+    uint8_t  bda[6];               /* Bluedroid BD_ADDR order (most significant byte first) */
+    uint32_t acl_sent;             /* host ACL packets handed to the ROM on this link */
+    uint32_t acl_completed;        /* ...completed by the ROM's NOCP (cumulative, counted before the host sees them) */
+    uint32_t nocp_last_ms;         /* now_ms() at the last NOCP for this link (0 without a clock or before the first) */
+} bt_ctrl_link_info_t;
 
 /* ---- lifecycle results ---- */
 #define BT_CTRL_STOP_PENDING  (-1)
@@ -208,6 +234,17 @@ int      bt_ctrl_note_pop(bt_ctrl_note_t *out);
  * Any task. */
 int      bt_ctrl_peer_name(uint8_t bda[6], char *name, uint16_t cap);
 uint16_t bt_ctrl_note_format(const bt_ctrl_note_t *n, char *buf, uint16_t cap);
+
+/* Snapshot of handle h (0x80..0x86) for any task. Returns 1 if h is a ROM ACL handle (the record may be all zero:
+ * never used this controller session), 0 otherwise. */
+int      bt_ctrl_link_info(uint16_t h, bt_ctrl_link_info_t *out);
+/* The scan value of the last 0C1A Write Scan Enable the ROM accepted this controller session (0 after HCI Reset):
+ * 0x01 inquiry scan, 0x02 page scan. The headphones session turns page scan off around 0401/0405 (design §6.2) and
+ * logs/asserts it with this. Any task. */
+uint8_t  bt_ctrl_scan_enable(void);
+/* Inquiry state as bt_ctrl saw it: 1 from a successful 0401 CS until Inquiry Complete or the 0402 CC (the ROM answers
+ * 0405 with 0x0C meanwhile, BT_ROM_HCI_MAP.md §2), else 0. Any task. */
+int      bt_ctrl_inquiry_active(void);
 
 /* Session log lines (no newline; return the length; truncated within cap). Fault: "BT bt_ctrl fault, first code N
  * site S a=0x........ b=0x........", this session's first fault with its site and values read together (all 0 when

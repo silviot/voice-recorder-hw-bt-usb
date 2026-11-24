@@ -266,7 +266,7 @@ the feature masks in §3.6 make them unreachable or conditional, so they are cla
 | `0C47` | Write Page Scan Type | `D:452`, unreachable (bit 29 cleared) | REJ | `CC(4)` | `s` | candidate `E049` | — |
 | `0C05` | Set Event Filter | `I:870,1567`: type `01`, condition `00` (all devices), or type `00` (clear) | SYN when the parameters are exactly `(01,00)` or `(00)`, else REJ | `CC(4)` | `s` | none. Exact: `bt_ctrl` never forwards a filter, so the controller is always at its default (no filter). A failure would end inquiry (`U:1293–1298`, `I:1620–1647`). | — |
 | `0401` | Inquiry | `I:1718` | FWD → REJ | `CS` → `0x02`…, `0x01` | `s, 01, 0401` | `E000` (5 B) → CS `E0C7`; `0x02` (`E0D1`, mode 0) and `0x01` (`E0D0`) now packed. A CS failure tells BTM the inquiry is done (`U` default case). | G-C |
-| `0402` | Inquiry Cancel | `I:748,1314` | FWD → REJ | `CC(4)` | `s` | `E001` (no parameters: needs zero-length FWD support) → CC `E066`, deferred until the LD stops. After a REJ, BTU still treats any CC as cancel-complete (`U:1290–1292`), while the inquiry runs until its duration ends. | G-C |
+| `0402` | Inquiry Cancel | `I:748,1314` | FWD → REJ | `CC(4)` | `s` | `E001` (no parameters; zero-length layout in `bt_ctrl_cmds.c` `k_fwd_zero_len`, as the stock `ke_msg_send_basic`) → CC `E066`, deferred until the LD stops. After a REJ, BTU still treats any CC as cancel-complete (`U:1290–1292`), while the inquiry runs until its duration ends. | G-C |
 | `0403` | Periodic Inquiry Mode | `I:1702`, explicit API only (unused) | REJ | `CC(4)` | `s` | candidate `E002` | — |
 | `0404` | Exit Periodic Inquiry Mode | `I:559`, only after `0403` | REJ | `CC(4)` | `s` | stock slot zero | — |
 | `0419` | Remote Name Request | `I:2116,2131,2137`, `S:5002` | FWD | `CS` → `0x07` | `s, 01, 0419` | `E00C` (10 B) → CS `E0CB`; terminal `E0D3` → `0x07` (255 B verbatim), optionally preceded by `E47C` → `0x3D`. LM SAVES it while LM state ≠ 0 (e.g. during an inquiry). A CS failure completes the name and security paths (`U` default case). | V-C |
@@ -405,6 +405,25 @@ fails. Clearing page-0 bit 54 also keeps `0C5F` unreachable if a future change l
     Still gated: `040F 0C37 0C28` (not needed by the phone path, risky ROM behaviour, see their rows), the inquiry and
     connection-creation rows (headphones path) and the G-B visibility writes. All gated rows now carry their reply id,
     and `bt_ctrl_init()` checks that every reply id in the table is packed back to its own opcode.
+
+12. **Headphones rows (2026-11-25, `docs/BT_A2DP_DESIGN.md` §7 milestone H2).** `0401 0402 0405 0408` keep `REJ` in
+    the default build and are forwarded with `-DBT_CTRL_EXP1_PASSED_LIST=BT_CTRL_HP_GATE_LIST` (host tests; bench
+    images with `make BT=1 BENCH=1 HP_GATES=1` for Exp 4a/4b). Every one of them validates with the gate on: ids,
+    payload sizes and reply ids are "exact" in `BT_ROM_HCI_MAP.md` §2, and `0402` now has its zero-length layout.
+    `test-bt-ctrl` runs both builds; `test-bt-host` runs the headphones smoke (`test_bt_host_hp hp`) on the gated
+    build. What the real Bluedroid sends around an outgoing link (harness, master role): `0C05` (SYN) and `0401`
+    for discovery, `0419` one device at a time after Inquiry Complete (BTA's name pass, never during the inquiry),
+    `0402` on cancel, then `0405`, the set-up reads `041F 041D 041B 041C` (FWD), and `080D`, `0C37`, `040F`, which
+    stay `REJ`: `080D` and `040F` have no handler for a failure, `0C37` (master only) leaves the ROM's 20 s supervision
+    timeout, which the design's credit-stall watchdog covers (§4.6). `040F` stays refused until Exp 4b decides it
+    (design §7 "role switch decision"); after a `0405` the link keeps the packet types the ROM computed from the
+    `0405` request. `080B` and `0C45` stay `REJ` too; `E0D6`/`E0D7` have packers (`bt_ctrl_evt.c`, ROM-sender
+    layouts) but stay unreachable while page-0 bit 30 is masked. Deadline facts for these rows (§2 rule 9): `0401`
+    and `0405` are SAVED in LM states 1/2, so their CS can come only at the 7 s deadline (`0x22`); the late CS is
+    consumed and a retry with the same opcode waits for it (`fwd_late_hold`); results or a Connection Complete of the
+    saved command still reach the host as events, so a `0405` answered `0x22` can still produce a link, which
+    Bluedroid has to disconnect (its role in `bt_ctrl_link_info` is then unknown). `0402`'s deferred CC is bounded
+    the same way.
 
 ## 8. Machine-readable list (C X-macro)
 

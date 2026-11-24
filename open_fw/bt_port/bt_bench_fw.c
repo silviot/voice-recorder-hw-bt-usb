@@ -184,6 +184,17 @@ int bt_bench_boot(exfat_vol_t *vol, int sd_mounted)
         lemit();
         return 0;
     }
+    if (s_cfg.mode != BT_BENCH_MODE_PHONE) {
+        /* mode=hp parses (bt_bench.c) but this image has no headphones bench session yet (docs/BT_A2DP_DESIGN.md
+         * milestone H3 adds it): consumed and refused, never run as a phone-mode test. */
+        lbegin("OFF");
+        lks("trig", bt_bench_trig_name(t));
+        lks("mode", "hp");
+        lks("err", "unsupported");
+        lks("file", BT_BENCH_TRIGGER_FILE);
+        lemit();
+        return 0;
+    }
     bt_bench_cap_init(&s_cap, s_cap_buf, sizeof(s_cap_buf), g_openfw_log.write_idx);
     s_armed = 1u;
     s_in = 0u;

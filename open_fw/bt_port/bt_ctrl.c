@@ -161,6 +161,25 @@ static struct {
     bt_ctrl_stats_t st;
 } g;
 
+/* Link view and inquiry/page state for the headphones path (bt_ctrl_link_info, bt_ctrl_scan_enable,
+ * bt_ctrl_inquiry_active). On target it lives in SRAM_HI (.bss_hi, zeroed at boot, like bt_xrec_fw.c's recovery
+ * objects): `g` is in .bt_bss, which comes out of the RTOS_HEAP region, and the BT=1 HCI_PROBE self-test image had
+ * only ~28 B left above the 32 KiB heap_5 floor asserted by sl6801_firm.ld. Reset with `g` (bt_ctrl_init) and at
+ * every controller reset. */
+#if defined(__arm__)
+#define BT_CTRL_HI __attribute__((section(".bss_hi"), aligned(4)))
+#else
+#define BT_CTRL_HI
+#endif
+static struct {
+    bt_ctrl_link_info_t link[BT_CTRL_MAX_LINKS];   /* written by bt_ctrl context and read by any task, under enter() */
+    uint8_t page_pending, page_bda[6];       /* 0405 accepted by the ROM (CS 0), Connection Complete still to come */
+    uint8_t accept_pending, accept_bda[6], accept_role;   /* 0409 accepted (CS 0), its Role parameter */
+    uint8_t scan_enable;                     /* last 0C1A value the ROM accepted (bt_ctrl_scan_enable) */
+    uint8_t inq_active;                      /* 0401 CS 0 seen, no Inquiry Complete / 0402 CC since */
+    uint32_t inq_results;                    /* inquiry result events of the running inquiry */
+} lv BT_CTRL_HI;
+
 /* ------------------------------------------------------------------------------------------------------------- */
 /* helpers                                                                                                        */
 /* ------------------------------------------------------------------------------------------------------------- */
@@ -404,12 +423,171 @@ static void rmt_name_seen(const uint8_t *param, uint16_t param_len)
 /* ------------------------------------------------------------------------------------------------------------- */
 /* ROM upcalls                                                                                                    */
 /* ------------------------------------------------------------------------------------------------------------- */
+#define BT_HCI_EVT_INQ_CMP  0x01u
+#define BT_HCI_EVT_INQ_RES  0x02u
 #define BT_HCI_EVT_CONN_CMP 0x03u
 #define BT_HCI_EVT_CONN_REQ 0x04u
 #define BT_HCI_EVT_RMT_NAME 0x07u
+#define BT_HCI_EVT_ROLE_CHG 0x12u
+#define BT_HCI_EVT_MODE_CHG 0x14u
+#define BT_HCI_EVT_MAX_SLOTS 0x1Bu
+#define BT_HCI_EVT_PKT_TYPE 0x1Du
+#define BT_HCI_EVT_INQ_RSSI 0x22u
+#define BT_HCI_EVT_INQ_EXT  0x2Fu
+#define BT_CTRL_OP_INQUIRY 0x0401u
+#define BT_CTRL_OP_INQUIRY_CANCEL 0x0402u
+#define BT_CTRL_OP_CREATE_CONN 0x0405u
+#define BT_CTRL_OP_ACCEPT_CONN 0x0409u
 #define BT_CTRL_OP_RMT_NAME 0x0419u
 #define BT_CTRL_OP_DISCONNECT 0x0406u
 #define BT_CTRL_OP_WRITE_SCAN_ENABLE 0x0C1Au
+
+/* The host command the session log follows was answered (by the ROM, or locally when `local`). */
+static void cmd_note(uint16_t op, uint16_t handle, uint8_t status, uint8_t local)
+{
+    switch (op) {
+    case BT_CTRL_OP_DISCONNECT:
+        note_add(BT_CTRL_NOTE_DISC_CMD, handle, status, 0u, local);
+        break;
+    case BT_CTRL_OP_RMT_NAME:
+        note_add(BT_CTRL_NOTE_NAME_CMD, 0u, status, 0u, local);
+        break;
+    case BT_CTRL_OP_INQUIRY:
+        note_add(BT_CTRL_NOTE_INQ_CMD, 0u, status, 0u, local);
+        break;
+    case BT_CTRL_OP_CREATE_CONN:
+        note_add(BT_CTRL_NOTE_PAGE_CMD, 0u, status, 0u, local);
+        break;
+    default:
+        break;
+    }
+}
+
+static bt_ctrl_link_info_t *link_of(uint16_t hdl)
+{
+    return (hdl >= 0x80u && hdl < 0x80u + BT_CTRL_MAX_LINKS) ? &lv.link[hdl - 0x80u] : NULL;
+}
+
+/* bda in BD_ADDR order (MSB first) equals the wire-order (LSB first) address w */
+static bool bda_is_wire(const uint8_t *bda, const uint8_t *w)
+{
+    for (uint32_t i = 0u; i < 6u; i++) {
+        if (bda[i] != w[5u - i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* The ROM accepted a forwarded command (status 0 in its initial reply): state the link view needs later. */
+static void cmd_accepted(uint16_t op)
+{
+    if (op == BT_CTRL_OP_CREATE_CONN && g.fwd_plen >= 6u) {
+        lv.page_pending = 1u;                 /* the Connection Complete for this address makes an outgoing link */
+        memcpy(lv.page_bda, g.fwd_params, 6u);
+    } else if (op == BT_CTRL_OP_ACCEPT_CONN && g.fwd_plen >= 7u) {
+        lv.accept_pending = 1u;
+        memcpy(lv.accept_bda, g.fwd_params, 6u);
+        lv.accept_role = g.fwd_params[6];
+    } else if (op == BT_CTRL_OP_INQUIRY) {
+        lv.inq_active = 1u;
+        lv.inq_results = 0u;
+    } else if (op == BT_CTRL_OP_WRITE_SCAN_ENABLE && g.fwd_plen >= 1u) {
+        lv.scan_enable = g.fwd_params[0];
+    }
+}
+
+/* Link view from the link-level events (ROM param layouts: docs/BT_ROM_HCI_MAP.md §9). */
+static void link_event(const bt_ctrl_evt_info_t *info, const uint8_t *param, uint16_t param_len)
+{
+    uint16_t h = (uint16_t)(info->handle & 0x0FFFu);
+    bt_ctrl_link_info_t *l = NULL;
+    switch (info->evt_code) {
+    case BT_HCI_EVT_CONN_CMP: {                        /* {s, pad, h, pad, bdaddr@5, type, enc} (13) */
+        const uint8_t *a = &param[5];
+        uint8_t out = lv.page_pending && memcmp(a, lv.page_bda, 6u) == 0;
+        uint8_t acc = lv.accept_pending && memcmp(a, lv.accept_bda, 6u) == 0;
+        uint8_t role = out ? BT_CTRL_ROLE_MASTER
+                       : acc ? (lv.accept_role == 0u ? BT_CTRL_ROLE_MASTER : BT_CTRL_ROLE_SLAVE) : BT_CTRL_ROLE_UNKNOWN;
+        lv.page_pending = out ? 0u : lv.page_pending;
+        lv.accept_pending = acc ? 0u : lv.accept_pending;
+        l = link_of(h);
+        if (info->status == BT_HCI_OK && l != NULL) {
+            g.p.enter();
+            memset(l, 0, sizeof(*l));
+            l->up = 1u;
+            l->outgoing = out;
+            l->role = role;
+            for (uint32_t i = 0u; i < 6u; i++) {
+                l->bda[i] = a[5u - i];
+            }
+            g.p.exit();
+        }
+        break;
+    }
+    case BT_HCI_EVT_DISC:
+        l = link_of(h);
+        if (info->status == BT_HCI_OK && l != NULL) {
+            g.p.enter();
+            l->up = 0u;
+            g.p.exit();
+        }
+        break;
+    case BT_HCI_EVT_ROLE_CHG: {                        /* {s, bdaddr, role} (8) verbatim */
+        uint16_t hh = 0u;
+        for (uint32_t i = 0u; i < BT_CTRL_MAX_LINKS; i++) {
+            if (lv.link[i].up && bda_is_wire(lv.link[i].bda, &param[1])) {
+                hh = (uint16_t)(0x80u + i);
+                g.p.enter();
+                lv.link[i].role_changes++;
+                if (info->status == BT_HCI_OK) {
+                    lv.link[i].role = param[7];
+                }
+                g.p.exit();
+                break;
+            }
+        }
+        note_add(BT_CTRL_NOTE_ROLE, hh, info->status, param[7], 0u);
+        break;
+    }
+    case BT_HCI_EVT_MAX_SLOTS:                         /* {u16 h, slots} (3) */
+        l = link_of((uint16_t)(rd16(param) & 0x0FFFu));
+        if (l != NULL) {
+            g.p.enter();
+            l->max_slots = param[2];
+            g.p.exit();
+        }
+        break;
+    case BT_HCI_EVT_MODE_CHG:                          /* {s, pad, h, mode@4, pad, interval} */
+        l = link_of(h);
+        if (l != NULL && info->status == BT_HCI_OK) {
+            g.p.enter();
+            l->mode = param[4];
+            g.p.exit();
+        }
+        break;
+    case BT_HCI_EVT_PKT_TYPE:                          /* {s, pad, h, u16 types@4} */
+        l = link_of(h);
+        if (l != NULL && info->status == BT_HCI_OK) {
+            g.p.enter();
+            l->pkt_type = rd16(&param[4]);
+            g.p.exit();
+        }
+        break;
+    case BT_HCI_EVT_INQ_RES:
+    case BT_HCI_EVT_INQ_RSSI:
+    case BT_HCI_EVT_INQ_EXT:
+        lv.inq_results++;
+        break;
+    case BT_HCI_EVT_INQ_CMP:
+        lv.inq_active = 0u;
+        note_add(BT_CTRL_NOTE_INQ_DONE, 0u, info->status, (uint8_t)(lv.inq_results > 255u ? 255u : lv.inq_results), 0u);
+        break;
+    default:
+        break;
+    }
+    (void)param_len;                                   /* every field read here is inside the packer's `need` */
+}
 
 /* One bit per ROM ACL handle 0x80..0x86 (BT_CTRL_MAX_LINKS); 0 for any other handle. */
 static uint8_t handle_bit(uint16_t h)
@@ -495,6 +673,14 @@ static void rom_nocp(const uint8_t *p, uint16_t len)
         uint32_t done = hc_sub(g.inflight, h, c);
         g.inflight_total -= done;
         g.st.nocp_excess += c - done;
+        bt_ctrl_link_info_t *l = link_of(h);
+        if (l != NULL && done != 0u) {
+            uint32_t t = g.now_ms != NULL ? g.now_ms() : 0u;
+            g.p.enter();
+            l->acl_completed += done;
+            l->nocp_last_ms = t;
+            g.p.exit();
+        }
         if (done != 0u && !hc_add(g.nocp_pend, h, done)) {
             g.st.invariant++;
             defer_fault(BT_CTRL_FAULT_INVARIANT, BT_CTRL_SITE_NOCP_TABLE, h, done);
@@ -583,10 +769,12 @@ static bt_rom_msg_ret_t up_on_hci_msg(void *ctx, uint16_t id, uint8_t *param, ui
     }
     if ((info.kind == BT_CTRL_EVK_CC || info.kind == BT_CTRL_EVK_CS) && g.fwd_pending && info.opcode == g.fwd_opcode) {
         /* Reply to the forwarded command: its slot was reserved when the command was admitted. */
-        if (info.opcode == BT_CTRL_OP_DISCONNECT) {
-            note_add(BT_CTRL_NOTE_DISC_CMD, g.fwd_handle, info.status, 0u, 0u);
-        } else if (info.opcode == BT_CTRL_OP_RMT_NAME) {
-            note_add(BT_CTRL_NOTE_NAME_CMD, 0u, info.status, 0u, 0u);
+        cmd_note(info.opcode, g.fwd_handle, info.status, 0u);
+        if (info.status == BT_HCI_OK) {
+            cmd_accepted(info.opcode);
+        }
+        if (info.opcode == BT_CTRL_OP_INQUIRY_CANCEL) {
+            lv.inq_active = 0u;               /* 0402 CC: the inquiry is over (no Inquiry Complete follows a cancel) */
         }
         g.fwd_pending = 0u;
         g.fwd_orphan = 0u;
@@ -635,6 +823,9 @@ static bt_rom_msg_ret_t up_on_hci_msg(void *ctx, uint16_t id, uint8_t *param, ui
     } else if (info.evt_code == BT_HCI_EVT_RMT_NAME) {
         rmt_name_seen(param, param_len);
     }
+    if (info.kind == BT_CTRL_EVK_EVT) {
+        link_event(&info, param, param_len);
+    }
     apply_event_side_effects(&info);
     return accept_general(id, param, param_len, g.scratch, len, seq);
 }
@@ -681,6 +872,13 @@ static void controller_state_reset(void)
     g.c2h_out_total = 0u;
     memset(g.local_name, 0, sizeof(g.local_name));
     g.ssp_host = 0u;
+    lv.page_pending = lv.accept_pending = 0u;
+    lv.inq_active = 0u;
+    lv.inq_results = 0u;
+    g.p.enter();
+    memset(lv.link, 0, sizeof(lv.link));
+    lv.scan_enable = 0u;
+    g.p.exit();
     g.held_head = g.held_n = 0u;
     g.def_head = g.def_n = 0u;
     g.acl_blocked = 0u;
@@ -931,11 +1129,7 @@ static uint8_t forward_cmd(const bt_ctrl_cmd_row_t *row, uint16_t op, const uint
  * going to send would already have been dispatched before its queue ran empty, and is then matched normally. */
 static void fwd_local_reply(uint8_t status)
 {
-    if (g.fwd_opcode == BT_CTRL_OP_DISCONNECT) {
-        note_add(BT_CTRL_NOTE_DISC_CMD, g.fwd_handle, status, 0u, 1u);
-    } else if (g.fwd_opcode == BT_CTRL_OP_RMT_NAME) {
-        note_add(BT_CTRL_NOTE_NAME_CMD, 0u, status, 0u, 1u);
-    }
+    cmd_note(g.fwd_opcode, g.fwd_handle, status, 1u);
     const bt_ctrl_cmd_row_t *row = bt_ctrl_cmds_lookup(g.fwd_opcode);
     uint16_t len = bt_ctrl_cmds_reply_fail(row, g.fwd_opcode, g.fwd_params, g.fwd_plen, status, g.scratch);
     g.fwd_pending = 0u;
@@ -1046,11 +1240,7 @@ static void process_cmd(uint32_t idx)
             return;
         }
         g.st.cmd_local_fail++;
-        if (op == BT_CTRL_OP_DISCONNECT) {
-            note_add(BT_CTRL_NOTE_DISC_CMD, plen >= 2u ? (uint16_t)(rd16(prm) & 0x0FFFu) : 0u, s, 0u, 1u);
-        } else if (op == BT_CTRL_OP_RMT_NAME) {
-            note_add(BT_CTRL_NOTE_NAME_CMD, 0u, s, 0u, 1u);
-        }
+        cmd_note(op, plen >= 2u ? (uint16_t)(rd16(prm) & 0x0FFFu) : 0u, s, 1u);
         if (row->cls == BTC_M) {
             g.st.invariant++;                /* class M must not fail */
             raise_fault(BT_CTRL_FAULT_INVARIANT, BT_CTRL_SITE_CLASS_M_LOCAL, op, s);
@@ -1139,6 +1329,12 @@ static int process_acl(uint32_t idx)
     }
     g.inflight_total++;
     g.st.acl_to_rom++;
+    bt_ctrl_link_info_t *li = link_of(handle);
+    if (li != NULL) {
+        g.p.enter();
+        li->acl_sent++;
+        g.p.exit();
+    }
     return ACL_DONE;
 }
 
@@ -1723,6 +1919,7 @@ int bt_ctrl_dlv_run(void)
 int bt_ctrl_init(const bt_rom_if_t *rom, const bt_ctrl_platform_t *platform, const uint8_t bd_addr[6])
 {
     memset(&g, 0, sizeof(g));
+    memset(&lv, 0, sizeof(lv));
     g.rom = rom;
     g.p = *platform;
     memcpy(g.bd_addr, bd_addr, 6u);
@@ -1903,6 +2100,38 @@ int bt_ctrl_peer_name(uint8_t bda[6], char *name, uint16_t cap)
     return got;
 }
 
+int bt_ctrl_link_info(uint16_t h, bt_ctrl_link_info_t *out)
+{
+    const bt_ctrl_link_info_t *l = link_of((uint16_t)(h & 0x0FFFu));
+    if (out == NULL) {
+        return 0;
+    }
+    memset(out, 0, sizeof(*out));
+    if (l == NULL) {
+        return 0;
+    }
+    g.p.enter();
+    *out = *l;
+    g.p.exit();
+    return 1;
+}
+
+uint8_t bt_ctrl_scan_enable(void)
+{
+    g.p.enter();
+    uint8_t v = lv.scan_enable;
+    g.p.exit();
+    return v;
+}
+
+int bt_ctrl_inquiry_active(void)
+{
+    g.p.enter();
+    int v = lv.inq_active ? 1 : 0;
+    g.p.exit();
+    return v;
+}
+
 static uint16_t put_str(char *buf, uint16_t cap, uint16_t at, const char *s)
 {
     while (*s != '\0' && at + 1u < cap) {
@@ -2007,6 +2236,19 @@ uint16_t bt_ctrl_note_format(const bt_ctrl_note_t *n, char *buf, uint16_t cap)
     case BT_CTRL_NOTE_NAME:
         at = put_hex(buf, cap, put_str(buf, cap, at, "name complete"), " st=", n->status, 2u);
         return put_dec(buf, cap, at, " len=", n->reason);
+    case BT_CTRL_NOTE_INQ_CMD:
+        at = put_hex(buf, cap, put_str(buf, cap, at, "inquiry"), " st=", n->status, 2u);
+        return put_str(buf, cap, at, n->local ? " local" : " rom");
+    case BT_CTRL_NOTE_INQ_DONE:
+        at = put_hex(buf, cap, put_str(buf, cap, at, "inquiry complete"), " st=", n->status, 2u);
+        return put_dec(buf, cap, at, " results=", n->reason);
+    case BT_CTRL_NOTE_PAGE_CMD:
+        at = put_hex(buf, cap, put_str(buf, cap, at, "create connection"), " st=", n->status, 2u);
+        return put_str(buf, cap, at, n->local ? " local" : " rom");
+    case BT_CTRL_NOTE_ROLE:
+        at = put_hex(buf, cap, put_str(buf, cap, at, "role change"), " h=", n->handle, 4u);
+        at = put_hex(buf, cap, at, " st=", n->status, 2u);
+        return put_str(buf, cap, at, n->reason == BT_CTRL_ROLE_MASTER ? " master" : " slave");
     default:
         return put_hex(buf, cap, put_str(buf, cap, at, "note"), " ", n->kind, 2u);
     }

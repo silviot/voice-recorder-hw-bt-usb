@@ -59,13 +59,21 @@ test-bt-ctrl:
 		bt_port/bt_ctrl_evt.c $(BT_CTRL_TEST_DIR)/hci_packet_parser.o $(BT_CTRL_TEST_DIR)/bt_ctrl_parser_shim.o \
 		-o $(BT_CTRL_TEST_DIR)/test_bt_ctrl
 	$(BT_CTRL_TEST_DIR)/test_bt_ctrl
+	@# The same tests with the headphones rows forwarded (BT_CTRL_HP_GATE_LIST: 0401 0402 0405 0408; design H2 gate
+	@# "green with and without the gate list"): the table validates, and the inquiry/page fake-ROM models run.
+	$(HOST_CC) $(BT_CTRL_TEST_CFLAGS) -DBT_CTRL_EXP1_PASSED_LIST=BT_CTRL_HP_GATE_LIST tests/test_bt_ctrl.c \
+		tests/fake_rom.c bt_port/bt_ctrl.c bt_port/bt_ctrl_cmds.c bt_port/bt_ctrl_evt.c \
+		$(BT_CTRL_TEST_DIR)/hci_packet_parser.o $(BT_CTRL_TEST_DIR)/bt_ctrl_parser_shim.o \
+		-o $(BT_CTRL_TEST_DIR)/test_bt_ctrl_hp
+	$(BT_CTRL_TEST_DIR)/test_bt_ctrl_hp
 
 # ---- test-bt-host: Bluedroid end-to-end on the FreeRTOS POSIX port (plan M3 path (b), step 5). ----
 # Real Bluedroid (patches 0001-0027) + bt_port + bt_ctrl + tests/fake_rom.c on FreeRTOS-Kernel V11.1.0's POSIX port,
 # ASan/UBSan: patch 0009 fixed_queue slot restore, init/enable/GAP/disable/deinit, patch 0010 NOACK at zero command
 # credits, a 200-cycle leak loop, the phone-mode end-to-end scenario (BT=1 XREC backend + fake ROM laptop: SSP, bond
 # store, SDP, RFCOMM, XREC PAIR/CHAL/GETS with congestion (session window and BTC ring), reconnect, stop with traffic
-# outstanding, stop with a detach that never completes, restart, policy rejections incl. stale Just Works bonds; tests/bt_host/test_phone.c, on a 4096-sector exFAT image), then the allocation-failure sweeps over
+# outstanding, stop with a detach that never completes, restart, policy rejections incl. stale Just Works bonds; tests/bt_host/test_phone.c, on a 4096-sector exFAT image), the headphones-path smoke (test_bt_host_hp hp:
+# inquiry, names, cancel, page as master, disconnect; tests/bt_host/test_hp_link.c), then the allocation-failure sweeps over
 # esp_bluedroid_init/enable/disable/deinit (one process per failing attempt; waivers, if any, carry exact point counts
 # in tests/bt_host/sweep_waivers.txt, anything else fails; none since patches 0011-0023). Details:
 # tests/bt_host/README.md.
@@ -77,6 +85,8 @@ test-bt-host:
 	dd if=/dev/zero of=$(BT_HOST_TEST_DIR)/phone_exfat.img bs=512 count=4096 status=none
 	/usr/sbin/mkfs.exfat -q -b 4096 -c 4096 $(BT_HOST_TEST_DIR)/phone_exfat.img
 	$(BT_HOST_TEST_DIR)/asan/test_bt_host phone $(BT_HOST_TEST_DIR)/phone_exfat.img
+	@# headphones-path smoke (docs/BT_A2DP_DESIGN.md H2): bt_ctrl with BT_CTRL_HP_GATE_LIST, inquiry/name/cancel/page
+	$(BT_HOST_TEST_DIR)/asan/test_bt_host_hp hp
 	set -e; for m in init enable disable deinit; do \
 		python3 tests/bt_host/run_sweep.py $(BT_HOST_TEST_DIR)/asan/test_bt_host --mode $$m --jobs $(BT_HOST_JOBS) \
 			--timeout 120 --waivers tests/bt_host/sweep_waivers.txt; done
@@ -91,6 +101,8 @@ test-bt-host-tsan:
 	/usr/sbin/mkfs.exfat -q -b 4096 -c 4096 $(BT_HOST_TEST_DIR)/phone_exfat_tsan.img
 	TSAN_OPTIONS="suppressions=$(CURDIR)/tests/bt_host/tsan.supp report_signal_unsafe=0 halt_on_error=1" \
 		$(BT_HOST_TEST_DIR)/tsan/test_bt_host phone $(BT_HOST_TEST_DIR)/phone_exfat_tsan.img
+	TSAN_OPTIONS="suppressions=$(CURDIR)/tests/bt_host/tsan.supp report_signal_unsafe=0 halt_on_error=1" \
+		$(BT_HOST_TEST_DIR)/tsan/test_bt_host_hp hp
 
 # ---- test-bt-xrec: XREC session over Bluedroid SPP (plan M4): bt_port/bt_xrec_bluedroid.c + the real xrec_proto
 # against mocked esp_spp / esp_bt_gap APIs (real Bluedroid API headers) and a mocked platform. Host build, ASan/UBSan.

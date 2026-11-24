@@ -74,6 +74,28 @@ typedef struct {
     uint32_t scan_refused;          /* 0C1A refused by the ROM's more-than-one-link rule */
     uint8_t  scan_enable;           /* the scan value of the last accepted 0C1A (0 after reset): 1 inquiry, 2 page */
     uint32_t scan_writes;           /* 0C1A writes received (accepted or refused) */
+
+    /* ---- headphones path (docs/BT_A2DP_DESIGN.md §8.2 "Fake ROM additions"; ROM facts: docs/BT_ROM_HCI_MAP.md §2,
+     * §3). The fake TASK_LM state: 0 idle, 1/2 the undocumented states in which the ROM SAVES 0401/0405/0419 (the
+     * message waits on the saved queue and runs again at the next LM state change), 3 paging, 4 inquiry, 7 inquiry
+     * cancel pending. Tests may force 1 or 2 with fake_rom_set_lm_state(). ---- */
+    uint8_t  lm_state;
+    bool     lm_state2_err;         /* LM state 2 with env +0x4b set: 0401 answered 0x3A instead of SAVED */
+    bool     inq_auto_complete;     /* Inquiry Complete right after the results (else at fake_rom_inquiry_end()) */
+    bool     inq_cancel_hold;       /* 0402's deferred CC waits for the LD stop (fake_rom_inquiry_end()) */
+    bool     page_hold;             /* 0405 keeps paging until fake_rom_page_answer() / _page_timeout() / 0408 */
+    uint8_t  inq_mode;              /* accepted 0C45 value: 0 -> E0D1, 1 -> E0D6, 2 -> E0D7 (§3) */
+    /* ACL air model with pacing (for the A2DP media path): with auto_ack_acl false and air_rate_Bps != 0,
+     * fake_rom_air_tick(ms) completes in-air packets in order as the byte budget allows, one NOCP per tick; with
+     * air_stall the baseband stops acknowledging (NOCP stops, no detach: the "ghost link" of BT_HW_RESULTS session 4-6). */
+    uint32_t air_rate_Bps;
+    bool     air_stall;
+    uint32_t air_budget;            /* bytes the next tick may complete (carried over, capped at one second's worth) */
+    /* observations */
+    uint32_t inquiries, inq_results_sent, inq_completes, inq_cancels, inq_refused;
+    uint32_t pages, pages_ok, page_timeouts, page_cancels, page_refused, create_cancels;
+    uint32_t saved, saved_reruns;   /* messages SAVED by the fake LM / re-dispatched after a state change */
+    uint32_t air_ticks, air_acked, air_acked_bytes, air_nocp_events;
 } fake_rom_t;
 
 extern fake_rom_t fake_rom;
@@ -121,6 +143,13 @@ typedef struct {
     uint8_t lmp_ver;
     uint16_t manuf, subver, clk_off;
     char name[32];
+    /* headphones path: the peer as a discoverable headset that we page (docs/BT_A2DP_DESIGN.md §8.2) */
+    bool discoverable;              /* answers inquiries (CoD `cod`, page scan repetition mode `psrm`, `rssi`) */
+    bool ignores_pages;             /* out of range / not connectable: a 0405 to it ends in page timeout 0x04 */
+    uint8_t psrm;
+    int8_t rssi;
+    bool role_switch_on_connect;    /* right after our page the headset takes the master role: E461 (we: slave) */
+    uint8_t max_slots_on_connect;   /* E468 Max Slots Change after the Connection Complete (0 = none) */
 } fake_peer_cfg_t;
 
 typedef struct {
@@ -159,6 +188,12 @@ typedef struct {
     uint32_t detach_deferred;       /* 0406 accepted without a Disconnection Complete */
     uint32_t stop_kills;            /* the link was still up when the controller stopped (no event: the ROM is gone) */
     uint32_t tx_flushed;            /* ACL in flight when the link ended: freed, reported by NOCP before E458 */
+    /* headphones path: what the host's 0405 asked for, and the link it made */
+    bool we_paged;                  /* the current link came from the host's 0405 */
+    uint8_t host_allow_rs, host_psrm;
+    uint16_t host_pkt_type, host_clk_off;
+    uint32_t host_creates;          /* 0405 that reached the fake LM (incl. refused) */
+    uint32_t role_changes;
 } fake_peer_t;
 
 extern fake_peer_t fake_peer;
@@ -173,6 +208,29 @@ int  fake_peer_send_acl(const uint8_t *data, uint16_t len);   /* peer -> host AC
 int  fake_peer_page_again(uint32_t link);            /* ghost page while connected (see ghost_pending); -1 if not */
 void fake_peer_ghost_end(uint8_t status);            /* the rejected link ends: E0D2 Connection Complete(status) */
 void fake_peer_name_release(void);                   /* the held name request completes (E0D3 with the name) */
+void fake_peer_role_switch(uint8_t new_role);        /* the peer switches roles: E461 {0, addr, our new role} */
+void fake_peer_max_slots(uint8_t slots);             /* E468 Max Slots Change on the peer's link */
+
+/* ---- headphones path: discoverable devices other than the scripted peer (inquiry results and names only; a page
+ * to one of them times out like an out-of-range device) ---- */
+#define FAKE_ROM_DEVS 8u
+typedef struct {
+    uint8_t addr[6];                /* wire order */
+    uint8_t cod[3];
+    uint8_t psrm;
+    uint16_t clk_off;
+    int8_t rssi;
+    bool answers_name;              /* a 0419 temporary page succeeds (else E0D3 0x04 page timeout) */
+    char name[32];
+} fake_dev_t;
+
+int  fake_rom_add_device(const fake_dev_t *d);       /* -1 when FAKE_ROM_DEVS are configured already */
+void fake_rom_set_lm_state(uint8_t st);              /* force the fake LM state (1/2: SAVED states); re-runs saved */
+void fake_rom_inquiry_end(void);                     /* the LD inquiry ends: E0D0 (state 4) or the deferred 0402 CC
+                                                        (state 7); LM state 0, saved messages run again */
+void fake_rom_page_answer(void);                     /* a held page (page_hold) to the scripted peer succeeds */
+void fake_rom_page_timeout(void);                    /* a held page fails: E0D2 0x04 */
+uint32_t fake_rom_air_tick(uint32_t ms);             /* pacing model step; returns packets completed */
 
 uint32_t fake_rom_em_rx_in_use(void);
 uint32_t fake_rom_em_tx_in_use(void);

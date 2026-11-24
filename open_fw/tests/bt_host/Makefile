@@ -33,7 +33,7 @@ BD_SRCS   := $(addprefix $(ROOT)/,$(BLUEDROID_SRCS)) $(ROOT)/bt_port/bt_xrec_spp
 PORT_SRCS := $(addprefix $(ROOT)/bt_port/,bt_alarm.c bt_esp_timer.c bt_entropy.c bt_drbg.c bt_store.c bt_ctrl.c \
              bt_ctrl_cmds.c bt_ctrl_evt.c bt_xrec_bluedroid.c)
 HOST_SRCS := $(HT)/host_heap.c $(HT)/host_glue.c $(HT)/host_ctrl.c $(HT)/test_bt_host.c $(HT)/host_link_stubs.c \
-             $(HT)/host_xrec.c $(HT)/test_phone.c $(ROOT)/tests/fake_rom.c
+             $(HT)/host_xrec.c $(HT)/test_phone.c $(HT)/test_hp_link.c $(ROOT)/tests/fake_rom.c
 KERN_SRCS := $(addprefix $(FR)/,tasks.c queue.c list.c timers.c event_groups.c stream_buffer.c) $(HT)/host_main.c
 PPORT_SRCS:= $(POSIX)/port.c $(POSIX)/utils/wait_for_event.c
 # Firmware sources the phone scenario runs unmodified: XREC protocol and the exFAT layer (RAM SD card).
@@ -103,9 +103,19 @@ WRAPS   := malloc calloc realloc free esp_timer_create esp_timer_delete
 LDFLAGS := $(SANFLAGS) -no-pie -pthread -Wl,--gc-sections $(addprefix -Wl$(comma)--wrap=,$(WRAPS))
 
 BIN := $(OUT)/test_bt_host
-all: $(BIN)
+# test_bt_host_hp: the same harness with bt_ctrl's headphones rows forwarded (BT_CTRL_HP_GATE_LIST: 0401 0402 0405 0408),
+# for the headphones smoke (`test_bt_host_hp hp`, tests/bt_host/test_hp_link.c). Only bt_ctrl_cmds differs.
+BIN_HP := $(OUT)/test_bt_host_hp
+CMDS_OBJ := $(OUT)/bt_port/bt_ctrl_cmds.o
+CMDS_HP_OBJ := $(OUT)/bt_port/bt_ctrl_cmds_hpgates.o
+all: $(BIN) $(BIN_HP)
 $(BIN): $(ALL_OBJS)
 	$(CC) $(LDFLAGS) $^ -lm -o $@
+$(BIN_HP): $(filter-out $(CMDS_OBJ),$(ALL_OBJS)) $(CMDS_HP_OBJ)
+	$(CC) $(LDFLAGS) $^ -lm -o $@
+$(CMDS_HP_OBJ): $(ROOT)/bt_port/bt_ctrl_cmds.c $(THIS_MK)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS_PORT) -DBT_CTRL_EXP1_PASSED_LIST=BT_CTRL_HP_GATE_LIST -MMD -MP -c $< -o $@
 
 $(BD_OBJS): $(OUT)/%.o: $(ROOT)/%.c
 	@mkdir -p $(dir $@)
@@ -124,5 +134,5 @@ $(FW_OBJS): $(OUT)/%.o: $(ROOT)/%.c
 	$(CC) $(OPT) -fno-pie $(SANFLAGS) -Wall -Wextra -Werror -I$(ROOT)/include -MMD -MP -c $< -o $@
 $(ALL_OBJS): $(THIS_MK)
 
--include $(ALL_OBJS:.o=.d)
+-include $(ALL_OBJS:.o=.d) $(CMDS_HP_OBJ:.o=.d)
 .PHONY: all
