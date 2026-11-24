@@ -1,0 +1,84 @@
+# Self-contained build of Bluedroid (Classic only) for size measurement / future integration.
+# NOT included from open_fw/Makefile yet.
+#
+#   make -f bt/Makefile.bluedroid [PICOLIBC=/path/to/picolibc-install] [BT_LOGS=0|1]
+#   make -f bt/Makefile.bluedroid syntax     # compile-check only (-fsyntax-only)
+#   make -f bt/Makefile.bluedroid size       # per-directory size report (see tools/measure_bluedroid.sh)
+#
+# SPDX-License-Identifier: MIT
+
+CLANG     ?= clang
+LLD       ?= $(shell which ld.lld 2>/dev/null || find /usr/lib "$${ANDROID_HOME:-$$HOME/Android/Sdk}/ndk" -maxdepth 8 \( -type f -o -type l \) -executable -name ld.lld 2>/dev/null | head -n 1)
+AR        ?= $(shell which llvm-ar 2>/dev/null || ls /usr/lib/llvm-*/bin/llvm-ar 2>/dev/null | tail -n 1)
+SIZE      ?= $(shell which llvm-size 2>/dev/null || ls /usr/lib/llvm-*/bin/llvm-size 2>/dev/null | tail -n 1)
+NM        ?= $(shell which llvm-nm 2>/dev/null || ls /usr/lib/llvm-*/bin/llvm-nm 2>/dev/null | tail -n 1)
+PICOLIBC  ?= $(error set PICOLIBC=<picolibc install prefix built for thumbv7em/cortex-m4f, see third_party/bluedroid/PORTING_NOTES.md>)
+
+ROOT      := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/..)
+BD        := $(ROOT)/third_party/bluedroid
+BUILD_DIR ?= /tmp/bluedroid_build
+BT_LOGS   ?= 0
+
+include $(ROOT)/bt/bluedroid_srcs.mk
+SRCS := $(addprefix $(ROOT)/,$(BLUEDROID_SRCS)) $(ROOT)/bt_port/bt_port_heap.c
+OBJS := $(patsubst $(ROOT)/%.c,$(BUILD_DIR)/%.o,$(SRCS))
+
+# All upstream "include" dirs are on the path, exactly like the CMake components do.
+INC_DIRS := $(shell find $(BD)/host/bluedroid $(BD)/common -type d \( -name include -o -path '*/api/include/api' \) -not -path '*/test*' 2>/dev/null) \
+            $(BD)/host/bluedroid/bta/pan $(BD)/common/btc/profile/esp/blufi/include
+INCS := $(addprefix -I,$(sort $(INC_DIRS))) -I$(BD)/host/bluedroid/api/include/api -I$(BD)/common/tinycrypt/port -I$(BD)/common/tinycrypt/include \
+        -I$(ROOT)/bt_port -I$(BD)/deps/esp_ringbuf/include -I$(BD)/deps/ble_profiles_common/include -I$(ROOT)/third_party/freertos/include -I$(ROOT)/third_party/freertos/portable/GCC/ARM_CM4F -I$(ROOT)/src/rtos -I$(PICOLIBC)/include
+
+CPU_FLAGS := --target=thumbv7em-none-eabi -mcpu=cortex-m4 -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb
+CFLAGS    := $(CPU_FLAGS) -Os -std=gnu11 -ffunction-sections -fdata-sections -fno-stack-protector \
+             -Wall -Wno-unused-function -Wno-unused-variable -Wno-unused-but-set-variable -Wno-format \
+             -Wno-address-of-packed-member -Wno-implicit-fallthrough -Wno-unused-const-variable \
+             -Wno-pointer-sign -Wno-unterminated-string-initialization -Wno-missing-braces \
+             -Wno-sometimes-uninitialized -Wno-unused-label -Wno-absolute-value -Wno-parentheses \
+             -DESP_PLATFORM=1 -D__ESP_ATTR_H__ -DOPENFW_BLUEDROID=1 -DBT_LOGS=$(BT_LOGS) \
+             -include $(ROOT)/bt_port/bt_port_prefix.h $(INCS)
+
+.PHONY: all syntax clean size
+all: $(BUILD_DIR)/bluedroid.a
+syntax: $(OBJS:.o=.syn)
+
+$(BUILD_DIR)/%.syn: $(ROOT)/%.c
+	@mkdir -p $(dir $@)
+	@$(CLANG) $(CFLAGS) -fsyntax-only $< 2>&1 | head -5; touch $@
+$(BUILD_DIR)/%.o: $(ROOT)/%.c
+	@mkdir -p $(dir $@)
+	$(CLANG) $(CFLAGS) -c $< -o $@
+$(BUILD_DIR)/bluedroid.a: $(OBJS)
+	$(AR) rcs $@ $^
+clean:
+	rm -rf $(BUILD_DIR)
+
+# ---- link-test variants (measurement only; never flashed) ----------------------------------
+FR        := $(ROOT)/third_party/freertos
+KERNEL_SRCS := $(FR)/tasks.c $(FR)/queue.c $(FR)/list.c $(FR)/timers.c $(FR)/event_groups.c $(FR)/stream_buffer.c \
+               $(FR)/portable/GCC/ARM_CM4F/port.c $(FR)/portable/MemMang/heap_5.c
+KERNEL_OBJS := $(patsubst $(FR)/%.c,$(BUILD_DIR)/freertos/%.o,$(KERNEL_SRCS))
+LT_VARIANTS := core core_spp core_a2dp full
+LT_DEFS_core      := -DLT_CORE
+LT_DEFS_core_spp  := -DLT_CORE -DLT_SPP
+LT_DEFS_core_a2dp := -DLT_CORE -DLT_A2DP
+LT_DEFS_full      := -DLT_CORE -DLT_SPP -DLT_A2DP
+LIBC_A    := $(PICOLIBC)/lib/libc.a $(wildcard $(PICOLIBC)/lib/libclang_rt_min.a)
+STUB_OBJ  := $(BUILD_DIR)/bt_port_link_stubs.o
+LDFLAGS   := --gc-sections -e main --warn-unresolved-symbols -z norelro
+
+$(BUILD_DIR)/freertos/%.o: $(FR)/%.c
+	@mkdir -p $(dir $@)
+	$(CLANG) $(CPU_FLAGS) -Os -ffunction-sections -fdata-sections -Wno-unused-parameter $(INCS) -c $< -o $@
+$(BUILD_DIR)/lt_%.o: $(ROOT)/bt_port/link_test_main.c
+	$(CLANG) $(CFLAGS) $(LT_DEFS_$*) -c $< -o $@
+$(STUB_OBJ): $(ROOT)/bt_port/bt_port_link_stubs.c
+	$(CLANG) $(CFLAGS) -c $< -o $@
+$(BUILD_DIR)/lt_%.elf: $(BUILD_DIR)/lt_%.o $(BUILD_DIR)/bluedroid.a $(KERNEL_OBJS) $(STUB_OBJ)
+	$(LLD) $(LDFLAGS) -Map=$(@:.elf=.map) $< $(STUB_OBJ) $(KERNEL_OBJS) $(BUILD_DIR)/bluedroid.a $(LIBC_A) -o $@ 2> $(@:.elf=.undef.txt) || true
+link: $(addprefix $(BUILD_DIR)/lt_,$(addsuffix .elf,$(LT_VARIANTS)))
+.PHONY: link
+
+print-cflags:
+	@echo $(CFLAGS)
+.PHONY: print-cflags

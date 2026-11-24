@@ -86,14 +86,18 @@
 #define AVCT_INCLUDED               TRUE
 #define AVRC_INCLUDED               TRUE
 #define BTC_AV_INCLUDED             TRUE
+#ifndef OPENFW_A2DP_SOURCE_ONLY /* open_fw patch 0001: drop the A2DP sink (RAM ~9.6 KB + SBC decoder) */
 #define BTA_AV_SINK_INCLUDED        TRUE
 #define BTC_AV_SINK_INCLUDED        TRUE
+#endif
 #define BTC_AV_SRC_INCLUDED         TRUE
 #if (UC_BT_A2DP_USE_EXTERNAL_CODEC == TRUE)
 #define BTC_AV_EXT_CODEC            TRUE
 #define BTA_AV_EXT_CODEC            TRUE
 #else
+#ifndef OPENFW_A2DP_SOURCE_ONLY
 #define SBC_DEC_INCLUDED            TRUE
+#endif
 #define SBC_ENC_INCLUDED            TRUE
 #endif
 #if (UC_BT_A2DP_CODEC_AAC_ENABLED == TRUE)

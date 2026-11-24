@@ -432,6 +432,7 @@ void BTA_SetDelayValue(UINT16 delay_value)
     }
 }
 
+#if (BTA_AV_SINK_INCLUDED == TRUE) /* open_fw patch 0003: event only exists with the sink */
 /*******************************************************************************
 **
 ** Function         BTA_GetDelayValue
@@ -450,6 +451,7 @@ void BTA_GetDelayValue(void)
         bta_sys_sendmsg(p_buf);
     }
 }
+#endif
 
 /*******************************************************************************
 **

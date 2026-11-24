@@ -84,7 +84,9 @@ enum {
 #define MAX_PCM_FRAME_NUM_PER_TICK             21 // 14 for 20ms
 #endif
 
+#ifndef BTC_MEDIA_AA_BUF_SIZE /* open_fw patch 0002: overridable (frames are <= A2DP MTU 1008, not 4 KB) */
 #define BTC_MEDIA_AA_BUF_SIZE                  (4096+16)
+#endif
 
 #ifndef BTC_MEDIA_BITRATE_STEP
 #define BTC_MEDIA_BITRATE_STEP                 5

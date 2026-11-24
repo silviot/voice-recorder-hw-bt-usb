@@ -1,0 +1,26 @@
+# Wrapper used by tools/gen_bluedroid_config.py to evaluate Bluedroid's Kconfig
+# outside of ESP-IDF. Only the external symbols Bluedroid's Kconfig references
+# are declared here (all "n" unless the .defaults fragment sets them).
+mainmenu "open_fw Bluedroid (host-only, Classic)"
+config SOC_BT_SUPPORTED
+    bool
+    default y
+config SOC_BT_CLASSIC_SUPPORTED
+    bool
+    default y
+config IDF_TARGET_ESP32
+    bool
+    default y
+config IDF_TARGET
+    string
+    default "esp32"
+config FREERTOS_UNICORE
+    bool
+    default y
+config BTDM_CTRL_MODE_BR_EDR_ONLY
+    bool
+    default y
+config APP_NO_BLOBS
+    bool
+    default n
+source "$IDF_PATH/components/bt/Kconfig"
