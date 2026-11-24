@@ -14,6 +14,7 @@ Python host utilities for building, flashing, debugging, syncing, and testing th
 | **[`asr_prep.py`](asr_prep.py)** | Downstream ASR preprocessing for NVIDIA Parakeet (`--target parakeet`) and Cactus Whistle (`--target whistle`) | `python3 tools/asr_prep.py --self-test` |
 | **[`cassini_to_device.py`](cassini_to_device.py)** | Convert Cassini portable-meeting Ogg Opus files into device-ready IMA-ADPCM/PCM `.wav` + `.cwx` synced transcript files | `python3 tools/cassini_to_device.py --self-test` |
 | **[`inspect_fw.py`](inspect_fw.py)** | Validate `HLKJ` bootloader header, partition directory, and CRC-16/CCITT-FALSE checksums on 2 MiB SL6801 images | `python3 tools/inspect_fw.py dumps/firmware_2M_openfw.bin` |
+| **[`bt_probe_report.py`](bt_probe_report.py)** | Markdown/JSON report of the Bluetooth Exp 1 stage A HCI probe (`HCIP` lines from `dev_cycle.py log`; image `make -C open_fw BT=1 HCI_PROBE=1`, see `docs/BT_HW_RESULTS.md`) | `python3 tools/bt_probe_report.py --self-test` |
 | **[`test_tools.py`](test_tools.py)** | Offline regression tests for `usb_sync.py`, `bt_sync.py` path-traversal guards, and `fix_exfat_boundary.py` | `python3 tools/test_tools.py` |
 
 ## Bluetooth Sync Tools

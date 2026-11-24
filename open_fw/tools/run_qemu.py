@@ -349,6 +349,10 @@ def main() -> int:
     ap.add_argument("--skip-keys", action="store_true", help="Skip KEY_ENTER -> USB MSC check")
     ap.add_argument("--vbus-off", action="store_true", help="Boot unplugged on battery (pmu-vbus=off)")
     ap.add_argument("--png-out", type=Path, default=BUILD_DIR / "qemu_lcd.png")
+    ap.add_argument("--expect-log", action="append", default=[], metavar="TEXT",
+                    help="Keep running until g_openfw_log contains TEXT (repeatable); fail if it never does")
+    ap.add_argument("--expect-seconds", type=float, default=40.0,
+                    help="Guest-run budget for --expect-log (default: 40 s)")
     orient = ap.add_mutually_exclusive_group()
     orient.add_argument(
         "--landscape",
@@ -434,6 +438,30 @@ def main() -> int:
                 heap_free_start=words[4], heap_min_end=words[5], detail=list(words[6:nwords]),
             )
 
+        expect_result: dict = {}
+
+        def read_log_text(client: GdbRspClient) -> str:
+            """Whole g_openfw_log ring in chronological order (it wraps at log_size)."""
+            magic, size, widx, _ = struct.unpack("<4I", client.read_mem(log_addr, 16))
+            if magic != LOG_MAGIC or size == 0 or widx == 0:
+                return ""
+            raw = client.read_mem(log_addr + 16, size if widx > size else widx)
+            if widx > size:
+                start = widx % size
+                raw = raw[start:] + raw[:start]
+            return raw.decode("ascii", "replace")
+
+        def wait_for_log(client: GdbRspClient) -> None:
+            """--expect-log: run the guest in 0.5 s slices until every TEXT is in the log (or the budget ends)."""
+            waited = 0.0
+            text = read_log_text(client)
+            while waited < args.expect_seconds and not all(t in text for t in args.expect_log):
+                _ = client.continue_for(0.5)
+                waited += 0.5
+                text = read_log_text(client)
+            expect_result.update(text=text, waited=waited,
+                                 missing=[t for t in args.expect_log if t not in text])
+
         def inspect_boot(client: GdbRspClient):
             _ = client.continue_for(args.boot_seconds)
             if "g_rtos_selftest" in syms:
@@ -456,6 +484,12 @@ def main() -> int:
             sd_rca &= 0xFFFF
             sd_mounted = client.read_i32(syms["g_sd_mounted"][0])
             fb_raw = client.read_mem(FB_ADDR, LCD_STRIDE * LCD_H * 2)
+            if args.expect_log:
+                wait_for_log(client)
+                # The probe must leave the app alive: the tick and the CPU state are checked again afterwards.
+                e_sys1 = client.read_u32(systick_addr)
+                _ = client.continue_for(0.4)
+                expect_result.update(regs=client.read_regs(), systick=(e_sys1, client.read_u32(systick_addr)))
             return (
                 regs, systick_1, systick_2,
                 log_magic, log_size, log_widx, log_drop, log_text,
@@ -548,6 +582,24 @@ def main() -> int:
                 failures.append("RTOS selftest did not complete")
             if selftest_result["pass_mask"] != (1 << n) - 1 or selftest_result["fail_mask"] != 0:
                 failures.append("RTOS selftest reported failures")
+
+        if args.expect_log:
+            text = expect_result.get("text", "")
+            hcip = [ln[ln.index("HCIP "):] for ln in text.splitlines() if "HCIP " in ln]
+            print(f"Expect-log: ran {expect_result.get('waited', 0.0):.1f} s more, {len(hcip)} HCIP lines")
+            for ln in hcip:
+                print(f"  [HCIP] {ln}")
+            for t in expect_result.get("missing", []):
+                failures.append(f"log never contained {t!r} within {args.expect_seconds:.0f} s")
+            e_regs = expect_result.get("regs")
+            e_s1, e_s2 = expect_result.get("systick", (0, 0))
+            if e_regs is not None:
+                e_pc = e_regs[15]
+                print(f"After expect-log: PC=0x{e_pc:08x} g_systick_ms={e_s1} -> {e_s2}")
+                if is_in_fault(e_pc, default_handler) or e_pc < 0x00804C00:
+                    failures.append(f"CPU not in open_fw after the expect-log wait (PC=0x{e_pc:08x})")
+                if e_s2 <= e_s1:
+                    failures.append(f"g_systick_ms stopped after the expect-log wait ({e_s1} -> {e_s2})")
 
         if not args.skip_keys:
             usb_active_addr = syms["g_usb_active"][0]

@@ -2195,3 +2195,32 @@ void bt_xrec_get_status(bt_status_t *out)
     bt_memcpy(out->bd_addr, g_bd_addr, 6u);
     bt_memcpy(out->dev_name, g_dev_name, 16u);
 }
+
+#if defined(OPENFW_HCI_PROBE) && OPENFW_HCI_PROBE
+/* HCI probe image only (make BT=1 HCI_PROBE=1, plan M5 Exp 1 stage A): bt_port/bt_rom_real.c reuses this file's ROM
+ * bring-up (LD/LC/LM layers) and g_bt_heap instead of re-deriving them. The probe build also compiles this file with
+ * -DRWBT_IRQHandler=bt_hci_legacy_irq_top (open_fw/Makefile), so bt_rom_real.c owns the only IRQ-26 vector and calls
+ * the legacy top half while this path owns the controller. Kept at the end of the file so that no line above moves
+ * (docs cite this file as F:<line>). Default and BT=0 builds compile none of it. */
+extern uint32_t *const bt_hci_shared_heap;
+void bt_hci_shared_init_ld_layer(const uint8_t bd_addr[6]);
+void bt_hci_shared_init_lc_layer(void);
+void bt_hci_shared_init_lm_layer(void);
+
+uint32_t *const bt_hci_shared_heap = g_bt_heap;
+
+void bt_hci_shared_init_ld_layer(const uint8_t bd_addr[6])
+{
+    rwbt_init_ld_layer(bd_addr);
+}
+
+void bt_hci_shared_init_lc_layer(void)
+{
+    rwbt_init_lc_layer();
+}
+
+void bt_hci_shared_init_lm_layer(void)
+{
+    rwbt_init_lm_layer();
+}
+#endif

@@ -19,6 +19,11 @@ test-bt-port:
 	$(BT_PORT_TEST_DIR)/test_bt_alarm
 	$(HOST_CC) $(BT_PORT_TEST_CFLAGS) tests/test_bt_store.c bt_port/bt_store.c src/crypto.c -o $(BT_PORT_TEST_DIR)/test_bt_store
 	$(BT_PORT_TEST_DIR)/test_bt_store
+	$(HOST_CC) $(BT_PORT_TEST_CFLAGS) tests/test_hci_probe.c bt_port/hci_probe_trigger.c src/exfat.c \
+		-o $(BT_PORT_TEST_DIR)/test_hci_probe
+	dd if=/dev/zero of=$(BT_PORT_TEST_DIR)/hcip_exfat.img bs=512 count=4096 status=none
+	/usr/sbin/mkfs.exfat -q -b 4096 -c 4096 $(BT_PORT_TEST_DIR)/hcip_exfat.img
+	$(BT_PORT_TEST_DIR)/test_hci_probe $(BT_PORT_TEST_DIR)/hcip_exfat.img
 
 # ---- test-bt-ctrl: controller shim against the fake ROM (plan M1, step 3). Host build, sanitizers on. ----
 # Bluedroid's hci_packet_parser.c is compiled in (unmodified) so the mandatory-success replies are proven against the

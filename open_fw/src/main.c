@@ -1649,6 +1649,13 @@ static const openfw_exp_api_t k_exp_api = {
     .bt_xrec_get_status    = bt_xrec_get_status,
 };
 
+#if defined(OPENFW_HCI_PROBE) && OPENFW_HCI_PROBE
+/* bt_port/hci_probe.c: plan M5 Exp 1 stage A (make BT=1 HCI_PROBE=1). Hooks kept below M:1289 (docs cite lines). */
+void hci_probe_start(exfat_vol_t *vol, int sd_mounted);
+int  hci_probe_active(void);   /* legacy BT mode refused (probe running, or RW-BT left claimed) */
+int  hci_probe_running(void);  /* recording refused, USB MSC deferred until the probe's END */
+#endif
+
 int openfw_main(void)
 {
     wdt_feed();
@@ -1860,6 +1867,9 @@ int openfw_main(void)
     openfw_log_u32(g_cpu1_wfe_wakes);
     openfw_log_putc('\n');
     dirty = 0;
+#if defined(OPENFW_HCI_PROBE) && OPENFW_HCI_PROBE
+    hci_probe_start(&g_exfat_vol, g_sd_mounted); /* runs only if SD:/HCIPROBE.RUN exists (deleted first) */
+#endif
 
     while (1) {
         wdt_feed();
@@ -1918,6 +1928,12 @@ int openfw_main(void)
                     g_ui.rec_stopped = 1u;
                     copy_cstr(g_ui.rec_stop_reason, (int)sizeof(g_ui.rec_stop_reason), ui_tr(UI_STR_LOW_BATTERY));
                     rec_active = 0;
+#if defined(OPENFW_HCI_PROBE) && OPENFW_HCI_PROBE
+                } else if (hci_probe_running()) {
+                    g_ui.rec_stopped = 1u; /* the probe's resets stall the app ~0.5 s: audio would overrun */
+                    copy_cstr(g_ui.rec_stop_reason, (int)sizeof(g_ui.rec_stop_reason), ui_tr(UI_STR_START_FAILED));
+                    rec_active = 0;
+#endif
                 } else if (recorder_start(&g_exfat_vol, g_sd_mounted) == 0) {
                     rec_active = 1;
                     copy_cstr(g_ui.rec_filename, (int)sizeof(g_ui.rec_filename), recorder_get_filename());
@@ -2071,7 +2087,11 @@ int openfw_main(void)
                 prev_vbus               = 0;
                 usb_probing             = 0;
                 usb_suppress_until_unpl = 0;
-            } else if (!usb_suppress_until_unpl) {
+            } else if (!usb_suppress_until_unpl
+#if defined(OPENFW_HCI_PROBE) && OPENFW_HCI_PROBE
+                       && !hci_probe_running() /* USB MSC starts after the probe's END */
+#endif
+                       ) {
 #if OPENFW_UNATTENDED_DEV
                 enter_usb_auto = 1;
                 prev_vbus      = 1;
@@ -2190,7 +2210,13 @@ int openfw_main(void)
                                 g_ui_screen         = (uint32_t)scr;
                                 dirty               = 1;
                             } else {
+#if defined(OPENFW_HCI_PROBE) && OPENFW_HCI_PROBE
+                                if (!hci_probe_active()) { /* the probe owns RW-BT or left it claimed */
+                                    run_bt_xrec_mode();
+                                }
+#else
                                 run_bt_xrec_mode();
+#endif
                                 g_ui_screen = (uint32_t)scr;
                                 dirty       = 1;
                                 modal_done  = 1;
@@ -2425,6 +2451,10 @@ int openfw_main(void)
                                     if (!pmu_is_vbus_present()) {
                                         ui_show_toast(ui_tr(UI_STR_TOAST_PLUG_USB), UI_COL_AMBER, t, 1500u);
                                         dirty = 1;
+#if defined(OPENFW_HCI_PROBE) && OPENFW_HCI_PROBE
+                                    } else if (hci_probe_running()) {
+                                        dirty = 1; /* USB MSC waits for the probe's END */
+#endif
                                     } else {
                                         save_persisted_state();
                                         int manual = run_usb_msc_mode(1);

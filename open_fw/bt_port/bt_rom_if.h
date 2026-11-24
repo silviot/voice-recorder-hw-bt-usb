@@ -7,7 +7,8 @@
  * the only thing that crosses from the IRQ-26 top half is the on_irq upcall.
  *
  * Implementations:
- *   real: bt_rom_real.c (not written yet; plan step 6) = today's bt_hci.c bring-up/hooks/ISR, verbatim.
+ *   real: bt_rom_real.c = the legacy bt_hci.c bring-up/hooks/ISR (LD/LC/LM layers reused, not copied); built into
+ *         the Exp 1 stage A probe image (make BT=1 HCI_PROBE=1) until bt_ctrl is integrated (plan step 6).
  *   fake: tests/fake_rom.c (host tests).
  *
  * Deviations from BT_ROM_INTERFACE.md §10 (all additive):
