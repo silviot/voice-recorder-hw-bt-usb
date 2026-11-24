@@ -36,7 +36,7 @@ Three 4-bit anti-aliased LVGL v9 fonts (~`14.8 KiB` combined glyph bitmaps) are 
 | `ui_font_sm` | Noto Sans Medium **11 px** | ~24–28 chars | Top status bar, durations, badges, bottom hint bar | `2.3 KiB` |
 
 - **Tabular numerals:** Digits `0..9` share a uniform advance width so live recording and playback timers never jitter horizontally.
-- **Included UI symbols:** `±`, `·`, `×`, `…`, `−`, `■`, `▲`, `▶`, `▼`, `◀`, `●`, `✓`.
+- **Included UI symbols & Latin accents:** `±`, `·`, `×`, `…`, `−`, `■`, `▲`, `▶`, `▼`, `◀`, `●`, `✓`, `«`, `»`, and Italian accented vowels (`À Á È É Ì Í Ò Ó Ù Ú à á è é ì í ò ó ù ú`).
 - **Automatic truncation:** LVGL `LV_LABEL_LONG_DOT` handles clean ellipsis truncation on long names.
 
 ---

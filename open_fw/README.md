@@ -67,8 +67,39 @@ make -C open_fw DEV_EXP=1 all update-up
 | Region | Address | Budget / Purpose |
 | :--- | :--- | :--- |
 | `.ram_boot` | `0x00804C00` | `<= 4 KiB` Stage-1 `HLKJ` load window (bootstrap + vector table) |
-| `.text` / `.rodata` | `0x00C0F430` | Quad 48 MHz XIP NOR (~`272 KiB` used out of ~`1.9 MiB`) |
+| `.text` / `.rodata` | `0x00C0F430` | Quad 48 MHz XIP NOR (~`308 KiB` used out of ~`1.9 MiB`) |
 | `.data` + `.bss` | `0x0081A380..0x0084FFFF` | Zero-wait-state SRAM fast-path (hot LVGL/LCD code, 25.6 KiB FB, audio rings, TLSF heap) |
 | `.exp_arena` / `.exp_out` | `0x00850000..0x0085BFFF` | `32 KiB` SRAM probe arena + `16 KiB` capture buffer |
+| `.bss_hi` (`OPENFW_SRAM_HI`) | `0x0085C000..0x00866FFF` | `44 KiB` upper SRAM for large non-hot buffers (96-entry file browser & CPU1 UI slots), leaving `~15 KiB` below `_estack = 0x0086AC08` |
+
+## microSD Disk Layout (exFAT)
+
+The recorder uses a single exFAT partition on the microSD card with the following directory and file conventions:
+
+```text
+/
+├── record/                     # On-device voice recordings saved by recorder.c
+│   ├── REC_0001.wav            # 16 kHz mono/stereo PCM WAV (newest-first in Files root)
+│   ├── REC_0001.cwx            # Optional synced word-timed transcript sidecar (CWX1)
+│   └── <subfolder>/            # Optional nested folders (also surfaced in Files root)
+├── audiobooks/                 # Recommended location for multi-chapter audiobooks / audio folders
+│   └── <Book_Name>/            # Surfaced as a folder row ("Book Name", "<N> ▶") in Files root
+│       ├── 01_Cap1.wav         # Chapters listed ascending (A–Z) inside the folder
+│       └── 01_Cap1.cwx         # Optional synced UTF-8 transcript sidecar per chapter
+├── cassini/                    # Firmware state & metadata
+│   ├── settings.bin            # Persisted UI/audio settings + last played file & resume offset
+│   └── <subfolder>/            # Optional nested audio folders (also surfaced in Files root)
+├── cassini.key                 # +XREC v5 paired host key ("CSK5" + 32 B)
+├── bt_keys.bin                 # Classic BT link-key cache ("BLK1", 4 slots)
+├── update.up                   # Optional SD OTA firmware update package (Stage-1 HLKJ)
+└── <Custom_Folder>/            # Any other non-empty root folder (excluding dotfiles, System Volume Information, $RECYCLE.BIN)
+```
+
+### File Browser Rules (`src/main.c`, `src/ui/ui_screens.c`)
+- **Root `Files` view:** Shows all non-empty subfolders discovered under `/audiobooks/`, `/cassini/`, `/record/`, and `/` (sorted A–Z with an amber dot and `<N> ▶` chapter count), followed by loose `.wav` files from `/record/`, `/cassini/`, and `/` sorted **newest-first** (up to `96` entries per view).
+- **Inside a folder (`OK` to enter, `BACK` to return):** Shows any nested subfolders first, followed by `.wav` files sorted **ascending (A–Z)** so audiobook chapters play in order. Double-tap prev/next in the player navigates only within audio files and skips folder rows.
+- **Display titles:** Generic recorder names (`REC_*` or `YYYY*` timestamps) render as friendly dates (`Today 14:32`); custom names (folders and audiobook chapters) strip `.wav` and replace `_` with spaces (e.g., `Jekyll_Hyde` → `Jekyll Hyde`, `JH_01a_Cap1.wav` → `JH 01a Cap1`).
+- **Transcripts (`.cwx`):** Any `<stem>.cwx` sitting in the same directory as `<stem>.wav` is automatically matched and displayed as live karaoke captions during playback.
+- **Safety & resume:** Folder rows are protected from long-press delete; `settings.bin` resume lookup searches both loose files and discovered folders.
 
 For deeper technical details, see **[../docs/LVGL_ARCHITECTURE.md](../docs/LVGL_ARCHITECTURE.md)**, **[../docs/SL6801_HW76_HARDWARE.md](../docs/SL6801_HW76_HARDWARE.md)**, and **[../docs/DEVELOPMENT_WORKFLOW.md](../docs/DEVELOPMENT_WORKFLOW.md)**.
