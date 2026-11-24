@@ -1,4 +1,4 @@
-# Bluetooth Classic for open_fw — Integration Plan (v18, for joint review)
+# Bluetooth Classic for open_fw — Integration Plan (v18, AGREED by Codex and agy)
 
 Branch `feat/freertos-bluedroid` (worktree `../voice-recorder-hw-bt-usb-bt`). Hardware: Smartlink SL6801 `HW_76`
 (dual Cortex-M4F @ 96 MHz, 512 KB SRAM, 2 MB SPI NOR XIP, **BR/EDR-only** RivieraWaves `RW-BT` controller in mask ROM,
@@ -420,7 +420,9 @@ telemetry: heap/stack watermarks, largest free block, IRQ-26 latency and multipl
   recorder). Plan v15. Round 14: agy APPROVE; Codex 1 item (app cannot enforce its deadline during a long SD
   write). Plan v16. Round 15: agy APPROVE; Codex 2 items (continuity beyond the DMA ring; check-then-ROM-call race).
   Plan v17 states both guarantees at their enforceable bounds. Round 16: agy APPROVE (no items); Codex 1.5 items
-  (bound depends on queue depth; overrun not persisted). Plan v18. Exp 0 probes (`exp/exp_sram_fill.c`, `exp/exp_sram_check.c`) written.
+  (bound depends on queue depth; overrun not persisted). Plan v18.
+  Round 17: **Codex APPROVE, agy APPROVE, no open items. Plan v18 agreed; execution continues with steps 2–3 and the
+  step-4 hardware session.** Follow-up outside this plan: persist the recorder overrun count in recordings. Exp 0 probes (`exp/exp_sram_fill.c`, `exp/exp_sram_check.c`) written.
 
 ## 11. Round-1 traceability
 
