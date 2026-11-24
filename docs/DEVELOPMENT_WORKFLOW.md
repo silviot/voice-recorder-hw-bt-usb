@@ -111,6 +111,13 @@ When a silicon register, FIFO size, clock mux, IRQ line, or SD card write path i
 - **Memory-ownership checks:** `exp/exp_sram_fill.c` → exercise (`exp_bt.c`, `exp_dac.c`, `exp/exp_sram_exercise.c`) →
   `exp/exp_sram_check.c` proves whether anything else (ROM, DMA, CPU1, USB) touches an SRAM range. Run it on an image
   that does not itself use the range.
+- **Files on the device's microSD from the host:** with USB attached, OpenFW enters USB disk mode and the card appears
+  as an exFAT block device (`lsblk` → model `OpenFW Recorder`). `udisksctl mount -b /dev/sdX1`, write, `sync`,
+  `udisksctl unmount -b /dev/sdX1`. Used for one-shot triggers such as `HCIPROBE.RUN` (`docs/BT_HW_RESULTS.md`).
+- **One-shot, file-triggered experiments** are the safe pattern for anything that could hang: the image deletes the
+  trigger file (and verifies the delete) *before* the risky part, because a runtime-WDT reset is a PMU cold reset that
+  wipes `AON_BACKUP` — a marker kept there cannot stop a reset loop.
+- **NVIC:** SL6801 implements **4** priority bits (mask `0xF0`); IRQ 26's priority byte is `0xF0` at boot, not 0.
 - A full experiment session that ends on production firmware takes ~10 minutes; results go in `docs/BT_HW_RESULTS.md`
   (or the matching results doc) so they are not rediscovered.
 
