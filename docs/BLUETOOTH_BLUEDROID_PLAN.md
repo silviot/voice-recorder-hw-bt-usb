@@ -422,7 +422,10 @@ telemetry: heap/stack watermarks, largest free block, IRQ-26 latency and multipl
   Plan v17 states both guarantees at their enforceable bounds. Round 16: agy APPROVE (no items); Codex 1.5 items
   (bound depends on queue depth; overrun not persisted). Plan v18.
   Round 17: **Codex APPROVE, agy APPROVE, no open items. Plan v18 agreed; execution continues with steps 2–3 and the
-  step-4 hardware session.** Follow-up outside this plan: persist the recorder overrun count in recordings. Exp 0 probes (`exp/exp_sram_fill.c`, `exp/exp_sram_check.c`) written.
+  step-4 hardware session.** Follow-up outside this plan: persist the recorder overrun count in recordings.
+- 2026-11-24 (hardware session 1, `docs/BT_HW_RESULTS.md`): Exp 0 PASS (both regions intact after legacy BT, DMA,
+  SD, USB, UI) → lower region enabled as heap_5 region 0; BT image free heap 34 KB → 118 KB. RTOS+BT self-test 14/14
+  on silicon. Exp 2 first read: mic ADC low bits ≈ 0.95 bit/bit, SARADC and timer jitter unusable. Exp 0 probes (`exp/exp_sram_fill.c`, `exp/exp_sram_check.c`) written.
 
 ## 11. Round-1 traceability
 

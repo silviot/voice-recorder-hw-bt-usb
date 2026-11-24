@@ -21,6 +21,8 @@ uint32_t g_openfw_cpu_hz = 96000000u;
 
 extern uint8_t _srtos_heap0[];
 extern uint8_t _ertos_heap0[];
+extern uint8_t _srtos_heap_lo[];
+extern uint8_t _ertos_heap_lo[];
 
 extern void xPortSysTickHandler(void);
 extern void systick_init(uint32_t cpu_hz);
@@ -165,7 +167,9 @@ static void app_task(void *arg)
 
 void openfw_rtos_start(openfw_rtos_entry_t entry)
 {
+    /* heap_5 needs regions in ascending address order: lower (Exp 0 validated) first. */
     HeapRegion_t regions[] = {
+        { _srtos_heap_lo, (size_t)(_ertos_heap_lo - _srtos_heap_lo) },
         { _srtos_heap0, (size_t)(_ertos_heap0 - _srtos_heap0) },
         { NULL, 0 },
     };

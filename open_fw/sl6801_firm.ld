@@ -23,6 +23,9 @@ MEMORY
     /* Physical SRAM extends to 0x0087FFFF (stock FIRM used it for heaps). Unused by open_fw
      * unless built with OPENFW_RTOS=1; heap_5 region, NOT zeroed at boot. Verify on hardware. */
     RTOS_HEAP (rw)  : ORIGIN = 0x0086B000, LENGTH = 0x00015000
+    /* RTOS builds only: stock-FIRM code/data area, unused by open_fw. Validated on silicon by Experiment 0
+     * (2026-11-24: pattern intact after RW-BT ROM controller, DAC/mic DMA, SD, USB, CPU1 UI). heap_5 region 0. */
+    RTOS_HEAP_LO (rw) : ORIGIN = 0x00805C00, LENGTH = 0x00014780
 }
 
 _estack = 0x0086AC08;
@@ -145,6 +148,14 @@ SECTIONS
         . = ALIGN(4);
         _ebt_bss = .;
     } > RTOS_HEAP
+
+    .rtos_heap_lo (NOLOAD) : ALIGN(8) {
+        _srtos_heap_lo = .;
+        . = ORIGIN(RTOS_HEAP_LO) + LENGTH(RTOS_HEAP_LO);
+        _ertos_heap_lo = .;
+    } > RTOS_HEAP_LO
+
+    ASSERT(_srtos_heap_lo >= 0x00805C00 && _ertos_heap_lo <= 0x0081A380, "RTOS_HEAP_LO outside the validated range")
 
     .rtos_heap (NOLOAD) : ALIGN(8) {
         _srtos_heap0 = .;
