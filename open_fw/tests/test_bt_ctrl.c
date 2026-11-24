@@ -1511,6 +1511,94 @@ static void test_stale_tx_acl_flush(void)
     shutdown_and_check();
 }
 
+/* Credit-blocked inbound ACL (g.held[]) must never be delivered after Disconnection Complete or onto a reused handle,
+ * and ACL_RX for a dead or out-of-range handle must be dropped immediately. */
+static void test_stale_rx_acl_flush(void)
+{
+    uint8_t d_a[1024], d_b[64];
+    memset(d_a, 0xAA, sizeof(d_a));
+    memset(d_b, 0xBB, sizeof(d_b));
+    const pkt_t *p;
+
+    /* (a) credit-blocked packets on 0x80 dropped once Disconnection Complete is delivered; never injected onto a
+     *     new connection reusing 0x80 when the host returns the earlier credits */
+    setup();
+    bring_up();
+    link_up(0);
+    for (int i = 0; i < 6; i++) CHECK(fake_rom_inject_acl(0x80, 2, d_a, 64) == 0, "inject A %d", i);
+    pump();
+    t_rx_rd = t_rx_n;
+    CHECK(dbg().c2h_outstanding == 4u && dbg().held_acl == 2u, "4 delivered, 2 held");
+    fake_rom_link(0, false);
+    inject_disc(0x80, 0x13);
+    pump();
+    p = next_pkt();
+    CHECK(is_evt(p, BT_HCI_EVT_DISC) && next_pkt() == NULL, "Disconnection Complete delivered");
+    CHECK(dbg().held_acl == 0u && fake_rom_em_rx_in_use() == 0u,
+          "stale held ACL freed once Disconnection Complete crossed to host (held %u em %u)",
+          dbg().held_acl, fake_rom_em_rx_in_use());
+    fake_rom_link(0, true);
+    inject_conn_cmp(0x80);
+    host_nocp(0x80, 4);
+    pump();
+    uint32_t stale_acl = 0u, saw_conn = 0u;
+    while ((p = next_pkt()) != NULL) {
+        stale_acl += p->d[0] == BT_H4_ACL;
+        saw_conn += is_evt(p, 0x03u);
+    }
+    CHECK(saw_conn == 1u && stale_acl == 0u, "no stale Peer A ACL delivered onto Peer B (stale %u)", stale_acl);
+    shutdown_and_check();
+
+    /* (b) partially delivered >1021 B packet: continuation fragment dropped on Disconnection Complete */
+    setup();
+    bring_up();
+    link_up(0);
+    uint8_t hbs1[7] = { 0xFD, 0x03, 0xFF, 0x01, 0x00, 0x0A, 0x00 };
+    (void)roundtrip(0x0C33u, hbs1, 7u);
+    CHECK(fake_rom_inject_acl(0x80, 2, d_a, 1024) == 0, "inject 1024");
+    pump();
+    p = next_pkt();
+    CHECK(p != NULL && p->d[0] == BT_H4_ACL && dbg().held_acl == 1u, "first fragment delivered, continuation held");
+    fake_rom_link(0, false);
+    inject_disc(0x80, 0x13);
+    pump();
+    p = next_pkt();
+    CHECK(is_evt(p, BT_HCI_EVT_DISC) && dbg().held_acl == 0u && fake_rom_em_rx_in_use() == 0u,
+          "continuation fragment dropped on disconnect");
+    host_nocp(0x80, 1);
+    pump();
+    CHECK(next_pkt() == NULL, "no orphan continuation fragment delivered after disconnect");
+    shutdown_and_check();
+
+    /* (c) non-head held entry for 0x80 behind live 0x81, plus late ACL_RX on dead 0x80 and out-of-range 0x87 */
+    setup();
+    bring_up();
+    link_up(0);
+    link_up(1);
+    for (int i = 0; i < 5; i++) CHECK(fake_rom_inject_acl(0x81, 2, d_b, 32) == 0, "inject B %d", i);
+    CHECK(fake_rom_inject_acl(0x80, 2, d_a, 32) == 0, "inject A behind B");
+    pump();
+    t_rx_rd = t_rx_n;
+    CHECK(dbg().held_acl == 2u, "B#5 and A#1 held");
+    fake_rom_link(0, false);
+    inject_disc(0x80, 0x13);
+    pump();
+    p = next_pkt();
+    CHECK(is_evt(p, BT_HCI_EVT_DISC) && dbg().held_acl == 1u, "A#1 swept while B#5 kept (held %u)", dbg().held_acl);
+    CHECK(fake_rom_inject_acl(0x80, 2, d_a, 32) == 0, "late ACL_RX on dead 0x80");
+    CHECK(fake_rom_inject_acl(0x87, 2, d_a, 32) == 0, "ACL_RX on out-of-range 0x87");
+    pump();
+    CHECK(dbg().held_acl == 1u && fake_rom_em_rx_in_use() == 1u, "dead/out-of-range ACL_RX dropped at upcall");
+    host_nocp(0x81, 4);
+    pump();
+    p = next_pkt();
+    CHECK(p != NULL && p->d[0] == BT_H4_ACL && (p->d[1] | ((p->d[2] & 0x0Fu) << 8)) == 0x81u && p->d[5] == 0xBBu &&
+          next_pkt() == NULL, "only live 0x81 packet delivered");
+    host_nocp(0x81, 1);
+    pump();
+    shutdown_and_check();
+}
+
 /* Finding 10: send-available only on a full -> not-full transition. */
 static void test_send_avail_only_when_full(void)
 {
@@ -2852,6 +2940,7 @@ int main(void)
         { "reset_failure_masks_irq", test_reset_failure_masks_irq },
         { "fwd_orphan", test_fwd_orphan },
         { "stale_tx_acl_flush", test_stale_tx_acl_flush },
+        { "stale_rx_acl_flush", test_stale_rx_acl_flush },
         { "send_avail_only_when_full", test_send_avail_only_when_full },
         { "class_m_fwd_fault", test_class_m_fwd_fault },
         { "deferred_order_after_free", test_deferred_order_after_free },
