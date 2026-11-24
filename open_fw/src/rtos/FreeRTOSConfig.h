@@ -66,9 +66,9 @@ extern uint64_t us_timer_now(void);
 #define configTIMER_TASK_STACK_DEPTH             ( 384U )
 
 /* Interrupt priorities (top bits only; the port auto-detects implemented bits at start-up) */
-#define configPRIO_BITS                          3
+#define configPRIO_BITS                          4   /* SL6801: 4 implemented NVIC priority bits (mask 0xF0), measured on silicon (Exp 1, 2026-11-24) */
 #define configLIBRARY_LOWEST_INTERRUPT_PRIORITY  ( ( 1U << configPRIO_BITS ) - 1U )
-#define configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY 4U
+#define configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY 8U  /* = 0x80 (unchanged); ISRs at 0x80..0xF0 may call FromISR APIs */
 #define configKERNEL_INTERRUPT_PRIORITY          ( configLIBRARY_LOWEST_INTERRUPT_PRIORITY << ( 8 - configPRIO_BITS ) )
 #define configMAX_SYSCALL_INTERRUPT_PRIORITY     ( configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY << ( 8 - configPRIO_BITS ) )
 

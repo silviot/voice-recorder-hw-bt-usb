@@ -47,6 +47,29 @@ repeats, and confirmation that the noise is electronic (it is present at low gai
 - Idle key-ladder ADC 4055..4090.
 - One SD multi-block write timed out and fell back to single-sector writes (existing driver behaviour, `SDW_MDTO`).
 
+## Session 2 (2026-11-24): Exp 1 stage A — PASS
+
+Image: `BT=1 HCI_PROBE=1` at `6d2a093`, one-shot request `HCIPROBE.RUN` (consumed: `trig=taken`). `bt_ctrl` drove the real
+RW-BT ROM through `bt_rom_real.c`. Result: `END st=DONE fails=0` in 6.3 s; afterwards `legacy=allowed`.
+
+| Item | Result |
+|---|---|
+| HCI Reset (`bt_ctrl` real reset: RF calibration + ROM start) | CC status 0 in 205 ms (RF cal 202 ms, start 2.2 ms) |
+| Read-only commands (answered locally) | 1005, 1001, 1009 (BD_ADDR matches eFuse: `02:CA:55:00:01:1D`), 1002, 1004 p0/p1, 0C14 — all CC status 0, 146–288 µs |
+| IRQ 26 liveness after Reset | 3 IRQs within 15 µs |
+| Clean restart (stop + start + Reset + Read BD_ADDR) ×5 | 5/5 OK, stop 14–15 µs, no retries — answers BT_ROM_INTERFACE §11 Q9 |
+| Idle IRQ 26 (5 s, controller up, no traffic) | only INTSTAT bit 0, 1600.1 Hz (one per 625 µs = 2 slots), no coalescing, 0 spurious |
+| IRQ → bottom half latency | avg 8 µs, max 40 µs; `irq_service()` max 41 µs; ROM `run()` max 8 µs; `bt_ctrl_run()` max 80 µs (plan asserts ≤ 1 ms) |
+| `bt_ctrl` CPU at idle | **5.3 %** (8000 wake-ups / 5 s) — a power cost to address (only bring the controller up when a mode needs it; look for ROM sleep/low-power modes) |
+| NVIC | **4 implemented priority bits (mask 0xF0)**; IRQ 26 set to 0x80 and read back 0x80; SHPR3 0xF0F00000 (PendSV/SysTick lowest). Original IRQ-26 IPR before the probe was **0xF0**, not 0 as BT_ROM_INTERFACE §12 assumed; restored on release. |
+| `g_bt_heap` (8 KiB ROM heap) | high-water 0 in stage A (no ROM messages yet: stage B/C will load it) |
+| Free stack | bt_ctrl 888 B, bt_dlv 1372 B, probe 1196 B |
+| RTOS heap free during probe | 104,720 B |
+
+Follow-ups: `FreeRTOSConfig.h` now states `configPRIO_BITS 4` with the syscall ceiling kept at 0x80 (image unchanged: the
+V11 port reads the implemented bits from hardware). Stage B (verified writes 0C56/0C01/0C24/0C13/0C1A) and the
+"needs disassembly" rows are next; ACL/connection traffic (stage C) also repeats the Exp 0 memory check.
+
 ## Exp 1 stage A: how to run
 
 Probe image for plan M5 Exp 1 stage A (step 4): `bt_ctrl` (plan M1) drives the real RW-BT ROM through
