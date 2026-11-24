@@ -201,7 +201,10 @@ static inline uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b)
     return (uint16_t)(((uint16_t)(r >> 3) << 11) | ((uint16_t)(g >> 2) << 5) | (uint16_t)(b >> 3));
 }
 
-void     lcd_backlight_set(uint8_t percent);
+void     lcd_backlight_set(uint8_t percent);   /* instant; cancels a fade */
+void     lcd_backlight_fade(uint8_t from_pct, uint8_t to_pct, uint32_t ms);
+int      lcd_backlight_fading(void);
+void     lcd_backlight_fade_tick(void);        /* 1 ms SysTick ISR */
 void     lcd_init(void);
 uint64_t lcd_init_begin(void);
 void     lcd_init_finish(uint64_t t_slpout_us);

@@ -28,6 +28,7 @@ extern int  openfw_main(void);
 extern void DMAC_CH0_IRQHandler(void);
 extern void DMAC_CH1_IRQHandler(void);
 extern void keys_scan_tick(uint32_t now_ms);
+extern void lcd_backlight_fade_tick(void);
 
 /* ============================================================================
  * Host Imports (provided by web_emu/worker.js)
@@ -527,6 +528,7 @@ static void sync_time_ms(uint32_t now_ms)
             g_soc.us_time = step_us;
         }
         keys_scan_tick(g_systick_ms);
+        lcd_backlight_fade_tick();
         pump_audio_dmac();
         if ((uint32_t)(g_systick_ms - g_soc.rtc_last_sec_ms) >= 1000u) {
             g_soc.rtc_last_sec_ms += 1000u;

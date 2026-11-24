@@ -171,6 +171,7 @@ void SysTick_Handler(void)
         system_reboot();
     }
     keys_scan_tick(now);
+    lcd_backlight_fade_tick();
 }
 
 __attribute__((section(".ramtext"), naked, used))

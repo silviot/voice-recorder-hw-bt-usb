@@ -135,9 +135,26 @@ static void backlight_apply(uint8_t pct)
     }
 }
 
+/*
+ * Screen sleep/wake fades (ramp runs in the SysTick ISR, see lcd_st7735s.c).
+ * Sleep: fade to 0 over BL_FADE_OUT_MS while g_screen_off stays AWAKE, so the
+ * UI keeps drawing and keys act normally; backlight_service() then performs the
+ * real off-actions. Any wake during the fade cancels it at full brightness.
+ * Wake: CPU1 restarts and the (black) OFF frame is still on the panel, then the
+ * backlight ramps up over BL_FADE_IN_MS while the caller renders the new frame.
+ */
+#define BL_FADE_OUT_MS 200u
+#define BL_FADE_IN_MS  100u
+static enum screen_sleep_state g_fade_out_reason = SCREEN_AWAKE;
+
 static void backlight_wake(uint32_t now_ms)
 {
     g_last_activity_ms = now_ms;
+    if (g_fade_out_reason != SCREEN_AWAKE) {
+        g_fade_out_reason = SCREEN_AWAKE;
+        backlight_apply(user_bl_pct()); /* cancels the ramp */
+        return;
+    }
     int was_off        = (g_screen_off != SCREEN_AWAKE);
     g_screen_off       = SCREEN_AWAKE;
     if (was_off) {
@@ -145,15 +162,40 @@ static void backlight_wake(uint32_t now_ms)
         if (g_cpu1_booted && !cpu1_ui_is_active()) {
             (void)cpu1_ui_start();
         }
+        g_cur_bl_pct = user_bl_pct();
+        lcd_backlight_fade(0u, g_cur_bl_pct, BL_FADE_IN_MS);
+    } else {
+        backlight_apply(user_bl_pct());
     }
-    backlight_apply(user_bl_pct());
 }
 
 static void backlight_sleep_now(enum screen_sleep_state reason)
 {
-    g_screen_off = reason;
-    keys_ignore_held();
-    backlight_apply(0u);
+    if (g_screen_off != SCREEN_AWAKE) {
+        return;
+    }
+    if (g_fade_out_reason == SCREEN_AWAKE) {
+        keys_ignore_held(); /* suppress the press that requested sleep */
+        lcd_backlight_fade((g_cur_bl_pct > 100u) ? 100u : g_cur_bl_pct, 0u, BL_FADE_OUT_MS);
+        g_cur_bl_pct = 0u;
+    }
+    g_fade_out_reason = reason; /* a manual off may upgrade an idle fade */
+}
+
+static int screen_manually_off(void)
+{
+    return g_screen_off == SCREEN_MANUALLY_OFF || g_fade_out_reason == SCREEN_MANUALLY_OFF;
+}
+
+/* Task context, called from every UI loop: finish a completed fade-out. */
+static void backlight_service(void)
+{
+    if (g_fade_out_reason == SCREEN_AWAKE || lcd_backlight_fading()) {
+        return;
+    }
+    g_screen_off      = g_fade_out_reason;
+    g_fade_out_reason = SCREEN_AWAKE;
+    lcd_backlight_set(0u); /* disconnect the PWM from the pad */
     ui_render_screen(UI_SCR_OFF, &g_ui);
     cpu1_ui_sync(60u);
     /* When hardware IPC Mailbox WFE is active, CPU1 is already halted in
@@ -169,6 +211,7 @@ int ui_poll_power_button(ui_screen_id_t screen, ui_model_t *model, uint32_t now)
      * The PMU latches edges until acknowledged. */
     static uint32_t last_poll;
     static int      seen_press_after_boot;
+    backlight_service();
     if (now - last_poll >= 16u) {
         last_poll = now;
         uint8_t ev = key_onoff_poll();
@@ -181,7 +224,9 @@ int ui_poll_power_button(ui_screen_id_t screen, ui_model_t *model, uint32_t now)
         }
         uint8_t progress = 0;
         power_button_action_t action = power_button_update(ev, now,
-                                                           g_screen_off, &progress);
+                                                           g_screen_off != SCREEN_AWAKE ||
+                                                           g_fade_out_reason != SCREEN_AWAKE,
+                                                           &progress);
         switch (action) {
         case POWER_BUTTON_SLEEP:
             backlight_sleep_now(SCREEN_MANUALLY_OFF);
@@ -225,6 +270,10 @@ int ui_poll_power_button(ui_screen_id_t screen, ui_model_t *model, uint32_t now)
 
 static void backlight_update(void)
 {
+    backlight_service();
+    if (g_fade_out_reason != SCREEN_AWAKE) {
+        return;
+    }
     if (g_screen_off) {
         backlight_apply(0u);
         return;
@@ -1199,7 +1248,7 @@ static int run_usb_msc_mode(int auto_mode)
             if (rxp > 0u || txp > 0u || now >= 3000u) {
                 clear_boot_strikes_once();
             }
-            if ((txp != prev_txp || rxp != prev_rxp) && g_screen_off != SCREEN_MANUALLY_OFF) {
+            if ((txp != prev_txp || rxp != prev_rxp) && !screen_manually_off()) {
                 backlight_wake(now);
             }
             if (txp != prev_txp) {
@@ -1348,7 +1397,7 @@ static void run_bt_xrec_mode(void)
                 prev_tx  = st.tx_acl_pkts;
                 prev_acl = st.acl_connected;
                 prev_spp = st.spp_open;
-                if (g_screen_off != SCREEN_MANUALLY_OFF) {
+                if (!screen_manually_off()) {
                     backlight_wake(now);
                 }
             }

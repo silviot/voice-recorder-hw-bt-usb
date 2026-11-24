@@ -1296,6 +1296,69 @@ static void test_exp_runner_guards(const char *exfat_img_path)
     printf("[OK] exp_runner guards + wrapped log dump MMIO\n");
 }
 
+/* Run the 1 ms fade tick until the ramp ends; check monotonic duty steps. */
+static uint32_t run_fade(int dir, uint32_t *ticks)
+{
+    uint32_t prev = g_soc.pwm3_period_duty & 0xFFFFu, steps = 0u;
+    *ticks = 0u;
+    while (lcd_backlight_fading() && *ticks < 1000u) {
+        lcd_backlight_fade_tick();
+        (*ticks)++;
+        uint32_t d = g_soc.pwm3_period_duty & 0xFFFFu;
+        assert((g_soc.pwm3_period_duty >> 16) == 48000u);
+        if (d != prev) {
+            assert(dir > 0 ? d > prev : d < prev);
+            assert((*ticks % 10u) == 0u);
+            steps++;
+        }
+        prev = d;
+    }
+    return steps;
+}
+
+static void test_backlight_fade(void)
+{
+    uint32_t ticks;
+    /* Fade-out 80% -> 0 over 200 ms: 20 steps, gamma-2 first step is small */
+    lcd_backlight_set(80u);
+    lcd_backlight_fade(80u, 0u, 200u);
+    assert(lcd_backlight_fading());
+    assert((g_soc.pwm3_period_duty & 0xFFFFu) == 80u * 480u);
+    for (int i = 0; i < 10; i++) lcd_backlight_fade_tick();
+    uint32_t d1 = g_soc.pwm3_period_duty & 0xFFFFu; /* L 894 -> 849: 34600 */
+    assert(d1 < 80u * 480u && d1 > 34000u);
+    assert(run_fade(-1, &ticks) == 19u && ticks == 190u);
+    assert((g_soc.pwm3_period_duty & 0xFFFFu) == 0u && !lcd_backlight_fading());
+    lcd_backlight_set(0u);
+    assert(((g_soc.gpio_mux[GPIO_PORT_B][2] >> 4) & 0xFu) == 1u);
+
+    /* Fade-in 0 -> 20% over 100 ms from a disconnected pad: PWM connects */
+    lcd_backlight_fade(0u, 20u, 100u);
+    assert(((g_soc.gpio_mux[GPIO_PORT_B][2] >> 4) & 0xFu) == 5u);
+    assert((g_soc.pwm3_period_duty & 0xFFFFu) == 0u);
+    assert(run_fade(+1, &ticks) == 10u && ticks == 100u);
+    assert(g_soc.pwm3_period_duty == ((48000u << 16) | (20u * 480u)));
+
+    /* Reversal mid-ramp continues from the current level (no jump) */
+    lcd_backlight_set(0u);
+    lcd_backlight_fade(0u, 100u, 100u);
+    for (int i = 0; i < 50; i++) lcd_backlight_fade_tick();
+    uint32_t mid = g_soc.pwm3_period_duty & 0xFFFFu;   /* L 500 -> 12000 */
+    assert(mid == 12000u);
+    lcd_backlight_fade(100u, 0u, 200u);
+    assert((g_soc.pwm3_period_duty & 0xFFFFu) == mid);
+    assert(run_fade(-1, &ticks) == 20u);
+
+    /* lcd_backlight_set() cancels a running ramp */
+    lcd_backlight_fade(0u, 60u, 100u);
+    lcd_backlight_fade_tick();
+    lcd_backlight_set(35u);
+    assert(!lcd_backlight_fading());
+    for (int i = 0; i < 50; i++) lcd_backlight_fade_tick();
+    assert(g_soc.pwm3_period_duty == ((48000u << 16) | (35u * 480u)));
+    printf("[OK] backlight fade ramp\n");
+}
+
 static void test_lcd_driver(void)
 {
     soc_reset();
@@ -1312,6 +1375,7 @@ static void test_lcd_driver(void)
     assert(((g_soc.gpio_mux[GPIO_PORT_B][2] >> 4) & 0xFu) == 5u);
     assert((g_soc.pwm3_ctrl & 0x3Fu) == 0x3Fu);
     assert(g_soc.pwm3_period_duty == ((48000u << 16) | (35u * 480u)));
+    test_backlight_fade();
 
     lcd_init();
     assert((g_soc.gpio_lcd_pad_en & 0x0000FFD0u) == 0x0000FFD0u);
