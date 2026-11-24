@@ -1,9 +1,9 @@
-# Bluetooth Classic for open_fw — Integration Plan (v12, for joint review)
+# Bluetooth Classic for open_fw — Integration Plan (v13, for joint review)
 
 Branch `feat/freertos-bluedroid` (worktree `../voice-recorder-hw-bt-usb-bt`). Hardware: Smartlink SL6801 `HW_76`
 (dual Cortex-M4F @ 96 MHz, 512 KB SRAM, 2 MB SPI NOR XIP, **BR/EDR-only** RivieraWaves `RW-BT` controller in mask ROM,
 no BLE). This document is the single source of truth: it is reviewed by Codex and agy until both agree, then executed.
-v3–v12 address rounds 1–10 (§11 traceability).
+v3–v13 address rounds 1–11 (§11 traceability).
 
 ## 0. Goals, non-goals
 
@@ -38,7 +38,8 @@ Nothing has run on silicon yet. Legacy BT host code has never shipped to users.
 - **D1 Host stack = Bluedroid.** Rejected: BTstack (licence), Zephyr host, NimBLE (BLE only), hand-rolled host.
 - **D2 FreeRTOS confined to CPU0**; CPU1 (LVGL worker) stays bare-metal. DMA audio/USB/SDIO stay ISR/poll driven.
 - **D3 HCI boundary = `esp_bluedroid_attach_hci_driver()`** (H4 framed); no custom HAL. `hci_layer.c`,
-  `hci_hal_h4.c`, `fixed_queue.c` and `osi/alarm.c` receive only the small documented patches listed in M1/M2 (D6).
+  `hci_hal_h4.c`, `fixed_queue.c`, `osi/alarm.c`, `osi/future.c` and `api/esp_bt_main.c` receive only the small
+  documented patches listed in M1/M2 (D6).
 - **D4 libc = picolibc** (pinned) + 6 compiler-rt builtins; `startup.c`'s `__aeabi_mem*`/64-bit division authoritative.
 - **D5 Legacy path stays default** until parity: flag `OPENFW_BT_BLUEDROID=1` (implies `RTOS=1`).
 - **D6 Upstream pristine**: every change is a documented patch file.
@@ -189,14 +190,23 @@ Acceptance budget per mode: minimum free heap under traffic ≥ 8 KB and largest
   quiesced (session id bumped, late callbacks rejected) → admission closed → controller stopped, reset completion
   checked (status reported, not ignored) → IRQ 26 masked → rings freed → tasks deleted (idle reaps).
 - **Recovery ladder (bounded, works under persistent allocation failure)**: the app task handles a BT fault (RX
-  delivery failures, ring overflow, command timeout storm, `bt_ctrl` invariant violation): (1) graceful
-  `esp_bluedroid_disable()` + teardown with a 2 s deadline; (2) if that returns an error (e.g. `ESP_ERR_NO_MEM`: it
-  allocates a future) or the deadline passes, a **hard path that needs no heap**: mask IRQ 26, stop the recorder
+  delivery failures, ring overflow, command timeout storm, `bt_ctrl` invariant violation): (1) graceful disable +
+  teardown with a 2 s deadline, using a documented **timed** variant (`esp_bluedroid_disable_timeout()` over a new
+  `future_await_timeout()`; upstream `future_await()` waits forever). On timeout the future is intentionally left
+  allocated (the hard path reboots); (2) if disable returns an error (e.g. `ESP_ERR_NO_MEM`: it allocates a future) or
+  the deadline passes, a **hard path that needs no heap**: mask IRQ 26, stop the recorder
   through its existing finalize path (static buffers only) so no recording is lost, write a fault record
   (`AON_BACKUP`, code `0xB1` + reason), and reboot via `system_reboot()`. After a BT-fault reboot BT starts **disabled**
   (fault record checked at boot; the UI shows "Bluetooth stopped after an error") so persistent faults cannot loop.
-  Test: hold allocation failure active from the RX failure through recovery → the hard path completes, recording file
-  is valid, the next boot has BT off.
+  **Allocation failure must reach the code on target**: today `vApplicationMallocFailedHook()` reboots immediately
+  (`0xF1`), so `malloc()` never returns NULL and an OOM would lose an active recording. Under `BT=1` the hook only
+  counts failures and records the largest failed size (telemetry) and returns, so `pvPortMalloc()` returns NULL and
+  callers fail soft; kernel objects created at boot are checked by their callers (existing `openfw_rtos_fatal` on a
+  failed boot-time create). The WDT supervisor tolerates the 2 s graceful window.
+  Tests: (a) host: allocation failure held active from the RX failure through recovery → hard path, recording valid,
+  next boot BT off; (b) host: disable started but completion withheld → deadline hit, hard path; (c) target (QEMU +
+  silicon): exhaust the real heap_5 allocator with a recording active → no `0xF1` reboot, recording finalised, BT
+  fault record `0xB1`.
 
 - **IRQ multiplicity**: per-source counters; bottom half loops until the status register reads clear.
 - **Local identity**: stable per-device BD_ADDR: eFuse if present; else derived deterministically (SHA-256, fixed
@@ -355,7 +365,7 @@ telemetry: heap/stack watermarks, largest free block, IRQ-26 latency and multipl
 
 ## 9. Open questions for reviewers (round 3)
 
-1. Does the v12 recovery ladder (graceful with deadline, then heap-free hard path + BT-off reboot) resolve round 10?
+1. Do the v13 changes (non-rebooting malloc-failed hook under BT=1; timed disable) resolve round 11?
 2. Any remaining blocker to starting steps 1–3?
 
 ## 10. Live log
@@ -374,7 +384,8 @@ telemetry: heap/stack watermarks, largest free block, IRQ-26 latency and multipl
   (`fc8402e`: BT=1 links Bluedroid, `.bt_data`/`.bt_bss`, link roots, QEMU 12/12). Round 8: agy APPROVE; Codex 1 item
   (`0C35` blocked by hciT command credits). Plan v10. Round 9: agy APPROVE; Codex 1 item (H4 RX enqueue
   failure drops packet). Plan v11 adds the fail-soft RX patch and a general allocation-failure sweep. Round 10: agy
-  APPROVE; Codex 1 item (recovery itself allocates). Plan v12 adds the bounded recovery ladder.
+  APPROVE; Codex 1 item (recovery itself allocates). Plan v12 adds the bounded recovery ladder. Round 11: both
+  reviewers found the same 2 items (malloc-failed hook reboots; disable waits forever). Plan v13.
 
 ## 11. Round-1 traceability
 
@@ -428,3 +439,6 @@ telemetry: heap/stack watermarks, largest free block, IRQ-26 latency and multipl
 | **Round 10** | |
 | Codex N1 (recovery needs memory) | recovery ladder: graceful with deadline → heap-free hard path (finalize recording, fault record, reboot, BT off next boot); persistent-failure test |
 | agy NB (D3 wording; restart from app, not bt_dlv) | D3 lists the documented patches; BT fault posted to the app task |
+| **Round 11** | |
+| Codex+agy N1 (malloc-failed hook reboots, malloc never NULL on target) | hook counts and returns under BT=1; real-allocator exhaustion test with recording active |
+| Codex+agy N2 (`esp_bluedroid_disable` waits forever) | timed disable variant over `future_await_timeout`; withheld-completion test |
