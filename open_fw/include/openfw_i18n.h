@@ -29,6 +29,7 @@ typedef enum {
     UI_LANG_HU,     /* Magyar */
     UI_LANG_BG,     /* Български */
     UI_LANG_RO,     /* Română */
+    UI_LANG_RU,     /* Русский */
     UI_LANG_COUNT
 } ui_lang_t;
 

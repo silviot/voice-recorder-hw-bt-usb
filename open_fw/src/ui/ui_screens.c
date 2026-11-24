@@ -1216,27 +1216,47 @@ static void bind_settings(const ui_model_t *m)
         set_hidden(rows[r], false);
         int sel = (idx == m->set_sel);
         set_changed_bg_opa(rows[r], sel ? LV_OPA_COVER : LV_OPA_TRANSP);
+        if (lv_label_get_long_mode(lbls[r]) != LV_LABEL_LONG_DOT) {
+            lv_label_set_long_mode(lbls[r], LV_LABEL_LONG_DOT);
+        }
+        if (lv_label_get_long_mode(vals[r]) != LV_LABEL_LONG_CLIP) {
+            lv_label_set_long_mode(vals[r], LV_LABEL_LONG_CLIP);
+        }
         set_changed_text(lbls[r], ui_tr(label_ids[idx]));
 
+        const char *val_str;
+        char val_buf[32];
         if (idx == 6 && sel && m->set_edit_clock != 0u) {
-            char cbuf[16];
-            lv_snprintf(cbuf, sizeof(cbuf), (m->set_edit_clock == 1u) ? "[%02u]:%02u" : "%02u:[%02u]",
+            lv_snprintf(val_buf, sizeof(val_buf), (m->set_edit_clock == 1u) ? "[%02u]:%02u" : "%02u:[%02u]",
                         (unsigned)m->set_edit_h, (unsigned)m->set_edit_m);
-            set_changed_text(vals[r], cbuf);
+            val_str = val_buf;
+            set_changed_text(vals[r], val_str);
             set_changed_text_color(vals[r], lv_color_hex(UI_HEX_CYAN));
         } else {
-            char val[24], disp[32];
+            char val[24];
             int adj = 0;
             format_setting_val(m, idx, val, (int)sizeof(val), &adj);
             if (sel && adj) {
-                lv_snprintf(disp, sizeof(disp), "- %s +", val);
-                set_changed_text(vals[r], disp);
+                lv_snprintf(val_buf, sizeof(val_buf), "- %s +", val);
+                val_str = val_buf;
+                set_changed_text(vals[r], val_str);
                 set_changed_text_color(vals[r], lv_color_hex(UI_HEX_CYAN));
             } else {
-                set_changed_text(vals[r], val);
+                lv_snprintf(val_buf, sizeof(val_buf), "%s", val);
+                val_str = val_buf;
+                set_changed_text(vals[r], val_str);
                 set_changed_text_color(vals[r], lv_color_hex((idx == 9 && sel && m->vbus_present) ? UI_HEX_CYAN : UI_HEX_DIM));
             }
         }
+        int32_t vw = lv_text_get_width(val_str, (uint32_t)lv_strlen(val_str), &ui_font_sm, 0) + 2;
+        if (vw < 54) vw = 54;
+        if (vw > 96) vw = 96;
+        int32_t vx = 146 - vw;
+        int32_t lw = vx - 8;
+        if (lw < 36) lw = 36;
+        set_changed_width(lbls[r], lw);
+        set_changed_x(vals[r], vx);
+        set_changed_width(vals[r], vw);
     }
     bind_scrollbar(objects.set_scroll_thumb, 11, m->set_scroll, 3, 50);
 
