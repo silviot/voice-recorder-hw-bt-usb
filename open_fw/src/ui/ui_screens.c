@@ -1435,6 +1435,52 @@ static enum ScreensEnum map_eez_screen(ui_screen_id_t scr, const ui_model_t *m)
     }
 }
 
+/* Navigation depth: entering a deeper screen pushes FORWARD, a shallower one
+ * BACK. Event screens (REC, SAVED, USB, BT) sit deepest so they always slide
+ * in from the right and slide back out. -1 = never animated (boot, screen
+ * off/wake, power-off hold, charge). */
+static int nav_depth(enum ScreensEnum id)
+{
+    switch (id) {
+    case SCREEN_ID_HOME:           return 0;
+    case SCREEN_ID_FILES:
+    case SCREEN_ID_FILES_EMPTY:
+    case SCREEN_ID_SETTINGS:       return 1;
+    case SCREEN_ID_PLAYER:
+    case SCREEN_ID_PLAYER_TR:
+    case SCREEN_ID_ABOUT:          return 2;
+    case SCREEN_ID_DELETE_CONFIRM: return 3;
+    case SCREEN_ID_REC:
+    case SCREEN_ID_REC_ERR:        return 4;
+    case SCREEN_ID_SAVED:          return 5;
+    case SCREEN_ID_USB:
+    case SCREEN_ID_BT:             return 6;
+    default:                       return -1;
+    }
+}
+
+/* Variants of one page swap in place (list <-> empty list, rec <-> rec error,
+ * player <-> player with transcript). */
+static enum ScreensEnum nav_family(enum ScreensEnum id)
+{
+    switch (id) {
+    case SCREEN_ID_FILES_EMPTY: return SCREEN_ID_FILES;
+    case SCREEN_ID_PLAYER_TR:   return SCREEN_ID_PLAYER;
+    case SCREEN_ID_REC_ERR:     return SCREEN_ID_REC;
+    default:                    return id;
+    }
+}
+
+static ui_transition_t nav_transition(enum ScreensEnum from, enum ScreensEnum to)
+{
+    int d_from = nav_depth(from);
+    int d_to = nav_depth(to);
+    if (d_from < 0 || d_to < 0 || nav_family(from) == nav_family(to)) {
+        return UI_TRANSITION_NONE;
+    }
+    return d_to < d_from ? UI_TRANSITION_BACK : UI_TRANSITION_FORWARD;
+}
+
 void ui_render_screen_sync(ui_screen_id_t scr, const ui_model_t *m)
 {
     if (!m) return;
@@ -1447,6 +1493,9 @@ void ui_render_screen_sync(ui_screen_id_t scr, const ui_model_t *m)
 
     enum ScreensEnum target = map_eez_screen(scr, m);
     bool entering = target != s_active_eez_scr;
+    if (entering) {
+        ui_transition(nav_transition(s_active_eez_scr, target));
+    }
     loadScreen(target);
     s_active_eez_scr = target;
 

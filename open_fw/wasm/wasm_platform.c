@@ -198,6 +198,9 @@ static struct {
     uint8_t  st_hi_byte;
     uint32_t fb_dirty;
     uint16_t fb[80][160];
+    uint16_t gram[80][162];   /* landscape GRAM: [row][CASET address], 0/161 hidden */
+    uint16_t st_ssa;          /* VSCSAD scroll start (gate lines) */
+    uint8_t  st_ssa_hi;
 
     /* SDIO Controller */
     uint32_t sdio_ctrl;
@@ -294,6 +297,26 @@ static void soc_rtc_tick_1s(void)
 /* ============================================================================
  * Virtual ST7735S Display Controller (160x80 Landscape RGB565)
  * ============================================================================ */
+/* Landscape (MV=1) hardware scroll: CASET addresses the 162 gate lines, MY=1
+ * reverses gate order, VSCSAD rotates gates. Returns the address shown at x. */
+static uint16_t st_shown_addr(uint16_t x)
+{
+    int my   = (g_soc.st_madctl & 0x80u) != 0u;
+    int a    = (int)x + 1;
+    int gate = my ? 161 - a : a;
+    int row  = (gate + (int)g_soc.st_ssa) % 162;
+    return (uint16_t)(my ? 161 - row : row);
+}
+
+static void st_refresh_fb(void)
+{
+    for (uint16_t x = 0u; x < 160u; x++) {
+        uint16_t a = st_shown_addr(x);
+        for (uint16_t y = 0u; y < 80u; y++) g_soc.fb[y][x] = g_soc.gram[y][a];
+    }
+    g_soc.fb_dirty = 1u;
+}
+
 static void st7735s_on_byte(int is_data, uint8_t b)
 {
     if (!is_data) {
@@ -335,7 +358,19 @@ static void st7735s_on_byte(int is_data, uint8_t b)
             g_soc.st_ram_half = 1u;
         } else {
             uint16_t px = (uint16_t)(((uint16_t)g_soc.st_hi_byte << 8) | b);
-            if (g_soc.st_cx < 160u && g_soc.st_cy < 80u) {
+            uint16_t addr = (uint16_t)(g_soc.st_cx + 1u);
+            if ((g_soc.st_madctl & 0x20u) && addr < 162u && g_soc.st_cy < 80u) {
+                g_soc.gram[g_soc.st_cy][addr] = px;
+                if (g_soc.st_ssa != 0u) {
+                    for (uint16_t x = 0u; x < 160u; x++) {
+                        if (st_shown_addr(x) == addr) g_soc.fb[g_soc.st_cy][x] = px;
+                    }
+                    g_soc.fb_dirty = 1u;
+                } else if (g_soc.st_cx < 160u) {
+                    g_soc.fb[g_soc.st_cy][g_soc.st_cx] = px;
+                    g_soc.fb_dirty = 1u;
+                }
+            } else if (g_soc.st_cx < 160u && g_soc.st_cy < 80u) {
                 g_soc.fb[g_soc.st_cy][g_soc.st_cx] = px;
                 g_soc.fb_dirty = 1u;
             }
@@ -351,6 +386,15 @@ static void st7735s_on_byte(int is_data, uint8_t b)
             }
             g_soc.st_ram_half = 0u;
         }
+        break;
+    case 0x37u: /* VSCSAD */
+        if (g_soc.st_param_idx == 0u) {
+            g_soc.st_ssa_hi = b;
+        } else if (g_soc.st_param_idx == 1u) {
+            g_soc.st_ssa = (uint16_t)((((uint16_t)g_soc.st_ssa_hi << 8) | b) % 162u);
+            if (g_soc.st_madctl & 0x20u) st_refresh_fb();
+        }
+        g_soc.st_param_idx++;
         break;
     default:
         g_soc.st_param_idx++;

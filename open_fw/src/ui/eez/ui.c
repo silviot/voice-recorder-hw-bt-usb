@@ -12,23 +12,6 @@ static lv_obj_t *getLvglObjectFromIndex(int32_t index) {
     return ((lv_obj_t **)&objects)[index];
 }
 
-static int screen_depth(enum ScreensEnum id) {
-    switch (id) {
-    case SCREEN_ID_HOME:
-        return 0;
-    case SCREEN_ID_FILES:
-    case SCREEN_ID_FILES_EMPTY:
-    case SCREEN_ID_SETTINGS:
-    case SCREEN_ID_SAVED:
-        return 1;
-    case SCREEN_ID_DELETE_CONFIRM:
-    case SCREEN_ID_ABOUT:
-        return 2;
-    default:
-        return -1; /* Instant: REC, PLAYER, USB, BT, CHARGE, POWER, OFF */
-    }
-}
-
 /* On 32-bit Cortex-M4 (4-byte pointers), keeping the 3 primary navigation
  * screens (HOME, FILES, SETTINGS) resident in LVGL's 24 KiB SRAM heap uses
  * ~11 KiB total and eliminates ~95 ms of widget teardown/rebuild on every
@@ -56,9 +39,6 @@ void loadScreen(enum ScreensEnum screenId) {
         ? (enum ScreensEnum)(currentScreen + 1)
         : (enum ScreensEnum)0;
     lv_obj_t *bootScreen = (currentScreen < 0) ? lv_screen_active() : 0;
-
-    int prev_depth = screen_depth(prevId);
-    int next_depth = screen_depth(screenId);
 
     /* Evict non-cached previous screen BEFORE allocating the new one when
      * neither is cached, or after switching away when cached — Wait: always
@@ -109,7 +89,6 @@ void loadScreen(enum ScreensEnum screenId) {
     if (screen) {
         currentScreen = nextScreen;
         lv_screen_load(screen);
-        ui_port_set_reveal(prev_depth >= 0 && next_depth >= 0, next_depth >= prev_depth);
     } else {
         currentScreen = -1;
     }
