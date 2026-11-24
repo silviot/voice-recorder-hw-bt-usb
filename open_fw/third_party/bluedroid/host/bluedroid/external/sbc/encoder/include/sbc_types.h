@@ -34,7 +34,13 @@
 #include "stack/bt_types.h"
 
 typedef short SINT16;
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+/* open_fw patch 0035: exactly 32 bits on every host. Same width as long on Cortex-M4; on the LP64 host (SBC
+ * round-trip tests) long is 64 bits and the analysis filter's SINT32 views of s16X run off its buffer. */
+typedef int32_t SINT32;
+#else
 typedef long SINT32;
+#endif
 
 #if (SBC_IPAQ_OPT == TRUE)
 

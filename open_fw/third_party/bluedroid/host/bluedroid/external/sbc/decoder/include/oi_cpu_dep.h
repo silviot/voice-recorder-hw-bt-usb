@@ -18,6 +18,9 @@
  ******************************************************************************/
 #ifndef _OI_CPU_DEP_H
 #define _OI_CPU_DEP_H
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+#include <stdint.h>   /* open_fw patch 0035 */
+#endif
 /**
  * @file
  * This file contains definitions for characteristics of the target CPU and
@@ -308,10 +311,19 @@ typedef OI_UINT32 OI_ELEMENT_UNION; /**< Type for first element of a union to su
 
 typedef signed char     OI_INT8;   /**< 8-bit signed integer values use native signed character data type for ARM7 processor. */
 typedef signed short    OI_INT16;  /**< 16-bit signed integer values use native signed short integer data type for ARM7 processor. */
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+/* open_fw patch 0035: exactly 32 bits on every host (this decoder only runs in the LP64 host tests). */
+typedef int32_t         OI_INT32;
+#else
 typedef signed long     OI_INT32;  /**< 32-bit signed integer values use native signed long integer data type for ARM7 processor. */
+#endif
 typedef unsigned char   OI_UINT8;  /**< 8-bit unsigned integer values use native unsigned character data type for ARM7 processor. */
 typedef unsigned short  OI_UINT16; /**< 16-bit unsigned integer values use native unsigned short integer data type for ARM7 processor. */
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+typedef uint32_t        OI_UINT32;
+#else
 typedef unsigned long   OI_UINT32; /**< 32-bit unsigned integer values use native unsigned long integer data type for ARM7 processor. */
+#endif
 
 typedef void *OI_ELEMENT_UNION;  /**< Type for first element of a union to support all data types up to pointer width. */
 
