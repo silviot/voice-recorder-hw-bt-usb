@@ -36,12 +36,16 @@ CFLAGS    := $(CPU_FLAGS) -Os -std=gnu11 -ffunction-sections -fdata-sections -fn
              -Wno-address-of-packed-member -Wno-implicit-fallthrough -Wno-unused-const-variable \
              -Wno-pointer-sign -Wno-unterminated-string-initialization -Wno-missing-braces \
              -Wno-sometimes-uninitialized -Wno-unused-label -Wno-absolute-value -Wno-parentheses \
-             -Wno-gnu-variable-sized-type-not-at-end \
+             -Wno-gnu-variable-sized-type-not-at-end -Wno-implicit-enum-enum-cast -Wno-constant-logical-operand \
              -DESP_PLATFORM=1 -D__ESP_ATTR_H__ -DOPENFW_BLUEDROID=1 -DBT_LOGS=$(BT_LOGS) \
              -include $(ROOT)/bt_port/bt_port_prefix.h $(INCS)
 
 .PHONY: all syntax clean size fw
 all: $(BUILD_DIR)/bluedroid.a
+
+# Vendored btc_spp.c passes size_t* where esp_ringbuf takes UBaseType_t* (same type on Xtensa). Both are 32-bit on
+# Cortex-M4 and 64-bit on the x86-64 host build; bt_port_prefix.h static-asserts equal size. File-local only.
+$(BUILD_DIR)/third_party/bluedroid/host/bluedroid/btc/profile/std/spp/btc_spp.o: CFLAGS += -Wno-incompatible-pointer-types
 
 # ---- firmware link inputs (BT=1) ---------------------------------------------------------------
 # Archive names matter: sl6801_firm.ld routes *libbluedroid.a: / *libbt_port.a: .data/.bss into .bt_data/.bt_bss.
@@ -54,17 +58,18 @@ $(BUILD_DIR)/libbluedroid.a: $(OBJS)
 $(BUILD_DIR)/libbt_port.a: $(FW_PORT_OBJS)
 	@rm -f $@
 	$(AR) rcs $@ $^
-$(BUILD_DIR)/bt_link_roots.o: $(ROOT)/bt/bt_link_roots.c
+$(BUILD_DIR)/bt_link_roots.o: $(ROOT)/bt/bt_link_roots.c $(ROOT)/bt/Makefile.bluedroid
 	@mkdir -p $(dir $@)
-	$(CLANG) $(CFLAGS) -c $< -o $@
+	$(CLANG) $(CFLAGS) -MMD -MP -c $< -o $@
 syntax: $(OBJS:.o=.syn)
 
 $(BUILD_DIR)/%.syn: $(ROOT)/%.c
 	@mkdir -p $(dir $@)
 	@$(CLANG) $(CFLAGS) -fsyntax-only $< 2>&1 | head -5; touch $@
-$(BUILD_DIR)/%.o: $(ROOT)/%.c
+$(BUILD_DIR)/%.o: $(ROOT)/%.c $(ROOT)/bt/Makefile.bluedroid
 	@mkdir -p $(dir $@)
-	$(CLANG) $(CFLAGS) -c $< -o $@
+	$(CLANG) $(CFLAGS) -MMD -MP -c $< -o $@
+-include $(OBJS:.o=.d) $(FW_PORT_OBJS:.o=.d) $(BUILD_DIR)/bt_link_roots.d
 $(BUILD_DIR)/bluedroid.a: $(OBJS)
 	$(AR) rcs $@ $^
 clean:

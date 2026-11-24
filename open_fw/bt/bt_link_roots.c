@@ -30,7 +30,7 @@ const void *const g_bt_link_roots[] = {
     ROOT(esp_spp_disconnect), ROOT(esp_spp_stop_srv), ROOT(esp_spp_deinit),
     /* headphones mode: A2DP source + AVRCP */
     ROOT(esp_a2d_register_callback), ROOT(esp_a2d_source_init), ROOT(esp_a2d_source_connect),
-    ROOT(esp_a2d_media_ctrl), ROOT(esp_a2d_source_audio_data_send), ROOT(esp_a2d_source_disconnect),
+    ROOT(esp_a2d_media_ctrl_by_handle), ROOT(esp_a2d_source_audio_data_send), ROOT(esp_a2d_source_disconnect_by_handle),
     ROOT(esp_a2d_source_deinit),
     ROOT(esp_avrc_ct_register_callback), ROOT(esp_avrc_ct_init), ROOT(esp_avrc_ct_deinit),
     ROOT(esp_avrc_tg_register_callback), ROOT(esp_avrc_tg_init), ROOT(esp_avrc_tg_deinit),

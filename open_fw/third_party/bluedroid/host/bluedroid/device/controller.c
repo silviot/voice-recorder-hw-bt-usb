@@ -271,11 +271,14 @@ static void start_up(void)
     controller_param.packet_parser->parse_generic_command_complete(response);
 #endif
 #endif // #if (BLE_42_SCAN_EN == TRUE)
+#ifndef L2CAP_HOST_FC_ACL_DATA_LEN  /* open_fw patch 0004: host ACL buffer length announced by Host Buffer Size */
+#define L2CAP_HOST_FC_ACL_DATA_LEN L2CAP_MTU_SIZE
+#endif
     // Tell the controller about our buffer sizes and buffer counts next
     // TODO(zachoverflow): factor this out. eww l2cap contamination. And why just a hardcoded 10?
     response = AWAIT_COMMAND(
                    controller_param.packet_factory->make_host_buffer_size(
-                       L2CAP_MTU_SIZE,
+                       L2CAP_HOST_FC_ACL_DATA_LEN,
                        SCO_HOST_BUFFER_SIZE,
                        L2CAP_HOST_FC_ACL_BUFS,
                        10
