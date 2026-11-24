@@ -1,9 +1,9 @@
-# Bluetooth Classic for open_fw — Integration Plan (v7, for joint review)
+# Bluetooth Classic for open_fw — Integration Plan (v8, for joint review)
 
 Branch `feat/freertos-bluedroid` (worktree `../voice-recorder-hw-bt-usb-bt`). Hardware: Smartlink SL6801 `HW_76`
 (dual Cortex-M4F @ 96 MHz, 512 KB SRAM, 2 MB SPI NOR XIP, **BR/EDR-only** RivieraWaves `RW-BT` controller in mask ROM,
 no BLE). This document is the single source of truth: it is reviewed by Codex and agy until both agree, then executed.
-v3–v7 address rounds 1–5 (§11 traceability).
+v3–v8 address rounds 1–6 (§11 traceability).
 
 ## 0. Goals, non-goals
 
@@ -202,14 +202,27 @@ Acceptance budget per mode: minimum free heap under traffic ≥ 8 KB and largest
   1. Each alarm has a `generation` (incremented by set, cancel and free) and a `pending` flag; both guarded by a
      short critical section (never `alarm_mutex`, which is held around `esp_timer_stop/delete` → ABBA risk).
   2. Daemon callback: under the critical section, if not already pending, mark pending, record `gen`, link the alarm
-     into a pending list; then try a **timeout-0** post of a single "drain alarms" message to BTC (new non-blocking
-     `btc_transfer_context` variant; at most one such message outstanding, tracked by a flag).
-  3. **Guaranteed wakeup without timers**: the BTC thread loop calls `osi_alarm_drain_pending()` after **every**
-     message it dispatches. If the timeout-0 post failed, the BTC queue was full, so BTC will dispatch at least one more
-     message and drain then; if it succeeded, the drain message does it. Pending is set before the post, so no window.
+     into a pending list; then post a drain work item with **`osi_thread_post(btc_thread, drain_fn, NULL, 0, 0)`** —
+     allocation-free (the `work_item` is copied by value into the queue), timeout 0, so a failure can **only** mean
+     the BTC queue is full (never heap exhaustion; `btc_transfer_context` is not used because it `osi_malloc`s).
+     At most one drain item outstanding (flag); the flag is cleared on a failed post and at the start of `drain_fn`
+     before draining.
+  3. **Guaranteed wakeup without timers**: `btc_thread_handler()` calls `osi_alarm_drain_pending()` at its end, i.e.
+     after **every** BTC message. If the post failed, the queue was full, so BTC dispatches at least one more message
+     and drains then; if it succeeded, `drain_fn` does it. Pending is set before the post, so there is no window.
+     Test: expiry while heap allocation is failing and with no later traffic → delivered once.
   4. Drain: for each pending alarm, under the critical section unlink it and compare the recorded `gen` with the
      alarm's current `generation`; mismatch (cancelled, re-armed, freed) → drop; match → invoke the callback in BTC
-     context. Cancel/free remove the alarm from the pending list and bump `generation`.
+     context **outside** the critical section, with the validated `gen` available via
+     `osi_alarm_delivery_gen()`. Cancel/free remove the alarm from the pending list and bump `generation`
+     (`generation` is preserved across `alarm_free()`'s `memset`).
+  4a. Because a higher-priority task can re-arm between validation and the callback taking its own lock, any callback
+     whose meaning depends on "which arming" must re-validate under its **own** lock. All `osi_alarm` users are
+     audited in step 2; the known case is `hci_layer.c` `command_timed_out`: patch records the generation when the
+     command-response timer is (re)armed under `commands_pending_response_lock`, and the callback, after taking that
+     lock, ignores the expiry unless `osi_alarm_delivery_gen()` equals the recorded generation, before reading the
+     queue head. Test: re-arm after BTC validated but before the callback takes the lock → ignored; the new command's
+     timeout still fires.
   5. Periodic alarms (A2DP media tick) are never re-armed by this path; overlapping expiries coalesce into one pending
      delivery (A2DP computes frames from elapsed time, so coalescing is safe); coalesce count is telemetry.
   Tests (host, with FreeRTOS POSIX): BTC queue full at expiry → drained exactly once; both BTC queue and timer command
@@ -313,7 +326,7 @@ telemetry: heap/stack watermarks, largest free block, IRQ-26 latency and multipl
 
 ## 9. Open questions for reviewers (round 3)
 
-1. Does the v7 alarm design (pending list + generation + drain-after-every-BTC-message) resolve the round-5 items?
+1. Do the v8 changes (allocation-free drain post; per-user re-validation under the user's lock) resolve round 6?
 2. Any remaining blocker to starting steps 1–3?
 
 ## 10. Live log
@@ -325,7 +338,8 @@ telemetry: heap/stack watermarks, largest free block, IRQ-26 latency and multipl
   T_REAP; QEMU 11/11; default image byte-identical). Round 3: agy APPROVE_WITH_CHANGES, Codex CHANGES_REQUIRED
   (3 precise items). Plan v5 written. Round 4: agy APPROVE, Codex CHANGES_REQUIRED (1 item: lost alarm expiry).
   Plan v6 written. Round 5: agy APPROVE; Codex CHANGES_REQUIRED (retry wakeup not guaranteed; stale expiry after
-  cancel). Plan v7 replaces the retry-timer approach.
+  cancel). Plan v7 replaces the retry-timer approach. Round 6: agy APPROVE_WITH_CHANGES (no blockers); Codex 2 items
+  (allocation-failure wakeup; validate-then-callback race). Plan v8 written. Step-1 build plumbing in progress.
 
 ## 11. Round-1 traceability
 
@@ -365,3 +379,7 @@ telemetry: heap/stack watermarks, largest free block, IRQ-26 latency and multipl
 | Codex N1 (retry re-arm can fail) | no retry timers: BTC drains pending alarms after every message; full queue ⇒ BTC runs again |
 | Codex N2 (stale expiry after cancel/re-arm) | per-alarm generation validated at dispatch; cancel/free unlink + bump |
 | agy NB (timeout-0 BTC post, no `alarm_mutex` in daemon, periodic alarms) | non-blocking transfer variant; critical section; periodic coalescing |
+| **Round 6** | |
+| Codex N1 / agy NB1 (drain post allocates) | `osi_thread_post` work item, allocation-free; heap-failure test |
+| Codex N2 (re-arm between validation and callback) | 4a: per-user re-validation under its own lock; `hci_layer.c` command generation; audit all alarm users |
+| agy NB2 (hook placement, flag hygiene, memset) | end of `btc_thread_handler()`; flag cleared on failure/start; generation preserved |
