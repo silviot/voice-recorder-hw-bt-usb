@@ -187,6 +187,137 @@ static void test_parse(void)
 }
 
 /* ---------------------------------------------------------------------------------------------------------------- */
+/* headphones keys (docs/BT_A2DP_DESIGN.md §10.2): defaults, every key, ranges, cross-key rules */
+static void test_parse_hp(void)
+{
+    bt_bench_cfg_t c;
+    uint32_t at = 99u;
+    CHECK(parse("", &c, NULL) == BT_BENCH_OK && c.mode == BT_BENCH_MODE_PHONE && c.hp_stage == BT_BENCH_HP_SCAN &&
+          !c.hp_addr_set && !c.hp_pick_first && !c.hp_pair && !c.hp_pscan && !c.hp_mono && c.hp_secs == 10u &&
+          c.hp_rate == 0u && c.hp_bitpool == 35u && c.hp_speech_bp == 24u && c.hp_tick_ms == 20u &&
+          c.hp_pkt_per_tick == 2u && c.hp_txq == 4u && c.hp_credit_ticks == 2u && c.hp_tone_hz == 1000u &&
+          c.hp_credits == 4u && c.hp_file[0] == '\0', "hp defaults");
+    CHECK(parse("mode=phone secs=60", &c, NULL) == BT_BENCH_OK && c.mode == BT_BENCH_MODE_PHONE, "mode=phone");
+    CHECK(parse("mode=hp", &c, NULL) == BT_BENCH_OK && c.mode == BT_BENCH_MODE_HP && c.hp_stage == BT_BENCH_HP_SCAN,
+          "mode=hp alone: scan stage (Exp 4.0 / 4a)");
+    /* the documented example */
+    CHECK(parse("mode=hp hp_stage=tone hp_addr=00:1B:66:AA:BB:CC hp_pair=1 secs=600 hp_bitpool=35 hp_credits=4", &c,
+                &at) == BT_BENCH_OK, "example (at %u)", at);
+    static const uint8_t a[6] = { 0x00, 0x1B, 0x66, 0xAA, 0xBB, 0xCC };
+    CHECK(c.hp_stage == BT_BENCH_HP_TONE && c.hp_addr_set && memcmp(c.hp_addr, a, 6) == 0 && c.hp_pair == 1u &&
+          c.secs == 600u && c.hp_bitpool == 35u && c.hp_credits == 4u, "example cfg");
+    /* every key at once, mixed case, lower-case hex */
+    const char *all = "MODE=HP Hp_Stage=Player hp_pick=FIRST hp_pair=1 hp_pscan=1 hp_secs=61 hp_rate=44100 "
+                      "hp_bitpool=53 hp_speech_bp=0 hp_mono=1 hp_tick_ms=10 hp_pkt_per_tick=1 hp_txq=8 "
+                      "hp_credit_ticks=4 hp_file=/MUSIC/A_1.WAV hp_credits=9 pair_secs=120";
+    CHECK(parse(all, &c, &at) == BT_BENCH_OK, "all keys (at %u)", at);
+    CHECK(c.hp_stage == BT_BENCH_HP_PLAYER && c.hp_pick_first && c.hp_pair && c.hp_pscan && c.hp_secs == 61u &&
+          c.hp_rate == 44100u && c.hp_bitpool == 53u && c.hp_speech_bp == 0u && c.hp_mono && c.hp_tick_ms == 10u &&
+          c.hp_pkt_per_tick == 1u && c.hp_txq == 8u && c.hp_credit_ticks == 4u && strcmp(c.hp_file, "/MUSIC/A_1.WAV") == 0
+          && c.hp_credits == 9u && c.pair_secs == 120u, "all keys cfg");
+    CHECK(parse("mode=hp hp_stage=connect hp_addr=a0:b1:c2:d3:e4:f5 hp_rate=48000 hp_rate_x=1", &c, NULL) ==
+          BT_BENCH_E_KEY, "unknown hp key");
+    CHECK(parse("mode=hp hp_stage=connect hp_addr=a0:b1:c2:d3:e4:f5 hp_rate=48000", &c, NULL) == BT_BENCH_OK &&
+          c.hp_addr[0] == 0xA0u && c.hp_addr[5] == 0xF5u && c.hp_rate == 48000u, "lower-case address, 48 kHz");
+    CHECK(parse("mode=hp hp_stage=connect hp_pick=first hp_rate=auto", &c, NULL) == BT_BENCH_OK && c.hp_pick_first &&
+          c.hp_rate == 0u, "pick first");
+    CHECK(parse("mode=hp hp_bitpool=20", &c, NULL) == BT_BENCH_OK && c.hp_speech_bp == 20u,
+          "default speech bitpool lowered to an explicit smaller max");
+    CHECK(parse("mode=hp hp_bitpool=20 hp_speech_bp=18", &c, NULL) == BT_BENCH_OK && c.hp_speech_bp == 18u,
+          "explicit speech bitpool under the max");
+    CHECK(parse("mode=hp hp_stage=tone hp_pick=first hp_tone_hz=440 hp_tick_ms=15 hp_pkt_per_tick=1", &c, NULL) ==
+          BT_BENCH_OK && c.hp_tone_hz == 440u, "tone stage keys");
+    CHECK(parse("mode=hp hp_stage=scan hp_addr=00:1B:66:AA:BB:CC", &c, NULL) == BT_BENCH_OK,
+          "hp_addr allowed (scan reports it)");
+    CHECK(parse("mode=hp hp_stage=player hp_pick=first hp_file=/A.B", &c, NULL) == BT_BENCH_OK &&
+          strcmp(c.hp_file, "/A.B") == 0, "shortest 8.3 path");
+    CHECK(parse("mode=hp hp_stage=player hp_pick=first hp_file=/ABCDEFGH/IJKLMNOP.WAV", &c, NULL) == BT_BENCH_OK,
+          "8-character components");
+    CHECK(parse("mode=hp hp_stage=player hp_pick=first hp_file=/README", &c, NULL) == BT_BENCH_OK,
+          "a name without extension");
+
+    static const struct { const char *s; bt_bench_err_t e; } bad[] = {
+        { "mode=headphones", BT_BENCH_E_VALUE },
+        { "mode=", BT_BENCH_E_VALUE },
+        { "mode=hp mode=hp", BT_BENCH_E_DUP },
+        { "hp_stage=tone", BT_BENCH_E_CONFLICT },                       /* hp_* without mode=hp */
+        { "mode=phone hp_bitpool=35", BT_BENCH_E_CONFLICT },
+        { "mode=hp hp_stage=stream", BT_BENCH_E_VALUE },
+        { "mode=hp hp_stage=connect", BT_BENCH_E_CONFLICT },            /* no address, no pick=first */
+        { "mode=hp hp_stage=tone hp_addr=00:1B:66:AA:BB:CC hp_pick=first", BT_BENCH_E_CONFLICT },
+        { "mode=hp hp_pair=1", BT_BENCH_E_CONFLICT },                   /* pairing needs a connect stage */
+        { "mode=hp pair=1", BT_BENCH_E_CONFLICT },                      /* phone-session keys */
+        { "mode=hp autoconfirm=1", BT_BENCH_E_CONFLICT },
+        { "mode=hp pair=1 xrec_pin=123456", BT_BENCH_E_CONFLICT },
+        { "mode=hp hp_stage=connect hp_pick=first hp_pkt_per_tick=1", BT_BENCH_E_CONFLICT },  /* tick 20 > 15 */
+        { "mode=hp hp_stage=connect hp_pick=first hp_tick_ms=16 hp_pkt_per_tick=1", BT_BENCH_E_CONFLICT },
+        { "mode=hp hp_tone_hz=440", BT_BENCH_E_CONFLICT },              /* tone key, scan stage */
+        { "mode=hp hp_stage=player hp_pick=first", BT_BENCH_E_CONFLICT },  /* player needs hp_file */
+        { "mode=hp hp_stage=tone hp_pick=first hp_file=/A.WAV", BT_BENCH_E_CONFLICT },
+        { "mode=hp hp_bitpool=20 hp_speech_bp=24", BT_BENCH_E_CONFLICT },
+        { "mode=hp hp_addr=00:1B:66:AA:BB", BT_BENCH_E_VALUE },
+        { "mode=hp hp_addr=00:1B:66:AA:BB:CC:DD", BT_BENCH_E_VALUE },
+        { "mode=hp hp_addr=00-1B-66-AA-BB-CC", BT_BENCH_E_VALUE },
+        { "mode=hp hp_addr=00:1B:66:AA:BB:CG", BT_BENCH_E_VALUE },
+        { "mode=hp hp_addr=00:00:00:00:00:00", BT_BENCH_E_VALUE },
+        { "mode=hp hp_addr=FF:FF:FF:FF:FF:FF", BT_BENCH_E_VALUE },
+        { "mode=hp hp_pick=last", BT_BENCH_E_VALUE },
+        { "mode=hp hp_pair=2", BT_BENCH_E_VALUE },
+        { "mode=hp hp_pscan=yes", BT_BENCH_E_VALUE },
+        { "mode=hp hp_secs=1", BT_BENCH_E_VALUE },
+        { "mode=hp hp_secs=62", BT_BENCH_E_VALUE },
+        { "mode=hp hp_rate=32000", BT_BENCH_E_VALUE },
+        { "mode=hp hp_rate=", BT_BENCH_E_VALUE },
+        { "mode=hp hp_bitpool=17", BT_BENCH_E_VALUE },
+        { "mode=hp hp_bitpool=54", BT_BENCH_E_VALUE },
+        { "mode=hp hp_speech_bp=17", BT_BENCH_E_VALUE },
+        { "mode=hp hp_speech_bp=36", BT_BENCH_E_VALUE },
+        { "mode=hp hp_mono=2", BT_BENCH_E_VALUE },
+        { "mode=hp hp_tick_ms=9", BT_BENCH_E_VALUE },
+        { "mode=hp hp_tick_ms=31", BT_BENCH_E_VALUE },
+        { "mode=hp hp_pkt_per_tick=0", BT_BENCH_E_VALUE },
+        { "mode=hp hp_pkt_per_tick=3", BT_BENCH_E_VALUE },
+        { "mode=hp hp_txq=1", BT_BENCH_E_VALUE },
+        { "mode=hp hp_txq=9", BT_BENCH_E_VALUE },
+        { "mode=hp hp_credit_ticks=0", BT_BENCH_E_VALUE },
+        { "mode=hp hp_credit_ticks=5", BT_BENCH_E_VALUE },
+        { "mode=hp hp_stage=tone hp_pick=first hp_tone_hz=99", BT_BENCH_E_VALUE },
+        { "mode=hp hp_stage=tone hp_pick=first hp_tone_hz=8001", BT_BENCH_E_VALUE },
+        { "mode=hp hp_credits=3", BT_BENCH_E_VALUE },
+        { "mode=hp hp_credits=10", BT_BENCH_E_VALUE },
+        { "mode=hp hp_file=A.WAV", BT_BENCH_E_VALUE },                  /* not absolute */
+        { "mode=hp hp_file=/", BT_BENCH_E_VALUE },
+        { "mode=hp hp_file=/MUSIC/", BT_BENCH_E_VALUE },
+        { "mode=hp hp_file=/LONGNAME9.WAV", BT_BENCH_E_VALUE },         /* 9-character name */
+        { "mode=hp hp_file=/A.WAVE", BT_BENCH_E_VALUE },                /* 4-character extension */
+        { "mode=hp hp_file=/A..WAV", BT_BENCH_E_VALUE },
+        { "mode=hp hp_file=/.WAV", BT_BENCH_E_VALUE },
+        { "mode=hp hp_file=/A./B", BT_BENCH_E_VALUE },
+        { "mode=hp hp_file=//A.WAV", BT_BENCH_E_VALUE },
+        { "mode=hp hp_file=/A.W/../B", BT_BENCH_E_VALUE },
+        { "mode=hp hp_file=/A$.WAV", BT_BENCH_E_VALUE },
+        { "mode=hp hp_file=/AAAAAAAA/BBBBBBBB/CCCCCCCC/DDDDDDDD/EEEEEEEE.WAV", BT_BENCH_E_VALUE },   /* > 47 */
+        { "mode=hp hp_bitpool=35 hp_bitpool=35", BT_BENCH_E_DUP },
+    };
+    for (size_t i = 0u; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        bt_bench_cfg_default(&c);
+        c.secs = 4321u;
+        bt_bench_err_t e = parse(bad[i].s, &c, &at);
+        CHECK(e == bad[i].e, "hp bad #%zu \"%s\": err %s (want %s)", i, bad[i].s, bt_bench_err_name(e),
+              bt_bench_err_name(bad[i].e));
+        CHECK(c.secs == 4321u, "hp bad #%zu: cfg untouched", i);
+    }
+    /* the longest well-formed request still fits the 256-byte file limit */
+    CHECK(strlen(all) < BT_BENCH_TRIGGER_MAX, "all-keys request fits BT_BENCH_TRIGGER_MAX (%zu)", strlen(all));
+    /* inquiry length: ceil(s / 1.28), 1..0x30 */
+    CHECK(bt_bench_hp_inq_len(10) == 8u && bt_bench_hp_inq_len(2) == 2u && bt_bench_hp_inq_len(61) == 0x30u &&
+          bt_bench_hp_inq_len(1) == 1u && bt_bench_hp_inq_len(0) == 1u && bt_bench_hp_inq_len(255) == 0x30u &&
+          bt_bench_hp_inq_len(13) == 11u, "inquiry length");
+    CHECK(strcmp(bt_bench_hp_stage_name(BT_BENCH_HP_TONE), "tone") == 0 && strcmp(bt_bench_hp_stage_name(9), "?") == 0,
+          "stage names");
+}
+
+/* ---------------------------------------------------------------------------------------------------------------- */
 static bt_bench_trig_t take(exfat_vol_t *vol, int mounted, bt_bench_cfg_t *c)
 {
     bt_bench_err_t e = (bt_bench_err_t)77;
@@ -500,6 +631,7 @@ int main(int argc, char **argv)
     g_ro = (blkdev_t){ mem_read, NULL, g_sectors, NULL };
 
     test_parse();
+    test_parse_hp();
     test_take();
     test_schedule();
     test_capture();

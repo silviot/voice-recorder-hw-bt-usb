@@ -29,6 +29,32 @@
  *   reboot=0|1     default 0: reboot after BT mode ended and BTBENCH.LOG was written
  * Example: "secs=180 pair=1 pair_every=60 autoconfirm=1 xrec_pin=246810 exit=auto"
  *
+ * Headphones mode (docs/BT_A2DP_DESIGN.md §10.2, Exp 4.0-4d; parsed and checked here, run by the headphones bench
+ * session; an image without that session refuses mode=hp in bt_bench_boot()):
+ *   mode=phone|hp       default phone; every hp_* key needs mode=hp; pair, pair_every, autoconfirm and xrec_pin are
+ *                       phone-mode keys and are refused with mode=hp (pair_secs is the hp_pair window length)
+ *   hp_stage=scan|connect|tone|player   default scan (Exp 4a / 4b / 4c / 4d)
+ *   hp_addr=XX:XX:XX:XX:XX:XX   the headset (as printed by a phone or bluetoothctl, most significant byte first);
+ *                       required from hp_stage=connect on unless hp_pick=first; not with hp_pick=first
+ *   hp_pick=addr|first  default addr; first = the first audio-class device the scan finds
+ *   hp_pair=0|1         default 0: open the pairing window (pair_secs) for the picked headset; not with hp_stage=scan
+ *   hp_pscan=0|1        default 0: leave page scan on during 0401/0405 (Exp 4a/4b variant, design §6.2)
+ *   hp_secs=N           2..61, default 10: discovery length in s (0401 Inquiry_Length = ceil(N / 1.28 s))
+ *   hp_rate=44100|48000|auto   default auto: register only that SEP
+ *   hp_bitpool=N        18..53, default 35: max bitpool advertised
+ *   hp_speech_bp=N      0 or 18..35, default 24 (lowered to hp_bitpool when that is smaller and hp_speech_bp is not
+ *                       given): per-frame bitpool for <= 16 kHz sources, 0 = use the max; given explicitly it must not
+ *                       exceed hp_bitpool
+ *   hp_mono=0|1         default 0: prefer mono SBC
+ *   hp_tick_ms=N        10..30, default 20: pacer tick
+ *   hp_pkt_per_tick=N   1..2, default 2: packets per tick; 1 needs hp_tick_ms <= 15 (design §4.3 headroom rule)
+ *   hp_txq=N            2..8, default 4: TXQ_PKT_CAP
+ *   hp_credit_ticks=N   1..4, default 2: elapsed clamp and the tick term of CREDIT_MAX
+ *   hp_tone_hz=N        100..8000, default 1000: tone stage only
+ *   hp_file=/DIR/NAME.EXT   player stage only, and required there: an absolute path of 8.3 components, <= 47 chars
+ *   hp_credits=N        4..9, default 4: experimental 1005 credit count
+ * Example: "mode=hp hp_stage=tone hp_addr=00:1B:66:AA:BB:CC hp_pair=1 secs=600 hp_bitpool=35 hp_credits=4"
+ *
  * Every log line of the run (the g_openfw_log ring, drained while BT mode runs) is also written to SD:/BTBENCH.LOG
  * after BT mode ended (replaced by each run): the 4 KiB ring wraps in a long session.
  *
@@ -53,6 +79,14 @@
 #define BT_BENCH_PAIR_SECS_DEF 60u
 #define BT_BENCH_STATUS_MS     30000u         /* "BENCH status" line period while BT mode runs */
 
+#define BT_BENCH_MODE_PHONE    0u
+#define BT_BENCH_MODE_HP       1u
+#define BT_BENCH_HP_SCAN       0u             /* hp_stage values, in Exp order */
+#define BT_BENCH_HP_CONNECT    1u
+#define BT_BENCH_HP_TONE       2u
+#define BT_BENCH_HP_PLAYER     3u
+#define BT_BENCH_HP_FILE_MAX   47u            /* hp_file characters */
+
 typedef struct {
     uint16_t secs;          /* BT mode length */
     uint16_t pair_every;    /* 0 = open the window once (if pair) */
@@ -61,6 +95,18 @@ typedef struct {
     uint8_t  autoconfirm;   /* bench SSP auto-confirm override */
     uint8_t  reboot;        /* reboot after the run */
     char     xrec_pin[8];   /* "" = DRBG PIN; else the bench XREC PIN (6 digits, NUL-terminated) */
+    /* headphones mode (mode=hp); defaults as in the table above */
+    uint8_t  mode;          /* BT_BENCH_MODE_* */
+    uint8_t  hp_stage;      /* BT_BENCH_HP_* */
+    uint8_t  hp_addr_set;   /* hp_addr given */
+    uint8_t  hp_addr[6];    /* esp_bd_addr_t order: most significant byte first, as written */
+    uint8_t  hp_pick_first; /* hp_pick=first */
+    uint8_t  hp_pair, hp_pscan, hp_mono;
+    uint8_t  hp_secs;       /* discovery length (s) */
+    uint16_t hp_rate;       /* 0 = auto, 44100, 48000 */
+    uint8_t  hp_bitpool, hp_speech_bp, hp_tick_ms, hp_pkt_per_tick, hp_txq, hp_credit_ticks, hp_credits;
+    uint16_t hp_tone_hz;
+    char     hp_file[BT_BENCH_HP_FILE_MAX + 1u];   /* "" = none */
 } bt_bench_cfg_t;
 
 typedef enum {
@@ -68,7 +114,7 @@ typedef enum {
     BT_BENCH_E_KEY,         /* unknown key (or a token without '=') */
     BT_BENCH_E_VALUE,       /* value not a number / word, or out of range */
     BT_BENCH_E_DUP,         /* a key given twice */
-    BT_BENCH_E_CONFLICT,    /* pair_every or xrec_pin without pair=1 */
+    BT_BENCH_E_CONFLICT,    /* pair_every or xrec_pin without pair=1; a mode=hp rule above broken */
     BT_BENCH_E_CHAR,        /* NUL or another control byte */
 } bt_bench_err_t;
 
@@ -93,6 +139,10 @@ bt_bench_err_t bt_bench_parse(const uint8_t *buf, uint32_t len, bt_bench_cfg_t *
  * (BT_BENCH_E_VALUE also stands for an unreadable or oversized file). */
 bt_bench_trig_t bt_bench_take(exfat_vol_t *vol, int mounted, bt_bench_cfg_t *cfg, bt_bench_err_t *perr,
                               uint32_t *err_at);
+
+/* 0401 Inquiry_Length (units of 1.28 s, 1..0x30) for hp_secs: ceil(secs / 1.28). */
+uint8_t bt_bench_hp_inq_len(uint8_t secs);
+const char *bt_bench_hp_stage_name(uint8_t stage);   /* scan, connect, tone, player */
 
 /* Short words for the log. */
 const char *bt_bench_trig_name(bt_bench_trig_t t);   /* taken, absent, no_sd, not_file, stuck, bad_content */
