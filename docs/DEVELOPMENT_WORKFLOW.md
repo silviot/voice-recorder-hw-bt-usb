@@ -90,6 +90,30 @@ When a silicon register, FIFO size, clock mux, IRQ line, or SD card write path i
 
 > **Always re-flash a normal production build** (`make -C open_fw all update-up && sudo python3 tools/dev_cycle.py flash`) when finished probing so `DEV_EXP=1` / `OPENFW_UNATTENDED_DEV` are not left enabled.
 
+### 3.1 Practical gotchas (learned in the Bluetooth/FreeRTOS sessions)
+
+- **`dev_cycle.py flash` writes `dumps/firmware_2M_openfw.bin`**, not `OPENFW_FIRM_BIN` alone. To flash a variant
+  (`RTOS=1`, `BT=1`, `DEV_EXP=1`, `RTOS_SELFTEST=1`), build it **with `update-up` and its own `BUILD_DIR`**, then flash:
+  ```bash
+  B=/tmp/sl6801_openfw_bt_devexp_st
+  make -C open_fw DEV_EXP=1 BT=1 RTOS_SELFTEST=1 BUILD_DIR=$B update-up
+  sudo env OPENFW_FIRM_BIN=$B/open_fw_firm.bin python3 tools/dev_cycle.py flash
+  ```
+  Building without `update-up` silently re-flashes whatever image `dumps/` already holds. Check the `Plan: … bytes`
+  line (the BT image is ~720 KB, the default ~434 KB).
+- **`sudo` drops your PATH**, so `exp` cannot find the toolchain. Pass it explicitly:
+  `sudo env LLD=/path/to/ld.lld OBJCOPY=/path/to/llvm-objcopy CLANG=$(which clang) python3 tools/dev_cycle.py exp …`
+- **Read any firmware variable on silicon** with `open_fw/exp/exp_peek.c` (24 words at `--arg ADDR`; get the address
+  with `llvm-nm`). Example: the RTOS self-test record `g_rtos_selftest` (magic `RTOS`, done, pass mask, fail mask, heap
+  free at start / minimum, per-test details) after flashing a `RTOS_SELFTEST=1` image.
+- **Raw data off the device:** a probe can fill `out_buf` (0x00858000, 16 KiB) and set `*api->out_len_ptr`; fetch it with
+  `dev_cycle.py exp … --dump-out FILE` (`exp/exp_entropy_dump.c` dumps noise sources this way).
+- **Memory-ownership checks:** `exp/exp_sram_fill.c` → exercise (`exp_bt.c`, `exp_dac.c`, `exp/exp_sram_exercise.c`) →
+  `exp/exp_sram_check.c` proves whether anything else (ROM, DMA, CPU1, USB) touches an SRAM range. Run it on an image
+  that does not itself use the range.
+- A full experiment session that ends on production firmware takes ~10 minutes; results go in `docs/BT_HW_RESULTS.md`
+  (or the matching results doc) so they are not rediscovered.
+
 ---
 
 ## 4. Fast Stock-Binary Verification (Before Writing Bare-Metal Drivers)

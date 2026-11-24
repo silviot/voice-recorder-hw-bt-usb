@@ -51,6 +51,7 @@ Largest contributors (flash KB): btm 28.5, btc/profile 27.6, l2cap 23.7, bta/av 
 Largest static RAM (.bss bytes): btm_cb 2188, bta_dm 1352+, l2cb 1392, rfc_cb 1700 (RFCOMM+port), bta_jv 2564 (after SDP buffer trims; upstream 6764), sdp 840, avdt 768, smp 720, a2dp_source 1752 (incl. SBC encoder state 1684).
 
 ## RAM budget (must hold in the 84 KB `.rtos_heap` region at 0x86B000 + whatever static goes there)
+> Superseded (Phase 1 estimate): see "Integration lessons" below and plan §4. Measured on silicon: 118 KB of heap free at boot with both RTOS regions.
 Static RAM above (21.4 KB) lives in normal `.bss` unless the linker script moves the Bluedroid objects' `.bss/.data` into the freed region; main SRAM has only ~8.7 KB free, so **place BT static data in the new region** (`*bluedroid.a:*(.bss* .data*)`, `*freertos*`).
 Dynamic estimate (heap arena; ESTIMATES from config constants — to be replaced by measured high-water marks in Phase 2 host runs and on hardware):
 | Item | Bytes |
@@ -68,3 +69,41 @@ Totals (dynamic): SPP mode ≈ 24–40 KB typical, ≈ 55 KB worst case; A2DP mo
 ## Go / no-go
 **GO.** Everything compiles with zero patches to logic, links to completion against real FreeRTOS + picolibc with only 64-bit division missing (already in `startup.c`), flash ≈ 279 KB (+115 KB for logs) vs 2 MB, RAM ≈ 60–70 KB per mode vs an 84 KB free region, and the controller boundary is an official, narrow API.
 Risks to retire in Phase 2: (1) `esp_ringbuf` on upstream FreeRTOS internals, (2) heap fragmentation under A2DP (5 × 1280 B frames churn + BT_HDR); run a long host soak with allocation tracking, (3) real stack high-water marks (HCI 2 KB, BTU 4.3 KB are IDF numbers for Xtensa/RISC-V; Cortex-M4F with `-Os` should be similar or smaller, verify), (4) `NVS`/`esp_random`/`esp_timer` shims correctness (SSP security depends on the RNG), (5) FreeRTOS priority/BASEPRI interplay with IRQ 26 (RW-BT) and ROM `ke` callbacks (owner-task design), (6) SPP SDP buffers trimmed (`BTA_JV_SDP_DB_SIZE` 1500): fine for server role; re-check if the device ever connects out to a peer's SPP record.
+
+## Integration lessons (2026-11-24, `BT=1` firmware build)
+Status: Bluedroid links into the firmware (`make BT=1`, ~710 KB image), not yet started. Port layer: `open_fw/bt_port/`.
+
+Build / link
+- **lld archive patterns need a member glob**: `*libbluedroid.a:*(.bss .bss.*)`. GNU ld's bare `archive.a:` form matches
+  nothing in lld, silently (the sections stayed empty and main `.bss` overflowed).
+- Route Bluedroid/port/picolibc `.data` to a **loadable** `.bt_data` (LMA in XIP, copied at boot, `-j .bt_data` in the
+  objcopy) and `.bss` to `.bt_bss` (zeroed); exclude both from the catch-all sections with `EXCLUDE_FILE`.
+- Until the app calls Bluedroid, `--gc-sections` would drop the whole stack: `bt/bt_link_roots.c` (KEEP section) +
+  `tools/check_bt_link_roots.sh` keep the size honest.
+- `bt/Makefile.bluedroid` needs `-MMD -MP`: a change to `bt_port_prefix.h`/`sdkconfig.h` otherwise leaves stale objects.
+- Firmware sources must not see picolibc headers; only Bluedroid and `bt_port` objects do (`bt_port` additionally gets
+  `open_fw/include`). Use plain extern declarations when firmware code needs a port function.
+- Upstream warning classes that are benign here are silenced for vendored code only; file-local exceptions carry a
+  static assert (e.g. `btc_spp.c` `size_t*` vs `UBaseType_t*`).
+
+Upstream behaviours that matter on a small target (found in the Codex/agy plan review; plan §5 has the fixes)
+- Many waits are unbounded (`OSI_THREAD_MAX_TIMEOUT` posts, `future_await`, `osi_mutex_lock` forever):
+  `esp_bluedroid_disable/deinit` can block forever → graceful recovery runs in a worker the app does not wait on
+  without a deadline.
+- `host_recv_pkt_cb()` ignores `fixed_queue_enqueue()`'s result and asserts on allocation failure → fail-soft patch.
+- hciT checks command credits before dequeuing, so Host Number Of Completed Packets (`0C35`, NOACK) can be stuck behind
+  a credit-blocked command → separate NOACK queue.
+- `check_send_available()` has no packet type, and hciT may check and then not send → TX admission must be a pure
+  query over one ring that fits any packet.
+- Host Buffer Size announces `L2CAP_MTU_SIZE` (1691) × `L2CAP_HOST_FC_ACL_BUFS` (100) → patch 0004 + overrides (4 × 1021).
+- Startup reply parsers `assert(stream != NULL)` on any non-zero status → mandatory startup opcodes must succeed.
+- `command_timed_out` only logs; once it feeds a fault path it must ignore stale expiries (patch 0007).
+- FreeRTOS software timers deliver an expiry by slot pointer and process due timers before queued stop commands, so a
+  cancelled/re-armed alarm can fire "as the new one" → BT alarms use `bt_port/bt_alarm.c` (caller-synchronous
+  generation), not FreeRTOS timers.
+- Classic-only Bluedroid never calls `esp_random`; SSP keys/nonces come from the ROM controller → the entropy work
+  must trace the ROM's RNG hooks, not only feed `esp_random`.
+
+Process
+- Two independent AI reviewers (Codex, agy) converged on v18 of the plan after 17 rounds; most late findings were real
+  edge cases in upstream code paths, which is why every one became a patch or a test rather than a comment.
