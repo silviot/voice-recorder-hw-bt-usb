@@ -243,7 +243,7 @@ static void wait_in_charging_standby(void)
     /* Discard any residual edge from the shutdown gesture and debounce 250 ms. */
     (void)key_onoff_poll();
     for (;;) {
-        OPENFW_WFI();
+        OPENFW_TASK_WAIT();
         uint32_t now = millis();
         if ((uint32_t)(now - last_poll) < 50u) {
             continue;

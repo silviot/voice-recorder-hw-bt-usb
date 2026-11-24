@@ -116,7 +116,7 @@ static void wfi_sleep_ms(uint32_t ms)
         if (keys_event_pending()) {
             break;
         }
-        OPENFW_WFI();
+        OPENFW_TASK_WAIT();
     }
     wdt_feed();
 }
@@ -1387,7 +1387,7 @@ static void run_bt_xrec_mode(void)
             bt_status_t cur_st;
             bt_xrec_get_status(&cur_st);
             if (cur_st.rx_acl_pkts == iter_rx && cur_st.tx_acl_pkts == iter_tx) {
-                OPENFW_WFI();
+                OPENFW_TASK_WAIT();
             } else {
                 iter_rx = cur_st.rx_acl_pkts;
                 iter_tx = cur_st.tx_acl_pkts;

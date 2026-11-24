@@ -3,7 +3,7 @@
  *
  * Design rules (see docs/BLUETOOTH_BLUEDROID_PLAN.md):
  *  - SysTick stays owned by startup.c (1 ms, g_systick_ms, keys_scan_tick). Its handler
- *    calls xPortSysTickHandler() when the scheduler runs; vPortSetupTimerInterrupt() is a no-op.
+ *    calls xPortSysTickHandler() when the scheduler runs; vPortSetupTimerInterrupt() starts it.
  *  - Audio DMA / USB / SD stay ISR-driven; only BT tasks and the app task run under the kernel.
  *  - ISRs that call *FromISR APIs must be configured at priority >= configMAX_SYSCALL_INTERRUPT_PRIORITY
  *    (numerically). ISRs left at priority 0 are never masked and MUST NOT call FreeRTOS.
@@ -24,7 +24,7 @@ extern uint64_t us_timer_now(void);
 #define configUSE_TICKLESS_IDLE                  0
 #define configCPU_CLOCK_HZ                       ( g_openfw_cpu_hz )
 #define configTICK_RATE_HZ                       ( 1000U )
-#define configMAX_PRIORITIES                     ( 8U )
+#define configMAX_PRIORITIES                     ( 10U )
 #define configMINIMAL_STACK_SIZE                 ( 128U )   /* words */
 #define configMAX_TASK_NAME_LEN                  ( 12U )
 #define configUSE_16_BIT_TICKS                   0
@@ -61,7 +61,7 @@ extern uint64_t us_timer_now(void);
 
 /* Software timers (daemon task) */
 #define configUSE_TIMERS                         1
-#define configTIMER_TASK_PRIORITY                ( configMAX_PRIORITIES - 2U )
+#define configTIMER_TASK_PRIORITY                ( configMAX_PRIORITIES - 1U )
 #define configTIMER_QUEUE_LENGTH                 16
 #define configTIMER_TASK_STACK_DEPTH             ( 384U )
 

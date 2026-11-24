@@ -19,7 +19,7 @@
 
 enum {
     T_DELAY = 0, T_QUEUE, T_MUTEX_PI, T_TIMER, T_NOTIFY, T_EVENTGROUP,
-    T_HEAP, T_PREEMPT, T_FROM_ISR, T_STACK, T_COUNT
+    T_HEAP, T_PREEMPT, T_FROM_ISR, T_STACK, T_REAP, T_COUNT
 };
 
 typedef struct {
@@ -165,6 +165,25 @@ static void pre_lo(void *a)
     vTaskDelete(NULL);
 }
 
+/* ---- T_REAP ---- self-deleting tasks are freed only by the idle task, which needs every
+ * higher-priority task (including the app super-loop) to block instead of spinning in WFI. */
+static volatile uint32_t g_reap_ran;
+static void reap_self(void *a)
+{
+    (void)a;
+    g_reap_ran++;
+    vTaskDelete(NULL);
+}
+
+/* ---- T_HEAP ---- victim that blocks until deleted by another task (never self-deletes) */
+static void heap_victim(void *a)
+{
+    (void)a;
+    for (;;) {
+        (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    }
+}
+
 static void selftest_main(void *arg)
 {
     (void)arg;
@@ -253,7 +272,7 @@ static void selftest_main(void *arg)
         uint32_t before = openfw_rtos_heap_free();
         for (int i = 0; i < 20; i++) {
             TaskHandle_t h;
-            xTaskCreate(notify_waiter, "hp", 256, NULL, 2, &h);
+            xTaskCreate(heap_victim, "hp", 256, NULL, 2, &h);
             vTaskDelay(pdMS_TO_TICKS(1));
             vTaskDelete(h);
             vTaskDelay(pdMS_TO_TICKS(1)); /* let idle free TCB/stack */
@@ -261,6 +280,17 @@ static void selftest_main(void *arg)
         vTaskDelay(pdMS_TO_TICKS(10));
         uint32_t after = openfw_rtos_heap_free();
         report(T_HEAP, after + 64u >= before, before - after);
+    }
+    /* T_REAP */
+    {
+        g_reap_ran = 0;
+        uint32_t before = openfw_rtos_heap_free();
+        for (int i = 0; i < 20; i++) {
+            xTaskCreate(reap_self, "rp", 256, NULL, 3, NULL);
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+        uint32_t after = openfw_rtos_heap_free();
+        report(T_REAP, g_reap_ran == 20 && after + 64u >= before, before - after);
     }
     /* T_STACK: this task's high-water mark is sane (not overflowed, not untouched) */
     {

@@ -139,6 +139,28 @@ static inline void nvic_clear_pending(uint32_t irq)
     openfw_mmio_wr32(NVIC_ICPR_ADDR(irq >> 5), (1u << (irq & 31u)));
 }
 
+/* NVIC_IPRn: one priority byte per IRQ; only the top implemented bits are writable. */
+#define NVIC_IPR_ADDR(irq)  (0xE000E400u + (uint32_t)(irq))
+
+static inline void nvic_set_priority(uint32_t irq, uint8_t prio)
+{
+    openfw_mmio_wr8(NVIC_IPR_ADDR(irq), prio);
+}
+
+static inline uint8_t nvic_get_priority(uint32_t irq)
+{
+    return openfw_mmio_rd8(NVIC_IPR_ADDR(irq));
+}
+
+/* Wait for "something to happen" from task context. Bare metal: WFI. Under the RTOS the app runs as a task
+ * and must block so lower-priority tasks (idle reaps deleted tasks) can run: wait one tick or a notification. */
+#if defined(OPENFW_RTOS) && OPENFW_RTOS && !defined(OPENFW_HOST_MMIO)
+void openfw_rtos_task_wait(void);
+#define OPENFW_TASK_WAIT() openfw_rtos_task_wait()
+#else
+#define OPENFW_TASK_WAIT() OPENFW_WFI()
+#endif
+
 #define IRQ_BT              26u
 #define IRQ_USB_MC          41u
 #define IRQ_USB_DMA         42u

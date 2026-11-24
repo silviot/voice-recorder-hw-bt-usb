@@ -408,20 +408,30 @@ def main() -> int:
 
         selftest_result: dict = {}
         selftest_names = ["delay", "queue", "mutex_pi", "timer", "notify", "eventgroup",
-                          "heap", "preempt", "from_isr", "stack"]
+                          "heap", "preempt", "from_isr", "stack", "reap"]
 
         def read_selftest(client: GdbRspClient):
             """FreeRTOS self-test (make RTOS=1 RTOS_SELFTEST=1): poll g_rtos_selftest until done."""
             addr = syms["g_rtos_selftest"][0]
             for _ in range(40):
-                raw = client.read_mem(addr, 16 * 4)
-                words = struct.unpack("<16I", raw)
+                nwords = 6 + len(selftest_names)
+                raw = client.read_mem(addr, nwords * 4)
+                words = struct.unpack(f"<{nwords}I", raw)
                 if words[1] == 1:
                     break
                 _ = client.continue_for(0.5)
+            aon = struct.unpack("<3I", client.read_mem(syms["g_rtos_fatal"][0] if "g_rtos_fatal" in syms else 0x40085180, 12))
+            st_regs = client.read_regs()
+            if words[1] != 1:
+                print(f"RTOS selftest stalled: pc=0x{st_regs[15]:08x} lr=0x{st_regs[14]:08x} "
+                      f"fatal[0..2]=0x{aon[0]:08x} 0x{aon[1]:08x} 0x{aon[2]:08x}")
+                sp = st_regs[13]
+                stk = struct.unpack("<96I", client.read_mem(sp, 96 * 4))
+                code = [f"0x{w:08x}" for w in stk if 0x00800000 <= (w & ~1) < 0x00880000 and (w & 1)]
+                print(f"  sp=0x{sp:08x} stack: {' '.join(f'{w:08x}' for w in stk[:48])}")
             selftest_result.update(
                 magic=words[0], done=words[1], pass_mask=words[2], fail_mask=words[3],
-                heap_free_start=words[4], heap_min_end=words[5], detail=list(words[6:16]),
+                heap_free_start=words[4], heap_min_end=words[5], detail=list(words[6:nwords]),
             )
 
         def inspect_boot(client: GdbRspClient):

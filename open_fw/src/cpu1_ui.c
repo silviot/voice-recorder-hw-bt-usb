@@ -481,7 +481,7 @@ int cpu1_ui_start(void)
         if ((us_timer_now() - t0) >= 60000ull) {
             break;
         }
-        OPENFW_WFI();
+        OPENFW_TASK_WAIT();
     }
 
     if (g_cpu1_alive != 0u && g_cpu1_faulted == 0u) {
@@ -551,7 +551,7 @@ void cpu1_ui_sync(uint32_t timeout_ms)
             return;
         }
         /* Yield AHB/XIP/APB bus completely to CPU1 until next 1 ms SysTick */
-        OPENFW_WFI();
+        OPENFW_TASK_WAIT();
     }
 }
 

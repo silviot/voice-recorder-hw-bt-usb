@@ -110,11 +110,22 @@ SECTIONS
 
     ASSERT(_ebss_hi <= 0x00867000, ".bss_hi overflowed into main stack")
 
+    /* RTOS build only: kernel-owned static objects (idle/timer TCBs + stacks), then heap_5 takes the rest. */
+    .rtos_static (NOLOAD) : ALIGN(8) {
+        _srtos_static = .;
+        *(.rtos_static .rtos_static.*)
+        . = ALIGN(8);
+        _ertos_static = .;
+    } > RTOS_HEAP
+
     .rtos_heap (NOLOAD) : ALIGN(8) {
         _srtos_heap0 = .;
-        . += LENGTH(RTOS_HEAP);
+        . = ORIGIN(RTOS_HEAP) + LENGTH(RTOS_HEAP);
         _ertos_heap0 = .;
     } > RTOS_HEAP
+
+    ASSERT(_ertos_heap0 == ORIGIN(RTOS_HEAP) + LENGTH(RTOS_HEAP), ".rtos_heap must end at the RTOS_HEAP region end")
+    ASSERT(_srtos_heap0 >= _ertos_static, ".rtos_heap overlaps .rtos_static")
 
     /DISCARD/ : {
         *(.ARM.exidx* .ARM.extab* .comment .note*)

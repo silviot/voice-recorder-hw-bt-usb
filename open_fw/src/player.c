@@ -1081,7 +1081,7 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
         if (!keys_event_pending() &&
             (scrub.speed || paused || eof_reached || (audio_dac_is_busy() &&
             (buf_pos < buf_frames || data_off >= winfo.data_bytes || played_frames >= winfo.total_samples)))) {
-            OPENFW_WFI();
+            OPENFW_TASK_WAIT();
         }
     }
 

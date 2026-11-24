@@ -12,12 +12,17 @@
 extern "C" {
 #endif
 
-/* Task priorities (higher = more urgent). configMAX_PRIORITIES = 8. Idle = 0. */
-#define OPENFW_PRIO_APP      1u   /* legacy super-loop (UI/recorder/player/USB poll) */
-#define OPENFW_PRIO_BT_APP   3u   /* BT profile callbacks (BTC) */
-#define OPENFW_PRIO_BT_STACK 4u   /* Bluedroid BTU */
-#define OPENFW_PRIO_BT_HCI   5u   /* HCI host / controller glue bottom half */
-/* priority 6 = FreeRTOS timer task (configTIMER_TASK_PRIORITY) */
+/* Task priorities (higher = more urgent). configMAX_PRIORITIES = 10. Idle = 0.
+ * Bluedroid derives its own task priorities from configMAX_PRIORITIES (hciT = MAX-3, BTU = MAX-5, BTC = MAX-6);
+ * the values below mirror them so a change of configMAX_PRIORITIES is caught by the static asserts in rtos_port.c.
+ * See docs/BLUETOOTH_BLUEDROID_PLAN.md section 3. */
+#define OPENFW_PRIO_APP      1u   /* legacy super-loop: UI, recorder, player, USB poll, ALL filesystem, XREC session */
+#define OPENFW_PRIO_BT_BTC   4u   /* Bluedroid BTC (profile callbacks)                    = configMAX_PRIORITIES - 6 */
+#define OPENFW_PRIO_BT_BTU   5u   /* Bluedroid BTU                                        = configMAX_PRIORITIES - 5 */
+#define OPENFW_PRIO_BT_DLV   6u   /* bt_dlv: controller RX rings -> host callback (may block) */
+#define OPENFW_PRIO_BT_HCI   7u   /* Bluedroid hciT                                       = configMAX_PRIORITIES - 3 */
+#define OPENFW_PRIO_BT_CTRL  8u   /* bt_ctrl: sole owner of RW-BT ROM/EM, never blocks on the host */
+/* priority 9 = FreeRTOS timer daemon (configTIMER_TASK_PRIORITY = configMAX_PRIORITIES - 1) */
 
 #define OPENFW_APP_STACK_WORDS  4096u  /* 16 KiB: replaces the old MSP super-loop stack */
 
@@ -29,6 +34,10 @@ void openfw_rtos_start(openfw_rtos_entry_t entry) __attribute__((noreturn));
 
 /* Called from SysTick_Handler (startup.c) on every 1 ms tick. Cheap no-op until scheduler runs. */
 void openfw_rtos_tick(void);
+
+/* Block the calling task until the next tick or a notification (replaces task-context WFI). Falls back to WFI
+ * before the scheduler starts or from interrupt context. Use via OPENFW_TASK_WAIT() in sl6801_regs.h. */
+void openfw_rtos_task_wait(void);
 
 /* Heap accounting for telemetry / tests. */
 uint32_t openfw_rtos_heap_free(void);

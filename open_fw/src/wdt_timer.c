@@ -174,6 +174,12 @@ void systick_init(uint32_t cpu_hz)
     if (reload == 0u) {
         reload = 1u;
     }
+#if defined(OPENFW_RTOS) && OPENFW_RTOS
+    /* Under the RTOS the scheduler starts SysTick first; re-programming it later would drop a tick. */
+    if ((openfw_mmio_rd32(SYSTICK_CSR_ADDR) & 0x7u) == 0x7u && openfw_mmio_rd32(SYSTICK_RVR_ADDR) == reload) {
+        return;
+    }
+#endif
     openfw_mmio_wr32(SYSTICK_CSR_ADDR, 0u);
     openfw_mmio_wr32(SYSTICK_RVR_ADDR, reload);
     openfw_mmio_wr32(SYSTICK_CVR_ADDR, 0u);
