@@ -15,11 +15,19 @@
 #define HDR 8u
 static inline void *blk_user(void *b) { return (uint8_t *)b + HDR; }
 
+/* Allocation-failure telemetry (vApplicationMallocFailedHook has no size argument; plan M1 recovery ladder). */
+volatile uint32_t g_bt_malloc_failures;
+volatile uint32_t g_bt_malloc_fail_largest;
+
 void *malloc(size_t n)
 {
     if (n == 0 || n > 0x7FFFFFF0u) return NULL;
     uint8_t *b = pvPortMalloc(n + HDR);
-    if (!b) return NULL;
+    if (!b) {
+        g_bt_malloc_failures++;
+        if ((uint32_t)n > g_bt_malloc_fail_largest) g_bt_malloc_fail_largest = (uint32_t)n;
+        return NULL;
+    }
     *(uint32_t *)b = (uint32_t)n;
     return blk_user(b);
 }
@@ -52,5 +60,11 @@ void *heap_caps_calloc(size_t n, size_t s, uint32_t c) { (void)c; return calloc(
 void *heap_caps_realloc(void *p, size_t s, uint32_t c) { (void)c; return realloc(p, s); }
 void heap_caps_free(void *p) { free(p); }
 size_t heap_caps_get_free_size(uint32_t c) { (void)c; return xPortGetFreeHeapSize(); }
-size_t heap_caps_get_largest_free_block(uint32_t c) { (void)c; return xPortGetFreeHeapSize(); } /* approximation */
+size_t heap_caps_get_largest_free_block(uint32_t c)
+{
+    (void)c;
+    HeapStats_t st;
+    vPortGetHeapStats(&st);
+    return st.xSizeOfLargestFreeBlockInBytes > HDR ? st.xSizeOfLargestFreeBlockInBytes - HDR : 0u;
+}
 size_t heap_caps_get_allocated_size(void *p) { return p ? *(uint32_t *)((uint8_t *)p - HDR) : 0; }
