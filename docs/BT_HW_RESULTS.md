@@ -171,6 +171,31 @@ timeout falling back to single-sector writes; the log file was complete.
 Next: the 22 G-B/G-C opcodes now have static mappings in `docs/BT_ROM_HCI_MAP.md` and need a stage that exercises them
 (inquiry 0401/0402, remote name 0419, connection 0405, …); stage C (ACL) repeats the Exp 0 memory check.
 
+## Session 4 (2026-11-24): phone mode on silicon — SSP + XREC PASS, then bt_ctrl fault 6 after a peer detach
+
+Image: bench `BT=1 BENCH=1` at `a0792fa` (FIRM CRC-16 0x3599). Request `secs=300 pair=1 pair_every=60 pair_secs=60
+autoconfirm=1 xrec_pin=246810 exit=auto`. Laptop: BlueZ `bluetoothctl` + `tools/bt_sync.py`; **the laptop was also
+streaming A2DP to a speaker** on another ACL (handle 51) for the whole run. Recipe steps 1–5 of "Phone mode (BT=1) on
+silicon" below; logs `SD:/BTBENCH.LOG` (3,262 B, `lost=0`), ring, laptop `btmon` trace.
+
+| Item | Result |
+|---|---|
+| Entropy at BT entry | `4096 symbols (0:1040 1:983 2:1055 3:1018) peak 130 in 419 ms, ok` — symbol counts flat, peak well inside the clip/flatline limits (8 LSB … 32000) |
+| Session P-192 key | `ms 67, public X 0xBACBE422...` (not the ROM constant `FA2B96D3`); `BT ROM keys: installed 1 unexpected 0 rng drbg 88 nonces 2 legacy 119 unknown 0 starved 0` — both pairing nonces came from the DRBG, the pool never ran dry |
+| Discovery | laptop scan found `Cassini_1D` (cached name first, then the new one) |
+| SSP numeric comparison | laptop `Confirm passkey 230749` → `Pairing successful`, `Paired: yes`, `Bonded: yes`, UUID `Serial Port`; device `bonded (numeric comparison, MITM)`, `window closed after the first bond`. **First SSP pairing ever on this ROM.** Still to prove: that the ROM used *our* key (the mismatched-key image of step 6b) |
+| XREC | `--ping` `PONG ... bound=0,auth=0,pair=1`; `--pair 246810` bound (`BT XREC PAIRED`); `--ping` `bound=1,pair=0`; `--list` CHAL/AUTH OK, 31 files; GETS of the 3,000 B test file **byte-exact** (SHA-256 match); `--stat` battery/SD line; wrong PIN inside window 2 → `ERR,PIN` |
+| Reconnect | `bluetoothctl disconnect` while idle, reconnect 3 s later with the stored keys: AUTH OK, no re-pairing |
+| Throughput | GETS 581,676 B in 25.7 s = **22.1 KB/s** steady (RFCOMM MTU 673, laptop radio shared with A2DP) |
+| Memory | heap free min 61,968 B, largest block ≥ 33,536, `mallocfail 0`; lowest stack headroom hciT 431 words, bt_dlv 313 words |
+| **Fault** | ~2 s after the big GETS the laptop dropped the idle ACL (HCI Disconnect 0x13 → Disconnect Complete at 21:34:25.9). The device never noticed: 20 s later `BENCH status t=120 acl=1 ... bound=1`, and from ~10 s after the detach it no longer answered pages (`Host is down`). When window 3 opened: `BT bt_ctrl fault, first code 6` (`BT_CTRL_FAULT_INVARIANT`), `platform fault 2`, graceful stop. **The recovery ladder worked**: no reboot, no fault record, the bench run finished on time and USB came back |
+| Log bug | `numeric comparison accepted (BENCH autoconfirm), value 0` while the laptop showed 230749 |
+
+The earlier idle disconnect at 21:33:52 was handled correctly; the failing one followed a long device→laptop ACL TX
+burst. The fault-6 site was not logged (10 raise sites, no sub-code) — the fix round adds site ids. Exit-with-link-up
+(step 6) could not be run because BT was already down. Bonds from this run are bench-only (laptop `remove`,
+`SD:/bt_bonds.bin`).
+
 ## Exp 1 stages A and B: how to run
 
 Probe image for plan M5 Exp 1 stage A and stage B (step 4): `bt_ctrl` (plan M1) drives the real RW-BT ROM through
