@@ -62,6 +62,15 @@ CFLAGS   += -DOPENFW_HCI_PROBE=1
 # bt_hci.c's legacy IRQ-26 handler is renamed: bt_port/bt_rom_real.c owns the vector and calls it (bt_hci.c, file end).
 $(BUILD_DIR)/bt_hci.o: CFLAGS += -DRWBT_IRQHandler=bt_hci_legacy_irq_top
 endif
+# BT=1 without HCI_PROBE: phone mode runs on Bluedroid (bt_port/bt_xrec_bluedroid.c, plan M4). bt_hci.c stays linked
+# for the ROM bring-up bt_port/bt_rom_real.c reuses (exported from its end under OPENFW_BT_BLUEDROID); its bt_xrec_*
+# entry points are renamed (unreferenced, dropped by --gc-sections) and so is its IRQ-26 handler (bt_rom_real owns the
+# vector). The probe image keeps the legacy phone mode.
+ifeq ($(BT)$(HCI_PROBE),10)
+$(BUILD_DIR)/bt_hci.o: CFLAGS += -DRWBT_IRQHandler=bt_hci_legacy_irq_top -Dbt_xrec_start=bt_legacy_xrec_start \
+	-Dbt_xrec_poll=bt_legacy_xrec_poll -Dbt_xrec_stop=bt_legacy_xrec_stop \
+	-Dbt_xrec_open_pairing=bt_legacy_xrec_open_pairing -Dbt_xrec_get_status=bt_legacy_xrec_get_status
+endif
 
 LVGL_CFLAGS := --target=thumbv7em-none-eabi -mcpu=cortex-m4 -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb \
                -O2 -ffreestanding -fno-builtin -fno-stack-protector \

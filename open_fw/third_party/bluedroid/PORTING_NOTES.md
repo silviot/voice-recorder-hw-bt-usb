@@ -125,3 +125,84 @@ Process
   event (BTA sys/DM, `btc_dm_sec_cb_handler`) or lose a sent command from the pending list (`event_command_ready`).
   They are explicit waivers in `open_fw/tests/bt_host/sweep_waivers.txt`; on target an assert reboots and a lost
   event leaves enable blocked, so the app's BT enable path needs a deadline (recovery ladder) until patches 0011+.
+  **Update (same day, patches 0011-0023): zero waivers.** The sweep now runs per lifecycle call (init 125 points,
+  enable 93, disable 24, deinit 5; `run_sweep.py --mode`), and every point completes or fails cleanly, tears down to
+  the baseline and leaves a following clean cycle working. Init had ~30 more unhandled sites (OSI primitives asserting,
+  BTU/BTM/L2CAP init ignoring or asserting on failures, cleanup of never-initialised blocks, BTC config failure after
+  the init future was already completed) and disable 5 (BTA timer start, DM disable request, the DISABLE_EVT hand-off).
+
+## Allocation-failure lessons (patches 0011-0023, `third_party/bluedroid_patches/README.md`)
+- **Three fixes, in this order of preference.** (1) Remove the allocation when it is avoidable: the command-pending
+  list links commands through their own `pkt_linked_item_t` (0015), `btc_dm_sec_cb_handler` allocates the BLE message
+  only for BLE events (0017), the bt_osal table is used in place (0023). (2) Do the step without the allocation:
+  BTA SYS self-posted events run synchronously from a stack copy on the BTU task (0014), a lost enable/disable
+  completion is posted to BTC by value with `osi_thread_post()` (allocation-free work item) (0018). (3) Fail the API
+  call cleanly: start-up commands (0011/0012) -> `BTM_DEV_STATUS_DOWN` -> BTA DM `BTA_DM_ENABLE_EVT(BTA_FAILURE)`
+  (0013); init failures -> `BT_STATUS_NOMEM` / `FUTURE_FAIL` (0020-0023). Bounded retries only where nobody can be
+  told: the CC/CS hand-off to BTU (0016: then BT fault through the 0007 hook) and `bta_sys_start_timer()` (0019).
+- **Failing an API call is only clean if a retry still works.** The sweep therefore runs, after every point, teardown
+  to the baseline AND a full clean init/enable/disable/deinit cycle. That caught nothing extra once the patches were
+  in, but it is what proves "nothing half-initialised blocks a later retry" (e.g. 0013's `bta_dm_enable_pending` is a
+  static outside `bta_dm_cb`, which BTA_SYS_HW_ON re-initialises; 0022's `btu_core_started` gates the core free).
+- **A successful init must be exercised.** Several upstream init functions ignore an allocation failure and return
+  normally (`l2c_init`, `sdp_init`, `btm_acl_init`, `bta_sys_init`); the init sweep only found them after it was made
+  to enable the stack after every successful swept init. Teardown alone passed.
+- **Ordering matters for reporting**: `btc_init_bluetooth()` used to run `btc_config_init()` after
+  `bte_main_boot_entry()`, by which time the BTU task may already have completed the init future, so a config failure
+  could not fail `esp_bluedroid_init()` (`future_ready` may be called once). 0023 loads the config first.
+- **Failing back from the BTU task to BTC is safe with `future_ready()`** (only a semaphore give) and with
+  `osi_thread_post()` (work item copied by value into the FreeRTOS queue); `btc_transfer_context()` allocates.
+- **Mutation-testing a patch series needs `git revert`, not `patch -R`**: adjacent hunks of later patches (0014/0019 in
+  `bta_sys_main.c`, 0015/0021 in `hci_layer.c`) make a reverse patch fail; reverting one commit of the series in a
+  scratch git repo keeps the others. And copy restored files with a fresh mtime (`rsync -a` keeps the old one, so make
+  does not rebuild them and the next mutation silently contains the previous one).
+- **Open (not an allocation crash, so not a sweep failure)**: an allocation failure while `config_new()` parses the
+  stored config makes `btc_config_init()` fall back to an empty config (init "succeeds", sweep points 21-26). Nothing
+  is written back at init (`config_save()` refuses an empty config), but the next bond save writes a config holding
+  only the new bond, i.e. stored bonds are lost. Treat a parse allocation failure as an init failure (needs
+  `config_new()` to tell "no/invalid config" from "no memory") before relying on persistent pairings under memory
+  pressure.
+
+## SPP / GAP behaviour the app relies on (phone mode, `bt_port/bt_xrec_bluedroid.c`)
+
+- **CB-mode `esp_spp_write()` copies** into BTC's per-connection ring (`tx_buffer_size`) and returns `ESP_ERR_NO_MEM`
+  when it does not fit (setting `upper_cong`); `ESP_SPP_CONG_EVT` (always `cong=false`) fires once the ring drains
+  below half. `ESP_SPP_WRITE_EVT.len` reports chunks submitted to RFCOMM (any size, not per write). The session keeps
+  its own TX queue, writes only while uncongested and keeps written-but-unreported bytes within `tx_buffer_size`.
+- **No negotiated MTU in the API**: `rfc_srv_open.peer_mtu` stays in btc's private slot. `bt_xrec_spp_mtu.c` reads it
+  in BTC context via `BTA_JvRfcommGetPortHdl()` + `PORT_GetQueueStatus()` (as btc_spp resolves the port itself).
+- **Just Works never reaches the app**: `btc_dm_sp_cfm_req_evt()` auto-confirms `just_works` requests; only numeric
+  comparison raises `ESP_BT_GAP_CFM_REQ_EVT`. A policy that forbids Just Works must act at `ESP_BT_GAP_AUTH_CMPL_EVT`
+  (`lk_type` 0x04/0x07 = unauthenticated) by removing the bond (`esp_bt_gap_remove_bond_device()` also drops the ACL).
+- **`AUTH_CMPL` success is raised only for new link keys** (`bta_dm_new_link_key_cback`), not for reconnections with a
+  stored key, so "authorized" for a reconnect = bonded (every kept bond passed the check above).
+- Internal Bluedroid headers define `bt_status_t`, which clashes with open_fw's (`include/openfw.h`): keep files that
+  need Bluedroid internals separate from files that include `openfw.h`.
+
+## Phone-mode end-to-end lessons (2026-11-24, `test_bt_host phone`, patches 0024-0026)
+
+The first run of the real XREC backend over Bluedroid against a scripted laptop (`open_fw/tests/bt_host/test_phone.c`)
+found what the mocked `test-bt-xrec` could not:
+- **A disable with a connected peer is bounded by BTA DM's timers, never by the link-down.** `bta_dm_disable()` calls
+  `bta_sys_disable(BTA_SYS_HW_BLUETOOTH)`, which runs every module's disable, BTA DM's own included
+  (`bta_dm_sm_disable()` -> `bta_sys_deregister(BTA_ID_DM)`). From then on BTA SYS drops DM's
+  `BTA_DM_ACL_CHANGE_EVT` ("BTA got unregistered event"), so the "all links down -> 1 s -> done" path in
+  `bta_dm_acl_change()` is dead code during a disable, and upstream always waits 5 s (profiles' graceful close; an SPP
+  peer never makes it: RFCOMM keeps the multiplexer up for its own inactivity timer) + 1.5 s (after the forced
+  detach). Patch 0026 shortens both (100 ms / 500 ms): measure any future change with a connected peer.
+- **Keep the peer answering while you stop.** A host test that blocks the peer's thread during `bt_xrec_stop()`
+  measures the stalled-peer case (RFCOMM DISC, L2CAP disconnect and LMP detach unanswered), not the normal one. A
+  stalled peer still ends inside the 2 s deadline with 0026 (detach + 500 ms, then `bt_ctrl` stop kills the link), but
+  on silicon the ROM's own detach timeout for an out-of-range phone is unmeasured: the deadline's hard path covers it.
+- **btc_spp's `s_spp_resident` mutex and TX event group are allocated by the first `esp_spp_init()` and never freed**
+  (upstream comment: a VFS `write()` may still wait on the group after deinit). Leak checks around SPP must take their
+  baseline after one SPP init/deinit cycle; exactly 2 blocks (224 B on x86-64) stay.
+- **Link keys are stored byte-reversed** in the BTC config (`LinkKey = <hex>` of the `LINK_KEY` array, which
+  `btu_hcif` fills with `STREAM_TO_ARRAY16`): a check of the bond file must reverse the wire key; the reconnect is the
+  real proof (Bluedroid's `040B` reply carries the peer's key).
+- **`TIMER_LIST_ENT.param` holds heap pointers too**: L2CAP keeps its link control blocks in a heap list
+  (`l2cb.p_lcb_pool`) and passes them through `TIMER_PARAM_TYPE` (UINT32 on target: fine). The x86-64 harness defines
+  `TIMER_PARAM_TYPE` pointer-wide (`tests/bt_host/Makefile`); sites that cast to `(UINT32)` explicitly (RFCOMM,
+  SDP, AVDT, HF AG) point at static control blocks in this configuration (`*_DYNAMIC_MEMORY` off).
+- BTC callback arguments are 4-aligned (copied right after the 4-byte `btc_msg_t`): fine on Cortex-M4, an UBSan
+  alignment report on x86-64; the app's two BTC callbacks carry `no_sanitize("alignment")` (`bt_xrec_bluedroid.c`).

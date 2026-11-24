@@ -1,0 +1,51 @@
+diff --git a/open_fw/third_party/bluedroid/host/bluedroid/bta/dm/bta_dm_act.c b/open_fw/third_party/bluedroid/host/bluedroid/bta/dm/bta_dm_act.c
+index 67d2644..a93f060 100644
+--- a/open_fw/third_party/bluedroid/host/bluedroid/bta/dm/bta_dm_act.c
++++ b/open_fw/third_party/bluedroid/host/bluedroid/bta/dm/bta_dm_act.c
+@@ -42,6 +42,19 @@
+ #include "device/controller.h"
+ #include "bta_dm_gap.h"
+ 
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++/* open_fw patch 0025: the BD_NAME a BTM security callback (and BTM_SecReadDevName) hands BTA is the device record's
++ * sec_bd_name, a tBTM_BD_NAME of BTM_MAX_REM_BD_NAME_LEN + 1 (65) bytes, not a 248-byte BD_NAME. Upstream memcpy'd
++ * BD_NAME_LEN - 1 = 247 bytes from it: a 182-byte over-read past the record on every bond (found by ASan in make
++ * test-bt-host, phone scenario). Copy what the source holds; the destination was zeroed by the caller's memset. */
++#define BTA_DM_COPY_BTM_NAME(dst, src) do { \
++        memcpy((dst), (src), BTM_MAX_REM_BD_NAME_LEN); \
++        (dst)[BTM_MAX_REM_BD_NAME_LEN] = 0; \
++    } while (0)
++#else
++#define BTA_DM_COPY_BTM_NAME(dst, src) memcpy((dst), (src), (BD_NAME_LEN - 1))
++#endif
++
+ #define LOG_TAG "bt_bta_dm"
+ // #include "osi/include/log.h"
+ 
+@@ -1417,7 +1430,7 @@ void bta_dm_bond (tBTA_DM_MSG *p_data)
+         bdcpy(sec_event.auth_cmpl.bd_addr, p_data->bond.bd_addr);
+         p_name = BTM_SecReadDevName(p_data->bond.bd_addr);
+         if (p_name != NULL) {
+-            memcpy(sec_event.auth_cmpl.bd_name, p_name, (BD_NAME_LEN - 1));
++            BTA_DM_COPY_BTM_NAME(sec_event.auth_cmpl.bd_name, p_name);
+             sec_event.auth_cmpl.bd_name[BD_NAME_LEN - 1] = 0;
+         }
+ 
+@@ -3335,7 +3348,7 @@ static UINT8  bta_dm_new_link_key_cback(BD_ADDR bd_addr, DEV_CLASS dev_class,
+ 
+         bdcpy(p_auth_cmpl->bd_addr, bd_addr);
+ 
+-        memcpy(p_auth_cmpl->bd_name, bd_name, (BD_NAME_LEN - 1));
++        BTA_DM_COPY_BTM_NAME(p_auth_cmpl->bd_name, bd_name);
+         p_auth_cmpl->bd_name[BD_NAME_LEN - 1] = 0;
+ 
+         p_auth_cmpl->key_present = TRUE;
+@@ -3379,7 +3392,7 @@ static UINT8 bta_dm_authentication_complete_cback(BD_ADDR bd_addr, DEV_CLASS dev
+         memset(&sec_event, 0, sizeof(tBTA_DM_SEC));
+         bdcpy(sec_event.auth_cmpl.bd_addr, bd_addr);
+ 
+-        memcpy(sec_event.auth_cmpl.bd_name, bd_name, (BD_NAME_LEN - 1));
++        BTA_DM_COPY_BTM_NAME(sec_event.auth_cmpl.bd_name, bd_name);
+         sec_event.auth_cmpl.bd_name[BD_NAME_LEN - 1] = 0;
+ 
+ #if BLE_INCLUDED == TRUE

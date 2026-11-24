@@ -68,11 +68,15 @@ void btm_init (void)
     memset(&btm_cb, 0, sizeof(tBTM_CB));
 #if (CLASSIC_BT_INCLUDED == TRUE)
     btm_cb.page_queue = fixed_queue_new(QUEUE_SIZE_MAX);
+#if !(defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID) /* open_fw patch 0022: checked by btu_init_core_ok() */
     assert(btm_cb.page_queue != NULL);
+#endif
 #endif // #if (CLASSIC_BT_INCLUDED == TRUE)
 #if (SMP_INCLUDED == TRUE)
     btm_cb.sec_pending_q = fixed_queue_new(QUEUE_SIZE_MAX);
+#if !(defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID) /* open_fw patch 0022: checked by btu_init_core_ok() */
     assert(btm_cb.sec_pending_q != NULL);
+#endif
 #endif // (SMP_INCLUDED == TRUE)
 #if defined(BTM_INITIAL_TRACE_LEVEL)
     btm_cb.trace_level = BTM_INITIAL_TRACE_LEVEL;

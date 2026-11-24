@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Offline regression tests for host safety tools:
+  - tools/bt_sync.py: remote filename guard, native-SPP (OpenFW) vs stock HFP start-up detection
   - tools/usb_sync.py: content-hashed collision handling & deduplication
   - tools/fix_exfat_boundary.py: tail-cluster allocation bitmap check,
     MBR/VBR geometry validation, shrink, and idempotency on re-run
@@ -38,6 +39,65 @@ def test_bt_sync_path_traversal() -> None:
                 rejected = True
             assert rejected, f"Expected safe_dest_path to reject {bad!r}"
     print("[PASS] bt_sync.py remote filename traversal & control-char guard")
+
+
+class _FakeRfcomm:
+    """Scripted stand-in for the AF_BLUETOOTH RFCOMM socket: recv() pops the script (None = timeout)."""
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.sent = bytearray()
+        self.timeouts = []
+
+    def settimeout(self, t):
+        self.timeouts.append(t)
+
+    def connect(self, addr):
+        self.addr = addr
+
+    def recv(self, n):
+        if not self.script:
+            raise bt_sync.socket.timeout()
+        item = self.script.pop(0)
+        if item is None:
+            raise bt_sync.socket.timeout()
+        return item
+
+    def sendall(self, data):
+        self.sent.extend(data)
+
+    def close(self):
+        pass
+
+
+def _run_handshake(script, transport="auto"):
+    fake = _FakeRfcomm(script)
+    real_socket, real_sleep = bt_sync.socket.socket, bt_sync.time.sleep
+    bt_sync.socket.socket = lambda *a, **k: fake
+    bt_sync.time.sleep = lambda s: None
+    try:
+        c = bt_sync.XRecRFCOMMClient("02:CA:55:00:01:1D", transport=transport)
+        c.connect_and_handshake()
+    finally:
+        bt_sync.socket.socket, bt_sync.time.sleep = real_socket, real_sleep
+    return c, fake
+
+
+def test_bt_sync_transport_detection() -> None:
+    # OpenFW: silent after RFCOMM open -> native SPP, nothing sent, probe timeout used once
+    c, fake = _run_handshake([None])
+    assert fake.sent == b"" and bt_sync.NATIVE_SPP_PROBE_S in fake.timeouts and c.rx_buf == b""
+    # forced native: no probe at all
+    c, fake = _run_handshake([], transport="native")
+    assert fake.sent == b"" and bt_sync.NATIVE_SPP_PROBE_S not in fake.timeouts
+    # unexpected non-AT bytes: native, bytes kept for the +XREC reader
+    c, fake = _run_handshake([b"+XREC:PONG,x\r\n"])
+    assert fake.sent == b"" and bytes(c.rx_buf) == b"+XREC:PONG,x\r\n"
+    # stock HW_76 HFP unit: AT+BRSF in the probe read, rest of the SLC after it
+    c, fake = _run_handshake([b"AT+BRSF=", b"20\rAT+CIND=?\r", b"AT+CIND?\rAT+CMER=3,0,0,1\r"])
+    sent = bytes(fake.sent)
+    assert b"+BRSF: 1007" in sent and b"+CIND: 1,0,0,0,5,0,5" in sent and sent.endswith(b"\r\nOK\r\n")
+    print("[PASS] bt_sync.py native-SPP (OpenFW) vs stock HFP start-up detection")
 
 
 def test_usb_sync_collisions() -> None:
@@ -163,6 +223,7 @@ def test_fix_exfat_boundary() -> None:
 
 def main() -> int:
     test_bt_sync_path_traversal()
+    test_bt_sync_transport_detection()
     test_usb_sync_collisions()
     test_fix_exfat_boundary()
     print("ALL HOST TOOL SAFETY TESTS PASSED")

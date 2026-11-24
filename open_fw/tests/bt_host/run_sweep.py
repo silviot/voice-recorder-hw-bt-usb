@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Allocation-failure sweep over esp_bluedroid_enable() (plan M1 "general rule", M3 harness).
+"""Allocation-failure sweep over one Bluedroid lifecycle call (plan M1 "general rule", M3 harness).
 
-Runs `test_bt_host sweep-count` to learn how many allocation attempts enable makes (all tasks), then one process per
-attempt N (`test_bt_host sweep-one N`, parallel, each under a timeout) with the N-th attempt failing. A point passes
-when enable completed (ENABLED) or failed cleanly (ESP_FAIL / ESP_ERR_NO_MEM) and the full teardown returned heap,
-tasks and esp_timer slots to the baseline with no sanitizer report, contract error or BT fault.
+--mode selects the call: esp_bluedroid_init(), _enable() (default), _disable() or _deinit(). Runs
+`test_bt_host sweep-count MODE` to learn how many allocation attempts the call makes (all tasks), then one process per
+attempt N (`test_bt_host sweep-one N MODE`, parallel, each under a timeout) with the N-th attempt failing. A point
+passes when the call completed (OK) or failed cleanly (an error with the API state unchanged: CLEAN_FAIL), teardown
+from there (a failed disable/deinit is retried) returned heap, tasks and esp_timer slots to the baseline, a following
+clean cycle still worked, and there was no sanitizer report, contract error or BT fault.
 
 Every non-passing point is classified (CRASH = assert/sanitizer abort, HANG = watchdog deadline, CHECK = leak or
 contract check failed) and grouped by the failing allocation's call site, symbolised from the INJECT backtrace the
@@ -13,8 +15,8 @@ harness prints (addr2line; the binary is non-PIE).
 A point that passes but whose N-th attempt never happened (`injected=0`: the run made fewer attempts than sweep-count
 reported) tested nothing and is classified NOT_INJECTED, which fails the run.
 
-Known upstream findings may be listed in a waiver file (one `site-function[<-caller]  CLASS  COUNT  reason` per line,
-'#' comments): matching points are reported as WAIVED and do not fail the run. COUNT is the exact number of points
+Known upstream findings may be listed in a waiver file (one `mode  site-function[<-caller]  CLASS  COUNT  reason`
+per line, '#' comments; only the lines of the swept mode apply): matching points are reported as WAIVED and do not fail the run. COUNT is the exact number of points
 the waiver is expected to cover. A waiver matching MORE points than its COUNT fails the run (a new failing path ended
 at a waived site); one matching fewer (or none: stale) prints a warning so the file gets updated. With --max the
 upper bound still applies, the stale warnings are skipped. Exit status: 0 when every point passes or is waived within
@@ -85,7 +87,7 @@ def waiver_matches(w, fn, caller, cls):
 
 
 def classify(rc, out):
-    m = re.search(r"SWEEP n=\d+ injected=(\d+) .*outcome=(\w+)", out)
+    m = re.search(r"SWEEP mode=\w+ n=\d+ injected=(\d+) .*outcome=(\w+)", out)
     if m and int(m.group(1)) == 0:
         return ("NOT_INJECTED", "", "the N-th allocation attempt never happened: nothing was tested")
     if rc == 0 and m:
@@ -108,6 +110,7 @@ def classify(rc, out):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("binary")
+    ap.add_argument("--mode", default="enable", choices=("init", "enable", "disable", "deinit"))
     ap.add_argument("--jobs", type=int, default=os.cpu_count() or 4)
     ap.add_argument("--timeout", type=int, default=90)
     ap.add_argument("--max", type=int, default=0, help="sweep only attempts 1..max (0 = all)")
@@ -115,35 +118,38 @@ def main():
     ap.add_argument("--verbose", action="store_true")
     a = ap.parse_args()
 
-    rc, out = run(a.binary, ["sweep-count"], a.timeout)
-    m = re.search(r"ENABLE_ALLOCS (\d+)", out)
+    rc, out = run(a.binary, ["sweep-count", a.mode], a.timeout)
+    m = re.search(r"SWEEP_ALLOCS %s (\d+)" % a.mode, out)
     if rc != 0 or not m:
         print(out)
-        print("sweep: sweep-count failed (rc=%d)" % rc)
+        print("sweep: sweep-count %s failed (rc=%d)" % (a.mode, rc))
         return 1
     total = int(m.group(1))
     n_max = min(total, a.max) if a.max else total
-    print("sweep: esp_bluedroid_enable() makes %d allocation attempts; failing each of 1..%d in turn" % (total, n_max))
+    print("sweep: esp_bluedroid_%s() makes %d allocation attempts; failing each of 1..%d in turn" % (a.mode, total,
+                                                                                                     n_max))
 
     waivers = []
     if a.waivers:
         for line in open(a.waivers):
             line = line.split("#", 1)[0].strip()
             if line:
-                parts = line.split(None, 3)
-                if len(parts) < 3 or not parts[2].isdigit():
-                    print("sweep: bad waiver line (want `function[<-caller]  CLASS  COUNT  reason`): %s" % line)
+                parts = line.split(None, 4)
+                if len(parts) < 4 or not parts[3].isdigit() or \
+                        parts[0] not in ("init", "enable", "disable", "deinit"):
+                    print("sweep: bad waiver line (want `mode  function[<-caller]  CLASS  COUNT  reason`): %s" % line)
                     return 1
-                waivers.append((parts[0], parts[1], parts[3] if len(parts) > 3 else "", int(parts[2])))
+                if parts[0] == a.mode:
+                    waivers.append((parts[1], parts[2], parts[4] if len(parts) > 4 else "", int(parts[3])))
 
     results = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=a.jobs) as ex:
-        futs = {ex.submit(run, a.binary, ["sweep-one", str(n)], a.timeout): n for n in range(1, n_max + 1)}
+        futs = {ex.submit(run, a.binary, ["sweep-one", str(n), a.mode], a.timeout): n for n in range(1, n_max + 1)}
         for f in concurrent.futures.as_completed(futs):
             results[futs[f]] = f.result()
 
     groups = {}
-    counts = {"ENABLED": 0, "CLEAN_FAIL": 0, "WAIVED": 0, "HANG": 0, "CRASH": 0, "CHECK": 0, "NOT_INJECTED": 0}
+    counts = {"OK": 0, "CLEAN_FAIL": 0, "WAIVED": 0, "HANG": 0, "CRASH": 0, "CHECK": 0, "NOT_INJECTED": 0}
     waiver_hits = {i: 0 for i in range(len(waivers))}
     for n in sorted(results):
         rc, out = results[n]
@@ -168,8 +174,8 @@ def main():
             chain = " <- ".join("%s" % f for f, _ in frames[:8])
             print("  n=%-4d %-6s %s: %s\n         %s" % (n, cls, fn, msg, chain))
 
-    print("sweep: %d points: %d ENABLED, %d CLEAN_FAIL, %d WAIVED, %d CRASH, %d HANG, %d CHECK, %d NOT_INJECTED" % (
-        n_max, counts["ENABLED"], counts["CLEAN_FAIL"], counts["WAIVED"], counts["CRASH"], counts["HANG"],
+    print("sweep %s: %d points: %d OK, %d CLEAN_FAIL, %d WAIVED, %d CRASH, %d HANG, %d CHECK, %d NOT_INJECTED" % (
+        a.mode, n_max, counts["OK"], counts["CLEAN_FAIL"], counts["WAIVED"], counts["CRASH"], counts["HANG"],
         counts["CHECK"], counts["NOT_INJECTED"]))
     for (cls, fn, loc, msg), ns in sorted(groups.items(), key=lambda kv: (kv[0][0], kv[1][0])):
         shown = ",".join(str(n) for n in ns[:8]) + (",..." if len(ns) > 8 else "")

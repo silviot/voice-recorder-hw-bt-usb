@@ -231,6 +231,12 @@ extern void bta_sys_disable(tBTA_SYS_HW_MODULE module);
 extern UINT32 bta_sys_get_remaining_ticks(TIMER_LIST_ENT *p_target_tle);
 
 extern void bta_sys_hw_register( tBTA_SYS_HW_MODULE module, tBTA_SYS_HW_CBACK *cback);
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+/* open_fw patch 0014: run a BTA SYS hardware event synchronously (BTU task only) when its message cannot be allocated */
+extern void bta_sys_hw_execute_local(UINT16 event, tBTA_SYS_HW_MODULE hw_module);
+/* open_fw patch 0022: bta_sys_init() allocated its alarm lock and hash map */
+extern BOOLEAN bta_sys_init_ok(void);
+#endif
 extern void bta_sys_hw_unregister( tBTA_SYS_HW_MODULE module );
 
 

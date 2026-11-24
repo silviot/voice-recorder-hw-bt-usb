@@ -308,6 +308,9 @@ void  btu_hcif_cmd_timeout (UINT8 controller_id);
 */
 void  btu_init_core(void);
 void  btu_free_core(void);
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+BOOLEAN btu_init_core_ok(void); /* open_fw patch 0022: every mandatory control-block allocation of btu_init_core() worked */
+#endif
 
 bool BTU_StartUp(void);
 void BTU_ShutDown(void);

@@ -27,14 +27,16 @@ SANFLAGS  := $(SAN_$(SAN))
 OPT       := -O1 -g -ffunction-sections -fdata-sections
 
 include $(ROOT)/bt/bluedroid_srcs.mk
-BD_SRCS   := $(addprefix $(ROOT)/,$(BLUEDROID_SRCS))
+# bt_xrec_spp_mtu.c (phone mode) includes Bluedroid internals: built like vendored code, as in bt/Makefile.bluedroid.
+BD_SRCS   := $(addprefix $(ROOT)/,$(BLUEDROID_SRCS)) $(ROOT)/bt_port/bt_xrec_spp_mtu.c
 PORT_SRCS := $(addprefix $(ROOT)/bt_port/,bt_alarm.c bt_esp_timer.c bt_entropy.c bt_drbg.c bt_store.c bt_ctrl.c \
-             bt_ctrl_cmds.c bt_ctrl_evt.c)
+             bt_ctrl_cmds.c bt_ctrl_evt.c bt_xrec_bluedroid.c)
 HOST_SRCS := $(HT)/host_heap.c $(HT)/host_glue.c $(HT)/host_ctrl.c $(HT)/test_bt_host.c $(HT)/host_link_stubs.c \
-             $(ROOT)/tests/fake_rom.c
+             $(HT)/host_xrec.c $(HT)/test_phone.c $(ROOT)/tests/fake_rom.c
 KERN_SRCS := $(addprefix $(FR)/,tasks.c queue.c list.c timers.c event_groups.c stream_buffer.c) $(HT)/host_main.c
 PPORT_SRCS:= $(POSIX)/port.c $(POSIX)/utils/wait_for_event.c
-FW_SRCS   := $(ROOT)/src/crypto.c
+# Firmware sources the phone scenario runs unmodified: XREC protocol and the exFAT layer (RAM SD card).
+FW_SRCS   := $(ROOT)/src/crypto.c $(ROOT)/src/xrec_proto.c $(ROOT)/src/exfat.c
 
 obj = $(patsubst $(ROOT)/%.c,$(OUT)/%.o,$(1))
 BD_OBJS   := $(call obj,$(BD_SRCS))
@@ -56,8 +58,11 @@ BD_WARN := -Wall -Wno-unused-function -Wno-unused-variable -Wno-unused-but-set-v
            -Wno-pointer-sign -Wno-unterminated-string-initialization -Wno-missing-braces \
            -Wno-sometimes-uninitialized -Wno-unused-label -Wno-absolute-value -Wno-parentheses \
            -Wno-gnu-variable-sized-type-not-at-end -Wno-implicit-enum-enum-cast -Wno-constant-logical-operand
+# TIMER_PARAM_TYPE (bt_target.h, #ifndef; UINT32 on target): pointer-wide on x86-64. L2CAP keeps its link control
+# blocks in a heap list (l2cb.p_lcb_pool) and stores them in TIMER_LIST_ENT.param through TIMER_PARAM_TYPE; heap
+# pointers are above 4 GiB on the host, so the first L2CAP link timer of a connected link crashed (phone scenario).
 BD_DEFS := -DESP_PLATFORM=1 -D__ESP_ATTR_H__ -DOPENFW_BLUEDROID=1 -DBT_LOGS=0 -DOPENFW_BT_HOST_HARNESS=1 \
-           -include $(ROOT)/bt_port/bt_port_prefix.h
+           -DTIMER_PARAM_TYPE=__UINTPTR_TYPE__ -include $(ROOT)/bt_port/bt_port_prefix.h
 # x86-64 only: Bluedroid keeps pointers in 32-bit fields (TIMER_LIST_ENT.param = UINT32 in l2cap/rfcomm/avdt/sdp/btm
 # timers, all pointing at static control blocks or code). The harness is linked -no-pie so .text/.data/.bss sit below
 # 4 GiB and those round trips are exact; test_bt_host.c asserts the image end (_end) < 4 GiB at start-up.

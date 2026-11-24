@@ -323,7 +323,9 @@ static void bring_up(void)
     r = roundtrip(0x1002u, NULL, 0u);
     uint8_t sc[64] = { 0 };
     if (r) PARSE_OK(shim_parse_supported_cmds(r->d, r->len, sc));
-    CHECK((sc[45] & 0x80u) == 0u && (sc[2] & 0x40u) == 0u, "1002: 0C84 / 041C bits must be clear");
+    /* 0C84 stays clear (D:1027). 041C is FWD since the phone-path promotion: Bluedroid then reads the peer's page 1
+     * (btm_acl.c:1286) and learns SSP host support (btm_sec_set_peer_sec_caps) instead of marking it legacy. */
+    CHECK((sc[45] & 0x80u) == 0u && (sc[2] & 0x40u) != 0u, "1002: 0C84 bit clear, 041C bit set");
     uint8_t page = 0, max_page = 0, pages[3][8];
     uint8_t pg = 0u;
     r = roundtrip(0x1004u, &pg, 1u);
@@ -471,8 +473,8 @@ static uint16_t golden(const bt_ctrl_cmd_row_t *r, const uint8_t *prm, uint8_t p
     case 0x1002: { static const uint8_t g[] = { 4, 0x0E, 68, 1, 0x02, 0x10, 0 };
         memcpy(out, g, sizeof(g));
         uint8_t *b = out + 7;  /* supported by the effective FWD/SYN/LOCAL rows of the default build */
-        b[0] = 0x20; b[1] = 0x3F; b[5] = 0xD0; b[6] = 0x81; b[7] = 0xA3; b[9] = 0x02; b[10] = 0xE0;
-        b[14] = 0xD8; b[15] = 0x02; b[17] = 0x40; b[18] = 0x80; b[19] = 0x03;
+        b[0] = 0x20; b[1] = 0xBF; b[2] = 0xF9; b[3] = 0x01; b[5] = 0xD0; b[6] = 0x81; b[7] = 0xA3; b[9] = 0x02;
+        b[10] = 0xE0; b[14] = 0xD8; b[15] = 0x02; b[17] = 0x40; b[18] = 0x80; b[19] = 0x03; b[20] = 0x08;
         return 7 + 64; }
     case 0x1004: { static const uint8_t g[] = { 4, 0x0E, 14, 1, 0x04, 0x10, 0, 0, 1,
                                                 0x1F, 0x06, 0xC4, 0x0A, 0x98, 0x1D, 0x18, 0x85 };
@@ -1428,6 +1430,9 @@ static void test_fwd_orphan(void)
     CHECK(r != NULL && status_of(r) == 0u, "next command not wedged");
     /* the ROM's own reply, when it comes after the Disconnection Complete, is used and not duplicated */
     link_up(0);
+    inject_conn_cmp(0x80);                       /* a new link on 0x80 (a dead handle is answered locally) */
+    pump();
+    t_rx_rd = t_rx_n;
     fake_rom.hold_replies = true;
     send_cmd(0x0406u, dp, 3u);
     pump();
@@ -1669,6 +1674,583 @@ static void test_c2h_fc_off(void)
     shutdown_and_check();
 }
 
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* 11. phone path: event packers, scripted remote peer, dead handles, forwarded-command deadline                   */
+/* ------------------------------------------------------------------------------------------------------------- */
+static void hexdump(const char *tag, const uint8_t *d, uint16_t n)
+{
+    printf("   %s:", tag);
+    for (uint16_t k = 0; k < n && k < 40; k++) printf(" %02X", d[k]);
+    printf(n > 40 ? " ...\n" : "\n");
+}
+
+static int same(const uint8_t *got, uint16_t glen, const uint8_t *want, uint16_t wlen)
+{
+    return glen == wlen && memcmp(got, want, wlen) == 0;
+}
+
+/* Golden vectors for every ROM reply/event id bt_ctrl_evt.c packs beyond the legacy set: ROM param bytes as the ROM
+ * sends them (naturally aligned struct, pad bytes 0xEE) -> exact H4 bytes, hand-derived from the stock packers
+ * (docs/BT_ROM_HCI_MAP.md §9), not from bt_ctrl_evt.c. */
+typedef struct {
+    uint16_t id;
+    uint8_t rom[24];
+    uint8_t rom_len;
+    uint8_t h4[30];
+    uint8_t h4_len;
+} evt_vec_t;
+
+#define A6 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6
+#define Q4(x) x, x, x, x
+static const evt_vec_t k_evt_vecs[] = {
+    { 0xE0D0, { 0x00 }, 1, { 4, 0x01, 1, 0x00 }, 4 },
+    { 0xE0D1, { 0x05, A6, 0x01, 0x00, 0x00, 0x0C, 0x02, 0x5A, 0xEE, 0x34, 0x12 }, 16,
+      { 4, 0x02, 15, 0x01, A6, 0x01, 0x00, 0x00, 0x0C, 0x02, 0x5A, 0x34, 0x12 }, 18 },
+    { 0xE45B, { 0x00, 0xEE, 0x80, 0x00 }, 4, { 4, 0x09, 3, 0x00, 0x80, 0x00 }, 6 },
+    { 0xE45C, { 0x00, 0xEE, 0x80, 0x00, 0x01 }, 5, { 4, 0x0A, 4, 0x00, 0x80, 0x00, 0x01 }, 7 },
+    { 0xE45F, { 0x00, 0xEE, 0x80, 0x00, 0x01, 0x02, 0xEE, 0xEE, Q4(0x11), Q4(0x22), Q4(0x33), Q4(0x44) }, 24,
+      { 4, 0x0D, 21, 0x00, 0x80, 0x00, 0x01, 0x02, Q4(0x11), Q4(0x22), Q4(0x33), Q4(0x44) }, 24 },
+    { 0xE0D4, { 0x07 }, 1, { 4, 0x10, 1, 0x07 }, 4 },
+    { 0xE460, { 0x80, 0x00 }, 2, { 4, 0x11, 2, 0x80, 0x00 }, 5 },
+    { 0xE461, { 0x00, A6, 0x01 }, 8, { 4, 0x12, 8, 0x00, A6, 0x01 }, 11 },
+    { 0xE463, { 0x00, 0xEE, 0x80, 0x00, 0x02, 0xEE, 0x20, 0x03 }, 8, { 4, 0x14, 6, 0x00, 0x80, 0x00, 0x02, 0x20, 0x03 }, 9 },
+    { 0xE467, { 0x01 }, 1, { 4, 0x1A, 1, 0x01 }, 4 },
+    { 0xE469, { 0x00, 0xEE, 0x80, 0x00, 0x34, 0x12 }, 6, { 4, 0x1C, 5, 0x00, 0x80, 0x00, 0x34, 0x12 }, 8 },
+    { 0xE46A, { 0x00, 0xEE, 0x80, 0x00, 0x18, 0xCC }, 6, { 4, 0x1D, 5, 0x00, 0x80, 0x00, 0x18, 0xCC }, 8 },
+    { 0xE46B, { 0x80, 0x00 }, 2, { 4, 0x1E, 2, 0x80, 0x00 }, 5 },
+    { 0xE46C, { 0x00, 0xEE, 0x80, 0x00, 0x00, 0x01, 0x02, 0xEE, Q4(0x11), Q4(0x22), Q4(0x33), Q4(0x44) }, 24,
+      { 4, 0x21, 22, 0x00, 0x80, 0x00, 0x00, 0x01, 0x02, Q4(0x11), Q4(0x22), Q4(0x33), Q4(0x44) }, 25 },
+    { 0xE46D, { 0x00, 0xEE, 0x80, 0x00, 0x01, 0x02, 0xF1, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7, 0xF8 }, 14,
+      { 4, 0x23, 13, 0x00, 0x80, 0x00, 0x01, 0x02, 0xF1, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7, 0xF8 }, 16 },
+    { 0xE471, { 0x00, 0xEE, 0x80, 0x00 }, 4, { 4, 0x30, 3, 0x00, 0x80, 0x00 }, 6 },
+    { 0xE475, { A6 }, 6, { 4, 0x34, 6, A6 }, 9 },
+    { 0xE476, { A6 }, 6, { 4, 0x35, 6, A6 }, 9 },
+    { 0xE479, { 0x80, 0x00 }, 2, { 4, 0x39, 2, 0x80, 0x00 }, 5 },
+    { 0xE47A, { A6, 0xEE, 0xEE, 0x40, 0xE2, 0x01, 0x00 }, 12, { 4, 0x3B, 10, A6, 0x40, 0xE2, 0x01, 0x00 }, 13 },
+    { 0xE47B, { A6, 0x02 }, 7, { 4, 0x3C, 7, A6, 0x02 }, 10 },
+    { 0xE47C, { A6, 0x01, 0, 0, 0, 0, 0, 0, 0x80 }, 14, { 4, 0x3D, 14, A6, 0x01, 0, 0, 0, 0, 0, 0, 0x80 }, 17 },
+    /* legacy-packed events on the phone path (bt_hci.c:763-848), same method */
+    { 0xE456, { 0x00, 0xEE, 0x80, 0x00, 0xEE, A6, 0x01, 0x00 }, 13, { 4, 0x03, 11, 0x00, 0x80, 0x00, A6, 0x01, 0x00 }, 14 },
+    { 0xE45A, { 0x00, 0xEE, 0x80, 0x00, 0x01 }, 5, { 4, 0x08, 4, 0x00, 0x80, 0x00, 0x01 }, 7 },
+    { 0xE459, { 0x05, 0xEE, 0x80, 0x00 }, 4, { 4, 0x06, 3, 0x05, 0x80, 0x00 }, 6 },
+    { 0xE474, { A6, 0xEE, 0xEE, 0x40, 0xE2, 0x01, 0x00 }, 12, { 4, 0x33, 10, A6, 0x40, 0xE2, 0x01, 0x00 }, 13 },
+    { 0xE45E, { 0x00, 0xEE, 0x80, 0x00, 0x0A, 0xEE, 0x0F, 0x00, 0x34, 0x12 }, 10,
+      { 4, 0x0C, 8, 0x00, 0x80, 0x00, 0x0A, 0x0F, 0x00, 0x34, 0x12 }, 11 },
+    /* command replies (stock reply tables; CC generic packer FW 0xD5860C, CS FW 0xD59189) */
+    { 0xE42E, { 0x00, 0xEE, 0x80, 0x00 }, 4, { 4, 0x0E, 6, 1, 0x28, 0x0C, 0x00, 0x80, 0x00 }, 9 },
+    { 0xE431, { 0x0C, 0xEE, 0x81, 0x00 }, 4, { 4, 0x0E, 6, 1, 0x37, 0x0C, 0x0C, 0x81, 0x00 }, 9 },
+    { 0xE06E, { 0x12, A6 }, 7, { 4, 0x0E, 10, 1, 0x1A, 0x04, 0x12, A6 }, 13 },
+    { 0xE076, { 0x00, A6 }, 7, { 4, 0x0E, 10, 1, 0x34, 0x04, 0x00, A6 }, 13 },
+    { 0xE069, { 0x02, A6 }, 7, { 4, 0x0E, 10, 1, 0x08, 0x04, 0x02, A6 }, 13 },
+    { 0xE066, { 0x0C }, 1, { 4, 0x0E, 4, 1, 0x02, 0x04, 0x0C }, 7 },
+    { 0xE088, { 0x12 }, 1, { 4, 0x0E, 4, 1, 0x18, 0x0C, 0x12 }, 7 },
+    { 0xE08C, { 0x00 }, 1, { 4, 0x0E, 4, 1, 0x1C, 0x0C, 0x00 }, 7 },
+    { 0xE08E, { 0x00 }, 1, { 4, 0x0E, 4, 1, 0x1E, 0x0C, 0x00 }, 7 },
+    { 0xE0A2, { 0x12 }, 1, { 4, 0x0E, 4, 1, 0x3A, 0x0C, 0x12 }, 7 },
+    { 0xE0A9, { 0x00 }, 1, { 4, 0x0E, 4, 1, 0x45, 0x0C, 0x00 }, 7 },
+    { 0xE0AF, { 0x00 }, 1, { 4, 0x0E, 4, 1, 0x52, 0x0C, 0x00 }, 7 },
+    { 0xE0C7, { 0x00 }, 1, { 4, 0x0F, 4, 0x00, 1, 0x01, 0x04 }, 7 },
+    { 0xE0C8, { 0x09 }, 1, { 4, 0x0F, 4, 0x09, 1, 0x05, 0x04 }, 7 },
+    { 0xE0CB, { 0x00 }, 1, { 4, 0x0F, 4, 0x00, 1, 0x19, 0x04 }, 7 },
+    { 0xE43D, { 0x11 }, 1, { 4, 0x0F, 4, 0x11, 1, 0x0F, 0x04 }, 7 },
+    { 0xE43E, { 0x00 }, 1, { 4, 0x0F, 4, 0x00, 1, 0x11, 0x04 }, 7 },
+    { 0xE43F, { 0x12 }, 1, { 4, 0x0F, 4, 0x12, 1, 0x13, 0x04 }, 7 },
+    { 0xE441, { 0x00 }, 1, { 4, 0x0F, 4, 0x00, 1, 0x1B, 0x04 }, 7 },
+    { 0xE442, { 0x1A }, 1, { 4, 0x0F, 4, 0x1A, 1, 0x1C, 0x04 }, 7 },
+    { 0xE443, { 0x0C }, 1, { 4, 0x0F, 4, 0x0C, 1, 0x1D, 0x04 }, 7 },
+    { 0xE444, { 0x00 }, 1, { 4, 0x0F, 4, 0x00, 1, 0x1F, 0x04 }, 7 },
+};
+#undef Q4
+
+static void test_event_packers(void)
+{
+    uint8_t out[BT_CTRL_EVT_MAX_H4];
+    bt_ctrl_evt_info_t info;
+    for (size_t i = 0; i < sizeof(k_evt_vecs) / sizeof(k_evt_vecs[0]); i++) {
+        const evt_vec_t *v = &k_evt_vecs[i];
+        memset(out, 0xCD, sizeof(out));
+        uint16_t n = bt_ctrl_evt_pack(v->id, v->rom, v->rom_len, out, &info);
+        CHECK(same(out, n, v->h4, v->h4_len), "ROM id %04X golden H4 mismatch", v->id);
+        if (!same(out, n, v->h4, v->h4_len)) { hexdump("got ", out, n); hexdump("want", v->h4, v->h4_len); }
+        CHECK(h4_rx_valid(out, n), "ROM id %04X packs an H4 packet Bluedroid would drop", v->id);
+        if (v->rom_len > 1u) {
+            CHECK(bt_ctrl_evt_pack(v->id, v->rom, (uint16_t)(v->rom_len - 1u), out, &info) == 0u &&
+                  info.kind == BT_CTRL_EVK_SHORT, "ROM id %04X: one byte short must be SHORT", v->id);
+        }
+    }
+    /* Remote Name Request Complete: full 255 B, and a short name zero-filled (stock copies 255 B verbatim) */
+    uint8_t rnr[255];
+    memset(rnr, 0, sizeof(rnr));
+    const uint8_t a6[6] = { A6 };
+    memcpy(&rnr[1], a6, 6);
+    memcpy(&rnr[7], "Pixel 9", 7);
+    memset(&rnr[200], 0x77, 55);                  /* name bytes at the end are kept */
+    uint16_t n = bt_ctrl_evt_pack(0xE0D3, rnr, 255, out, &info);
+    CHECK(n == 258u && out[0] == 4 && out[1] == 0x07 && out[2] == 255 && memcmp(&out[3], rnr, 255) == 0,
+          "E0D3 full -> event 0x07, 255 B verbatim");
+    n = bt_ctrl_evt_pack(0xE0D3, rnr, 14, out, &info);
+    int zero_tail = 1;
+    for (int k = 17; k < 258; k++) zero_tail &= out[k] == 0;
+    CHECK(n == 258u && memcmp(&out[3], rnr, 14) == 0 && zero_tail, "E0D3 short: name zero-filled to 248");
+    CHECK(bt_ctrl_evt_pack(0xE0D3, rnr, 6, out, &info) == 0u && info.kind == BT_CTRL_EVK_SHORT, "E0D3 < 7 B SHORT");
+    /* not packed on purpose (no stock packer / feature compiled out): counted as unknown, never mis-packed */
+    const uint16_t unknown[] = { 0xE0D6, 0xE0D7, 0xE46E, 0xE46F, 0xE470, 0xE454, 0xE455 };
+    for (size_t i = 0; i < sizeof(unknown) / sizeof(unknown[0]); i++) {
+        CHECK(bt_ctrl_evt_pack(unknown[i], rnr, 255, out, &info) == 0u && info.kind == BT_CTRL_EVK_UNKNOWN,
+              "%04X must stay unknown", unknown[i]);
+    }
+    /* every reply id in the opcode table (FWD and gated rows) maps back to its own opcode */
+    uint32_t rows_n = 0;
+    const bt_ctrl_cmd_row_t *rows = bt_ctrl_cmds_table(&rows_n);
+    for (uint32_t i = 0; i < rows_n; i++) {
+        if (rows[i].rom_rsp != 0u) {
+            CHECK(bt_ctrl_evt_reply_opcode(rows[i].rom_rsp) == rows[i].op, "%04X reply id %04X not packed back",
+                  rows[i].op, rows[i].rom_rsp);
+        }
+    }
+}
+
+/* ---- scripted phone ---- */
+static const uint8_t k_phone[6] = { 0x51, 0x52, 0x53, 0x54, 0x55, 0x56 };
+
+static void phone_cfg(fake_peer_cfg_t *c)
+{
+    memset(c, 0, sizeof(*c));
+    memcpy(c->addr, k_phone, 6);
+    c->cod[0] = 0x0C; c->cod[1] = 0x02; c->cod[2] = 0x5A;   /* smartphone */
+    c->io_cap = 0x01;                                       /* DisplayYesNo */
+    c->auth_req = 0x03;                                     /* MITM, dedicated bonding */
+    c->numeric = 123456u;                                   /* 0x0001E240 */
+    c->user_confirms = true;
+    c->auto_encrypt = true;
+    c->host_feat_notify = true;
+    c->key_type = 0x05;                                     /* authenticated combination key P-192 */
+    static const uint8_t f0[8] = { 0xBF, 0xFE, 0xCF, 0xFE, 0xDB, 0xFF, 0x7B, 0x87 };   /* bit 63 ext, bit 51 SSP */
+    static const uint8_t f1[8] = { 0x01, 0, 0, 0, 0, 0, 0, 0 };                        /* SSP host */
+    memcpy(c->features, f0, 8);
+    memcpy(c->features_p1, f1, 8);
+    c->max_page = 2;
+    c->lmp_ver = 0x0A;
+    c->manuf = 0x000F;
+    c->subver = 0x1234;
+    c->clk_off = 0x4321;
+    memcpy(c->name, "Pixel", 5);
+}
+
+/* Next delivered packet must be exactly `want`. */
+static void expect_pkt(const uint8_t *want, uint16_t n, const char *what)
+{
+    const pkt_t *p = next_pkt();
+    int ok = p != NULL && same(p->d, p->len, want, n);
+    CHECK(ok, "phone path: %s", what);
+    if (!ok) {
+        if (p != NULL) hexdump("got ", p->d, p->len); else printf("   got : (nothing)\n");
+        hexdump("want", want, n);
+    }
+}
+
+static void expect_cs(uint16_t op, uint8_t status, const char *what)
+{
+    uint8_t w[7] = { 4, 0x0F, 4, status, 1, (uint8_t)op, (uint8_t)(op >> 8) };
+    expect_pkt(w, 7, what);
+}
+
+static void expect_cc_addr(uint16_t op, uint8_t status, const char *what)
+{
+    uint8_t w[13] = { 4, 0x0E, 10, 1, (uint8_t)op, (uint8_t)(op >> 8), status };
+    memcpy(&w[7], k_phone, 6);
+    expect_pkt(w, 13, what);
+}
+
+static void expect_addr_evt(uint8_t code, const char *what)
+{
+    uint8_t w[9] = { 4, code, 6 };
+    memcpy(&w[3], k_phone, 6);
+    expect_pkt(w, 9, what);
+}
+
+static void expect_s_h(uint8_t code, uint8_t status, uint16_t h, const uint8_t *tail, uint8_t tail_len,
+                       const char *what)
+{
+    uint8_t w[32] = { 4, code, (uint8_t)(3u + tail_len), status, (uint8_t)h, (uint8_t)(h >> 8) };
+    if (tail_len) memcpy(&w[6], tail, tail_len);
+    expect_pkt(w, (uint16_t)(6u + tail_len), what);
+}
+
+static void cmd_addr(uint16_t op, const uint8_t *tail, uint8_t tail_len)
+{
+    uint8_t p[32];
+    memcpy(p, k_phone, 6);
+    if (tail_len) memcpy(&p[6], tail, tail_len);
+    send_cmd(op, p, (uint8_t)(6u + tail_len));
+    pump();
+}
+
+static void cmd_h(uint16_t op, uint16_t h, const uint8_t *tail, uint8_t tail_len)
+{
+    uint8_t p[32] = { (uint8_t)h, (uint8_t)(h >> 8) };
+    if (tail_len) memcpy(&p[2], tail, tail_len);
+    send_cmd(op, p, (uint8_t)(2u + tail_len));
+    pump();
+}
+
+/* Incoming connection: Connection Request, 0409 (remain slave: Bluedroid's choice without local role switch,
+ * l2c_link.c:96-98, and the legacy accept at bt_hci.c:1592-1595), CS, Connection Complete. */
+static void phone_connects(void)
+{
+    CHECK(fake_peer_page(0) == 0, "page");
+    pump();
+    uint8_t creq[13] = { 4, 0x04, 10, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x0C, 0x02, 0x5A, 0x01 };
+    expect_pkt(creq, 13, "Connection Request (E457 -> 0x04)");
+    uint8_t role = 0x01;
+    cmd_addr(0x0409u, &role, 1);
+    expect_cs(0x0409u, 0x00, "0409 CS (E0C9)");
+    uint8_t cc[14] = { 4, 0x03, 11, 0x00, 0x80, 0x00, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x01, 0x00 };
+    expect_pkt(cc, 14, "Connection Complete (E456 -> 0x03)");
+    CHECK(fake_peer.connected && fake_peer.host_accept_role == 0x01, "peer connected, host stayed slave");
+}
+
+/* btm_acl_created (btm_acl.c:435-436, 474) + btm_read_remote_features_complete (1286) + name (btm_sec.c:5002). */
+static void phone_link_setup(const fake_peer_cfg_t *c)
+{
+    cmd_h(0x041Fu, 0x80, NULL, 0);
+    expect_cs(0x041Fu, 0, "041F CS (E444)");
+    uint8_t off[2] = { 0x21, 0x43 };
+    expect_s_h(0x1C, 0, 0x80, off, 2, "Read Clock Offset Complete (E469 -> 0x1C)");
+    cmd_h(0x041Du, 0x80, NULL, 0);
+    expect_cs(0x041Du, 0, "041D CS (E443)");
+    uint8_t ver[5] = { 0x0A, 0x0F, 0x00, 0x34, 0x12 };
+    expect_s_h(0x0C, 0, 0x80, ver, 5, "Read Remote Version Complete (E45E -> 0x0C)");
+    cmd_h(0x041Bu, 0x80, NULL, 0);
+    expect_cs(0x041Bu, 0, "041B CS (E441)");
+    expect_s_h(0x0B, 0, 0x80, c->features, 8, "Read Remote Features Complete (E45D -> 0x0B)");
+    uint8_t pg = 1;
+    cmd_h(0x041Cu, 0x80, &pg, 1);
+    expect_cs(0x041Cu, 0, "041C CS (E442)");
+    uint8_t ext[10] = { 0x01, 0x02 };
+    memcpy(&ext[2], c->features_p1, 8);
+    expect_s_h(0x23, 0, 0x80, ext, 10, "Read Remote Ext Features Complete (E46D -> 0x23)");
+    uint8_t rnr_tail[4] = { 0x01, 0x00, 0x00, 0x00 };       /* R1, reserved, clock offset 0 (btm_sec.c:5002) */
+    cmd_addr(0x0419u, rnr_tail, 4);
+    expect_cs(0x0419u, 0, "0419 CS (E0CB)");
+    uint8_t hf[17] = { 4, 0x3D, 14, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56 };
+    memcpy(&hf[9], c->features_p1, 8);
+    expect_pkt(hf, 17, "Remote Host Supported Features Notification (E47C -> 0x3D)");
+    static uint8_t name[258];
+    memset(name, 0, sizeof(name));
+    name[0] = 4; name[1] = 0x07; name[2] = 255; name[3] = 0x00;
+    memcpy(&name[4], k_phone, 6);
+    memcpy(&name[10], "Pixel", 5);
+    expect_pkt(name, 258, "Remote Name Request Complete (E0D3 -> 0x07, 255 B)");
+}
+
+/* SSP numeric comparison as the responder (the phone authenticates us), Bluedroid's replies: no key (040C),
+ * DisplayYesNo + MITM (042B), user accepts (042C). Then the phone encrypts. */
+static void phone_pairs_us(void)
+{
+    fake_peer_authenticate();
+    pump();
+    expect_addr_evt(0x17, "Link Key Request (E465 -> 0x17)");
+    cmd_addr(0x040Cu, NULL, 0);
+    expect_cc_addr(0x040Cu, 0, "040C CC (E06B)");
+    uint8_t iorsp[12] = { 4, 0x32, 9, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x01, 0x00, 0x03 };
+    expect_pkt(iorsp, 12, "IO Capability Response (E473 -> 0x32), responder order: response first");
+    expect_addr_evt(0x31, "IO Capability Request (E472 -> 0x31)");
+    uint8_t io[3] = { 0x01, 0x00, 0x03 };                  /* DisplayYesNo, no OOB, MITM (plan M4 policy) */
+    cmd_addr(0x042Bu, io, 3);
+    expect_cc_addr(0x042Bu, 0, "042B CC (E06F)");
+    CHECK(fake_peer.host_io_cap == 0x01 && fake_peer.host_auth_req == 0x03, "ROM received DisplayYesNo + MITM");
+    uint8_t uc[13] = { 4, 0x33, 10, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x40, 0xE2, 0x01, 0x00 };
+    expect_pkt(uc, 13, "User Confirmation Request 123456 (E474 -> 0x33, u32 moved +8 -> +6)");
+    cmd_addr(0x042Cu, NULL, 0);
+    expect_cc_addr(0x042Cu, 0, "042C CC (E070)");
+    uint8_t spc[10] = { 4, 0x36, 7, 0x00, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56 };
+    expect_pkt(spc, 10, "Simple Pairing Complete (E477 -> 0x36)");
+    uint8_t lkn[26] = { 4, 0x18, 23, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56 };
+    memcpy(&lkn[9], fake_peer.key, 16);
+    lkn[25] = 0x05;
+    expect_pkt(lkn, 26, "Link Key Notification (E466 -> 0x18)");
+    uint8_t on = 1;
+    expect_s_h(0x08, 0, 0x80, &on, 1, "Encryption Change on (E45A -> 0x08)");
+    CHECK(fake_peer.has_key && fake_peer.authenticated && fake_peer.encrypted && fake_peer.pairings == 1u,
+          "paired, authenticated, encrypted");
+}
+
+/* SSP as the initiator (Bluedroid's 0411 from btm_sec_execute_procedure, btm_sec.c:5606), fresh pairing. */
+static void we_pair_phone(void)
+{
+    cmd_h(0x0411u, 0x80, NULL, 0);
+    expect_cs(0x0411u, 0, "0411 CS (E43E)");
+    expect_addr_evt(0x17, "Link Key Request after 0411");
+    cmd_addr(0x040Cu, NULL, 0);
+    expect_cc_addr(0x040Cu, 0, "040C CC");
+    expect_addr_evt(0x31, "IO Capability Request first (initiator order)");
+    uint8_t io[3] = { 0x01, 0x00, 0x03 };
+    cmd_addr(0x042Bu, io, 3);
+    expect_cc_addr(0x042Bu, 0, "042B CC");
+    uint8_t iorsp[12] = { 4, 0x32, 9, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x01, 0x00, 0x03 };
+    expect_pkt(iorsp, 12, "IO Capability Response (peer's LMP io_capability_res)");
+    uint8_t uc[13] = { 4, 0x33, 10, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x40, 0xE2, 0x01, 0x00 };
+    expect_pkt(uc, 13, "User Confirmation Request");
+}
+
+static void test_phone_path(void)
+{
+    fake_peer_cfg_t c;
+    phone_cfg(&c);
+    setup();
+    bring_up();
+    uint8_t scan = 0x03;
+    (void)roundtrip(0x0C1Au, &scan, 1);
+    fake_peer_init(&c);
+    t_rx_rd = t_rx_n;
+
+    /* (1) first connection, link set-up reads, responder pairing, peer-started encryption */
+    phone_connects();
+    phone_link_setup(&c);
+    phone_pairs_us();
+    uint8_t first_key[16];
+    memcpy(first_key, fake_peer.key, 16);
+
+    /* (2) ACL host -> phone under load: 20 L2CAP frames, never more than 1005's 4 credits in the ROM */
+    fake_rom.auto_ack_acl = false;
+    uint32_t sent = 0, acked = 0, n0 = fake_rom.n_acl, max_inflight = 0, nocp_total = 0;
+    for (int it = 0; it < 200 && (sent < 20u || acked < 20u); it++) {
+        while (sent < 20u && bt_ctrl_check_send_available()) {
+            send_acl(0x80, 2, (uint16_t)(8u + sent * 50u), (uint8_t)sent);
+            sent++;
+        }
+        bt_ctrl_run();
+        (void)bt_ctrl_dlv_run();
+        if (dbg().h2c_inflight > max_inflight) max_inflight = dbg().h2c_inflight;
+        if (it % 3 == 2) acked += fake_rom_ack_acl(2);
+        pump();
+        const pkt_t *p;
+        while ((p = next_pkt()) != NULL) {
+            CHECK(p->d[0] == BT_H4_EVT && p->d[1] == BT_HCI_EVT_NOCP && p->d[3] == 1 && p->d[4] == 0x80 && p->d[5] == 0,
+                  "only NOCP events for 0x80 during host ACL");
+            nocp_total += (uint32_t)(p->d[6] | (p->d[7] << 8));
+        }
+    }
+    CHECK(sent == 20u && acked == 20u && nocp_total == 20u && fake_rom.n_acl == n0 + 20u,
+          "20 frames to air, 20 completed, NOCP total %u", nocp_total);
+    CHECK(max_inflight == BT_CTRL_H2C_ACL_CREDITS && stats().acl_tx_credit_blocked != 0u,
+          "credit gate engaged at %u in flight", max_inflight);
+    int in_order = 1;
+    for (uint32_t i = 0; i < 20u; i++) {
+        const fake_acl_rec_t *r = &fake_rom.acl[n0 + i];
+        in_order &= r->handle == 0x80 && r->len == 8u + i * 50u && r->data[0] == (uint8_t)i && r->pb_bc == 2;
+    }
+    CHECK(in_order, "host ACL reached the air in order with exact lengths");
+
+    /* (3) ACL phone -> host under load: 12 frames, host window 4, credits returned with 0C35 */
+    uint8_t l2[600];
+    uint32_t injected = 0, got = 0, max_out = 0;
+    int data_ok = 1;
+    for (int it = 0; it < 200 && got < 12u; it++) {
+        while (injected < 12u && fake_rom_em_rx_in_use() < BT_ROM_EM_RX_BUFS) {
+            for (int k = 0; k < 600; k++) l2[k] = (uint8_t)(injected * 3u + (uint32_t)k);
+            if (fake_peer_send_acl(l2, (uint16_t)(40u + injected * 40u)) != 0) break;
+            injected++;
+        }
+        pump();
+        if (dbg().c2h_outstanding > max_out) max_out = dbg().c2h_outstanding;
+        const pkt_t *p;
+        uint32_t batch = 0;
+        while ((p = next_pkt()) != NULL) {
+            if (p->d[0] != BT_H4_ACL) continue;
+            uint16_t dl = (uint16_t)(p->d[3] | (p->d[4] << 8));
+            data_ok &= dl == 40u + got * 40u && p->d[5] == (uint8_t)(got * 3u) && ((p->d[2] >> 4) & 3u) == 2u;
+            got++;
+            batch++;
+        }
+        if (batch) host_nocp(0x80, (uint16_t)batch);
+        pump();
+    }
+    CHECK(got == 12u && data_ok, "12 phone frames delivered in order (%u)", got);
+    CHECK(max_out <= BT_CTRL_C2H_ACL_CREDITS && stats().c2h_excess == 0u && dbg().c2h_outstanding == 0u,
+          "host window respected (max %u outstanding)", max_out);
+
+    /* (4) disconnect while host ACL is queued: 4 in the ROM, 2 waiting in the TX ring, then 0406 */
+    uint32_t drop0 = stats().acl_tx_dropped;
+    for (int i = 0; i < 4; i++) { send_acl(0x80, 2, 30, (uint8_t)(0x40 + i)); pump(); }
+    send_acl(0x80, 2, 30, 0x50);
+    send_acl(0x80, 2, 30, 0x51);
+    pump();
+    CHECK(dbg().h2c_inflight == 4u && dbg().tx_free == 1u, "4 in flight, 2 queued (%u, %u)", dbg().h2c_inflight,
+          dbg().tx_free);
+    uint8_t reason = 0x13;
+    cmd_h(0x0406u, 0x80, &reason, 1);                     /* the command overtakes the credit-blocked ACL */
+    expect_cs(0x0406u, 0, "0406 CS (E43A)");
+    uint8_t r16 = 0x16;
+    expect_s_h(0x05, 0, 0x80, &r16, 1, "Disconnection Complete (E458 -> 0x05)");
+    CHECK(pending_pkts() == 0u, "nothing else after the Disconnection Complete");
+    CHECK(dbg().h2c_inflight == 0u && dbg().tx_free == BT_CTRL_TX_SLOTS && stats().acl_tx_dropped == drop0 + 2u,
+          "queued ACL flushed, in-flight credits released (dropped %u)", stats().acl_tx_dropped - drop0);
+    fake_rom_ack_acl(4);                                 /* the baseband's late completions for the dead link */
+    pump();
+    CHECK(pending_pkts() == 0u && dbg().nocp_pending == 0u, "no NOCP for a disconnected handle");
+    send_acl(0x80, 2, 30, 0x60);                         /* host had not seen the Disconnection Complete yet */
+    pump();
+    CHECK(stats().acl_tx_dead_handle == 1u && dbg().h2c_inflight == 0u, "late ACL for the dead handle dropped");
+    uint32_t cmds0 = fake_rom.n_cmds;
+    cmd_h(0x041Du, 0x80, NULL, 0);
+    expect_cs(0x041Du, BT_HCI_ERR_UNKNOWN_CONN, "LC command for the dead handle: CS 0x02, not forwarded");
+    CHECK(fake_rom.n_cmds == cmds0 && stats().cmd_dead_handle == 1u, "dead-handle command never reached the ROM");
+
+    /* (5) re-connect with the stored key, the phone authenticates and encrypts */
+    fake_rom.auto_ack_acl = true;
+    phone_connects();
+    fake_peer_authenticate();
+    pump();
+    expect_addr_evt(0x17, "Link Key Request on re-connect");
+    cmd_addr(0x040Bu, first_key, 16);                    /* Bluedroid's stored key (btm_sec.c:5082) */
+    expect_cc_addr(0x040Bu, 0, "040B CC (E06A)");
+    uint8_t on = 1;
+    expect_s_h(0x08, 0, 0x80, &on, 1, "Encryption Change after re-auth with the stored key");
+    CHECK(fake_peer.auth_ok == 2u && fake_peer.pairings == 1u && memcmp(fake_peer.host_key, first_key, 16) == 0,
+          "re-connect authenticated with the stored key, no new pairing");
+
+    /* (6) we authenticate (0411) and encrypt (0413) with the stored key */
+    cmd_h(0x0411u, 0x80, NULL, 0);
+    expect_cs(0x0411u, 0, "0411 CS");
+    expect_addr_evt(0x17, "Link Key Request after 0411");
+    cmd_addr(0x040Bu, first_key, 16);
+    expect_cc_addr(0x040Bu, 0, "040B CC");
+    expect_s_h(0x06, 0, 0x80, NULL, 0, "Authentication Complete (E459 -> 0x06)");
+    cmd_h(0x0413u, 0x80, &on, 1);
+    expect_cs(0x0413u, 0, "0413 CS (E43F)");
+    expect_s_h(0x08, 0, 0x80, &on, 1, "Encryption Change (E45A) after 0413");
+
+    /* (7) the phone forgot us: we initiate, fresh numeric comparison, accepted */
+    fake_peer_disconnect(0x13);
+    pump();
+    uint8_t r13 = 0x13;
+    expect_s_h(0x05, 0, 0x80, &r13, 1, "remote Disconnection Complete");
+    phone_connects();
+    fake_peer.has_key = false;
+    we_pair_phone();
+    cmd_addr(0x042Cu, NULL, 0);
+    expect_cc_addr(0x042Cu, 0, "042C CC");
+    uint8_t spc[10] = { 4, 0x36, 7, 0x00, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56 };
+    expect_pkt(spc, 10, "Simple Pairing Complete");
+    const pkt_t *lk = next_pkt();
+    CHECK(is_evt(lk, 0x18) && lk->len == 26u, "Link Key Notification");
+    expect_s_h(0x06, 0, 0x80, NULL, 0, "Authentication Complete after initiator pairing");
+
+    /* (8) initiator pairing refused locally: user rejects (042D), then IO capability refused (0434) */
+    fake_peer.has_key = false;
+    we_pair_phone();
+    cmd_addr(0x042Du, NULL, 0);
+    expect_cc_addr(0x042Du, 0, "042D CC (E071)");
+    uint8_t spf[10] = { 4, 0x36, 7, 0x05, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56 };
+    expect_pkt(spf, 10, "Simple Pairing Complete, authentication failure");
+    expect_s_h(0x06, 0x05, 0x80, NULL, 0, "Authentication Complete 0x05");
+    cmd_h(0x0411u, 0x80, NULL, 0);
+    expect_cs(0x0411u, 0, "0411 CS");
+    expect_addr_evt(0x17, "Link Key Request");
+    cmd_addr(0x040Cu, NULL, 0);
+    expect_cc_addr(0x040Cu, 0, "040C CC");
+    expect_addr_evt(0x31, "IO Capability Request");
+    uint8_t rej = 0x18;                                  /* Pairing Not Allowed (plan M4: outside the pairing window) */
+    cmd_addr(0x0434u, &rej, 1);
+    expect_cc_addr(0x0434u, 0, "0434 CC (E076)");
+    uint8_t sp18[10] = { 4, 0x36, 7, 0x18, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56 };
+    expect_pkt(sp18, 10, "Simple Pairing Complete 0x18");
+    expect_s_h(0x06, 0x18, 0x80, NULL, 0, "Authentication Complete 0x18");
+
+    /* (9) name request for an absent device and RNR cancel */
+    uint8_t absent[10] = { 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x01, 0, 0, 0 };
+    send_cmd(0x0419u, absent, 10);
+    pump();
+    expect_cs(0x0419u, 0, "0419 CS for an absent device");
+    const pkt_t *rn = next_pkt();
+    CHECK(is_evt(rn, 0x07) && rn->len == 258u && rn->d[3] == 0x04 && memcmp(&rn->d[4], absent, 6) == 0,
+          "RNR complete with page timeout");
+    cmd_addr(0x041Au, NULL, 0);
+    expect_cc_addr(0x041Au, 0x12, "041A CC (E06E) with no RNR running");
+
+    /* (10) the phone hangs up */
+    fake_peer_disconnect(0x13);
+    pump();
+    expect_s_h(0x05, 0, 0x80, &r13, 1, "remote Disconnection Complete");
+    bt_ctrl_stats_t s = stats();
+    CHECK(s.rom_unknown_ids == 0u && s.rom_short == 0u && s.evt_unsolicited_reply == 0u && s.cmd_unknown == 0u &&
+          s.invariant == 0u && t_faults == 0u, "phone path: no unknown/short ROM message, no unsolicited reply, no fault");
+    CHECK(pending_pkts() == 0u, "phone path: every packet accounted for");
+    CHECK(fake_rom.errors == 0u, "fake ROM: %s", fake_rom.first_error);
+    fake_peer_init(NULL);
+    shutdown_and_check();
+
+    /* (11) a phone that rejects the connection attempt by the host is not on this path; 040A after a Connection
+     * Request (legacy bt_hci.c:1585-1590) -> CS + Connection Complete with the reject reason */
+    setup();
+    bring_up();
+    fake_peer_init(&c);
+    CHECK(fake_peer_page(1) == 0, "page");
+    pump();
+    t_rx_rd = t_rx_n;
+    uint8_t lim = 0x0D;
+    cmd_addr(0x040Au, &lim, 1);
+    expect_cs(0x040Au, 0, "040A CS (E0CA)");
+    uint8_t ccr[14] = { 4, 0x03, 11, 0x0D, 0x00, 0x00, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x01, 0x00 };
+    expect_pkt(ccr, 14, "Connection Complete 0x0D (E0D2 -> 0x03)");
+    fake_peer_init(NULL);
+    shutdown_and_check();
+}
+
+/* Forwarded-command deadline: a class-O command the ROM consumes silently is answered 0x22 at 7 s (before
+ * Bluedroid's 8 s timeout); the late ROM reply is consumed; class-M commands are never answered by the deadline. */
+static uint32_t t_now_ms;
+static uint32_t clk(void) { return t_now_ms; }
+
+static void test_fwd_deadline(void)
+{
+    setup();
+    bt_ctrl_set_clock(clk);
+    t_now_ms = 0xFFFFF000u;                              /* wraps during the test */
+    bring_up();
+    link_up(0);
+    fake_rom.hold_replies = true;                        /* LC consumes it: no reply for now */
+    uint8_t h[2] = { 0x80, 0x00 };
+    send_cmd(0x041Du, h, 2);
+    pump();
+    t_now_ms += BT_CTRL_FWD_DEADLINE_MS - 1u;
+    pump();
+    CHECK(dbg().fwd_pending == 1u && pending_pkts() == 0u, "still waiting at deadline - 1 ms");
+    t_now_ms += 1u;
+    pump();
+    const pkt_t *p = next_pkt();
+    CHECK(is_reply(p, 0x041Du) && p->d[1] == BT_HCI_EVT_CS && status_of(p) == BT_HCI_ERR_LMP_TIMEOUT,
+          "CS 0x22 at the deadline");
+    CHECK(dbg().fwd_pending == 0u && dbg().rom_cmd_credits == 1u && dbg().evt_resv == 0u && stats().fwd_deadline == 1u,
+          "window released");
+    uint8_t one = 1;
+    send_cmd(0x0C1Au, &one, 1);                          /* the next command is not wedged (its reply is held too) */
+    pump();
+    fake_rom.hold_replies = false;
+    fake_rom_release_held();                             /* late 041D CS, then 0C1A CC */
+    pump();
+    uint32_t r41d = 0, r1a = 0;
+    while ((p = next_pkt()) != NULL) { r41d += is_reply(p, 0x041Du); r1a += is_reply(p, 0x0C1Au); }
+    CHECK(r41d == 0u && r1a == 1u && stats().fwd_late_reply == 1u && stats().evt_unsolicited_reply == 0u,
+          "late ROM reply consumed once, 0C1A answered");
+    /* class M (0C1A is M) is never answered by the deadline */
+    fake_rom.hold_replies = true;
+    send_cmd(0x0C1Au, &one, 1);
+    pump();
+    t_now_ms += 3u * BT_CTRL_FWD_DEADLINE_MS;
+    pump();
+    CHECK(dbg().fwd_pending == 1u && pending_pkts() == 0u && stats().fwd_deadline == 1u, "class M keeps waiting");
+    fake_rom.hold_replies = false;
+    fake_rom_release_held();
+    pump();
+    p = next_pkt();
+    CHECK(is_reply(p, 0x0C1Au) && status_of(p) == 0u, "class M reply delivered");
+    shutdown_and_check();
+}
+
 /* ------------------------------------------------------------------------------------------------------------- */
 /* 12. fuzzing                                                                                                    */
 /* ------------------------------------------------------------------------------------------------------------- */
@@ -1693,7 +2275,10 @@ static void check_invariants(void)
 
 static const uint16_t k_rom_ids[] = { 0xE0D2, 0xE456, 0xE457, 0xE458, 0xE459, 0xE45A, 0xE45D, 0xE45E, 0xE462, 0xE464,
                                       0xE465, 0xE466, 0xE468, 0xE472, 0xE473, 0xE474, 0xE477, 0xE478, 0xE079, 0xE0C9,
-                                      0xE43A, 0xE06A, 0x1234, 0xE47D };
+                                      0xE43A, 0xE06A, 0x1234, 0xE47D, 0xE0D0, 0xE0D1, 0xE0D3, 0xE0D4, 0xE45B, 0xE45C,
+                                      0xE45F, 0xE460, 0xE461, 0xE463, 0xE467, 0xE469, 0xE46A, 0xE46B, 0xE46C, 0xE46D,
+                                      0xE471, 0xE475, 0xE476, 0xE479, 0xE47A, 0xE47B, 0xE47C, 0xE42E, 0xE431, 0xE06E,
+                                      0xE076, 0xE0CB, 0xE441, 0xE443, 0xE0D6, 0xE46E };
 
 static void return_all_c2h(void)
 {
@@ -1863,6 +2448,9 @@ int main(void)
         { "reset_drops_queued_tx", test_reset_drops_queued_tx },
         { "handle_errors", test_handle_errors },
         { "c2h_fc_off", test_c2h_fc_off },
+        { "event_packers", test_event_packers },
+        { "phone_path", test_phone_path },
+        { "fwd_deadline", test_fwd_deadline },
         { "fuzz_rx", test_fuzz_rx },
         { "fuzz_tx", test_fuzz_tx },
     };

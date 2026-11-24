@@ -1,0 +1,260 @@
+diff --git a/open_fw/third_party/bluedroid/host/bluedroid/bta/include/bta/bta_sys.h b/open_fw/third_party/bluedroid/host/bluedroid/bta/include/bta/bta_sys.h
+index 5db6234..2b46d97 100644
+--- a/open_fw/third_party/bluedroid/host/bluedroid/bta/include/bta/bta_sys.h
++++ b/open_fw/third_party/bluedroid/host/bluedroid/bta/include/bta/bta_sys.h
+@@ -234,6 +234,8 @@ extern void bta_sys_hw_register( tBTA_SYS_HW_MODULE module, tBTA_SYS_HW_CBACK *c
+ #if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+ /* open_fw patch 0014: run a BTA SYS hardware event synchronously (BTU task only) when its message cannot be allocated */
+ extern void bta_sys_hw_execute_local(UINT16 event, tBTA_SYS_HW_MODULE hw_module);
++/* open_fw patch 0022: bta_sys_init() allocated its alarm lock and hash map */
++extern BOOLEAN bta_sys_init_ok(void);
+ #endif
+ extern void bta_sys_hw_unregister( tBTA_SYS_HW_MODULE module );
+ 
+diff --git a/open_fw/third_party/bluedroid/host/bluedroid/bta/sys/bta_sys_main.c b/open_fw/third_party/bluedroid/host/bluedroid/bta/sys/bta_sys_main.c
+index d107e27..d21b9d2 100644
+--- a/open_fw/third_party/bluedroid/host/bluedroid/bta/sys/bta_sys_main.c
++++ b/open_fw/third_party/bluedroid/host/bluedroid/bta/sys/bta_sys_main.c
+@@ -194,6 +194,15 @@ void bta_sys_init(void)
+ 
+ }
+ 
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++/* open_fw patch 0022: bta_sys_init() is void and ignores a failed lock / alarm hash map (the first BTA timer then
++ * locks a NULL mutex or asserts in hash_map_has_key()); btu_task_start_up() checks this and fails the init. */
++BOOLEAN bta_sys_init_ok(void)
++{
++    return bta_alarm_lock != NULL && bta_alarm_hash_map != NULL;
++}
++#endif
++
+ void bta_sys_free(void)
+ {
+     hash_map_free(bta_alarm_hash_map);
+diff --git a/open_fw/third_party/bluedroid/host/bluedroid/stack/btm/btm_dev.c b/open_fw/third_party/bluedroid/host/bluedroid/stack/btm/btm_dev.c
+index 27c23a4..0a00e76 100644
+--- a/open_fw/third_party/bluedroid/host/bluedroid/stack/btm/btm_dev.c
++++ b/open_fw/third_party/bluedroid/host/bluedroid/stack/btm/btm_dev.c
+@@ -806,7 +806,9 @@ BOOLEAN btm_set_bond_type_dev(BD_ADDR bd_addr, tBTM_BOND_TYPE bond_type)
+ void btm_sec_dev_init(void)
+ {
+     btm_cb.p_sec_dev_rec_list = list_new(osi_free_func);
++#if !(defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID) /* open_fw patch 0022: checked by btu_init_core_ok() */
+     assert(btm_cb.p_sec_dev_rec_list != NULL);
++#endif
+ }
+ 
+ /*******************************************************************************
+diff --git a/open_fw/third_party/bluedroid/host/bluedroid/stack/btm/btm_main.c b/open_fw/third_party/bluedroid/host/bluedroid/stack/btm/btm_main.c
+index 9fabc52..6ff5cc1 100644
+--- a/open_fw/third_party/bluedroid/host/bluedroid/stack/btm/btm_main.c
++++ b/open_fw/third_party/bluedroid/host/bluedroid/stack/btm/btm_main.c
+@@ -68,11 +68,15 @@ void btm_init (void)
+     memset(&btm_cb, 0, sizeof(tBTM_CB));
+ #if (CLASSIC_BT_INCLUDED == TRUE)
+     btm_cb.page_queue = fixed_queue_new(QUEUE_SIZE_MAX);
++#if !(defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID) /* open_fw patch 0022: checked by btu_init_core_ok() */
+     assert(btm_cb.page_queue != NULL);
++#endif
+ #endif // #if (CLASSIC_BT_INCLUDED == TRUE)
+ #if (SMP_INCLUDED == TRUE)
+     btm_cb.sec_pending_q = fixed_queue_new(QUEUE_SIZE_MAX);
++#if !(defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID) /* open_fw patch 0022: checked by btu_init_core_ok() */
+     assert(btm_cb.sec_pending_q != NULL);
++#endif
+ #endif // (SMP_INCLUDED == TRUE)
+ #if defined(BTM_INITIAL_TRACE_LEVEL)
+     btm_cb.trace_level = BTM_INITIAL_TRACE_LEVEL;
+diff --git a/open_fw/third_party/bluedroid/host/bluedroid/stack/btu/btu_init.c b/open_fw/third_party/bluedroid/host/bluedroid/stack/btu/btu_init.c
+index 115500b..c419694 100644
+--- a/open_fw/third_party/bluedroid/host/bluedroid/stack/btu/btu_init.c
++++ b/open_fw/third_party/bluedroid/host/bluedroid/stack/btu/btu_init.c
+@@ -114,6 +114,39 @@ void btu_init_core(void)
+ #endif
+ }
+ 
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++/* open_fw patch 0022: btu_init_core() and the component inits it calls return void and (upstream) assert on a failed
++ * allocation, or ignore it and fail much later (l2c_init, sdp_init). With the asserts removed they leave NULL members;
++ * this checks every mandatory one so btu_task_start_up() can fail esp_bluedroid_init() instead. */
++BOOLEAN btu_init_core_ok(void)
++{
++    BOOLEAN ok = TRUE;
++#if (CLASSIC_BT_INCLUDED == TRUE)
++    ok = ok && btm_cb.page_queue != NULL;
++#endif
++#if (SMP_INCLUDED == TRUE)
++    ok = ok && btm_cb.sec_pending_q != NULL;
++#endif
++    ok = ok && btm_cb.p_sec_dev_rec_list != NULL && btm_cb.p_acl_db_list != NULL;
++#if (CLASSIC_BT_INCLUDED == TRUE)
++    ok = ok && btm_cb.p_pm_mode_db_list != NULL;
++#endif
++#if (BTM_SCO_INCLUDED == TRUE) && (BTM_SCO_HCI_INCLUDED == TRUE)
++    for (int i = 0; i < BTM_MAX_SCO_LINKS; i++) {
++        ok = ok && btm_cb.sco_cb.sco_db[i].xmit_data_q != NULL;
++    }
++#endif
++    ok = ok && l2cb.p_ccb_pool != NULL && l2cb.p_lcb_pool != NULL && l2cb.rcv_pending_q != NULL;
++#if (defined(SDP_INCLUDED) && SDP_INCLUDED == TRUE)
++#if SDP_DYNAMIC_MEMORY
++    ok = ok && sdp_cb_ptr != NULL;
++#endif
++    ok = ok && sdp_cb.server_db.p_record_list != NULL;
++#endif
++    return ok;
++}
++#endif
++
+ /*****************************************************************************
+ **
+ ** Function         btu_free_core
+@@ -179,7 +212,13 @@ bool BTU_StartUp(void)
+         goto error_exit;
+     }
+ 
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++    if (osi_mutex_new(&btu_general_alarm_lock) != 0) {
++        goto error_exit; /* open_fw patch 0022: upstream ignores the failure; the first timer locks a NULL mutex */
++    }
++#else
+     osi_mutex_new(&btu_general_alarm_lock);
++#endif
+ 
+     btu_oneshot_alarm_hash_map = hash_map_new(BTU_ONESHOT_ALARM_HASH_MAP_SIZE,
+                                  hash_function_pointer, NULL, (data_free_fn)osi_alarm_free, NULL);
+@@ -187,7 +226,13 @@ bool BTU_StartUp(void)
+         goto error_exit;
+     }
+ 
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++    if (osi_mutex_new(&btu_oneshot_alarm_lock) != 0) {
++        goto error_exit; /* open_fw patch 0022 */
++    }
++#else
+     osi_mutex_new(&btu_oneshot_alarm_lock);
++#endif
+ 
+     btu_l2cap_alarm_hash_map = hash_map_new(BTU_L2CAP_ALARM_HASH_MAP_SIZE,
+                                             hash_function_pointer, NULL, (data_free_fn)osi_alarm_free, NULL);
+@@ -195,7 +240,13 @@ bool BTU_StartUp(void)
+         goto error_exit;
+     }
+ 
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++    if (osi_mutex_new(&btu_l2cap_alarm_lock) != 0) {
++        goto error_exit; /* open_fw patch 0022 */
++    }
++#else
+     osi_mutex_new(&btu_l2cap_alarm_lock);
++#endif
+ 
+     const size_t workqueue_len[] = {BTU_TASK_WORKQUEUE0_LEN};
+ #if (!CONFIG_BT_BLUEDROID_BTU_TASK_STACK_IN_EXT_MEM)
+diff --git a/open_fw/third_party/bluedroid/host/bluedroid/stack/btu/btu_task.c b/open_fw/third_party/bluedroid/host/bluedroid/stack/btu/btu_task.c
+index 39aa0ab..7530665 100644
+--- a/open_fw/third_party/bluedroid/host/bluedroid/stack/btu/btu_task.c
++++ b/open_fw/third_party/bluedroid/host/bluedroid/stack/btu/btu_task.c
+@@ -540,13 +540,31 @@ void btu_c2h_credit_pause_if_congested(void)
+ }
+ #endif
+ 
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++/* open_fw patch 0022: BTU_ShutDown() runs btu_task_shut_down() also when BTU_StartUp() failed before the start-up
++ * message ran (upstream then frees never-initialised core control blocks: l2c_free() asserts on a NULL list). */
++static bool btu_core_started;
++#endif
++
+ void btu_task_start_up(void *param)
+ {
+     UNUSED(param);
+     /* Initialize the mandatory core stack control blocks
+        (BTU, BTM, L2CAP, and SDP)
+      */
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++    btu_core_started = true;
++    btu_init_core();
++    if (!btu_init_core_ok()) {
++        HCI_TRACE_ERROR("btu_init_core failed (no memory)");
++        if (bluedroid_init_done_cb) {
++            bluedroid_init_done_cb(BT_STATUS_NOMEM); /* esp_bluedroid_init() fails; partial-init cleanup frees */
++        }
++        return;
++    }
++#else
+     btu_init_core();
++#endif
+ 
+     /* Initialize any optional stack components */
+     if (BTE_InitStack() != BT_STATUS_SUCCESS) {
+@@ -559,6 +577,15 @@ void btu_task_start_up(void *param)
+ 
+ #if (defined(BTA_INCLUDED) && BTA_INCLUDED == TRUE)
+     bta_sys_init();
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++    if (!bta_sys_init_ok()) {
++        HCI_TRACE_ERROR("bta_sys_init failed (no memory)");
++        if (bluedroid_init_done_cb) {
++            bluedroid_init_done_cb(BT_STATUS_NOMEM); /* open_fw patch 0022 */
++        }
++        return;
++    }
++#endif
+ #endif
+ 
+     // Inform the bt jni thread initialization is ok.
+@@ -570,6 +597,12 @@ void btu_task_start_up(void *param)
+ 
+ void btu_task_shut_down(void)
+ {
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++    if (!btu_core_started) {
++        return; /* open_fw patch 0022: nothing of the core stack was initialised */
++    }
++    btu_core_started = false;
++#endif
+ #if (defined(BTA_INCLUDED) && BTA_INCLUDED == TRUE)
+     bta_sys_free();
+ #endif
+diff --git a/open_fw/third_party/bluedroid/host/bluedroid/stack/include/stack/btu.h b/open_fw/third_party/bluedroid/host/bluedroid/stack/include/stack/btu.h
+index a133b0e..9ea26b3 100644
+--- a/open_fw/third_party/bluedroid/host/bluedroid/stack/include/stack/btu.h
++++ b/open_fw/third_party/bluedroid/host/bluedroid/stack/include/stack/btu.h
+@@ -308,6 +308,9 @@ void  btu_hcif_cmd_timeout (UINT8 controller_id);
+ */
+ void  btu_init_core(void);
+ void  btu_free_core(void);
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++BOOLEAN btu_init_core_ok(void); /* open_fw patch 0022: every mandatory control-block allocation of btu_init_core() worked */
++#endif
+ 
+ bool BTU_StartUp(void);
+ void BTU_ShutDown(void);
+diff --git a/open_fw/third_party/bluedroid/host/bluedroid/stack/l2cap/l2c_main.c b/open_fw/third_party/bluedroid/host/bluedroid/stack/l2cap/l2c_main.c
+index 9dd52ee..7f867bc 100644
+--- a/open_fw/third_party/bluedroid/host/bluedroid/stack/l2cap/l2c_main.c
++++ b/open_fw/third_party/bluedroid/host/bluedroid/stack/l2cap/l2c_main.c
+@@ -1280,6 +1280,11 @@ void l2c_free_p_lcb_pool(void)
+ {
+     list_node_t *p_node = NULL;
+     tL2C_LCB    *p_lcb  = NULL;
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++    if (l2cb.p_lcb_pool == NULL) {
++        return; /* open_fw patch 0022: l2c_init() could not allocate it (start-up failed) */
++    }
++#endif
+     for (p_node = list_begin(l2cb.p_lcb_pool); p_node; p_node = list_next(p_node)) {
+         p_lcb = list_node(p_node);
+         if (p_lcb) {
+@@ -1294,6 +1299,11 @@ void l2c_free_p_ccb_pool(void)
+ {
+     list_node_t *p_node = NULL;
+     tL2C_CCB    *p_ccb  = NULL;
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++    if (l2cb.p_ccb_pool == NULL) {
++        return; /* open_fw patch 0022 */
++    }
++#endif
+     for (p_node = list_begin(l2cb.p_ccb_pool); p_node; p_node = list_next(p_node)) {
+         p_ccb = list_node(p_node);
+         if (p_ccb) {

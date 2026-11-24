@@ -29,16 +29,26 @@ void *__real_calloc(size_t n, size_t m);
 void *__real_realloc(void *p, size_t n);
 void __real_free(void *p);
 
-#define HDR 16u
+#define HDR 96u
+#define BT_FRAMES 6
 #define MAGIC_LIVE 0xB7A110C8u
 #define MAGIC_DEAD 0xDEADF4EEu
 
-typedef struct {
+/* Live blocks are linked (under the allocator lock) with their allocation sequence number and return address, so a
+ * baseline failure can name what leaked (bth_heap_dump_since()). */
+typedef struct hdr_s {
     size_t size;
     uint32_t magic;
-    uint32_t pad;
+    uint32_t seq;
+    void *ra;
+    struct hdr_s *prev, *next;
+    uint64_t pad;
+    void *bt[BT_FRAMES];         /* allocation call stack, only with BTH_HEAP_TRACE set (backtrace() is slow) */
 } hdr_t;
 _Static_assert(sizeof(hdr_t) == HDR, "header must keep 16-byte alignment");
+static hdr_t *s_live;
+static uint32_t s_seq;
+static int s_trace = -1;
 
 static bth_heap_stats_t s_st;
 static uint64_t s_fail_at;
@@ -68,11 +78,30 @@ static bool inject(void *ra)
     return false;
 }
 
-static void *track(void *raw, size_t n)
+static void *track(void *raw, size_t n, void *ra)
 {
     hdr_t *h = (hdr_t *)raw;
     h->size = n;
     h->magic = MAGIC_LIVE;
+    h->seq = ++s_seq;
+    h->ra = ra;
+    memset(h->bt, 0, sizeof(h->bt));
+    if (s_trace < 0) {
+        s_trace = getenv("BTH_HEAP_TRACE") != NULL;
+    }
+    if (s_trace) {
+        void *f[BT_FRAMES + 3];
+        int k = backtrace(f, BT_FRAMES + 3);
+        for (int i = 3; i < k; i++) {
+            h->bt[i - 3] = f[i];
+        }
+    }
+    h->prev = NULL;
+    h->next = s_live;
+    if (s_live != NULL) {
+        s_live->prev = h;
+    }
+    s_live = h;
     s_st.live_bytes += n;
     s_st.live_blocks++;
     s_st.allocs++;
@@ -90,6 +119,14 @@ static hdr_t *untrack(void *p)
         abort();
     }
     h->magic = MAGIC_DEAD;
+    if (h->prev != NULL) {
+        h->prev->next = h->next;
+    } else {
+        s_live = h->next;
+    }
+    if (h->next != NULL) {
+        h->next->prev = h->prev;
+    }
     s_st.live_bytes -= h->size;
     s_st.live_blocks--;
     return h;
@@ -105,7 +142,7 @@ static void *bth_alloc(size_t n, bool zero, void *ra)
     if (!inject(ra)) {
         void *raw = zero ? __real_calloc(1, HDR + n) : __real_malloc(HDR + n);
         if (raw != NULL) {
-            r = track(raw, n);
+            r = track(raw, n, ra);
         }
     }
     unlock();
@@ -241,4 +278,29 @@ void bth_log(const char *fmt, ...)
     fflush(stdout);
     unlock();
     va_end(ap);
+}
+
+uint32_t bth_heap_seq(void)
+{
+    lock();
+    uint32_t v = s_seq;
+    unlock();
+    return v;
+}
+
+/* Print the live blocks allocated after sequence number `seq` (leak report; BTH_HEAP_TRACE=1 adds call stacks,
+ * symbolise with addr2line -f -e test_bt_host). Not under the allocator lock while printing: call when quiescent. */
+void bth_heap_dump_since(uint32_t seq)
+{
+    int n = 0;
+    for (hdr_t *h = s_live; h != NULL && n < 64; h = h->next) {
+        if (h->seq > seq) {
+            fprintf(stderr, "  live block seq %u size %zu ra %p bt", h->seq, h->size, h->ra);
+            for (int i = 0; i < BT_FRAMES && h->bt[i] != NULL; i++) {
+                fprintf(stderr, " %p", h->bt[i]);
+            }
+            fprintf(stderr, "\n");
+            n++;
+        }
+    }
 }

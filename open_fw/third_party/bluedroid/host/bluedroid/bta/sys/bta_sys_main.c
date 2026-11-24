@@ -44,6 +44,10 @@
 #include "bta/utl.h"
 #include "osi/allocator.h"
 #include "osi/mutex.h"
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+#include "freertos/FreeRTOS.h" /* open_fw patch 0019: vTaskDelay */
+#include "freertos/task.h"
+#endif
 
 
 /* system manager control block definition */
@@ -190,6 +194,15 @@ void bta_sys_init(void)
 
 }
 
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+/* open_fw patch 0022: bta_sys_init() is void and ignores a failed lock / alarm hash map (the first BTA timer then
+ * locks a NULL mutex or asserts in hash_map_has_key()); btu_task_start_up() checks this and fails the init. */
+BOOLEAN bta_sys_init_ok(void)
+{
+    return bta_alarm_lock != NULL && bta_alarm_hash_map != NULL;
+}
+#endif
+
 void bta_sys_free(void)
 {
     hash_map_free(bta_alarm_hash_map);
@@ -253,6 +266,25 @@ BOOLEAN bta_sys_sm_execute(BT_HDR *p_msg)
 }
 
 
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+/* open_fw patch 0014: BTA SYS posts some of its hardware state-machine events to itself (BTA_SYS_EVT_ENABLED_EVT,
+ * BTA_SYS_EVT_STACK_ENABLED_EVT / BTA_SYS_ERROR_EVT from BTM, BTA_SYS_EVT_DISABLED_EVT) and upstream silently drops
+ * the event when the message cannot be allocated, so enable or disable never completes. All of these are posted from
+ * the BTU task to the BTU task (bta_sys actions, BTM device-status callbacks), so on allocation failure the event is
+ * executed right here from a stack copy, through the same state table. bta_sys_sm_execute() never frees, and nesting
+ * is safe: every caller is the last action of its row (the outer bta_sys_sm_execute() then reads BTA_SYS_IGNORE). */
+void bta_sys_hw_execute_local(UINT16 event, tBTA_SYS_HW_MODULE hw_module)
+{
+    tBTA_SYS_HW_MSG msg;
+
+    APPL_TRACE_WARNING("%s: no memory for event 0x%x, executing it synchronously", __func__, event);
+    memset(&msg, 0, sizeof(msg));
+    msg.hdr.event = event;
+    msg.hw_module = hw_module;
+    bta_sys_sm_execute(&msg.hdr);
+}
+#endif
+
 void bta_sys_hw_register( tBTA_SYS_HW_MODULE module, tBTA_SYS_HW_CBACK *cback)
 {
     bta_sys_cb.sys_hw_cback[module] = cback;
@@ -298,6 +330,13 @@ void bta_sys_hw_btm_cback( tBTM_DEV_STATUS status )
         }
     } else {
         APPL_TRACE_DEBUG("ERROR bta_sys_hw_btm_cback couldn't send msg" );
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+        if (status == BTM_DEV_STATUS_UP) {
+            bta_sys_hw_execute_local(BTA_SYS_EVT_STACK_ENABLED_EVT, BTA_SYS_HW_BLUETOOTH); /* open_fw patch 0014 */
+        } else if (status == BTM_DEV_STATUS_DOWN) {
+            bta_sys_hw_execute_local(BTA_SYS_ERROR_EVT, BTA_SYS_HW_BLUETOOTH); /* open_fw patch 0014 */
+        }
+#endif
     }
 }
 
@@ -363,6 +402,11 @@ void bta_sys_hw_api_enable( tBTA_SYS_HW_MSG *p_sys_hw_msg )
 
             bta_sys_sendmsg(p_msg);
         }
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+        else {
+            bta_sys_hw_execute_local(BTA_SYS_EVT_ENABLED_EVT, p_sys_hw_msg->hw_module); /* open_fw patch 0014 */
+        }
+#endif
     } else {
         /* register which HW module was turned on */
         bta_sys_cb.sys_hw_module_active |=  ((UINT32)1 << p_sys_hw_msg->hw_module );
@@ -418,6 +462,11 @@ void bta_sys_hw_api_disable(tBTA_SYS_HW_MSG *p_sys_hw_msg)
 
             bta_sys_sendmsg(p_msg);
         }
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+        else {
+            bta_sys_hw_execute_local(BTA_SYS_EVT_DISABLED_EVT, p_sys_hw_msg->hw_module); /* open_fw patch 0014 */
+        }
+#endif
     }
 
 }
@@ -615,6 +664,63 @@ void bta_alarm_cb(void *data)
     btu_task_post(SIG_BTU_BTA_ALARM, p_tle, OSI_THREAD_MAX_TIMEOUT);
 }
 
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+/* open_fw patch 0019: the first start of a TIMER_LIST_ENT allocates its osi alarm and a hash-map entry; upstream logs
+ * a failure and returns, so the timer silently never fires (e.g. BTA DM's disable timer: disable never completes).
+ * The function is void and has dozens of callers, so the start is retried a bounded number of times, 1 tick apart,
+ * outside bta_alarm_lock (same policy as patch 0016). bta_sys_start_timer_once() is the upstream body returning
+ * whether the alarm is armed. */
+#ifndef OPENFW_BTA_TIMER_RETRIES
+#define OPENFW_BTA_TIMER_RETRIES 8
+#endif
+static BOOLEAN bta_sys_start_timer_once(TIMER_LIST_ENT *p_tle, UINT16 type, INT32 timeout_ms)
+{
+    osi_alarm_t *alarm = NULL;
+
+    assert(p_tle != NULL);
+
+    // Get the alarm for this p_tle.
+    osi_mutex_lock(&bta_alarm_lock, OSI_MUTEX_MAX_TIMEOUT);
+    if (!hash_map_has_key(bta_alarm_hash_map, p_tle)) {
+        alarm = osi_alarm_new("bta_sys", bta_alarm_cb, p_tle, 0);
+        if (alarm == NULL) {
+            APPL_TRACE_ERROR("%s unable to create new alarm.", __func__);
+            osi_mutex_unlock(&bta_alarm_lock);
+            return FALSE;
+        }
+        if (!hash_map_set(bta_alarm_hash_map, p_tle, alarm)) {
+            APPL_TRACE_ERROR("%s unable to set alarm in map.", __func__);
+            osi_alarm_free(alarm);
+            osi_mutex_unlock(&bta_alarm_lock);
+            return FALSE;
+        }
+    }
+
+    alarm = hash_map_get(bta_alarm_hash_map, p_tle);
+    if (alarm == NULL) {
+        APPL_TRACE_ERROR("%s unable to create alarm.", __func__);
+        osi_mutex_unlock(&bta_alarm_lock);
+        return FALSE;
+    }
+
+    p_tle->event = type;
+    p_tle->ticks = timeout_ms;
+    osi_alarm_set(alarm, (period_ms_t)timeout_ms);
+    osi_mutex_unlock(&bta_alarm_lock);
+    return TRUE;
+}
+
+void bta_sys_start_timer(TIMER_LIST_ENT *p_tle, UINT16 type, INT32 timeout_ms)
+{
+    for (int i = 0; !bta_sys_start_timer_once(p_tle, type, timeout_ms); i++) {
+        if (i == OPENFW_BTA_TIMER_RETRIES) {
+            APPL_TRACE_ERROR("%s: timer %p not started (no memory)", __func__, (void *)p_tle);
+            return;
+        }
+        vTaskDelay(1);
+    }
+}
+#else
 void bta_sys_start_timer(TIMER_LIST_ENT *p_tle, UINT16 type, INT32 timeout_ms)
 {
     osi_alarm_t *alarm = NULL;
@@ -651,6 +757,7 @@ void bta_sys_start_timer(TIMER_LIST_ENT *p_tle, UINT16 type, INT32 timeout_ms)
     osi_alarm_set(alarm, (period_ms_t)timeout_ms);
     osi_mutex_unlock(&bta_alarm_lock);
 }
+#endif
 
 bool hash_iter_ro_cb(hash_map_entry_t *hash_map_entry, void *context)
 {

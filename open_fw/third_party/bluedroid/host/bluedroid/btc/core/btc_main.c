@@ -94,6 +94,38 @@ void btc_cleanup_partial_init(void)
 
 static void btc_init_bluetooth(void)
 {
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+    /* open_fw patch 0023: the alarm mutex and the config are checked, and the config is loaded BEFORE the BTE boot:
+     * after bte_main_boot_entry() the BTU task may already have completed the init future (btc_init_callback), so a
+     * later failure could no longer be reported. Every failure here completes the future with FUTURE_FAIL and leaves
+     * only what esp_bluedroid_init()'s btc_cleanup_partial_init() (non-clean branch) releases. */
+    if (osi_alarm_create_mux() != 0) {
+        future_ready(*btc_main_get_future_p(BTC_MAIN_INIT_FUTURE), FUTURE_FAIL);
+        return;
+    }
+    osi_alarm_init();
+#if (SMP_INCLUDED)
+    if (!btc_config_init()) {   /* cleans up after itself on failure */
+        future_ready(*btc_main_get_future_p(BTC_MAIN_INIT_FUTURE), FUTURE_FAIL);
+        return;
+    }
+#endif
+    s_init_done_sem = xSemaphoreCreateBinary();
+    if ((s_init_done_sem == NULL) || (bte_main_boot_entry(btc_init_callback) != 0)) {
+#if (SMP_INCLUDED)
+        btc_config_clean_up();
+#endif
+        future_ready(*btc_main_get_future_p(BTC_MAIN_INIT_FUTURE), FUTURE_FAIL);
+        return;
+    }
+#if (SMP_INCLUDED)
+#if (BLE_INCLUDED == TRUE)
+    //load the ble local key which has been stored in the flash
+    btc_dm_load_ble_local_keys();
+    bta_dm_co_security_param_init();
+#endif  ///BLE_INCLUDED == TRUE
+#endif /* #if (SMP_INCLUDED) */
+#else
     osi_alarm_create_mux();
     osi_alarm_init();
     s_init_done_sem = xSemaphoreCreateBinary();
@@ -110,6 +142,7 @@ static void btc_init_bluetooth(void)
     bta_dm_co_security_param_init();
 #endif  ///BLE_INCLUDED == TRUE
 #endif /* #if (SMP_INCLUDED) */
+#endif /* open_fw patch 0023 */
 #if BTA_DYNAMIC_MEMORY
     deinit_semaphore = xSemaphoreCreateBinary();
 #endif /* #if BTA_DYNAMIC_MEMORY */

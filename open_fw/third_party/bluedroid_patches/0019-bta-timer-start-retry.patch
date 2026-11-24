@@ -1,0 +1,87 @@
+diff --git a/open_fw/third_party/bluedroid/host/bluedroid/bta/sys/bta_sys_main.c b/open_fw/third_party/bluedroid/host/bluedroid/bta/sys/bta_sys_main.c
+index 211af87..d107e27 100644
+--- a/open_fw/third_party/bluedroid/host/bluedroid/bta/sys/bta_sys_main.c
++++ b/open_fw/third_party/bluedroid/host/bluedroid/bta/sys/bta_sys_main.c
+@@ -44,6 +44,10 @@
+ #include "bta/utl.h"
+ #include "osi/allocator.h"
+ #include "osi/mutex.h"
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++#include "freertos/FreeRTOS.h" /* open_fw patch 0019: vTaskDelay */
++#include "freertos/task.h"
++#endif
+ 
+ 
+ /* system manager control block definition */
+@@ -651,6 +655,63 @@ void bta_alarm_cb(void *data)
+     btu_task_post(SIG_BTU_BTA_ALARM, p_tle, OSI_THREAD_MAX_TIMEOUT);
+ }
+ 
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++/* open_fw patch 0019: the first start of a TIMER_LIST_ENT allocates its osi alarm and a hash-map entry; upstream logs
++ * a failure and returns, so the timer silently never fires (e.g. BTA DM's disable timer: disable never completes).
++ * The function is void and has dozens of callers, so the start is retried a bounded number of times, 1 tick apart,
++ * outside bta_alarm_lock (same policy as patch 0016). bta_sys_start_timer_once() is the upstream body returning
++ * whether the alarm is armed. */
++#ifndef OPENFW_BTA_TIMER_RETRIES
++#define OPENFW_BTA_TIMER_RETRIES 8
++#endif
++static BOOLEAN bta_sys_start_timer_once(TIMER_LIST_ENT *p_tle, UINT16 type, INT32 timeout_ms)
++{
++    osi_alarm_t *alarm = NULL;
++
++    assert(p_tle != NULL);
++
++    // Get the alarm for this p_tle.
++    osi_mutex_lock(&bta_alarm_lock, OSI_MUTEX_MAX_TIMEOUT);
++    if (!hash_map_has_key(bta_alarm_hash_map, p_tle)) {
++        alarm = osi_alarm_new("bta_sys", bta_alarm_cb, p_tle, 0);
++        if (alarm == NULL) {
++            APPL_TRACE_ERROR("%s unable to create new alarm.", __func__);
++            osi_mutex_unlock(&bta_alarm_lock);
++            return FALSE;
++        }
++        if (!hash_map_set(bta_alarm_hash_map, p_tle, alarm)) {
++            APPL_TRACE_ERROR("%s unable to set alarm in map.", __func__);
++            osi_alarm_free(alarm);
++            osi_mutex_unlock(&bta_alarm_lock);
++            return FALSE;
++        }
++    }
++
++    alarm = hash_map_get(bta_alarm_hash_map, p_tle);
++    if (alarm == NULL) {
++        APPL_TRACE_ERROR("%s unable to create alarm.", __func__);
++        osi_mutex_unlock(&bta_alarm_lock);
++        return FALSE;
++    }
++
++    p_tle->event = type;
++    p_tle->ticks = timeout_ms;
++    osi_alarm_set(alarm, (period_ms_t)timeout_ms);
++    osi_mutex_unlock(&bta_alarm_lock);
++    return TRUE;
++}
++
++void bta_sys_start_timer(TIMER_LIST_ENT *p_tle, UINT16 type, INT32 timeout_ms)
++{
++    for (int i = 0; !bta_sys_start_timer_once(p_tle, type, timeout_ms); i++) {
++        if (i == OPENFW_BTA_TIMER_RETRIES) {
++            APPL_TRACE_ERROR("%s: timer %p not started (no memory)", __func__, (void *)p_tle);
++            return;
++        }
++        vTaskDelay(1);
++    }
++}
++#else
+ void bta_sys_start_timer(TIMER_LIST_ENT *p_tle, UINT16 type, INT32 timeout_ms)
+ {
+     osi_alarm_t *alarm = NULL;
+@@ -687,6 +748,7 @@ void bta_sys_start_timer(TIMER_LIST_ENT *p_tle, UINT16 type, INT32 timeout_ms)
+     osi_alarm_set(alarm, (period_ms_t)timeout_ms);
+     osi_mutex_unlock(&bta_alarm_lock);
+ }
++#endif
+ 
+ bool hash_iter_ro_cb(hash_map_entry_t *hash_map_entry, void *context)
+ {

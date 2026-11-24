@@ -20,7 +20,7 @@
   X(0x0C56u, BTC_M, BTC_FWD,   BTC_FWD,   BTC_CC,     4u, BTC_ECHO_NONE,  0xE04Fu, 0xE0B1u, 17u, 0x40u, BTC_EXP_V_B) \
   X(0x0C01u, BTC_M, BTC_FWD,   BTC_FWD,   BTC_CC,     4u, BTC_ECHO_NONE,  0xE01Cu, 0xE079u,  5u, 0x40u, BTC_EXP_V_B) \
   /* ---- class M: BTM reset / BTA enable / visibility set-up writes ---- */ \
-  X(0x0C18u, BTC_M, BTC_SYN,   BTC_FWD,   BTC_CC,     4u, BTC_ECHO_NONE,  0xE02Au, 0x0000u,  7u, 0x20u, BTC_EXP_G_B) \
+  X(0x0C18u, BTC_M, BTC_SYN,   BTC_FWD,   BTC_CC,     4u, BTC_ECHO_NONE,  0xE02Au, 0xE088u,  7u, 0x20u, BTC_EXP_G_B) \
   X(0x0C24u, BTC_M, BTC_FWD,   BTC_FWD,   BTC_CC,     4u, BTC_ECHO_NONE,  0xE034u, 0xE094u,  9u, 0x02u, BTC_EXP_V_B) \
   X(0x080Fu, BTC_M, BTC_SYN,   BTC_SYN,   BTC_CC,     4u, BTC_ECHO_NONE,  0x0000u, 0x0000u,  5u, 0x10u, BTC_EXP_NONE) \
   X(0x0C14u, BTC_M, BTC_SYN,   BTC_SYN,   BTC_CC,   252u, BTC_ECHO_NONE,  0x0000u, 0x0000u,  7u, 0x02u, BTC_EXP_NONE) \
@@ -28,44 +28,44 @@
   X(0x0C1Au, BTC_M, BTC_FWD,   BTC_FWD,   BTC_CC,     4u, BTC_ECHO_NONE,  0xE02Cu, 0xE08Au,  7u, 0x80u, BTC_EXP_V_B) \
   X(0x0C35u, BTC_M, BTC_LOCAL, BTC_LOCAL, BTC_NONE,   0u, BTC_ECHO_NONE,  0x0000u, 0x0000u, 10u, 0x80u, BTC_EXP_NONE) \
   /* ---- class O: visibility, inquiry, names ---- */ \
-  X(0x0C1Cu, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CC,     4u, BTC_ECHO_NONE,  0xE02Eu, 0x0000u,  8u, 0x02u, BTC_EXP_G_B) \
-  X(0x0C1Eu, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CC,     4u, BTC_ECHO_NONE,  0xE030u, 0x0000u,  8u, 0x08u, BTC_EXP_G_B) \
-  X(0x0C3Au, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CC,     4u, BTC_ECHO_NONE,  0xE042u, 0x0000u, 11u, 0x10u, BTC_EXP_G_B) \
-  X(0x0C52u, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CC,     4u, BTC_ECHO_NONE,  0xE04Du, 0x0000u, 17u, 0x02u, BTC_EXP_G_B) \
-  X(0x0C45u, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CC,     4u, BTC_ECHO_NONE,  0xE047u, 0x0000u, 13u, 0x01u, BTC_EXP_G_C) \
+  X(0x0C1Cu, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CC,     4u, BTC_ECHO_NONE,  0xE02Eu, 0xE08Cu,  8u, 0x02u, BTC_EXP_G_B) \
+  X(0x0C1Eu, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CC,     4u, BTC_ECHO_NONE,  0xE030u, 0xE08Eu,  8u, 0x08u, BTC_EXP_G_B) \
+  X(0x0C3Au, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CC,     4u, BTC_ECHO_NONE,  0xE042u, 0xE0A2u, 11u, 0x10u, BTC_EXP_G_B) \
+  X(0x0C52u, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CC,     4u, BTC_ECHO_NONE,  0xE04Du, 0xE0AFu, 17u, 0x02u, BTC_EXP_G_B) \
+  X(0x0C45u, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CC,     4u, BTC_ECHO_NONE,  0xE047u, 0xE0A9u, 13u, 0x01u, BTC_EXP_G_C) \
   X(0x0C43u, BTC_O, BTC_REJ,   BTC_REJ,   BTC_CC,     4u, BTC_ECHO_NONE,  0x0000u, 0x0000u, 12u, 0x20u, BTC_EXP_NONE) \
   X(0x0C47u, BTC_O, BTC_REJ,   BTC_REJ,   BTC_CC,     4u, BTC_ECHO_NONE,  0x0000u, 0x0000u, 13u, 0x02u, BTC_EXP_NONE) \
   X(0x0C05u, BTC_O, BTC_SYN,   BTC_SYN,   BTC_CC,     4u, BTC_ECHO_NONE,  0x0000u, 0x0000u,  6u, 0x01u, BTC_EXP_NONE) \
-  X(0x0401u, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CS,     4u, BTC_ECHO_NONE,  0xE000u, 0x0000u,  0u, 0x01u, BTC_EXP_G_C) \
-  X(0x0402u, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CC,     4u, BTC_ECHO_NONE,  0x0000u, 0x0000u,  0u, 0x02u, BTC_EXP_G_C) \
+  X(0x0401u, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CS,     4u, BTC_ECHO_NONE,  0xE000u, 0xE0C7u,  0u, 0x01u, BTC_EXP_G_C) \
+  X(0x0402u, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CC,     4u, BTC_ECHO_NONE,  0xE001u, 0xE066u,  0u, 0x02u, BTC_EXP_G_C) \
   X(0x0403u, BTC_O, BTC_REJ,   BTC_REJ,   BTC_CC,     4u, BTC_ECHO_NONE,  0x0000u, 0x0000u,  0u, 0x04u, BTC_EXP_NONE) \
   X(0x0404u, BTC_O, BTC_REJ,   BTC_REJ,   BTC_CC,     4u, BTC_ECHO_NONE,  0x0000u, 0x0000u,  0u, 0x08u, BTC_EXP_NONE) \
-  X(0x0419u, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CS,     4u, BTC_ECHO_NONE,  0xE00Cu, 0x0000u,  2u, 0x08u, BTC_EXP_G_C) \
-  X(0x041Au, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CC,    10u, BTC_ECHO_BDADDR,0xE00Du, 0x0000u,  2u, 0x10u, BTC_EXP_G_C) \
+  X(0x0419u, BTC_O, BTC_FWD,   BTC_FWD,   BTC_CS,     4u, BTC_ECHO_NONE,  0xE00Cu, 0xE0CBu,  2u, 0x08u, BTC_EXP_V_C) \
+  X(0x041Au, BTC_O, BTC_FWD,   BTC_FWD,   BTC_CC,    10u, BTC_ECHO_BDADDR,0xE00Du, 0xE06Eu,  2u, 0x10u, BTC_EXP_V_C) \
   /* ---- class O: connection set-up / teardown ---- */ \
-  X(0x0405u, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CS,     4u, BTC_ECHO_NONE,  0xE004u, 0x0000u,  0u, 0x10u, BTC_EXP_G_C) \
-  X(0x0408u, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CC,    10u, BTC_ECHO_BDADDR,0xE005u, 0x0000u,  0u, 0x80u, BTC_EXP_G_C) \
+  X(0x0405u, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CS,     4u, BTC_ECHO_NONE,  0xE004u, 0xE0C8u,  0u, 0x10u, BTC_EXP_G_C) \
+  X(0x0408u, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CC,    10u, BTC_ECHO_BDADDR,0xE005u, 0xE069u,  0u, 0x80u, BTC_EXP_G_C) \
   X(0x0409u, BTC_O, BTC_FWD,   BTC_FWD,   BTC_CS,     4u, BTC_ECHO_NONE,  0xE006u, 0xE0C9u,  1u, 0x01u, BTC_EXP_V_C) \
   X(0x040Au, BTC_O, BTC_FWD,   BTC_FWD,   BTC_CS,     4u, BTC_ECHO_NONE,  0xE007u, 0xE0CAu,  1u, 0x02u, BTC_EXP_V_C) \
   X(0x0406u, BTC_O, BTC_FWD,   BTC_FWD,   BTC_CS,     4u, BTC_ECHO_NONE,  0xE400u, 0xE43Au,  0u, 0x20u, BTC_EXP_V_C) \
   /* ---- class O: automatic per-connection reads and link settings ---- */ \
-  X(0x041Fu, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CS,     4u, BTC_ECHO_NONE,  0xE408u, 0x0000u,  3u, 0x01u, BTC_EXP_G_C) \
-  X(0x041Du, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CS,     4u, BTC_ECHO_NONE,  0xE407u, 0x0000u,  2u, 0x80u, BTC_EXP_G_C) \
-  X(0x041Bu, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CS,     4u, BTC_ECHO_NONE,  0xE405u, 0x0000u,  2u, 0x20u, BTC_EXP_G_C) \
-  X(0x041Cu, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CS,     4u, BTC_ECHO_NONE,  0xE406u, 0x0000u,  2u, 0x40u, BTC_EXP_G_C) \
-  X(0x040Fu, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CS,     4u, BTC_ECHO_NONE,  0xE401u, 0x0000u,  1u, 0x40u, BTC_EXP_G_C) \
+  X(0x041Fu, BTC_O, BTC_FWD,   BTC_FWD,   BTC_CS,     4u, BTC_ECHO_NONE,  0xE408u, 0xE444u,  3u, 0x01u, BTC_EXP_V_C) \
+  X(0x041Du, BTC_O, BTC_FWD,   BTC_FWD,   BTC_CS,     4u, BTC_ECHO_NONE,  0xE407u, 0xE443u,  2u, 0x80u, BTC_EXP_V_C) \
+  X(0x041Bu, BTC_O, BTC_FWD,   BTC_FWD,   BTC_CS,     4u, BTC_ECHO_NONE,  0xE405u, 0xE441u,  2u, 0x20u, BTC_EXP_V_C) \
+  X(0x041Cu, BTC_O, BTC_FWD,   BTC_FWD,   BTC_CS,     4u, BTC_ECHO_NONE,  0xE406u, 0xE442u,  2u, 0x40u, BTC_EXP_V_C) \
+  X(0x040Fu, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CS,     4u, BTC_ECHO_NONE,  0xE401u, 0xE43Du,  1u, 0x40u, BTC_EXP_G_C) \
   X(0x080Du, BTC_O, BTC_REJ,   BTC_REJ,   BTC_CC,     6u, BTC_ECHO_HANDLE,0x0000u, 0x0000u,  5u, 0x04u, BTC_EXP_NONE) \
-  X(0x0C37u, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CC,     6u, BTC_ECHO_HANDLE,0xE41Cu, 0x0000u, 11u, 0x02u, BTC_EXP_G_C) \
-  X(0x0C28u, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CC,     6u, BTC_ECHO_HANDLE,0xE419u, 0x0000u,  9u, 0x20u, BTC_EXP_G_C) \
+  X(0x0C37u, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CC,     6u, BTC_ECHO_HANDLE,0xE41Cu, 0xE431u, 11u, 0x02u, BTC_EXP_G_C) \
+  X(0x0C28u, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CC,     6u, BTC_ECHO_HANDLE,0xE419u, 0xE42Eu,  9u, 0x20u, BTC_EXP_G_C) \
   /* ---- class O: security / SSP ---- */ \
-  X(0x0411u, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CS,     4u, BTC_ECHO_NONE,  0xE402u, 0x0000u,  1u, 0x80u, BTC_EXP_G_C) \
-  X(0x0413u, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CS,     4u, BTC_ECHO_NONE,  0xE403u, 0x0000u,  2u, 0x01u, BTC_EXP_G_C) \
+  X(0x0411u, BTC_O, BTC_FWD,   BTC_FWD,   BTC_CS,     4u, BTC_ECHO_NONE,  0xE402u, 0xE43Eu,  1u, 0x80u, BTC_EXP_V_C) \
+  X(0x0413u, BTC_O, BTC_FWD,   BTC_FWD,   BTC_CS,     4u, BTC_ECHO_NONE,  0xE403u, 0xE43Fu,  2u, 0x01u, BTC_EXP_V_C) \
   X(0x040Bu, BTC_O, BTC_FWD,   BTC_FWD,   BTC_CC,    10u, BTC_ECHO_BDADDR,0xE008u, 0xE06Au,  1u, 0x04u, BTC_EXP_V_C) \
   X(0x040Cu, BTC_O, BTC_FWD,   BTC_FWD,   BTC_CC,    10u, BTC_ECHO_BDADDR,0xE009u, 0xE06Bu,  1u, 0x08u, BTC_EXP_V_C) \
   X(0x040Du, BTC_O, BTC_FWD,   BTC_FWD,   BTC_CC,    10u, BTC_ECHO_BDADDR,0xE00Au, 0xE06Cu,  1u, 0x10u, BTC_EXP_V_C) \
   X(0x040Eu, BTC_O, BTC_FWD,   BTC_FWD,   BTC_CC,    10u, BTC_ECHO_BDADDR,0xE00Bu, 0xE06Du,  1u, 0x20u, BTC_EXP_V_C) \
   X(0x042Bu, BTC_O, BTC_FWD,   BTC_FWD,   BTC_CC,    10u, BTC_ECHO_BDADDR,0xE011u, 0xE06Fu, 18u, 0x80u, BTC_EXP_V_C) \
-  X(0x0434u, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CC,    10u, BTC_ECHO_BDADDR,0xE018u, 0x0000u, 20u, 0x08u, BTC_EXP_G_C) \
+  X(0x0434u, BTC_O, BTC_FWD,   BTC_FWD,   BTC_CC,    10u, BTC_ECHO_BDADDR,0xE018u, 0xE076u, 20u, 0x08u, BTC_EXP_V_C) \
   X(0x042Cu, BTC_O, BTC_FWD,   BTC_FWD,   BTC_CC,    10u, BTC_ECHO_BDADDR,0xE012u, 0xE070u, 19u, 0x01u, BTC_EXP_V_C) \
   X(0x042Du, BTC_O, BTC_FWD,   BTC_FWD,   BTC_CC,    10u, BTC_ECHO_BDADDR,0xE013u, 0xE071u, 19u, 0x02u, BTC_EXP_V_C) \
   X(0x042Eu, BTC_O, BTC_REJ,   BTC_REJ,   BTC_CC,    10u, BTC_ECHO_BDADDR,0x0000u, 0x0000u, 19u, 0x04u, BTC_EXP_NONE) \
@@ -110,13 +110,22 @@ static const bt_ctrl_cmd_row_t k_vendor_row = {
     0xFC00u, BTC_O, BTC_REJ, BTC_REJ, BTC_CC, 4u, BTC_ECHO_NONE, 0u, 0u, 0xFFu, 0u, BTC_EXP_NONE
 };
 
-/* ROM payload sizes of the KE command structs open_fw has used (bt_hci.c:882-904, g_openfw_cmd_tbl min_len). A FWD
- * row without an entry has no verified ROM layout (BT_ROM_INTERFACE §3.2) and fails validation. */
+/* ROM payload sizes of the KE command structs (= the ROM param struct size; the struct is the HCI wire layout
+ * zero-padded to it, docs/BT_ROM_HCI_MAP.md §1.1). First block: legacy bt_hci.c:882-904 (g_openfw_cmd_tbl min_len,
+ * driven on silicon by the legacy phone mode). Second block: stock opcode tables, BT_ROM_HCI_MAP.md §2 "Struct" column
+ * (static, cross-checked against the ROM handler). A FWD row without an entry has no verified ROM layout
+ * (BT_ROM_INTERFACE §3.2) and fails validation. 0402 (E001, no parameters, stock send_basic) has no entry on purpose:
+ * a zero-length layout cannot be expressed here, so a 0402 gate fails validation until that is added. */
 static const struct { uint16_t op; uint8_t min_len; } k_fwd_layout[] = {
     { 0x0C01u,   8u }, { 0x0C13u, 248u }, { 0x0C1Au,   1u }, { 0x0C24u,   3u }, { 0x0C52u, 241u },
     { 0x0C56u,   1u }, { 0x0401u,   5u }, { 0x0405u,  14u }, { 0x0406u,   4u }, { 0x0409u,   7u },
     { 0x040Au,   7u }, { 0x040Bu,  22u }, { 0x040Cu,   6u }, { 0x040Du,  23u }, { 0x040Eu,   6u },
     { 0x042Bu,   9u }, { 0x042Cu,   6u }, { 0x042Du,   6u },
+    /* BT_ROM_HCI_MAP.md §2 */
+    { 0x0C18u,   2u }, { 0x0C1Cu,   4u }, { 0x0C1Eu,   4u }, { 0x0C3Au,   4u }, { 0x0C45u,   1u },
+    { 0x0408u,   6u }, { 0x040Fu,   4u }, { 0x0411u,   2u }, { 0x0413u,   4u }, { 0x0419u,  10u },
+    { 0x041Au,   6u }, { 0x041Bu,   2u }, { 0x041Cu,   4u }, { 0x041Du,   2u }, { 0x041Fu,   2u },
+    { 0x0434u,   7u }, { 0x0C37u,   4u }, { 0x0C28u,   4u },
 };
 
 /* Opcodes bt_ctrl_cmds_reply_syn() implements. */

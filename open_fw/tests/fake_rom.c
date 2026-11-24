@@ -202,6 +202,374 @@ static bool em_range_ok(const uint8_t *p, uint16_t len)
     return off + len <= BT_ROM_EM_BUF_PAYLOAD;
 }
 
+/* ---- scripted remote peer (phone path) ----
+ * Plays the ROM's LM/LC side of one remote device with the ROM's own message ids and naturally aligned layouts
+ * (docs/BT_ROM_HCI_MAP.md §2 and §9; legacy bt_hci.c:741-850). Replies go to the command's src_id, from LM (0x38) or
+ * from the link's LC instance ((link << 8) | 0x39). Each handler checks that bt_ctrl allocated at least the ROM param
+ * struct size (a shorter message would make the ROM read past it). */
+fake_peer_t fake_peer;
+static fake_peer_cfg_t s_peer;
+
+static void peer_emit(uint16_t id, uint16_t src, const uint8_t *p, uint16_t len)
+{
+    send_internal(id, BT_ROM_TASK_HCI, src, p, len);
+    fake_peer.events_sent++;
+}
+
+static uint16_t peer_lc_src(void)
+{
+    return (uint16_t)((fake_peer.link << 8) | BT_ROM_TASK_LC);
+}
+
+static void peer_status1(uint16_t id, uint16_t src, uint8_t status)
+{
+    peer_emit(id, src, &status, 1u);
+}
+
+static void peer_s_addr(uint16_t id, uint16_t src, uint8_t status)   /* CC {s, bdaddr} (7) */
+{
+    uint8_t p[7];
+    p[0] = status;
+    memcpy(&p[1], s_peer.addr, 6u);
+    peer_emit(id, src, p, 7u);
+}
+
+static void peer_s_h(uint16_t id, uint8_t status, const uint8_t *tail, uint16_t tail_len)   /* {s, pad, h, ...} */
+{
+    uint8_t p[16];
+    memset(p, 0, sizeof(p));
+    p[0] = status;
+    p[2] = (uint8_t)fake_peer.handle;
+    p[3] = (uint8_t)(fake_peer.handle >> 8);
+    if (tail_len != 0u) {
+        memcpy(&p[4], tail, tail_len);
+    }
+    peer_emit(id, peer_lc_src(), p, (uint16_t)(4u + tail_len));
+}
+
+static void peer_addr_evt(uint16_t id, uint16_t src)                   /* {bdaddr} (6) */
+{
+    peer_emit(id, src, s_peer.addr, 6u);
+}
+
+static void peer_link_down(uint8_t reason)
+{
+    uint8_t r = reason;
+    peer_s_h(0xE458u, 0u, &r, 1u);                                       /* Disconnection Complete {s,pad,h,reason} */
+    f.links[fake_peer.link] = false;
+    fake_peer.connected = fake_peer.encrypted = fake_peer.authenticated = false;
+    fake_peer.origin = FAKE_PEER_ORIGIN_NONE;
+    fake_peer.last_disc_reason = reason;
+}
+
+static void peer_auth_done(uint8_t status)
+{
+    if (status == 0u) {
+        fake_peer.authenticated = true;
+        fake_peer.auth_ok++;
+    } else {
+        fake_peer.auth_fail++;
+    }
+    if (fake_peer.origin == FAKE_PEER_ORIGIN_HOST) {
+        peer_s_h(0xE459u, status, NULL, 0u);                             /* Authentication Complete {s,pad,h} */
+    } else if (status == 0u && s_peer.auto_encrypt) {
+        uint8_t on = 1u;
+        fake_peer.encrypted = true;
+        peer_s_h(0xE45Au, 0u, &on, 1u);                                  /* the phone starts encryption */
+    }
+    fake_peer.origin = FAKE_PEER_ORIGIN_NONE;
+}
+
+static bool peer_need(const msg_t *m, uint16_t n)
+{
+    if (m->len < n) {
+        err("command 0x%04X: %u param bytes, ROM struct needs %u", m->id, m->len, n);
+        return false;
+    }
+    return true;
+}
+
+static bool peer_addr_is(const uint8_t *p)
+{
+    return memcmp(p, s_peer.addr, 6u) == 0;
+}
+
+static bool peer_handle(msg_t *m)
+{
+    if (!fake_peer.enabled) {
+        return false;
+    }
+    const uint8_t *p = m->block + MSG_HDR;
+    bool lc = (m->dst & 0xFFu) == BT_ROM_TASK_LC;
+    if (lc && (!fake_peer.connected || (uint32_t)(m->dst >> 8) != fake_peer.link)) {
+        return false;                                                    /* another link: default reply table */
+    }
+    switch (m->id) {
+    case 0xE006u:                                                        /* 0409 Accept Connection Request */
+        if (!peer_need(m, 7u) || !peer_addr_is(p)) return false;
+        fake_peer.host_accept_role = p[6];
+        peer_status1(0xE0C9u, BT_ROM_TASK_LM, 0u);
+        f.links[fake_peer.link] = true;
+        fake_peer.connected = true;
+        fake_peer.encrypted = fake_peer.authenticated = false;
+        fake_peer.handle = (uint16_t)(0x80u + fake_peer.link);
+        fake_peer.conn_count++;
+        {
+            uint8_t c[13];
+            memset(c, 0, sizeof(c));
+            c[2] = (uint8_t)fake_peer.handle;                            /* {s, pad, h, pad, bdaddr, type, enc} */
+            memcpy(&c[5], s_peer.addr, 6u);
+            c[11] = 1u;
+            peer_emit(0xE456u, peer_lc_src(), c, 13u);
+        }
+        return true;
+    case 0xE007u:                                                        /* 040A Reject Connection Request */
+        if (!peer_need(m, 7u) || !peer_addr_is(p)) return false;
+        peer_status1(0xE0CAu, BT_ROM_TASK_LM, 0u);
+        {
+            uint8_t c[13];
+            memset(c, 0, sizeof(c));
+            c[0] = p[6];
+            memcpy(&c[5], s_peer.addr, 6u);
+            c[11] = 1u;
+            peer_emit(0xE0D2u, BT_ROM_TASK_LM, c, 13u);
+        }
+        return true;
+    case 0xE405u:                                                        /* 041B Read Remote Supported Features */
+        if (!peer_need(m, 2u)) return false;
+        peer_status1(0xE441u, peer_lc_src(), 0u);
+        peer_s_h(0xE45Du, 0u, s_peer.features, 8u);
+        return true;
+    case 0xE406u: {                                                      /* 041C Read Remote Extended Features */
+        if (!peer_need(m, 4u)) return false;
+        uint8_t t[10];
+        memset(t, 0, sizeof(t));
+        t[0] = p[2];
+        t[1] = s_peer.max_page;
+        if (p[2] == 0u) memcpy(&t[2], s_peer.features, 8u);
+        if (p[2] == 1u) memcpy(&t[2], s_peer.features_p1, 8u);
+        peer_status1(0xE442u, peer_lc_src(), 0u);
+        peer_s_h(0xE46Du, 0u, t, 10u);
+        return true;
+    }
+    case 0xE407u: {                                                      /* 041D Read Remote Version Information */
+        if (!peer_need(m, 2u)) return false;
+        uint8_t t[6] = { s_peer.lmp_ver, 0u, (uint8_t)s_peer.manuf, (uint8_t)(s_peer.manuf >> 8),
+                         (uint8_t)s_peer.subver, (uint8_t)(s_peer.subver >> 8) };
+        peer_status1(0xE443u, peer_lc_src(), 0u);
+        peer_s_h(0xE45Eu, 0u, t, 6u);
+        return true;
+    }
+    case 0xE408u: {                                                      /* 041F Read Clock Offset (slave: CS first) */
+        if (!peer_need(m, 2u)) return false;
+        uint8_t t[2] = { (uint8_t)s_peer.clk_off, (uint8_t)(s_peer.clk_off >> 8) };
+        peer_status1(0xE444u, peer_lc_src(), 0u);
+        peer_s_h(0xE469u, 0u, t, 2u);
+        return true;
+    }
+    case 0xE00Cu: {                                                      /* 0419 Remote Name Request */
+        if (!peer_need(m, 10u)) return false;
+        uint8_t r[255];
+        memset(r, 0, sizeof(r));
+        memcpy(&r[1], p, 6u);
+        peer_status1(0xE0CBu, BT_ROM_TASK_LM, 0u);
+        if (!peer_addr_is(p)) {
+            r[0] = 0x04u;                                                /* Page Timeout: nobody answers */
+        } else {
+            if (s_peer.host_feat_notify) {
+                uint8_t h[14];
+                memcpy(h, s_peer.addr, 6u);
+                memcpy(&h[6], s_peer.features_p1, 8u);
+                peer_emit(0xE47Cu, BT_ROM_TASK_LM, h, 14u);
+            }
+            memcpy(&r[7], s_peer.name, strnlen(s_peer.name, sizeof(s_peer.name)));
+        }
+        peer_emit(0xE0D3u, BT_ROM_TASK_LM, r, 255u);
+        fake_peer.name_requests++;
+        return true;
+    }
+    case 0xE00Du:                                                        /* 041A RNR Cancel: none running */
+        if (!peer_need(m, 6u)) return false;
+        peer_s_addr(0xE06Eu, BT_ROM_TASK_LM, 0x12u);
+        return true;
+    case 0xE402u:                                                        /* 0411 Authentication Requested */
+        if (!peer_need(m, 2u)) return false;
+        peer_status1(0xE43Eu, peer_lc_src(), 0u);
+        fake_peer.origin = FAKE_PEER_ORIGIN_HOST;
+        peer_addr_evt(0xE465u, peer_lc_src());                           /* Link Key Request */
+        return true;
+    case 0xE008u:                                                        /* 040B Link Key Request Reply */
+        if (!peer_need(m, 22u) || !peer_addr_is(p)) return false;
+        peer_s_addr(0xE06Au, BT_ROM_TASK_LM, 0u);
+        fake_peer.host_key_replies++;
+        memcpy(fake_peer.host_key, &p[6], 16u);
+        if (fake_peer.has_key && memcmp(fake_peer.key, &p[6], 16u) == 0) {
+            peer_auth_done(0u);
+        } else if (fake_peer.origin == FAKE_PEER_ORIGIN_HOST) {
+            peer_auth_done(0x06u);                                       /* PIN or Key Missing */
+        } else {
+            fake_peer.auth_fail++;
+            peer_link_down(0x05u);                                       /* the phone drops a link that fails auth */
+        }
+        return true;
+    case 0xE009u:                                                        /* 040C Link Key Request Negative Reply */
+        if (!peer_need(m, 6u) || !peer_addr_is(p)) return false;
+        peer_s_addr(0xE06Bu, BT_ROM_TASK_LM, 0u);
+        fake_peer.host_key_neg++;
+        if (fake_peer.origin != FAKE_PEER_ORIGIN_HOST) {
+            /* responder: the initiator's LMP io_capability_req arrives first -> IO Capability Response, then
+             * IO Capability Request (Core Vol 2 Part F, SSP IO capability exchange) */
+            uint8_t io[9];
+            memcpy(io, s_peer.addr, 6u);
+            io[6] = s_peer.io_cap;
+            io[7] = s_peer.oob;
+            io[8] = s_peer.auth_req;
+            peer_emit(0xE473u, peer_lc_src(), io, 9u);
+        }
+        peer_addr_evt(0xE472u, peer_lc_src());                           /* IO Capability Request */
+        return true;
+    case 0xE011u:                                                        /* 042B IO Capability Request Reply */
+        if (!peer_need(m, 9u) || !peer_addr_is(p)) return false;
+        peer_s_addr(0xE06Fu, BT_ROM_TASK_LM, 0u);
+        fake_peer.host_io_replies++;
+        fake_peer.host_io_cap = p[6];
+        fake_peer.host_oob = p[7];
+        fake_peer.host_auth_req = p[8];
+        if (fake_peer.origin == FAKE_PEER_ORIGIN_HOST) {
+            uint8_t io[9];
+            memcpy(io, s_peer.addr, 6u);
+            io[6] = s_peer.io_cap;
+            io[7] = s_peer.oob;
+            io[8] = s_peer.auth_req;
+            peer_emit(0xE473u, peer_lc_src(), io, 9u);                   /* the peer's LMP io_capability_res */
+        }
+        {
+            uint8_t uc[12];                                              /* {bdaddr, pad[2], u32 numeric} */
+            memset(uc, 0, sizeof(uc));
+            memcpy(uc, s_peer.addr, 6u);
+            memcpy(&uc[8], &s_peer.numeric, 4u);
+            peer_emit(0xE474u, peer_lc_src(), uc, 12u);
+        }
+        return true;
+    case 0xE018u: {                                                      /* 0434 IO Capability Request Neg Reply */
+        if (!peer_need(m, 7u) || !peer_addr_is(p)) return false;
+        peer_s_addr(0xE076u, BT_ROM_TASK_LM, 0u);
+        fake_peer.host_io_neg++;
+        uint8_t sp[7];
+        sp[0] = p[6];
+        memcpy(&sp[1], s_peer.addr, 6u);
+        peer_emit(0xE477u, peer_lc_src(), sp, 7u);                       /* Simple Pairing Complete (failed) */
+        peer_auth_done(p[6]);
+        return true;
+    }
+    case 0xE012u:                                                        /* 042C User Confirmation Request Reply */
+    case 0xE013u: {                                                      /* 042D ... Negative Reply */
+        if (!peer_need(m, 6u) || !peer_addr_is(p)) return false;
+        bool yes = m->id == 0xE012u;
+        peer_s_addr(yes ? 0xE070u : 0xE071u, BT_ROM_TASK_LM, 0u);
+        if (yes) {
+            fake_peer.host_confirms++;
+        } else {
+            fake_peer.host_rejects++;
+        }
+        uint8_t sp[7];
+        sp[0] = (yes && s_peer.user_confirms) ? 0u : 0x05u;              /* Authentication Failure */
+        memcpy(&sp[1], s_peer.addr, 6u);
+        peer_emit(0xE477u, peer_lc_src(), sp, 7u);
+        if (sp[0] == 0u) {
+            uint8_t ln[23];                                              /* {bdaddr, key[16], type} */
+            for (uint32_t i = 0u; i < 16u; i++) {
+                fake_peer.key[i] = (uint8_t)((s_peer.numeric >> (8u * (i & 3u))) ^ s_peer.addr[i % 6u] ^ (i * 29u));
+            }
+            fake_peer.has_key = true;
+            fake_peer.pairings++;
+            memcpy(ln, s_peer.addr, 6u);
+            memcpy(&ln[6], fake_peer.key, 16u);
+            ln[22] = s_peer.key_type;
+            peer_emit(0xE466u, peer_lc_src(), ln, 23u);
+        }
+        peer_auth_done(sp[0]);
+        return true;
+    }
+    case 0xE403u: {                                                      /* 0413 Set Connection Encryption */
+        if (!peer_need(m, 4u)) return false;
+        uint8_t on = p[2];
+        peer_status1(0xE43Fu, peer_lc_src(), 0u);
+        uint8_t st = fake_peer.authenticated ? 0u : 0x06u;
+        if (st == 0u) {
+            fake_peer.encrypted = on != 0u;
+        }
+        peer_s_h(0xE45Au, st, &on, 1u);
+        return true;
+    }
+    case 0xE400u:                                                        /* 0406 Disconnect */
+        if (!peer_need(m, 4u)) return false;
+        peer_status1(0xE43Au, peer_lc_src(), 0u);
+        peer_link_down(0x16u);                                           /* Connection Terminated By Local Host */
+        return true;
+    default:
+        return false;
+    }
+}
+
+void fake_peer_init(const fake_peer_cfg_t *cfg)
+{
+    memset(&fake_peer, 0, sizeof(fake_peer));
+    memset(&s_peer, 0, sizeof(s_peer));
+    if (cfg != NULL) {
+        s_peer = *cfg;
+        fake_peer.enabled = true;
+    }
+}
+
+void fake_peer_set_key(const uint8_t key[16])
+{
+    memcpy(fake_peer.key, key, 16u);
+    fake_peer.has_key = true;
+}
+
+int fake_peer_page(uint32_t link)
+{
+    if (!fake_peer.enabled || link >= 7u || fake_peer.connected) {
+        return -1;
+    }
+    fake_peer.link = link;
+    uint8_t c[10];                                                       /* {bdaddr, cod[3], link_type} = wire */
+    memcpy(c, s_peer.addr, 6u);
+    memcpy(&c[6], s_peer.cod, 3u);
+    c[9] = 1u;
+    peer_emit(0xE457u, BT_ROM_TASK_LM, c, 10u);
+    return 0;
+}
+
+void fake_peer_authenticate(void)
+{
+    fake_peer.origin = FAKE_PEER_ORIGIN_PEER;
+    peer_addr_evt(0xE465u, peer_lc_src());
+}
+
+void fake_peer_encrypt(bool on)
+{
+    uint8_t v = on ? 1u : 0u;
+    uint8_t st = fake_peer.authenticated ? 0u : 0x06u;
+    if (st == 0u) {
+        fake_peer.encrypted = on;
+    }
+    peer_s_h(0xE45Au, st, &v, 1u);
+}
+
+void fake_peer_disconnect(uint8_t reason)
+{
+    if (fake_peer.connected) {
+        peer_link_down(reason);
+    }
+}
+
+int fake_peer_send_acl(const uint8_t *data, uint16_t len)
+{
+    return fake_peer.connected ? fake_rom_inject_acl(fake_peer.handle, 0x2u, data, len) : -1;
+}
+
 /* ---- fake LM / LC ---- */
 static reply_t *find_reply(uint16_t req)
 {
@@ -276,6 +644,9 @@ static void lmlc_handle(msg_t *m)
             f.held[f.held_n++] = ((uint32_t)m->id << 16) | m->len;   /* address echo comes from the cmds log */
         }
         return;
+    }
+    if (peer_handle(m)) {
+        return;                              /* scripted remote peer answered with the ROM's own messages */
     }
     reply_t *r = find_reply(m->id);
     if (r == NULL) {
@@ -672,6 +1043,19 @@ void fake_rom_reset(void)
     fake_rom_set_reply(0xE011u, 0xE06Fu, 0u, 7u, true);    /* 042B */
     fake_rom_set_reply(0xE012u, 0xE070u, 0u, 7u, true);
     fake_rom_set_reply(0xE013u, 0xE071u, 0u, 7u, true);
+    /* Phone-path rows promoted to FWD from docs/BT_ROM_HCI_MAP.md §2 (initial replies only; the scripted peer below
+     * adds the terminal events). */
+    fake_rom_set_reply(0xE00Cu, 0xE0CBu, 0u, 1u, false);   /* 0419 CS (LM) */
+    fake_rom_set_reply(0xE00Du, 0xE06Eu, 0u, 7u, true);    /* 041A CC {s, bdaddr} */
+    fake_rom_set_reply(0xE018u, 0xE076u, 0u, 7u, true);    /* 0434 CC {s, bdaddr} */
+    fake_rom_set_reply(0xE402u, 0xE43Eu, 0u, 1u, false);   /* 0411 CS (LC) */
+    fake_rom_set_reply(0xE403u, 0xE43Fu, 0u, 1u, false);   /* 0413 CS (LC) */
+    fake_rom_set_reply(0xE405u, 0xE441u, 0u, 1u, false);   /* 041B CS (LC) */
+    fake_rom_set_reply(0xE406u, 0xE442u, 0u, 1u, false);   /* 041C CS (LC) */
+    fake_rom_set_reply(0xE407u, 0xE443u, 0u, 1u, false);   /* 041D CS (LC) */
+    fake_rom_set_reply(0xE408u, 0xE444u, 0u, 1u, false);   /* 041F CS (LC) */
+    memset(&fake_peer, 0, sizeof(fake_peer));
+    memset(&s_peer, 0, sizeof(s_peer));
 }
 
 void fake_rom_shutdown(void)

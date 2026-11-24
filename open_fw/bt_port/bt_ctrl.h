@@ -38,6 +38,8 @@
 #define BT_CTRL_RUN_STEPS         4u     /* ke_event dispatches per rom->run() call */
 #define BT_CTRL_RUN_CALLS         16u    /* rom->run() calls per pass */
 #define BT_CTRL_PASS_MAX          8u     /* passes per bt_ctrl_run() before it reports "more work" */
+#define BT_CTRL_FWD_DEADLINE_MS   7000u  /* class-O forwarded command answered locally (0x22) after this long without a
+                                            ROM reply: just under Bluedroid's 8 s hci_layer.c command timeout */
 
 /* ---- fault codes (plan M1 recovery ladder: posted once per session to the app task) ---- */
 enum {
@@ -80,6 +82,10 @@ typedef struct {
     uint32_t tx_cmds, tx_acl, tx_noack, tx_dropped_closed, tx_contract_violation, tx_malformed;
     uint32_t cmd_fwd, cmd_syn, cmd_rej, cmd_unknown, cmd_local_fail, cmd_alloc_refused, mandatory_fwd_fail;
     uint32_t fwd_orphaned;          /* LC-destined command answered locally (0x02) after its link went, no ROM reply */
+    uint32_t fwd_deadline;          /* class-O command answered locally (0x22) at BT_CTRL_FWD_DEADLINE_MS */
+    uint32_t fwd_late_reply;        /* ROM reply that arrived after its command was answered at the deadline (consumed) */
+    uint32_t cmd_dead_handle;       /* LC-destined command for a handle already reported disconnected (answered 0x02) */
+    uint32_t acl_tx_dead_handle;    /* host ACL for a handle already reported disconnected (dropped; also acl_tx_dropped) */
     uint16_t unknown_opcode_last;
     uint32_t acl_to_rom, acl_tx_dropped, acl_tx_em_fail, acl_tx_credit_blocked;
     /* controller -> host */
@@ -108,6 +114,10 @@ typedef struct {
 
 /* One-time binding. Returns the number of opcode/event table validation errors (0 required; >0 also faults). */
 int bt_ctrl_init(const bt_rom_if_t *rom, const bt_ctrl_platform_t *platform, const uint8_t bd_addr[6]);
+
+/* Optional monotonic millisecond clock (wraps at 2^32) for the forwarded-command deadline; call after bt_ctrl_init().
+ * Called only from bt_ctrl_run() (bt_ctrl task context). NULL (the default) disables the deadline. */
+void bt_ctrl_set_clock(uint32_t (*now_ms)(void));
 
 /* Lifecycle. open: new session, admission open; the ROM is started by the host's HCI Reset (plan M1 "Reset ... same
  * path on re-enable"). Returns -1 if not OFF or bt_dlv is still inside a host callback.

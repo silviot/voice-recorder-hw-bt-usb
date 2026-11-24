@@ -62,8 +62,13 @@ int osi_alarm_create_mux(void)
         OSI_TRACE_WARNING("%s, invalid state %d\n", __func__, alarm_state);
         return -1;
     }
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+    /* open_fw patch 0023: report the failure (upstream returns 0 and osi_alarm_init() asserts on the NULL mutex) */
+    return osi_mutex_new(&alarm_mutex) == 0 ? 0 : -1;
+#else
     osi_mutex_new(&alarm_mutex);
     return 0;
+#endif
 }
 
 int osi_alarm_delete_mux(void)
@@ -101,6 +106,11 @@ end:
 
 void osi_alarm_deinit(void)
 {
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+    if (alarm_mutex == NULL) {
+        return; /* open_fw patch 0023: osi_alarm_create_mux() failed, nothing was initialised */
+    }
+#endif
     assert(alarm_mutex != NULL);
 
     osi_mutex_lock(&alarm_mutex, OSI_MUTEX_MAX_TIMEOUT);

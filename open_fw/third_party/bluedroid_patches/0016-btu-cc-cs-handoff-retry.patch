@@ -1,0 +1,99 @@
+diff --git a/open_fw/third_party/bluedroid/host/bluedroid/stack/btu/btu_hcif.c b/open_fw/third_party/bluedroid/host/bluedroid/stack/btu/btu_hcif.c
+index b0580ea..c184f32 100644
+--- a/open_fw/third_party/bluedroid/host/bluedroid/stack/btu/btu_hcif.c
++++ b/open_fw/third_party/bluedroid/host/bluedroid/stack/btu/btu_hcif.c
+@@ -48,6 +48,35 @@
+ //#include "osi/mutex.h"
+ // TODO(zachoverflow): remove this horrible hack
+ #include "stack/btu.h"
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++#include "freertos/FreeRTOS.h"
++#include "freertos/task.h"
++#include "bt_port_hooks.h"
++
++/* open_fw patch 0016: hand-off of a Command Complete / Command Status to BTU. Upstream dereferences its unchecked
++ * osi_calloc() (NULL deref) and leaks the response/command when btu_task_post() fails. The event cannot be failed
++ * back to the controller and its loss leaves the BTM procedure waiting forever, so this is a bounded retry: up to
++ * OPENFW_HCIF_HANDOFF_RETRIES more attempts, 1 tick apart, on the HCI thread (the same policy as bt_dlv's RX retry,
++ * BT_CTRL_DLV_FAULT_AFTER). If memory does not come back the event is dropped, its buffers freed, and the loss is
++ * reported like a command timeout (patch 0007 hook: BT fault -> recovery ladder). */
++#ifndef OPENFW_HCIF_HANDOFF_RETRIES
++#define OPENFW_HCIF_HANDOFF_RETRIES 8
++#endif
++static BT_HDR *openfw_hcif_handoff_alloc(size_t size)
++{
++    BT_HDR *event = osi_calloc(size);
++    for (int i = 0; event == NULL && i < OPENFW_HCIF_HANDOFF_RETRIES; i++) {
++        vTaskDelay(1);
++        event = osi_calloc(size);
++    }
++    return event;
++}
++
++static uint16_t openfw_hcif_cmd_opcode(const uint8_t *p)
++{
++    return (uint16_t)(p[0] | (p[1] << 8));
++}
++#endif
+ 
+ extern void btm_process_cancel_complete(UINT8 status, UINT8 mode);
+ extern void btm_ble_test_command_complete(UINT8 *p, UINT16 len);
+@@ -1615,7 +1644,19 @@ static void btu_hcif_command_complete_evt_on_task(BT_HDR *event)
+ 
+ static void btu_hcif_command_complete_evt(BT_HDR *response, void *context)
+ {
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++    BT_HDR *event = openfw_hcif_handoff_alloc(sizeof(BT_HDR) + sizeof(command_complete_hack_t));
++    if (event == NULL) {
++        /* open_fw patch 0016: opcode follows the event code, length and Num_HCI_Command_Packets */
++        uint16_t opcode = openfw_hcif_cmd_opcode(response->data + response->offset + 3);
++        HCI_TRACE_ERROR("%s: no memory, Command Complete 0x%04x dropped", __func__, opcode);
++        osi_free(response);
++        bt_port_on_hci_command_timeout(opcode);
++        return;
++    }
++#else
+     BT_HDR *event = osi_calloc(sizeof(BT_HDR) + sizeof(command_complete_hack_t));
++#endif
+     command_complete_hack_t *hack = (command_complete_hack_t *)&event->data[0];
+ #if ((BLE_50_FEATURE_SUPPORT == TRUE) || (BLE_42_FEATURE_SUPPORT == TRUE))
+     UINT8 status = 0;
+@@ -1633,6 +1674,9 @@ static void btu_hcif_command_complete_evt(BT_HDR *response, void *context)
+ 
+     if (btu_task_post(SIG_BTU_HCI_MSG, event, OSI_THREAD_MAX_TIMEOUT) == false) {
+         osi_free(event);
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++        osi_free(response); /* open_fw patch 0016: the callback owns the response (upstream leaked it) */
++#endif
+     }
+ }
+ 
+@@ -1961,7 +2005,18 @@ static void btu_hcif_command_status_evt_on_task(BT_HDR *event)
+ 
+ static void btu_hcif_command_status_evt(uint8_t status, BT_HDR *command, void *context)
+ {
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++    BT_HDR *event = openfw_hcif_handoff_alloc(sizeof(BT_HDR) + sizeof(command_status_hack_t));
++    if (event == NULL) {
++        uint16_t opcode = openfw_hcif_cmd_opcode(command->data + command->offset);
++        HCI_TRACE_ERROR("%s: no memory, Command Status 0x%04x dropped", __func__, opcode);
++        HCI_FREE_CMD_BUF(command); /* open_fw patch 0016: the status callback owns the command */
++        bt_port_on_hci_command_timeout(opcode);
++        return;
++    }
++#else
+     BT_HDR *event = osi_calloc(sizeof(BT_HDR) + sizeof(command_status_hack_t));
++#endif
+     command_status_hack_t *hack = (command_status_hack_t *)&event->data[0];
+ #if ((BLE_50_FEATURE_SUPPORT == TRUE) || (BLE_42_FEATURE_SUPPORT == TRUE))
+     if (status != HCI_SUCCESS) {
+@@ -1977,6 +2032,9 @@ static void btu_hcif_command_status_evt(uint8_t status, BT_HDR *command, void *c
+     event->event = BTU_POST_TO_TASK_NO_GOOD_HORRIBLE_HACK;
+     if (btu_task_post(SIG_BTU_HCI_MSG, event, OSI_THREAD_MAX_TIMEOUT) == false) {
+         osi_free(event);
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++        HCI_FREE_CMD_BUF(command); /* open_fw patch 0016: the status callback owns the command (upstream leaked it) */
++#endif
+     }
+ }
+ 

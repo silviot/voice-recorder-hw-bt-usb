@@ -2196,9 +2196,9 @@ void bt_xrec_get_status(bt_status_t *out)
     bt_memcpy(out->dev_name, g_dev_name, 16u);
 }
 
-#if defined(OPENFW_HCI_PROBE) && OPENFW_HCI_PROBE
-/* HCI probe image only (make BT=1 HCI_PROBE=1, plan M5 Exp 1 stage A): bt_port/bt_rom_real.c reuses this file's ROM
- * bring-up (LD/LC/LM layers) and g_bt_heap instead of re-deriving them. The probe build also compiles this file with
+#if (defined(OPENFW_HCI_PROBE) && OPENFW_HCI_PROBE) || (defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID)
+/* BT=1 images (HCI probe, and the Bluedroid phone mode bt_port/bt_xrec_*.c): bt_port/bt_rom_real.c reuses this file's
+ * ROM bring-up (LD/LC/LM layers) and g_bt_heap instead of re-deriving them. These builds also compile this file with
  * -DRWBT_IRQHandler=bt_hci_legacy_irq_top (open_fw/Makefile), so bt_rom_real.c owns the only IRQ-26 vector and calls
  * the legacy top half while this path owns the controller. Kept at the end of the file so that no line above moves
  * (docs cite this file as F:<line>). Default and BT=0 builds compile none of it. */

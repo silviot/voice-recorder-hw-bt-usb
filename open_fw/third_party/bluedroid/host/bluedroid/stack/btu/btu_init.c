@@ -114,6 +114,39 @@ void btu_init_core(void)
 #endif
 }
 
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+/* open_fw patch 0022: btu_init_core() and the component inits it calls return void and (upstream) assert on a failed
+ * allocation, or ignore it and fail much later (l2c_init, sdp_init). With the asserts removed they leave NULL members;
+ * this checks every mandatory one so btu_task_start_up() can fail esp_bluedroid_init() instead. */
+BOOLEAN btu_init_core_ok(void)
+{
+    BOOLEAN ok = TRUE;
+#if (CLASSIC_BT_INCLUDED == TRUE)
+    ok = ok && btm_cb.page_queue != NULL;
+#endif
+#if (SMP_INCLUDED == TRUE)
+    ok = ok && btm_cb.sec_pending_q != NULL;
+#endif
+    ok = ok && btm_cb.p_sec_dev_rec_list != NULL && btm_cb.p_acl_db_list != NULL;
+#if (CLASSIC_BT_INCLUDED == TRUE)
+    ok = ok && btm_cb.p_pm_mode_db_list != NULL;
+#endif
+#if (BTM_SCO_INCLUDED == TRUE) && (BTM_SCO_HCI_INCLUDED == TRUE)
+    for (int i = 0; i < BTM_MAX_SCO_LINKS; i++) {
+        ok = ok && btm_cb.sco_cb.sco_db[i].xmit_data_q != NULL;
+    }
+#endif
+    ok = ok && l2cb.p_ccb_pool != NULL && l2cb.p_lcb_pool != NULL && l2cb.rcv_pending_q != NULL;
+#if (defined(SDP_INCLUDED) && SDP_INCLUDED == TRUE)
+#if SDP_DYNAMIC_MEMORY
+    ok = ok && sdp_cb_ptr != NULL;
+#endif
+    ok = ok && sdp_cb.server_db.p_record_list != NULL;
+#endif
+    return ok;
+}
+#endif
+
 /*****************************************************************************
 **
 ** Function         btu_free_core
@@ -179,7 +212,13 @@ bool BTU_StartUp(void)
         goto error_exit;
     }
 
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+    if (osi_mutex_new(&btu_general_alarm_lock) != 0) {
+        goto error_exit; /* open_fw patch 0022: upstream ignores the failure; the first timer locks a NULL mutex */
+    }
+#else
     osi_mutex_new(&btu_general_alarm_lock);
+#endif
 
     btu_oneshot_alarm_hash_map = hash_map_new(BTU_ONESHOT_ALARM_HASH_MAP_SIZE,
                                  hash_function_pointer, NULL, (data_free_fn)osi_alarm_free, NULL);
@@ -187,7 +226,13 @@ bool BTU_StartUp(void)
         goto error_exit;
     }
 
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+    if (osi_mutex_new(&btu_oneshot_alarm_lock) != 0) {
+        goto error_exit; /* open_fw patch 0022 */
+    }
+#else
     osi_mutex_new(&btu_oneshot_alarm_lock);
+#endif
 
     btu_l2cap_alarm_hash_map = hash_map_new(BTU_L2CAP_ALARM_HASH_MAP_SIZE,
                                             hash_function_pointer, NULL, (data_free_fn)osi_alarm_free, NULL);
@@ -195,7 +240,13 @@ bool BTU_StartUp(void)
         goto error_exit;
     }
 
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+    if (osi_mutex_new(&btu_l2cap_alarm_lock) != 0) {
+        goto error_exit; /* open_fw patch 0022 */
+    }
+#else
     osi_mutex_new(&btu_l2cap_alarm_lock);
+#endif
 
     const size_t workqueue_len[] = {BTU_TASK_WORKQUEUE0_LEN};
 #if (!CONFIG_BT_BLUEDROID_BTU_TASK_STACK_IN_EXT_MEM)

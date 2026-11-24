@@ -3,8 +3,9 @@
 Status: **static disassembly only, nothing here has run on silicon.** This file resolves the `BT_CTRL_OPCODE_TABLE.md`
 rows marked "needs disassembly" (G-B: `0C18 0C1C 0C1E 0C3A 0C52`; G-C: `0C45 0401 0402 0419 041A 0405 0408 041F 041D
 041B 041C 040F 0C37 0C28 0411 0413 0434`), the stage-A cross-checks (`1009` via `E05D→E0C0`, `1001`/`LMP_version_res`)
-and the reply ids of `1005 1001 1002 0C14 1004`. It does not change the opcode table or any code. The table still
-decides the actions, and each G-x gate still needs its hardware stage (§7).
+and the reply ids of `1005 1001 1002 0C14 1004`. §9 decodes every stock event packer (ROM id → HCI event and
+de-padding) and §10 lists the phone-mode path. The opcode table decides the actions: since 2026-11-24 it forwards the
+phone-path rows of §2 (`BT_CTRL_OPCODE_TABLE.md` §7 item 11); the other G-x gates still need their hardware stage (§7).
 
 Citation key: `ROM 0xNNNNN` = `dumps/bootrom_384K.bin` (base 0). `FW 0xNNNNNN` = stock `dumps/firmware_2M.bin` in XIP
 addresses (`addr = 0xC00000 + file offset`). `RAM 0x81xxxx` = stock `.ramtext/.data`, load image at file `0x039470`
@@ -159,6 +160,11 @@ These two layouts are therefore read from the ROM senders only (ROM `0x3F01E`, `
 8. `E0D6`/`E0D7` have never been exercised by any firmware. Enabling RSSI/EIR inquiry (page-0 bit 30, G-C) needs new
    packers with the §3 layouts, and `rf_rssi_convert` output checked against a reference RSSI.
 
+Status of these items in `bt_ctrl` (2026-11-24): 1 → dead-handle rule and forwarded-command deadline
+(`BT_CTRL_OPCODE_TABLE.md` §2 rules 8–9); 2 → the deadline is 7 s, so a command SAVED for longer (an RNR behind a
+long inquiry) is answered `0x22`, which Bluedroid would otherwise turn into an 8 s command timeout and a BT fault;
+3 → `0402`/`0C37` stay gated; 5 → `0434` is FWD; 6 → `040F` stays gated; 8 → still open (inquiry mode 0 only).
+
 ## 7. What remains uncertain and how stage B/C confirms it
 
 Static facts are tied to ROM and FW addresses. None of them is a measured reply. Every row in §2 still needs its
@@ -213,3 +219,95 @@ for base, first, n in ((0x8178E0, 0xE065, 0x70), (0x817628, 0xE427, 0x56)):
 Lesson worth keeping: the per-OGF tables give the KE id but not the zero-parameter commands, which the stock
 dispatches from a `switch` (FW `0xD55970`). Read the reply table before declaring a reply id "unknown", because every
 LM/LC id from `E065` to `E47C` is listed there with its opcode and return length.
+
+## 9. Event packers (stock reply tables, exact)
+
+The stock reply tables (§1) give every LM/LC reply id with a packer. Each packer was read (FW `0xD591E0..0xD596AC`;
+the message param starts at packer `r0 + 0x10`, the event code goes to `r0 + 0xE`, the length to `r0 + 0xF`). They
+all follow one rule: the ROM struct is naturally aligned and the packer removes the pad byte after a leading status
+and re-packs u16/u32 fields in place. `bt_ctrl_evt.c` implements every row below; host golden vectors:
+`test_bt_ctrl.c` `test_event_packers`. **L** = the legacy `bt_hci.c:741-850` packer agrees byte for byte (legacy
+phone mode exercises it on silicon whenever that event occurs).
+
+| ROM id | Event | ROM struct → wire | Packer | |
+|---|---|---|---|---|
+| `E0D0` | `0x01` Inquiry Complete | `{s}` (1) | `0xD594B0` | |
+| `E0D1` | `0x02` Inquiry Result | §3 (16 → 15, `num` forced to 1) | `0xD594BA` | |
+| `E0D2`, `E456` | `0x03` Connection Complete | `{s, pad, h, pad, a@5, type@11, enc@12}` (13 → 11) | `0xD594D8` | L |
+| `E457` | `0x04` Connection Request | `{a, cod[3], type}` (10) verbatim | `0xD59504` | L |
+| `E458` | `0x05` Disconnection Complete | `{s, pad, h, reason@4}` (5 → 4) | `0xD59510` | L |
+| `E459` | `0x06` Authentication Complete | `{s, pad, h}` (4 → 3) | `0xD59528` | L |
+| `E0D3` | `0x07` Remote Name Req Complete | `{s, a, name[248]}` (255) verbatim | `0xD5953C` | |
+| `E45A` | `0x08` Encryption Change | `{s, pad, h, enc@4}` (5 → 4) | `0xD5954A` | L |
+| `E45B` | `0x09` Change Conn Link Key Complete | `{s, pad, h}` (4 → 3) | `0xD59208` | |
+| `E45C` | `0x0A` Master Link Key Complete | `{s, pad, h, flag@4}` (5 → 4) | `0xD5921C` | |
+| `E45D` | `0x0B` Read Remote Features Complete | `{s, pad, h, feat[8]@4}` (12 → 11) | `0xD59562` | L |
+| `E45E` | `0x0C` Read Remote Version Complete | `{s, pad, h, ver@4, pad, manuf@6, subver@8}` (10 → 8) | `0xD59584` | L |
+| `E45F` | `0x0D` QoS Setup Complete | `{s, pad, h, flags@4, type@5, pad[2], u32 ×4 @8}` (24 → 21) | `0xD59234` | |
+| `E0D4` | `0x10` Hardware Error | `{code}` (1) | `0xD5927A` | |
+| `E460` | `0x11` Flush Occurred | `{h}` (2) | `0xD59286` | |
+| `E461` | `0x12` Role Change | `{s, a, role}` (8) verbatim | `0xD595AC` | |
+| `E462` | `0x13` NOCP | `{n, pad, n × {h, count}}` → `{n, …}` | `0xD5929A` | L (bt_ctrl owns it) |
+| `E463` | `0x14` Mode Change | `{s, pad, h, mode@4, pad, interval@6}` (8 → 6) | `0xD595B8` | |
+| `E464`/`E465` | `0x16` PIN / `0x17` Link Key Request | `{a}` (6) | `0xD595D8`/`0xD595E4` | L |
+| `E466` | `0x18` Link Key Notification | `{a, key[16], type}` (23) | `0xD595F0` | L |
+| `E467` | `0x1A` Data Buffer Overflow | `{type}` (1) | `0xD592CC` | |
+| `E468` | `0x1B` Max Slots Change | `{h, slots}` (3; the stock packer also zeroes `param[3]`) | `0xD595FC` | L |
+| `E469` | `0x1C` Read Clock Offset Complete | `{s, pad, h, offset@4}` (6 → 5) | `0xD592D8` | |
+| `E46A` | `0x1D` Conn Packet Type Changed | `{s, pad, h, types@4}` (6 → 5) | `0xD592F4` | |
+| `E46B` | `0x1E` QoS Violation | `{h}` (2) | `0xD59310` | |
+| `E46C` | `0x21` Flow Specification Complete | `{s, pad, h, flags, dir, type, pad, u32 ×4 @8}` (24 → 22) | `0xD59324` | |
+| `E46D` | `0x23` Read Remote Ext Features Complete | `{s, pad, h, page@4, max@5, feat[8]@6}` (14 → 13) | `0xD5938C` | |
+| `E46E`, `E46F`, `E470` | `0x2C`/`0x2D` sync link, `0x2E` sniff subrating | not packed by `bt_ctrl` (no SCO/eSCO, no sniff): counted as unknown | `0xD59614`, `0xD593B8`, `0xD593E4` | |
+| `E471` | `0x30` Encryption Key Refresh Complete | `{s, pad, h}` (4 → 3) | `0xD59436` | |
+| `E472` | `0x31` IO Capability Request | `{a}` (6) | `0xD5965C` | L |
+| `E473` | `0x32` IO Capability Response | `{a, io, oob, auth}` (9) | `0xD5944A` | L |
+| `E474` | `0x33` User Confirmation Request | `{a, pad[2], u32 value@8}` (12 → 10) | `0xD59668` | L |
+| `E475`/`E476` | `0x34` Passkey / `0x35` OOB Data Request | `{a}` (6) | `0xD59456`/`0xD59462` | |
+| `E477` | `0x36` Simple Pairing Complete | `{s, a}` (7) | `0xD59684` | L |
+| `E478` | `0x38` LSTO Changed | `{h, timeout}` (4) | `0xD59690` | L |
+| `E479` | `0x39` Enhanced Flush Complete | `{h}` (2) | `0xD5946E` | |
+| `E47A` | `0x3B` User Passkey Notification | `{a, pad[2], u32 passkey@8}` (12 → 10) | `0xD59482` | |
+| `E47B` | `0x3C` Keypress Notification | `{a, type}` (7) | `0xD59498` | |
+| `E47C` | `0x3D` Remote Host Supported Features | `{a, feat[8]}` (14) | `0xD594A4` | |
+
+Command replies: CC generic packer `0xD5860C` copies `ret_len` bytes (status first); CS generic packer `0xD59189`
+takes the status from `param[0]`. The two CC-with-handle replies `E42E` (`0C28`) and `E431` (`0C37`) de-pad
+`{s, pad, h}` first (`0xD5902C`, `0xD5905C`). `E454`/`E455` are stock-synthesised replies (§2 last paragraph).
+
+## 10. Phone-mode path: commands and events (2026-11-24)
+
+What Bluedroid (our `sdkconfig.h`, `ssp_en = true`, `sc_en = false`, local IO capability DisplayYesNo) sends and needs
+when a phone or laptop pages us, pairs with numeric comparison, exchanges ACL, disconnects and re-connects with the
+stored key. Send sites as in the opcode table (`A` = `btm_acl.c`, `S` = `btm_sec.c`, `L2` = `l2c_link.c`).
+
+| Step | Host → controller | ROM path | Controller → host |
+|---|---|---|---|
+| Page from the phone | — | — | `E457` → `0x04` |
+| Accept, remain slave (`L2:96-106`: no local role switch, so `btm_dev_support_switch()` is false; legacy `F:1592-1595` does the same) | `0409` | `E006` → CS `E0C9`/`E43B` | `E456` → `0x03` |
+| ACL set-up reads (`A:435-436`, `A:1229`, `A:1246`) | `041F`, `041D`, `041B`, `041C` p1 | `E408`/`E407`/`E405`/`E406` → CS `E444`/`E443`/`E441`/`E442` | `E469` → `0x1C`, `E45E` → `0x0C`, `E45D` → `0x0B`, `E46D` → `0x23` |
+| Name (`S:5002`, BTM name discovery) | `0419`, rarely `041A` | `E00C` → CS `E0CB`; `E00D` → CC `E06E` | `E47C` → `0x3D` (if the ROM sends it), `E0D3` → `0x07` |
+| Phone authenticates (we respond) | `040C` or `040B` | `E009`/`E008` → CC `E06B`/`E06A` | `E465` → `0x17` first |
+| SSP, responder order | `042B`, then `042C`/`042D` (or `0434`) | `E011` → `E06F`; `E012`/`E013` → `E070`/`E071`; `E018` → `E076` | `E473` → `0x32`, `E472` → `0x31`, `E474` → `0x33`, `E477` → `0x36`, `E466` → `0x18` |
+| We authenticate (`S:5606`) | `0411`, then as above | `E402` → CS `E43E` | `0x17`, then **initiator order** `0x31` before `0x32`, … , `E459` → `0x06` |
+| Encryption (`S:5624`, or by the phone) | `0413` | `E403` → CS `E43F` | `E45A` → `0x08`; `E471` → `0x30` on a key refresh |
+| ACL both ways | ACL (`E426`) | EM TX, `E462` NOCP | `E47D` ACL RX, `0x13` NOCP |
+| Link events the phone can cause | — | — | `E461` → `0x12` (role switch: page-0 LMP features still advertise it), `E463` → `0x14` (hold), `E468` → `0x1B`, `E478` → `0x38` |
+| Disconnect (`S:1557`, `L2:788`) or by the phone | `0406` | `E400` → CS `E43A` | `E458` → `0x05` |
+
+Legacy `bt_hci.c` ground truth for this path: it accepts as slave (`F:1595`), answers `0x17` with `040B`/`040C`
+(`F:1650-1661`), `0x31` with `042B` NoInputNoOutput (`F:1670-1678`), `0x33` with `042C` (`F:1681-1684`), and stores
+the key from `0x18` (`F:1664-1667`); it never sends `0411 0413 041B 041C 041D 041F 0419`. Its packers are reused
+unchanged (§9 "L"); the commands legacy never sent are forwarded with the §2 layouts, which are the wire layout
+zero-padded to the stock size (§1.1), so no command needed a repacking step.
+
+**Lessons**
+- Without `041C`, Bluedroid never reads the peer's page 1, `btm_sec_set_peer_sec_caps()` marks the peer
+  `BTM_SM4_KNOWN` (legacy) and every service-level security check takes the legacy branch until an IO Capability
+  Request happens to set `BTM_SM4_TRUE`. So `041C` is part of the SSP path, not an optional read; the `1002` bit for
+  it must be set for Bluedroid to send it at all.
+- The SSP event order differs by role: as responder the controller reports the initiator's IO capabilities (`0x32`)
+  before asking ours (`0x31`); as initiator it asks first. Bluedroid handles both, the fake ROM peer
+  (`tests/fake_rom.h` `fake_peer_*`) plays both so host tests cover both.
+- Bluedroid's 8 s command timeout is a stack restart, not a retry: any ROM behaviour that delays an initial reply that
+  long (SAVED commands, silent consumption) costs the whole session. `bt_ctrl` answers class-O commands at 7 s.

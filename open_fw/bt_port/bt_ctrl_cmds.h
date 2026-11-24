@@ -62,6 +62,7 @@ typedef struct {
 #define BT_HCI_ERR_MEM_FULL          0x07u
 #define BT_HCI_ERR_CMD_DISALLOWED    0x0Cu
 #define BT_HCI_ERR_INVALID_PARAMS    0x12u
+#define BT_HCI_ERR_LMP_TIMEOUT       0x22u   /* forwarded command not answered by the ROM within the deadline */
 
 #define BT_H4_CMD   0x01u
 #define BT_H4_ACL   0x02u

@@ -94,6 +94,58 @@ uint32_t fake_rom_ack_acl(uint32_t n);                /* complete n in-air ACL p
 /* Deliver a message through upcalls saved from an earlier start() (late callback after a restart). */
 int  fake_rom_deliver_stale(uint16_t id, const uint8_t *param, uint16_t len);
 
+/* ---- scripted remote peer (phone/laptop) for the phone path ----
+ * When enabled, the fake LM/LC answer the phone-path commands for this one peer with the ROM's own message ids and
+ * aligned layouts (docs/BT_ROM_HCI_MAP.md §2 and §9) instead of the status-only reply table: initial CS/CC first,
+ * then the terminal event, from LM (0x38) or the link's LC instance like the ROM. Covered: 0409/040A (+ E456/E0D2),
+ * 041B/041C/041D/041F (+ E45D/E46D/E45E/E469), 0419/041A (+ E47C/E0D3), 0411 (+ E465), 040B/040C, 042B/0434,
+ * 042C/042D (+ E473/E472/E474/E477/E466/E459), 0413 (+ E45A), 0406 (+ E458). ACL is the existing air model
+ * (host -> peer: fake_rom.acl log + NOCP; peer -> host: fake_peer_send_acl). */
+#define FAKE_PEER_ORIGIN_NONE 0u
+#define FAKE_PEER_ORIGIN_PEER 1u    /* the remote authenticates us (we are the SSP responder) */
+#define FAKE_PEER_ORIGIN_HOST 2u    /* the host sent 0411 (we are the SSP initiator) */
+
+typedef struct {
+    uint8_t addr[6];                /* wire order (LSB first), as in every ROM message */
+    uint8_t cod[3];
+    uint8_t io_cap, oob, auth_req;  /* the peer's IO Capability Response (1 = DisplayYesNo) */
+    uint32_t numeric;               /* numeric comparison value in User Confirmation Request (E474) */
+    bool user_confirms;             /* the peer's user accepts the comparison */
+    bool auto_encrypt;              /* after a peer-initiated authentication succeeds, the peer starts encryption */
+    bool host_feat_notify;          /* E47C (0x3D) precedes E0D3 on a remote name request */
+    uint8_t key_type;               /* Link Key Notification key type (0x05: authenticated combination P-192) */
+    uint8_t features[8], features_p1[8], max_page;
+    uint8_t lmp_ver;
+    uint16_t manuf, subver, clk_off;
+    char name[32];
+} fake_peer_cfg_t;
+
+typedef struct {
+    bool enabled, connected, encrypted, authenticated;
+    uint32_t link;
+    uint16_t handle;
+    uint8_t origin;                 /* FAKE_PEER_ORIGIN_* of the authentication in progress */
+    bool has_key;                   /* the peer holds a link key for us (pairing done, or fake_peer_set_key) */
+    uint8_t key[16];
+    /* what bt_ctrl delivered to the ROM on behalf of the host */
+    uint8_t host_accept_role, host_io_cap, host_oob, host_auth_req;
+    uint8_t host_key[16];
+    uint32_t host_io_replies, host_io_neg, host_confirms, host_rejects, host_key_replies, host_key_neg;
+    /* outcome counters */
+    uint32_t conn_count, auth_ok, auth_fail, pairings, name_requests, events_sent;
+    uint8_t last_disc_reason;
+} fake_peer_t;
+
+extern fake_peer_t fake_peer;
+
+void fake_peer_init(const fake_peer_cfg_t *cfg);     /* NULL disables; fake_rom_reset() also disables */
+void fake_peer_set_key(const uint8_t key[16]);       /* the peer already holds this key (re-connect) */
+int  fake_peer_page(uint32_t link);                  /* the peer pages us: E457 Connection Request; -1 if connected */
+void fake_peer_authenticate(void);                   /* the peer authenticates: E465 Link Key Request */
+void fake_peer_encrypt(bool on);                     /* the peer switches encryption: E45A */
+void fake_peer_disconnect(uint8_t reason);           /* the peer drops the link: E458 */
+int  fake_peer_send_acl(const uint8_t *data, uint16_t len);   /* peer -> host ACL start fragment (PB 10) */
+
 uint32_t fake_rom_em_rx_in_use(void);
 uint32_t fake_rom_em_tx_in_use(void);
 uint32_t fake_rom_msgs_owned_by_ctrl(void);           /* ALLOC (unsent) + KEPT messages */

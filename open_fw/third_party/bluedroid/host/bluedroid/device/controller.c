@@ -234,7 +234,28 @@ static controller_local_param_t *controller_param_ptr;
 #define controller_param (*controller_param_ptr)
 #endif
 
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+/* open_fw patch 0012: a start-up command that cannot be built (patch 0011) or queued with a future (hci_layer.c)
+ * aborts start_up() instead of asserting / dereferencing NULL: the controller stays not ready (readable == false),
+ * which BTM_DeviceReset() turns into a failed enable (patch 0013). Commands already sent were answered and freed. */
+static BT_HDR *openfw_await_command(BT_HDR *command)
+{
+    if (command == NULL) {
+        return NULL;
+    }
+    future_t *future = controller_param.hci->transmit_command_futured(command);
+    return future == NULL ? NULL : (BT_HDR *)future_await(future);
+}
+#define AWAIT_COMMAND(command) ({                                                                                     \
+        BT_HDR *openfw_rsp_ = openfw_await_command(command);                                                          \
+        if (openfw_rsp_ == NULL) {                                                                                    \
+            goto start_up_failed;                                                                                     \
+        }                                                                                                             \
+        openfw_rsp_;                                                                                                  \
+    })
+#else
 #define AWAIT_COMMAND(command) future_await(controller_param.hci->transmit_command_futured(command))
+#endif
 
 static bool loaded = false;
 // Module lifecycle functions
@@ -487,6 +508,11 @@ static void start_up(void)
     controller_param.readable = true;
     // return future_new_immediate(FUTURE_SUCCESS);
     return;
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+start_up_failed:
+    controller_param.readable = false; /* open_fw patch 0012 */
+    return;
+#endif
 }
 
 static void shut_down(void)

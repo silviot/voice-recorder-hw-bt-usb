@@ -1,0 +1,101 @@
+diff --git a/open_fw/third_party/bluedroid/host/bluedroid/bta/dm/bta_dm_act.c b/open_fw/third_party/bluedroid/host/bluedroid/bta/dm/bta_dm_act.c
+index 8bc6c17..67d2644 100644
+--- a/open_fw/third_party/bluedroid/host/bluedroid/bta/dm/bta_dm_act.c
++++ b/open_fw/third_party/bluedroid/host/bluedroid/bta/dm/bta_dm_act.c
+@@ -4065,6 +4065,13 @@ static void bta_dm_disable_conn_down_timer_cback (TIMER_LIST_ENT *p_tle)
+         sys_enable_event->hw_module = BTA_SYS_HW_BLUETOOTH;
+         bta_sys_sendmsg(sys_enable_event);
+     }
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++    else {
++        /* open_fw patch 0014: upstream drops the disable request (disable never completes); this timer callback runs
++         * on the BTU task, so run it right here (upstream does the same when BTA_DISABLE_DELAY is 0). */
++        bta_sys_hw_execute_local(BTA_SYS_API_DISABLE_EVT, BTA_SYS_HW_BLUETOOTH);
++    }
++#endif
+ 
+     bta_dm_cb.disabling = FALSE;
+ 
+diff --git a/open_fw/third_party/bluedroid/host/bluedroid/bta/include/bta/bta_sys.h b/open_fw/third_party/bluedroid/host/bluedroid/bta/include/bta/bta_sys.h
+index 07cd39d..5db6234 100644
+--- a/open_fw/third_party/bluedroid/host/bluedroid/bta/include/bta/bta_sys.h
++++ b/open_fw/third_party/bluedroid/host/bluedroid/bta/include/bta/bta_sys.h
+@@ -231,6 +231,10 @@ extern void bta_sys_disable(tBTA_SYS_HW_MODULE module);
+ extern UINT32 bta_sys_get_remaining_ticks(TIMER_LIST_ENT *p_target_tle);
+ 
+ extern void bta_sys_hw_register( tBTA_SYS_HW_MODULE module, tBTA_SYS_HW_CBACK *cback);
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++/* open_fw patch 0014: run a BTA SYS hardware event synchronously (BTU task only) when its message cannot be allocated */
++extern void bta_sys_hw_execute_local(UINT16 event, tBTA_SYS_HW_MODULE hw_module);
++#endif
+ extern void bta_sys_hw_unregister( tBTA_SYS_HW_MODULE module );
+ 
+ 
+diff --git a/open_fw/third_party/bluedroid/host/bluedroid/bta/sys/bta_sys_main.c b/open_fw/third_party/bluedroid/host/bluedroid/bta/sys/bta_sys_main.c
+index eee9877..211af87 100644
+--- a/open_fw/third_party/bluedroid/host/bluedroid/bta/sys/bta_sys_main.c
++++ b/open_fw/third_party/bluedroid/host/bluedroid/bta/sys/bta_sys_main.c
+@@ -253,6 +253,25 @@ BOOLEAN bta_sys_sm_execute(BT_HDR *p_msg)
+ }
+ 
+ 
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++/* open_fw patch 0014: BTA SYS posts some of its hardware state-machine events to itself (BTA_SYS_EVT_ENABLED_EVT,
++ * BTA_SYS_EVT_STACK_ENABLED_EVT / BTA_SYS_ERROR_EVT from BTM, BTA_SYS_EVT_DISABLED_EVT) and upstream silently drops
++ * the event when the message cannot be allocated, so enable or disable never completes. All of these are posted from
++ * the BTU task to the BTU task (bta_sys actions, BTM device-status callbacks), so on allocation failure the event is
++ * executed right here from a stack copy, through the same state table. bta_sys_sm_execute() never frees, and nesting
++ * is safe: every caller is the last action of its row (the outer bta_sys_sm_execute() then reads BTA_SYS_IGNORE). */
++void bta_sys_hw_execute_local(UINT16 event, tBTA_SYS_HW_MODULE hw_module)
++{
++    tBTA_SYS_HW_MSG msg;
++
++    APPL_TRACE_WARNING("%s: no memory for event 0x%x, executing it synchronously", __func__, event);
++    memset(&msg, 0, sizeof(msg));
++    msg.hdr.event = event;
++    msg.hw_module = hw_module;
++    bta_sys_sm_execute(&msg.hdr);
++}
++#endif
++
+ void bta_sys_hw_register( tBTA_SYS_HW_MODULE module, tBTA_SYS_HW_CBACK *cback)
+ {
+     bta_sys_cb.sys_hw_cback[module] = cback;
+@@ -298,6 +317,13 @@ void bta_sys_hw_btm_cback( tBTM_DEV_STATUS status )
+         }
+     } else {
+         APPL_TRACE_DEBUG("ERROR bta_sys_hw_btm_cback couldn't send msg" );
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++        if (status == BTM_DEV_STATUS_UP) {
++            bta_sys_hw_execute_local(BTA_SYS_EVT_STACK_ENABLED_EVT, BTA_SYS_HW_BLUETOOTH); /* open_fw patch 0014 */
++        } else if (status == BTM_DEV_STATUS_DOWN) {
++            bta_sys_hw_execute_local(BTA_SYS_ERROR_EVT, BTA_SYS_HW_BLUETOOTH); /* open_fw patch 0014 */
++        }
++#endif
+     }
+ }
+ 
+@@ -363,6 +389,11 @@ void bta_sys_hw_api_enable( tBTA_SYS_HW_MSG *p_sys_hw_msg )
+ 
+             bta_sys_sendmsg(p_msg);
+         }
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++        else {
++            bta_sys_hw_execute_local(BTA_SYS_EVT_ENABLED_EVT, p_sys_hw_msg->hw_module); /* open_fw patch 0014 */
++        }
++#endif
+     } else {
+         /* register which HW module was turned on */
+         bta_sys_cb.sys_hw_module_active |=  ((UINT32)1 << p_sys_hw_msg->hw_module );
+@@ -418,6 +449,11 @@ void bta_sys_hw_api_disable(tBTA_SYS_HW_MSG *p_sys_hw_msg)
+ 
+             bta_sys_sendmsg(p_msg);
+         }
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++        else {
++            bta_sys_hw_execute_local(BTA_SYS_EVT_DISABLED_EVT, p_sys_hw_msg->hw_module); /* open_fw patch 0014 */
++        }
++#endif
+     }
+ 
+ }

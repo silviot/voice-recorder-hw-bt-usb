@@ -1,0 +1,65 @@
+diff --git a/open_fw/third_party/bluedroid/host/bluedroid/device/controller.c b/open_fw/third_party/bluedroid/host/bluedroid/device/controller.c
+index b894a28..1cb0dab 100644
+--- a/open_fw/third_party/bluedroid/host/bluedroid/device/controller.c
++++ b/open_fw/third_party/bluedroid/host/bluedroid/device/controller.c
+@@ -234,7 +234,28 @@ static controller_local_param_t *controller_param_ptr;
+ #define controller_param (*controller_param_ptr)
+ #endif
+ 
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++/* open_fw patch 0012: a start-up command that cannot be built (patch 0011) or queued with a future (hci_layer.c)
++ * aborts start_up() instead of asserting / dereferencing NULL: the controller stays not ready (readable == false),
++ * which BTM_DeviceReset() turns into a failed enable (patch 0013). Commands already sent were answered and freed. */
++static BT_HDR *openfw_await_command(BT_HDR *command)
++{
++    if (command == NULL) {
++        return NULL;
++    }
++    future_t *future = controller_param.hci->transmit_command_futured(command);
++    return future == NULL ? NULL : (BT_HDR *)future_await(future);
++}
++#define AWAIT_COMMAND(command) ({                                                                                     \
++        BT_HDR *openfw_rsp_ = openfw_await_command(command);                                                          \
++        if (openfw_rsp_ == NULL) {                                                                                    \
++            goto start_up_failed;                                                                                     \
++        }                                                                                                             \
++        openfw_rsp_;                                                                                                  \
++    })
++#else
+ #define AWAIT_COMMAND(command) future_await(controller_param.hci->transmit_command_futured(command))
++#endif
+ 
+ static bool loaded = false;
+ // Module lifecycle functions
+@@ -487,6 +508,11 @@ static void start_up(void)
+     controller_param.readable = true;
+     // return future_new_immediate(FUTURE_SUCCESS);
+     return;
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++start_up_failed:
++    controller_param.readable = false; /* open_fw patch 0012 */
++    return;
++#endif
+ }
+ 
+ static void shut_down(void)
+diff --git a/open_fw/third_party/bluedroid/host/bluedroid/hci/hci_layer.c b/open_fw/third_party/bluedroid/host/bluedroid/hci/hci_layer.c
+index 42d72c4..571bda0 100644
+--- a/open_fw/third_party/bluedroid/host/bluedroid/hci/hci_layer.c
++++ b/open_fw/third_party/bluedroid/host/bluedroid/hci/hci_layer.c
+@@ -422,6 +422,15 @@ static future_t *transmit_command_futured(BT_HDR *command)
+     metadata->flags_vnd |= (HCI_CMD_MSG_F_VND_QUEUED | HCI_CMD_MSG_F_VND_FUTURE);
+ 
+     future_t *future = future_new();
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++    if (future == NULL) {
++        /* open_fw patch 0012: fail soft (upstream asserts in its caller): the command is freed unsent and NULL tells
++         * controller.c's start_up() to abort, which fails esp_bluedroid_enable() (patch 0013). */
++        hci_cmd_free_cb free_func = metadata->command_free_cb ? metadata->command_free_cb : (hci_cmd_free_cb) osi_free_func;
++        free_func(linked_pkt);
++        return NULL;
++    }
++#endif
+ 
+     metadata->complete_future = future;
+ 

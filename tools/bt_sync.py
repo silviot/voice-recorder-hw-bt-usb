@@ -86,11 +86,15 @@ def discover_hw_mac(explicit_mac: Optional[str] = None) -> Optional[str]:
     return None
 
 
+NATIVE_SPP_PROBE_S = 1.5  # OpenFW (native SPP) sends nothing after RFCOMM open; the stock HFP unit sends AT+BRSF at once
+
+
 class XRecRFCOMMClient:
-    def __init__(self, mac: str, channel: int = 1, timeout: float = 8.0):
+    def __init__(self, mac: str, channel: int = 1, timeout: float = 8.0, transport: str = "auto"):
         self.mac = mac
         self.channel = channel
         self.timeout = timeout
+        self.transport = transport  # "auto" | "native" (OpenFW SPP, no HFP) | "hfp" (stock HW_76 + bt_filesync)
         self.sock: Optional[socket.socket] = None
         self.rx_buf = bytearray()
 
@@ -99,6 +103,28 @@ class XRecRFCOMMClient:
         self.sock.settimeout(self.timeout)
         print(f"Connecting RFCOMM {self.mac} ch {self.channel}...")
         self.sock.connect((self.mac, self.channel))
+        first = b""
+        if self.transport == "native":
+            print("Native SPP (OpenFW): no HFP handshake.")
+            return
+        if self.transport == "auto":
+            # OpenFW (legacy bt_spp.c and the BT=1 Bluedroid SPP server) speaks +XREC directly on channel 1 and stays
+            # silent until a command arrives; the stock firmware's HFP unit starts the SLC with AT+BRSF immediately.
+            self.sock.settimeout(NATIVE_SPP_PROBE_S)
+            try:
+                first = self.sock.recv(256)
+            except (TimeoutError, socket.timeout):
+                first = b""
+            finally:
+                self.sock.settimeout(self.timeout)
+            if not first:
+                print("Native SPP (OpenFW): device silent after connect, skipping the HFP handshake.")
+                return
+            if not first.lstrip().startswith(b"AT"):
+                # Not HFP either: keep the bytes for the +XREC reader.
+                self.rx_buf.extend(first)
+                print("Native SPP (OpenFW): no AT command after connect, skipping the HFP handshake.")
+                return
 
         def send_ag(lines: List[str]) -> None:
             assert self.sock is not None
@@ -107,12 +133,15 @@ class XRecRFCOMMClient:
                 time.sleep(0.05)
 
         # Complete HFP Service Level Connection until SLC_OPEN (after AT+CMER)
-        buf = ""
+        buf = first.decode("ascii", errors="replace")
         deadline = time.monotonic() + 10.0
         while time.monotonic() < deadline:
-            chunk = self.sock.recv(256).decode("ascii", errors="replace")
-            if not chunk:
-                raise ConnectionError("RFCOMM closed during HFP handshake")
+            if "\r" in buf:
+                chunk = ""
+            else:
+                chunk = self.sock.recv(256).decode("ascii", errors="replace")
+                if not chunk:
+                    raise ConnectionError("RFCOMM closed during HFP handshake")
             buf += chunk
             while "\r" in buf:
                 line, buf = buf.split("\r", 1)
@@ -426,6 +455,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Download recordings from HW_76 over Bluetooth RFCOMM (+XREC).")
     parser.add_argument("--mac", type=str, default=None, help="Bluetooth MAC address of HW_76")
     parser.add_argument(
+        "--transport",
+        choices=("auto", "native", "hfp"),
+        default="auto",
+        help="RFCOMM start-up: native = OpenFW SPP (no HFP), hfp = stock firmware HFP SLC handshake, "
+        f"auto = native unless the device sends AT commands within {NATIVE_SPP_PROBE_S} s (default)",
+    )
+    parser.add_argument(
         "-d", "--dest",
         type=Path,
         default=Path.home() / "Recordings" / "HW_76",
@@ -474,7 +510,7 @@ def main() -> None:
         print("Could not find Cassini_* or HW_* in BlueZ paired devices. Pass --mac XX:XX:XX:XX:XX:XX.")
         sys.exit(1)
 
-    client = XRecRFCOMMClient(mac)
+    client = XRecRFCOMMClient(mac, transport=args.transport)
     try:
         client.connect_and_handshake()
         pong = client.ping()

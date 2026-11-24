@@ -1,0 +1,56 @@
+diff --git a/open_fw/third_party/bluedroid/host/bluedroid/btc/core/btc_dm.c b/open_fw/third_party/bluedroid/host/bluedroid/btc/core/btc_dm.c
+index 1bc8dda..ed5e2c0 100644
+--- a/open_fw/third_party/bluedroid/host/bluedroid/btc/core/btc_dm.c
++++ b/open_fw/third_party/bluedroid/host/bluedroid/btc/core/btc_dm.c
+@@ -845,12 +845,21 @@ void btc_dm_sec_cb_handler(btc_msg_t *msg)
+     bool rsp_app = false;
+     bt_status_t ret = BT_STATUS_SUCCESS;
+ 
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++    /* open_fw patch 0017: upstream allocates the BLE GAP message for EVERY DM security event and returns on failure,
++     * which loses BTA_DM_ENABLE_EVT / BTA_DM_DISABLE_EVT (enable or disable never completes). The cases below only
++     * fill in the header (act); the full message is allocated when an event is actually forwarded (rsp_app). */
++    btc_msg_t ble_hdr;
++    memset(&ble_hdr, 0, sizeof(ble_hdr));
++    ble_msg = &ble_hdr;
++#else
+     ble_msg = (btc_msg_t *)osi_malloc(sizeof(btc_msg_t) + sizeof(esp_ble_gap_cb_param_t));
+     if (ble_msg == NULL) {
+         BTC_TRACE_ERROR("%s malloc fail", __func__);
+         btc_dm_sec_arg_deep_free(msg);
+         return;
+     }
++#endif
+     ble_msg->sig = BTC_SIG_API_CB;
+     ble_msg->pid = BTC_PID_GAP_BLE;
+     // tBTA_SERVICE_MASK service_mask;
+@@ -1158,6 +1167,22 @@ void btc_dm_sec_cb_handler(btc_msg_t *msg)
+         break;
+     }
+ 
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++    if (rsp_app) {
++        ble_msg = (btc_msg_t *)osi_malloc(sizeof(btc_msg_t) + sizeof(esp_ble_gap_cb_param_t));
++        if (ble_msg == NULL) {
++            BTC_TRACE_ERROR("%s malloc fail, BLE GAP event %u dropped", __func__, ble_hdr.act);
++        } else {
++            memcpy(ble_msg, &ble_hdr, sizeof(btc_msg_t));
++            memcpy(ble_msg->arg, &param, sizeof(esp_ble_gap_cb_param_t));
++            ret = btc_inter_profile_call(ble_msg);
++            if (ret != BT_STATUS_SUCCESS) {
++                BTC_TRACE_ERROR("%s btc_inter_profile_call failed\n", __func__);
++            }
++            osi_free(ble_msg);
++        }
++    }
++#else
+     if (rsp_app) {
+         memcpy(ble_msg->arg, &param, sizeof(esp_ble_gap_cb_param_t));
+         ret = btc_inter_profile_call(ble_msg);
+@@ -1167,5 +1192,6 @@ void btc_dm_sec_cb_handler(btc_msg_t *msg)
+         }
+     }
+     osi_free(ble_msg);
++#endif
+     btc_dm_sec_arg_deep_free(msg);
+ }

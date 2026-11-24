@@ -42,6 +42,29 @@
 #include "device/controller.h"
 #include "bta_dm_gap.h"
 
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+/* open_fw patch 0025: the BD_NAME a BTM security callback (and BTM_SecReadDevName) hands BTA is the device record's
+ * sec_bd_name, a tBTM_BD_NAME of BTM_MAX_REM_BD_NAME_LEN + 1 (65) bytes, not a 248-byte BD_NAME. Upstream memcpy'd
+ * BD_NAME_LEN - 1 = 247 bytes from it: a 182-byte over-read past the record on every bond (found by ASan in make
+ * test-bt-host, phone scenario). Copy what the source holds; the destination was zeroed by the caller's memset. */
+#define BTA_DM_COPY_BTM_NAME(dst, src) do { \
+        memcpy((dst), (src), BTM_MAX_REM_BD_NAME_LEN); \
+        (dst)[BTM_MAX_REM_BD_NAME_LEN] = 0; \
+    } while (0)
+#else
+#define BTA_DM_COPY_BTM_NAME(dst, src) memcpy((dst), (src), (BD_NAME_LEN - 1))
+#endif
+
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+/* patch 0026 (bta_dm_disable): wait before detaching the remaining links, then for the detach to complete */
+#ifndef OPENFW_BTA_DM_DISABLE_LINK_WAIT_MS
+#define OPENFW_BTA_DM_DISABLE_LINK_WAIT_MS 100
+#endif
+#ifndef OPENFW_BTA_DM_DISABLE_DETACH_WAIT_MS
+#define OPENFW_BTA_DM_DISABLE_DETACH_WAIT_MS 500
+#endif
+#endif
+
 #define LOG_TAG "bt_bta_dm"
 // #include "osi/include/log.h"
 
@@ -315,6 +338,31 @@ void BTM_LegacyBleCallbackTrigger(tBTM_BLE_LEGACY_GAP_EVENT event, tBTM_BLE_LEGA
 ** Returns          void
 **
 *******************************************************************************/
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+/* open_fw patch 0013: an enable is pending from bta_dm_enable() until BTA_DM_ENABLE_EVT is reported. A failure on the
+ * way (the BTA SYS enable message cannot be allocated, controller start-up fails and BTM reports the device down)
+ * reports BTA_DM_ENABLE_EVT with BTA_FAILURE (esp_bluedroid_enable() returns ESP_FAIL) instead of asserting or never
+ * answering, and undoes bta_dm_enable() so nothing keeps BTA DM marked active. A separate flag, not bta_dm_cb (the
+ * BTA_SYS_HW_ON_EVT handler re-initialises bta_dm_cb). */
+static BOOLEAN bta_dm_enable_pending;
+
+static void bta_dm_enable_failed(void)
+{
+    tBTA_DM_SEC sec_event;
+    tBTA_DM_SEC_CBACK *p_sec_cback = bta_dm_cb.p_sec_cback;
+
+    APPL_TRACE_ERROR("%s", __func__);
+    bta_dm_enable_pending = FALSE;
+    bta_sys_hw_unregister(BTA_SYS_HW_BLUETOOTH);
+    bta_dm_cb.is_bta_dm_active = FALSE;
+    memset(&sec_event, 0, sizeof(sec_event));
+    sec_event.enable.status = BTA_FAILURE;
+    if (p_sec_cback != NULL) {
+        p_sec_cback(BTA_DM_ENABLE_EVT, &sec_event);
+    }
+}
+#endif
+
 void bta_dm_enable(tBTA_DM_MSG *p_data)
 {
     tBTA_SYS_HW_MSG *sys_enable_event;
@@ -341,6 +389,9 @@ void bta_dm_enable(tBTA_DM_MSG *p_data)
     }
     /* notify BTA DM is now active */
     bta_dm_cb.is_bta_dm_active = TRUE;
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+    bta_dm_enable_pending = TRUE; /* open_fw patch 0013 */
+#endif
 
     /* send a message to BTA SYS */
     if ((sys_enable_event = (tBTA_SYS_HW_MSG *) osi_malloc(sizeof(tBTA_SYS_HW_MSG))) != NULL) {
@@ -351,7 +402,11 @@ void bta_dm_enable(tBTA_DM_MSG *p_data)
     } else {
         // if malloc failed, restart
         APPL_TRACE_ERROR("%s, failed to allocate memory for sys_enable_event", __func__);
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+        bta_dm_enable_failed(); /* open_fw patch 0013: report the failure instead of asserting */
+#else
         assert(0);
+#endif
     }
 }
 
@@ -474,6 +529,12 @@ static void bta_dm_sys_hw_cback( tBTA_SYS_HW_EVT status )
     APPL_TRACE_DEBUG("%s with event: %i", __func__, status);
 
     /* On H/W error evt, report to the registered DM application callback */
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+    if (status == BTA_SYS_HW_ERROR_EVT && bta_dm_enable_pending) {
+        bta_dm_enable_failed(); /* open_fw patch 0013: the device went down during enable (controller start-up) */
+        return;
+    }
+#endif
     if (status == BTA_SYS_HW_ERROR_EVT) {
         if ( bta_dm_cb.p_sec_cback != NULL ) {
             bta_dm_cb.p_sec_cback(BTA_DM_HW_ERROR_EVT, NULL);
@@ -673,7 +734,19 @@ void bta_dm_disable (tBTA_DM_MSG *p_data)
     } else {
         bta_dm_cb.disable_timer.p_cback = (TIMER_CBACK *)&bta_dm_disable_timer_cback;
         bta_dm_cb.disable_timer.param = 0;
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+        /* open_fw patch 0026: upstream gives the profiles 5 s to close their channels before
+         * bta_dm_disable_timer_cback() detaches the remaining links, then waits 1.5 s more before reporting
+         * BTA_DM_DISABLE_EVT. The link-down path that would end the wait early never runs here: bta_sys_disable()
+         * above has already deregistered BTA DM itself (bta_dm_sm_disable), so its own BTA_DM_ACL_CHANGE_EVT is
+         * dropped. Every disable with a phone connected therefore took 6.5 s, past the plan's one absolute 2 s
+         * teardown deadline (hard path + reboot on every BT-mode exit). Detach after
+         * OPENFW_BTA_DM_DISABLE_LINK_WAIT_MS and report after OPENFW_BTA_DM_DISABLE_DETACH_WAIT_MS (measured in make
+         * test-bt-host, phone scenario: disable ~0.7 s with a connected SPP peer and data outstanding). */
+        bta_sys_start_timer(&bta_dm_cb.disable_timer, 0, OPENFW_BTA_DM_DISABLE_LINK_WAIT_MS);
+#else
         bta_sys_start_timer(&bta_dm_cb.disable_timer, 0, 5000);
+#endif
     }
 
 #if BLE_INCLUDED == TRUE && BLE_PRIVACY_SPT == TRUE
@@ -718,7 +791,11 @@ static void bta_dm_disable_timer_cback (TIMER_LIST_ENT *p_tle)
         if (trigger_disc) {
             bta_dm_cb.disable_timer.p_cback = (TIMER_CBACK *)&bta_dm_disable_timer_cback;
             bta_dm_cb.disable_timer.param = 1;
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+            bta_sys_start_timer(&bta_dm_cb.disable_timer, 0, OPENFW_BTA_DM_DISABLE_DETACH_WAIT_MS);   /* patch 0026 */
+#else
             bta_sys_start_timer(&bta_dm_cb.disable_timer, 0, 1500);
+#endif
         }
     } else {
         bta_dm_cb.disabling = FALSE;
@@ -1379,7 +1456,7 @@ void bta_dm_bond (tBTA_DM_MSG *p_data)
         bdcpy(sec_event.auth_cmpl.bd_addr, p_data->bond.bd_addr);
         p_name = BTM_SecReadDevName(p_data->bond.bd_addr);
         if (p_name != NULL) {
-            memcpy(sec_event.auth_cmpl.bd_name, p_name, (BD_NAME_LEN - 1));
+            BTA_DM_COPY_BTM_NAME(sec_event.auth_cmpl.bd_name, p_name);
             sec_event.auth_cmpl.bd_name[BD_NAME_LEN - 1] = 0;
         }
 
@@ -3297,7 +3374,7 @@ static UINT8  bta_dm_new_link_key_cback(BD_ADDR bd_addr, DEV_CLASS dev_class,
 
         bdcpy(p_auth_cmpl->bd_addr, bd_addr);
 
-        memcpy(p_auth_cmpl->bd_name, bd_name, (BD_NAME_LEN - 1));
+        BTA_DM_COPY_BTM_NAME(p_auth_cmpl->bd_name, bd_name);
         p_auth_cmpl->bd_name[BD_NAME_LEN - 1] = 0;
 
         p_auth_cmpl->key_present = TRUE;
@@ -3341,7 +3418,7 @@ static UINT8 bta_dm_authentication_complete_cback(BD_ADDR bd_addr, DEV_CLASS dev
         memset(&sec_event, 0, sizeof(tBTA_DM_SEC));
         bdcpy(sec_event.auth_cmpl.bd_addr, bd_addr);
 
-        memcpy(sec_event.auth_cmpl.bd_name, bd_name, (BD_NAME_LEN - 1));
+        BTA_DM_COPY_BTM_NAME(sec_event.auth_cmpl.bd_name, bd_name);
         sec_event.auth_cmpl.bd_name[BD_NAME_LEN - 1] = 0;
 
 #if BLE_INCLUDED == TRUE
@@ -3546,6 +3623,9 @@ static void bta_dm_local_name_cback(const BD_ADDR bd_addr)
     UNUSED(bd_addr);
 
     sec_event.enable.status = BTA_SUCCESS;
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+    bta_dm_enable_pending = FALSE; /* open_fw patch 0013 */
+#endif
 
     if (bta_dm_cb.p_sec_cback) {
         bta_dm_cb.p_sec_cback(BTA_DM_ENABLE_EVT, &sec_event);
@@ -4024,6 +4104,13 @@ static void bta_dm_disable_conn_down_timer_cback (TIMER_LIST_ENT *p_tle)
         sys_enable_event->hw_module = BTA_SYS_HW_BLUETOOTH;
         bta_sys_sendmsg(sys_enable_event);
     }
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+    else {
+        /* open_fw patch 0014: upstream drops the disable request (disable never completes); this timer callback runs
+         * on the BTU task, so run it right here (upstream does the same when BTA_DISABLE_DELAY is 0). */
+        bta_sys_hw_execute_local(BTA_SYS_API_DISABLE_EVT, BTA_SYS_HW_BLUETOOTH);
+    }
+#endif
 
     bta_dm_cb.disabling = FALSE;
 

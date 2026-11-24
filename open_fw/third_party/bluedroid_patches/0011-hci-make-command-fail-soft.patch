@@ -1,0 +1,129 @@
+diff --git a/open_fw/third_party/bluedroid/host/bluedroid/hci/hci_packet_factory.c b/open_fw/third_party/bluedroid/host/bluedroid/hci/hci_packet_factory.c
+index abee5fa..7c2635c 100644
+--- a/open_fw/third_party/bluedroid/host/bluedroid/hci/hci_packet_factory.c
++++ b/open_fw/third_party/bluedroid/host/bluedroid/hci/hci_packet_factory.c
+@@ -29,6 +29,14 @@
+ 
+ static BT_HDR *make_command_no_params(uint16_t opcode);
+ static BT_HDR *make_command(uint16_t opcode, size_t parameter_size, uint8_t **stream_out);
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++/* open_fw patch 0011: make_command() returns NULL when the command buffer cannot be allocated (upstream asserts);
++ * every builder that writes parameters returns that NULL before touching the stream. controller.c's start_up()
++ * treats a NULL command as a failed start-up (patch 0012). */
++#define OPENFW_RETURN_IF_NO_PACKET(packet) do { if ((packet) == NULL) { return NULL; } } while (0)
++#else
++#define OPENFW_RETURN_IF_NO_PACKET(packet) do { } while (0)
++#endif
+ 
+ // Interface functions
+ 
+@@ -47,6 +55,7 @@ static BT_HDR *make_set_c2h_flow_control(uint8_t enable)
+     uint8_t *stream;
+     const uint8_t parameter_size = 1;
+     BT_HDR *packet = make_command(HCI_SET_HC_TO_HOST_FLOW_CTRL, parameter_size, &stream);
++    OPENFW_RETURN_IF_NO_PACKET(packet);
+ 
+     UINT8_TO_STREAM(stream, enable);
+     return packet;
+@@ -58,6 +67,7 @@ static BT_HDR *make_set_adv_report_flow_control(uint8_t enable, uint16_t num, ui
+     uint8_t *stream;
+     const uint8_t parameter_size = 1 + 2 + 2;
+     BT_HDR *packet = make_command(HCI_VENDOR_BLE_SET_ADV_FLOW_CONTROL, parameter_size, &stream);
++    OPENFW_RETURN_IF_NO_PACKET(packet);
+ 
+     UINT8_TO_STREAM(stream, enable);
+     UINT16_TO_STREAM(stream, num);
+@@ -70,6 +80,7 @@ static BT_HDR *make_host_buffer_size(uint16_t acl_size, uint8_t sco_size, uint16
+     uint8_t *stream;
+     const uint8_t parameter_size = 2 + 1 + 2 + 2; // from each of the parameters
+     BT_HDR *packet = make_command(HCI_HOST_BUFFER_SIZE, parameter_size, &stream);
++    OPENFW_RETURN_IF_NO_PACKET(packet);
+ 
+     UINT16_TO_STREAM(stream, acl_size);
+     UINT8_TO_STREAM(stream, sco_size);
+@@ -103,6 +114,7 @@ static BT_HDR *make_read_local_extended_features(uint8_t page_number)
+     uint8_t *stream;
+     const uint8_t parameter_size = 1;
+     BT_HDR *packet = make_command(HCI_READ_LOCAL_EXT_FEATURES, parameter_size, &stream);
++    OPENFW_RETURN_IF_NO_PACKET(packet);
+ 
+     UINT8_TO_STREAM(stream, page_number);
+     return packet;
+@@ -113,6 +125,7 @@ static BT_HDR *make_write_simple_pairing_mode(uint8_t mode)
+     uint8_t *stream;
+     const uint8_t parameter_size = 1;
+     BT_HDR *packet = make_command(HCI_WRITE_SIMPLE_PAIRING_MODE, parameter_size, &stream);
++    OPENFW_RETURN_IF_NO_PACKET(packet);
+ 
+     UINT8_TO_STREAM(stream, mode);
+     return packet;
+@@ -123,6 +136,7 @@ static BT_HDR *make_write_secure_connections_host_support(uint8_t mode)
+     uint8_t *stream;
+     const uint8_t parameter_size = 1;
+     BT_HDR *packet = make_command(HCI_WRITE_SECURE_CONNS_SUPPORT, parameter_size, &stream);
++    OPENFW_RETURN_IF_NO_PACKET(packet);
+ 
+     UINT8_TO_STREAM(stream, mode);
+     return packet;
+@@ -133,6 +147,7 @@ static BT_HDR *make_set_event_mask(const bt_event_mask_t *event_mask)
+     uint8_t *stream;
+     uint8_t parameter_size = sizeof(bt_event_mask_t);
+     BT_HDR *packet = make_command(HCI_SET_EVENT_MASK, parameter_size, &stream);
++    OPENFW_RETURN_IF_NO_PACKET(packet);
+ 
+     ARRAY8_TO_STREAM(stream, event_mask->as_array);
+     return packet;
+@@ -143,6 +158,7 @@ static BT_HDR *make_ble_write_host_support(uint8_t supported_host, uint8_t simul
+     uint8_t *stream;
+     const uint8_t parameter_size = 1 + 1;
+     BT_HDR *packet = make_command(HCI_WRITE_LE_HOST_SUPPORT, parameter_size, &stream);
++    OPENFW_RETURN_IF_NO_PACKET(packet);
+ 
+     UINT8_TO_STREAM(stream, supported_host);
+     UINT8_TO_STREAM(stream, simultaneous_host);
+@@ -191,6 +207,7 @@ static BT_HDR *make_ble_write_suggested_default_data_length(uint16_t SuggestedMa
+     uint8_t *stream;
+     uint8_t parameter_size = sizeof(uint16_t) + sizeof(uint16_t);
+     BT_HDR *packet = make_command(HCI_BLE_WRITE_DEFAULT_DATA_LENGTH, parameter_size, &stream);
++    OPENFW_RETURN_IF_NO_PACKET(packet);
+ 
+     UINT16_TO_STREAM(stream, SuggestedMaxTxOctets);
+     UINT16_TO_STREAM(stream, SuggestedMaxTxTime);
+@@ -202,6 +219,7 @@ static BT_HDR *make_ble_set_event_mask(const bt_event_mask_t *event_mask)
+     uint8_t *stream;
+     uint8_t parameter_size = sizeof(bt_event_mask_t);
+     BT_HDR *packet = make_command(HCI_BLE_SET_EVENT_MASK, parameter_size, &stream);
++    OPENFW_RETURN_IF_NO_PACKET(packet);
+ 
+     ARRAY8_TO_STREAM(stream, event_mask->as_array);
+     return packet;
+@@ -212,6 +230,7 @@ static BT_HDR *make_write_sync_flow_control_enable(uint8_t enable)
+     uint8_t *stream;
+     const uint8_t parameter_size = 1;
+     BT_HDR *packet = make_command(HCI_WRITE_SCO_FLOW_CTRL_ENABLE, parameter_size, &stream);
++    OPENFW_RETURN_IF_NO_PACKET(packet);
+ 
+     UINT8_TO_STREAM(stream, enable);
+     return packet;
+@@ -222,6 +241,7 @@ static BT_HDR *make_write_default_erroneous_data_report(uint8_t enable)
+     uint8_t *stream;
+     const uint8_t parameter_size = 1;
+     BT_HDR *packet = make_command(HCI_WRITE_ERRONEOUS_DATA_RPT, parameter_size, &stream);
++    OPENFW_RETURN_IF_NO_PACKET(packet);
+ 
+     UINT8_TO_STREAM(stream, enable);
+     return packet;
+@@ -250,7 +270,13 @@ static BT_HDR *make_command_no_params(uint16_t opcode)
+ static BT_HDR *make_command(uint16_t opcode, size_t parameter_size, uint8_t **stream_out)
+ {
+     BT_HDR *packet = HCI_GET_CMD_BUF(parameter_size);
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++    if (packet == NULL) {
++        return NULL; /* open_fw patch 0011: fail soft, see OPENFW_RETURN_IF_NO_PACKET */
++    }
++#else
+     assert(packet != NULL);
++#endif
+ 
+     hci_cmd_metadata_t *metadata = HCI_GET_CMD_METAMSG(packet);
+     metadata->opcode = opcode;

@@ -302,3 +302,97 @@ Lessons from building stage B (QEMU, 2026-11-24):
   (RF-calibration busy-wait at `bt_ctrl` priority) under QEMU. Re-run before suspecting the port. The same `btport`
   step-3 failure also showed up once in plain `test-qemu-bt` (no probe linked; the next three runs passed) while the
   host was building in parallel: the check depends on QEMU's wall-clock pacing, not only on the probe.
+
+## Phone mode (BT=1) on silicon: how to test
+
+What runs: every `BT=1` image without `HCI_PROBE` replaces the legacy phone mode with the Bluedroid session
+(`open_fw/bt_port/bt_xrec_bluedroid.c` + `bt_xrec_fw.c`, plan M4). Host status (2026-11-24): `make -C open_fw
+test-bt-host` runs the whole path end to end against the fake ROM (`tests/bt_host/README.md` scenario P), including
+SSP numeric comparison, bond store, SDP, RFCOMM, XREC, reconnect, restart and teardown with a connected peer. Nothing
+of it has run on silicon yet: the ROM's answers to the newly forwarded commands (`docs/BT_ROM_HCI_MAP.md` §10) are the
+first thing this test checks.
+
+**Known limit until an entropy source is registered in firmware** (plan live log, interim deviation 5):
+`bt_entropy_get()` fails closed, so the XREC PIN is not issued (`+XREC:PAIR` answers `+XREC:ERR,PAIRCLOSED`) and
+`+XREC:CHAL` closes the link. Everything below the XREC authentication (radio, Bluedroid over `bt_ctrl`/ROM, pairing,
+bonds, SDP, RFCOMM, `+XREC:PING`, `+XREC:ERR,LOCKED` for privileged commands, reconnect, BT exit) is testable now.
+Bluedroid's Classic paths never ask for randomness (only BLE code calls `esp_random()`), so pairing does not hit the
+`0xB0` entropy fatal.
+
+**Build and flash** (as the probe recipe above; `update-up` writes `dumps/firmware_2M_openfw.bin`, which QEMU gates
+overwrite, so build right before flashing):
+```bash
+B=/tmp/sl6801_openfw_bt_phone
+make -C open_fw BT=1 BUILD_DIR=$B update-up        # "Packed hybrid FIRM ... 732,000 B" (2026-11-24), 0 warnings
+sudo env OPENFW_FIRM_BIN=$B/open_fw_firm.bin python3 tools/dev_cycle.py flash
+```
+
+**On the device:** Home -> the fourth tile (Bluetooth) -> ENTER opens the BT screen and starts the session
+(`run_bt_xrec_mode()`, `src/main.c`). Name `Cassini_1D` (eFuse address `02:CA:55:00:01:1D` on the bench unit), CoD
+0x200404, connectable but not discoverable. **ENTER on the BT screen** opens the 60 s pairing window
+(`bt_xrec_open_pairing(60000)`: discoverable; the numeric-comparison value is shown in the BT screen's "PIN" toast while
+a pairing waits). **BACK** leaves BT mode (`bt_xrec_stop()`: graceful teardown, 2 s hard deadline). Sliding REC on also
+leaves it.
+
+**Laptop (BlueZ):**
+```bash
+sudo btmon -w /tmp/phone.btsnoop &                  # HCI trace of the laptop side, for any failure
+bluetoothctl
+  remove 02:CA:55:00:01:1D                          # forget an old bond (the device's bond store starts empty)
+  agent DisplayYesNo                                # numeric comparison needs a display + yes/no agent on both sides
+  default-agent
+  scan on                                           # press ENTER on the device's BT screen first: Cassini_1D appears
+  pair 02:CA:55:00:01:1D                            # "[agent] Confirm passkey NNNNNN (yes/no)": the device shows the
+                                                    # same NNNNNN in its PIN toast and confirms by itself inside the
+                                                    # window; answer yes
+  trust 02:CA:55:00:01:1D
+  info 02:CA:55:00:01:1D                            # Paired: yes, Bonded: yes, UUID: Serial Port (00001101-...)
+  scan off
+  quit
+python3 tools/bt_sync.py --mac 02:CA:55:00:01:1D --ping            # native-SPP path (no HFP handshake)
+python3 tools/bt_sync.py --mac 02:CA:55:00:01:1D --pair 000000     # expected for now: "+XREC:ERR,PAIRCLOSED"
+python3 - <<'PY'                                    # raw RFCOMM channel 1 (what the Android app does with UUID 0x1101)
+import socket
+s = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
+s.settimeout(5); s.connect(("02:CA:55:00:01:1D", 1))
+for c in (b"+XREC:PING\r", b"+XREC:LS\r"):
+    s.send(c); print(s.recv(512))
+s.close()
+PY
+```
+Expected: `bt_sync.py` prints `Native SPP (OpenFW): device silent after connect, skipping the HFP handshake.` and
+`Ping response: +XREC:PONG,openfw_v5,v5,bound=0,auth=0,pair=0` (`pair=1` needs the XREC PIN, i.e. entropy; on the
+host, with its TEST-ONLY source, it is 1 inside the window); the raw socket gets the same PONG, then
+`+XREC:ERR,LOCKED` for LS (no XREC authentication without entropy).
+
+**Then, in order:**
+1. *Reconnect with the stored key:* `bluetoothctl disconnect 02:CA:55:00:01:1D`, wait for the window to close (60 s)
+   or leave and re-enter BT mode, run `--ping` again: it must connect with no pairing prompt.
+2. *Bond persistence:* BACK (BT off), reboot the device (`sudo python3 tools/dev_cycle.py dfu`, then `boot`), re-enter
+   BT mode, `--ping`: still no pairing prompt (bond loaded from `SD:/bt_bonds.bin` before `esp_bluedroid_init()`).
+3. *Exit with a link up:* keep the raw socket open (`s.connect` then `input()`), press BACK on the device: the
+   device must leave BT mode in about a second with no reboot (host: ~0.64 s with data outstanding, patch 0026), and
+   the laptop sees the link drop.
+4. *Pairing refused with the window closed:* from a second laptop/phone, pair while the window is closed: refused.
+5. *Just Works refused:* `bluetoothctl` with `agent NoInputNoOutput`, window open, `pair`: BlueZ reports success
+   briefly, then the device removes the bond and drops the link.
+
+**Device log** (`g_openfw_log`; read it after BACK, with USB up: `sudo python3 tools/dev_cycle.py log >
+/tmp/bt_phone_ring.log`). Expected lines, in order: `BT start (Bluedroid):` `Cassini_1D` · `BT XREC READY (SPP
+channel 1)` · `BT XREC PIN unavailable: entropy not ready (SSP pairing window open)` · `BT SSP numeric comparison
+accepted (pairing window), value NNNNNN` · `BT SSP bonded (numeric comparison, MITM)` · `BT XREC SPP open, mtu N` ·
+`BT XREC SPP closed` · `BT stopped` · `BT bt_recover stack free words N`. Refusals: `BT SSP numeric comparison
+rejected: pairing window closed`, `BT SSP bond removed: Just Works / unauthenticated key`, `BT XREC CHAL refused:
+entropy not ready`. Faults: `BT bring-up failed, code N` (1 `bt_ctrl_open`, 2 HCI driver attach, 3
+`esp_bluedroid_init`, 4 `esp_bluedroid_enable`: the HCI Reset .. init chain through the ROM), `BT fault, reason N` /
+`BT shutdown: hard path, reason N` (`BT_XREC_FAULT_*` in `bt_xrec_bluedroid.h`: 2 bring-up timeout, 4 SPP config
+timeout, 6 platform, 7 teardown deadline), `BT platform fault N` (1 `bt_ctrl_run()` stuck > 3 s, 2 `bt_ctrl` fault,
+3 HCI command timeout), `BT bt_ctrl fault, first code N`. The hard path reboots and leaves fault record `0xFA0170B1`
+(`dev_cycle.py` "previous fault"; `AON_BACKUP(1)` = reason); BT stays refused for that boot.
+
+**Capture on failure:** the ring log (above, before anything else logs), `/tmp/phone.btsnoop` (laptop HCI), the
+`bluetoothctl` transcript, `SD:/bt_bonds.bin` and `SD:/cassini.key` (USB disk mode), the `dev_cycle.py status`
+output (previous fault), and the BT screen state. A first failure in pairing or connection set-up is most likely a ROM
+message the host has not seen yet: compare the laptop's btmon trace with `docs/BT_ROM_HCI_MAP.md` §10 (which ROM reply
+or event each step needs) and check the opcode-table rows of the commands around the failure. Per the hardware-access
+rule, leave the latest BT-branch build on the device afterwards.

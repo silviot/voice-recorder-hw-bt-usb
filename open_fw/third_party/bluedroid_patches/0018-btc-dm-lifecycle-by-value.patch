@@ -1,0 +1,60 @@
+diff --git a/open_fw/third_party/bluedroid/host/bluedroid/btc/core/btc_dm.c b/open_fw/third_party/bluedroid/host/bluedroid/btc/core/btc_dm.c
+index ed5e2c0..c0f2d99 100644
+--- a/open_fw/third_party/bluedroid/host/bluedroid/btc/core/btc_dm.c
++++ b/open_fw/third_party/bluedroid/host/bluedroid/btc/core/btc_dm.c
+@@ -98,6 +98,27 @@ void btc_dm_sec_arg_deep_copy(btc_msg_t *msg, void *dst, void *src)
+ **
+ *******************************************************************************/
+ 
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++/* open_fw patch 0018: BTC side of an enable/disable completion posted by value (see btc_dm_sec_evt). */
++static void btc_dm_lifecycle_evt_work(void *ctx)
++{
++    union {
++        btc_msg_t msg;
++        uint8_t raw[sizeof(btc_msg_t) + sizeof(btc_dm_sec_args_t)];
++    } buf;
++    btc_dm_sec_args_t arg;
++
++    memset(&buf, 0, sizeof(buf));
++    memset(&arg, 0, sizeof(arg));
++    buf.msg.sig = BTC_SIG_API_CB;
++    buf.msg.pid = BTC_PID_DM_SEC;
++    buf.msg.act = (uint8_t)((uintptr_t)ctx >> 8);
++    arg.sec.enable.status = (tBTA_STATUS)((uintptr_t)ctx & 0xFFu);
++    memcpy(buf.msg.arg, &arg, sizeof(arg)); /* same layout as btc_transfer_context()'s copy */
++    btc_dm_sec_cb_handler(&buf.msg);
++}
++#endif
++
+ void btc_dm_sec_evt(tBTA_DM_SEC_EVT event, tBTA_DM_SEC *data)
+ {
+     btc_msg_t msg = {0};
+@@ -106,9 +127,27 @@ void btc_dm_sec_evt(tBTA_DM_SEC_EVT event, tBTA_DM_SEC *data)
+     msg.pid = BTC_PID_DM_SEC;
+     msg.act = event;
+ 
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++    if (btc_transfer_context(&msg, (btc_dm_sec_args_t *)data,
++                             data == NULL ? 0 : sizeof(btc_dm_sec_args_t),
++                             btc_dm_sec_arg_deep_copy, btc_dm_sec_arg_deep_free) != BT_STATUS_SUCCESS &&
++            (event == BTA_DM_ENABLE_EVT || event == BTA_DM_DISABLE_EVT)) {
++        /* open_fw patch 0018: the hand-off of an enable/disable completion could not be allocated (upstream drops it
++         * and esp_bluedroid_enable()/disable() wait forever). Both carry at most a status, so post an allocation-free
++         * work item (copied by value into BTC's queue 0, behind the messages already there) that runs the same BTC
++         * handler from a stack message. Other DM events stay best-effort, as upstream. */
++        uintptr_t ctx = ((uintptr_t)event << 8) | (event == BTA_DM_ENABLE_EVT && data != NULL ? data->enable.status : 0);
++        BTC_TRACE_WARNING("%s: no memory for DM event %u, posting it by value", __func__, (unsigned)event);
++        if (!osi_thread_post(btc_get_current_thread(), btc_dm_lifecycle_evt_work, (void *)ctx, 0,
++                             OSI_THREAD_MAX_TIMEOUT)) {
++            BTC_TRACE_ERROR("%s: DM event %u lost", __func__, (unsigned)event); /* BTC gone: nobody is waiting */
++        }
++    }
++#else
+     btc_transfer_context(&msg, (btc_dm_sec_args_t *)data,
+                             data == NULL ? 0 : sizeof(btc_dm_sec_args_t),
+                             btc_dm_sec_arg_deep_copy, btc_dm_sec_arg_deep_free);
++#endif
+ }
+ 
+ static void btc_enable_bluetooth_evt(tBTA_STATUS status)

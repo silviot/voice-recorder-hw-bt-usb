@@ -806,7 +806,9 @@ BOOLEAN btm_set_bond_type_dev(BD_ADDR bd_addr, tBTM_BOND_TYPE bond_type)
 void btm_sec_dev_init(void)
 {
     btm_cb.p_sec_dev_rec_list = list_new(osi_free_func);
+#if !(defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID) /* open_fw patch 0022: checked by btu_init_core_ok() */
     assert(btm_cb.p_sec_dev_rec_list != NULL);
+#endif
 }
 
 /*******************************************************************************

@@ -1,0 +1,1154 @@
+/* bt_xrec_bluedroid: phone-mode XREC session over Bluedroid SPP for BT=1 (see bt_xrec_bluedroid.h).
+ *
+ * Legacy mapping (F: = src/bt_hci.c, S: = src/bt_spp.c, line numbers of this tree; the legacy path drives the same ROM
+ * on silicon today and is the reference for names, ids and behaviour):
+ *   - Device name "Cassini_" + hex(bd_addr[0]) (F:2005-2012); BD_ADDR from eFuse (F:1990-2003, without the legacy
+ *     timer-derived fallback: plan M1 "never timer-derived"; see bt_xrec_plat_identity).
+ *   - Class of device 0x200404 (F:1550), SPP server on RFCOMM channel 1 named "Cassini" with an SDP record for
+ *     UUID 0x1101 (S:341-353), so tools/bt_sync.py (channel 1) and the Android app (SPP UUID) find it unchanged.
+ *   - Connectable always while ready, discoverable only while the pairing window is open (F:1559, F:2092-2095,
+ *     F:2113-2118), discoverability closed on a successful XREC PAIR (F:1807-1810).
+ *   - XREC PIN for the window (F:2079-2089), now from the DRBG (plan M2: fails closed, no timer fallback).
+ *   - Deferred reboot / OTA / DFU after 250 ms once the reply left (F:1823-1835, F:1896-1901, F:2138-2148), now
+ *     through bt_shutdown() first (plan M4).
+ *   - bt_xrec_stop (F:2151-2176) = bt_shutdown(): graceful Bluedroid/bt_ctrl teardown with the M1 recovery ladder.
+ *   - bt_xrec_get_status (F:2178-2197): same fields, equivalent meaning (see bt_xrec_get_status below).
+ * Deliberate differences (plan M4 pairing policy): IO capability DisplayYesNo instead of NoInputNoOutput (F:1674),
+ * numeric comparison accepted only inside the pairing window, legacy PIN pairing rejected instead of answering "0000"
+ * (F:1636-1647), Just Works / passkey bonds removed, XREC traffic only on MITM-authenticated, encrypted links.
+ * SPDX-License-Identifier: MIT */
+#include <stdbool.h>
+#include <stdint.h>
+#include <string.h>
+
+#include "openfw.h"
+#include "esp_err.h"
+#include "esp_gap_bt_api.h"
+#include "esp_spp_api.h"
+#include "bt_xrec_bluedroid.h"
+
+_Static_assert((BT_XREC_RX_RING & (BT_XREC_RX_RING - 1u)) == 0u, "RX ring size must be a power of two");
+_Static_assert((BT_XREC_TX_RING & (BT_XREC_TX_RING - 1u)) == 0u, "TX ring size must be a power of two");
+_Static_assert(BT_XREC_TX_RING >= 12u + XREC_MAX_CHUNK, "one GETS frame must fit the TX ring (send is all-or-nothing)");
+_Static_assert(BT_XREC_SPP_TX_BUF >= ESP_SPP_MIN_TX_BUFFER_SIZE && BT_XREC_SPP_TX_BUF <= ESP_SPP_MAX_TX_BUFFER_SIZE,
+               "esp_spp_cfg_t.tx_buffer_size range");
+_Static_assert(BT_XREC_WRITE_MAX <= BT_XREC_SPP_TX_BUF, "a write must fit BTC's ring");
+
+/* ---- event records (BTC -> app). DATA and WRITE coalesce with the newest record of the same kind and handle. ---- */
+enum {
+    EV_DATA = 1, EV_WRITE, EV_CONG, EV_SPP_INIT, EV_SPP_START, EV_SRV_OPEN, EV_CLOSE, EV_RX_OVERFLOW,
+    EV_CFM_REQ, EV_PIN_REQ, EV_KEY_REQ, EV_KEY_NOTIF, EV_AUTH_CMPL, EV_ACL_CONN, EV_ACL_DISC,
+};
+
+typedef struct {
+    uint8_t  type;
+    uint8_t  status;
+    uint8_t  extra;        /* START: scn; AUTH_CMPL: link key type; CONG: cong */
+    uint8_t  bda[6];
+    uint32_t handle;
+    uint32_t val;          /* DATA/WRITE: bytes; CFM_REQ: number; SRV_OPEN: peer MTU */
+} ev_t;
+
+typedef struct {
+    xrec_ctx_t xrec;
+    uint8_t    rx[BT_XREC_RX_RING];
+    uint8_t    tx[BT_XREC_TX_RING];
+} bufs_t;
+
+typedef struct {
+    uint8_t  valid;
+    uint8_t  bda[6];
+} bda_slot_t;
+
+static struct {
+    /* ---- shared with the BTC callbacks: only under bt_xrec_plat_lock() ---- */
+    uint8_t  cb_open;          /* callbacks may touch b->rx and the queue */
+    uint8_t  evq_lost;
+    ev_t     evq[BT_XREC_EVQ_SLOTS];
+    uint32_t ev_head, ev_tail; /* free-running */
+    uint32_t rx_head, rx_tail; /* free-running byte counters into b->rx */
+    uint32_t rx_frames;        /* ESP_SPP_DATA_IND_EVT count (status rx_acl_pkts) */
+    uint32_t rx_overflows, evq_lost_n;
+    bufs_t  *b;
+
+    /* ---- app task only ---- */
+    uint8_t  state;
+    uint32_t t_state;
+    uint8_t  bd[6];
+    char     name[16];
+    uint8_t  spp_inited;
+    uint8_t  window_open, xrec_pin_issued;
+    uint32_t window_deadline;
+    uint8_t  scan_disc, scan_applied;      /* scan_applied: 0 none, 1 connectable, 2 connectable+discoverable */
+    uint8_t  ssp_showing;
+    char     ssp_digits[8];
+    uint32_t ssp_deadline;
+    bda_slot_t cfm_ok, auth_ok, reject;    /* accepted numeric comparison, accepted MITM bond, policy reject */
+    uint32_t acl_links;
+    /* connection */
+    uint8_t  conn_open, conn_authorized, conn_closing, cong, entropy_fail, xrec_reset_pending;
+    uint32_t conn_handle;
+    uint8_t  conn_bda[6];
+    uint16_t mtu;
+    uint32_t tx_head, tx_tail, inflight;
+    /* deferred reboot */
+    uint8_t  reboot_mode;
+    uint32_t reboot_at;
+    uint32_t last_fault;
+    bt_xrec_debug_t d;          /* counters only (the rest is filled by bt_xrec_get_debug) */
+} s;
+
+static volatile uint8_t s_spp_uninit_seen;
+
+/* ============================================ helpers ========================================================== */
+static bool bda_eq(const uint8_t a[6], const uint8_t b[6]) { return memcmp(a, b, 6u) == 0; }
+
+static bool slot_is(const bda_slot_t *sl, const uint8_t bda[6]) { return sl->valid && bda_eq(sl->bda, bda); }
+
+static void slot_set(bda_slot_t *sl, const uint8_t bda[6])
+{
+    sl->valid = 1u;
+    memcpy(sl->bda, bda, 6u);
+}
+
+static bool time_reached(uint32_t now, uint32_t at) { return (int32_t)(now - at) >= 0; }
+
+static void set_state(uint8_t st)
+{
+    s.state = st;
+    s.t_state = bt_xrec_plat_now_ms();
+}
+
+/* ============================================ BTC side (copy + notify only) ===================================== */
+static bool push_locked(const ev_t *e)
+{
+    if (s.ev_head != s.ev_tail && (e->type == EV_DATA || e->type == EV_WRITE)) {
+        ev_t *last = &s.evq[(s.ev_head - 1u) % BT_XREC_EVQ_SLOTS];
+        if (last->type == e->type && last->handle == e->handle && last->val <= UINT32_MAX - e->val) {
+            last->val += e->val;
+            return true;
+        }
+    }
+    if (s.ev_head - s.ev_tail >= BT_XREC_EVQ_SLOTS) {
+        s.evq_lost = 1u;
+        s.evq_lost_n++;
+        return false;
+    }
+    s.evq[s.ev_head % BT_XREC_EVQ_SLOTS] = *e;
+    s.ev_head++;
+    return true;
+}
+
+static void post(const ev_t *e)
+{
+    bool queued = false;
+    bt_xrec_plat_lock();
+    if (s.cb_open) {
+        (void)push_locked(e);
+        queued = true;
+    }
+    bt_xrec_plat_unlock();
+    if (queued) {
+        bt_xrec_plat_notify_app();
+    }
+}
+
+static void on_data_ind(uint32_t handle, const uint8_t *data, uint16_t len)
+{
+    bool queued = false;
+    bt_xrec_plat_lock();
+    if (s.cb_open && s.b != NULL && data != NULL && len > 0u) {
+        s.rx_frames++;
+        uint32_t used = s.rx_head - s.rx_tail;
+        ev_t e = { 0 };
+        e.handle = handle;
+        if ((uint32_t)len > BT_XREC_RX_RING - used) {
+            /* No backpressure exists in ESP_SPP_MODE_CB: never drop silently, the app closes this connection. */
+            s.rx_overflows++;
+            e.type = EV_RX_OVERFLOW;
+            (void)push_locked(&e);
+        } else {
+            uint32_t off = s.rx_head & (BT_XREC_RX_RING - 1u);
+            uint32_t first = BT_XREC_RX_RING - off;
+            if (first > len) {
+                first = len;
+            }
+            memcpy(&s.b->rx[off], data, first);
+            memcpy(&s.b->rx[0], data + first, (size_t)len - first);
+            e.type = EV_DATA;
+            e.val = len;
+            if (push_locked(&e)) {
+                s.rx_head += len;
+            }
+        }
+        queued = true;
+    }
+    bt_xrec_plat_unlock();
+    if (queued) {
+        bt_xrec_plat_notify_app();
+    }
+}
+
+/* BTC hands callbacks the copy it placed right after the 4-byte btc_msg_t: 4-aligned, which is all Cortex-M4 needs
+ * for these pointer-holding unions; x86-64 UBSan (make test-bt-host) wants 8. Host-only finding, not a target issue. */
+#define BTC_CB_ARG_ALIGN4 __attribute__((no_sanitize("alignment")))
+
+BTC_CB_ARG_ALIGN4
+static void spp_cb(esp_spp_cb_event_t event, esp_spp_cb_param_t *p)
+{
+    ev_t e = { 0 };
+    if (p == NULL) {
+        return;
+    }
+    switch (event) {
+    case ESP_SPP_INIT_EVT:
+        e.type = EV_SPP_INIT;
+        e.status = (uint8_t)p->init.status;
+        break;
+    case ESP_SPP_UNINIT_EVT:
+        s_spp_uninit_seen = 1u;   /* read by the teardown job; nothing else to do */
+        return;
+    case ESP_SPP_START_EVT:
+        e.type = EV_SPP_START;
+        e.status = (uint8_t)p->start.status;
+        e.extra = p->start.scn;
+        e.handle = p->start.handle;
+        break;
+    case ESP_SPP_SRV_OPEN_EVT:
+        e.type = EV_SRV_OPEN;
+        e.status = (uint8_t)p->srv_open.status;
+        e.handle = p->srv_open.handle;
+        memcpy(e.bda, p->srv_open.rem_bda, 6u);
+        e.val = p->srv_open.status == ESP_SPP_SUCCESS ? bt_xrec_plat_spp_peer_mtu(p->srv_open.handle) : 0u;
+        break;
+    case ESP_SPP_CLOSE_EVT:
+        e.type = EV_CLOSE;
+        e.handle = p->close.handle;
+        break;
+    case ESP_SPP_DATA_IND_EVT:
+        on_data_ind(p->data_ind.handle, p->data_ind.data, p->data_ind.len);
+        return;
+    case ESP_SPP_CONG_EVT:
+        e.type = EV_CONG;
+        e.handle = p->cong.handle;
+        e.extra = p->cong.cong ? 1u : 0u;
+        break;
+    case ESP_SPP_WRITE_EVT:
+        if (p->write.status != ESP_SPP_SUCCESS || p->write.len <= 0) {
+            return;
+        }
+        e.type = EV_WRITE;
+        e.handle = p->write.handle;
+        e.val = (uint32_t)p->write.len;
+        break;
+    default:
+        return;
+    }
+    post(&e);
+}
+
+BTC_CB_ARG_ALIGN4
+static void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *p)
+{
+    ev_t e = { 0 };
+    if (p == NULL) {
+        return;
+    }
+    switch (event) {
+    case ESP_BT_GAP_CFM_REQ_EVT:   /* Just Works never gets here: btc_dm.c:542 auto-confirms it (see AUTH_CMPL) */
+        e.type = EV_CFM_REQ;
+        memcpy(e.bda, p->cfm_req.bda, 6u);
+        e.val = p->cfm_req.num_val;
+        break;
+    case ESP_BT_GAP_PIN_REQ_EVT:
+        e.type = EV_PIN_REQ;
+        memcpy(e.bda, p->pin_req.bda, 6u);
+        break;
+    case ESP_BT_GAP_KEY_REQ_EVT:
+        e.type = EV_KEY_REQ;
+        memcpy(e.bda, p->key_req.bda, 6u);
+        break;
+    case ESP_BT_GAP_KEY_NOTIF_EVT:
+        e.type = EV_KEY_NOTIF;
+        memcpy(e.bda, p->key_notif.bda, 6u);
+        break;
+    case ESP_BT_GAP_AUTH_CMPL_EVT:
+        e.type = EV_AUTH_CMPL;
+        memcpy(e.bda, p->auth_cmpl.bda, 6u);
+        e.status = (uint8_t)p->auth_cmpl.stat;
+        e.extra = p->auth_cmpl.lk_type;
+        break;
+    case ESP_BT_GAP_ACL_CONN_CMPL_STAT_EVT:
+        e.type = EV_ACL_CONN;
+        e.status = (uint8_t)p->acl_conn_cmpl_stat.stat;
+        e.handle = p->acl_conn_cmpl_stat.handle;
+        memcpy(e.bda, p->acl_conn_cmpl_stat.bda, 6u);
+        break;
+    case ESP_BT_GAP_ACL_DISCONN_CMPL_STAT_EVT:
+        e.type = EV_ACL_DISC;
+        e.handle = p->acl_disconn_cmpl_stat.handle;
+        memcpy(e.bda, p->acl_disconn_cmpl_stat.bda, 6u);
+        break;
+    default:
+        return;
+    }
+    post(&e);
+}
+
+/* ============================================ app side ========================================================== */
+static void fault(uint32_t reason);
+
+static void tx_drop(void)
+{
+    s.tx_head = s.tx_tail = 0u;
+}
+
+/* Disconnect cancels pending work and clears XREC authorization (plan M4), immediately, before Bluedroid's CLOSE.
+ * This can run inside xrec_proto (send -> tx_kick -> write error), so only the auth flag is cleared here and the full
+ * xrec_on_disconnect() (which aborts a staged PUT) runs at the next xrec_reset_flush(), outside xrec_proto. */
+static void conn_close_request(const char *why)
+{
+    if (!s.conn_open || s.conn_closing) {
+        return;
+    }
+    s.conn_closing = 1u;
+    tx_drop();
+    if (s.b != NULL) {
+        s.b->xrec.auth = 0u;
+        s.xrec_reset_pending = 1u;
+    }
+    bt_xrec_plat_log(why);
+    esp_err_t r = esp_spp_disconnect(s.conn_handle);
+    if (r != ESP_OK) {
+        bt_xrec_plat_log_u32("BT XREC esp_spp_disconnect failed", (uint32_t)r);
+    }
+}
+
+static void xrec_reset_flush(void)
+{
+    if (s.xrec_reset_pending && s.b != NULL) {
+        xrec_on_disconnect(&s.b->xrec);
+    }
+    s.xrec_reset_pending = 0u;
+}
+
+static void conn_reset(void)
+{
+    if (s.b != NULL) {
+        xrec_on_disconnect(&s.b->xrec);
+    }
+    s.xrec_reset_pending = 0u;
+    s.conn_open = s.conn_authorized = s.conn_closing = s.cong = s.entropy_fail = 0u;
+    s.conn_handle = 0u;
+    s.mtu = 0u;
+    s.inflight = 0u;
+    tx_drop();
+}
+
+/* Hand queued bytes to esp_spp_write() while BTC accepts them. Every result is checked: ESP_ERR_NO_MEM = BTC ring
+ * full (congested until ESP_SPP_CONG_EVT), anything else = the connection is gone or broken. */
+static void tx_kick(void)
+{
+    while (s.conn_open && !s.conn_closing && !s.cong && s.tx_head != s.tx_tail) {
+        uint32_t used = s.tx_head - s.tx_tail;
+        uint32_t off = s.tx_tail & (BT_XREC_TX_RING - 1u);
+        uint32_t n = BT_XREC_TX_RING - off;
+        if (n > used) {
+            n = used;
+        }
+        if (n > BT_XREC_WRITE_MAX) {
+            n = BT_XREC_WRITE_MAX;
+        }
+        if (n > BT_XREC_INFLIGHT_MAX - s.inflight) {
+            n = BT_XREC_INFLIGHT_MAX - s.inflight;
+        }
+        if (n == 0u) {
+            return;              /* resumes on ESP_SPP_WRITE_EVT */
+        }
+        esp_err_t r = esp_spp_write(s.conn_handle, (int)n, &s.b->tx[off]);
+        if (r == ESP_OK) {       /* BTC copied the bytes into its ring (btc_spp.c esp_spp_write CB mode) */
+            s.tx_tail += n;
+            s.inflight += n;
+            s.d.tx_writes++;
+            s.d.tx_bytes += n;
+        } else if (r == ESP_ERR_NO_MEM) {
+            s.cong = 1u;
+            s.d.tx_nomem++;
+            return;
+        } else {
+            s.d.tx_errors++;
+            bt_xrec_plat_log_u32("BT XREC esp_spp_write error", (uint32_t)r);
+            conn_close_request("BT XREC close: write failed");
+            return;
+        }
+    }
+}
+
+/* ---- xrec_proto ops owned by the session ---- */
+static int xo_send(void *user, const uint8_t *data, uint16_t len)
+{
+    (void)user;
+    if (!s.conn_open || !s.conn_authorized || s.conn_closing || s.entropy_fail || s.b == NULL) {
+        return -1;
+    }
+    if (len == 0u) {
+        return 0;
+    }
+    if (data == NULL) {
+        return -1;
+    }
+    uint32_t used = s.tx_head - s.tx_tail;
+    if ((uint32_t)len > BT_XREC_TX_RING - used) {
+        s.d.tx_busy++;
+        return -1;               /* all-or-nothing, like S:845 bt_spp_send: xrec_proto retries LS/GETS next poll */
+    }
+    uint32_t off = s.tx_head & (BT_XREC_TX_RING - 1u);
+    uint32_t first = BT_XREC_TX_RING - off;
+    if (first > len) {
+        first = len;
+    }
+    memcpy(&s.b->tx[off], data, first);
+    memcpy(&s.b->tx[0], data + first, (size_t)len - first);
+    s.tx_head += len;
+    tx_kick();
+    return 0;
+}
+
+static uint16_t xo_get_mtu(void *user)
+{
+    (void)user;
+    return s.conn_open ? s.mtu : 0u;
+}
+
+static void xo_entropy(void *user, uint8_t out[16])
+{
+    (void)user;
+    if (bt_xrec_plat_entropy(out, 16u) != 0) {
+        /* Fail closed (plan M2): no fixed fallback. The reply is never sent and the link is closed by the next poll. */
+        memset(out, 0, 16u);
+        if (!s.entropy_fail) {
+            bt_xrec_plat_log("BT XREC CHAL refused: entropy not ready");
+        }
+        s.entropy_fail = 1u;
+    }
+}
+
+static void window_close(void)
+{
+    s.window_open = 0u;
+    s.xrec_pin_issued = 0u;
+    if (s.b != NULL) {
+        xrec_close_pairing(&s.b->xrec);
+    }
+}
+
+static void xo_bound_key(void *user, const uint8_t key[32])
+{
+    (void)user;
+    bt_xrec_plat_log("BT XREC PAIRED");
+    window_close();              /* legacy F:1805-1810: window and discoverability closed */
+    bt_xrec_plat_save_bound_key(key);
+}
+
+static void defer_reboot(uint8_t mode)
+{
+    s.reboot_mode = mode;
+    s.reboot_at = bt_xrec_plat_now_ms() + BT_XREC_REBOOT_DELAY_MS;
+}
+
+static void xo_reboot(void *user) { (void)user; defer_reboot(1u); }
+static void xo_ota(void *user) { (void)user; defer_reboot(2u); }
+static void xo_dfu(void *user) { (void)user; defer_reboot(3u); }
+
+/* ---- pairing policy ---- */
+static bool is_bonded(const uint8_t bda[6])
+{
+    int n = esp_bt_gap_get_bond_device_num();
+    if (n <= 0) {
+        return false;
+    }
+    esp_bd_addr_t list[8];
+    int cnt = (int)(sizeof(list) / sizeof(list[0]));
+    if (esp_bt_gap_get_bond_device_list(&cnt, list) != ESP_OK) {
+        return false;
+    }
+    for (int i = 0; i < cnt && i < (int)(sizeof(list) / sizeof(list[0])); i++) {
+        if (bda_eq(list[i], bda)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* XREC traffic only on a link that is encrypted (SPP security mask) and MITM-authenticated: either this link just
+ * bonded through an accepted numeric comparison, or the peer holds a bond made that way (unauthenticated bonds are
+ * removed at AUTH_CMPL, so every stored bond passed the same check). */
+static bool link_authorized(const uint8_t bda[6])
+{
+    if (slot_is(&s.reject, bda)) {
+        return false;
+    }
+    return slot_is(&s.auth_ok, bda) || is_bonded(bda);
+}
+
+static void reject_bond(const uint8_t bda[6], const char *why)
+{
+    slot_set(&s.reject, bda);
+    s.d.bonds_removed++;
+    bt_xrec_plat_log(why);
+    esp_err_t r = esp_bt_gap_remove_bond_device((uint8_t *)bda);   /* also takes the ACL down (bta_dm_remove_device) */
+    if (r != ESP_OK) {
+        bt_xrec_plat_log_u32("BT SSP remove_bond_device failed", (uint32_t)r);
+    }
+    if (s.conn_open && bda_eq(s.conn_bda, bda)) {
+        conn_close_request("BT XREC close: link not MITM-authenticated");
+    }
+}
+
+static void digits6(char out[8], uint32_t v)
+{
+    v %= 1000000u;
+    for (int i = 5; i >= 0; i--) {
+        out[i] = (char)('0' + (v % 10u));
+        v /= 10u;
+    }
+    out[6] = '\0';
+    out[7] = '\0';
+}
+
+static void on_gap_event(const ev_t *e)
+{
+    esp_err_t r;
+    switch (e->type) {
+    case EV_CFM_REQ: {
+        bool accept = s.window_open && s.state == BT_XREC_ST_READY;
+        /* INTERIM (plan M4 needs a local accept/reject prompt with a 30 s timeout; its strings belong to step 8):
+         * auto-confirm inside the user-opened pairing window only, show the value through bt_status_t.pair_pin
+         * (the BT screen's existing "PIN" toast) and log it. */
+        r = esp_bt_gap_ssp_confirm_reply((uint8_t *)e->bda, accept);
+        if (r != ESP_OK) {
+            bt_xrec_plat_log_u32("BT SSP confirm_reply failed", (uint32_t)r);
+        }
+        if (accept) {
+            s.d.ssp_accepted++;
+            slot_set(&s.cfm_ok, e->bda);
+            digits6(s.ssp_digits, e->val);
+            s.ssp_showing = 1u;
+            s.ssp_deadline = bt_xrec_plat_now_ms() + BT_XREC_SSP_SHOW_MS;
+            bt_xrec_plat_log_u32("BT SSP numeric comparison accepted (pairing window), value", e->val % 1000000u);
+        } else {
+            s.d.ssp_rejected++;
+            bt_xrec_plat_log("BT SSP numeric comparison rejected: pairing window closed");
+        }
+        break;
+    }
+    case EV_PIN_REQ: {
+        esp_bt_pin_code_t pin;
+        memset(pin, 0, sizeof(pin));
+        s.d.pin_rejected++;
+        r = esp_bt_gap_pin_reply((uint8_t *)e->bda, false, 0u, pin);
+        bt_xrec_plat_log("BT legacy PIN pairing rejected");
+        if (r != ESP_OK) {
+            bt_xrec_plat_log_u32("BT pin_reply failed", (uint32_t)r);
+        }
+        break;
+    }
+    case EV_KEY_REQ:
+        s.d.passkey_rejected++;
+        r = esp_bt_gap_ssp_passkey_reply((uint8_t *)e->bda, false, 0u);
+        bt_xrec_plat_log("BT SSP passkey entry rejected");
+        if (r != ESP_OK) {
+            bt_xrec_plat_log_u32("BT passkey_reply failed", (uint32_t)r);
+        }
+        break;
+    case EV_KEY_NOTIF:
+        /* Passkey display has no reply: mark the peer so the resulting bond is removed at AUTH_CMPL. */
+        s.d.passkey_rejected++;
+        slot_set(&s.reject, e->bda);
+        bt_xrec_plat_log("BT SSP passkey display rejected");
+        break;
+    case EV_AUTH_CMPL:
+        if (s.ssp_showing && slot_is(&s.cfm_ok, e->bda)) {
+            s.ssp_showing = 0u;
+        }
+        if (e->status == ESP_BT_STATUS_SUCCESS) {
+            bool mitm = e->extra == ESP_BT_LINK_KEY_AUTHED_COMB_P192 || e->extra == ESP_BT_LINK_KEY_AUTHED_COMB_P256;
+            if (mitm && slot_is(&s.cfm_ok, e->bda) && !slot_is(&s.reject, e->bda)) {
+                slot_set(&s.auth_ok, e->bda);
+                bt_xrec_plat_log("BT SSP bonded (numeric comparison, MITM)");
+            } else {
+                reject_bond(e->bda, mitm ? "BT SSP bond removed: not confirmed in the pairing window"
+                                         : "BT SSP bond removed: Just Works / unauthenticated key");
+            }
+        } else {
+            bt_xrec_plat_log_u32("BT SSP pairing failed, status", e->status);
+        }
+        if (slot_is(&s.cfm_ok, e->bda)) {
+            s.cfm_ok.valid = 0u;
+        }
+        break;
+    case EV_ACL_CONN:
+        if (e->status == ESP_BT_STATUS_SUCCESS) {
+            s.acl_links++;
+        }
+        break;
+    case EV_ACL_DISC:
+        if (s.acl_links > 0u) {
+            s.acl_links--;
+        }
+        if (slot_is(&s.reject, e->bda)) {
+            s.reject.valid = 0u;
+        }
+        if (slot_is(&s.auth_ok, e->bda)) {
+            s.auth_ok.valid = 0u;
+        }
+        if (slot_is(&s.cfm_ok, e->bda)) {
+            s.cfm_ok.valid = 0u;
+            s.ssp_showing = 0u;
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+static void start_server(void)
+{
+    esp_spp_start_srv_cfg_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.local_scn = BT_XREC_SPP_SCN;
+    cfg.create_spp_record = true;
+    cfg.sec_mask = ESP_SPP_SEC_AUTHENTICATE | ESP_SPP_SEC_ENCRYPT;
+    cfg.role = ESP_SPP_ROLE_SLAVE;
+    cfg.name = BT_XREC_SPP_NAME;
+    esp_err_t r = esp_spp_start_srv_with_cfg(&cfg);
+    if (r != ESP_OK) {
+        bt_xrec_plat_log_u32("BT XREC esp_spp_start_srv failed", (uint32_t)r);
+        fault(BT_XREC_FAULT_CONFIG);
+    }
+}
+
+static void on_spp_event(const ev_t *e)
+{
+    switch (e->type) {
+    case EV_SPP_INIT:
+        if (s.state != BT_XREC_ST_CONFIG) {
+            s.d.stale_events++;
+        } else if (e->status != ESP_SPP_SUCCESS) {
+            bt_xrec_plat_log_u32("BT XREC SPP init failed, status", e->status);
+            fault(BT_XREC_FAULT_CONFIG);
+        } else {
+            s.spp_inited = 1u;
+            start_server();
+        }
+        break;
+    case EV_SPP_START:
+        if (s.state != BT_XREC_ST_CONFIG) {
+            s.d.stale_events++;
+        } else if (e->status != ESP_SPP_SUCCESS || e->extra != BT_XREC_SPP_SCN) {
+            bt_xrec_plat_log_u32("BT XREC SPP server start failed, scn", e->extra);
+            fault(BT_XREC_FAULT_CONFIG);
+        } else {
+            set_state(BT_XREC_ST_READY);
+            bt_xrec_plat_log("BT XREC READY (SPP channel 1)");
+        }
+        break;
+    case EV_SRV_OPEN:
+        if (e->status != ESP_SPP_SUCCESS) {
+            break;
+        }
+        if (s.conn_open) {
+            /* One session at a time (legacy F:1585-1590 rejects a second ACL). */
+            s.d.conns_rejected++;
+            bt_xrec_plat_log("BT XREC second SPP connection refused");
+            esp_err_t r = esp_spp_disconnect(e->handle);
+            if (r != ESP_OK) {
+                bt_xrec_plat_log_u32("BT XREC esp_spp_disconnect failed", (uint32_t)r);
+            }
+            break;
+        }
+        conn_reset();
+        s.conn_open = 1u;
+        s.conn_handle = e->handle;
+        memcpy(s.conn_bda, e->bda, 6u);
+        s.mtu = (uint16_t)(e->val > 0xFFFFu ? 0xFFFFu : e->val);
+        if (link_authorized(e->bda)) {
+            s.conn_authorized = 1u;
+            bt_xrec_plat_log_u32("BT XREC SPP open, mtu", s.mtu);
+        } else {
+            s.d.conns_rejected++;
+            conn_close_request("BT XREC close: peer not bonded with MITM");
+        }
+        break;
+    case EV_CLOSE:
+        if (s.conn_open && e->handle == s.conn_handle) {
+            conn_reset();
+            bt_xrec_plat_log("BT XREC SPP closed");
+        }
+        break;
+    case EV_RX_OVERFLOW:
+        if (s.conn_open && e->handle == s.conn_handle) {
+            conn_close_request("BT XREC close: RX buffer overflow");
+        }
+        break;
+    case EV_WRITE:
+        s.d.write_evts++;
+        s.d.write_evt_bytes += e->val;
+        if (s.conn_open && e->handle == s.conn_handle) {
+            s.inflight -= e->val < s.inflight ? e->val : s.inflight;
+        } else {
+            s.d.stale_events++;
+        }
+        break;
+    case EV_CONG:
+        s.d.cong_evts++;
+        if (s.conn_open && e->handle == s.conn_handle) {
+            s.cong = e->extra;
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+/* Drain the event queue in order. DATA is consumed in chunks so the lock is never held while xrec_proto runs. */
+static void drain_events(void)
+{
+    uint8_t chunk[128];
+    uint32_t budget = BT_XREC_RX_RING * 2u;    /* bounded work per poll: the UI loop keeps its cadence */
+    for (;;) {
+        ev_t e;
+        uint32_t n = 0u;
+        bt_xrec_plat_lock();
+        if (s.ev_head == s.ev_tail || s.b == NULL) {
+            bt_xrec_plat_unlock();
+            return;
+        }
+        ev_t *head = &s.evq[s.ev_tail % BT_XREC_EVQ_SLOTS];
+        e = *head;
+        if (e.type == EV_DATA) {
+            n = e.val < sizeof(chunk) ? e.val : (uint32_t)sizeof(chunk);
+            uint32_t off = s.rx_tail & (BT_XREC_RX_RING - 1u);
+            uint32_t first = BT_XREC_RX_RING - off;
+            if (first > n) {
+                first = n;
+            }
+            memcpy(chunk, &s.b->rx[off], first);
+            memcpy(chunk + first, &s.b->rx[0], n - first);
+            s.rx_tail += n;
+            head->val -= n;
+            if (head->val == 0u) {
+                s.ev_tail++;
+            }
+        } else {
+            s.ev_tail++;
+        }
+        bt_xrec_plat_unlock();
+
+        if (e.type == EV_DATA) {
+            if (s.conn_open && e.handle == s.conn_handle && s.conn_authorized && !s.conn_closing && !s.entropy_fail) {
+                s.d.rx_bytes += n;
+                xrec_on_rx(&s.b->xrec, chunk, (uint16_t)n);
+            } else {
+                s.d.rx_dropped += n;
+            }
+            xrec_reset_flush();
+            if (budget <= n) {
+                return;
+            }
+            budget -= n;
+        } else if (e.type >= EV_CFM_REQ) {
+            on_gap_event(&e);
+        } else {
+            on_spp_event(&e);
+        }
+        xrec_reset_flush();
+        if (s.state == BT_XREC_ST_OFF || s.state == BT_XREC_ST_FAULTED || s.state == BT_XREC_ST_DEAD) {
+            return;
+        }
+    }
+}
+
+static void config_begin(void)
+{
+    esp_err_t r;
+    uint8_t iocap = ESP_BT_IO_CAP_IO;          /* DisplayYesNo: numeric comparison with phones (plan M4) */
+    esp_bt_cod_t cod;
+    esp_spp_cfg_t cfg;
+    memset(&cod, 0, sizeof(cod));
+    cod.minor = 0x01u;                          /* 0x200404 = legacy F:1550 {0x04, 0x04, 0x20} */
+    cod.major = ESP_BT_COD_MAJOR_DEV_AV;
+    cod.service = ESP_BT_COD_SRVC_AUDIO;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.mode = ESP_SPP_MODE_CB;
+    cfg.enable_l2cap_ertm = false;              /* basic mode, as the legacy RFCOMM (S:) and the desktop tools */
+    cfg.tx_buffer_size = BT_XREC_SPP_TX_BUF;
+
+    set_state(BT_XREC_ST_CONFIG);
+    if ((r = esp_bt_gap_register_callback(gap_cb)) != ESP_OK ||
+        (r = esp_spp_register_callback(spp_cb)) != ESP_OK ||
+        (r = esp_bt_gap_set_device_name(s.name)) != ESP_OK ||
+        (r = esp_bt_gap_set_cod(cod, ESP_BT_INIT_COD)) != ESP_OK ||
+        (r = esp_bt_gap_set_security_param(ESP_BT_SP_IOCAP_MODE, &iocap, sizeof(iocap))) != ESP_OK ||
+        (r = esp_spp_enhanced_init(&cfg)) != ESP_OK) {
+        bt_xrec_plat_log_u32("BT XREC GAP/SPP configuration failed", (uint32_t)r);
+        fault(BT_XREC_FAULT_CONFIG);
+    }
+}
+
+static void apply_scan_mode(void)
+{
+    if (s.state != BT_XREC_ST_READY) {
+        return;
+    }
+    uint8_t want = s.window_open ? 2u : 1u;
+    if (want == s.scan_applied) {
+        return;
+    }
+    esp_err_t r = esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE,
+                                           want == 2u ? ESP_BT_GENERAL_DISCOVERABLE : ESP_BT_NON_DISCOVERABLE);
+    if (r == ESP_OK) {
+        s.scan_applied = want;
+    } else {
+        bt_xrec_plat_log_u32("BT XREC set_scan_mode failed (retrying)", (uint32_t)r);
+    }
+}
+
+static void free_session(void)
+{
+    bufs_t *b;
+    bt_xrec_plat_lock();
+    s.cb_open = 0u;
+    b = s.b;
+    s.b = NULL;
+    s.ev_head = s.ev_tail = 0u;
+    s.rx_head = s.rx_tail = 0u;
+    s.evq_lost = 0u;
+    bt_xrec_plat_unlock();
+    if (b != NULL) {
+        memset(&b->xrec.key, 0, sizeof(b->xrec.key));
+        bt_xrec_plat_free(b);
+    }
+}
+
+int bt_shutdown(void)
+{
+    if (s.state == BT_XREC_ST_OFF || s.state == BT_XREC_ST_FAULTED) {
+        return 0;
+    }
+    if (s.state == BT_XREC_ST_DEAD) {
+        return (int)s.last_fault;
+    }
+    /* 1. quiesce: late BTC callbacks no longer touch the session; pending XREC work is cancelled. */
+    bt_xrec_plat_lock();
+    s.cb_open = 0u;
+    bt_xrec_plat_unlock();
+    if (s.b != NULL) {
+        xrec_close_pairing(&s.b->xrec);
+        xrec_on_disconnect(&s.b->xrec);
+    }
+    conn_reset();
+    s.window_open = s.xrec_pin_issued = s.ssp_showing = 0u;
+    s.reboot_mode = 0u;
+    /* 2. graceful teardown in the worker; the app keeps the recorder serviced and enforces one absolute deadline. */
+    s_spp_uninit_seen = 0u;
+    bt_xrec_plat_stack_down_begin();
+    uint32_t t0 = bt_xrec_plat_now_ms();
+    uint32_t reason = BT_XREC_FAULT_NONE;
+    for (;;) {
+        int r = 0;
+        if (bt_xrec_plat_job_done(&r)) {
+            if (bt_xrec_plat_deadline_disarm()) {
+                reason = BT_XREC_FAULT_DOWN_LATCHED;   /* disarm first, then check the latch (plan M1) */
+            } else if (r != 0) {
+                reason = BT_XREC_FAULT_DOWN_FAIL;
+            }
+            break;
+        }
+        if (bt_xrec_plat_now_ms() - t0 >= BT_XREC_SHUTDOWN_DEADLINE_MS) {
+            (void)bt_xrec_plat_deadline_disarm();
+            reason = BT_XREC_FAULT_DOWN_DEADLINE;
+            break;
+        }
+        bt_xrec_plat_service();
+        bt_xrec_plat_wait();
+    }
+    s.spp_inited = 0u;
+    s.scan_applied = 0u;
+    s.acl_links = 0u;
+    s.cfm_ok.valid = s.auth_ok.valid = s.reject.valid = 0u;
+    free_session();
+    if (reason != BT_XREC_FAULT_NONE) {
+        s.last_fault = reason;
+        set_state(BT_XREC_ST_DEAD);
+        bt_xrec_plat_log_u32("BT shutdown: hard path, reason", reason);
+        bt_xrec_plat_hard_path(reason);        /* target: finalise recording, fault record 0xB1, reboot */
+        return (int)reason;
+    }
+    bt_xrec_plat_session_end();
+    set_state(BT_XREC_ST_OFF);
+    bt_xrec_plat_log("BT stopped");
+    return 0;
+}
+
+static void fault(uint32_t reason)
+{
+    if (s.state == BT_XREC_ST_OFF || s.state == BT_XREC_ST_FAULTED || s.state == BT_XREC_ST_DEAD) {
+        return;
+    }
+    s.last_fault = reason;
+    bt_xrec_plat_log_u32("BT fault, reason", reason);
+    if (bt_shutdown() == 0) {
+        set_state(BT_XREC_ST_FAULTED);         /* graceful recovery done: BT off until the next bt_xrec_start() */
+    }
+}
+
+/* ============================================ public API ======================================================== */
+int bt_xrec_start(exfat_vol_t *vol, int sd_mounted)
+{
+    if (s.state == BT_XREC_ST_UP || s.state == BT_XREC_ST_CONFIG || s.state == BT_XREC_ST_READY) {
+        return 0;
+    }
+    if (s.state == BT_XREC_ST_DEAD || !bt_xrec_plat_start_allowed()) {
+        bt_xrec_plat_log("BT start refused: BT fault recorded this boot");
+        return -1;
+    }
+    bufs_t *b = (bufs_t *)bt_xrec_plat_alloc(sizeof(bufs_t));
+    if (b == NULL) {
+        bt_xrec_plat_log("BT start failed: no memory");
+        return -1;
+    }
+    memset(b, 0, sizeof(*b));
+
+    uint32_t last_fault = s.last_fault;
+    memset(&s, 0, sizeof(s));
+    s.last_fault = last_fault;
+    bt_xrec_plat_identity(s.bd);
+    static const char hex[] = "0123456789ABCDEF";
+    memcpy(s.name, "Cassini_", 8u);            /* legacy naming scheme F:2005-2012 */
+    s.name[8] = hex[s.bd[0] >> 4];
+    s.name[9] = hex[s.bd[0] & 0x0Fu];
+    s.name[10] = '\0';
+
+    xrec_ops_t ops = *bt_xrec_plat_device_ops();
+    ops.send = xo_send;
+    ops.get_entropy = xo_entropy;
+    ops.on_bound_key = xo_bound_key;
+    ops.on_reboot = xo_reboot;
+    ops.on_ota = xo_ota;
+    ops.on_dfu = xo_dfu;
+    ops.get_mtu = xo_get_mtu;
+    xrec_init(&b->xrec, sd_mounted ? vol : 0, &ops, 0);
+    bt_xrec_plat_load_bound_key(&b->xrec);
+
+    bt_xrec_plat_lock();
+    s.b = b;
+    s.cb_open = 1u;
+    bt_xrec_plat_unlock();
+
+    bt_xrec_plat_log("BT start (Bluedroid):");
+    bt_xrec_plat_log(s.name);
+    if (bt_xrec_plat_stack_up_begin(vol, sd_mounted, s.bd) != 0) {
+        bt_xrec_plat_log("BT start failed: platform");
+        free_session();
+        return -1;
+    }
+    set_state(BT_XREC_ST_UP);
+    return 0;
+}
+
+void bt_xrec_open_pairing(uint32_t duration_ms)
+{
+    if (s.state != BT_XREC_ST_UP && s.state != BT_XREC_ST_CONFIG && s.state != BT_XREC_ST_READY) {
+        return;
+    }
+    s.window_open = 1u;
+    s.window_deadline = bt_xrec_plat_now_ms() + (duration_ms ? duration_ms : 60000u);
+    /* XREC PIN from the DRBG (rejection sampling: no modulo bias). Fails closed: the SSP window still opens, but
+     * XREC PAIR answers PAIRCLOSED until entropy is credited. */
+    uint32_t v = 0u;
+    bool ok = false;
+    for (int i = 0; i < 4 && !ok; i++) {
+        uint8_t r4[4];
+        if (bt_xrec_plat_entropy(r4, sizeof(r4)) != 0) {
+            break;
+        }
+        v = (uint32_t)r4[0] | ((uint32_t)r4[1] << 8) | ((uint32_t)r4[2] << 16) | ((uint32_t)r4[3] << 24);
+        ok = v < 4294000000u;                   /* largest multiple of 10^6 below 2^32 */
+    }
+    if (ok && s.b != NULL) {
+        char pin[8];
+        digits6(pin, v);
+        xrec_open_pairing(&s.b->xrec, pin);
+        s.xrec_pin_issued = 1u;
+        memset(pin, 0, sizeof(pin));
+    } else {
+        bt_xrec_plat_log("BT XREC PIN unavailable: entropy not ready (SSP pairing window open)");
+    }
+    apply_scan_mode();
+}
+
+void bt_xrec_poll(void)
+{
+    if (s.state == BT_XREC_ST_OFF || s.state == BT_XREC_ST_FAULTED || s.state == BT_XREC_ST_DEAD) {
+        return;
+    }
+    uint32_t now = bt_xrec_plat_now_ms();
+    if (s.state == BT_XREC_ST_UP) {
+        int r = 0;
+        if (bt_xrec_plat_job_done(&r)) {
+            if (r != 0) {
+                bt_xrec_plat_log_u32("BT bring-up failed, code", (uint32_t)r);
+                fault(BT_XREC_FAULT_UP_FAIL);
+                return;
+            }
+            config_begin();
+        } else if (now - s.t_state >= BT_XREC_UP_DEADLINE_MS) {
+            fault(BT_XREC_FAULT_UP_TIMEOUT);
+            return;
+        }
+        if (s.state != BT_XREC_ST_CONFIG) {
+            return;
+        }
+    }
+
+    drain_events();
+    if (s.state != BT_XREC_ST_CONFIG && s.state != BT_XREC_ST_READY) {
+        return;
+    }
+    bt_xrec_plat_lock();
+    uint8_t lost = s.evq_lost;
+    bt_xrec_plat_unlock();
+    if (lost) {
+        fault(BT_XREC_FAULT_EVQ_OVERFLOW);
+        return;
+    }
+    now = bt_xrec_plat_now_ms();
+    if (s.state == BT_XREC_ST_CONFIG && now - s.t_state >= BT_XREC_CONFIG_DEADLINE_MS) {
+        fault(BT_XREC_FAULT_CONFIG_TIMEOUT);
+        return;
+    }
+
+    /* pairing window: deadline, or closed by xrec_proto (PAIR success, 5 wrong PINs) like legacy F:2107-2118 */
+    if (s.window_open && (time_reached(now, s.window_deadline) ||
+                          (s.xrec_pin_issued && s.b != NULL && !s.b->xrec.pair_active))) {
+        window_close();
+    }
+    if (s.ssp_showing && time_reached(now, s.ssp_deadline)) {
+        s.ssp_showing = 0u;
+    }
+    apply_scan_mode();
+
+    if (s.entropy_fail && s.conn_open && !s.conn_closing) {
+        conn_close_request("BT XREC close: entropy not ready");
+    }
+    if (s.conn_open && s.conn_authorized && !s.conn_closing) {
+        xrec_poll(&s.b->xrec);
+    }
+    tx_kick();
+    xrec_reset_flush();
+
+    if (s.reboot_mode != 0u && time_reached(now, s.reboot_at) &&
+        ((s.tx_head == s.tx_tail && s.inflight == 0u) || now - s.reboot_at >= BT_XREC_REBOOT_DRAIN_MAX_MS)) {
+        uint8_t mode = s.reboot_mode;
+        s.reboot_mode = 0u;
+        bt_xrec_plat_log_u32("BT XREC deferred reboot, mode", mode);
+        (void)bt_shutdown();                    /* coordinated teardown before any reboot (plan M4) */
+        bt_xrec_plat_reboot(mode);
+        return;
+    }
+
+    uint32_t why = bt_xrec_plat_poll();
+    if (why != 0u) {
+        bt_xrec_plat_log_u32("BT platform fault", why);
+        fault(BT_XREC_FAULT_PLATFORM);
+    }
+}
+
+void bt_xrec_stop(void)
+{
+    (void)bt_shutdown();
+}
+
+/* Same fields and meaning as legacy F:2178-2197. rx/tx_acl_pkts count SPP data events / esp_spp_write calls
+ * (Bluedroid hides ACL packets); main.c only compares them between iterations (activity) and uses tx for progress. */
+void bt_xrec_get_status(bt_status_t *out)
+{
+    if (out == NULL) {
+        return;
+    }
+    memset(out, 0, sizeof(*out));
+    out->active = (uint8_t)(s.state == BT_XREC_ST_UP || s.state == BT_XREC_ST_CONFIG || s.state == BT_XREC_ST_READY);
+    out->hci_ready = (uint8_t)(s.state == BT_XREC_ST_READY);
+    out->acl_connected = (uint8_t)(s.acl_links > 0u || s.conn_open);
+    out->spp_open = (uint8_t)(s.conn_open && !s.conn_closing);
+    if (s.b != NULL) {
+        out->xrec_bound = s.b->xrec.bound;
+        out->xrec_auth = s.b->xrec.auth;
+    }
+    out->pair_active = s.window_open;
+    if (s.ssp_showing) {
+        memcpy(out->pair_pin, s.ssp_digits, sizeof(out->pair_pin));   /* numeric comparison value (INTERIM) */
+    } else if (s.window_open && s.b != NULL && s.b->xrec.pair_active) {
+        memcpy(out->pair_pin, s.b->xrec.pair_pin, sizeof(out->pair_pin));
+    }
+    bt_xrec_plat_lock();
+    out->rx_acl_pkts = s.rx_frames;
+    bt_xrec_plat_unlock();
+    out->tx_acl_pkts = s.d.tx_writes;
+    out->irq_count = out->active ? bt_xrec_plat_irq_count() : 0u;
+    memcpy(out->bd_addr, s.bd, 6u);
+    memcpy(out->dev_name, s.name, sizeof(out->dev_name));
+}
+
+void bt_xrec_get_debug(bt_xrec_debug_t *out)
+{
+    if (out == NULL) {
+        return;
+    }
+    *out = s.d;
+    out->state = s.state;
+    out->window_open = s.window_open;
+    out->scan_disc = (uint8_t)(s.scan_applied == 2u);
+    out->scan_applied = s.scan_applied;
+    out->conn_open = s.conn_open;
+    out->conn_authorized = s.conn_authorized;
+    out->conn_closing = s.conn_closing;
+    out->cong = s.cong;
+    out->spp_inited = s.spp_inited;
+    out->ssp_showing = s.ssp_showing;
+    out->entropy_fail = s.entropy_fail;
+    out->reboot_mode = s.reboot_mode;
+    out->conn_handle = s.conn_handle;
+    out->tx_used = s.tx_head - s.tx_tail;
+    out->inflight = s.inflight;
+    out->acl_links = s.acl_links;
+    out->mtu = s.mtu;
+    out->last_fault = s.last_fault;
+    bt_xrec_plat_lock();
+    out->rx_used = s.rx_head - s.rx_tail;
+    out->evq_used = s.ev_head - s.ev_tail;
+    out->rx_frames = s.rx_frames;
+    out->rx_overflows = s.rx_overflows;
+    out->evq_lost = s.evq_lost_n;
+    bt_xrec_plat_unlock();
+}
+
+/* The teardown job (bt_xrec_fw.c) waits for ESP_SPP_UNINIT_EVT before esp_bluedroid_disable(). */
+int bt_xrec_spp_uninit_seen(void)
+{
+    return s_spp_uninit_seen != 0u;
+}
+
+#if defined(BT_XREC_TEST_HOOKS) && BT_XREC_TEST_HOOKS
+/* Host tests only: forget a DEAD session (on target the hard path reboots). */
+void bt_xrec_test_reset(void);
+void bt_xrec_test_reset(void)
+{
+    if (s.b != NULL) {
+        bt_xrec_plat_free(s.b);
+    }
+    memset(&s, 0, sizeof(s));
+    s_spp_uninit_seen = 0u;
+}
+#endif

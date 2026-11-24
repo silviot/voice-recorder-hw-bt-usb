@@ -43,7 +43,13 @@ fixed_queue_t *fixed_queue_new(size_t capacity)
         goto error;
     }
 
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+    if (osi_mutex_new(&ret->lock) != 0) {
+        goto error; /* open_fw patch 0020: fail soft like the other members (upstream asserts below) */
+    }
+#else
     osi_mutex_new(&ret->lock);
+#endif
     /* CONTRACT / PRECONDITION:
      * - ret->lock is guaranteed non-NULL after successful osi_mutex_new().
      * - Rationale: treat mutex allocation failure as fatal in debug builds;

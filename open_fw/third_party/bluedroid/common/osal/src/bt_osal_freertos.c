@@ -1376,6 +1376,14 @@ struct bt_osal_funcs_t * bt_osal_freertos_funcs_get(void)
 
 void bt_osal_freertos_funcs_init(void)
 {
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+    /* open_fw patch 0023: upstream copies the constant table to the heap and asserts when that fails (after
+     * esp_bluedroid_init() has otherwise succeeded). Nothing ever writes through bt_osal_funcs, so use the table in
+     * place: no allocation, nothing to fail. (The heap copy exists for ESP32 flash-cache-off ISR access; our image
+     * reads .rodata from directly mapped flash.) */
+    bt_osal_funcs = (struct bt_osal_funcs_t *)&bt_osal_funcs_ro;
+    return;
+#endif
     bt_osal_funcs = (struct bt_osal_funcs_t *)bt_osal_malloc(sizeof(struct bt_osal_funcs_t));
     if(!bt_osal_funcs) {
         printf("OSAL funcs init failed\n");
@@ -1387,6 +1395,10 @@ void bt_osal_freertos_funcs_init(void)
 
 void bt_osal_freertos_funcs_deinit(void)
 {
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+    bt_osal_funcs = NULL; /* open_fw patch 0023: the constant table, not a heap copy */
+    return;
+#endif
     if (bt_osal_funcs) {
         bt_osal_free(bt_osal_funcs);
     }

@@ -1,0 +1,101 @@
+diff --git a/open_fw/third_party/bluedroid/host/bluedroid/bta/dm/bta_dm_act.c b/open_fw/third_party/bluedroid/host/bluedroid/bta/dm/bta_dm_act.c
+index 9f51c4b..8bc6c17 100644
+--- a/open_fw/third_party/bluedroid/host/bluedroid/bta/dm/bta_dm_act.c
++++ b/open_fw/third_party/bluedroid/host/bluedroid/bta/dm/bta_dm_act.c
+@@ -315,6 +315,31 @@ void BTM_LegacyBleCallbackTrigger(tBTM_BLE_LEGACY_GAP_EVENT event, tBTM_BLE_LEGA
+ ** Returns          void
+ **
+ *******************************************************************************/
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++/* open_fw patch 0013: an enable is pending from bta_dm_enable() until BTA_DM_ENABLE_EVT is reported. A failure on the
++ * way (the BTA SYS enable message cannot be allocated, controller start-up fails and BTM reports the device down)
++ * reports BTA_DM_ENABLE_EVT with BTA_FAILURE (esp_bluedroid_enable() returns ESP_FAIL) instead of asserting or never
++ * answering, and undoes bta_dm_enable() so nothing keeps BTA DM marked active. A separate flag, not bta_dm_cb (the
++ * BTA_SYS_HW_ON_EVT handler re-initialises bta_dm_cb). */
++static BOOLEAN bta_dm_enable_pending;
++
++static void bta_dm_enable_failed(void)
++{
++    tBTA_DM_SEC sec_event;
++    tBTA_DM_SEC_CBACK *p_sec_cback = bta_dm_cb.p_sec_cback;
++
++    APPL_TRACE_ERROR("%s", __func__);
++    bta_dm_enable_pending = FALSE;
++    bta_sys_hw_unregister(BTA_SYS_HW_BLUETOOTH);
++    bta_dm_cb.is_bta_dm_active = FALSE;
++    memset(&sec_event, 0, sizeof(sec_event));
++    sec_event.enable.status = BTA_FAILURE;
++    if (p_sec_cback != NULL) {
++        p_sec_cback(BTA_DM_ENABLE_EVT, &sec_event);
++    }
++}
++#endif
++
+ void bta_dm_enable(tBTA_DM_MSG *p_data)
+ {
+     tBTA_SYS_HW_MSG *sys_enable_event;
+@@ -341,6 +366,9 @@ void bta_dm_enable(tBTA_DM_MSG *p_data)
+     }
+     /* notify BTA DM is now active */
+     bta_dm_cb.is_bta_dm_active = TRUE;
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++    bta_dm_enable_pending = TRUE; /* open_fw patch 0013 */
++#endif
+ 
+     /* send a message to BTA SYS */
+     if ((sys_enable_event = (tBTA_SYS_HW_MSG *) osi_malloc(sizeof(tBTA_SYS_HW_MSG))) != NULL) {
+@@ -351,7 +379,11 @@ void bta_dm_enable(tBTA_DM_MSG *p_data)
+     } else {
+         // if malloc failed, restart
+         APPL_TRACE_ERROR("%s, failed to allocate memory for sys_enable_event", __func__);
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++        bta_dm_enable_failed(); /* open_fw patch 0013: report the failure instead of asserting */
++#else
+         assert(0);
++#endif
+     }
+ }
+ 
+@@ -474,6 +506,12 @@ static void bta_dm_sys_hw_cback( tBTA_SYS_HW_EVT status )
+     APPL_TRACE_DEBUG("%s with event: %i", __func__, status);
+ 
+     /* On H/W error evt, report to the registered DM application callback */
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++    if (status == BTA_SYS_HW_ERROR_EVT && bta_dm_enable_pending) {
++        bta_dm_enable_failed(); /* open_fw patch 0013: the device went down during enable (controller start-up) */
++        return;
++    }
++#endif
+     if (status == BTA_SYS_HW_ERROR_EVT) {
+         if ( bta_dm_cb.p_sec_cback != NULL ) {
+             bta_dm_cb.p_sec_cback(BTA_DM_HW_ERROR_EVT, NULL);
+@@ -3546,6 +3584,9 @@ static void bta_dm_local_name_cback(const BD_ADDR bd_addr)
+     UNUSED(bd_addr);
+ 
+     sec_event.enable.status = BTA_SUCCESS;
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++    bta_dm_enable_pending = FALSE; /* open_fw patch 0013 */
++#endif
+ 
+     if (bta_dm_cb.p_sec_cback) {
+         bta_dm_cb.p_sec_cback(BTA_DM_ENABLE_EVT, &sec_event);
+diff --git a/open_fw/third_party/bluedroid/host/bluedroid/stack/btm/btm_devctl.c b/open_fw/third_party/bluedroid/host/bluedroid/stack/btm/btm_devctl.c
+index 89299f5..1d8c2d0 100644
+--- a/open_fw/third_party/bluedroid/host/bluedroid/stack/btm/btm_devctl.c
++++ b/open_fw/third_party/bluedroid/host/bluedroid/stack/btm/btm_devctl.c
+@@ -248,6 +248,15 @@ void BTM_DeviceReset (UNUSED_ATTR tBTM_CMPL_CB *p_cb)
+     /* todo: review the below logic; start_up executes under another task context
+      * reset_complete runs in btu task */
+     controller_get_interface()->start_up();
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++    if (!controller_get_interface()->get_is_ready()) {
++        /* open_fw patch 0013: start_up() failed (patch 0012). reset_complete() would read the controller's (unset)
++         * parameters; report the device down instead, which fails a pending enable (bta_dm_sys_hw_cback). */
++        BTM_TRACE_ERROR("%s controller start-up failed", __func__);
++        btm_report_device_status(BTM_DEV_STATUS_DOWN);
++        return;
++    }
++#endif
+     reset_complete();
+ }
+ 

@@ -71,6 +71,17 @@ set fails the build (§7, item 10).
 7. **FWD with a nonzero ROM status is passed through unchanged** for class O. For class M rows, the ROM status
    is checked against the golden vectors in Exp 1. A class M FWD reply with a nonzero status on target counts as
    a `bt_ctrl` invariant violation (BT fault, plan M1 recovery ladder). It is never rewritten to `0x00`.
+8. **Dead handles.** After a successful Disconnection Complete for handle `h` (and until a successful Connection
+   Complete reuses it), an LC-destined FWD command for `h` is answered locally with `0x02` (Unknown Connection
+   Identifier, `cmd_dead_handle`) and host ACL for `h` is dropped (`acl_tx_dead_handle`). Reason: the ROM can still
+   map `h` to a dying LC instance whose handlers consume commands silently (`BT_ROM_HCI_MAP.md` §1.2 (c)) and
+   whose ACL is never completed by a NOCP, which would hold one of the `1005` credits for good.
+9. **Forwarded-command deadline.** With a clock (`bt_ctrl_set_clock()`, set by `bt_ctrl_rtos.c`), a class O FWD
+   command that has no ROM reply after `BT_CTRL_FWD_DEADLINE_MS` = 7 s is answered locally with `0x22` in its
+   reserved slot (`fwd_deadline`); the ROM's late reply for that opcode is consumed once (`fwd_late_reply`), never
+   delivered twice. 7 s is just under Bluedroid's own 8 s command timeout (`hci_layer.c` `COMMAND_PENDING_TIMEOUT`),
+   which would otherwise post a BT fault and restart the whole stack; so the deadline only turns a stack restart into
+   one failed command. Class M commands keep waiting: their failure must reach the recovery ladder.
 
 ## 3. Synthesized content
 
@@ -139,7 +150,7 @@ Bluedroid reads only two bits for Classic:
 
 | Octet / mask | Command | Effect |
 |---|---|---|
-| 2 / `0x40` | `041C` Read Remote Extended Features | When clear, `041C` is never sent (`A:1286–1287`). |
+| 2 / `0x40` | `041C` Read Remote Extended Features | **Set** (FWD since the phone-path promotion). When clear, `041C` is never sent (`A:1286–1287`) and every peer is treated as legacy (no page 1, `S:6249–6258`). |
 | 45 / `0x80` | `0C84` Set Min Encryption Key Size | **Always clear.** Then `0C84` is never sent (`D:1027`). |
 
 All other bits are informative and are still kept truthful. Octets 25–28 (LE) are zero.
@@ -225,7 +236,7 @@ the feature masks in §3.6 make them unreachable or conditional, so they are cla
 | `0C56` | Write Simple Pairing Mode (`01`) | `C:331` (page-0 bit 51 and `ssp_en`) | FWD | `CC(4)` | `s` | `E04F → E0B1` (`F:747,888`) | V-B |
 | `1004` | Read Local Extended Features, page 1 | `C:351` | SYN | `CC(14)` | `s=00, 01, 01, ssp?01:00, 00×7` | none | — |
 | `0C01` | Set Event Mask | `C:477` (last start-up command) | FWD | `CC(4)` | `s` | `E01C → E079` (`F:742,883`); the ROM hook ORs mandatory bits (`F:481–487`) | V-B |
-| `0C18` | Write Page Timeout (`0x2000`) | `D:230` (reset), `bta_dm_act.c:572` | FWD → SYN | `CC(4)` | `s` | candidate `E02A`. SYN is exact while the value is `0x2000`, the HCI default; G-A confirms the ROM default after reset. | G-B |
+| `0C18` | Write Page Timeout (`0x2000`) | `D:230` (reset), `bta_dm_act.c:572` | FWD → SYN | `CC(4)` | `s` | `E02A` (2 B) → CC `E088`. SYN is exact while the value is `0x2000`, the HCI default; G-A confirms the ROM default after reset. | G-B |
 | `0C24` | Write Class of Device | `bta_dm_act.c:546` | FWD | `CC(4)` | `s` | `E034 → E094` (`F:746,886`) | V-B |
 | `080F` | Write Default Link Policy Settings | `bta_dm_act.c:574` → `A:1082`; BTM masks the value to `0000` (`A:1063–1076`) | SYN | `CC(4)` | `s=00` | none (exact: no LMP link modes are advertised, §3.6) | — |
 | `0C14` | Read Local Name | `bta_dm_act.c:584` → `D:594` (BTA enable barrier) | SYN | `CC(252)` | `s=00, name[248]` (§3.7) | none (stock slot zero) | — |
@@ -239,27 +250,27 @@ the feature masks in §3.6 make them unreachable or conditional, so they are cla
 
 | Opcode | Command | Send site / reachability | Action | Reply | Return parameters | ROM path | Exp 1 |
 |---|---|---|---|---|---|---|---|
-| `0C1C` | Write Page Scan Activity | `I:636`, when interval/window change | FWD → REJ | `CC(4)` | `s` | candidate `E02E` | G-B |
-| `0C1E` | Write Inquiry Scan Activity | `I:231`, when changed | FWD → REJ | `CC(4)` | `s` | candidate `E030` | G-B |
-| `0C3A` | Write Current IAC LAP | `I:216,220`, discoverability mode change | FWD → REJ (controller keeps GIAC) | `CC(4)` | `s` | candidate `E042` | G-B |
-| `0C52` | Write Extended Inquiry Response | `bta_dm_act.c:4656` → `I:2364`, only with page-0 bit 48 | FWD → bit 48 cleared (unreachable; REJ if it arrives anyway) | `CC(4)` | `s` | `E04D` (TX only, reply id unknown) | G-B |
-| `0C45` | Write Inquiry Mode | `D:439–441`, only with page-0 bit 30 (cleared) | REJ → FWD after G-C | `CC(4)` | `s` | candidate `E047`; needs `0x22`/`0x2F` packers | G-C |
+| `0C1C` | Write Page Scan Activity | `I:636`, when interval/window change | FWD → REJ | `CC(4)` | `s` | `E02E` (4 B) → CC `E08C` (map §2) | G-B |
+| `0C1E` | Write Inquiry Scan Activity | `I:231`, when changed | FWD → REJ | `CC(4)` | `s` | `E030` (4 B) → CC `E08E` | G-B |
+| `0C3A` | Write Current IAC LAP | `I:216,220`, discoverability mode change | FWD → REJ (controller keeps GIAC) | `CC(4)` | `s` | `E042` (4 B) → CC `E0A2`; `num` must be 1, so Bluedroid's LIAC+GIAC write fails `0x12` | G-B |
+| `0C52` | Write Extended Inquiry Response | `bta_dm_act.c:4656` → `I:2364`, only with page-0 bit 48 | FWD → bit 48 cleared (unreachable; REJ if it arrives anyway) | `CC(4)` | `s` | `E04D` (241 B) → CC `E0AF` | G-B |
+| `0C45` | Write Inquiry Mode | `D:439–441`, only with page-0 bit 30 (cleared) | REJ → FWD after G-C | `CC(4)` | `s` | `E047` (1 B) → CC `E0A9`; needs `0x22`/`0x2F` packers (no stock packer) | G-C |
 | `0C43` | Write Inquiry Scan Type | `D:453`, unreachable (bit 28 cleared) | REJ | `CC(4)` | `s` | candidate `E045` | — |
 | `0C47` | Write Page Scan Type | `D:452`, unreachable (bit 29 cleared) | REJ | `CC(4)` | `s` | candidate `E049` | — |
 | `0C05` | Set Event Filter | `I:870,1567`: type `01`, condition `00` (all devices), or type `00` (clear) | SYN when the parameters are exactly `(01,00)` or `(00)`, else REJ | `CC(4)` | `s` | none. Exact: `bt_ctrl` never forwards a filter, so the controller is always at its default (no filter). A failure would end inquiry (`U:1293–1298`, `I:1620–1647`). | — |
-| `0401` | Inquiry | `I:1718` | FWD → REJ | `CS` → `0x02`…, `0x01` | `s, 01, 0401` | `E000` (TX only; needs the CS packer and `0x01`/`0x02` packers). A CS failure tells BTM the inquiry is done (`U` default case). | G-C |
-| `0402` | Inquiry Cancel | `I:748,1314` | FWD → REJ | `CC(4)` | `s` | KE id unknown (stock slot zero). After a REJ, BTU still treats any CC as cancel-complete (`U:1290–1292`), while the inquiry runs until its duration ends. | G-C |
+| `0401` | Inquiry | `I:1718` | FWD → REJ | `CS` → `0x02`…, `0x01` | `s, 01, 0401` | `E000` (5 B) → CS `E0C7`; `0x02` (`E0D1`, mode 0) and `0x01` (`E0D0`) now packed. A CS failure tells BTM the inquiry is done (`U` default case). | G-C |
+| `0402` | Inquiry Cancel | `I:748,1314` | FWD → REJ | `CC(4)` | `s` | `E001` (no parameters: needs zero-length FWD support) → CC `E066`, deferred until the LD stops. After a REJ, BTU still treats any CC as cancel-complete (`U:1290–1292`), while the inquiry runs until its duration ends. | G-C |
 | `0403` | Periodic Inquiry Mode | `I:1702`, explicit API only (unused) | REJ | `CC(4)` | `s` | candidate `E002` | — |
 | `0404` | Exit Periodic Inquiry Mode | `I:559`, only after `0403` | REJ | `CC(4)` | `s` | stock slot zero | — |
-| `0419` | Remote Name Request | `I:2116,2131,2137`, `S:5002` | FWD → REJ | `CS` → `0x07` | `s, 01, 0419` | candidate `E00C`; event `0x07` packer missing. A CS failure completes the name and security paths (`U` default case). | G-C |
-| `041A` | Remote Name Request Cancel | `I:963` | FWD → REJ | `CC(10)` | `s, a` (echo `a`) | candidate `E00D` | G-C |
+| `0419` | Remote Name Request | `I:2116,2131,2137`, `S:5002` | FWD | `CS` → `0x07` | `s, 01, 0419` | `E00C` (10 B) → CS `E0CB`; terminal `E0D3` → `0x07` (255 B verbatim), optionally preceded by `E47C` → `0x3D`. LM SAVES it while LM state ≠ 0 (e.g. during an inquiry). A CS failure completes the name and security paths (`U` default case). | V-C |
+| `041A` | Remote Name Request Cancel | `I:963` | FWD | `CC(10)` | `s, a` | `E00D` (6 B) → CC `E06E` `{s, a}`; no RNR running → `0x12` | V-C |
 
 ### 5.2 Connection set-up and teardown
 
 | Opcode | Command | Send site / reachability | Action | Reply | Return parameters | ROM path | Exp 1 |
 |---|---|---|---|---|---|---|---|
-| `0405` | Create Connection | `stack/l2cap/l2c_utils.c:2660` (headphones mode) | FWD → REJ | `CS` → `0x03` | `s, 01, 0405` | `E004` (TX only; 13-byte HCI parameters need a field-by-field layout, `F:930–940`); terminal `E0D2/E456` packed. Allow-role-switch = no, because page-0 bit 5 is clear. | G-C |
-| `0408` | Create Connection Cancel | `S:1313` | FWD → REJ | `CC(10)` | `s, a` (echo) | candidate `E005` | G-C |
+| `0405` | Create Connection | `stack/l2cap/l2c_utils.c:2660` (headphones mode) | FWD → REJ | `CS` → `0x03` | `s, 01, 0405` | `E004` (14 B; the struct is the wire layout zero-padded, map §1.1) → CS `E0C8`; terminal `E0D2/E456` packed. Allow-role-switch = no, because page-0 bit 5 is clear. | G-C |
+| `0408` | Create Connection Cancel | `S:1313` | FWD → REJ | `CC(10)` | `s, a` (echo) | `E005` (6 B) → CC `E069` `{s, a}` | G-C |
 | `0409` | Accept Connection Request | `l2c_link.c:106,126` | FWD | `CS` → `0x03` | `s, 01, 0409` | `E006 → E0C9/E43B` (`F:757–758,895`) | V-C |
 | `040A` | Reject Connection Request | `l2c_link.c:73,133,139`, `S:2731` | FWD | `CS` → `0x03` (failure) | `s, 01, 040A` | `E007 → E0CA/E43C` (`F:759–760,896`) | V-C |
 | `0406` | Disconnect | `S:1557`, `l2c_link.c:788` | FWD | `CS` → `0x05` | `s, 01, 0406` | `E400 → E43A` (`F:761,894`); terminal `E458` packed | V-C |
@@ -268,27 +279,27 @@ the feature masks in §3.6 make them unreachable or conditional, so they are cla
 
 | Opcode | Command | Send site / reachability | Action | Reply | Return parameters | ROM path | Exp 1 |
 |---|---|---|---|---|---|---|---|
-| `041F` | Read Clock Offset | `A:435`, each new BR ACL | FWD → REJ (harmless; value only cached) | `CS` → `0x1C` | `s, 01, 041F` | candidate `E408`; `0x1C` packer missing | G-C |
-| `041D` | Read Remote Version Information | `A:436,490` | FWD → REJ (harmless) | `CS` → `0x0C` | `s, 01, 041D` | candidate `E407`; terminal `E45E` packed | G-C |
-| `041B` | Read Remote Supported Features | `A:474,497` → `A:1229` | FWD (**required by procedure**) | `CS` → `0x0B` | `s, 01, 041B` | candidate `E405`; terminal `E45D` packed. **A REJ stalls `btm_establish_continue`** (`A:1270–1300`; the BTU CS failure branch has no case for it), so a failed gate fails the profile gate. It is not a configuration we can ship. | G-C |
-| `041C` | Read Remote Extended Features | `A:1246`, only if `1002` octet 2 bit `0x40` is set | FWD → bit cleared (unreachable) | `CS` → `0x23` | `s, 01, 041C` | candidate `E406`; `0x23` packer missing. A CS failure is handled (`btm_read_remote_ext_features_failed`). | G-C |
-| `040F` | Change Connection Packet Type | `A:1840` via `A:1420` (establish) and `A:1682` (role change) | FWD → REJ (the link keeps the packet types from create/accept) | `CS` → `0x1D` | `s, 01, 040F` | candidate `E401`; `0x1D` packer missing | G-C |
+| `041F` | Read Clock Offset | `A:435`, each new BR ACL | FWD | `CS` → `0x1C` | `s, 01, 041F` | `E408` (2 B) → CS `E444`; terminal `E469` → `0x1C`. As slave (phone mode) the ROM answers from the local clock, CS first. Master path: silent if LC env `+0x46 == 3` (map §2), covered by the deadline (§2 rule 9). | V-C |
+| `041D` | Read Remote Version Information | `A:436,490` | FWD | `CS` → `0x0C` | `s, 01, 041D` | `E407` (2 B) → CS `E443`; terminal `E45E` (legacy packer) | V-C |
+| `041B` | Read Remote Supported Features | `A:474,497` → `A:1229` | FWD (**required by procedure**) | `CS` → `0x0B` | `s, 01, 041B` | `E405` (2 B) → CS `E441`; terminal `E45D` (legacy packer). SAVED until the LMP features exchange ends. **A REJ stalls `btm_establish_continue`** (`A:1270–1300`; the BTU CS failure branch has no case for it). | V-C |
+| `041C` | Read Remote Extended Features | `A:1246`, when the peer's page 0 has bit 63 (and `1002` octet 2 bit `0x40`, now set) | FWD | `CS` → `0x23` | `s, 01, 041C` | `E406` (4 B) → CS `E442`; terminal `E46D` → `0x23`. **Needed for SSP**: without page 1 `btm_sec_set_peer_sec_caps()` (`S:6249–6258`) marks every peer `BTM_SM4_KNOWN` (legacy) and the access checks take the legacy branch (`S:2300`, `S:2571`). A CS failure (`0x1A` when the peer lacks page-0 bit 63) is handled (`btm_read_remote_ext_features_failed`). | V-C |
+| `040F` | Change Connection Packet Type | `A:1840` via `A:1420` (establish) and `A:1682` (role change) | FWD → REJ (the link keeps the packet types from create/accept) | `CS` → `0x1D` | `s, 01, 040F` | `E401` (4 B) → CS `E43D`; terminal `E46A` → `0x1D` (packed). Stays gated: the ROM fails any set that differs from its own computed set with `0x11`, and is silent if LC env `+0x46 == 3`; no Bluedroid path depends on it (a CS failure has no handler). | G-C |
 | `080D` | Write Link Policy Settings | `A:1040` via `A:362`, `bta_dm_act.c:1499` (value masked to `0000`) | REJ (no BTU CC handler; harmless) | `CC(6)` | `s, h` (echo `h`) | candidate `E414` | — |
-| `0C37` | Write Link Supervision Timeout | `A:1507`, master role only; re-sent after a role change (`A:1678`) | FWD → REJ (ROM default stays, 20 s) | `CC(6)` | `s, h` (echo) | candidate `E41C` | G-C |
-| `0C28` | Write Automatic Flush Timeout | `bta_av_aact.c:2155,2468,2701` → `l2c_api.c:1181–1200` (A2DP) | FWD → REJ (no BTU handler; flush stays infinite) | `CC(6)` | `s, h` (echo) | candidate `E419` | G-C |
+| `0C37` | Write Link Supervision Timeout | `A:1507`, master role only; re-sent after a role change (`A:1678`) | FWD → REJ (ROM default stays, 20 s) | `CC(6)` | `s, h` (echo) | `E41C` (4 B) → CC `E431` `{s, pad, h}` (de-padded), **deferred** until the LMP PDU completes. Not on the phone path (slave). | G-C |
+| `0C28` | Write Automatic Flush Timeout | `bta_av_aact.c:2155,2468,2701` → `l2c_api.c:1181–1200` (A2DP) | FWD → REJ (no BTU handler; flush stays infinite) | `CC(6)` | `s, h` (echo) | `E419` (4 B) → CC `E42E` `{s, pad, h}` (de-padded) | G-C |
 
 ### 5.4 Security and SSP
 
 | Opcode | Command | Send site / reachability | Action | Reply | Return parameters | ROM path | Exp 1 |
 |---|---|---|---|---|---|---|---|
-| `0411` | Authentication Requested | `S:5606` | FWD → REJ (reported as authentication failure, `U` default) | `CS` → `0x06` | `s, 01, 0411` | candidate `E402`; terminal `E459` packed | G-C |
-| `0413` | Set Connection Encryption | `S:5624`, `A:874,1695` | FWD → REJ (reported as encryption failure, `U` default) | `CS` → `0x08` | `s, 01, 0413` | candidate `E403`; terminal `E45A` packed | G-C |
+| `0411` | Authentication Requested | `S:5606` | FWD | `CS` → `0x06` | `s, 01, 0411` | `E402` (2 B) → CS `E43E`; then `0x17`, SSP events, terminal `E459` → `0x06` (legacy packer). SAVED while the LC is in a pairing state (e.g. a peer-started pairing waiting for the user): the deadline (§2 rule 9) bounds it. | V-C |
+| `0413` | Set Connection Encryption | `S:5624`, `A:874,1695` | FWD | `CS` → `0x08` | `s, 01, 0413` | `E403` (4 B) → CS `E43F`; terminal `E45A` → `0x08` (legacy packer). A no-op change answers `0x12`. | V-C |
 | `040B` | Link Key Request Reply | `S:5082` | FWD | `CC(10)` | `s, a` | `E008 → E06A` (`F:749,897`) | V-C |
 | `040C` | Link Key Request Negative Reply | `S:5063,5078,5090` | FWD | `CC(10)` | `s, a` | `E009 → E06B` (`F:750,898`) | V-C |
 | `040D` | PIN Code Request Reply | `S:994,5261` (legacy; the policy rejects it, so Bluedroid normally sends `040E`) | FWD | `CC(10)` | `s, a` | `E00A → E06C` (`F:751,899`) | V-C |
 | `040E` | PIN Code Request Negative Reply | `S:930,5249` | FWD | `CC(10)` | `s, a` | `E00B → E06D` (`F:752,900`) | V-C |
 | `042B` | IO Capability Request Reply | `S:1736,3547` | FWD | `CC(10)` | `s, a` | `E011 → E06F` (`F:753,901`) | V-C |
-| `0434` | IO Capability Request Negative Reply | `S:3390,3473` (pairing refused outside the pairing window, plan M4) | FWD → REJ (the peer then waits for the LMP timeout: degraded refusal path) | `CC(10)` | `s, a` (echo) | candidate `E018` | G-C |
+| `0434` | IO Capability Request Negative Reply | `S:3390,3473` (pairing refused outside the pairing window, plan M4) | FWD | `CC(10)` | `s, a` | `E018` (7 B) → CC `E076` `{s, a}`; the LC sends LMP not_accepted with the reason. No link → `0x01` (not `0x12`). | V-C |
 | `042C` | User Confirmation Request Reply | `S:1603` | FWD | `CC(10)` | `s, a` | `E012 → E070` (`F:754,902`) | V-C |
 | `042D` | User Confirmation Request Negative Reply | `S:1607,3725` | FWD | `CC(10)` | `s, a` | `E013 → E071` (`F:755,903`) | V-C |
 | `042E` | User Passkey Request Reply | `S:1670`; unreachable: local IO capability is DisplayYesNo, so `0x34` never arrives | REJ | `CC(10)` | `s, a` (echo) | candidate `E014` | — |
@@ -378,6 +389,15 @@ fails. Clearing page-0 bit 54 also keeps `0C5F` unreachable if a future change l
    `/tmp/sl6801_openfw_bt/open_fw.elf` (Nov 24 12:27), not from a fresh build of the current tree.
 10. **Proposed test.** A `test-bt-port` check should compare `nm | grep btsnd_hcic_` (plus the `make_*` factory)
     against `BT_CTRL_OPCODE_TABLE`, so that a newly linked encoder without a table row fails the build.
+11. **Phone-path promotion (2026-11-24).** `0419 041A 041B 041C 041D 041F 0411 0413 0434` moved from `REJ → FWD`
+    (G-C) to `FWD` (V-C): ids, payload sizes and reply ids from `BT_ROM_HCI_MAP.md` §2 ("exact": stock opcode table
+    + ROM handler table + handler disassembly agree), event packers from the stock reply tables (map §9). Legacy
+    `bt_hci.c` sends none of these commands, so there was nothing to disagree with; every event they produce that
+    legacy also packs (`E459 E45A E45D E45E E465 E466 E472 E473 E474 E477`) uses the legacy packer unchanged, and the
+    stock packers agree with it byte for byte. Silicon only has to confirm the golden vectors (V-C, plan step 6).
+    Still gated: `040F 0C37 0C28` (not needed by the phone path, risky ROM behaviour, see their rows), the inquiry and
+    connection-creation rows (headphones path) and the G-B visibility writes. All gated rows now carry their reply id,
+    and `bt_ctrl_init()` checks that every reply id in the table is packed back to its own opcode.
 
 ## 8. Machine-readable list (C X-macro)
 
@@ -414,7 +434,7 @@ carry the parameter rule in `bt_ctrl_cmds.c`; here they show their success actio
   X(0x0C56u, BTC_M, BTC_FWD,   BTC_FWD,   BTC_CC,     4u, BTC_ECHO_NONE,  0xE04Fu, 0xE0B1u, 17u, 0x40u, BTC_EXP_V_B) \
   X(0x0C01u, BTC_M, BTC_FWD,   BTC_FWD,   BTC_CC,     4u, BTC_ECHO_NONE,  0xE01Cu, 0xE079u,  5u, 0x40u, BTC_EXP_V_B) \
   /* ---- class M: BTM reset / BTA enable / visibility set-up writes ---- */ \
-  X(0x0C18u, BTC_M, BTC_SYN,   BTC_FWD,   BTC_CC,     4u, BTC_ECHO_NONE,  0xE02Au, 0x0000u,  7u, 0x20u, BTC_EXP_G_B) \
+  X(0x0C18u, BTC_M, BTC_SYN,   BTC_FWD,   BTC_CC,     4u, BTC_ECHO_NONE,  0xE02Au, 0xE088u,  7u, 0x20u, BTC_EXP_G_B) \
   X(0x0C24u, BTC_M, BTC_FWD,   BTC_FWD,   BTC_CC,     4u, BTC_ECHO_NONE,  0xE034u, 0xE094u,  9u, 0x02u, BTC_EXP_V_B) \
   X(0x080Fu, BTC_M, BTC_SYN,   BTC_SYN,   BTC_CC,     4u, BTC_ECHO_NONE,  0x0000u, 0x0000u,  5u, 0x10u, BTC_EXP_NONE) \
   X(0x0C14u, BTC_M, BTC_SYN,   BTC_SYN,   BTC_CC,   252u, BTC_ECHO_NONE,  0x0000u, 0x0000u,  7u, 0x02u, BTC_EXP_NONE) \
@@ -422,44 +442,44 @@ carry the parameter rule in `bt_ctrl_cmds.c`; here they show their success actio
   X(0x0C1Au, BTC_M, BTC_FWD,   BTC_FWD,   BTC_CC,     4u, BTC_ECHO_NONE,  0xE02Cu, 0xE08Au,  7u, 0x80u, BTC_EXP_V_B) \
   X(0x0C35u, BTC_M, BTC_LOCAL, BTC_LOCAL, BTC_NONE,   0u, BTC_ECHO_NONE,  0x0000u, 0x0000u, 10u, 0x80u, BTC_EXP_NONE) \
   /* ---- class O: visibility, inquiry, names ---- */ \
-  X(0x0C1Cu, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CC,     4u, BTC_ECHO_NONE,  0xE02Eu, 0x0000u,  8u, 0x02u, BTC_EXP_G_B) \
-  X(0x0C1Eu, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CC,     4u, BTC_ECHO_NONE,  0xE030u, 0x0000u,  8u, 0x08u, BTC_EXP_G_B) \
-  X(0x0C3Au, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CC,     4u, BTC_ECHO_NONE,  0xE042u, 0x0000u, 11u, 0x10u, BTC_EXP_G_B) \
-  X(0x0C52u, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CC,     4u, BTC_ECHO_NONE,  0xE04Du, 0x0000u, 17u, 0x02u, BTC_EXP_G_B) \
-  X(0x0C45u, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CC,     4u, BTC_ECHO_NONE,  0xE047u, 0x0000u, 13u, 0x01u, BTC_EXP_G_C) \
+  X(0x0C1Cu, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CC,     4u, BTC_ECHO_NONE,  0xE02Eu, 0xE08Cu,  8u, 0x02u, BTC_EXP_G_B) \
+  X(0x0C1Eu, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CC,     4u, BTC_ECHO_NONE,  0xE030u, 0xE08Eu,  8u, 0x08u, BTC_EXP_G_B) \
+  X(0x0C3Au, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CC,     4u, BTC_ECHO_NONE,  0xE042u, 0xE0A2u, 11u, 0x10u, BTC_EXP_G_B) \
+  X(0x0C52u, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CC,     4u, BTC_ECHO_NONE,  0xE04Du, 0xE0AFu, 17u, 0x02u, BTC_EXP_G_B) \
+  X(0x0C45u, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CC,     4u, BTC_ECHO_NONE,  0xE047u, 0xE0A9u, 13u, 0x01u, BTC_EXP_G_C) \
   X(0x0C43u, BTC_O, BTC_REJ,   BTC_REJ,   BTC_CC,     4u, BTC_ECHO_NONE,  0x0000u, 0x0000u, 12u, 0x20u, BTC_EXP_NONE) \
   X(0x0C47u, BTC_O, BTC_REJ,   BTC_REJ,   BTC_CC,     4u, BTC_ECHO_NONE,  0x0000u, 0x0000u, 13u, 0x02u, BTC_EXP_NONE) \
   X(0x0C05u, BTC_O, BTC_SYN,   BTC_SYN,   BTC_CC,     4u, BTC_ECHO_NONE,  0x0000u, 0x0000u,  6u, 0x01u, BTC_EXP_NONE) \
-  X(0x0401u, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CS,     4u, BTC_ECHO_NONE,  0xE000u, 0x0000u,  0u, 0x01u, BTC_EXP_G_C) \
-  X(0x0402u, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CC,     4u, BTC_ECHO_NONE,  0x0000u, 0x0000u,  0u, 0x02u, BTC_EXP_G_C) \
+  X(0x0401u, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CS,     4u, BTC_ECHO_NONE,  0xE000u, 0xE0C7u,  0u, 0x01u, BTC_EXP_G_C) \
+  X(0x0402u, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CC,     4u, BTC_ECHO_NONE,  0xE001u, 0xE066u,  0u, 0x02u, BTC_EXP_G_C) \
   X(0x0403u, BTC_O, BTC_REJ,   BTC_REJ,   BTC_CC,     4u, BTC_ECHO_NONE,  0x0000u, 0x0000u,  0u, 0x04u, BTC_EXP_NONE) \
   X(0x0404u, BTC_O, BTC_REJ,   BTC_REJ,   BTC_CC,     4u, BTC_ECHO_NONE,  0x0000u, 0x0000u,  0u, 0x08u, BTC_EXP_NONE) \
-  X(0x0419u, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CS,     4u, BTC_ECHO_NONE,  0xE00Cu, 0x0000u,  2u, 0x08u, BTC_EXP_G_C) \
-  X(0x041Au, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CC,    10u, BTC_ECHO_BDADDR,0xE00Du, 0x0000u,  2u, 0x10u, BTC_EXP_G_C) \
+  X(0x0419u, BTC_O, BTC_FWD,   BTC_FWD,   BTC_CS,     4u, BTC_ECHO_NONE,  0xE00Cu, 0xE0CBu,  2u, 0x08u, BTC_EXP_V_C) \
+  X(0x041Au, BTC_O, BTC_FWD,   BTC_FWD,   BTC_CC,    10u, BTC_ECHO_BDADDR,0xE00Du, 0xE06Eu,  2u, 0x10u, BTC_EXP_V_C) \
   /* ---- class O: connection set-up / teardown ---- */ \
-  X(0x0405u, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CS,     4u, BTC_ECHO_NONE,  0xE004u, 0x0000u,  0u, 0x10u, BTC_EXP_G_C) \
-  X(0x0408u, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CC,    10u, BTC_ECHO_BDADDR,0xE005u, 0x0000u,  0u, 0x80u, BTC_EXP_G_C) \
+  X(0x0405u, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CS,     4u, BTC_ECHO_NONE,  0xE004u, 0xE0C8u,  0u, 0x10u, BTC_EXP_G_C) \
+  X(0x0408u, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CC,    10u, BTC_ECHO_BDADDR,0xE005u, 0xE069u,  0u, 0x80u, BTC_EXP_G_C) \
   X(0x0409u, BTC_O, BTC_FWD,   BTC_FWD,   BTC_CS,     4u, BTC_ECHO_NONE,  0xE006u, 0xE0C9u,  1u, 0x01u, BTC_EXP_V_C) \
   X(0x040Au, BTC_O, BTC_FWD,   BTC_FWD,   BTC_CS,     4u, BTC_ECHO_NONE,  0xE007u, 0xE0CAu,  1u, 0x02u, BTC_EXP_V_C) \
   X(0x0406u, BTC_O, BTC_FWD,   BTC_FWD,   BTC_CS,     4u, BTC_ECHO_NONE,  0xE400u, 0xE43Au,  0u, 0x20u, BTC_EXP_V_C) \
   /* ---- class O: automatic per-connection reads and link settings ---- */ \
-  X(0x041Fu, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CS,     4u, BTC_ECHO_NONE,  0xE408u, 0x0000u,  3u, 0x01u, BTC_EXP_G_C) \
-  X(0x041Du, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CS,     4u, BTC_ECHO_NONE,  0xE407u, 0x0000u,  2u, 0x80u, BTC_EXP_G_C) \
-  X(0x041Bu, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CS,     4u, BTC_ECHO_NONE,  0xE405u, 0x0000u,  2u, 0x20u, BTC_EXP_G_C) \
-  X(0x041Cu, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CS,     4u, BTC_ECHO_NONE,  0xE406u, 0x0000u,  2u, 0x40u, BTC_EXP_G_C) \
-  X(0x040Fu, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CS,     4u, BTC_ECHO_NONE,  0xE401u, 0x0000u,  1u, 0x40u, BTC_EXP_G_C) \
+  X(0x041Fu, BTC_O, BTC_FWD,   BTC_FWD,   BTC_CS,     4u, BTC_ECHO_NONE,  0xE408u, 0xE444u,  3u, 0x01u, BTC_EXP_V_C) \
+  X(0x041Du, BTC_O, BTC_FWD,   BTC_FWD,   BTC_CS,     4u, BTC_ECHO_NONE,  0xE407u, 0xE443u,  2u, 0x80u, BTC_EXP_V_C) \
+  X(0x041Bu, BTC_O, BTC_FWD,   BTC_FWD,   BTC_CS,     4u, BTC_ECHO_NONE,  0xE405u, 0xE441u,  2u, 0x20u, BTC_EXP_V_C) \
+  X(0x041Cu, BTC_O, BTC_FWD,   BTC_FWD,   BTC_CS,     4u, BTC_ECHO_NONE,  0xE406u, 0xE442u,  2u, 0x40u, BTC_EXP_V_C) \
+  X(0x040Fu, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CS,     4u, BTC_ECHO_NONE,  0xE401u, 0xE43Du,  1u, 0x40u, BTC_EXP_G_C) \
   X(0x080Du, BTC_O, BTC_REJ,   BTC_REJ,   BTC_CC,     6u, BTC_ECHO_HANDLE,0x0000u, 0x0000u,  5u, 0x04u, BTC_EXP_NONE) \
-  X(0x0C37u, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CC,     6u, BTC_ECHO_HANDLE,0xE41Cu, 0x0000u, 11u, 0x02u, BTC_EXP_G_C) \
-  X(0x0C28u, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CC,     6u, BTC_ECHO_HANDLE,0xE419u, 0x0000u,  9u, 0x20u, BTC_EXP_G_C) \
+  X(0x0C37u, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CC,     6u, BTC_ECHO_HANDLE,0xE41Cu, 0xE431u, 11u, 0x02u, BTC_EXP_G_C) \
+  X(0x0C28u, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CC,     6u, BTC_ECHO_HANDLE,0xE419u, 0xE42Eu,  9u, 0x20u, BTC_EXP_G_C) \
   /* ---- class O: security / SSP ---- */ \
-  X(0x0411u, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CS,     4u, BTC_ECHO_NONE,  0xE402u, 0x0000u,  1u, 0x80u, BTC_EXP_G_C) \
-  X(0x0413u, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CS,     4u, BTC_ECHO_NONE,  0xE403u, 0x0000u,  2u, 0x01u, BTC_EXP_G_C) \
+  X(0x0411u, BTC_O, BTC_FWD,   BTC_FWD,   BTC_CS,     4u, BTC_ECHO_NONE,  0xE402u, 0xE43Eu,  1u, 0x80u, BTC_EXP_V_C) \
+  X(0x0413u, BTC_O, BTC_FWD,   BTC_FWD,   BTC_CS,     4u, BTC_ECHO_NONE,  0xE403u, 0xE43Fu,  2u, 0x01u, BTC_EXP_V_C) \
   X(0x040Bu, BTC_O, BTC_FWD,   BTC_FWD,   BTC_CC,    10u, BTC_ECHO_BDADDR,0xE008u, 0xE06Au,  1u, 0x04u, BTC_EXP_V_C) \
   X(0x040Cu, BTC_O, BTC_FWD,   BTC_FWD,   BTC_CC,    10u, BTC_ECHO_BDADDR,0xE009u, 0xE06Bu,  1u, 0x08u, BTC_EXP_V_C) \
   X(0x040Du, BTC_O, BTC_FWD,   BTC_FWD,   BTC_CC,    10u, BTC_ECHO_BDADDR,0xE00Au, 0xE06Cu,  1u, 0x10u, BTC_EXP_V_C) \
   X(0x040Eu, BTC_O, BTC_FWD,   BTC_FWD,   BTC_CC,    10u, BTC_ECHO_BDADDR,0xE00Bu, 0xE06Du,  1u, 0x20u, BTC_EXP_V_C) \
   X(0x042Bu, BTC_O, BTC_FWD,   BTC_FWD,   BTC_CC,    10u, BTC_ECHO_BDADDR,0xE011u, 0xE06Fu, 18u, 0x80u, BTC_EXP_V_C) \
-  X(0x0434u, BTC_O, BTC_REJ,   BTC_FWD,   BTC_CC,    10u, BTC_ECHO_BDADDR,0xE018u, 0x0000u, 20u, 0x08u, BTC_EXP_G_C) \
+  X(0x0434u, BTC_O, BTC_FWD,   BTC_FWD,   BTC_CC,    10u, BTC_ECHO_BDADDR,0xE018u, 0xE076u, 20u, 0x08u, BTC_EXP_V_C) \
   X(0x042Cu, BTC_O, BTC_FWD,   BTC_FWD,   BTC_CC,    10u, BTC_ECHO_BDADDR,0xE012u, 0xE070u, 19u, 0x01u, BTC_EXP_V_C) \
   X(0x042Du, BTC_O, BTC_FWD,   BTC_FWD,   BTC_CC,    10u, BTC_ECHO_BDADDR,0xE013u, 0xE071u, 19u, 0x02u, BTC_EXP_V_C) \
   X(0x042Eu, BTC_O, BTC_REJ,   BTC_REJ,   BTC_CC,    10u, BTC_ECHO_BDADDR,0x0000u, 0x0000u, 19u, 0x04u, BTC_EXP_NONE) \

@@ -1,0 +1,52 @@
+diff --git a/open_fw/third_party/bluedroid/host/bluedroid/btc/profile/std/spp/btc_spp.c b/open_fw/third_party/bluedroid/host/bluedroid/btc/profile/std/spp/btc_spp.c
+index 2738422..ce512c0 100644
+--- a/open_fw/third_party/bluedroid/host/bluedroid/btc/profile/std/spp/btc_spp.c
++++ b/open_fw/third_party/bluedroid/host/bluedroid/btc/profile/std/spp/btc_spp.c
+@@ -484,6 +484,29 @@ static void btc_create_server_fail_cb(void)
+     btc_spp_cb_to_app(ESP_SPP_START_EVT, &param);
+ }
+ 
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++/* open_fw patch 0024: bta_jv_act.c hands several events to these callbacks as a pointer to the event's own struct
++ * cast to tBTA_JV * (RFCOMM_START, RFCOMM_CL_INIT, RFCOMM_WRITE, FREE_SCN, DISABLE, DISCOVERY_COMP: stack variables
++ * of that type), while upstream copies sizeof(tBTA_JV) from it into the BTC message: an out-of-bounds stack read on
++ * every esp_spp_write() (found by ASan in make test-bt-host, phone scenario). Copy the member the event carries;
++ * btc_spp_cb_handler() reads only that member. */
++static size_t btc_spp_jv_evt_len(tBTA_JV_EVT event)
++{
++    switch (event) {
++    case BTA_JV_RFCOMM_START_EVT:   return sizeof(tBTA_JV_RFCOMM_START);
++    case BTA_JV_RFCOMM_CL_INIT_EVT: return sizeof(tBTA_JV_RFCOMM_CL_INIT);
++    case BTA_JV_RFCOMM_WRITE_EVT:   return sizeof(tBTA_JV_RFCOMM_WRITE);
++    case BTA_JV_FREE_SCN_EVT:       return sizeof(tBTA_JV_FREE_SCN);
++    case BTA_JV_DISABLE_EVT:        return sizeof(tBTA_JV_STATUS);
++    case BTA_JV_DISCOVERY_COMP_EVT: return sizeof(tBTA_JV_DISCOVERY_COMP);
++    default:                        return sizeof(tBTA_JV);
++    }
++}
++#define BTC_SPP_JV_EVT_LEN(event) btc_spp_jv_evt_len(event)
++#else
++#define BTC_SPP_JV_EVT_LEN(event) sizeof(tBTA_JV)
++#endif
++
+ static void *btc_spp_rfcomm_inter_cb(tBTA_JV_EVT event, tBTA_JV *p_data, void *user_data)
+ {
+     bt_status_t status;
+@@ -612,7 +635,7 @@ static void *btc_spp_rfcomm_inter_cb(tBTA_JV_EVT event, tBTA_JV *p_data, void *u
+ 
+ 
+     status = btc_transfer_context(&msg, p_data,
+-                                  sizeof(tBTA_JV), NULL, NULL);
++                                  BTC_SPP_JV_EVT_LEN(event), NULL, NULL);
+ 
+     if (status != BT_STATUS_SUCCESS) {
+         BTC_TRACE_ERROR("%s btc_transfer_context failed", __func__);
+@@ -702,7 +725,7 @@ static void btc_spp_dm_inter_cb(tBTA_JV_EVT event, tBTA_JV *p_data, void *user_d
+         msg.pid = BTC_PID_SPP;
+         msg.act = event;
+ 
+-        status = btc_transfer_context(&msg, p_data, sizeof(tBTA_JV), NULL, NULL);
++        status = btc_transfer_context(&msg, p_data, BTC_SPP_JV_EVT_LEN(event), NULL, NULL);
+ 
+         if (status != BT_STATUS_SUCCESS) {
+             BTC_TRACE_ERROR("%s btc_transfer_context failed\n", __func__);

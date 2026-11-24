@@ -441,6 +441,61 @@ telemetry: heap/stack watermarks, largest free block, IRQ-26 latency and multipl
   waivers with exact point counts (`tests/bt_host/sweep_waivers.txt`) pending patches 0011+. 0009 is checked directly
   (capacity-2 `fixed_queue`), since the sweep cannot see one lost RX slot. TSan variant clean (cooperative scheduling).
   Path (a) (Bumble) not started.
+- 2026-11-24 (M1 "general rule"): patches 0011-0023 handle every allocation failure the sweep finds on the
+  lifecycle paths: complete without the allocation, bounded retry where no caller can be told (CC/CS hand-off to BTU,
+  BTA timer start), or fail `esp_bluedroid_init()`/`enable()` cleanly. The sweep runs per call (init 125 / enable 93 /
+  disable 24 / deinit 5 points), each point followed by teardown to baseline and a full clean cycle: **0 waivers**.
+  Each patch was mutation-checked (reverted alone -> its sweep fails). Contract for the app: after a failed enable,
+  deinit (recovery ladder) before retrying. Open: an OOM while parsing the stored config loses bonds at the next save
+  (`third_party/bluedroid/PORTING_NOTES.md`).
+- 2026-11-24 (M4 XREC session, step 6 code; not yet on silicon): `bt_port/bt_xrec_bluedroid.c` implements the UI's
+  `bt_xrec_*` API on Bluedroid SPP for every BT=1 image except the probe (`open_fw/Makefile` renames the legacy
+  `bt_xrec_*` and IRQ handler in `bt_hci.c`; `bt_hci.c`'s ROM bring-up export now also builds under
+  `OPENFW_BT_BLUEDROID`; default image byte-identical). `bt_port/bt_xrec_fw.c`: device callbacks (legacy F:1733-1966),
+  bonds in `SD:/bt_bonds.bin` (staged replace) loaded before init, `bt_recover` worker running the up job (bt_ctrl
+  open + attach + init + enable) and the down job (`esp_spp_deinit` -> disable -> bt_ctrl stop -> deinit),
+  2 s teardown deadline, hard path = fault record `0xB1` (BT refused for the rest of the next boot). Legacy-compatible
+  surface: name `Cassini_XX`, CoD 0x200404, SPP channel 1 "Cassini" with SDP 0x1101 (bt_sync.py connects to ch 1).
+  `make test-bt-xrec`: 221 checks (data path, congestion, partial writes / in-flight window, write error, disconnect
+  mid-transfer, policy, stop during transfer, deferred reboot behind congestion, faults, hard paths), mutation-checked.
+  **Interim deviations** (to close in step 8 / follow-ups): (1) no local accept prompt yet (needs i18n strings): a
+  numeric comparison is auto-confirmed only inside the user-opened pairing window, its value is shown through
+  `bt_status_t.pair_pin` (the BT screen's existing "PIN" toast) and logged; outside the window it is rejected.
+  (2) Just Works cannot be refused at the request (`btc_dm.c` auto-confirms it without an app event): the bond is
+  removed at `AUTH_CMPL` (unauthenticated key type, or not confirmed in the window) and the link dropped; passkey
+  display/entry likewise rejected. XREC bytes flow only on links bonded that way. (3) The teardown deadline is a
+  FreeRTOS timer-daemon one-shot (priority 9; preempts the app even in an SD write), not a SysTick-ISR hook, to keep
+  `startup.c` untouched. (4) `bt_recover` stack/TCB live in SRAM_HI (`.bss_hi`) instead of `.rtos_static`: with
+  bt_ctrl's rings and stacks linked, RTOS_HEAP would fall below the 32 KiB heap floor. (5) No credited entropy source
+  is registered in firmware yet, so `bt_entropy_get()` fails: the SSP window still opens, but XREC PAIR answers
+  PAIRCLOSED and CHAL closes the link (fail closed) until Exp 2's source is wired. (6) Without eFuse the BD_ADDR is a
+  fixed fallback (probe scheme), never timer-derived; NOR-UID derivation pending. (7) `main.c` still calls
+  `bt_rf_init_calibrated()` before `bt_xrec_start()`, so RF is calibrated twice per BT-mode entry (bt_rom_real
+  calibrates again at HCI Reset).
+- 2026-11-24 (integration: bt_ctrl phone path + 0011-0023 + XREC backend, step 6 host gate): **phone mode end to end
+  on the host**: `make test-bt-host` now also runs `test_bt_host phone` (`tests/bt_host/test_phone.c`, 228 checks):
+  the real BT=1 XREC backend (`bt_xrec_bluedroid.c` + `xrec_proto.c` + `exfat.c` on a RAM exFAT card, platform
+  `tests/bt_host/host_xrec.c` mirroring `bt_xrec_fw.c`) over Bluedroid + `bt_ctrl` + the fake ROM's scripted laptop,
+  which this scenario extends with a laptop host stack (L2CAP signalling, SDP client, RFCOMM with credit-based flow
+  control, the `+XREC` client side of `bt_sync.py`): pairing window -> page -> SSP numeric comparison -> link key
+  through `bt_store` into `/bt_bonds.bin` -> SDP finds SPP "Cassini" on channel 1 -> RFCOMM -> PING/PAIR/LS -> 40000 B
+  GETS with a mid-transfer stall (credits and baseband acks withheld: the session's 2 KiB in-flight cap holds) ->
+  link loss -> reconnect with the stored key (window closed) -> CHAL/AUTH -> stop with a 300000 B GETS outstanding
+  (636 ms, graceful) -> restart: bond from `/bt_bonds.bin`, XREC key from `/cassini.key` -> window-closed pairing
+  rejected -> Just Works bond removed and link dropped -> stop; heap/task/esp_timer baselines restored after each stop.
+  ASan/UBSan and TSan clean, 6/6 repeat runs. It found four real defects, all fixed:
+  (1) **`bta_dm_disable()` with a connected phone took 6.5 s** (> the 2 s teardown deadline: every BT-mode exit with
+  a phone connected would have taken the hard path and rebooted). `bta_sys_disable()` deregisters BTA DM itself, so DM
+  never sees the link-down that would end its 5 s + 1.5 s waits; patch 0026 detaches after 100 ms and reports after
+  500 ms more (disable ~0.63 s with a peer and data outstanding, 0.21 s without links).
+  (2) Patch 0024: `btc_spp.c` copied `sizeof(tBTA_JV)` from smaller per-event structs (stack over-read on every
+  `esp_spp_write()`). (3) Patch 0025: `bta_dm_act.c` copied 247 bytes from BTM's 65-byte device name (heap over-read on
+  every bond). (4) `bt_xrec_fw.c` loaded the XREC bound key from `s_vol` before `stack_up_begin()` set it: the key was
+  never loaded on target, so every reboot needed a new XREC PAIR; it now reads the context's volume.
+  `tools/bt_sync.py` gains the native-SPP detection of M4 "Client compatibility" (`--transport auto|native|hfp`; auto:
+  OpenFW sends nothing after RFCOMM open, the stock HFP unit sends `AT+BRSF` at once), unit-tested in
+  `tools/test_tools.py`. Silicon recipe: `docs/BT_HW_RESULTS.md` "Phone mode (BT=1) on silicon". Still interim:
+  deviations (1)-(7) above; on silicon XREC PAIR/CHAL fail closed until an entropy source is registered.
 
 ## 11. Round-1 traceability
 

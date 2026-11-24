@@ -29,6 +29,8 @@ void bth_heap_fail_disarm(void);
 /* Allocation attempts counted since the last arm (also counts while armed with n = 0 via bth_heap_count_start). */
 void bth_heap_count_start(void);
 uint64_t bth_heap_counted(void);
+uint32_t bth_heap_seq(void);                /* allocation sequence number (live blocks carry theirs) */
+void bth_heap_dump_since(uint32_t seq);     /* stderr: live blocks allocated after seq (BTH_HEAP_TRACE=1: stacks) */
 
 /* ---- logging: serialised (FreeRTOS critical section), safe from any task ---- */
 void bth_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));

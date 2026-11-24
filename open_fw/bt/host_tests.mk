@@ -4,8 +4,9 @@
 #   test-bt-host  : Bluedroid-on-host end-to-end harness        [owner: hosttest]
 #   test-bt-host-tsan : the same harness under ThreadSanitizer    [owner: hosttest]
 #   test-bt-port  : entropy/DRBG/store shim tests               [owner: entropy]
-.PHONY: test-bt-ctrl test-bt-host test-bt-host-tsan test-bt-port test-bt-all
-test-bt-all: test-bt-ctrl test-bt-host test-bt-port
+#   test-bt-xrec  : phone-mode XREC session on mocked esp_spp/esp_bt_gap [owner: xrec]
+.PHONY: test-bt-ctrl test-bt-host test-bt-host-tsan test-bt-port test-bt-xrec test-bt-all
+test-bt-all: test-bt-ctrl test-bt-host test-bt-port test-bt-xrec
 
 # ---- test-bt-port: entropy pool + HMAC_DRBG (plan M2, step 2). Host build, sanitizers on. ----
 BT_PORT_TEST_DIR ?= /tmp/sl6801_bt_port_tests
@@ -50,18 +51,25 @@ test-bt-ctrl:
 	$(BT_CTRL_TEST_DIR)/test_bt_ctrl
 
 # ---- test-bt-host: Bluedroid end-to-end on the FreeRTOS POSIX port (plan M3 path (b), step 5). ----
-# Real Bluedroid (patches 0001-0010) + bt_port + bt_ctrl + tests/fake_rom.c on FreeRTOS-Kernel V11.1.0's POSIX port,
+# Real Bluedroid (patches 0001-0026) + bt_port + bt_ctrl + tests/fake_rom.c on FreeRTOS-Kernel V11.1.0's POSIX port,
 # ASan/UBSan: patch 0009 fixed_queue slot restore, init/enable/GAP/disable/deinit, patch 0010 NOACK at zero command
-# credits, a 200-cycle leak loop, then the allocation-failure sweep over esp_bluedroid_enable() (one process per failing
-# attempt; known upstream sites are waived with exact point counts in tests/bt_host/sweep_waivers.txt, anything else
-# fails). Details: tests/bt_host/README.md.
+# credits, a 200-cycle leak loop, the phone-mode end-to-end scenario (BT=1 XREC backend + fake ROM laptop: SSP, bond
+# store, SDP, RFCOMM, XREC PAIR/CHAL/GETS with congestion, reconnect, stop with traffic outstanding, restart, policy
+# rejections; tests/bt_host/test_phone.c, on a 4096-sector exFAT image), then the allocation-failure sweeps over
+# esp_bluedroid_init/enable/disable/deinit (one process per failing attempt; waivers, if any, carry exact point counts
+# in tests/bt_host/sweep_waivers.txt, anything else fails; none since patches 0011-0023). Details:
+# tests/bt_host/README.md.
 BT_HOST_TEST_DIR ?= /tmp/sl6801_bt_host_tests
 BT_HOST_JOBS ?= $(shell nproc 2>/dev/null || echo 4)
 test-bt-host:
 	$(MAKE) -f tests/bt_host/Makefile BUILD_DIR=$(BT_HOST_TEST_DIR) SAN=asan -j$(BT_HOST_JOBS)
 	$(BT_HOST_TEST_DIR)/asan/test_bt_host all 200
-	python3 tests/bt_host/run_sweep.py $(BT_HOST_TEST_DIR)/asan/test_bt_host --jobs $(BT_HOST_JOBS) --timeout 120 \
-		--waivers tests/bt_host/sweep_waivers.txt
+	dd if=/dev/zero of=$(BT_HOST_TEST_DIR)/phone_exfat.img bs=512 count=4096 status=none
+	/usr/sbin/mkfs.exfat -q -b 4096 -c 4096 $(BT_HOST_TEST_DIR)/phone_exfat.img
+	$(BT_HOST_TEST_DIR)/asan/test_bt_host phone $(BT_HOST_TEST_DIR)/phone_exfat.img
+	set -e; for m in init enable disable deinit; do \
+		python3 tests/bt_host/run_sweep.py $(BT_HOST_TEST_DIR)/asan/test_bt_host --mode $$m --jobs $(BT_HOST_JOBS) \
+			--timeout 120 --waivers tests/bt_host/sweep_waivers.txt; done
 
 # TSan variant: cooperative scheduling (the POSIX port's in-signal-handler task switch deadlocks under TSan), two
 # suppressions for races inside the port itself (tests/bt_host/tsan.supp).
@@ -69,3 +77,17 @@ test-bt-host-tsan:
 	$(MAKE) -f tests/bt_host/Makefile BUILD_DIR=$(BT_HOST_TEST_DIR) SAN=tsan -j$(BT_HOST_JOBS)
 	TSAN_OPTIONS="suppressions=$(CURDIR)/tests/bt_host/tsan.supp report_signal_unsafe=0 halt_on_error=1" \
 		$(BT_HOST_TEST_DIR)/tsan/test_bt_host all 50
+	dd if=/dev/zero of=$(BT_HOST_TEST_DIR)/phone_exfat_tsan.img bs=512 count=4096 status=none
+	/usr/sbin/mkfs.exfat -q -b 4096 -c 4096 $(BT_HOST_TEST_DIR)/phone_exfat_tsan.img
+	TSAN_OPTIONS="suppressions=$(CURDIR)/tests/bt_host/tsan.supp report_signal_unsafe=0 halt_on_error=1" \
+		$(BT_HOST_TEST_DIR)/tsan/test_bt_host phone $(BT_HOST_TEST_DIR)/phone_exfat_tsan.img
+
+# ---- test-bt-xrec: XREC session over Bluedroid SPP (plan M4): bt_port/bt_xrec_bluedroid.c + the real xrec_proto
+# against mocked esp_spp / esp_bt_gap APIs (real Bluedroid API headers) and a mocked platform. Host build, ASan/UBSan.
+BT_XREC_TEST_DIR ?= /tmp/sl6801_bt_xrec_tests
+test-bt-xrec:
+	@mkdir -p $(BT_XREC_TEST_DIR)
+	$(HOST_CC) $(BT_CTRL_TEST_CFLAGS) $(BT_CTRL_BD_DEFS) $(BT_CTRL_BD_INCS) -DBT_XREC_TEST_HOOKS=1 \
+		tests/test_bt_xrec.c bt_port/bt_xrec_bluedroid.c src/xrec_proto.c src/crypto.c src/exfat.c \
+		-o $(BT_XREC_TEST_DIR)/test_bt_xrec
+	$(BT_XREC_TEST_DIR)/test_bt_xrec

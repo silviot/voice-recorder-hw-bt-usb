@@ -1,0 +1,80 @@
+diff --git a/open_fw/third_party/bluedroid/host/bluedroid/hci/hci_hal_h4.c b/open_fw/third_party/bluedroid/host/bluedroid/hci/hci_hal_h4.c
+index d018760..f9c7df1 100644
+--- a/open_fw/third_party/bluedroid/host/bluedroid/hci/hci_hal_h4.c
++++ b/open_fw/third_party/bluedroid/host/bluedroid/hci/hci_hal_h4.c
+@@ -132,14 +132,26 @@ static bool hci_hal_env_init(const hci_hal_callbacks_t *upper_callbacks, osi_thr
+ #endif
+ #endif // #if (BLE_42_SCAN_EN == TRUE)
+     hci_hal_env.rx_q = fixed_queue_new(QUEUE_SIZE_MAX);
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++    if (hci_hal_env.rx_q == NULL) {
++        return false; /* open_fw patch 0021: hal_open() cleans up and fails esp_bluedroid_init() */
++    }
++#else
+     assert(hci_hal_env.rx_q != NULL);
++#endif
+ #if (BLE_42_SCAN_EN == TRUE)
+     hci_hal_env.adv_rpt_q = pkt_queue_create();
+     assert(hci_hal_env.adv_rpt_q != NULL);
+ #endif // #if (BLE_42_SCAN_EN == TRUE)
+ 
+     struct osi_event *event = osi_event_create(hci_upstream_data_handler, NULL);
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++    if (event == NULL) {
++        return false; /* open_fw patch 0021 */
++    }
++#else
+     assert(event != NULL);
++#endif
+     hci_hal_env.upstream_data_ready = event;
+     osi_event_bind(hci_hal_env.upstream_data_ready, hci_hal_env.hci_h4_thread, HCI_UPSTREAM_DATA_QUEUE_IDX);
+ 
+@@ -182,7 +194,14 @@ static void hci_hal_env_deinit(void)
+ 
+ static bool hal_open(const hci_hal_callbacks_t *upper_callbacks, void *task_thread)
+ {
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++    if (!hci_hal_env_init(upper_callbacks, (osi_thread_t *)task_thread)) {
++        hci_hal_env_deinit(); /* open_fw patch 0021: NULL-safe for the members not created yet */
++        return false;
++    }
++#else
+     hci_hal_env_init(upper_callbacks, (osi_thread_t *)task_thread);
++#endif
+ 
+     //register vhci host cb
+     if (hci_host_register_callback(&hci_host_cb) != ESP_OK) {
+diff --git a/open_fw/third_party/bluedroid/host/bluedroid/hci/hci_layer.c b/open_fw/third_party/bluedroid/host/bluedroid/hci/hci_layer.c
+index 629f10f..deda736 100644
+--- a/open_fw/third_party/bluedroid/host/bluedroid/hci/hci_layer.c
++++ b/open_fw/third_party/bluedroid/host/bluedroid/hci/hci_layer.c
+@@ -281,7 +281,14 @@ static int hci_layer_init_env(void)
+ #endif
+ 
+     struct osi_event *event = osi_event_create(hci_downstream_data_handler, NULL);
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++    if (event == NULL) {
++        HCI_TRACE_ERROR("%s unable to create the downstream event.", __func__);
++        return -1; /* open_fw patch 0021: hci_start_up() -> hci_shut_down() cleans up, esp_bluedroid_init() fails */
++    }
++#else
+     assert(event != NULL);
++#endif
+     hci_host_env.downstream_data_ready = event;
+ 
+     hci_host_env.packet_queue = fixed_queue_new(QUEUE_SIZE_MAX);
+@@ -304,7 +311,14 @@ static int hci_layer_init_env(void)
+         return -1;
+     }
+ #endif
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++    if (osi_mutex_new(&cmd_wait_q->commands_pending_response_lock) != 0) {
++        HCI_TRACE_ERROR("%s unable to create the pending-response lock.", __func__);
++        return -1; /* open_fw patch 0021: upstream ignores it; the first command locks a NULL mutex */
++    }
++#else
+     osi_mutex_new(&cmd_wait_q->commands_pending_response_lock);
++#endif
+     cmd_wait_q->command_response_timer = osi_alarm_new("cmd_rsp_to", command_timed_out, cmd_wait_q, COMMAND_PENDING_TIMEOUT);
+     if (!cmd_wait_q->command_response_timer) {
+         HCI_TRACE_ERROR("%s unable to create command response timer.", __func__);

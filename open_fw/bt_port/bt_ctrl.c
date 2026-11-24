@@ -109,7 +109,12 @@ static struct {
     uint8_t fwd_lc;               /* the forwarded command went to the per-link LC task of fwd_handle */
     uint8_t fwd_orphan;           /* ...and that link's Disconnection Complete arrived while it was pending */
     uint16_t fwd_opcode, fwd_handle;
+    uint16_t fwd_late_op;         /* opcode answered locally at its deadline; the ROM's late reply is consumed once */
+    uint32_t fwd_t0;              /* now_ms() when the pending command was forwarded */
     uint8_t fwd_params[255];
+    uint8_t dead;                 /* handles 0x80..0x86 whose Disconnection Complete came after their last Connection
+                                     Complete: LC commands and ACL for them are answered / dropped locally */
+    uint32_t (*now_ms)(void);     /* optional clock for the forwarded-command deadline (bt_ctrl_set_clock) */
 
     /* event ring (SPSC: bt_ctrl produces, bt_dlv consumes) */
     evt_slot_t evt[BT_CTRL_EVT_SLOTS];
@@ -342,6 +347,12 @@ static void tx_drop_acl_for(uint16_t h)
 /* ------------------------------------------------------------------------------------------------------------- */
 #define BT_HCI_EVT_CONN_CMP 0x03u
 
+/* One bit per ROM ACL handle 0x80..0x86 (BT_CTRL_MAX_LINKS); 0 for any other handle. */
+static uint8_t handle_bit(uint16_t h)
+{
+    return (h >= 0x80u && h < 0x80u + BT_CTRL_MAX_LINKS) ? (uint8_t)(1u << (h - 0x80u)) : 0u;
+}
+
 static void apply_event_side_effects(const bt_ctrl_evt_info_t *info)
 {
     if (info->kind != BT_CTRL_EVK_EVT || info->status != BT_HCI_OK) {
@@ -356,6 +367,7 @@ static void apply_event_side_effects(const bt_ctrl_evt_info_t *info)
         g.inflight_total -= hc_clear(g.inflight, h);
         (void)hc_clear(g.nocp_pend, h);
         tx_drop_acl_for(h);
+        g.dead |= handle_bit(h);
         if (g.fwd_pending && g.fwd_lc && g.fwd_handle == h) {
             g.fwd_orphan = 1u;               /* answered locally once the ROM queue is idle (bt_ctrl_run) */
         }
@@ -363,6 +375,7 @@ static void apply_event_side_effects(const bt_ctrl_evt_info_t *info)
         /* A new link on h: the host has not seen this Connection Complete yet, so any ACL for h in the TX ring was
          * sent for an earlier link that used the same handle. */
         tx_drop_acl_for(h);
+        g.dead &= (uint8_t)~handle_bit(h);
     }
 }
 
@@ -512,6 +525,14 @@ static bt_rom_msg_ret_t up_on_hci_msg(void *ctx, uint16_t id, uint8_t *param, ui
         }
         return BT_ROM_MSG_CONSUMED;
     }
+    if ((info.kind == BT_CTRL_EVK_CC || info.kind == BT_CTRL_EVK_CS) && g.fwd_late_op != 0u &&
+        info.opcode == g.fwd_late_op) {
+        /* The ROM's reply to a command bt_ctrl already answered at its deadline: the host has its reply (one per
+         * command, opcode table §2 rule 1), so this one is counted and consumed, never delivered twice. */
+        g.fwd_late_op = 0u;
+        g.st.fwd_late_reply++;
+        return BT_ROM_MSG_CONSUMED;
+    }
     if (info.kind == BT_CTRL_EVK_CC || info.kind == BT_CTRL_EVK_CS) {
         g.st.evt_unsolicited_reply++;
     }
@@ -543,6 +564,8 @@ static void controller_state_reset(void)
     g.fwd_pending = 0u;
     g.fwd_lc = 0u;
     g.fwd_orphan = 0u;
+    g.fwd_late_op = 0u;
+    g.dead = 0u;
     g.evt_resv = 0u;
     memset(g.inflight, 0, sizeof(g.inflight));
     g.inflight_total = 0u;
@@ -755,6 +778,13 @@ static uint8_t forward_cmd(const bt_ctrl_cmd_row_t *row, uint16_t op, const uint
             return 0xFFu;
         }
         handle = (uint16_t)(rd16(prm) & 0x0FFFu);
+        if ((g.dead & handle_bit(handle)) != 0u) {
+            /* Disconnection Complete already seen for this handle: the ROM may still map it to a dying LC instance
+             * whose handlers consume commands silently (BT_ROM_HCI_MAP.md §1.2 (c)), which would wedge the one-command
+             * window. A real controller answers 0x02 here. */
+            g.st.cmd_dead_handle++;
+            return BT_HCI_ERR_UNKNOWN_CONN;
+        }
         dest = g.rom->conhdl_to_task(handle);
         if (dest == BT_ROM_TASK_INVALID) {
             return BT_HCI_ERR_UNKNOWN_CONN;
@@ -784,6 +814,7 @@ static uint8_t forward_cmd(const bt_ctrl_cmd_row_t *row, uint16_t op, const uint
     g.fwd_orphan = 0u;
     g.fwd_handle = handle;
     g.fwd_opcode = op;
+    g.fwd_t0 = g.now_ms != NULL ? g.now_ms() : 0u;
     g.fwd_cls = row->cls;
     g.fwd_plen = plen;
     memcpy(g.fwd_params, prm, plen);
@@ -794,19 +825,41 @@ static uint8_t forward_cmd(const bt_ctrl_cmd_row_t *row, uint16_t op, const uint
  * ran empty without a reply: the ROM dropped the message with the LC instance. Answer it locally in its reserved
  * slot (status 0x02 Unknown Connection Identifier) so the one-command window does not wedge. A reply the ROM was
  * going to send would already have been dispatched before its queue ran empty, and is then matched normally. */
-static void fwd_orphan_reply(void)
+static void fwd_local_reply(uint8_t status)
 {
     const bt_ctrl_cmd_row_t *row = bt_ctrl_cmds_lookup(g.fwd_opcode);
-    uint16_t len = bt_ctrl_cmds_reply_fail(row, g.fwd_opcode, g.fwd_params, g.fwd_plen, BT_HCI_ERR_UNKNOWN_CONN,
-                                           g.scratch);
+    uint16_t len = bt_ctrl_cmds_reply_fail(row, g.fwd_opcode, g.fwd_params, g.fwd_plen, status, g.scratch);
     g.fwd_pending = 0u;
     g.fwd_orphan = 0u;
     g.rom_cmd_credits++;
     g.evt_resv--;
-    g.st.fwd_orphaned++;
     if (len != 0u) {
         evt_push(g.scratch, len, g.rx_seq++);
     }
+}
+
+static void fwd_orphan_reply(void)
+{
+    g.st.fwd_orphaned++;
+    fwd_local_reply(BT_HCI_ERR_UNKNOWN_CONN);
+}
+
+/* Forwarded-command deadline (BT_ROM_HCI_MAP.md §6.1-6.2). The ROM can consume a command without any reply (LC
+ * handlers in idle/detach states) or hold it on its saved queue; either way the one-command window would stay shut
+ * until Bluedroid's own 8 s command timeout (hci_layer.c COMMAND_PENDING_TIMEOUT) posts a BT fault and restarts the
+ * stack. Just before that, bt_ctrl answers a class-O command itself (status 0x22) so only that command fails. Class M
+ * commands keep waiting: their failure must reach the recovery ladder. Needs bt_ctrl_set_clock(). */
+static void fwd_deadline_check(void)
+{
+    if (!g.fwd_pending || g.fwd_orphan || g.now_ms == NULL || g.fwd_cls != BTC_O) {
+        return;
+    }
+    if ((uint32_t)(g.now_ms() - g.fwd_t0) < BT_CTRL_FWD_DEADLINE_MS) {
+        return;
+    }
+    g.st.fwd_deadline++;
+    g.fwd_late_op = g.fwd_opcode;
+    fwd_local_reply(BT_HCI_ERR_LMP_TIMEOUT);
 }
 
 static void process_cmd(uint32_t idx)
@@ -875,6 +928,14 @@ static int process_acl(uint32_t idx)
     uint16_t dlen = rd16(&d[3]);
     if (!g.rom_running) {
         g.st.acl_tx_dropped++;
+        return ACL_DONE;
+    }
+    if ((g.dead & handle_bit(handle)) != 0u) {
+        /* Sent before the host saw this handle's Disconnection Complete. The host returns its credits for the handle
+         * on that event, and a packet handed to a dying LC would never be completed by a NOCP: it would hold one of
+         * the 1005 controller credits for good. */
+        g.st.acl_tx_dropped++;
+        g.st.acl_tx_dead_handle++;
         return ACL_DONE;
     }
     if (!gate()) {
@@ -1275,6 +1336,10 @@ uint32_t bt_ctrl_run(void)
                 fwd_orphan_reply();
                 progress = true;
             }
+            if (g.fwd_pending && !events_left) {
+                fwd_deadline_check();
+                progress |= !g.fwd_pending;
+            }
         }
         progress |= rx_dispatch();
         if (g.parked) {
@@ -1519,11 +1584,13 @@ int bt_ctrl_init(const bt_rom_if_t *rom, const bt_ctrl_platform_t *platform, con
     g.stop_result = BT_CTRL_STOP_OK;
     controller_state_reset();
     int err = bt_ctrl_cmds_init();
-    /* Every effective FWD row's ROM reply id must be packed back to the same opcode. */
+    /* Every ROM reply id in the table (effective FWD rows and gated rows alike) must be packed back to the same
+     * opcode, so a gate that passes cannot leave a reply unpacked. */
     uint32_t n = 0u;
     const bt_ctrl_cmd_row_t *rows = bt_ctrl_cmds_table(&n);
     for (uint32_t i = 0u; i < n; i++) {
-        if (bt_ctrl_cmds_eff(&rows[i]) == BTC_FWD && bt_ctrl_evt_reply_opcode(rows[i].rom_rsp) != rows[i].op) {
+        if ((bt_ctrl_cmds_eff(&rows[i]) == BTC_FWD || rows[i].rom_rsp != 0u) &&
+            bt_ctrl_evt_reply_opcode(rows[i].rom_rsp) != rows[i].op) {
             err++;
         }
     }
@@ -1533,6 +1600,11 @@ int bt_ctrl_init(const bt_rom_if_t *rom, const bt_ctrl_platform_t *platform, con
         raise_fault(BT_CTRL_FAULT_INVARIANT);
     }
     return err;
+}
+
+void bt_ctrl_set_clock(uint32_t (*now_ms)(void))
+{
+    g.now_ms = now_ms;
 }
 
 int bt_ctrl_open(void)

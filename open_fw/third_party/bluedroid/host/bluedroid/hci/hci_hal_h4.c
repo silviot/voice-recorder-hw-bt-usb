@@ -132,14 +132,26 @@ static bool hci_hal_env_init(const hci_hal_callbacks_t *upper_callbacks, osi_thr
 #endif
 #endif // #if (BLE_42_SCAN_EN == TRUE)
     hci_hal_env.rx_q = fixed_queue_new(QUEUE_SIZE_MAX);
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+    if (hci_hal_env.rx_q == NULL) {
+        return false; /* open_fw patch 0021: hal_open() cleans up and fails esp_bluedroid_init() */
+    }
+#else
     assert(hci_hal_env.rx_q != NULL);
+#endif
 #if (BLE_42_SCAN_EN == TRUE)
     hci_hal_env.adv_rpt_q = pkt_queue_create();
     assert(hci_hal_env.adv_rpt_q != NULL);
 #endif // #if (BLE_42_SCAN_EN == TRUE)
 
     struct osi_event *event = osi_event_create(hci_upstream_data_handler, NULL);
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+    if (event == NULL) {
+        return false; /* open_fw patch 0021 */
+    }
+#else
     assert(event != NULL);
+#endif
     hci_hal_env.upstream_data_ready = event;
     osi_event_bind(hci_hal_env.upstream_data_ready, hci_hal_env.hci_h4_thread, HCI_UPSTREAM_DATA_QUEUE_IDX);
 
@@ -182,7 +194,14 @@ static void hci_hal_env_deinit(void)
 
 static bool hal_open(const hci_hal_callbacks_t *upper_callbacks, void *task_thread)
 {
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+    if (!hci_hal_env_init(upper_callbacks, (osi_thread_t *)task_thread)) {
+        hci_hal_env_deinit(); /* open_fw patch 0021: NULL-safe for the members not created yet */
+        return false;
+    }
+#else
     hci_hal_env_init(upper_callbacks, (osi_thread_t *)task_thread);
+#endif
 
     //register vhci host cb
     if (hci_host_register_callback(&hci_host_cb) != ESP_OK) {

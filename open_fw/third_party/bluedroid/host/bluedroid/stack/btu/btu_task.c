@@ -540,13 +540,31 @@ void btu_c2h_credit_pause_if_congested(void)
 }
 #endif
 
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+/* open_fw patch 0022: BTU_ShutDown() runs btu_task_shut_down() also when BTU_StartUp() failed before the start-up
+ * message ran (upstream then frees never-initialised core control blocks: l2c_free() asserts on a NULL list). */
+static bool btu_core_started;
+#endif
+
 void btu_task_start_up(void *param)
 {
     UNUSED(param);
     /* Initialize the mandatory core stack control blocks
        (BTU, BTM, L2CAP, and SDP)
      */
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+    btu_core_started = true;
     btu_init_core();
+    if (!btu_init_core_ok()) {
+        HCI_TRACE_ERROR("btu_init_core failed (no memory)");
+        if (bluedroid_init_done_cb) {
+            bluedroid_init_done_cb(BT_STATUS_NOMEM); /* esp_bluedroid_init() fails; partial-init cleanup frees */
+        }
+        return;
+    }
+#else
+    btu_init_core();
+#endif
 
     /* Initialize any optional stack components */
     if (BTE_InitStack() != BT_STATUS_SUCCESS) {
@@ -559,6 +577,15 @@ void btu_task_start_up(void *param)
 
 #if (defined(BTA_INCLUDED) && BTA_INCLUDED == TRUE)
     bta_sys_init();
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+    if (!bta_sys_init_ok()) {
+        HCI_TRACE_ERROR("bta_sys_init failed (no memory)");
+        if (bluedroid_init_done_cb) {
+            bluedroid_init_done_cb(BT_STATUS_NOMEM); /* open_fw patch 0022 */
+        }
+        return;
+    }
+#endif
 #endif
 
     // Inform the bt jni thread initialization is ok.
@@ -570,6 +597,12 @@ void btu_task_start_up(void *param)
 
 void btu_task_shut_down(void)
 {
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+    if (!btu_core_started) {
+        return; /* open_fw patch 0022: nothing of the core stack was initialised */
+    }
+    btu_core_started = false;
+#endif
 #if (defined(BTA_INCLUDED) && BTA_INCLUDED == TRUE)
     bta_sys_free();
 #endif

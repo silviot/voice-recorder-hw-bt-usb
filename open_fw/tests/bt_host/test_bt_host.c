@@ -1,5 +1,5 @@
 /* Bluedroid end-to-end host harness, path (b) "through M1" (plan docs/BLUETOOTH_BLUEDROID_PLAN.md M3, step 5):
- * real Bluedroid (patches 0001-0010) + bt_port (alarms, esp_timer shim, store, entropy) + bt_ctrl + tests/fake_rom.c,
+ * real Bluedroid (patches 0001-0023) + bt_port (alarms, esp_timer shim, store, entropy) + bt_ctrl + tests/fake_rom.c,
  * on FreeRTOS-Kernel V11.1.0 (POSIX port), under ASan/UBSan (TSan variant: make test-bt-host-tsan).
  *
  *   test_bt_host [all [N]]       all scenarios: patch 0009 fixed_queue slot restore, init+enable, GAP name/scan mode,
@@ -7,10 +7,14 @@
  *   test_bt_host fixedq          the patch 0009 scenario alone
  *   test_bt_host noack           the patch 0010 scenario alone
  *   test_bt_host cycles N        the leak loop with N cycles
- *   test_bt_host sweep-count     prints "ENABLE_ALLOCS <n>": allocation attempts made while esp_bluedroid_enable() runs
- *   test_bt_host sweep-one N     one cycle with the N-th allocation attempt of enable failing; exit 0 when enable
- *                                completed (ENABLED) or failed cleanly, and the stack tore down with no leak; a point
- *                                whose N-th attempt never happened (nothing injected) fails
+ *   test_bt_host phone IMG       phone mode end to end (tests/bt_host/test_phone.c): the BT=1 XREC backend over this
+ *                                stack and the fake ROM's scripted laptop; IMG = a 4096-sector exFAT image (SD card)
+ *   test_bt_host sweep-count [M] prints "SWEEP_ALLOCS <M> <n>": allocation attempts made while the call under test
+ *                                runs; M = init | enable (default) | disable | deinit (esp_bluedroid_<M>())
+ *   test_bt_host sweep-one N [M] one cycle with the N-th allocation attempt of that call failing; exit 0 when the call
+ *                                completed (OK) or failed cleanly (CLEAN_FAIL), the stack tore down with no leak and a
+ *                                following clean cycle (init, enable, disable, deinit) still works; a point whose N-th
+ *                                attempt never happened (nothing injected) fails
  *
  * Every blocking step runs under a deadline enforced by a watchdog pthread outside FreeRTOS (exit code 124 + the
  * step name on expiry), so a hang never stalls the gate.
@@ -453,42 +457,141 @@ static void scenario_fixed_queue_slot(void)
           "(before %zu / %zu)", h1.live_bytes, h1.live_blocks, h0.live_bytes, h0.live_blocks);
 }
 
-/* Allocation attempts made while esp_bluedroid_enable() runs (all tasks). */
-static uint64_t count_enable_allocs(void)
+/* Allocation-failure sweep (plan M1 "general rule"; run_sweep.py). One mode per lifecycle call: the stack is brought
+ * to the state before that call, the N-th allocation attempt made while the call runs (all tasks) fails, then:
+ *   - the call returned ESP_OK, or an error with the API state unchanged (a clean failure);
+ *   - teardown from there works: a failed disable is retried (the API stays ENABLED, so a recovery has to disable
+ *     again), a failed deinit is retried, then heap bytes/blocks, tasks and esp_timer slots are back at the baseline;
+ *   - a following clean cycle (init, enable, disable, deinit) still succeeds and returns to the baseline, so a failure
+ *     leaves nothing half-initialised behind that blocks a later retry. */
+typedef enum { SWEEP_INIT, SWEEP_ENABLE, SWEEP_DISABLE, SWEEP_DEINIT, SWEEP_MODES } sweep_mode_t;
+static const char *const k_sweep_mode[SWEEP_MODES] = {"init", "enable", "disable", "deinit"};
+
+static int sweep_mode_of(const char *name, sweep_mode_t *m)
 {
-    CHECK(do_init() == ESP_OK, "init");
+    for (int i = 0; i < SWEEP_MODES; i++) {
+        if (strcmp(name, k_sweep_mode[i]) == 0) {
+            *m = (sweep_mode_t)i;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* State before the call under test: bt_ctrl open (init); initialised (enable); enabled (disable); disabled with
+ * bt_ctrl deliveries quiesced (deinit, contract §2). */
+static void sweep_prepare(sweep_mode_t m)
+{
+    CHECK(bth_ctrl_open() == 0, "bt_ctrl_open / attach");
+    if (m >= SWEEP_ENABLE) {
+        bth_step("esp_bluedroid_init", 20000u);
+        CHECK(esp_bluedroid_init() == ESP_OK, "init");
+        bth_step_done();
+    }
+    if (m >= SWEEP_DISABLE) {
+        CHECK(do_enable() == ESP_OK, "enable");
+    }
+    if (m == SWEEP_DEINIT) {
+        bth_step("esp_bluedroid_disable", 20000u);
+        CHECK(esp_bluedroid_disable() == ESP_OK, "disable");
+        bth_step_done();
+        bth_step("bt_ctrl close", 5000u);
+        CHECK(bth_ctrl_close(4000u) == BT_CTRL_STOP_OK, "bt_ctrl shutdown");
+        bth_step_done();
+    }
+}
+
+static esp_err_t sweep_call(sweep_mode_t m)
+{
+    static const char *const step[SWEEP_MODES] = {"esp_bluedroid_init (swept)", "esp_bluedroid_enable (swept)",
+                                                  "esp_bluedroid_disable (swept)", "esp_bluedroid_deinit (swept)"};
+    esp_err_t e = ESP_FAIL;
+    bth_step(step[m], 20000u);
+    switch (m) {
+    case SWEEP_INIT: e = esp_bluedroid_init(); break;
+    case SWEEP_ENABLE: e = esp_bluedroid_enable(); break;
+    case SWEEP_DISABLE: e = esp_bluedroid_disable(); break;
+    default: e = esp_bluedroid_deinit(); break;
+    }
+    bth_step_done();
+    return e;
+}
+
+/* API state the call leaves behind on success and on a clean failure. */
+static void sweep_check_state(sweep_mode_t m, esp_err_t e)
+{
+    static const esp_bluedroid_status_t ok[SWEEP_MODES] = {
+        ESP_BLUEDROID_STATUS_INITIALIZED, ESP_BLUEDROID_STATUS_ENABLED, ESP_BLUEDROID_STATUS_INITIALIZED,
+        ESP_BLUEDROID_STATUS_UNINITIALIZED};
+    static const esp_bluedroid_status_t failed[SWEEP_MODES] = {
+        ESP_BLUEDROID_STATUS_UNINITIALIZED, ESP_BLUEDROID_STATUS_INITIALIZED, ESP_BLUEDROID_STATUS_ENABLED,
+        ESP_BLUEDROID_STATUS_INITIALIZED};
+    esp_bluedroid_status_t want = e == ESP_OK ? ok[m] : failed[m];
+    CHECK(esp_bluedroid_get_status() == want, "%s returned %d: status %d, want %d", k_sweep_mode[m], (int)e,
+          (int)esp_bluedroid_get_status(), (int)want);
+}
+
+static void sweep_teardown(sweep_mode_t m)
+{
+    if (m != SWEEP_DEINIT) {
+        do_teardown();      /* disables first when still ENABLED (a failed disable is retried here) */
+        return;
+    }
+    if (esp_bluedroid_get_status() != ESP_BLUEDROID_STATUS_UNINITIALIZED) {
+        bth_step("esp_bluedroid_deinit (retry)", 20000u);
+        CHECK(esp_bluedroid_deinit() == ESP_OK, "deinit retry");
+        bth_step_done();
+    }
+}
+
+/* Allocation attempts made while the call under test runs (all tasks). */
+static uint64_t sweep_count(sweep_mode_t m)
+{
+    sweep_prepare(m);
     bth_heap_count_start();
-    CHECK(do_enable() == ESP_OK, "enable");
+    CHECK(sweep_call(m) == ESP_OK, "%s", k_sweep_mode[m]);
     uint64_t n = bth_heap_counted();
-    do_teardown();
+    sweep_teardown(m);
     return n;
 }
 
-/* One sweep point: fail the n-th allocation attempt of enable. Pass = completion or a clean failure, then a full
- * teardown with no leak, no fault, no contract error. */
-static int sweep_one(const baseline_t *base, uint64_t n)
+static int sweep_one(const baseline_t *base, sweep_mode_t m, uint64_t n)
 {
-    CHECK(do_init() == ESP_OK, "init");
+    sweep_prepare(m);
     bth_heap_fail_arm(n, false);
-    esp_err_t e = do_enable();
+    esp_err_t e = sweep_call(m);
     bth_heap_stats_t h;
     bth_heap_stats(&h);
     bth_heap_fail_disarm();
     /* A point beyond the attempts this run made tests nothing (run_sweep.py also rejects injected=0). */
     CHECK(h.injected == 1u, "sweep %llu: %llu allocations injected, want exactly 1", (unsigned long long)n,
           (unsigned long long)h.injected);
-    const char *outcome = e == ESP_OK ? "ENABLED" : "CLEAN_FAIL";
-    if (e == ESP_OK) {
-        CHECK(esp_bluedroid_get_status() == ESP_BLUEDROID_STATUS_ENABLED, "status %d", (int)esp_bluedroid_get_status());
+    const char *outcome = e == ESP_OK ? "OK" : "CLEAN_FAIL";
+    sweep_check_state(m, e);
+    if (m == SWEEP_INIT && e == ESP_OK) {
+        /* an init that reports success must have built a usable stack (upstream ignores some failures, e.g. l2c_init
+         * and sdp_init lists, and only falls over later): enable it before tearing down */
+        CHECK(do_enable() == ESP_OK, "enable after a successful swept init");
     }
     check_controller_clean("sweep");
-    do_teardown();
+    sweep_teardown(m);
     baseline_t now;
     CHECK(settle_to(base, &now), "sweep %llu: heap %zu B / %zu blocks (base %zu / %zu), tasks %lu (base %lu), "
           "timers %u (base %u)", (unsigned long long)n, now.bytes, now.blocks, base->bytes, base->blocks,
           (unsigned long)now.tasks, (unsigned long)base->tasks, now.timers, base->timers);
-    bth_log("SWEEP n=%llu injected=%llu ra=%p outcome=%s dlv_retries=%u fail=%d\n", (unsigned long long)n,
-            (unsigned long long)h.injected, h.last_injected_ra, outcome, bth_dlv_retries(), g_fail);
+    if (g_fail == 0) {
+        /* retry: a clean cycle after the failure */
+        CHECK(do_init() == ESP_OK, "retry init");
+        CHECK(do_enable() == ESP_OK, "retry enable");
+        do_teardown();
+        check_controller_clean("sweep retry");
+        CHECK(settle_to(base, &now), "sweep %llu retry: heap %zu B / %zu blocks (base %zu / %zu), tasks %lu, timers %u",
+              (unsigned long long)n, now.bytes, now.blocks, base->bytes, base->blocks, (unsigned long)now.tasks,
+              now.timers);
+    }
+    bth_log("SWEEP mode=%s n=%llu injected=%llu ra=%p outcome=%s dlv_retries=%u fail=%d\n", k_sweep_mode[m],
+            (unsigned long long)n, (unsigned long long)h.injected, h.last_injected_ra, outcome, bth_dlv_retries(),
+            g_fail);
     return g_fail == 0 ? 0 : 1;
 }
 
@@ -497,6 +600,7 @@ static int sweep_one(const baseline_t *base, uint64_t n)
 /* ------------------------------------------------------------------------------------------------------------- */
 int s_argc;
 char **s_argv;
+int bth_phone_scenario(const char *img_path);   /* test_phone.c */
 
 extern char _end[];   /* end of .bss (GNU ld) */
 
@@ -513,18 +617,29 @@ void bth_test_task(void *arg)
     baseline_t base = snap();
     const char *mode = s_argc > 1 ? s_argv[1] : "all";
     int rc;
+    sweep_mode_t sm = SWEEP_ENABLE;
     if (strcmp(mode, "sweep-count") == 0) {
-        uint64_t n = count_enable_allocs();
-        printf("ENABLE_ALLOCS %llu\n", (unsigned long long)n);
+        if (s_argc > 2 && !sweep_mode_of(s_argv[2], &sm)) {
+            bth_log("unknown sweep mode %s\n", s_argv[2]);
+            exit(2);
+        }
+        uint64_t n = sweep_count(sm);
+        printf("SWEEP_ALLOCS %s %llu\n", k_sweep_mode[sm], (unsigned long long)n);
         rc = g_fail ? 1 : 0;
     } else if (strcmp(mode, "sweep-one") == 0 && s_argc > 2) {
-        rc = sweep_one(&base, strtoull(s_argv[2], NULL, 0));
+        if (s_argc > 3 && !sweep_mode_of(s_argv[3], &sm)) {
+            bth_log("unknown sweep mode %s\n", s_argv[3]);
+            exit(2);
+        }
+        rc = sweep_one(&base, sm, strtoull(s_argv[2], NULL, 0));
     } else if (strcmp(mode, "fixedq") == 0) {
         scenario_fixed_queue_slot();
         rc = g_fail ? 1 : 0;
     } else if (strcmp(mode, "noack") == 0) {
         scenario_noack_zero_credits(&base);
         rc = g_fail ? 1 : 0;
+    } else if (strcmp(mode, "phone") == 0 && s_argc > 2) {
+        rc = bth_phone_scenario(s_argv[2]) == 0 ? 0 : 1;
     } else if (strcmp(mode, "cycles") == 0 && s_argc > 2) {
         scenario_cycles(&base, atoi(s_argv[2]));
         rc = g_fail ? 1 : 0;

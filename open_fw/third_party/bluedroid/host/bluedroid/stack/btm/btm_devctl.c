@@ -248,6 +248,15 @@ void BTM_DeviceReset (UNUSED_ATTR tBTM_CMPL_CB *p_cb)
     /* todo: review the below logic; start_up executes under another task context
      * reset_complete runs in btu task */
     controller_get_interface()->start_up();
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+    if (!controller_get_interface()->get_is_ready()) {
+        /* open_fw patch 0013: start_up() failed (patch 0012). reset_complete() would read the controller's (unset)
+         * parameters; report the device down instead, which fails a pending enable (bta_dm_sys_hw_cback). */
+        BTM_TRACE_ERROR("%s controller start-up failed", __func__);
+        btm_report_device_status(BTM_DEV_STATUS_DOWN);
+        return;
+    }
+#endif
     reset_complete();
 }
 
