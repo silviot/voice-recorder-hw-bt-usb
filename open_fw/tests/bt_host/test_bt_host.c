@@ -30,6 +30,7 @@
 #include "esp_bt_main.h"
 #include "esp_bt_device.h"
 #include "esp_gap_bt_api.h"
+#include "osi/alarm.h"
 #include "osi/fixed_queue.h"
 #include "bt_ctrl.h"
 #include "fake_rom.h"
@@ -457,6 +458,69 @@ static void scenario_fixed_queue_slot(void)
           "(before %zu / %zu)", h1.live_bytes, h1.live_blocks, h0.live_bytes, h0.live_blocks);
 }
 
+/* Patch 0029: if a higher-priority task preempts BTC right after bt_alarm_drain() pops an expired osi_alarm (before
+ * alarm_cb_handler() runs) and frees + reallocates the same alarm_cbs[] slot without arming the new alarm,
+ * alarm_cb_handler() must revalidate under alarm_mutex and drop the stale delivery instead of firing the new
+ * callback with the new cb_data. */
+static TaskHandle_t s_p29_preempt_task, s_p29_btc_task;
+static osi_alarm_t *s_p29_a1, *s_p29_a2;
+static volatile int s_p29_cb1_hits, s_p29_cb2_hits, s_p29_preempted;
+static int s_p29_arg1 = 0x1111, s_p29_arg2 = 0x2222;
+
+static void p29_cb1(void *arg) { if (arg == &s_p29_arg1) s_p29_cb1_hits++; }
+static void p29_cb2(void *arg) { (void)arg; s_p29_cb2_hits++; }
+
+static void p29_drain_hook(void)
+{
+    s_p29_btc_task = xTaskGetCurrentTaskHandle();
+    xTaskNotifyGive(s_p29_preempt_task);
+    (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));   /* deterministic handoff even under BTH_PREEMPTION=0 */
+}
+
+static void p29_preempt_fn(void *arg)
+{
+    (void)arg;
+    if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(4000)) != 0u) {
+        osi_alarm_free(s_p29_a1);
+        s_p29_a1 = NULL;
+        /* Allocate into the freshly-freed alarm_cbs[] slot, WITHOUT calling osi_alarm_set(). */
+        s_p29_a2 = osi_alarm_new("p29_b", p29_cb2, &s_p29_arg2, 0);
+        s_p29_preempted = 1;
+        xTaskNotifyGive(s_p29_btc_task);
+    }
+    vTaskDelete(NULL);
+}
+
+static void scenario_alarm_preempt_revalidate(const baseline_t *base)
+{
+    bth_log("[0b] patch 0029: osi_alarm revalidates under alarm_mutex when preempted by free+new\n");
+    CHECK(do_init() == ESP_OK, "p29 init");
+    s_p29_cb1_hits = s_p29_cb2_hits = s_p29_preempted = 0;
+    s_p29_a1 = s_p29_a2 = NULL;
+    CHECK(xTaskCreate(p29_preempt_fn, "p29_hp", 4096, NULL, configMAX_PRIORITIES - 1, &s_p29_preempt_task) == pdPASS,
+          "create p29_hp");
+    s_p29_a1 = osi_alarm_new("p29_a", p29_cb1, &s_p29_arg1, 0);
+    CHECK(s_p29_a1 != NULL, "osi_alarm_new a1");
+    bth_alarm_arm_drain_exit_hook(p29_drain_hook);
+    CHECK(osi_alarm_set(s_p29_a1, 5) == OSI_ALARM_ERR_PASS, "osi_alarm_set a1");
+    bth_step("patch 0029 preemption", 5000u);
+    CHECK(wait_until(&s_p29_preempted, 1, 3000u), "p29 drain hook never fired");
+    bth_step_done();
+    vTaskDelay(pdMS_TO_TICKS(30));
+    CHECK(s_p29_a2 != NULL, "osi_alarm_new a2");
+    CHECK(s_p29_cb1_hits == 0 && s_p29_cb2_hits == 0,
+          "stale delivery fired across free+new (cb1=%d, unarmed cb2=%d; patch 0029 missing?)",
+          s_p29_cb1_hits, s_p29_cb2_hits);
+    if (s_p29_a2 != NULL) {
+        osi_alarm_free(s_p29_a2);
+        s_p29_a2 = NULL;
+    }
+    do_teardown();
+    baseline_t now;
+    CHECK(settle_to(base, &now), "after patch 0029: heap %zu/%zu, tasks %lu, timers %u",
+          now.bytes, now.blocks, (unsigned long)now.tasks, now.timers);
+}
+
 /* Allocation-failure sweep (plan M1 "general rule"; run_sweep.py). One mode per lifecycle call: the stack is brought
  * to the state before that call, the N-th allocation attempt made while the call runs (all tasks) fails, then:
  *   - the call returned ESP_OK, or an error with the API state unchanged (a clean failure);
@@ -635,6 +699,9 @@ void bth_test_task(void *arg)
     } else if (strcmp(mode, "fixedq") == 0) {
         scenario_fixed_queue_slot();
         rc = g_fail ? 1 : 0;
+    } else if (strcmp(mode, "patch29") == 0) {
+        scenario_alarm_preempt_revalidate(&base);
+        rc = g_fail ? 1 : 0;
     } else if (strcmp(mode, "noack") == 0) {
         scenario_noack_zero_credits(&base);
         rc = g_fail ? 1 : 0;
@@ -645,6 +712,9 @@ void bth_test_task(void *arg)
         rc = g_fail ? 1 : 0;
     } else {
         scenario_fixed_queue_slot();
+        if (g_fail == 0) {
+            scenario_alarm_preempt_revalidate(&base);
+        }
         if (g_fail == 0) {
             scenario_enable_gap_disable(&base);
         }

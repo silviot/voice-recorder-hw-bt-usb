@@ -153,17 +153,30 @@ static struct alarm_t *alarm_cbs_lookfor_available(void)
 static void alarm_cb_handler(struct alarm_t *alarm)
 {
     OSI_TRACE_DEBUG("TimerID %p\n", alarm);
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+    /* open_fw patch 0005 + 0029: the esp_timer shim delivers in BTC context (bt_alarm drain). Revalidate under
+     * alarm_mutex and snapshot (cb, cb_data) before invoking: a higher-priority task (e.g. BTU) may have preempted
+     * BTC between bt_alarm_drain()'s critical section and here to cancel, re-arm, free, or reallocate this slot. */
+    if (alarm == NULL || alarm_mutex == NULL) {
+        return;
+    }
+    osi_alarm_callback_t cb = NULL;
+    void *cb_data = NULL;
+    osi_mutex_lock(&alarm_mutex, OSI_MUTEX_MAX_TIMEOUT);
+    if (alarm_state == ALARM_STATE_OPEN && alarm->alarm_hdl != NULL &&
+        osi_alarm_delivery_gen() != 0u && osi_alarm_delivery_gen() == osi_alarm_generation(alarm)) {
+        cb = alarm->cb;
+        cb_data = alarm->cb_data;
+    }
+    osi_mutex_unlock(&alarm_mutex);
+    if (cb != NULL) {
+        cb(cb_data);
+    }
+#else
     if (alarm_state != ALARM_STATE_OPEN) {
         OSI_TRACE_WARNING("%s, invalid state %d\n", __func__, alarm_state);
         return;
     }
-#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
-    /* open_fw patch 0005: the esp_timer shim delivers in BTC context (bt_alarm drain), already validated against
-     * the alarm generation; call directly instead of btc_transfer_context (which allocates and may block). */
-    if (alarm->cb != NULL) {
-        alarm->cb(alarm->cb_data);
-    }
-#else
     btc_msg_t msg = {0};
     btc_alarm_args_t arg;
     msg.sig = BTC_SIG_API_CALL;

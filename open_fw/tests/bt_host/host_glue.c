@@ -48,8 +48,23 @@ uint64_t us_timer_now(void)
 
 /* ---- bt_alarm platform (as bt_port_glue.c) ---- */
 static uint64_t plat_now_us(void) { return us_timer_now(); }
+static void (*s_drain_exit_hook)(void);
+static int s_in_drain, s_drain_exits;
 static void plat_enter(void) { taskENTER_CRITICAL(); }
-static void plat_exit(void) { taskEXIT_CRITICAL(); }
+static void plat_exit(void)
+{
+    int fire = 0;
+    void (*fn)(void) = NULL;
+    if (s_in_drain && s_drain_exit_hook != NULL && ++s_drain_exits == 2) {
+        fn = s_drain_exit_hook;
+        s_drain_exit_hook = NULL;
+        fire = 1;
+    }
+    taskEXIT_CRITICAL();
+    if (fire) {
+        fn();
+    }
+}
 static void plat_wake(void)
 {
     if (s_alarm_task != NULL) {
@@ -79,7 +94,20 @@ static void bt_alarm_task(void *arg)
 }
 
 /* ---- hooks for Bluedroid patches 0005-0007 ---- */
-void bt_port_alarm_drain(void) { bt_alarm_drain(); }
+void bth_alarm_arm_drain_exit_hook(void (*fn)(void))
+{
+    taskENTER_CRITICAL();
+    s_drain_exit_hook = fn;
+    s_drain_exits = 0;
+    taskEXIT_CRITICAL();
+}
+void bt_port_alarm_drain(void)
+{
+    s_in_drain = 1;
+    s_drain_exits = 0;
+    bt_alarm_drain();
+    s_in_drain = 0;
+}
 uint32_t bt_port_alarm_delivery_gen(void) { return bt_alarm_delivery_gen(); }
 void bt_port_on_hci_command_timeout(uint16_t opcode)
 {
