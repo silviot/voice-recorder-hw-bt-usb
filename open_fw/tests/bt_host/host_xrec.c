@@ -34,6 +34,14 @@
 #include "bt_store.h"
 #include "host_env.h"
 #include "host_xrec.h"
+/* Bluedroid's osi thread API (osi/thread.h pulls in bt_common.h, whose bt_status_t clashes with openfw.h's). */
+typedef struct osi_thread osi_thread_t;
+bool osi_thread_post(osi_thread_t *thread, void (*func)(void *context), void *context, int queue_idx,
+                     uint32_t timeout);
+
+osi_thread_t *hci_get_current_thread(void);
+osi_thread_t *btu_get_current_thread(void);
+osi_thread_t *btc_get_current_thread(void);
 
 #define BTHX_RECOVER_PRIO 2u
 /* as bt_xrec_fw.c: loads by the starting session's mode, writes by the mode whose bonds the RAM store holds */
@@ -78,6 +86,35 @@ static volatile uint32_t s_dl_fired_total, s_hard_reason, s_bond_writes, s_key_w
 static uint32_t s_faults_base, s_hci_to_base, s_flush_seen;
 static volatile uint8_t s_fail_bond_writes;   /* test knob: every /bt_bonds.bin write fails (full / removed card) */
 static volatile uint32_t s_bond_write_fails;
+
+/* Bluedroid task supervisor: the firmware's (bt_xrec_fw.c sup_post), armed at the first platform poll, disarmed when
+ * the teardown starts; a stall is platform fault 4. */
+static bt_task_sup_t s_sup;
+static volatile uint8_t s_sup_ready;
+static volatile uint32_t s_sup_faults;
+static volatile uint8_t s_block[BT_TASK_SUP_N];       /* test knob: a work item that keeps the thread busy */
+static volatile uint8_t s_block_running[BT_TASK_SUP_N];
+
+static int sup_post(unsigned idx, void (*fn)(void *ctx), void *ctx)
+{
+    osi_thread_t *t = idx == BT_TASK_SUP_HCI ? hci_get_current_thread()
+                    : idx == BT_TASK_SUP_BTU ? btu_get_current_thread()
+                    : btc_get_current_thread();
+    if (t == NULL) {
+        return 0;
+    }
+    return osi_thread_post(t, fn, ctx, 0, 0u) ? 1 : 0;
+}
+
+static void block_cb(void *ctx)
+{
+    unsigned idx = (unsigned)(uintptr_t)ctx;
+    s_block_running[idx] = 1u;
+    while (s_block[idx]) {
+        vTaskDelay(1);                 /* the thread is stuck in this item (a lost wake-up, a wait that never ends) */
+    }
+    s_block_running[idx] = 0u;
+}
 static uint8_t s_bond_fails;                  /* as bt_xrec_fw.c: consecutive failures, bounded retry */
 static uint32_t s_bond_retry_at;
 #define BOND_RETRY_MS  1000u
@@ -496,6 +533,7 @@ int bt_xrec_plat_stack_up_begin(exfat_vol_t *vol, int sd_mounted, const uint8_t 
 
 void bt_xrec_plat_stack_down_begin(void)
 {
+    bt_task_sup_disarm(&s_sup);
     s_key_installed = 0u;            /* the controller stops: bt_rom_real stop() wipes the session key */
     taskENTER_CRITICAL();
     s_dl_fired = 0u;
@@ -533,11 +571,64 @@ uint32_t bt_xrec_plat_poll(void)
     if (bth_hci_cmd_timeouts() != s_hci_to_base) {
         return 3u;
     }
+    if (s_sup_ready) {
+        uint32_t now = bt_xrec_plat_now_ms();
+        bt_task_sup_arm(&s_sup, now);
+        uint32_t stalled = bt_task_sup_poll(&s_sup, now);
+        if (stalled != 0u) {
+            for (unsigned i = 0u; i < BT_TASK_SUP_N; i++) {
+                if (stalled & (1u << i)) {
+                    bth_log("    [xrec] BT task stalled: %s\n", bt_task_sup_name(i));
+                }
+            }
+            s_sup_faults++;
+            return 4u;
+        }
+    }
     return 0u;
+}
+
+void bthx_sup_limits(uint32_t period_ms, uint32_t stall_ms, uint32_t hold_ms)
+{
+    bt_task_sup_set_limits(&s_sup, period_ms, stall_ms, hold_ms);
+}
+
+void bthx_sup_stats(bt_task_sup_stats_t *out)
+{
+    bt_task_sup_stats(&s_sup, bt_xrec_plat_now_ms(), out);
+}
+
+int bthx_sup_hold(void)
+{
+    return bt_task_sup_hold(&s_sup, bt_xrec_plat_now_ms());
+}
+
+uint32_t bthx_sup_faults(void)
+{
+    return s_sup_faults;
+}
+
+int bthx_block_thread(unsigned idx, int on)
+{
+    if (idx >= BT_TASK_SUP_N) {
+        return -1;
+    }
+    if (!on) {
+        s_block[idx] = 0u;
+        return 0;
+    }
+    s_block[idx] = 1u;
+    return sup_post(idx, block_cb, (void *)(uintptr_t)idx) ? 0 : -1;
+}
+
+int bthx_block_running(unsigned idx)
+{
+    return idx < BT_TASK_SUP_N ? s_block_running[idx] : 0;
 }
 
 void bt_xrec_plat_session_end(void)
 {
+    bt_task_sup_disarm(&s_sup);
     bonds_write();                   /* final flush of the bond store */
     s_bond_fails = 0u;
     s_key_staged = s_key_installed = 0u;
@@ -634,6 +725,8 @@ int bthx_init(exfat_vol_t *vol)
     if (s_dl_timer == NULL) {
         return -1;
     }
+    bt_task_sup_init(&s_sup, sup_post);
+    s_sup_ready = 1u;
     if (xTaskCreate(bt_recover_task, "bt_recover", 8192u, NULL, BTHX_RECOVER_PRIO, &s_rec) != pdPASS ||
         xTaskCreate(app_task, "app", 16384u, NULL, OPENFW_PRIO_APP, &s_app) != pdPASS) {
         return -1;

@@ -40,6 +40,15 @@
 #include "bt_ctrl_rtos.h"
 #include "bt_rom_real.h"
 #include "bt_xrec_bluedroid.h"
+#include "bt_task_sup.h"
+/* Bluedroid's osi thread API (osi/thread.h pulls in bt_common.h, whose bt_status_t clashes with openfw.h's). */
+typedef struct osi_thread osi_thread_t;
+bool osi_thread_post(osi_thread_t *thread, void (*func)(void *context), void *context, int queue_idx,
+                     uint32_t timeout);
+
+osi_thread_t *hci_get_current_thread(void);
+osi_thread_t *btu_get_current_thread(void);
+osi_thread_t *btc_get_current_thread(void);
 
 /* Static, heap-free objects of the recovery ladder (plan M1: bt_recover exists without heap). They live in SRAM_HI
  * (.bss_hi, zeroed at boot, like bt_port/hci_probe.c's buffers) rather than .rtos_static: with bt_ctrl's rings and
@@ -83,6 +92,10 @@ static StaticTimer_t s_dl_buf BT_HI_STATIC;
 static StaticTimer_t s_guard_buf BT_HI_STATIC;
 static TimerHandle_t s_dl_timer, s_guard_timer;
 static volatile uint8_t s_dl_armed, s_dl_fired, s_ctrl_hung;
+
+/* ---- task liveness supervisor (bt_task_sup.h; plan M4 "Watchdog") ---- */
+static bt_task_sup_t s_sup BT_HI_STATIC;
+static uint8_t s_sup_ready;
 
 /* ---- faults / telemetry ---- */
 /* RAM budget telemetry (plan §4: free heap under traffic >= 8 KiB, largest free block >= the largest allocation;
@@ -879,6 +892,49 @@ int bt_xrec_plat_deadline_disarm(void)
     return fired;
 }
 
+/* ============================================ task supervisor ===================================================== */
+/* App task only, and only while the stack is enabled (armed from the first platform poll, disarmed when the teardown
+ * starts): the thread handles are valid then. Queue 0, no wait: a full queue is a refusal (counted as outstanding). */
+static int sup_post(unsigned idx, void (*fn)(void *ctx), void *ctx)
+{
+    osi_thread_t *t = idx == BT_TASK_SUP_HCI ? hci_get_current_thread()
+                    : idx == BT_TASK_SUP_BTU ? btu_get_current_thread()
+                    : btc_get_current_thread();
+    if (t == NULL) {
+        return 0;
+    }
+    return osi_thread_post(t, fn, ctx, 0, 0u) ? 1 : 0;
+}
+
+/* src/wdt_timer.c wdt_feed() (BT=1 images; weak 0 there): the backstop of bt_task_sup.h. Any context. */
+int bt_task_sup_feed_hold_now(void)
+{
+    return s_sup_ready ? bt_task_sup_hold(&s_sup, millis()) : 0;
+}
+
+static void sup_log(const char *when)
+{
+    bt_task_sup_stats_t st;
+    bt_task_sup_stats(&s_sup, millis(), &st);
+    openfw_log_puts("BT sup ");
+    openfw_log_puts(when);
+    openfw_log_puts(" stalls ");
+    openfw_log_u32(st.stalls);
+    for (unsigned i = 0u; i < BT_TASK_SUP_N; i++) {
+        openfw_log_putc(' ');
+        openfw_log_puts(bt_task_sup_name(i));
+        openfw_log_puts(" n=");
+        openfw_log_u32(st.answers[i]);
+        openfw_log_puts(" max=");
+        openfw_log_u32(st.max_ms[i]);
+        openfw_log_puts(" ref=");
+        openfw_log_u32(st.refused[i]);
+        openfw_log_puts(" out=");
+        openfw_log_u32(st.outstanding_ms[i]);
+    }
+    openfw_log_putc('\n');
+}
+
 /* ============================================ lifecycle (app task) ============================================== */
 static int once_init(void)
 {
@@ -892,6 +948,8 @@ static int once_init(void)
     if (s_dl_timer == NULL || s_guard_timer == NULL) {
         return -1;
     }
+    bt_task_sup_init(&s_sup, sup_post);
+    s_sup_ready = 1u;
     int err = bt_ctrl_rtos_init(&bt_rom_real, s_bd);   /* bt_ctrl + bt_dlv tasks, opcode-table validation */
     if (err != 0) {
         bt_xrec_plat_log_u32("BT bt_ctrl init failed", (uint32_t)err);
@@ -931,6 +989,7 @@ int bt_xrec_plat_stack_up_begin(exfat_vol_t *vol, int sd_mounted, const uint8_t 
 
 void bt_xrec_plat_stack_down_begin(void)
 {
+    bt_task_sup_disarm(&s_sup);                          /* the teardown has its own deadline (bt_task_sup.h) */
     taskENTER_CRITICAL();
     s_dl_fired = 0u;
     s_dl_armed = 1u;
@@ -990,6 +1049,21 @@ uint32_t bt_xrec_plat_poll(void)
     if (s_ctrl_hung) {
         return 1u;
     }
+    if (s_sup_ready) {
+        bt_task_sup_arm(&s_sup, now);                    /* no-op while armed: first poll with the stack enabled */
+        uint32_t stalled = bt_task_sup_poll(&s_sup, now);
+        if (stalled != 0u) {
+            for (unsigned i = 0u; i < BT_TASK_SUP_N; i++) {
+                if (stalled & (1u << i)) {
+                    openfw_log_puts("BT task stalled: ");
+                    openfw_log_puts(bt_task_sup_name(i));
+                    openfw_log_putc('\n');
+                }
+            }
+            sup_log("stall");
+            return 4u;
+        }
+    }
 #if defined(OPENFW_BT_BENCH_IMAGE) && OPENFW_BT_BENCH_IMAGE
     rom_links_log(0);
 #endif
@@ -1011,6 +1085,7 @@ uint32_t bt_xrec_plat_poll(void)
 
 void bt_xrec_plat_session_end(void)
 {
+    bt_task_sup_disarm(&s_sup);
     if (s_guard_timer != NULL) {
         (void)xTimerStop(s_guard_timer, 0);
     }
@@ -1019,6 +1094,9 @@ void bt_xrec_plat_session_end(void)
     s_bond_fails = 0u;
     mem_sample();                                        /* the Bluedroid tasks are gone: their last samples */
     mem_log("stop");
+    if (s_sup_ready) {
+        sup_log("stop");
+    }
     log_ctrl_line(bt_ctrl_stats_format);
     bt_rom_real_sec_t sec;
     bt_rom_real_sec(&sec);

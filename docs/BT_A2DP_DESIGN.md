@@ -731,7 +731,9 @@ The TG receives passthrough commands in BTC. bt_hp posts them to its ring; `bt_h
   and player screens today), entering USB mass storage (`run_usb_msc_mode`: otherwise `bt_hp` could flush
   `bt_hp_bonds.bin` while the host writes raw sectors), and entering phone mode (`run_bt_xrec_mode`: one `bt_ctrl`
   owner). OpenFW has no card-removal detection, so rev 2's "card removal" item is dropped; an SD write error during
-  a store flush is logged and retried at the next flush.
+  a store flush is logged and retried at the next flush. Step 8 adds low battery (`bt_port/bt_lowbatt.h`): below
+  3450 mV in 3 samples 0.5 s apart without VBUS the session stops (home loop, Bluetooth screens, player) and a start
+  is refused; Exp 5 (`docs/BT_HW_RESULTS.md`) checks every transition on silicon.
 - **Start failure toast.** If `aout_start` returns -1 (headphones On but no stream OPEN), the player shows
   `Headphones not connected` before returning; `main.c` already keeps `resume_sec`, but it clears `unplayed`, so
   under `BT=1` that clear is skipped for a start failure.
@@ -868,6 +870,9 @@ per step for S6/S13. The host build of `test_headphones` passes its own `BT_CTRL
 ---
 
 ## 9. UI flow (English only, `/* TODO(i18n) */` on every string)
+
+Step 8 (2026-11-25): the strings now come from `include/openfw_i18n_bt.h` (18 languages, BT=1 only); some English
+texts were shortened to fit their labels (plan live log, step 8 entry). The table below keeps the original wording.
 
 Settings gains a `Bluetooth headphones` row (`BT=1` only).
 

@@ -138,6 +138,7 @@ SRCS      := src/startup.c src/wdt_timer.c src/rtc.c src/uart.c src/pmu.c \
              src/persist.c src/apmem.c src/hsprobe_log.c src/hsprobe.c src/main.c
 ifeq ($(BT),1)
 SRCS      += src/audio_out.c   # output dispatch DAC / headset / both (include/audio_out.h; BT=0 aliases the DAC)
+SRCS      += src/ui/ui_i18n_bt.c   # BT UI strings, 18 languages (include/openfw_i18n_bt.h; not in the BT=0 image)
 endif
 OBJS      := $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(SRCS))
 $(BUILD_DIR)/audio_out.o: CFLAGS += -Ibt_port
@@ -208,10 +209,10 @@ $(BUILD_DIR)/lvgl_host/%.o: $(LVGL_DIR)/%.c include/lv_conf.h include/board_conf
 $(BUILD_DIR)/liblvgl_host.a: $(LVGL_HOST_OBJS)
 	$(AR) rcs $@ $^
 
-$(BUILD_DIR)/main.o: src/main.c $(SPLASH_HDR) $(CONFIG_STAMP) include/sl6801_regs.h include/openfw.h include/openfw_ui.h include/openfw_i18n.h include/openfw_exp.h include/openfw_player.h include/openfw_apmem.h include/openfw_hsprobe.h include/board_config.h src/ui/ui_port.h | $(BUILD_DIR)
+$(BUILD_DIR)/main.o: src/main.c $(SPLASH_HDR) $(CONFIG_STAMP) include/sl6801_regs.h include/openfw.h include/openfw_ui.h include/openfw_i18n.h include/openfw_i18n_bt.h include/openfw_exp.h include/openfw_player.h include/openfw_apmem.h include/openfw_hsprobe.h include/board_config.h src/ui/ui_port.h | $(BUILD_DIR)
 	$(CLANG) $(CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/%.o: src/%.c $(CONFIG_STAMP) include/sl6801_regs.h include/sl6801_rom.h include/openfw.h include/openfw_ui.h include/openfw_i18n.h include/audio_dsp.h include/openfw_exp.h include/openfw_crypto.h include/openfw_wav.h include/openfw_cwx.h include/openfw_player.h include/openfw_apmem.h include/openfw_fs.h include/openfw_usb_msc.h include/openfw_bt_spp.h include/openfw_xrec.h include/openfw_hsprobe.h include/board_config.h include/lv_conf.h | $(BUILD_DIR)
+$(BUILD_DIR)/%.o: src/%.c $(CONFIG_STAMP) include/sl6801_regs.h include/sl6801_rom.h include/openfw.h include/openfw_ui.h include/openfw_i18n.h include/openfw_i18n_bt.h include/audio_dsp.h include/openfw_exp.h include/openfw_crypto.h include/openfw_wav.h include/openfw_cwx.h include/openfw_player.h include/openfw_apmem.h include/openfw_fs.h include/openfw_usb_msc.h include/openfw_bt_spp.h include/openfw_xrec.h include/openfw_hsprobe.h include/board_config.h include/lv_conf.h | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
 	$(CLANG) $(CFLAGS) -c $< -o $@
 
@@ -260,7 +261,7 @@ test-host: $(LVGL_DIR)/lvgl.h $(BUILD_DIR)/liblvgl_host.a tests/test_core.c src/
 	@# BT=1 phone-mode UI (prompt, peer line, toasts): the same renderer with OPENFW_BT_BLUEDROID
 	$(HOST_CC) $(HOST_CFLAGS) -DOPENFW_HOST_MMIO -DOPENFW_BT_BLUEDROID=1 tests/test_ui_render.c \
 		src/lcd_st7735s.c src/cpu1_ui.c src/ui_spectrogram.c src/cwx.c \
-		src/ui/ui_port.c src/ui/ui_theme.c src/ui/ui_fonts.c src/ui/ui_i18n.c src/ui/ui_screens.c \
+		src/ui/ui_port.c src/ui/ui_theme.c src/ui/ui_fonts.c src/ui/ui_i18n.c src/ui/ui_i18n_bt.c src/ui/ui_screens.c \
 		$(EEZ_SRCS) \
 		$(BUILD_DIR)/liblvgl_host.a \
 		-lm -o $(BUILD_DIR)/test_ui_render_bt

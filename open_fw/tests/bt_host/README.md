@@ -65,8 +65,11 @@ P. **Phone mode end to end** (`test_bt_host phone IMG`, its own process; IMG = a
    - P6 link loss (reason 0x08): SPP closed, XREC authorization cleared;
    - P7 reconnect, window closed: stored key (`040B` carries the peer's key), no pairing; RFCOMM straight to channel 1;
      PING (`bound=1`), CHAL/AUTH (HMAC with the bound key), GETS;
-   - P8 stop with a 300000 B GETS outstanding (laptop app not reading, its stack answering): graceful, ~0.64 s
-     (patch 0026), link down, heap/tasks/esp_timer back to the baseline;
+   - P7b WDT supervisor (`bt_port/bt_task_sup.h`, limits 200 ms / 1.5 s / 4 s here): idle bonded phone for 3 stall
+     windows: every ping of hciT/BTU/BTC answered, no stall, no WDT hold;
+   - P8 stop with a 300000 B GETS outstanding (laptop app not reading, its stack answering): first held 2 stall
+     windows (the plan's "intentionally stalled transfer": the peer is stuck, the tasks are not: no stall), then the
+     stop: graceful, ~0.64 s (patch 0026), link down, heap/tasks/esp_timer back to the baseline;
    - P9 restart: bond loaded from `/bt_bonds.bin`, XREC key from `/cassini.key` (`bt_xrec_fw.c` key-load fix):
      reconnect with the stored key, CHAL/AUTH, GETS;
    - P10 laptop B pairs with the window closed: numeric comparison rejected (`042D`), no bond;
@@ -99,7 +102,10 @@ P. **Phone mode end to end** (`test_bt_host phone IMG`, its own process; IMG = a
    - P19 bench-style start (`BTHX_START_PAIR` with the up job held by `bthx_hold_bringup`, bench XREC PIN 246810):
      the gate is deferred while UP and decided at READY (SSP part opens, `0C1A 0x03`); D: XREC PAIR with the bench PIN
      and a new key, CHAL/AUTH with it, LS, GETS; bench PIN off: DRBG PIN again;
-   - P20 stop: baseline; `/bt_bonds.bin` holds A (and D) but never B or C; the scenario's heap peak (`bth_heap_peak_reset()` after the
+   - P22 (runs before the final stop) a work item keeps BTC busy: the supervisor reports `BTC_TASK` after the stall
+     limit (1.5 s), platform fault 4, the blocker ends, graceful recovery (FAULTED, no hard path), supervisor disarmed;
+     restart to READY, healthy again;
+   - P20/P21 stop: baseline; `/bt_bonds.bin` holds A (and D) but never B or C; the scenario's heap peak (`bth_heap_peak_reset()` after the
      warm-up) under a host regression ceiling (x86-64 sizes; the target budget is read from the firmware's `BT mem`
      lines). Every stop also checks: no fake-ROM contract error, unknown opcode, ROM id without a packer,
      forwarded-command deadline, BT fault, HCI command timeout, XREC hard path.

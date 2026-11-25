@@ -20,6 +20,9 @@
 #include "openfw_ui.h"
 #include "ui_port.h"
 #include "eez/screens.h"
+#if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID
+#include "openfw_i18n_bt.h"
+#endif
 
 /* Minimal host MMIO mock for LCDC (0x40095000) + ROM/GPIO stubs.
  *
@@ -311,11 +314,151 @@ static void check_toast_text(ui_model_t *m)
 }
 
 #if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID
+/* BT=1 strings (include/openfw_i18n_bt.h): every language non-empty, every glyph in ui_font_sm/md, and each string
+ * fits the buffer it is copied into and the pixels of the label that shows it (no "..." on a translated toast). */
+static int utf8_glyphs_ok(const char *str)
+{
+    const uint8_t *p = (const uint8_t *)str;
+    while (*p) {
+        uint32_t cp;
+        if (*p < 0x80u) {
+            cp = *p++;
+        } else if ((*p & 0xE0u) == 0xC0u && (p[1] & 0xC0u) == 0x80u) {
+            cp = ((uint32_t)(p[0] & 0x1Fu) << 6) | (uint32_t)(p[1] & 0x3Fu);
+            p += 2;
+        } else if ((*p & 0xF0u) == 0xE0u && (p[1] & 0xC0u) == 0x80u && (p[2] & 0xC0u) == 0x80u) {
+            cp = ((uint32_t)(p[0] & 0x0Fu) << 12) | ((uint32_t)(p[1] & 0x3Fu) << 6) | (uint32_t)(p[2] & 0x3Fu);
+            p += 3;
+        } else {
+            return 0;
+        }
+        lv_font_glyph_dsc_t g;
+        if (!lv_font_get_glyph_dsc(&ui_font_sm, &g, cp, 0u) || !lv_font_get_glyph_dsc(&ui_font_md, &g, cp, 0u)) {
+            fprintf(stderr, "missing glyph U+%04X in \"%s\"\n", (unsigned)cp, str);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int32_t px(const char *s, const lv_font_t *f)
+{
+    return lv_text_get_width(s, (uint32_t)strlen(s), f, 0);
+}
+
+enum { BK_TOAST, BK_FOOT, BK_BTFOOT, BK_BTL2, BK_LBL, BK_VAL, BK_SETVAL, BK_SETLBL, BK_PREFIX };
+static const struct { ui_bt_str_id_t id; uint8_t kind; } k_bt_kinds[] = {
+    { UI_BT_STR_PAIR_Q_FMT, BK_BTL2 },        { UI_BT_STR_PAIR_KEYS, BK_BTFOOT },
+    { UI_BT_STR_PAIR_OPEN_FMT, BK_BTL2 },     { UI_BT_STR_BONDED, BK_BTL2 },
+    { UI_BT_STR_PAIR_UNAVAIL, BK_TOAST },     { UI_BT_STR_AUDIO_OUTPUT, BK_SETLBL },
+    { UI_BT_STR_OUT_SPEAKER, BK_SETVAL },     { UI_BT_STR_HEADPHONES, BK_LBL },
+    { UI_BT_STR_OUT_BOTH, BK_SETVAL },        { UI_BT_STR_OUT_BT, BK_SETVAL },
+    { UI_BT_STR_DESC_AUDIO_OUTPUT, BK_FOOT }, { UI_BT_STR_PHONE_SYNC, BK_LBL },
+    { UI_BT_STR_DESC_PHONE, BK_FOOT },        { UI_BT_STR_DESC_HP, BK_FOOT },
+    { UI_BT_STR_BT_FAULT, BK_LBL },           { UI_BT_STR_STARTING, BK_LBL },
+    { UI_BT_STR_DISCONNECT, BK_LBL },         { UI_BT_STR_PAIRING, BK_LBL },
+    { UI_BT_STR_CONNECTING, BK_LBL },         { UI_BT_STR_LINK_STALLED, BK_LBL },
+    { UI_BT_STR_RECONNECTING, BK_LBL },       { UI_BT_STR_NOT_CONNECTED, BK_LBL },
+    { UI_BT_STR_SEARCHING, BK_LBL },          { UI_BT_STR_SEARCH, BK_LBL },
+    { UI_BT_STR_FORGET_PREFIX, BK_PREFIX },   { UI_BT_STR_AUDIO, BK_VAL },
+    { UI_BT_STR_OTHER, BK_VAL },              { UI_BT_STR_HP_FOOT, BK_FOOT },
+    { UI_BT_STR_HP_PAIR_HINT, BK_FOOT },      { UI_BT_STR_SEARCH_DONE, BK_FOOT },
+    { UI_BT_STR_SEARCH_FAILED, BK_FOOT },     { UI_BT_STR_PAIR_FAILED, BK_FOOT },
+    { UI_BT_STR_PAIR_REFUSED, BK_FOOT },      { UI_BT_STR_HP_CONNECTED, BK_FOOT },
+    { UI_BT_STR_CONNECT_FAILED, BK_FOOT },    { UI_BT_STR_HP_DISCONNECTED, BK_TOAST },
+    { UI_BT_STR_HP_FORGOTTEN, BK_FOOT },      { UI_BT_STR_LINK_STALLED_RECONN, BK_FOOT },
+    { UI_BT_STR_HP_NOT_READY, BK_TOAST },     { UI_BT_STR_NOT_IN_BUILD, BK_FOOT },
+    { UI_BT_STR_HP_NOT_CONNECTED, BK_TOAST }, { UI_BT_STR_HP_PAUSED, BK_TOAST },
+    { UI_BT_STR_LOWBATT_BT_OFF, BK_TOAST },
+};
+
+static void check_bt_i18n(void)
+{
+    ui_model_t *mm = NULL;
+    assert(sizeof(k_bt_kinds) / sizeof(k_bt_kinds[0]) == (size_t)UI_BT_STR_COUNT);
+    int bad = 0;
+    for (unsigned i = 0; i < (unsigned)UI_BT_STR_COUNT; i++) {
+        assert(k_bt_kinds[i].id == (ui_bt_str_id_t)i);
+    }
+    for (uint8_t lang = 0u; lang < (uint8_t)UI_LANG_COUNT; lang++) {
+        for (unsigned i = 0; i < (unsigned)UI_BT_STR_COUNT; i++) {
+            const char *s = ui_tr_bt_lang(lang, (ui_bt_str_id_t)i);
+            char f[64];
+            size_t len = strlen(s);
+            size_t cap = 0;          /* bytes incl. NUL of the buffer it is copied into (0: none) */
+            int32_t w = 0, wmax = 0;
+            if (s[0] == '\0' || !utf8_glyphs_ok(s)) {
+                fprintf(stderr, "BT string %u lang %u empty or bad glyph\n", i, (unsigned)lang);
+                bad++;
+                continue;
+            }
+            switch (k_bt_kinds[i].kind) {
+            case BK_TOAST:  cap = sizeof(mm->toast_msg); w = px(s, &ui_font_sm); wmax = 136; /* LONG_DOT max */ break;
+            case BK_FOOT:   cap = sizeof(mm->list_foot); w = px(s, &ui_font_sm); wmax = 154; break;
+            case BK_BTFOOT: w = px(s, &ui_font_sm); wmax = 160; break;
+            case BK_BTL2:
+                lv_snprintf(f, sizeof(f), s, 60u);
+                cap = 32u;                   /* bind_bt l2s */
+                len = strlen(f);
+                w = px(f, &ui_font_sm);
+                wmax = 120;
+                break;
+            case BK_LBL: {
+                cap = sizeof(mm->list_lbl[0]);
+                /* the widest value a row can carry next to it: "On"/"Off" or "60 s" */
+                const char *v = (i == UI_BT_STR_HEADPHONES) ? (px(ui_tr_lang(lang, UI_STR_OFF), &ui_font_sm) >
+                                                            px(ui_tr_lang(lang, UI_STR_ON), &ui_font_sm)
+                                                                ? ui_tr_lang(lang, UI_STR_OFF)
+                                                                : ui_tr_lang(lang, UI_STR_ON))
+                              : (i == UI_BT_STR_RECONNECTING || i == UI_BT_STR_SEARCHING) ? "60 s" : "";
+                int32_t vw = v[0] ? px(v, &ui_font_sm) + 2 : 0;
+                w = px(s, &ui_font_md);
+                wmax = 146 - vw - 8;
+                if (i == UI_BT_STR_HEADPHONES && len + 1u > sizeof(mm->list_title)) {
+                    cap = sizeof(mm->list_title);   /* also the headphones screen's title */
+                }
+                break;
+            }
+            case BK_VAL:    cap = sizeof(mm->list_val[0]); w = px(s, &ui_font_sm); wmax = 70; break;
+            case BK_SETVAL:
+            case BK_SETLBL:  break;      /* the Audio output row below */
+            case BK_PREFIX: cap = 16u; break;
+            default: break;
+            }
+            if ((cap != 0u && len + 1u > cap) || (wmax != 0 && w > wmax)) {
+                fprintf(stderr, "BT string %u lang %u \"%s\": %zu B (buffer %zu), %d px (max %d)\n", i,
+                        (unsigned)lang, s, len, cap, (int)w, (int)wmax);
+                bad++;
+            }
+        }
+        /* Settings "Audio output" row with its widest value selected ("- X +", ui_screens.c bind_settings) */
+        static const ui_bt_str_id_t vals[3] = { UI_BT_STR_OUT_SPEAKER, UI_BT_STR_OUT_BT, UI_BT_STR_OUT_BOTH };
+        for (unsigned k = 0; k < 3u; k++) {
+            char v[40];
+            const char *vs = ui_tr_bt_lang(lang, vals[k]);
+            snprintf(v, sizeof(v), "- %s +", vs);
+            int32_t vw = px(v, &ui_font_sm) + 2;
+            int32_t lw = px(ui_tr_bt_lang(lang, UI_BT_STR_AUDIO_OUTPUT), &ui_font_md);
+            if (vw < 54) vw = 54;
+            if (strlen(vs) + 1u > 24u || vw > 96 || lw > 146 - vw - 8) {
+                fprintf(stderr, "Settings Audio output row lang %u: label %d px, value \"%s\" %d px\n", (unsigned)lang,
+                        (int)lw, v, (int)vw);
+                bad++;
+            }
+        }
+    }
+    printf("BT=1 i18n: %u strings x %u languages checked, %d problems\n", (unsigned)UI_BT_STR_COUNT,
+           (unsigned)UI_LANG_COUNT, bad);
+    assert(bad == 0);
+    assert(strcmp(ui_tr_bt_lang(200u, UI_BT_STR_BONDED), ui_tr_bt_lang(UI_LANG_EN, UI_BT_STR_BONDED)) == 0);
+    assert(ui_tr_bt_lang(UI_LANG_DE, UI_BT_STR_COUNT)[0] == '\0');
+}
+
 /* BT=1 phone-mode UI checks (review findings): the toast label shows its text (not "...") on the BT screen, a long
  * peer name on the BT status line ends in "..." on one line instead of wrapping out of the 12 px label. */
-
 static void check_bt_ui(ui_model_t *m)
 {
+    check_bt_i18n();
     ui_model_t b = *m;
     b.toast_msg[0] = '\0';
     b.bt_state = 1u;
