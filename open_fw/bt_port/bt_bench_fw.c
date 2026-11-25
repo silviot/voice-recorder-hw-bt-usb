@@ -192,6 +192,7 @@ static struct {
     uint32_t next_stat, stat_n, t_tone;
     uint32_t phase;
     uint32_t prev_pkts, prev_frames, prev_acked, prev_pads, prev_el_ms;
+    uint32_t prev_us, prev_idle, prev_btc, prev_app, prev_late, prev_ticks;
 } s_hp BENCH_HI;
 static char s_hp_play_path[BT_BENCH_HP_FILE_MAX + 1u] BENCH_HI;
 
@@ -308,6 +309,44 @@ static void hp_found_log(void)
     }
 }
 
+/* Run time of a task so far (run-time stats clock: us_timer, FreeRTOSConfig.h); 0 if there is no such task. */
+static uint32_t task_run_us(const char *name)
+{
+    TaskHandle_t h = xTaskGetHandle(name);
+    if (h == NULL) {
+        return 0u;
+    }
+    TaskStatus_t ts;
+    vTaskGetInfo(h, &ts, pdFALSE, eRunning);
+    return (uint32_t)ts.ulRunTimeCounter;
+}
+
+/* CPU over the stats interval, permille of wall time: idle, the BTC task (hp_tx tick: resampler + SBC), the app task
+ * (player); late = BTC ticks past the credit clamp (air time lost). Silicon 2026-11-25: the player stage starved the
+ * ring while the tone stage did not; this line tells CPU load apart from a producer stall. */
+static void hp_cpu_stats(const hp_tx_t *t)
+{
+    uint32_t now = (uint32_t)us_timer_now(), idle = (uint32_t)ulTaskGetIdleRunTimeCounter();
+    uint32_t btc = task_run_us("BTC_TASK"), app = task_run_us("app");
+    uint32_t dt = now - s_hp.prev_us;
+    if (s_hp.prev_us != 0u && dt != 0u) {
+        lbegin("hp cpu");
+        lku("ms", dt / 1000u);
+        lku("idle_pm", (uint32_t)((uint64_t)(idle - s_hp.prev_idle) * 1000u / dt));
+        lku("btc_pm", (uint32_t)((uint64_t)(btc - s_hp.prev_btc) * 1000u / dt));
+        lku("app_pm", (uint32_t)((uint64_t)(app - s_hp.prev_app) * 1000u / dt));
+        lku("late", t->st.tick_late - s_hp.prev_late);
+        lku("ticks", t->st.ticks - s_hp.prev_ticks);
+        lemit();
+    }
+    s_hp.prev_us = now;
+    s_hp.prev_idle = idle;
+    s_hp.prev_btc = btc;
+    s_hp.prev_app = app;
+    s_hp.prev_late = t->st.tick_late;
+    s_hp.prev_ticks = t->st.ticks;
+}
+
 static void hp_stats(uint32_t el_ms)
 {
     hp_tx_t *t = hp_tx_bd();
@@ -361,6 +400,7 @@ static void hp_stats(uint32_t el_ms)
         lku("heap_min", (uint32_t)xPortGetMinimumEverFreeHeapSize());
         lemit();
     }
+    hp_cpu_stats(t);
 }
 
 /* Tone through the full output path (aout -> hp_sink ring -> resampler -> SBC), 16 kHz mono. */

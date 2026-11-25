@@ -183,15 +183,29 @@ Settings > Headset button test) merged on top of the BT branch. The BT=0 image s
   through `keys_inject()`, called only in bench images; the default image is unchanged).
 - Open: no laptop recording of the stream yet; PipeWire showed the bluez card in `audio-gateway` with no A2DP source
   and the transport idle during the player stage (unexplained). Not yet with real headphones.
+- **Player starved the ring** (`stage=player`, `/cassini/cassini-final-moments.wav`, IMA ADPCM 16 kHz mono):
+  `pads=5..17` of ~47 packets/s, while `stage=tone` (16 kHz mono through the same aout -> ring -> x3 -> SBC path)
+  had 0. Cause: the player never called `aout_set_src_channels()` and always expanded mono to stereo, so the ring was
+  stereo (4096 frames = 256 ms instead of 8192 = 512 ms) and the BTC tick ran the 24-tap x3 FIR on two channels
+  (about 23 M vs 12 M cycles/s at 96 MHz from XIP: `hp_rs_process` inner loop 6 instructions per tap). The tone stage
+  sets a mono ring. With the extra BTC load the app task (priority 1) went unscheduled for 300-480 ms at a time
+  (the stats line's stale `now`: 216..560 SBC frames per "second", 329 frames/s on average instead of 375, so BTC
+  itself lost credit too), longer than the stereo ring. Fix: the player sets the ring's channel count per file and
+  writes mono to the headset unexpanded (BT=1 only; `docs/BT_A2DP_DESIGN.md` §3.1 "Mono", the open "mono
+  pass-through" item). `test-bt-hp` runs `tests/test_player_bt.c`: BT=1 `player.c` + `audio_out.c` + `hp_sink.c`,
+  a real-time 48 kHz packet consumer, the app task out 400 ms each second: 0 mid-stream pads (12 without the fix).
+  The bench stats now take the clock, not the player's loop-top time, and add `hp cpu` (idle / BTC / app permille,
+  late and run ticks per interval) to tell CPU load from a producer stall on the next run. Stereo files keep a
+  256 ms ring (44.1 kHz stereo: 93 ms); a 32 KiB ring is the next step if they starve too.
 
 ## Not tested / open
 
 - On silicon so far only with a laptop as the sink (above). Real headphones: role switch / packet types / slots,
   NOCP latency, CPU of SBC from XIP, heap under long streaming: the recipe's stages answer these.
 - Not on the host: the speed dial on the headset route (silent clock, link loss mid-dial), a 44.1 kHz-only sink (SEID 1 fallback), bitpool-limited peers, page-scan variants, the player and
-  UI integration (no `test_player` BT=1 variant yet), wasm rendering of `UI_SCR_LIST`, TSan for scenario S, soak.
-- Design items still open: patches B/C, `bt_ctrl_rnr_pending()`, AVRCP scrub, Home PLAY, idle disconnect, mono
-  pass-through, "BT" volume label, LRU of 2 headset bonds, REC → disconnect fallback (Exp 4h; a refused SUSPEND is
+  UI integration beyond `tests/test_player_bt.c` (headset route, mono pass-through, starvation), wasm rendering of `UI_SCR_LIST`, TSan for scenario S, soak.
+- Design items still open: patches B/C, `bt_ctrl_rnr_pending()`, AVRCP scrub, Home PLAY, idle disconnect,
+  "BT" volume label, LRU of 2 headset bonds, REC → disconnect fallback (Exp 4h; a refused SUSPEND is
   now retried 3 times), the third round's deferred list above.
 - The controller branch's H2 findings are still only in `docs/BT_CTRL_OPCODE_TABLE.md` §7 and
   `docs/BT_ROM_HCI_MAP.md` §6: fold them into the design's live log with this file.
