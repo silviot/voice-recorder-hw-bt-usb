@@ -117,6 +117,20 @@ and never above 16 (1 bit/symbol) without a written reason; the RCT/APT cutoffs 
 `tests/test_bt_entropy.c` (`make -C open_fw test-bt-port` fails if they no longer match the claim). Record the results
 here.
 
+### Mismatched public key (plan step 6b): result (2026-11-25, session 9)
+Image: `make BT=1 BENCH=1 HP_GATES=1 KEYTEST_MISMATCH=1` from `5d45a5e` (FIRM CRC `0x2A66`): the session's private
+key is staged with the public key of a second, independent `bt_p192_keygen` pair. Run `secs=150 pair=1 pair_secs=120
+autoconfirm=1`; the user paired an Android phone from its Bluetooth settings.
+- `BT KEYTEST: staged public key belongs to another private key`, `BT ROM keys: installed 1 unexpected 0`.
+- Numeric comparison reached the device (`value 47398`, autoconfirmed), then `HCI ev=0x36 st=0x05` (Simple Pairing
+  Complete, Authentication Failure), disconnect reason 0x16; `BT SSP key spent ... no SSP until the next BT-mode
+  entry`. Phone: pairing failed; a second attempt no longer found `Cassini_1D` (window closed, not discoverable).
+- **Result: the ROM uses the staged pair.** A ROM keeping its fixed pair would have paired. Combined with the
+  consistent-pair successes (session 6 laptop numeric comparison, session 9 Jabra Just Works, both `installed 1`),
+  the private key in use is ours as well: our public with the ROM's private would fail every consistent pairing.
+- Same-phone control on the normal image (`029f2a8`, CRC `0x6B6A`) not yet run (staged, then withdrawn when the user
+  left; recipe: same RUN file, pairing must succeed).
+
 ### Entropy source assessment: results (2026-11-25, session 9)
 Image: `DEV_EXP=1` default build from `integ/bt-all-local` `f078c9c` (FIRM CRC `0xA6BA`), gain 8, quiet room,
 device on the desk, warm (after ~1 h of BT use). 16 sequential runs + 63 restart runs (one reboot each) + 3 controls:
@@ -202,7 +216,7 @@ silicon" below; logs `SD:/BTBENCH.LOG` (3,262 B, `lost=0`), ring, laptop `btmon`
 | Entropy at BT entry | `4096 symbols (0:1040 1:983 2:1055 3:1018) peak 130 in 419 ms, ok` — symbol counts flat, peak well inside the clip/flatline limits (8 LSB … 32000) |
 | Session P-192 key | `ms 67, public X 0xBACBE422...` (not the ROM constant `FA2B96D3`); `BT ROM keys: installed 1 unexpected 0 rng drbg 88 nonces 2 legacy 119 unknown 0 starved 0` — both pairing nonces came from the DRBG, the pool never ran dry |
 | Discovery | laptop scan found `Cassini_1D` (cached name first, then the new one) |
-| SSP numeric comparison | laptop `Confirm passkey 230749` → `Pairing successful`, `Paired: yes`, `Bonded: yes`, UUID `Serial Port`; device `bonded (numeric comparison, MITM)`, `window closed after the first bond`. **First SSP pairing ever on this ROM.** Still to prove: that the ROM used *our* key (the mismatched-key image of step 6b) |
+| SSP numeric comparison | laptop `Confirm passkey 230749` → `Pairing successful`, `Paired: yes`, `Bonded: yes`, UUID `Serial Port`; device `bonded (numeric comparison, MITM)`, `window closed after the first bond`. **First SSP pairing ever on this ROM.** Proven in session 9: the ROM uses our key (mismatched-key image, step 6b) |
 | XREC | `--ping` `PONG ... bound=0,auth=0,pair=1`; `--pair 246810` bound (`BT XREC PAIRED`); `--ping` `bound=1,pair=0`; `--list` CHAL/AUTH OK, 31 files; GETS of the 3,000 B test file **byte-exact** (SHA-256 match); `--stat` battery/SD line; wrong PIN inside window 2 → `ERR,PIN` |
 | Reconnect | `bluetoothctl disconnect` while idle, reconnect 3 s later with the stored keys: AUTH OK, no re-pairing |
 | Throughput | GETS 581,676 B in 25.7 s = **22.1 KB/s** steady (RFCOMM MTU 673, laptop radio shared with A2DP) |
