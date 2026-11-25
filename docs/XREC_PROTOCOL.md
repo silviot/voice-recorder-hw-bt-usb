@@ -80,8 +80,11 @@ The earlier clean-room host (`src/bt_hci.c` + `src/bt_spp.c`) was deleted in pla
     that cannot sync while recording (skip every download while `media == 33`).
   * `rec_idx`: the `NNNN` of the `REC_NNNN.wav` being recorded, 0 = not recording.
   * `pace_ms`: 0 = no pacing (not recording). Mono recording: the time one 16 KiB GETS window takes at the device's
-    rate cap (342 ms at 48000 B/s); pause about this long between windows. Stereo recording: 30000 (no transfers
-    until the recording stops, see 5.5).
+    rate cap (342 ms at 48000 B/s), i.e. the shortest interval between the **starts** of two windows. The device
+    paces the frames itself: send the next GETS as soon as a window is complete, **do not add a pause after it**
+    (the device's burst allowance is only 2 KiB, so a pause after each window is lost and halves the rate). A client
+    that paces itself starts windows at most every `pace_ms`. Stereo recording: 30000 (no transfers until the
+    recording stops, see 5.5).
 * `+XREC:RTC` -> `+XREC:RTC,YYYY-MM-DD HH:MM:SS,<wd 0=Mon..6=Sun>`.
 * `+XREC:RTC,y,m,d,h,mi,s,wd` -> `+XREC:OK,RTC` | `ERR,ARGS` | `ERR,RTCRNG` | `ERR,RTC`. While recording:
   `+XREC:OK,RTC,LATER`: **the clock is not changed** (set it again after the recording; an `OK` and not an `ERR`
@@ -136,20 +139,34 @@ The earlier clean-room host (`src/bt_hci.c` + `src/bt_spp.c`) was deleted in pla
 ### 5.5 While the recorder records (open_fw with STAT field 9)
 The recording always wins (docs/BT_SYNC_SPEED_AND_RECORDING.md): the device never lets a transfer delay it, so a
 client sees slower replies, and some commands wait for the end of the recording.
-* **Recorder first.** A command is taken, and a GETS / LS chunk read from the card, only when the recorder has no
-  audio waiting; one pass reads for at most 5 ms. Replies are later, never lost.
+* **Recorder first.** A command is taken, and a GETS chunk, an LS directory chunk or a GET / GETS file lookup read
+  from the card, only when the recorder has no audio waiting; one pass stops reading once it used 5 ms (it always
+  makes progress: at least one read per pass) and the next pass continues where it stopped, so a large `/record`
+  costs more passes, not a longer one. Replies are later, never lost.
 * **Rate cap (mono).** GETS payload is limited to about 48000 B/s (+ a 2 KiB burst); `pace_ms` says how long a 16 KiB
   window takes. Downloads of finished recordings continue at that pace.
 * **The active file** (`rec_idx`): `GETS` / `GET` answer `ERR,BUSY`, `DEL` answers `ERR,BUSY`. Skip only that file.
 * **No second card writer.** `DEL` of another file, `PUT` to `REC` / `CAS` / `OTA` (the payload is discarded
   unparsed), `PUTEND`, `OTA` and `PAIR` answer `+XREC:ERR,LATER,<ms>` (`<ms>` = 30000): nothing changed, ask again
   after that long, at the latest when `STAT` shows `media != 33`. An upload staged before the recording started is
-  kept and continues with the same chunk after the recording. `PUT ... EXP` (RAM) is unaffected. A clock set answers
+  kept **for the rest of this connection** and continues with the same chunk after the recording. If the link goes
+  during the recording, the staged upload is dropped (temp closed and deleted) once the recording stopped, or when
+  Bluetooth is switched off, never during the recording; a new connection never sees it (`PUTEND` -> `NOPUT`, the
+  next chunk -> `OFF`: start again at offset 0). `PUT ... EXP` (RAM) is unaffected. A clock set answers
   `OK,RTC,LATER` (not applied). The bond file of a new Bluetooth pairing is written when the recording stops.
+  `GAIN` / `DSP` / `VOR` / `CH` apply at once as before; the settings file is rewritten after the recording.
+* **Pairing needs the recorder idle.** `PAIR` answers `LATER` (no PIN attempt used) because the key is saved to the
+  card; the pairing window closes after 60 s, so in practice a phone is bound only while the recorder does not
+  record. Clients should say so ("stop the recording to pair") instead of reporting a generic failure.
 * **Stereo recordings: no transfers.** `GETS` / `GET` answer `ERR,LATER,<ms>`; a stream running when a stereo
   recording starts ends with `ERR,LATER,<ms>` in place of the next frame. `LS` and `STAT` still answer.
-* Older clients: `LATER` is an unknown reason (the file fails for that sync, nothing is lost); extra STAT fields are
-  ignored by position-based parsers.
+* Older clients: extra STAT fields are ignored by position-based parsers and `BUSY` skips the file. `LATER` is an
+  unknown reason, and nothing on the card is lost or changed, but it is not always confined to one file: the Cassini
+  app before its S4 change (cassini-android-recorder `c1104d47`, "Sync finished recordings while the recorder
+  records") treats a `LATER` to a transcript `PUT REC` as a device error that **ends the whole sync as failed**, on
+  every sync while a recording runs and a transcript is pending. **Release gate:** this firmware ships only together
+  with an app that knows `LATER` (S4 or later). `tools/bt_sync.py` skips `BUSY` / `LATER` files and reports a clock
+  set that answered `OK,RTC,LATER`.
 
 ## 6. PUT uploads
 

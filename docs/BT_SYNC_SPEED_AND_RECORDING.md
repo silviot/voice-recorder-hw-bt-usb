@@ -104,7 +104,7 @@ All BT code stays behind the BT build flag. **The default (non-BT) image is byte
 | Large GETS `total` | already accepted | already accepted (any open_fw); stock firmware (`pen133` in PONG) keeps 3840 |
 | STAT `rec_idx`, `pace_ms` (fields 9, 10, numeric) | the old parser ignores extra numeric fields | field 9 missing → app keeps today's "skip everything while recording" |
 | `ERR,BUSY` on GETS of the active file | already treated as "file changed, skip" | n/a |
-| `ERR,LATER,<ms>` | old app sees OTHER_DEVICE_ERROR → file FAILED for this sync, no harm | never sent |
+| `ERR,LATER,<ms>` | old app (before S4, `c1104d47`) sees OTHER_DEVICE_ERROR; for a transcript `PUT REC` that is not a per-file upload failure, so **the whole sync ends Failed** while a recording runs and a transcript is pending (nothing on the card is lost). Release gate: ship this firmware with the S4 app or later. | never sent |
 | PONG `gmax=<n>` | old app asks for 640 | no flag → app keeps 640 |
 
 `docs/XREC_PROTOCOL.md` gets updated: the "recommended 3840" text, the new STAT fields, LATER, and gmax. The stale "K=7 credits" comment in `tools/bt_sync.py:37` is fixed too.
@@ -117,7 +117,7 @@ All BT code stays behind the BT build flag. **The default (non-BT) image is byte
 | A2 | Error recovery: after a failure, re-issue GETS at the last good offset immediately (this cancels the old stream) and skip stale frames, with a stale-byte budget of ~256 KiB. This is valid only because downloaded files are immutable, which F7 guarantees. Until A2 lands, keep window ≤ rate x (5 s − 0.3 s) so `drain()` still works (64 KiB qualifies). |
 | A3 | Metrics hook: GETS → first frame, frame gaps, bytes/s per window. One log line per file. |
 | A4 | Parse STAT `rec_idx` / `pace_ms`; parse the first 8 fields as numbers and keep extras raw. `SyncPlanner` skips **only** the active file (new `SkipReason.ACTIVE`) when the firmware names it; otherwise it keeps today's rule. Send LS before STAT. No per-file STAT when the firmware names the active file. No RTC set while recording. |
-| A5 | `ERR,LATER,<ms>` → new `XrecFailure.LATER`: wait min(ms, 30 s), retry from the same offset without counting a failure, cap ~2 min per file, then "deferred" (not FAILED). `pace_ms` adds a wait between windows. |
+| A5 | `ERR,LATER,<ms>` → new `XrecFailure.LATER`: wait min(ms, 30 s), retry from the same offset without counting a failure, cap ~2 min per file, then "deferred" (not FAILED). `pace_ms` is the shortest interval between window **starts** (the time a 16 KiB window takes at the cap): the device paces, so the client sends the next GETS when a window completes and adds no pause after it (a pause after each window halves the rate: the bucket holds only 2 KiB). |
 | A6 | Triggers: fixed 2-min poll while the recorder records (no idle doubling). CDM presence (`CompanionDeviceService`, `startObservingDevicePresence`) so the device's page after REC (F10) starts a sync. Disconnect as soon as sync is done. No uploads while recording unless the firmware signals it (pace field present). |
 | A7 | Optional: 64 KiB `BufferedOutputStream` on the `.part` file, flushed before `fd.sync()` and before PartialDownload is stored. |
 
@@ -130,7 +130,7 @@ Tests (core, app-logic, app) as listed in the app report, section 4: one GETS pe
 | **Radio start/stop/reset during REC.** RF calibration + HCI Reset busy-wait 0.2–0.5 s, more than the 384 ms ring. | timing | **Eliminated by rule:** the radio comes up only on Home when not recording. No start, stop, reset or recovery while recording. Lowbatt/USB/HP transitions are deferred to REC end. | code review + E-series regression |
 | **BT fault during REC** (fault 6 was seen after a large GETS) | reboot ends the recording | **Eliminated:** F8, keep recording and drop BT. | fault injection on bench |
 | **CPU:** BT tasks (prio 4–8) preempt the recorder (prio 1) | starvation | Bounded: rate cap F1b + no idle link. Measured idle% and recorder-loop gap must stay ≤ 25 % of ring tolerance (≤ 96 ms stereo, ≤ 224 ms mono). | M3 |
-| **SD contention:** GETS reads, STAT, DEL, PUT in the same task | delay of `recorder_poll` | No interleaving is possible (single task, no mutex needed). Bounded by: GETS only when the ring is empty, 5 ms budget per pass, STAT cached, writers deferred (F1, F4, F6). Worst XREC pass ≤ 10 ms, against a 128 ms slot. | M3 (max loop gap) |
+| **SD contention:** GETS reads, STAT, DEL, PUT in the same task | delay of `recorder_poll` | No interleaving is possible (single task, no mutex needed). Bounded by: GETS only when the ring is empty, 5 ms budget per pass (GETS chunks, LS directory chunks and GET / GETS lookups all resume at the next pass), STAT cached, writers deferred (F1, F4, F6). Target: worst XREC pass ≤ 10 ms against a 128 ms slot — **not measured yet**; host tests bound the reads per pass, M3 measures the pass on silicon. | M3 (max loop gap) |
 | **SD busy timeout** (up to 500 ms, exists without BT) | timing | Not BT-specific; F1c raises mono tolerance to 896 ms. F6 means BT adds no extra writes during REC. | M3 counters |
 | **Active file** | wrong / duplicate notes | **Eliminated:** firmware refuses GETS (BUSY) and names the file (`rec_idx`); the app skips it; LS before STAT. | host tests + M5 |
 | **RF/digital coupling into the mic** (1600 Hz slot tick, 800/400/267 Hz packet rhythms, 40 Hz poll, page scan 0.78 Hz, VBAT sag, the phone's own TX) | electrical | **Unmeasured — the main risk.** Bounded by: no idle link, no discoverability, bursty paced transfers, rate cap. Release gated on M2. Fallback ladder 2.6. | M2 |
@@ -230,18 +230,21 @@ Branch: a feature branch off `feat/bt-step9`, committed and pushed at milestones
 
 | ID | Where | What it does |
 |---|---|---|
-| F1 | `xrec_proto.c` (ops `rec_channels`, `rec_pending`, `now_us`), `main.c` BT loop | While recording: no XREC command runs and no GETS / LS chunk is read while `audio_ring_pending() != 0` (bytes stay in the RX ring like TX back-pressure); one `xrec_poll` pass reads for <= `XREC_REC_PASS_BUDGET_US` (5000). The BT loop is `recorder_poll(); bt_xrec_poll(); recorder_poll();`. |
+| F1 | `xrec_proto.c` (ops `rec_channels`, `rec_pending`, `now_us`), `exfat.c` (`exfat_list_dir_resume`, `exfat_find_in_dir_resume`), `main.c` BT loop | While recording: no XREC command runs and no GETS / LS chunk is read while `audio_ring_pending() != 0` (bytes stay in the RX ring like TX back-pressure); one `xrec_poll` pass stops reading once it used `XREC_REC_PASS_BUDGET_US` (5000): GETS chunks, LS (resumes at the saved directory slot, no re-walk from the first entry) and the GET / GETS lookup in `/record` (resumable, over several passes). The BT loop is `recorder_poll(); bt_xrec_poll(); recorder_poll();`. |
 | F1b | `xrec_proto.c` | Token bucket on GETS payload while recording: `XREC_REC_GETS_RATE_BPS` 48000, depth `XREC_REC_GETS_BURST` 2048 (compile-time); bench: `+XREC:DBG,PACE[,<B/s>[,<us>]]`, `bt_sync.py --load-pace`. |
 | F1c | `audio_dma.c` | One 32 KiB buffer: mono 8 x 4 KiB slots (7 queue = 896 ms), stereo 4 x 8 KiB (384 ms). No RAM change. DMAC CH1 (IRQ 61) stays at priority 0x00. |
 | F1d | `main.c` | While recording the BT loop waits one tick (`OPENFW_TASK_WAIT`, woken early by BT) instead of spinning. |
 | F4 | `exfat.c` | Free-cluster cache: first `exfat_stat_fs` after a mount scans, every bitmap change through the volume adjusts it, any bitmap I/O error drops it; MSC is followed by the existing remount. |
-| F6 | `xrec_proto.c`, `bt_xrec_fw.c` | While recording: DEL, PUT REC / CAS / OTA, PUTEND, OTA, PAIR -> `ERR,LATER,30000` (staged uploads kept); RTC set -> `OK,RTC,LATER` (not applied: old apps fail a sync on any ERR to a clock set); bond-file flush deferred to REC end. Stereo: GETS / GET -> LATER, a running stream ends with LATER. |
-| F7 | `xrec_proto.c`, `bt_xrec_fw.c` | GETS / GET of the active file -> `ERR,BUSY`. STAT + `rec_idx`, `pace_ms` (0; mono 342; stereo 30000). `tools/bt_sync.py` and the app's `XrecReplies.status` (numeric fields, size >= 8) accept 10 fields. |
+| F6 | `xrec_proto.c`, `bt_xrec_fw.c` | While recording: DEL, PUT REC / CAS / OTA, PUTEND, OTA, PAIR -> `ERR,LATER,30000` (staged uploads kept); RTC set -> `OK,RTC,LATER` (not applied: old apps fail a sync on any ERR to a clock set); bond-file flush deferred to REC end. A staged upload whose link goes during the recording keeps its writer and temp until REC stopped (`xrec_deferred_poll`, every session poll) or BT stops (`xrec_deferred_flush`). XREC `GAIN` / `DSP` / `VOR` / `CH` apply live; the BT loop rewrites the settings file only after REC (the REC-stop paths save it). Stereo: GETS / GET -> LATER, a running stream (or lookup) ends with LATER, retried at the next poll while the TX ring is full. PAIR -> LATER: pairing needs the recorder idle (60 s window). |
+| F7 | `xrec_proto.c`, `bt_xrec_fw.c`, `recorder.c` (`recorder_rec_index_of`, `recorder_get_rec_index`; host-tested incl. a forced 2 GiB split) | GETS / GET of the active file -> `ERR,BUSY`. STAT + `rec_idx`, `pace_ms` (0; mono 342; stereo 30000). `tools/bt_sync.py` and the app's `XrecReplies.status` (numeric fields, size >= 8) accept 10 fields. |
 | F8 | `bt_xrec_bluedroid.c`, `bt_hp_bluedroid.c`, `bt_xrec_fw.c` | A session fault while recording parks: no teardown / ladder / reboot; `bt_ctrl_rtos_hard_stop` + `bt_rom_real_silence`, task supervisor (WDT hold) and hang guard disarmed, no Bluedroid call, no card write, session memory kept, BT start refused. A BT-task assert parks too (the task suspends once parked). The hard path (0xB1 + reboot) runs at the first session poll / stop after REC stops. |
 
 Left for silicon (M3) and later stages:
 - the 5 ms budget and 48000 B/s are host-tested logic only: M3 must show the recorder-loop gap, `poll_max_us`, idle
-  and `wr_max_us` with the pacing on (`--load-pace`), and choose the cap;
+  and `wr_max_us` with the pacing on (`--load-pace`), and choose the cap; include LS and GETS of the last file on a
+  `/record` with many recordings (thousands of entries) during a mono recording;
+- a staged upload's temp is still closed and deleted when BT is switched off during a recording (the session context
+  goes); only a disconnect is deferred;
 - `bt_rom_real_silence()` while a recording runs (no ROM call, a soft-reset poll) was only ever used on the reboot
   path: fault injection during REC on the bench (M5) must confirm the recording continues glitch-free;
 - the BT loop now sleeps one tick per pass while recording: confirm with the M3 counters (`gap_max_us`);
@@ -253,7 +256,8 @@ Left for silicon (M3) and later stages:
 Backward compatibility:
 - New app + old open_fw: 64 KiB window works; no STAT fields → today's all-skip-while-recording rule; no LATER/gmax.
 - New app + stock firmware: detected by `pen133` in PONG → keeps 3840/640.
-- Old app + new firmware: unchanged behaviour (it sends 3840/640 GETS; extra STAT fields are ignored; BUSY/LATER degrade to skip/failed for that sync).
+- Old app (before S4, `c1104d47`) + new firmware: GETS 3840/640 and extra STAT fields work; BUSY skips the file. A `LATER` to a pending transcript upload while recording ends **the whole sync** as Failed until REC stops (not just that file): **release gate**, ship this firmware with the S4 app or later.
+- S4 app + new firmware: works; but the S4 app sleeps `pace_ms` after each GETS window (XrecClient `pauseMillis`), which halves the paced rate: the app should start windows at most every `pace_ms` instead (XREC_PROTOCOL.md 5.1).
 - Bonds, pairing flow and the modal BT screen are unchanged. The default non-BT image is byte-identical.
 
 ---
