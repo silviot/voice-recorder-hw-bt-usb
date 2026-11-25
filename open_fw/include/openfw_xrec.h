@@ -116,6 +116,7 @@ typedef struct {
 
     /* Streaming +XREC:PUT -> OTA / EXP / CAS / REC upload state */
     uint8_t        put_active;
+    uint8_t        put_discard;        /* refused header: eat put_len payload bytes unparsed, no reply */
     uint8_t        put_auth_ok;
     uint8_t        put_target;
     char           put_name[32];       /* CAS / REC file name of the chunk being received */
@@ -138,6 +139,9 @@ typedef struct {
     uint32_t       put_last_off;
     uint16_t       put_last_len;
     uint16_t       put_last_crc;
+    /* last PUTEND commit, so a repeated PUTEND (lost reply) answers the same OK until the next PUT header */
+    uint8_t        put_done_valid;
+    uint32_t       put_done_total;
 } xrec_ctx_t;
 
 void xrec_init(xrec_ctx_t *ctx, exfat_vol_t *vol, const xrec_ops_t *ops, void *user);

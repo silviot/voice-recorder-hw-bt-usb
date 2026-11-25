@@ -261,6 +261,8 @@ test-host: $(LVGL_DIR)/lvgl.h $(BUILD_DIR)/liblvgl_host.a tests/test_core.c test
 	/usr/sbin/mkfs.exfat -q -b 4096 -c 4096 $(BUILD_DIR)/test_xrec_rec.img
 	$(BUILD_DIR)/test_xrec_rec $(BUILD_DIR)/test_xrec_rec.img
 	/usr/sbin/fsck.exfat -n $(BUILD_DIR)/test_xrec_rec.img
+	python3 -I ../tools/test_bt_sync_xrec.py > $(BUILD_DIR)/test_bt_sync_xrec.log
+	@tail -n 1 $(BUILD_DIR)/test_bt_sync_xrec.log
 	$(HOST_CC) $(HOST_CFLAGS) -DOPENFW_HOST_MMIO -DOPENFW_ENABLE_USB_EXP=1 -DOPENFW_UNATTENDED_DEV=1 tests/test_drivers_mmio.c \
 		src/wdt_timer.c src/uart.c src/rtc.c src/pmu.c src/keys.c \
 		src/sdio.c src/lcd_st7735s.c src/usb_musb.c src/usb_scsi.c src/exfat.c \
