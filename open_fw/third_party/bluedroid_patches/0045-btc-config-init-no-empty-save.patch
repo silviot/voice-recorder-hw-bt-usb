@@ -1,0 +1,40 @@
+diff --git a/open_fw/third_party/bluedroid/host/bluedroid/btc/core/btc_config.c b/open_fw/third_party/bluedroid/host/bluedroid/btc/core/btc_config.c
+index f2ab5a0..2a04e3a 100644
+--- a/open_fw/third_party/bluedroid/host/bluedroid/btc/core/btc_config.c
++++ b/open_fw/third_party/bluedroid/host/bluedroid/btc/core/btc_config.c
+@@ -22,6 +22,9 @@
+ #include "stack/bt_types.h"
+ #include "nvs.h"
+ 
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++void bt_store_hold_nonempty(void);   /* bt_port/bt_store.c (patch 0045) */
++#endif
+ static char CONFIG_FILE_PATH[NVS_NS_NAME_MAX_SIZE] = "bt_config.conf";
+ static const period_ms_t CONFIG_SETTLE_PERIOD_MS = 3000;
+ 
+@@ -91,6 +94,9 @@ bool btc_config_init(void)
+     }
+ 
+     config = config_new(CONFIG_FILE_PATH);
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++    bool parsed = config != NULL;
++#endif
+     if (!config) {
+         BTC_TRACE_WARNING("%s unable to load/parse config; starting unconfigured without overwriting NVS.\n", __func__);
+         config = config_new_empty();
+@@ -99,6 +105,15 @@ bool btc_config_init(void)
+             goto error;
+         }
+     }
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++    /* open_fw patch 0045: the save below ran also when the stored config could not be read or parsed (no memory for
++     * config_parse's buffers, a store read error), and wrote the empty config over every bond, although the warning
++     * above promises not to. Skip it then, and hold the store (bt_port/bt_store.h): the app writes nothing over the
++     * card's bond file this session; the next start parses it again. */
++    if (!parsed) {
++        bt_store_hold_nonempty();
++    } else
++#endif
+     if (config_save(config, CONFIG_FILE_PATH)) {
+         // unlink(LEGACY_CONFIG_FILE_PATH);
+     }

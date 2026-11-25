@@ -908,6 +908,19 @@ secret of ~33 predictable bits: bench-only waiver, see the review-round entry be
   read; the Just Works over a MITM bond fails without 0042's confirmation check; the final reconnect with the MITM key
   fails without the AUTH_FAILURE keep, and without both 0042 checks (the storage check alone keeps the key). Gates
   (0 warnings, all rc=0): FIRM CRC def 0xECB8 (unchanged), bt 0x4F01, hp 0x3D1D, hpb 0x343F, bench 0x6FC3.
+- 2026-11-25 (`fix/hp-bond-image-change`, from `ab27527`): silicon session 8 bond loss (`bt_hp_bonds.bin` 152 -> 43 B
+  on the first headphones boot of `64d820e` over `0edcb61`). Reading `0edcb61..64d820e`: nothing reaches the first start
+  of a boot differently (`s_store_mode` 0xFF -> reset + load; `bt_store`, Bluedroid, `bt_hp_cfg.bin` unchanged; reconnect
+  only after READY, i.e. after `btc_storage_load_bonded_devices`). The harness reproduces the exact 152 -> 43 B in two
+  ways: a non-empty file the session cannot take over (bt_store reject, or `config_parse` failing) is replaced by the
+  empty config `btc_config_init()` saves at every start; and a peer without the key (S9: Key Missing -> SSP retry ->
+  refused -> Bluedroid removes the bond). Which one hit silicon is not known (ring tail only). Fixed the first:
+  `bt_store` write hold (`bt_store_held`/`bt_store_hold`/`bt_store_hold_nonempty`, replaces `s_bonds_hold`), set by a
+  rejected non-empty image, an oversized or unreadable file and new patch **0042** (renumbered **0045** at integration; `btc_config_init` no longer saves
+  after a failed parse); `bonds_write` refuses while held and logs it; the next start retries the file. Tests: headphones
+  S11a/S11b (S12a/S12b after integration) fail without the fix (152 -> 43 B), S11b also without 0045 alone; `test_bt_store` hold checks. Default
+  image unchanged 0xECB8 (BT=1 code only); bt 0x682B, hp 0x7897, hpb 0x28F1, bench 0x701C, 0 warnings. Next silicon occurrence: look for `BT bond file rejected`, `BT bonds not saved: the
+  card's bond file`, `BT bond file held`, or an `auth st=` failure before the SSP attempt (peer lost the key).
 
 ## 11. Round-1 traceability
 

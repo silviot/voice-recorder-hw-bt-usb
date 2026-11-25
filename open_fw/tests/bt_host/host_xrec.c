@@ -84,7 +84,7 @@ static TimerHandle_t s_dl_timer;
 static volatile uint8_t s_dl_armed, s_dl_fired;
 static volatile uint32_t s_dl_fired_total, s_hard_reason, s_bond_writes, s_key_writes, s_reboot_mode;
 static uint32_t s_faults_base, s_hci_to_base, s_flush_seen;
-static uint8_t s_bonds_hold;                  /* as bt_xrec_fw.c: the bond file could not be read, never written */
+static uint8_t s_hold_logged;                 /* as bt_xrec_fw.c: the bond-file hold was reported this session */
 static volatile uint8_t s_fail_bond_reads;    /* test knob: reading the mode's bond file fails (SD error) */
 static volatile uint8_t s_fail_bond_writes;   /* test knob: every /bt_bonds.bin write fails (full / removed card) */
 static volatile uint32_t s_bond_write_fails;
@@ -307,9 +307,11 @@ void bt_xrec_plat_set_mode(uint8_t mode, int (*profile_down)(void))
 static void bonds_write(void);
 
 /* As bt_xrec_fw.c bonds_load (review STEP10 C10 / A2: unsaved RAM bonds kept over the older file, the other mode's
- * unsaved bonds flushed before the switch, an unreadable file never written over). */
+ * unsaved bonds flushed before the switch; a bond file whose bonds the session cannot take over is held (bt_store_held)
+ * and never written over: silicon 2026-11-25 bond loss). */
 static void bonds_load(void)
 {
+    s_hold_logged = 0u;
     if (s_store_mode != s_mode) {    /* as bt_xrec_fw.c (design §6.4) */
         if (s_store_mode != 0xFFu && bt_store_dirty()) {
             bonds_write();
@@ -319,8 +321,7 @@ static void bonds_load(void)
         }
         bt_store_reset();
         s_store_mode = s_mode;
-        s_bonds_hold = 0u;
-    } else if (bt_store_dirty() && !s_bonds_hold) {
+    } else if (bt_store_dirty() && !bt_store_held()) {
         bt_xrec_plat_log("BT bonds kept from RAM (unsaved changes are newer than the card)");
         return;                      /* the start's config save asks for the flush (bt_xrec_fw.c sets the request) */
     }
@@ -330,26 +331,32 @@ static void bonds_load(void)
     char path[24];
     snprintf(path, sizeof(path), "/%s", BOND_FILE(s_mode));
     exfat_entry_t ent;
-    if (exfat_find_path(s_vol, path, &ent) != 0 || ent.is_dir || ent.size == 0u || ent.size > BT_STORE_IMAGE_MAX) {
-        s_bonds_hold = 0u;
+    if (exfat_find_path(s_vol, path, &ent) != 0 || ent.is_dir || ent.size == 0u) {
+        bt_store_hold(0);
+        return;
+    }
+    if (ent.size > BT_STORE_IMAGE_MAX) {
+        bt_xrec_plat_log_u32("BT bond file too large (kept, not written this session), size", ent.size);
+        bt_store_reset();
+        bt_store_hold(1);
         return;
     }
     uint8_t *img = (uint8_t *)pvPortMalloc(BT_STORE_IMAGE_MAX);
     if (img == NULL) {
         bt_xrec_plat_log("BT bonds not loaded: no memory (bond file kept, not written this session)");
-        s_bonds_hold = 1u;
+        bt_store_hold(1);
         return;
     }
     int n = s_fail_bond_reads ? -1 : read_root_file(s_vol, BOND_FILE(s_mode), img, BT_STORE_IMAGE_MAX);
     if (n > 0) {
-        s_bonds_hold = 0u;
         esp_err_t r = bt_store_load(img, (size_t)n);
         if (r != ESP_OK) {
-            bt_xrec_plat_log_u32("BT bond file rejected (store starts empty), err", (uint32_t)r);
+            bt_xrec_plat_log_u32("BT bond file rejected (kept, not written this session; store starts empty), err",
+                                 (uint32_t)r);
         }
     } else {
         bt_xrec_plat_log("BT bond file unreadable (kept, not written this session)");
-        s_bonds_hold = 1u;
+        bt_store_hold(1);
     }
     wipe_mem(img, BT_STORE_IMAGE_MAX);
     vPortFree(img);
@@ -357,7 +364,14 @@ static void bonds_load(void)
 
 static void bonds_write(void)
 {
-    if (!bt_store_dirty() || !s_sd || s_vol == NULL || s_store_mode == 0xFFu || s_bonds_hold) {
+    if (!bt_store_dirty() || !s_sd || s_vol == NULL || s_store_mode == 0xFFu) {
+        return;
+    }
+    if (bt_store_held()) {
+        if (!s_hold_logged) {
+            s_hold_logged = 1u;
+            bt_xrec_plat_log("BT bonds not saved: the card's bond file was not loaded this session (kept)");
+        }
         return;
     }
     uint8_t *img = (uint8_t *)pvPortMalloc(BT_STORE_IMAGE_MAX);
@@ -675,6 +689,9 @@ void bt_xrec_plat_session_end(void)
 {
     bt_task_sup_disarm(&s_sup);
     bonds_write();                   /* final flush of the bond store */
+    if (bt_store_held() && !s_hold_logged) {
+        bt_xrec_plat_log("BT bond file held this session (its bonds were not loaded; file kept)");
+    }
     s_bond_fails = 0u;
     s_key_staged = s_key_installed = 0u;
     s_vol = NULL;
