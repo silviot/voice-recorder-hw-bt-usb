@@ -72,6 +72,13 @@ void aout_set_src_channels(uint8_t ch)
 void aout_bt_attach(void *tx, void *sink, const aout_bt_link_t *link, int ring_is_dac_buf)
 {
     if (link == NULL || tx == NULL || sink == NULL) {
+        /* the session stopped (BT off, fault) possibly while a file plays to the headset: that file has no headset
+         * any more (BOTH keeps its DAC half); the player pauses on the session's link-lost event */
+        if (g_ao.route == AOUT_ROUTE_BT) {
+            g_ao.route = AOUT_ROUTE_NONE;
+        } else if (g_ao.route == AOUT_ROUTE_BOTH) {
+            g_ao.route = AOUT_ROUTE_DAC;
+        }
         g_ao.tx = NULL;
         g_ao.sink = NULL;
         g_ao.link = NULL;

@@ -2208,6 +2208,25 @@ int bt_hp_stream_ready(void)
     return link_stream_ready();
 }
 
+void bt_hp_suspend(void)
+{
+    if (g != NULL && s_state == BT_HP_ST_READY && g->link == BT_HP_LINK_STARTED) {
+        g->mc_want = MC_SUSPEND;
+        mc_pump();
+    }
+}
+
+uint16_t bt_hp_acl_handle(void)
+{
+    uint16_t h = 0xFFFFu;
+    bt_xrec_plat_lock();
+    if (g != NULL && g->acl_valid) {
+        h = g->acl_handle;
+    }
+    bt_xrec_plat_unlock();
+    return h;
+}
+
 int bt_hp_abs_vol(void)
 {
     return g != NULL && s_state == BT_HP_ST_READY && g->ct_conn && g->abs_vol;

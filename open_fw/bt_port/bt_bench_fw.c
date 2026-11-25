@@ -11,6 +11,8 @@
 #include "bt_bench.h"
 #include "bt_ctrl.h"
 #include "bt_xrec_bluedroid.h"
+#include "bt_hp.h"
+#include <string.h>
 
 /* SRAM_HI (.bss_hi, zeroed at boot) like hci_probe.c's log copy: .bt_bss would come out of the RTOS heap region. */
 #define BENCH_HI           __attribute__((section(".bss_hi"), aligned(4)))
@@ -22,6 +24,7 @@ static bt_bench_cap_t s_cap BENCH_HI;
 static bt_bench_run_t s_run BENCH_HI;
 static bt_bench_cfg_t s_cfg BENCH_HI;
 static char s_line[160] BENCH_HI;
+static uint32_t s_cap_ui[(sizeof(bt_hp_ui_t) + 3u) / 4u] BENCH_HI;   /* bt_hp_get_ui() scratch (off the stack) */
 static uint32_t s_ll;
 static uint8_t s_armed;          /* request taken this boot, run not ended yet */
 static uint8_t s_in;             /* between bt_bench_begin() and bt_bench_end() */
@@ -168,6 +171,392 @@ static void act(uint32_t a, uint32_t now)
     }
 }
 
+/* ============================================ headphones run (mode=hp) ========================================= */
+#include "bt_hp.h"
+#include "hp_tx.h"
+#include "hp_tx_bd.h"
+#ifndef OPENFW_BT_BLUEDROID
+#define OPENFW_BT_BLUEDROID 1                /* BT=1 only; the bt_port library is built without the app's -D */
+#endif
+#include "audio_out.h"
+
+enum { HPB_WAIT_READY = 0, HPB_SCANNING, HPB_CONNECTING, HPB_CONNECTED, HPB_STREAMING, HPB_PLAY_DUE, HPB_DONE };
+
+static struct {
+    uint8_t  st;
+    uint8_t  scanned;
+    uint8_t  tone_on;
+    uint8_t  played;
+    uint8_t  last_link;
+    uint32_t last_msg_seq;
+    uint32_t next_stat, stat_n, t_tone;
+    uint32_t phase;
+    uint32_t prev_pkts, prev_frames, prev_acked, prev_pads;
+} s_hp BENCH_HI;
+static char s_hp_play_path[BT_BENCH_HP_FILE_MAX + 1u] BENCH_HI;
+
+static const int16_t k_sin64[64] = {
+    0, 3212, 6393, 9512, 12539, 15446, 18204, 20787, 23170, 25329, 27245, 28898, 30273, 31356, 32137, 32609,
+    32767, 32609, 32137, 31356, 30273, 28898, 27245, 25329, 23170, 20787, 18204, 15446, 12539, 9512, 6393, 3212,
+    0, -3212, -6393, -9512, -12539, -15446, -18204, -20787, -23170, -25329, -27245, -28898, -30273, -31356, -32137,
+    -32609, -32767, -32609, -32137, -31356, -30273, -28898, -27245, -25329, -23170, -20787, -18204, -15446, -12539,
+    -9512, -6393, -3212,
+};
+
+static void lka(const char *k, const uint8_t b[6])
+{
+    static const char hx[] = "0123456789ABCDEF";
+    lc(' ');
+    ls(k);
+    ls("=..:");
+    for (int i = 3; i < 6; i++) {
+        lc(hx[b[i] >> 4]);
+        lc(hx[b[i] & 0xFu]);
+        if (i < 5) {
+            lc(':');
+        }
+    }
+}
+
+static void hp_boot_log(void)
+{
+    lbegin("start");
+    lks("mode", "hp");
+    lks("stage", bt_bench_hp_stage_name(s_cfg.hp_stage));
+    lku("secs", s_cfg.secs);
+    lku("hp_secs", s_cfg.hp_secs);
+    lku("pick_first", s_cfg.hp_pick_first);
+    lku("addr_set", s_cfg.hp_addr_set);
+    if (s_cfg.hp_addr_set) {
+        lka("addr", s_cfg.hp_addr);
+    }
+    lku("pair", s_cfg.hp_pair);
+    lku("rate", s_cfg.hp_rate);
+    lku("bitpool", s_cfg.hp_bitpool);
+    lku("speech_bp", s_cfg.hp_speech_bp);
+    lku("tick_ms", s_cfg.hp_tick_ms);
+    lku("tone_hz", s_cfg.hp_tone_hz);
+    lku("credits", s_cfg.hp_credits);
+    lks("file", s_cfg.hp_file[0] ? s_cfg.hp_file : "-");
+    lkx("prev_fault", g_prev_fault_code);
+    lks("log", BT_BENCH_LOG_FILE);
+    lemit();
+    if (s_cfg.hp_credits != BT_CTRL_H2C_ACL_CREDITS) {
+        lbegin("hp");
+        lks("note", "hp_credits differs from this image's build-time credit count (not applied, design §7)");
+        lku("image", BT_CTRL_H2C_ACL_CREDITS);
+        lemit();
+    }
+    if (s_cfg.hp_pscan) {
+        lbegin("hp");
+        lks("note", "hp_pscan=1 ignored: this session never enables page scan (live log)");
+        lemit();
+    }
+}
+
+/* Before bt_hp_start(): the SD request's tunables. */
+void bt_bench_hp_prepare(void)
+{
+    bt_hp_bench_tun_t t;
+    memset(&t, 0, sizeof(t));
+    t.rate = s_cfg.hp_rate;
+    t.bitpool = s_cfg.hp_bitpool;
+    t.speech_bp = s_cfg.hp_speech_bp;
+    t.tick_ms = s_cfg.hp_tick_ms;
+    t.pkt_per_tick = s_cfg.hp_pkt_per_tick;
+    t.txq = s_cfg.hp_txq;
+    t.credit_ticks = s_cfg.hp_credit_ticks;
+    t.pscan = s_cfg.hp_pscan;
+    bt_hp_set_bench_tun(&t);
+}
+
+void bt_bench_hp_begin(void)
+{
+    if (!s_armed || s_in) {
+        return;
+    }
+    s_in = 1u;
+    memset(&s_hp, 0, sizeof(s_hp));
+    uint32_t now = millis();
+    bt_bench_run_begin(&s_run, &s_cfg, now);
+    s_run.next_pair = UINT32_MAX;
+    drain();
+}
+
+static void hp_found_log(void)
+{
+    bt_hp_ui_t *u = (bt_hp_ui_t *)s_cap_ui;
+    bt_hp_get_ui(u);
+    lbegin("hp scan");
+    lku("found", u->n_found);
+    lemit();
+    for (uint32_t i = 0u; i < u->n_found; i++) {
+        const bt_hp_found_t *f = &u->found[i];
+        lbegin("hp dev");
+        lku("i", i);
+        lka("addr", f->bda);
+        lkx("cod", f->cod);
+        lku("audio", f->is_audio);
+        if (f->has_rssi) {
+            lks("rssi", "-");
+            lu((uint32_t)(f->rssi < 0 ? -(int32_t)f->rssi : (int32_t)f->rssi));
+        }
+        lks("name", f->named ? f->name : "?");
+        lemit();
+    }
+}
+
+static void hp_stats(uint32_t el_ms)
+{
+    hp_tx_t *t = hp_tx_bd();
+    bt_hp_ui_t *u = (bt_hp_ui_t *)s_cap_ui;
+    bt_hp_get_ui(u);
+    lbegin("hp");
+    lku("t", el_ms / 1000u);
+    lku("link", u->link);
+    lku("rate", t->conn_rate);
+    lku("bp", t->cfg.max_bp);
+    lku("fpp", t->fpp);
+    lku("pkts", t->st.pkts - s_hp.prev_pkts);
+    lku("sbc", t->st.frames_sbc - s_hp.prev_frames);
+    lku("acked", t->acked_sbc - s_hp.prev_acked);
+    lku("pads", t->st.pad_pkts - s_hp.prev_pads);
+    lku("lost", t->st.tx_lost_sbc);
+    lku("drop", t->st.flush_drop_sbc);
+    lku("allocf", t->st.alloc_fail);
+    lku("cs_no", t->st.can_send_no);
+    lku("txq", t->last_st.qlen);
+    lku("txq_max", t->st.txq_max);
+    lku("down", hp_tx_down_sbc(t));
+    lku("nocp_max_ms", t->st.nocp_gap_max_ms);
+    lku("stalls", t->st.stalls);
+    lku("late", t->st.tick_late);
+    lemit();
+    s_hp.prev_pkts = t->st.pkts;
+    s_hp.prev_frames = t->st.frames_sbc;
+    s_hp.prev_acked = t->acked_sbc;
+    s_hp.prev_pads = t->st.pad_pkts;
+    uint16_t h = bt_hp_acl_handle();
+    bt_ctrl_link_info_t li;
+    if (h != 0xFFFFu && bt_ctrl_link_info(h, &li)) {
+        lbegin("hp linkinfo");
+        lks("role", li.role == BT_CTRL_ROLE_MASTER ? "M" : li.role == BT_CTRL_ROLE_SLAVE ? "S" : "?");
+        lkx("pkt_type", li.pkt_type);
+        lku("max_slots", li.max_slots);
+        lku("mode", li.mode);
+        lku("acl_sent", li.acl_sent);
+        lku("acl_done", li.acl_completed);
+        lku("heap_free", (uint32_t)xPortGetFreeHeapSize());
+        lku("heap_min", (uint32_t)xPortGetMinimumEverFreeHeapSize());
+        lemit();
+    }
+}
+
+/* Tone through the full output path (aout -> hp_sink ring -> resampler -> SBC), 16 kHz mono. */
+static void hp_tone_feed(uint32_t now)
+{
+    int16_t buf[128];
+    for (int round = 0; round < 8; round++) {
+        uint32_t hz = s_cfg.hp_tone_hz;
+        if (hz == 0u) {
+            hz = (((now - s_hp.t_tone) / 1000u) & 1u) ? 880u : 440u;
+        }
+        uint32_t step = (hz << 16) / 16000u * 64u;       /* phase step, 64-entry table in 16.16 */
+        uint32_t ph = s_hp.phase;
+        for (int i = 0; i < 128; i++) {
+            buf[i] = (int16_t)(k_sin64[(ph >> 16) & 63u] / 3);   /* -9.5 dBFS */
+            ph += step;
+        }
+        int w = aout_write(buf, 128u, 1u);
+        if (w <= 0) {
+            break;
+        }
+        uint32_t adv = step * (uint32_t)w;
+        s_hp.phase += adv;
+    }
+}
+
+/* In the headphones bench loop (main.c): returns BT_BENCH_HP_ACT_* bits; *path gets the file for PLAY. */
+int bt_bench_hp_tick(uint32_t now, char *path, uint32_t cap)
+{
+    if (!s_in) {
+        return 0;
+    }
+    uint32_t el = now - s_run.t0;
+    int act = 0;
+    bt_hp_ui_t *u = (bt_hp_ui_t *)s_cap_ui;
+    bt_hp_get_ui(u);
+    if (u->msg_seq != s_hp.last_msg_seq) {
+        s_hp.last_msg_seq = u->msg_seq;
+        lbegin("hp msg");
+        lku("msg", u->msg);
+        lku("link", u->link);
+        lemit();
+    }
+    if (u->link != s_hp.last_link) {
+        lbegin("hp link");
+        lku("from", s_hp.last_link);
+        lku("to", u->link);
+        lku("t_ms", el);
+        lemit();
+        s_hp.last_link = u->link;
+    }
+    if (u->state == BT_HP_ST_FAULTED || u->state == BT_HP_ST_OFF) {
+        if (s_hp.st != HPB_DONE) {
+            lbegin("hp");
+            lks("st", "session ended (fault or off): see the BT hp lines above");
+            lemit();
+            s_hp.st = HPB_DONE;
+        }
+    }
+    switch (s_hp.st) {
+    case HPB_WAIT_READY:
+        if (u->state == BT_HP_ST_READY) {
+            lbegin("hp ready");
+            lku("t_ms", el);
+            lku("last", u->has_last);
+            lemit();
+            if (s_cfg.hp_stage == BT_BENCH_HP_SCAN || s_cfg.hp_pick_first) {
+                if (bt_hp_scan(s_cfg.hp_secs) == 0) {
+                    s_hp.st = HPB_SCANNING;
+                } else {
+                    lbegin("hp");
+                    lks("err", "scan refused");
+                    lemit();
+                    s_hp.st = HPB_DONE;
+                }
+            } else {
+                if (s_cfg.hp_pair) {
+                    lbegin("hp pair window");
+                    lks("note", "bench, no user: Just Works for this address only, 120 s");
+                    lemit();
+                }
+                (void)bt_hp_connect_addr(s_cfg.hp_addr, s_cfg.hp_pair);
+                s_hp.st = HPB_CONNECTING;
+            }
+        }
+        break;
+    case HPB_SCANNING:
+        if (!u->scanning) {
+            hp_found_log();
+            if (s_cfg.hp_stage == BT_BENCH_HP_SCAN) {
+                s_hp.st = HPB_DONE;
+                break;
+            }
+            int pick = -1;
+            for (uint32_t i = 0u; i < u->n_found && pick < 0; i++) {
+                if (u->found[i].is_audio) {
+                    pick = (int)i;
+                }
+            }
+            if (pick < 0) {
+                lbegin("hp");
+                lks("err", "no audio-class device found (put the headphones in pairing mode)");
+                lemit();
+                s_hp.st = HPB_DONE;
+                break;
+            }
+            lbegin("hp pick");
+            lku("i", (uint32_t)pick);
+            lka("addr", u->found[pick].bda);
+            lks("name", u->found[pick].named ? u->found[pick].name : "?");
+            lku("pair", s_cfg.hp_pair);
+            lemit();
+            if (s_cfg.hp_pair) {
+                lbegin("hp pair window");
+                lks("note", "bench, no user: Just Works for this address only, 120 s");
+                lemit();
+            }
+            (void)bt_hp_pick((uint8_t)pick, s_cfg.hp_pair);
+            s_hp.st = HPB_CONNECTING;
+        }
+        break;
+    case HPB_CONNECTING:
+        if (u->link == BT_HP_LINK_OPEN || u->link == BT_HP_LINK_STARTED) {
+            lbegin("hp connected");
+            lku("t_ms", el);
+            lku("rate", u->rate);
+            lku("bp", u->bp_max);
+            lku("abs_vol", u->abs_vol);
+            lks("name", u->target_name[0] ? u->target_name : "?");
+            lemit();
+            s_hp.st = HPB_CONNECTED;
+        }
+        break;
+    case HPB_CONNECTED:
+        if (s_cfg.hp_stage == BT_BENCH_HP_TONE) {
+            aout_set_mode(AOUT_MODE_HEADPHONES);
+            aout_set_src_channels(1u);
+            int r = aout_start(16000u, 24u);
+            lbegin("hp tone");
+            lku("hz", s_cfg.hp_tone_hz);
+            lku("start", (uint32_t)(r == 0));
+            lemit();
+            s_hp.t_tone = now;
+            s_hp.tone_on = r == 0;
+            s_hp.next_stat = el + 1000u;
+            s_hp.st = HPB_STREAMING;
+        } else if (s_cfg.hp_stage == BT_BENCH_HP_PLAYER) {
+            s_hp.st = HPB_PLAY_DUE;
+        } else {
+            s_hp.next_stat = el + 1000u;
+            s_hp.st = HPB_STREAMING;   /* connect stage: hold the link, stats only */
+        }
+        break;
+    case HPB_PLAY_DUE:
+        if (!s_hp.played) {
+            s_hp.played = 1u;
+            const char *f = s_cfg.hp_file;
+            uint32_t i = 0u;
+            for (; f[i] != '\0' && i + 1u < cap; i++) {
+                path[i] = f[i];
+            }
+            path[i] = '\0';
+            act |= BT_BENCH_HP_ACT_PLAY;
+            s_hp.next_stat = el + 1000u;
+            s_hp.st = HPB_STREAMING;
+        }
+        break;
+    case HPB_STREAMING:
+        if (s_hp.tone_on) {
+            hp_tone_feed(now);
+        }
+        break;
+    default:
+        break;
+    }
+    if (s_hp.st == HPB_STREAMING && (int32_t)(el - s_hp.next_stat) >= 0) {
+        hp_stats(el);
+        s_hp.stat_n++;
+        s_hp.next_stat = el + (s_hp.stat_n < 15u ? 1000u : 15000u);
+    }
+    uint32_t a = bt_bench_run_tick(&s_run, now);
+    if (a & BT_BENCH_ACT_EXIT) {
+        if (!s_why_time) {
+            s_why_time = 1u;
+            hp_stats(el);
+            lbegin("exit");
+            lks("why", "time");
+            lku("ms", el);
+            lemit();
+        }
+        act |= BT_BENCH_HP_ACT_EXIT;
+    }
+    drain();
+    return act;
+}
+
+/* After the player stage's file (main.c) and at the end of the run: tone off, output mode back. */
+void bt_bench_hp_finish(uint8_t out_mode)
+{
+    if (s_hp.tone_on) {
+        aout_stop();
+        s_hp.tone_on = 0u;
+    }
+    aout_set_src_channels(2u);
+    aout_set_mode((aout_mode_t)out_mode);
+}
+
 int bt_bench_boot(exfat_vol_t *vol, int sd_mounted)
 {
     bt_bench_err_t err = BT_BENCH_OK;
@@ -184,18 +573,14 @@ int bt_bench_boot(exfat_vol_t *vol, int sd_mounted)
         lemit();
         return 0;
     }
-    if (s_cfg.mode != BT_BENCH_MODE_PHONE) {
-        /* mode=hp parses (bt_bench.c) but this image has no headphones bench session yet (docs/BT_A2DP_DESIGN.md
-         * milestone H3 adds it): consumed and refused, never run as a phone-mode test. */
-        lbegin("OFF");
-        lks("trig", bt_bench_trig_name(t));
-        lks("mode", "hp");
-        lks("err", "unsupported");
-        lks("file", BT_BENCH_TRIGGER_FILE);
-        lemit();
-        return 0;
-    }
     bt_bench_cap_init(&s_cap, s_cap_buf, sizeof(s_cap_buf), g_openfw_log.write_idx);
+    if (s_cfg.mode == BT_BENCH_MODE_HP) {
+        hp_boot_log();
+        s_armed = 1u;
+        s_in = 0u;
+        s_why_time = 0u;
+        return 2;                            /* main.c: run_bt_hp_bench() */
+    }
     s_armed = 1u;
     s_in = 0u;
     s_why_time = 0u;

@@ -229,6 +229,10 @@ static void test_parse_hp(void)
           BT_BENCH_OK && c.hp_tone_hz == 440u, "tone stage keys");
     CHECK(parse("mode=hp hp_stage=scan hp_addr=00:1B:66:AA:BB:CC", &c, NULL) == BT_BENCH_OK,
           "hp_addr allowed (scan reports it)");
+    CHECK(parse("mode=hp hp_stage=player hp_pick=first", &c, NULL) == BT_BENCH_OK && c.hp_file[0] == '\0',
+          "player stage without hp_file: the first /record file");
+    CHECK(parse("mode=hp hp_stage=tone hp_pick=first hp_tone_hz=0", &c, NULL) == BT_BENCH_OK && c.hp_tone_hz == 0u,
+          "hp_tone_hz=0: alternating 440 / 880 Hz");
     CHECK(parse("mode=hp hp_stage=player hp_pick=first hp_file=/A.B", &c, NULL) == BT_BENCH_OK &&
           strcmp(c.hp_file, "/A.B") == 0, "shortest 8.3 path");
     CHECK(parse("mode=hp hp_stage=player hp_pick=first hp_file=/ABCDEFGH/IJKLMNOP.WAV", &c, NULL) == BT_BENCH_OK,
@@ -252,7 +256,6 @@ static void test_parse_hp(void)
         { "mode=hp hp_stage=connect hp_pick=first hp_pkt_per_tick=1", BT_BENCH_E_CONFLICT },  /* tick 20 > 15 */
         { "mode=hp hp_stage=connect hp_pick=first hp_tick_ms=16 hp_pkt_per_tick=1", BT_BENCH_E_CONFLICT },
         { "mode=hp hp_tone_hz=440", BT_BENCH_E_CONFLICT },              /* tone key, scan stage */
-        { "mode=hp hp_stage=player hp_pick=first", BT_BENCH_E_CONFLICT },  /* player needs hp_file */
         { "mode=hp hp_stage=tone hp_pick=first hp_file=/A.WAV", BT_BENCH_E_CONFLICT },
         { "mode=hp hp_bitpool=20 hp_speech_bp=24", BT_BENCH_E_CONFLICT },
         { "mode=hp hp_addr=00:1B:66:AA:BB", BT_BENCH_E_VALUE },

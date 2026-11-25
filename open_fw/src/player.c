@@ -10,6 +10,18 @@
 #include "openfw_cwx.h"
 #include "openfw_player.h"
 #include "audio_out.h"
+#if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID && !(defined(OPENFW_HCI_PROBE) && OPENFW_HCI_PROBE)
+/* BT=1 headphones hooks (docs/BT_A2DP_DESIGN.md §3.1 R-14, §6.6, §6.7): PA off and jack edges ignored while the
+ * headset plays, AVRCP keys, headset events pause with the snapshot rewind, bt_vol for the headset route. */
+#include "../bt_port/bt_hp.h"
+#define PLAYER_BT 1
+#define PA_SET(on) audio_pa_set((on) && aout_route() != AOUT_ROUTE_BT)
+#define PLAYER_VOL_GAIN(v) ((aout_is_bt() && bt_hp_abs_vol()) ? 31u : (v))
+#else
+#define PLAYER_BT 0
+#define PA_SET(on) audio_pa_set(on)
+#define PLAYER_VOL_GAIN(v) (v)
+#endif
 
 #define PLAYER_DAC_CHUNK_FRAMES 1024u
 
@@ -643,6 +655,12 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
         volume = 18u;
     }
     if (aout_start(winfo.sample_rate, volume) != 0) {
+#if PLAYER_BT
+        if (aout_get_mode() == AOUT_MODE_HEADPHONES) {
+            str_copy_cap(m->toast_msg, (int)sizeof(m->toast_msg), "Headphones not connected"); /* TODO(i18n) */
+            m->toast_col = UI_COL_AMBER;
+        }
+#endif
         return 0;
     }
     /* Re-sample PB11 after codec analog bias is enabled by audio_dac_start() (via aout_start) */
@@ -655,8 +673,16 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
         }
         aout_set_volume(volume, 0x1FFu);
     }
+#if PLAYER_BT
+    int bt_only = aout_route() == AOUT_ROUTE_BT;   /* the headset alone: jack edges change nothing (R-14) */
+    int bt_route = aout_is_bt();                    /* the session can stop under us (BT off, fault) */
+    if (aout_is_bt()) {
+        volume = bt_hp_vol31();
+        aout_set_volume(PLAYER_VOL_GAIN(volume), 0x1FFu);
+    }
+#endif
     /* Route audio to built-in speaker PA (PB30) when no 3.5 mm jack is inserted */
-    audio_pa_set(!hp_in);
+    PA_SET(!hp_in);
 
     /* Panel is already configured for 160x80 landscape at boot; avoid touching LCDC
      * directly from CPU0 while CPU1 owns the display controller. */
@@ -751,6 +777,57 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
             hp_cand_since = now;
         }
         int cur_hp = ((uint32_t)(now - hp_cand_since) >= 30u) ? hp_cand : hp_in;
+#if PLAYER_BT
+        if (bt_only) {
+            cur_hp = hp_in;
+        }
+        bt_hp_poll();
+        if (act == PLAYER_ACT_NONE && aout_is_bt()) {
+            /* AVRCP keys (design §6.6): past the screen-off gate (a headset button in a pocket still works) */
+            switch (bt_hp_take_key()) {
+            case BT_HP_KEY_PLAY:     act = (paused || eof_reached) ? PLAYER_ACT_PLAY_PAUSE : PLAYER_ACT_NONE; break;
+            case BT_HP_KEY_PAUSE:    act = (!paused && !eof_reached) ? PLAYER_ACT_PLAY_PAUSE : PLAYER_ACT_NONE; break;
+            case BT_HP_KEY_TOGGLE:   act = PLAYER_ACT_PLAY_PAUSE; break;
+            case BT_HP_KEY_NEXT:     act = PLAYER_ACT_SEEK_FWD; break;   /* next file or +seek per skip mode */
+            case BT_HP_KEY_PREV:     act = PLAYER_ACT_SEEK_BACK; break;
+            case BT_HP_KEY_VOL_UP:   act = PLAYER_ACT_VOL_UP; break;
+            case BT_HP_KEY_VOL_DOWN: act = PLAYER_ACT_VOL_DOWN; break;
+            default: break;
+            }
+        }
+        if (act == PLAYER_ACT_PLAY_PAUSE && paused && aout_is_bt() && !bt_hp_stream_ready()) {
+            act = PLAYER_ACT_NONE;                   /* nothing would drain the ring: stay paused */
+            str_copy_cap(m->toast_msg, (int)sizeof(m->toast_msg), "Headphones not connected"); /* TODO(i18n) */
+            m->toast_col = UI_COL_AMBER;
+            toast_until  = now + 1500u;
+            ui_dirty     = 1;
+        }
+        if (bt_route && !aout_is_bt() && !paused && !eof_reached) {
+            bt_route = 0;                            /* headphones mode stopped under the file: hold it */
+            paused = 1;
+            str_copy_cap(m->toast_msg, (int)sizeof(m->toast_msg), "Headphones disconnected"); /* TODO(i18n) */
+            m->toast_col = UI_COL_AMBER;
+            toast_until  = now + 2000u;
+            ui_dirty     = 1;
+        }
+        {
+            uint32_t pev = bt_hp_take_player_events();
+            if (pev != 0u && aout_is_bt() && !paused && !eof_reached && !scrub.speed) {
+                /* link lost / stalled / remote suspend / START failed (design §6.7): pause, rewind to the last
+                 * heard frame (the transmit path's snapshot), like a headphone unplug */
+                paused = 1;
+                aout_set_mute(1);
+                player_pause_rewind(&winfo, &data_off, &played_frames, &buf_pos, &buf_frames, &skip_frames);
+                str_copy_cap(m->toast_msg, (int)sizeof(m->toast_msg),
+                             (pev & BT_HP_PEV_REMOTE_SUSPEND) ? "Headphones paused" :      /* TODO(i18n) */
+                             (pev & BT_HP_PEV_START_FAILED) ? "Headphones not ready" :     /* TODO(i18n) */
+                                                              "Headphones disconnected");  /* TODO(i18n) */
+                m->toast_col = UI_COL_AMBER;
+                toast_until  = now + 2000u;
+                ui_dirty     = 1;
+            }
+        }
+#endif
         int unplug = hp_in && !cur_hp;
         if (scrub.speed && (!keys.hold_active || unplug ||
                             (!keys_event_pending() && keys_state(NULL) != keys.held))) {
@@ -763,7 +840,7 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
             eof_reached = heard == winfo.total_samples;
             if (eof_reached) played_frames = heard;
             aout_set_mute(paused || eof_reached);
-            audio_pa_set(!paused && !eof_reached && !hp_in && !unplug);
+            PA_SET(!paused && !eof_reached && !hp_in && !unplug);
             ui_dirty = 1;
         }
         if (cur_hp != hp_in) {
@@ -773,7 +850,7 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
             aout_set_volume(volume, 0x1FFu);
             if (was_hp && !hp_in && !paused && !eof_reached) {
                 paused = 1;
-                audio_pa_set(0);
+                PA_SET(0);
                 aout_set_mute(1);
                 player_pause_rewind(&winfo, &data_off, &played_frames,
                                     &buf_pos, &buf_frames, &skip_frames);
@@ -782,7 +859,7 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
                 m->toast_col = UI_COL_AMBER;
                 toast_until  = now + 1500u;
             } else {
-                audio_pa_set((!hp_in && !paused && !eof_reached) ? 1 : 0);
+                PA_SET((!hp_in && !paused && !eof_reached) ? 1 : 0);
             }
             ui_dirty = 1;
         }
@@ -805,13 +882,13 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
                 paused ^= 1;
                 if (paused) {
                     aout_set_mute(1);
-                    audio_pa_set(0);
+                    PA_SET(0);
                     player_pause_rewind(&winfo, &data_off, &played_frames,
                                         &buf_pos, &buf_frames, &skip_frames);
                 }
             }
             aout_set_mute(paused);
-            audio_pa_set((!hp_in && !paused && !eof_reached) ? 1 : 0);
+            PA_SET((!hp_in && !paused && !eof_reached) ? 1 : 0);
             ui_dirty = 1;
         } else if (act == PLAYER_ACT_VOL_UP || act == PLAYER_ACT_VOL_DOWN) {
             if (act == PLAYER_ACT_VOL_UP && volume < 31u) {
@@ -819,12 +896,17 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
             } else if (act == PLAYER_ACT_VOL_DOWN && volume > 0u) {
                 volume--;
             }
+#if PLAYER_BT
+            if (aout_is_bt()) {
+                bt_hp_set_vol31(volume);             /* bt_vol (AVRCP absolute volume when the headset has it) */
+            } else
+#endif
             if (hp_in) {
                 m->cfg.hp_vol = volume;
             } else {
                 m->cfg.spk_vol = volume;
             }
-            aout_set_volume(volume, 0x1FFu);
+            aout_set_volume(PLAYER_VOL_GAIN(volume), 0x1FFu);
             last_vol_ms = now ? now : 1u;
             ui_dirty    = 1;
         } else if (act == PLAYER_ACT_PREV_FILE || act == PLAYER_ACT_NEXT_FILE) {
@@ -834,7 +916,7 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
             aout_flush();
             scrub = (scrub_t){ .speed = act == PLAYER_ACT_SCRUB_FWD ? 2 : -2, .next = heard };
             aout_set_mute(0);
-            audio_pa_set(!hp_in);
+            PA_SET(!hp_in);
             ui_dirty = 1;
         } else if (act == PLAYER_ACT_SEEK_BACK || act == PLAYER_ACT_SEEK_FWD) {
             int fwd = act == PLAYER_ACT_SEEK_FWD;
@@ -861,7 +943,7 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
                 skip_frames = 0u;
                 eof_reached = 0;
                 aout_flush();
-                audio_pa_set((!hp_in && !paused) ? 1 : 0);
+                PA_SET((!hp_in && !paused) ? 1 : 0);
                 ui_dirty    = 1;
             }
         }
@@ -888,7 +970,7 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
                         eof_reached = 1;
                         peak_l_pct  = 0u;
                         peak_r_pct  = 0u;
-                        audio_pa_set(0);
+                        PA_SET(0);
                         ui_dirty    = 1;
                         break;
                     }
@@ -920,7 +1002,7 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
                             eof_reached = 1;
                             peak_l_pct  = 0u;
                             peak_r_pct  = 0u;
-                            audio_pa_set(0);
+                            PA_SET(0);
                             ui_dirty    = 1;
                         }
                         break;
@@ -934,7 +1016,7 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
                             eof_reached = 1;
                             peak_l_pct  = 0u;
                             peak_r_pct  = 0u;
-                            audio_pa_set(0);
+                            PA_SET(0);
                             ui_dirty    = 1;
                         }
                         break;

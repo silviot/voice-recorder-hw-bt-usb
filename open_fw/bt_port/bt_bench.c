@@ -220,7 +220,7 @@ static int hp_num(uint32_t k, int32_t n, bt_bench_cfg_t *c)
         c->hp_credit_ticks = (uint8_t)n;
         return 0;
     case K_HP_TONE_HZ:
-        if (n < 100 || n > 8000) return -1;
+        if (n != 0 && (n < 100 || n > 8000)) return -1;   /* 0: 440 / 880 Hz alternating each second */
         c->hp_tone_hz = (uint16_t)n;
         return 0;
     case K_HP_CREDITS:
@@ -266,8 +266,8 @@ static int hp_rules(uint32_t seen, bt_bench_cfg_t *c)
     if (SEEN(K_HP_TONE_HZ) && c->hp_stage != BT_BENCH_HP_TONE) {
         return -1;
     }
-    if ((c->hp_file[0] != '\0') != (c->hp_stage == BT_BENCH_HP_PLAYER)) {
-        return -1;
+    if (c->hp_file[0] != '\0' && c->hp_stage != BT_BENCH_HP_PLAYER) {
+        return -1;                                       /* player stage only; without it: the first /record file */
     }
     if (c->hp_speech_bp > c->hp_bitpool) {
         if (SEEN(K_HP_SPEECH_BP)) {

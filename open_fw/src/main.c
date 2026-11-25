@@ -29,6 +29,13 @@
 #include "cassini_splash.h"
 #if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID && !(defined(OPENFW_HCI_PROBE) && OPENFW_HCI_PROBE)
 #include "../bt_port/bt_xrec_bluedroid.h" /* plan M2.3: pairing-window gate feedback (bt_xrec_get_debug) */
+#include "../bt_port/bt_hp.h"             /* headphones mode (docs/BT_A2DP_DESIGN.md §6, §9) */
+#include "audio_out.h"
+#define OPENFW_BT_HP 1
+#define BT_HP_POLL() bt_hp_poll()
+#else
+#define OPENFW_BT_HP 0
+#define BT_HP_POLL() ((void)0)
 #endif
 
 #define MENU_MAX_FILES 96
@@ -205,6 +212,12 @@ int ui_poll_power_button(ui_screen_id_t screen, ui_model_t *model, uint32_t now)
             break;
         case POWER_BUTTON_SHUTDOWN:
             lcd_shutdown();
+#if OPENFW_BT_HP
+            if (screen == UI_SCR_PLAYER) {
+                aout_stop();                        /* the headset route too (design §3.1 R-14) */
+            }
+            (void)bt_shutdown();                    /* phone or headphones mode, whichever runs (design §6.7) */
+#endif
             if (screen == UI_SCR_USB) {
                 usb_msc_stop();
             } else if (screen == UI_SCR_BT) {
@@ -1081,6 +1094,9 @@ static int main_usb_audio_cfg_cb(int set, uint8_t cfg[4], int16_t *rms_x10, uint
 
 static int run_usb_msc_mode(int auto_mode)
 {
+#if OPENFW_BT_HP
+    (void)bt_shutdown();      /* headphones mode must not flush bt_hp_bonds.bin while the host owns the card (§6.7) */
+#endif
     keys_flush_events();
     g_ui_screen        = UI_SCR_USB;
     g_ui.usb_read_act  = 0u;
@@ -1267,6 +1283,7 @@ static int run_usb_msc_mode(int auto_mode)
 /* bt_port/bt_bench_fw.c: one-shot SD:/BTBENCH.RUN unattended phone-mode run (bench images only: make BT=1 BENCH=1;
  * bt_bench.h). A release BT=1 image never reads the file. */
 #define OPENFW_BT_BENCH 1
+#include "../bt_port/bt_bench.h"   /* headphones run hooks (bt_bench_hp_*) */
 int  bt_bench_boot(exfat_vol_t *vol, int sd_mounted);
 void bt_bench_begin(void);
 int  bt_bench_tick(uint32_t now_ms);
@@ -1514,6 +1531,456 @@ static void run_bt_xrec_mode(void)
     reload_files_and_sd_stats();
 }
 
+#if OPENFW_BT_HP
+/* ======================== Bluetooth: mode choice and headphones (BT=1; docs/BT_A2DP_DESIGN.md §9) ==================
+ * English only (TODO(i18n) on every string). The screens reuse the Settings layout through UI_SCR_LIST. The
+ * headphones session keeps running in the background when the screen is left (the player streams to it); the
+ * home loop and the player poll it. */
+enum { HPR_POWER = 0, HPR_STATUS, HPR_DISCONNECT, HPR_SEARCH, HPR_FORGET, HPR_DEV };
+
+static uint8_t g_hp_row_kind[UI_LIST_ROWS];
+static uint8_t g_hp_row_arg[UI_LIST_ROWS];
+static uint32_t g_hp_msg_seen;
+
+static void hp_addr_text(char *out, int cap, const uint8_t b[6])
+{
+    static const char hx[] = "0123456789ABCDEF";
+    int o = 0;
+    for (int i = 0; i < 6 && o + 3 < cap; i++) {
+        out[o++] = hx[b[i] >> 4];
+        out[o++] = hx[b[i] & 0xFu];
+        if (i < 5) {
+            out[o++] = ':';
+        }
+    }
+    out[o] = '\0';
+}
+
+static void hp_u32_text(char *out, int *p, int cap, uint32_t v)
+{
+    char b[10];
+    int n = 0;
+    do {
+        b[n++] = (char)('0' + v % 10u);
+        v /= 10u;
+    } while (v && n < 10);
+    while (n > 0 && *p < cap - 1) {
+        out[(*p)++] = b[--n];
+    }
+    out[*p] = '\0';
+}
+
+static const char *hp_msg_text(uint8_t msg)
+{
+    switch (msg) { /* TODO(i18n) */
+    case BT_HP_MSG_SCAN_DONE:           return "Search done";
+    case BT_HP_MSG_SCAN_FAIL:           return "Search failed";
+    case BT_HP_MSG_PAIRED:              return "Paired";
+    case BT_HP_MSG_PAIR_FAIL:           return "Pairing failed";
+    case BT_HP_MSG_PAIR_REFUSED:        return "Pairing refused";
+    case BT_HP_MSG_CONNECTED:           return "Headphones connected";
+    case BT_HP_MSG_CONNECT_FAIL:        return "Connection failed";
+    case BT_HP_MSG_DISCONNECTED:        return "Headphones disconnected";
+    case BT_HP_MSG_RECONNECTING:        return "Reconnecting...";
+    case BT_HP_MSG_FORGOTTEN:           return "Headphones forgotten";
+    case BT_HP_MSG_PAIRING_UNAVAILABLE: return "Pairing unavailable";
+    case BT_HP_MSG_STALLED:             return "Link stalled, reconnecting";
+    case BT_HP_MSG_START_FAILED:        return "Headphones not ready";
+    default:                            return "";
+    }
+}
+
+/* Fill the list model from the session; keeps the selection on the same kind of row. */
+static void hp_build(const bt_hp_ui_t *u)
+{
+    uint8_t sel_kind = g_ui.list_sel < g_ui.list_n ? g_hp_row_kind[g_ui.list_sel] : HPR_POWER;
+    uint8_t sel_arg = g_ui.list_sel < g_ui.list_n ? g_hp_row_arg[g_ui.list_sel] : 0u;
+    int n = 0;
+    int active = u->state == BT_HP_ST_UP || u->state == BT_HP_ST_CONFIG || u->state == BT_HP_ST_READY;
+    copy_cstr(g_ui.list_title, (int)sizeof(g_ui.list_title), "Headphones"); /* TODO(i18n) */
+    g_ui.list_sub[0] = '\0';
+#define HP_ROW(kind, arg, lbl, val, col)                                                                          \
+    do {                                                                                                          \
+        if (n < UI_LIST_ROWS) {                                                                                   \
+            g_hp_row_kind[n] = (kind);                                                                            \
+            g_hp_row_arg[n] = (uint8_t)(arg);                                                                     \
+            copy_cstr(g_ui.list_lbl[n], (int)sizeof(g_ui.list_lbl[n]), (lbl));                                    \
+            copy_cstr(g_ui.list_val[n], (int)sizeof(g_ui.list_val[n]), (val));                                    \
+            g_ui.list_val_col[n] = (uint8_t)(col);                                                                \
+            n++;                                                                                                  \
+        }                                                                                                         \
+    } while (0)
+    HP_ROW(HPR_POWER, 0, "Headphones mode", active ? "On" : "Off", active ? 2 : 0); /* TODO(i18n) */
+    char lbl[32], val[16];
+    int p = 0;
+    if (!active) {
+        HP_ROW(HPR_STATUS, 0, u->state == BT_HP_ST_FAULTED ? "BT fault (see log)" : "Off", "", 3); /* TODO(i18n) */
+    } else if (u->state != BT_HP_ST_READY) {
+        HP_ROW(HPR_STATUS, 0, "Starting...", "", 1); /* TODO(i18n) */
+    } else if (u->link == BT_HP_LINK_OPEN || u->link == BT_HP_LINK_STARTED) {
+        copy_cstr(lbl, (int)sizeof(lbl), u->target_name[0] ? u->target_name : "Headphones"); /* TODO(i18n) */
+        p = 0;
+        val[0] = '\0';
+        if (u->rate) {
+            hp_u32_text(val, &p, (int)sizeof(val), u->rate / 1000u);
+            append_str(val, &p, (int)sizeof(val), u->rate == 44100u ? ".1k bp" : "k bp");
+            hp_u32_text(val, &p, (int)sizeof(val), u->bp_max);
+        }
+        HP_ROW(HPR_STATUS, 0, lbl, val, 2);
+        HP_ROW(HPR_DISCONNECT, 0, "Disconnect", "", 0); /* TODO(i18n) */
+    } else if (u->link == BT_HP_LINK_CONNECTING) {
+        HP_ROW(HPR_STATUS, 0, u->pairing ? "Pairing..." : "Connecting...", "", 3); /* TODO(i18n) */
+    } else if (u->link == BT_HP_LINK_STALLED) {
+        HP_ROW(HPR_STATUS, 0, "Link stalled", "", 3); /* TODO(i18n) */
+    } else if (u->reconnecting && u->has_last) {
+        p = 0;
+        val[0] = '\0';
+        hp_u32_text(val, &p, (int)sizeof(val), u->reconnect_s);
+        append_str(val, &p, (int)sizeof(val), " s");
+        HP_ROW(HPR_STATUS, 0, "Reconnecting", val, 3); /* TODO(i18n) */
+    } else {
+        HP_ROW(HPR_STATUS, 0, "Not connected", "", 0); /* TODO(i18n) */
+    }
+    if (u->state == BT_HP_ST_READY) {
+        val[0] = '\0';
+        if (u->scanning) {
+            p = 0;
+            hp_u32_text(val, &p, (int)sizeof(val), u->scan_s_left);
+            append_str(val, &p, (int)sizeof(val), " s");
+        }
+        HP_ROW(HPR_SEARCH, 0, u->scanning ? "Searching..." : "Search for headphones", val, 1); /* TODO(i18n) */
+    }
+    if (u->has_last) {
+        p = 0;
+        lbl[0] = '\0';
+        append_str(lbl, &p, (int)sizeof(lbl), "Forget "); /* TODO(i18n) */
+        if (u->last_name[0]) {
+            append_str(lbl, &p, (int)sizeof(lbl), u->last_name);
+        } else {
+            char a[20];
+            hp_addr_text(a, (int)sizeof(a), u->last);
+            append_str(lbl, &p, (int)sizeof(lbl), a);
+        }
+        HP_ROW(HPR_FORGET, 0, lbl, "", 0);
+    }
+    for (uint32_t i = 0u; i < u->n_found; i++) {
+        const bt_hp_found_t *f = &u->found[i];
+        if (f->named) {
+            copy_cstr(lbl, (int)sizeof(lbl), f->name);
+        } else {
+            hp_addr_text(lbl, (int)sizeof(lbl), f->bda);
+        }
+        p = 0;
+        val[0] = '\0';
+        if (f->has_rssi) {
+            append_str(val, &p, (int)sizeof(val), "-");
+            hp_u32_text(val, &p, (int)sizeof(val), (uint32_t)(f->rssi < 0 ? -f->rssi : f->rssi));
+            append_str(val, &p, (int)sizeof(val), " dBm");
+        } else {
+            append_str(val, &p, (int)sizeof(val), f->is_audio ? "audio" : "other"); /* TODO(i18n) */
+        }
+        HP_ROW(HPR_DEV, i, lbl, val, f->is_audio ? 1 : 0);
+    }
+#undef HP_ROW
+    g_ui.list_n = (uint8_t)n;
+    int sel = 0;
+    for (int i = 0; i < n; i++) {
+        if (g_hp_row_kind[i] == sel_kind && (sel_kind != HPR_DEV || g_hp_row_arg[i] == sel_arg)) {
+            sel = i;
+            break;
+        }
+    }
+    g_ui.list_sel = (uint8_t)sel;
+    if (g_ui.list_sel < g_ui.list_scroll) {
+        g_ui.list_scroll = g_ui.list_sel;
+    } else if (g_ui.list_sel >= g_ui.list_scroll + 3u) {
+        g_ui.list_scroll = (uint8_t)(g_ui.list_sel - 2u);
+    }
+    if (g_ui.list_scroll + 3u > g_ui.list_n) {
+        g_ui.list_scroll = g_ui.list_n > 3u ? (uint8_t)(g_ui.list_n - 3u) : 0u;
+    }
+    const char *foot = "ENTER select \xC2\xB7 BACK leave"; /* TODO(i18n) */
+    if (u->msg != BT_HP_MSG_NONE && u->msg_seq != 0u) {
+        foot = hp_msg_text(u->msg);
+    }
+    if (g_hp_row_kind[g_ui.list_sel] == HPR_SEARCH && u->state == BT_HP_ST_READY && !u->scanning) {
+        foot = "Put the headphones in pairing mode, then ENTER"; /* TODO(i18n) */
+    }
+    copy_cstr(g_ui.list_foot, (int)sizeof(g_ui.list_foot), foot);
+}
+
+static int hp_start_session(void)
+{
+    if (bt_hp_active()) {
+        return 0;
+    }
+    wdt_feed();
+    (void)bt_rf_init_calibrated(0x53u, 32000000u);
+    return bt_hp_start(&g_exfat_vol, g_sd_mounted);
+}
+
+static void hp_act(uint8_t kind, uint8_t arg)
+{
+    switch (kind) {
+    case HPR_POWER:
+        if (bt_hp_active()) {
+            (void)bt_hp_stop();
+        } else {
+            (void)hp_start_session();
+        }
+        break;
+    case HPR_DISCONNECT:
+        (void)bt_hp_disconnect();
+        break;
+    case HPR_SEARCH:
+        (void)bt_hp_scan(BT_HP_SCAN_SECS_DEF);
+        break;
+    case HPR_FORGET:
+        (void)bt_hp_forget();
+        break;
+    case HPR_DEV:
+        (void)bt_hp_pick(arg, 1);   /* pairing window for this device only (design §6.3) */
+        break;
+    default:
+        break;
+    }
+}
+
+/* The headphones screen. bench != 0: SD:/BTBENCH.RUN mode=hp (bt_bench_hp_tick drives the session). */
+static void run_bt_hp_screen(int bench)
+{
+    (void)bench;                       /* release images: no bench run */
+    g_ui_screen     = UI_SCR_LIST;
+    g_ui.list_sel   = 0u;
+    g_ui.list_scroll = 0u;
+    g_ui.list_n     = 0u;
+    backlight_wake(millis());
+    refresh_telemetry();
+#if OPENFW_BT_BENCH
+    if (bench) {
+        bt_bench_hp_prepare();
+    }
+#endif
+    (void)hp_start_session();
+#if OPENFW_BT_BENCH
+    if (bench) {
+        bt_bench_hp_begin();
+    }
+#endif
+    bt_hp_ui_t u;
+    bt_hp_get_ui(&u);
+    g_hp_msg_seen = u.msg_seq;
+    uint32_t last_ui = 0u;
+    for (;;) {
+        wdt_feed();
+        bt_hp_poll();
+        recorder_poll();
+        if (keys_read_rec_switch()) {
+            backlight_wake(millis());
+            break;
+        }
+        uint32_t now = millis();
+        int show = ui_poll_power_button(UI_SCR_LIST, &g_ui, now);
+        int leave = 0;
+        key_event_t kev;
+        while (keys_pop_event(&kev)) {
+            if (!show || !kev.pressed) {
+                continue;
+            }
+            backlight_wake(kev.t_ms);
+            if (kev.key == KEY_BACK) {
+                leave = 1;
+                break;
+            } else if (kev.key == KEY_LEFT && g_ui.list_sel > 0u) {
+                g_ui.list_sel--;
+            } else if (kev.key == KEY_RIGHT && g_ui.list_sel + 1u < g_ui.list_n) {
+                g_ui.list_sel++;
+            } else if (kev.key == KEY_ENTER && g_ui.list_sel < g_ui.list_n) {
+                hp_act(g_hp_row_kind[g_ui.list_sel], g_hp_row_arg[g_ui.list_sel]);
+            }
+            if (g_ui.list_sel < g_ui.list_scroll) {
+                g_ui.list_scroll = g_ui.list_sel;
+            } else if (g_ui.list_sel >= g_ui.list_scroll + 3u) {
+                g_ui.list_scroll = (uint8_t)(g_ui.list_sel - 2u);
+            }
+            last_ui = 0u;
+        }
+        if (leave) {
+            break;
+        }
+#if OPENFW_BT_BENCH
+        if (bench) {
+            char path[BT_BENCH_HP_FILE_MAX + 1u];
+            int a = bt_bench_hp_tick(now, path, (uint32_t)sizeof(path));
+            if (a & BT_BENCH_HP_ACT_PLAY) {
+                /* player stage: hp_file, or the first recording of the list */
+                char dir[MENU_DIR_CAP];
+                const char *name = NULL;
+                if (path[0] != '\0') {
+                    int cut = 0;
+                    for (int i = 0; path[i] != '\0'; i++) {
+                        if (path[i] == '/') {
+                            cut = i;
+                        }
+                    }
+                    int k = 0;
+                    for (; k < cut && k < (int)sizeof(dir) - 1; k++) {
+                        dir[k] = path[k];
+                    }
+                    dir[k] = '\0';
+                    if (k == 0) {
+                        dir[0] = '/';
+                        dir[1] = '\0';
+                    }
+                    name = &path[cut + 1];
+                } else {
+                    for (int i = 0; i < g_ui.file_count && name == NULL; i++) {
+                        if (!g_files[i].is_dir) {
+                            copy_cstr(dir, (int)sizeof(dir), g_file_dirs[i]);
+                            name = g_files[i].filename;
+                        }
+                    }
+                }
+                if (name != NULL) {
+                    aout_set_mode(AOUT_MODE_HEADPHONES);
+                    openfw_log_puts("BENCH hp play ");
+                    openfw_log_puts(dir);
+                    openfw_log_putc('/');
+                    openfw_log_puts(name);
+                    openfw_log_putc('\n');
+                    g_ui_screen = UI_SCR_PLAYER;
+                    {
+                        uint8_t *z = (uint8_t *)&g_ui.play_file;
+                        for (uint32_t i = 0u; i < sizeof(g_ui.play_file); i++) {
+                            z[i] = 0u;
+                        }
+                    }
+                    copy_cstr(g_ui.play_file.filename, (int)sizeof(g_ui.play_file.filename), name);
+                    g_ui.play_has_prev = 0u;
+                    g_ui.play_has_next = 0u;
+                    int rc = openfw_play_file_ui(&g_exfat_vol, dir, name, &g_ui);
+                    keys_ignore_held();
+                    openfw_log_puts("BENCH hp play end rc ");
+                    openfw_log_u32((uint32_t)(rc + 10));
+                    openfw_log_putc('\n');
+                    bt_bench_hp_finish(g_ui.bt_out_mode);
+                    g_ui_screen = UI_SCR_LIST;
+                } else {
+                    openfw_log_puts("BENCH hp play: no file\n");
+                }
+            }
+            if (a & BT_BENCH_HP_ACT_EXIT) {
+                break;
+            }
+        }
+#endif
+        if ((uint32_t)(now - last_ui) >= 200u || last_ui == 0u) {
+            last_ui = now;
+            pmu_poll_charge_manage();
+            bt_hp_get_ui(&u);
+            hp_build(&u);
+            if (u.msg_seq != g_hp_msg_seen) {
+                g_hp_msg_seen = u.msg_seq;
+                const char *t = hp_msg_text(u.msg);
+                if (t[0] != '\0') {
+                    ui_show_toast(t, (u.msg == BT_HP_MSG_CONNECTED || u.msg == BT_HP_MSG_PAIRED) ? UI_COL_GREEN
+                                     : UI_COL_AMBER, now, 1500u);
+                    if (g_screen_off != SCREEN_MANUALLY_OFF) {
+                        backlight_wake(now);
+                    }
+                }
+            } else {
+                (void)ui_poll_toast_expire(now);
+            }
+            backlight_update();
+            refresh_telemetry();
+            if (show && !g_screen_off) {
+                ui_render_screen(UI_SCR_LIST, &g_ui);
+            }
+        }
+        if (!keys_event_pending() && !recorder_is_saving()) {
+            OPENFW_TASK_WAIT();
+        }
+    }
+#if OPENFW_BT_BENCH
+    if (bench) {
+        bt_bench_hp_finish(g_ui.bt_out_mode);
+        (void)bt_hp_stop();              /* the bench run ends with BT off, like phone mode */
+    }
+#endif
+    keys_ignore_held();
+    g_ui.toast_msg[0] = '\0';
+    backlight_wake(millis());
+}
+
+/* Bluetooth tile: Phone (XREC sync, unchanged) or Headphones. */
+static void run_bt_choice(void)
+{
+    g_ui_screen = UI_SCR_LIST;
+    uint8_t sel = bt_hp_active() ? 1u : 0u;
+    uint32_t last_ui = 0u;
+    for (;;) {
+        wdt_feed();
+        bt_hp_poll();
+        recorder_poll();
+        if (keys_read_rec_switch()) {
+            backlight_wake(millis());
+            return;
+        }
+        uint32_t now = millis();
+        int show = ui_poll_power_button(UI_SCR_LIST, &g_ui, now);
+        int pick = -1;
+        key_event_t kev;
+        while (keys_pop_event(&kev)) {
+            if (!show || !kev.pressed) {
+                continue;
+            }
+            backlight_wake(kev.t_ms);
+            if (kev.key == KEY_BACK) {
+                keys_ignore_held();
+                return;
+            } else if (kev.key == KEY_LEFT || kev.key == KEY_RIGHT) {
+                sel ^= 1u;
+            } else if (kev.key == KEY_ENTER) {
+                pick = sel;
+            }
+            last_ui = 0u;
+        }
+        if (pick == 0) {
+            (void)bt_hp_stop();          /* one controller owner: headphones mode off before phone mode */
+            run_bt_xrec_mode();
+            return;
+        } else if (pick == 1) {
+            run_bt_hp_screen(0);
+            return;
+        }
+        if ((uint32_t)(now - last_ui) >= 200u || last_ui == 0u) {
+            last_ui = now;
+            copy_cstr(g_ui.list_title, (int)sizeof(g_ui.list_title), "Bluetooth");
+            g_ui.list_sub[0] = '\0';
+            g_ui.list_n = 2u;
+            g_ui.list_sel = sel;
+            g_ui.list_scroll = 0u;
+            copy_cstr(g_ui.list_lbl[0], (int)sizeof(g_ui.list_lbl[0]), "Phone (sync)"); /* TODO(i18n) */
+            copy_cstr(g_ui.list_val[0], (int)sizeof(g_ui.list_val[0]), "");
+            g_ui.list_val_col[0] = 0u;
+            copy_cstr(g_ui.list_lbl[1], (int)sizeof(g_ui.list_lbl[1]), "Headphones"); /* TODO(i18n) */
+            copy_cstr(g_ui.list_val[1], (int)sizeof(g_ui.list_val[1]), bt_hp_active() ? "On" : ""); /* TODO(i18n) */
+            g_ui.list_val_col[1] = 2u;
+            copy_cstr(g_ui.list_foot, (int)sizeof(g_ui.list_foot),
+                      sel ? "Play recordings on BT headphones" : "Sync recordings with the phone app"); /* TODO(i18n) */
+            refresh_telemetry();
+            if (show && !g_screen_off) {
+                ui_render_screen(UI_SCR_LIST, &g_ui);
+            }
+        }
+        if (!keys_event_pending()) {
+            OPENFW_TASK_WAIT();
+        }
+    }
+}
+#endif
+
 static void play_boot_animation(void)
 {
     /*
@@ -1603,6 +2070,13 @@ static void adjust_setting(int idx, int delta, uint32_t now_ms)
         g_ui.cfg.lang = (uint8_t)((g_ui.cfg.lang + (delta > 0 ? 1u : ((uint32_t)UI_LANG_COUNT - 1u))) % (uint32_t)UI_LANG_COUNT);
         ui_i18n_set_lang(g_ui.cfg.lang);
         break;
+#if OPENFW_BT_HP
+    case UI_SET_ROW_AOUT: /* Audio output: Speaker / Headphones / Both (saved in SD:/bt_hp_cfg.bin, not settings.bin) */
+        g_ui.bt_out_mode = (uint8_t)((g_ui.bt_out_mode + (delta > 0 ? 1u : 2u)) % 3u);
+        bt_hp_set_out_mode(g_ui.bt_out_mode);
+        aout_set_mode((aout_mode_t)g_ui.bt_out_mode);
+        break;
+#endif
     default:
         break;
     }
@@ -1885,6 +2359,11 @@ int openfw_main(void)
         uart0_puts("f\n");
     }
     load_persisted_state();
+#if OPENFW_BT_HP
+    bt_hp_set_boot_volume(&g_exfat_vol, &g_sd_mounted);
+    g_ui.bt_out_mode = bt_hp_out_mode();                   /* SD:/bt_hp_cfg.bin (not settings.bin, design §6.6) */
+    aout_set_mode((aout_mode_t)g_ui.bt_out_mode);
+#endif
     openfw_log_puts("BOOT_US LCDB=");
     openfw_log_u32(lcd_b_us);
     openfw_log_puts(" SD=");
@@ -1982,8 +2461,13 @@ int openfw_main(void)
 #endif
 #if OPENFW_BT_BENCH
     /* Unattended phone-mode run: only if SD:/BTBENCH.RUN exists (deleted first). BT mode, then the normal boot. */
-    if (bt_bench_boot(&g_exfat_vol, g_sd_mounted)) {
-        run_bt_xrec_mode();
+    int bench_kind = bt_bench_boot(&g_exfat_vol, g_sd_mounted);
+    if (bench_kind) {
+        if (bench_kind == 2) {
+            run_bt_hp_screen(1);       /* mode=hp: headphones bench run (scan / connect / tone / player) */
+        } else {
+            run_bt_xrec_mode();
+        }
         clear_boot_strikes_once(); /* this boot reached BT mode and left it: reboot=1 is no boot-loop strike */
         if (bt_bench_end(&g_exfat_vol, g_sd_mounted)) {
             (void)sd_flush(&g_sd_card);
@@ -1996,6 +2480,7 @@ int openfw_main(void)
 
     while (1) {
         wdt_feed();
+        BT_HP_POLL();
 #if defined(OPENFW_HCI_PROBE) && OPENFW_HCI_PROBE
         hci_probe_poll(&g_exfat_vol, g_sd_mounted);
 #endif
@@ -2020,6 +2505,9 @@ int openfw_main(void)
             enter_press_ms   = 0u;
             enter_long_fired = 0;
             if (rec_sw) {
+#if OPENFW_BT_HP
+                bt_hp_suspend();       /* design §6.9: keep the link, stop sending while recording */
+#endif
                 if (scr != UI_SCR_REC && scr != UI_SCR_SAVED) {
                     prev_scr = scr;
                 }
@@ -2340,6 +2828,8 @@ int openfw_main(void)
                                 if (!hci_probe_active()) { /* the probe owns RW-BT or left it claimed */
                                     run_bt_xrec_mode();
                                 }
+#elif OPENFW_BT_HP
+                                run_bt_choice();
 #else
                                 run_bt_xrec_mode();
 #endif
@@ -2553,7 +3043,7 @@ int openfw_main(void)
                                     dirty = 1;
                                 }
                             } else if (key == KEY_RIGHT) {
-                                if (g_ui.set_sel < 10) {
+                                if (g_ui.set_sel < UI_SET_ROWS - 1) {
                                     g_ui.set_sel++;
                                     if (g_ui.set_sel >= g_ui.set_scroll + 3) {
                                         g_ui.set_scroll = g_ui.set_sel - 2;
@@ -2589,7 +3079,7 @@ int openfw_main(void)
                                         dirty       = 1;
                                         modal_done  = 1;
                                     }
-                                } else if (g_ui.set_sel == 10) {
+                                } else if (g_ui.set_sel == UI_SET_ROW_ABOUT) {
                                     enter_press_ms = 0u;
                                     about_armed    = 0;
                                     scr            = UI_SCR_ABOUT;

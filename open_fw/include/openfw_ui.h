@@ -113,7 +113,23 @@ typedef enum {
     UI_SCR_CHARGE,
     UI_SCR_POWER,
     UI_SCR_OFF,
+#if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID
+    UI_SCR_LIST,            /* BT=1: generic list on the Settings layout (Bluetooth mode choice, headphones) */
+#endif
 } ui_screen_id_t;
+
+/* Settings rows: BT=1 adds "Audio output" before About (output routing for the headphones mode). */
+#if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID && !(defined(OPENFW_HCI_PROBE) && OPENFW_HCI_PROBE)
+#define UI_SET_ROW_AOUT   10
+#define UI_SET_ROW_ABOUT  11
+#define UI_SET_ROWS       12
+#define UI_SET_ROWS_STR   "12"
+#else
+#define UI_SET_ROW_ABOUT  10
+#define UI_SET_ROWS       11
+#define UI_SET_ROWS_STR   "11"
+#endif
+#define UI_LIST_ROWS      12        /* UI_SCR_LIST rows (title + 3 visible, scrolled) */
 
 typedef enum {
     UI_SKIP_5_10 = 0,
@@ -262,6 +278,15 @@ typedef struct {
     uint8_t        bt_bonded;       /* the shown peer holds a MITM bond */
     uint16_t       bt_window_s;     /* pairing window seconds left (0 = closed) */
     char           bt_digits[8];
+    /* BT=1 generic list screen (UI_SCR_LIST): Bluetooth mode choice, headphones screen. English, TODO(i18n). */
+    char           list_title[20];
+    char           list_sub[12];
+    uint8_t        list_n, list_sel, list_scroll;
+    char           list_lbl[UI_LIST_ROWS][26];
+    char           list_val[UI_LIST_ROWS][14];
+    uint8_t        list_val_col[UI_LIST_ROWS];   /* 0 dim, 1 cyan, 2 green, 3 amber */
+    char           list_foot[44];
+    uint8_t        bt_out_mode;     /* Settings "Audio output": 0 Speaker, 1 Headphones, 2 Both */
 #endif
 
     /* Power off */

@@ -1184,6 +1184,11 @@ static void format_setting_val(const ui_model_t *m, int idx, char *val, int vcap
     case 7: lv_snprintf(val, (size_t)vcap, "%s", skip_mode_name(m->cfg.skip_mode)); break;
     case 8: lv_snprintf(val, (size_t)vcap, "%s", ui_lang_native_name(m->cfg.lang)); break;
     case 9: lv_snprintf(val, (size_t)vcap, "%s", ui_tr(m->vbus_present ? UI_STR_CONNECT : UI_STR_UNPLUGGED)); *adj = 0; break;
+#ifdef UI_SET_ROW_AOUT
+    case UI_SET_ROW_AOUT: /* TODO(i18n) */
+        lv_snprintf(val, (size_t)vcap, "%s", m->bt_out_mode == 1u ? "Headphones" : m->bt_out_mode == 2u ? "Both" : "Speaker");
+        break;
+#endif
     default: lv_snprintf(val, (size_t)vcap, "%s", BOARD_FW_VERSION_STR); *adj = 0; break;
     }
 }
@@ -1197,10 +1202,10 @@ static void bind_settings(const ui_model_t *m)
     };
     int sel_disp = m->set_sel;
     if (sel_disp < 0) sel_disp = 0;
-    if (sel_disp > 10) sel_disp = 10;
+    if (sel_disp > UI_SET_ROWS - 1) sel_disp = UI_SET_ROWS - 1;
 
     char sub[12];
-    lv_snprintf(sub, sizeof(sub), "%d / 11", sel_disp + 1);
+    lv_snprintf(sub, sizeof(sub), "%d / " UI_SET_ROWS_STR, sel_disp + 1);
     bind_status_bar(objects.set_bar, objects.set_bar_ic, objects.set_bar_l, objects.set_bar_sub,
                     objects.set_bar_r, objects.set_bar_hp, objects.set_batt,
                     objects.set_batt_fill, objects.set_batt_nub,
@@ -1212,7 +1217,7 @@ static void bind_settings(const ui_model_t *m)
 
     for (int r = 0; r < 3; r++) {
         int idx = m->set_scroll + r;
-        if (idx < 0 || idx >= 11) { set_hidden(rows[r], true); continue; }
+        if (idx < 0 || idx >= UI_SET_ROWS) { set_hidden(rows[r], true); continue; }
         set_hidden(rows[r], false);
         int sel = (idx == m->set_sel);
         set_changed_bg_opa(rows[r], sel ? LV_OPA_COVER : LV_OPA_TRANSP);
@@ -1222,7 +1227,15 @@ static void bind_settings(const ui_model_t *m)
         if (lv_label_get_long_mode(vals[r]) != LV_LABEL_LONG_CLIP) {
             lv_label_set_long_mode(vals[r], LV_LABEL_LONG_CLIP);
         }
+#ifdef UI_SET_ROW_AOUT
+        if (idx == UI_SET_ROW_AOUT) {
+            set_changed_text(lbls[r], "Audio output"); /* TODO(i18n) */
+        } else {
+            set_changed_text(lbls[r], ui_tr(label_ids[idx > UI_SET_ROW_AOUT ? idx - 1 : idx]));
+        }
+#else
         set_changed_text(lbls[r], ui_tr(label_ids[idx]));
+#endif
 
         const char *val_str;
         char val_buf[32];
@@ -1258,7 +1271,7 @@ static void bind_settings(const ui_model_t *m)
         set_changed_x(vals[r], vx);
         set_changed_width(vals[r], vw);
     }
-    bind_scrollbar(objects.set_scroll_thumb, 11, m->set_scroll, 3, 50);
+    bind_scrollbar(objects.set_scroll_thumb, UI_SET_ROWS, m->set_scroll, 3, 50);
 
     if (m->set_edit_clock != 0u) {
         set_hidden(objects.set_foot_vu_box, true);
@@ -1284,11 +1297,59 @@ static void bind_settings(const ui_model_t *m)
         case 7: desc = ui_tr(UI_STR_DESC_SKIP); break;
         case 8: desc = ui_tr(UI_STR_DESC_LANGUAGE); break;
         case 9: desc = ui_tr(m->vbus_present ? UI_STR_DESC_USB_MOUNT : UI_STR_DESC_USB_PLUG); break;
+#ifdef UI_SET_ROW_AOUT
+        case UI_SET_ROW_AOUT: desc = "Play to the speaker, BT headphones, or both"; break; /* TODO(i18n) */
+#endif
         default: break;
         }
         set_changed_text(objects.set_foot_desc, desc);
     }
 }
+
+#if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID
+/* BT=1 generic list (UI_SCR_LIST) on the Settings layout: title, 3 visible rows of label + value, footer text. The
+ * strings come from main.c (English, TODO(i18n) there). */
+static void bind_list(const ui_model_t *m)
+{
+    bind_status_bar(objects.set_bar, objects.set_bar_ic, objects.set_bar_l, objects.set_bar_sub,
+                    objects.set_bar_r, objects.set_bar_hp, objects.set_batt,
+                    objects.set_batt_fill, objects.set_batt_nub,
+                    m, UI_COL_BAR, UI_COL_TEXT, UI_ICON_NONE, UI_COL_TEXT, m->list_title, m->list_sub, NULL, 0);
+    lv_obj_t *rows[3] = { objects.set_row_0, objects.set_row_1, objects.set_row_2 };
+    lv_obj_t *lbls[3] = { objects.set_lbl_0, objects.set_lbl_1, objects.set_lbl_2 };
+    lv_obj_t *vals[3] = { objects.set_val_0, objects.set_val_1, objects.set_val_2 };
+    static const uint32_t cols[4] = { UI_HEX_DIM, UI_HEX_CYAN, UI_HEX_GREEN, UI_HEX_AMBER };
+    int n = m->list_n > UI_LIST_ROWS ? UI_LIST_ROWS : m->list_n;
+    for (int r = 0; r < 3; r++) {
+        int idx = m->list_scroll + r;
+        if (idx < 0 || idx >= n) { set_hidden(rows[r], true); continue; }
+        set_hidden(rows[r], false);
+        set_changed_bg_opa(rows[r], idx == m->list_sel ? LV_OPA_COVER : LV_OPA_TRANSP);
+        if (lv_label_get_long_mode(lbls[r]) != LV_LABEL_LONG_DOT) {
+            lv_label_set_long_mode(lbls[r], LV_LABEL_LONG_DOT);
+        }
+        if (lv_label_get_long_mode(vals[r]) != LV_LABEL_LONG_CLIP) {
+            lv_label_set_long_mode(vals[r], LV_LABEL_LONG_CLIP);
+        }
+        set_changed_text(lbls[r], m->list_lbl[idx]);
+        set_changed_text(vals[r], m->list_val[idx]);
+        set_changed_text_color(vals[r], lv_color_hex(cols[m->list_val_col[idx] & 3u]));
+        const char *v = m->list_val[idx];
+        int32_t vw = v[0] ? lv_text_get_width(v, (uint32_t)lv_strlen(v), &ui_font_sm, 0) + 2 : 0;
+        if (vw > 70) vw = 70;
+        int32_t vx = 146 - vw;
+        int32_t lw = vx - 8;
+        if (lw < 36) lw = 36;
+        set_changed_width(lbls[r], lw);
+        set_changed_x(vals[r], vx);
+        set_changed_width(vals[r], vw > 0 ? vw : 1);
+    }
+    bind_scrollbar(objects.set_scroll_thumb, n, m->list_scroll, 3, 50);
+    set_hidden(objects.set_foot_vu_box, true);
+    set_hidden(objects.set_foot_desc, false);
+    set_changed_text(objects.set_foot_desc, m->list_foot);
+}
+#endif
 
 static void bind_about(const ui_model_t *m)
 {
@@ -1434,6 +1495,9 @@ static enum ScreensEnum map_eez_screen(ui_screen_id_t scr, const ui_model_t *m)
     case UI_SCR_BT:       return SCREEN_ID_BT;
     case UI_SCR_CHARGE:   return SCREEN_ID_CHARGE;
     case UI_SCR_POWER:    return SCREEN_ID_POWER;
+#if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID
+    case UI_SCR_LIST:     return SCREEN_ID_SETTINGS;
+#endif
     case UI_SCR_OFF:
     default:              return SCREEN_ID_OFF;
     }
@@ -1471,7 +1535,11 @@ void ui_render_screen_sync(ui_screen_id_t scr, const ui_model_t *m)
     case SCREEN_ID_PLAYER:
     case SCREEN_ID_PLAYER_TR:      bind_player(m, entering); break;
     case SCREEN_ID_DELETE_CONFIRM: bind_delete(m); break;
+#if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID
+    case SCREEN_ID_SETTINGS:       if (scr == UI_SCR_LIST) bind_list(m); else bind_settings(m); break;
+#else
     case SCREEN_ID_SETTINGS:       bind_settings(m); break;
+#endif
     case SCREEN_ID_ABOUT:          bind_about(m); break;
     case SCREEN_ID_USB:            bind_usb(m); break;
     case SCREEN_ID_BT:             bind_bt(m); break;

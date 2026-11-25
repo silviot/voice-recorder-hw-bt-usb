@@ -50,10 +50,15 @@
  *   hp_pkt_per_tick=N   1..2, default 2: packets per tick; 1 needs hp_tick_ms <= 15 (design §4.3 headroom rule)
  *   hp_txq=N            2..8, default 4: TXQ_PKT_CAP
  *   hp_credit_ticks=N   1..4, default 2: elapsed clamp and the tick term of CREDIT_MAX
- *   hp_tone_hz=N        100..8000, default 1000: tone stage only
- *   hp_file=/DIR/NAME.EXT   player stage only, and required there: an absolute path of 8.3 components, <= 47 chars
+ *   hp_tone_hz=N        0 or 100..8000, default 1000: tone stage only; 0 = 440 / 880 Hz alternating each second
+ *   hp_file=/DIR/NAME.EXT   player stage only (default: the first file of /record): an absolute path of 8.3
+ *                       components, <= 47 chars
  *   hp_credits=N        4..9, default 4: experimental 1005 credit count
  * Example: "mode=hp hp_stage=tone hp_addr=00:1B:66:AA:BB:CC hp_pair=1 secs=600 hp_bitpool=35 hp_credits=4"
+ * The headphones run (bt_bench_hp.c): scan logs every inquiry result; connect/tone/player pick hp_addr or the first
+ * audio-class device, open its pairing window when hp_pair=1 (Just Works then pairs without the user, logged as
+ * "BENCH hp pair window (bench, no user)"), and connect; tone streams for the rest of secs with a stats line every
+ * second for the first 15 s, then every 15 s; player plays hp_file (or the first /record file) once.
  *
  * Every log line of the run (the g_openfw_log ring, drained while BT mode runs) is also written to SD:/BTBENCH.LOG
  * after BT mode ended (replaced by each run): the 4 KiB ring wraps in a long session.
@@ -187,9 +192,16 @@ int bt_bench_log_save(exfat_vol_t *vol, int mounted, const char *data, uint32_t 
                       uint32_t tail_len, exfat_writer_t *w);
 
 /* ---- firmware hooks (bt_bench_fw.c; called from src/main.c, app task) ---- */
-int  bt_bench_boot(exfat_vol_t *vol, int sd_mounted);   /* 1: request taken, run BT mode now (logs BENCH start/OFF) */
+int  bt_bench_boot(exfat_vol_t *vol, int sd_mounted);   /* 1: phone run, 2: headphones run (logs BENCH start/OFF) */
 void bt_bench_begin(void);                              /* in run_bt_xrec_mode(), after bt_xrec_start() */
 int  bt_bench_tick(uint32_t now_ms);                    /* in the BT-mode loop: 1 = leave BT mode now */
 int  bt_bench_end(exfat_vol_t *vol, int sd_mounted);    /* after BT mode: BTBENCH.LOG; 1 = reboot requested */
+/* mode=hp (bt_bench_boot() returned 2): main.c runs the headphones bench loop. */
+#define BT_BENCH_HP_ACT_EXIT 0x1
+#define BT_BENCH_HP_ACT_PLAY 0x2
+void bt_bench_hp_prepare(void);                         /* before bt_hp_start(): the request's tunables */
+void bt_bench_hp_begin(void);                           /* after bt_hp_start() */
+int  bt_bench_hp_tick(uint32_t now_ms, char *path, uint32_t cap);   /* BT_BENCH_HP_ACT_*; PLAY: path to play */
+void bt_bench_hp_finish(uint8_t out_mode);              /* tone off, the user's output mode back */
 
 #endif /* BT_BENCH_H */

@@ -125,6 +125,8 @@ int  bt_hp_forget(void);              /* remove the last headset's bond and forg
 void bt_hp_get_ui(bt_hp_ui_t *out);
 void bt_hp_get_debug(bt_hp_debug_t *out);
 int  bt_hp_stream_ready(void);        /* OPEN, STARTED or suspended (aout routes to the headset) */
+void bt_hp_suspend(void);             /* REC switch (design §6.9): suspend the stream, keep the link */
+uint16_t bt_hp_acl_handle(void);      /* the headset's ACL handle (0xFFFF = none): bench linkinfo / stats */
 int  bt_hp_streaming(void);
 
 /* ---- player integration (src/player.c, BT=1) ---- */
