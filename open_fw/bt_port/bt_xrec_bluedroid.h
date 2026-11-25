@@ -88,6 +88,7 @@ typedef struct {
     uint32_t last_fault;
     /* counters */
     uint32_t rx_frames, rx_bytes, rx_dropped, rx_overflows, tx_writes, tx_bytes, tx_nomem, tx_errors, tx_busy;
+    uint32_t rx_held;         /* times xrec_proto held a received command back for TX room (review STEP10 A5) */
     uint32_t write_evts, write_evt_bytes, cong_evts, evq_lost, stale_events;
     uint32_t ssp_accepted, ssp_rejected, pin_rejected, passkey_rejected, bonds_removed, conns_rejected;
     uint32_t conns_authorized;   /* SPP connections marked authorized for XREC */

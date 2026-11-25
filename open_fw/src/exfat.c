@@ -1912,8 +1912,12 @@ int exfat_delete_file(exfat_vol_t *vol, const char *dir_path, const char *filena
      * (protects against power loss during exfat_replace_file leaving a shared cluster). */
     if (fc.result.first_cluster >= 2u && fc.result.size > 0u) {
         cluster_ref_ctx_t ref = { fc.result.first_cluster, 0 };
-        (void)list_dir_with_loc(vol, dir_ent.first_cluster, dir_ent.no_fat_chain, dir_ent.size,
-                                cluster_ref_cb, 0, &ref);
+        if (list_dir_with_loc(vol, dir_ent.first_cluster, dir_ent.no_fat_chain, dir_ent.size,
+                              cluster_ref_cb, 0, &ref) != 0 && !ref.found) {
+            /* The scan did not finish (I/O error): another entry may still own these clusters. Leak them (the entry
+             * is already gone; a card check reclaims them) rather than free them under a live file (STEP10 C1). */
+            return -1;
+        }
         if (!ref.found) {
             if (free_file_clusters(vol, fc.result.first_cluster, fc.result.size, fc.result.no_fat_chain) != 0) {
                 return -1;
