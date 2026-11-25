@@ -55,10 +55,10 @@ typedef struct {
 #endif
 
 /* The headphones (A2DP source, initiator) rows: Inquiry, Inquiry Cancel, Create Connection, Create Connection Cancel
- * (docs/BT_A2DP_DESIGN.md §7, milestone H2). Still gated: the default list is empty, so release images refuse them.
- * Host tests and bench images opt in with -DBT_CTRL_EXP1_PASSED_LIST=BT_CTRL_HP_GATE_LIST (make test-bt-ctrl runs both
- * builds; make BT=1 BENCH=1 HP_GATES=1 for silicon Exp 4a/4b). Each row flips to the default list only after its
- * silicon experiment passed (one commit each, citing docs/BT_HW_RESULTS.md). 040F, 080B and 080D stay REJ (§7). */
+ * (docs/BT_A2DP_DESIGN.md §7, milestone H2). Their silicon experiments passed (docs/BT_HW_RESULTS.md sessions 7-9), so
+ * every BT=1 firmware image forwards them (bt/Makefile.bluedroid passes -DBT_CTRL_EXP1_PASSED_LIST=BT_CTRL_HP_GATE_LIST).
+ * The header default stays empty on purpose: host tests build both ways (make test-bt-ctrl, test_bt_host scenario G)
+ * so the refused path keeps its coverage. 040F, 080B and 080D stay REJ (§7). */
 #define BT_CTRL_HP_GATE_LIST 0x0401u, 0x0402u, 0x0405u, 0x0408u
 
 /* HCI status codes used by bt_ctrl */

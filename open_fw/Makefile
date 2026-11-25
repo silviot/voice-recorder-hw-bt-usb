@@ -73,7 +73,8 @@ $(error BENCH=1 requires BT=1 without HCI_PROBE=1)
 endif
 CFLAGS   += -DOPENFW_BT_BENCH_IMAGE=1
 endif
-# HP_GATES=1 (with BENCH=1): bt_ctrl forwards the headphones rows 0401 0402 0405 0408 (bt/Makefile.bluedroid).
+# HP_GATES=1 (with BENCH=1): bench HCI trace in bt_ctrl. The headphones rows 0401 0402 0405 0408 are forwarded in
+# every BT=1 image (bt/Makefile.bluedroid).
 ifeq ($(HP_GATES),1)
 ifneq ($(BENCH),1)
 $(error HP_GATES=1 requires BENCH=1)

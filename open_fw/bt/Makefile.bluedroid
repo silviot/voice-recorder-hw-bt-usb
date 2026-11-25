@@ -85,21 +85,22 @@ ifeq ($(BENCH),1)
 XREC_SRCS += $(ROOT)/bt_port/bt_bench.c $(ROOT)/bt_port/bt_bench_fw.c
 endif
 BENCH_STAMP := $(BUILD_DIR)/.bench_flags
-# HP_GATES=1 (bench images only): bt_ctrl forwards the headphones rows 0401 0402 0405 0408 (BT_CTRL_HP_GATE_LIST,
-# docs/BT_A2DP_DESIGN.md §7) for silicon Exp 4a/4b. Release images keep them refused. The stamp rebuilds bt_ctrl_cmds.o
-# when it changes in the same BUILD_DIR.
+# Headphones rows 0401 0402 0405 0408 (BT_CTRL_HP_GATE_LIST, docs/BT_A2DP_DESIGN.md §7): forwarded in EVERY BT=1
+# image since their silicon experiments passed (docs/BT_HW_RESULTS.md sessions 7-9: inquiry, page, cancel, reconnect
+# with real headsets). The header default (bt_ctrl_cmds.h) stays empty so the host tests keep the refused path.
+# HP_GATES=1 (bench images only) now only adds BT_CTRL_HCI_TRACE (every event to the host as a link note).
+# The stamp rebuilds bt_ctrl_cmds.o / bt_ctrl.o when the flags change in the same BUILD_DIR.
 HP_GATES ?= 0
 ifeq ($(HP_GATES),1)
 ifneq ($(BENCH),1)
 $(error HP_GATES=1 requires BENCH=1)
 endif
-GATE_FLAGS := -DBT_CTRL_EXP1_PASSED_LIST=BT_CTRL_HP_GATE_LIST
-else
-GATE_FLAGS :=
 endif
+GATE_FLAGS := -DBT_CTRL_EXP1_PASSED_LIST=BT_CTRL_HP_GATE_LIST
 GATE_STAMP := $(BUILD_DIR)/.gate_flags
 $(BUILD_DIR)/bt_port/bt_ctrl_cmds.o: CFLAGS += $(GATE_FLAGS)
 ifeq ($(HP_GATES),1)
+GATE_FLAGS += -DBT_CTRL_HCI_TRACE=1
 $(BUILD_DIR)/bt_port/bt_ctrl.o: CFLAGS += -DBT_CTRL_HCI_TRACE=1
 endif
 $(BUILD_DIR)/bt_port/bt_ctrl.o: $(GATE_STAMP)

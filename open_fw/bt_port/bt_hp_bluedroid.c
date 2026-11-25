@@ -1101,8 +1101,8 @@ static const struct {
 } k_link = { link_stream_ready, link_request_start };
 
 /* ============================================ connect / reconnect ============================================= */
-/* bt_ctrl forwards the initiator rows (BT_CTRL_HP_GATE_LIST): a release BT=1 image refuses them until their silicon
- * experiments passed (bt_ctrl_cmds.h), so search and connect cannot work there; say so at once. */
+/* bt_ctrl forwards the initiator rows (BT_CTRL_HP_GATE_LIST) in every BT=1 firmware image (bt/Makefile.bluedroid); a
+ * bt_ctrl built without them (host tests, scenario G) refuses them, so search and connect cannot work: say so at once. */
 static bool hp_rows_on(void)
 {
     static const uint16_t k_rows[] = { 0x0401u, 0x0402u, 0x0405u, 0x0408u };
@@ -1121,7 +1121,7 @@ static bool hp_rows_refused(const char *what)
         return false;
     }
     lbegin(what);
-    lks("refused", "this build's bt_ctrl refuses inquiry/page (0401/0402/0405/0408): build BT=1 BENCH=1 HP_GATES=1");
+    lks("refused", "this build's bt_ctrl refuses inquiry/page (0401/0402/0405/0408): BT_CTRL_HP_GATE_LIST not compiled in");
     lend();
     set_msg(BT_HP_MSG_UNSUPPORTED);
     return true;

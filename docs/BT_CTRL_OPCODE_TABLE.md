@@ -408,7 +408,7 @@ fails. Clearing page-0 bit 54 also keeps `0C5F` unreachable if a future change l
 
 12. **Headphones rows (2026-11-25, `docs/BT_A2DP_DESIGN.md` §7 milestone H2).** `0401 0402 0405 0408` keep `REJ` in
     the default build and are forwarded with `-DBT_CTRL_EXP1_PASSED_LIST=BT_CTRL_HP_GATE_LIST` (host tests; bench
-    images with `make BT=1 BENCH=1 HP_GATES=1` for Exp 4a/4b). Every one of them validates with the gate on: ids,
+    images with `make BT=1 BENCH=1 HP_GATES=1` for Exp 4a/4b; since 2026-11-25, after Exp 4 passed on silicon in sessions 7-9, every `BT=1` firmware image forwards them and `HP_GATES=1` only adds the bench HCI trace). Every one of them validates with the gate on: ids,
     payload sizes and reply ids are "exact" in `BT_ROM_HCI_MAP.md` §2, and `0402` now has its zero-length layout.
     `test-bt-ctrl` runs both builds; `test-bt-host` runs the headphones smoke (`test_bt_host_hp hp`) on the gated
     build. What the real Bluedroid sends around an outgoing link (harness, master role): `0C05` (SYN) and `0401`
