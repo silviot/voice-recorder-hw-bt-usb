@@ -39,6 +39,11 @@ static const uint8_t PEER2[6] = { 0x21, 0x22, 0x23, 0x24, 0x25, 0x26 };
 #define H1 0x81u
 #define H2 0x82u
 
+/* exFAT test volume (make test-bt-xrec passes a fresh mkfs.exfat image): GETS streams for the coalescing test [26] */
+static exfat_vol_t g_vol;
+static int g_have_vol;
+static exfat_vol_t *m_vol;   /* handed to bt_xrec_start by bring_up(); NULL = no card */
+
 /* =============================================== mocks: platform =============================================== */
 static uint32_t m_now = 1000u;
 static int m_lock_depth, m_lock_max, m_notifies, m_allocs, m_frees, m_alloc_fail, m_start_allowed = 1;
@@ -421,6 +426,8 @@ static uint8_t m_wire[1 << 16];
 static uint32_t m_wire_len, m_btc_used, m_btc_cap = 100000u;
 static int m_writes, m_upper_cong, m_write_calls_after_stop;
 static uint32_t m_write_max;   /* longest esp_spp_write() since the last reset (bench TX knobs test) */
+static uint16_t m_wlen[2048];  /* esp_spp_write() lengths since the last wire_clear (coalescing test) */
+static uint32_t m_wlen_n;
 static esp_err_t m_write_err = ESP_OK;
 static int m_stopped;
 esp_err_t esp_spp_write(uint32_t handle, int len, uint8_t *data)
@@ -441,6 +448,10 @@ esp_err_t esp_spp_write(uint32_t handle, int len, uint8_t *data)
     }
     memcpy(&m_wire[m_wire_len], data, (size_t)len);
     m_wire_len += (uint32_t)len;
+    if (m_wlen_n < sizeof(m_wlen) / sizeof(m_wlen[0])) {
+        m_wlen[m_wlen_n] = (uint16_t)len;
+    }
+    m_wlen_n++;
     if ((uint32_t)len > m_write_max) {
         m_write_max = (uint32_t)len;
     }
@@ -613,7 +624,7 @@ static bool wire_has(const char *needle)
     return false;
 }
 
-static void wire_clear(void) { m_wire_len = 0u; }
+static void wire_clear(void) { m_wire_len = 0u; m_wlen_n = 0u; }
 
 static bt_xrec_debug_t dbg(void)
 {
@@ -670,6 +681,8 @@ static void mocks_reset(void)
     m_free_dirty = 0;
     memset(m_blk, 0, sizeof(m_blk));
     m_wire_len = m_btc_used = 0u;
+    m_wlen_n = 0u;
+    m_vol = NULL;
     m_btc_cap = 100000u;
     m_writes = m_upper_cong = m_write_calls_after_stop = 0;
     m_write_max = 0u;
@@ -680,10 +693,10 @@ static void mocks_reset(void)
     }
 }
 
-/* start -> up job done -> GAP/SPP config -> INIT_EVT -> START_EVT -> READY */
+/* start -> up job done -> GAP/SPP config -> INIT_EVT -> START_EVT -> READY (with the exFAT test volume if m_vol) */
 static void bring_up(void)
 {
-    CHECK(bt_xrec_start(NULL, 0) == 0, "start");
+    CHECK(bt_xrec_start(m_vol, m_vol != NULL) == 0, "start");
     bt_xrec_poll();
     CHECK(m_spp_cb != NULL && m_gap_cb != NULL, "callbacks registered after the up job");
     esp_spp_cb_param_t p;
@@ -1060,9 +1073,10 @@ static void t_congestion_partial(void)
     CHECK(dbg().inflight == 0u, "in-flight accounting back to 0 (%u)", dbg().inflight);
     wire_clear();
 
-    /* (b) in-flight window: BTC never reports, a reply is split at the window edge (partial write of a message) */
+    /* (b) in-flight window: BTC never reports, a reply is split at the window edge (partial write of a message).
+     * 8 replies (~4.3 KB) outgrow the 3960 B window. */
     m_btc_cap = 100000u;
-    for (int k = 0; k < 4; k++) {
+    for (int k = 0; k < 8; k++) {
         char cmd[48];
         snprintf(cmd, sizeof(cmd), "+XREC:LOG,%u,512\r\n", (unsigned)(k * 512));
         rx(H1, cmd);
@@ -1070,13 +1084,13 @@ static void t_congestion_partial(void)
     bt_xrec_debug_t d = dbg();
     CHECK(d.inflight == BT_XREC_INFLIGHT_MAX, "window full (%u)", d.inflight);
     CHECK(d.tx_used > 0u && d.tx_used < 600u, "tail of the 4th reply still queued (%u)", d.tx_used);
-    btc_drain(H1, 300u, 77u);   /* odd chunk sizes */
+    btc_drain(H1, 700u, 77u);   /* odd chunk sizes */
     bt_xrec_poll();
     d = dbg();
     CHECK(d.tx_used == 0u, "rest written after WRITE_EVT (%u left)", d.tx_used);
     btc_drain(H1, m_btc_used, 1000u);
     bt_xrec_poll();
-    CHECK(check_log_frames(0u, 4) == 0, "4 replies intact across the split (%d)", check_log_frames(0u, 4));
+    CHECK(check_log_frames(0u, 8) == 0, "8 replies intact across the split (%d)", check_log_frames(0u, 8));
     CHECK(dbg().inflight == 0u && dbg().write_evt_bytes == dbg().tx_bytes, "every byte reported once");
     /* stale WRITE_EVT for another handle is ignored */
     esp_spp_cb_param_t p;
@@ -1097,6 +1111,9 @@ static void t_tx_flow_control(void)
 {
     printf("[6b] XREC RX flow control: pipelined replies larger than the TX ring are not dropped (A5)\n");
     mocks_reset();
+    /* the 2 KiB TX ring / 2 KiB BTC ring of the original scenario (bench knobs): 8 replies outgrow it */
+    bt_xrec_bench_tput_t small = { BT_XREC_WRITE_MAX, 2048u, 2048u, 1u };
+    bt_xrec_set_bench_tput(&small);
     bring_up();
     pair_and_auth();
     m_btc_cap = 1000u;                            /* >= BT_XREC_WRITE_MAX: every write fits once drained */
@@ -2215,9 +2232,229 @@ static void t_bench_tput(void)
     bt_xrec_set_bench_tput(NULL);
 }
 
+
+/* ---- [26] the release TX path: coalesced full-size writes (docs/BT_SYNC_THROUGHPUT.md) ---- */
+#define CO_FILE_LEN 40000u
+static uint8_t m_cofile[CO_FILE_LEN];
+
+static int file_read_sectors(void *ctx, uint32_t lba, uint32_t count, void *buf)
+{
+    FILE *fp = (FILE *)ctx;
+    if (fseek(fp, (long)lba * 512L, SEEK_SET) != 0) {
+        return -1;
+    }
+    return fread(buf, 512u, count, fp) == count ? 0 : -1;
+}
+
+static int file_write_sectors(void *ctx, uint32_t lba, uint32_t count, const void *buf)
+{
+    FILE *fp = (FILE *)ctx;
+    if (fseek(fp, (long)lba * 512L, SEEK_SET) != 0 || fwrite(buf, 512u, count, fp) != count) {
+        return -1;
+    }
+    return fflush(fp) == 0 ? 0 : -1;
+}
+
+/* Mount the image and write /record/CO.wav (CO_FILE_LEN bytes of a counter pattern). */
+static int co_volume(const char *img)
+{
+    static FILE *fp;
+    static blkdev_t dev;
+    fp = fopen(img, "r+b");
+    if (fp == NULL || fseek(fp, 0L, SEEK_END) != 0) {
+        return -1;
+    }
+    dev.read_sectors = file_read_sectors;
+    dev.write_sectors = file_write_sectors;
+    dev.total_sectors = (uint32_t)(ftell(fp) / 512L);
+    dev.ctx = fp;
+    if (exfat_mount(&g_vol, &dev) != 0) {
+        return -1;
+    }
+    for (uint32_t i = 0u; i < CO_FILE_LEN; i++) {
+        m_cofile[i] = (uint8_t)(i * 31u + (i >> 8));
+    }
+    exfat_writer_t w;
+    (void)exfat_mkdir(&g_vol, "/record");
+    if (exfat_create_file(&g_vol, "/record", "CO.wav", &w) != 0 || exfat_write(&w, m_cofile, CO_FILE_LEN) != 0 ||
+        exfat_close_file(&w) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+/* Parse the captured stream as consecutive GETS frames ("XREC" off len crc payload) from off0 to off0 + total. */
+static int check_gets_frames(uint32_t off0, uint32_t total)
+{
+    uint32_t i = 0u, off = off0;
+    while (i < m_wire_len) {
+        if (i + 12u > m_wire_len || memcmp(&m_wire[i], "XREC", 4u) != 0) {
+            return -1;
+        }
+        uint32_t o = (uint32_t)m_wire[i + 4] | ((uint32_t)m_wire[i + 5] << 8) | ((uint32_t)m_wire[i + 6] << 16) |
+                     ((uint32_t)m_wire[i + 7] << 24);
+        uint32_t l = (uint32_t)m_wire[i + 8] | ((uint32_t)m_wire[i + 9] << 8);
+        if (o != off || i + 12u + l > m_wire_len || o + l > CO_FILE_LEN || memcmp(&m_wire[i + 12u], &m_cofile[o], l) != 0) {
+            return -2;
+        }
+        i += 12u + l;
+        off += l;
+    }
+    return off == off0 + total ? 0 : -3;
+}
+
+/* BTC reports everything it holds and the session refills, until the GETS window is out. No clock advance. */
+static void co_drain_all(uint32_t chunk)
+{
+    for (int i = 0; i < 1000 && (dbg().tx_used > 0u || m_btc_used > 0u); i++) {
+        btc_drain(H1, m_btc_used, chunk);
+        bt_xrec_poll();
+    }
+}
+
+/* writes [from, to) all exactly `len` long */
+static int co_all_len(uint32_t from, uint32_t to, uint16_t len)
+{
+    for (uint32_t i = from; i < to && i < sizeof(m_wlen) / sizeof(m_wlen[0]); i++) {
+        if (m_wlen[i] != len) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void t_coalesce(void)
+{
+    printf("[26] release TX path: GETS frames merge into full-MTU writes, text replies are never held, 5 ms bound\n");
+    if (!g_have_vol) {
+        CHECK(0, "no exFAT test image (make test-bt-xrec passes one)");
+        return;
+    }
+    /* (a) 30000 B in 640 B chunks (47 frames, 30564 B): every write is 990 B but the last; the ring wrap (8192 is not
+     * a multiple of 990) never cuts one; no hold times out (the clock does not move) */
+    mocks_reset();
+    m_vol = &g_vol;
+    m_peer_mtu = 990u;
+    bring_up();
+    CHECK(m_spp_cfg.tx_buffer_size == 3960u, "BTC ring 4 x 990 (%u)", (unsigned)m_spp_cfg.tx_buffer_size);
+    pair_and_auth();
+    btc_drain(H1, m_btc_used, 1000u);   /* the OK,PAIR reply: an empty in-flight window */
+    bt_xrec_poll();
+    bt_xrec_bench_tput_snap_t x0, x;
+    bt_xrec_bench_tput_snap(&x0);
+    CHECK(x0.tx_size == 8192u && x0.inflight_cap == 3960u, "TX ring %u, in-flight cap %u", (unsigned)x0.tx_size,
+          (unsigned)x0.inflight_cap);
+    wire_clear();
+    uint32_t t0 = m_now;
+    rx(H1, "+XREC:GETS,0,30000,640,CO.wav\r\n");
+    CHECK(m_wlen_n == 4u && dbg().inflight == 3960u && co_all_len(0u, 4u, 990u),
+          "first poll: 4 full writes fill the in-flight window (%u writes, inflight %u)", (unsigned)m_wlen_n,
+          (unsigned)dbg().inflight);
+    co_drain_all(990u);
+    CHECK(m_now == t0, "no clock advance");
+    CHECK(check_gets_frames(0u, 30000u) == 0, "30000 B of GETS frames intact and in order (%d)",
+          check_gets_frames(0u, 30000u));
+    CHECK(m_wire_len == 30564u && m_wlen_n == 31u, "31 writes for 30564 B (%u writes, %u B)", (unsigned)m_wlen_n,
+          (unsigned)m_wire_len);
+    CHECK(co_all_len(0u, m_wlen_n - 1u, 990u) && m_wlen[m_wlen_n - 1u] == 30564u - 30u * 990u,
+          "all writes 990 B, the last %u B", (unsigned)m_wlen[m_wlen_n - 1u]);
+    bt_xrec_bench_tput_snap(&x);
+    CHECK(x.wr_wrap == x0.wr_wrap && x.co_forced == x0.co_forced && x.co_waits > x0.co_waits,
+          "no wrap cut, no forced write, short writes held (%u holds)", (unsigned)(x.co_waits - x0.co_waits));
+
+    /* (b) a write the in-flight cap shortens (BTC reported 300 B) is held for more room, at most 5 ms */
+    wire_clear();
+    rx(H1, "+XREC:GETS,0,30000,640,CO.wav\r\n");
+    CHECK(m_wlen_n == 4u && dbg().inflight == 3960u, "window full again (%u writes)", (unsigned)m_wlen_n);
+    btc_drain(H1, 300u, 300u);
+    bt_xrec_poll();
+    CHECK(m_wlen_n == 4u && dbg().inflight == 3660u, "300 B of room: no 300 B write yet (%u writes)",
+          (unsigned)m_wlen_n);
+    m_now += BT_XREC_COALESCE_MS - 1u;
+    bt_xrec_poll();
+    CHECK(m_wlen_n == 4u, "still held after %u ms (%u writes)", BT_XREC_COALESCE_MS - 1u, (unsigned)m_wlen_n);
+    m_now += 1u;
+    bt_xrec_poll();
+    CHECK(m_wlen_n == 5u && m_wlen[4] == 300u, "after %u ms the short write goes out (%u writes, last %u)",
+          BT_XREC_COALESCE_MS, (unsigned)m_wlen_n, (unsigned)m_wlen[m_wlen_n - 1u]);
+    co_drain_all(990u);
+    CHECK(check_gets_frames(0u, 30000u) == 0, "stream intact around the forced write (%d)",
+          check_gets_frames(0u, 30000u));
+    CHECK(co_all_len(5u, m_wlen_n - 1u, 990u), "full writes again after it");
+    bt_xrec_bench_tput_snap(&x0);
+    CHECK(x0.co_forced == x.co_forced + 1u, "one forced write (%u)", (unsigned)(x0.co_forced - x.co_forced));
+
+    /* (c) text replies are never held: the same in-flight shortfall, LOG replies -> written at once */
+    wire_clear();
+    for (int k = 0; k < 8; k++) {
+        char cmd[48];
+        snprintf(cmd, sizeof(cmd), "+XREC:LOG,%u,512\r\n", (unsigned)(k * 512));
+        rx(H1, cmd);
+    }
+    CHECK(dbg().inflight == 3960u && dbg().tx_used > 300u, "8 LOG replies (one write each): window full, %u B queued",
+          (unsigned)dbg().tx_used);
+    uint32_t left = dbg().tx_used, nw = m_wlen_n;
+    t0 = m_now;
+    btc_drain(H1, 300u, 300u);
+    bt_xrec_poll();
+    CHECK(m_now == t0 && m_wlen_n == nw + 1u && m_wlen[nw] == 300u && dbg().tx_used == left - 300u,
+          "reply bytes go out at once on 300 B of room (%u writes, %u left)", (unsigned)m_wlen_n,
+          (unsigned)dbg().tx_used);
+    co_drain_all(990u);
+    CHECK(check_log_frames(0u, 8) == 0, "8 LOG replies intact (%d)", check_log_frames(0u, 8));
+    wire_clear();
+    rx(H1, "+XREC:PING\r\n");
+    CHECK(m_now == t0 && m_wlen_n == 1u && m_wlen[0] < 990u && wire_has("+XREC:PONG"),
+          "PONG written in the same poll, no wait (%u writes)", (unsigned)m_wlen_n);
+    stop_ok();
+
+    /* (d) a 660 B peer MTU: writes of one RFCOMM frame = 660 B, never 990 B that BTC would split */
+    mocks_reset();
+    m_vol = &g_vol;
+    m_peer_mtu = 660u;
+    bring_up();
+    pair_and_auth();
+    wire_clear();
+    rx(H1, "+XREC:GETS,1000,20000,640,CO.wav\r\n");
+    co_drain_all(660u);
+    CHECK(check_gets_frames(1000u, 20000u) == 0, "MTU 660: frames intact (%d)", check_gets_frames(1000u, 20000u));
+    CHECK(m_write_max == 660u && co_all_len(0u, m_wlen_n - 1u, 660u), "MTU 660: all writes 660 B but the last "
+          "(max %u, %u writes)", (unsigned)m_write_max, (unsigned)m_wlen_n);
+    stop_ok();
+
+    /* (e) bench coalesce=0 (the pre-2026-11-26 path): one write per frame, cut at the ring wrap */
+    mocks_reset();
+    m_vol = &g_vol;
+    m_peer_mtu = 990u;
+    bt_xrec_bench_tput_t old = { BT_XREC_WRITE_MAX, 2048u, 2048u, 0u };
+    bt_xrec_set_bench_tput(&old);
+    bring_up();
+    pair_and_auth();
+    wire_clear();
+    bt_xrec_bench_tput_snap(&x0);
+    rx(H1, "+XREC:GETS,0,30000,640,CO.wav\r\n");
+    co_drain_all(990u);
+    bt_xrec_bench_tput_snap(&x);
+    CHECK(check_gets_frames(0u, 30000u) == 0, "coalesce=0: frames intact (%d)", check_gets_frames(0u, 30000u));
+    CHECK(x.wr_wrap > x0.wr_wrap && x.co_waits == x0.co_waits && m_wlen_n > 31u,
+          "coalesce=0: writes cut at the wrap (%u), never held, more writes (%u)", (unsigned)(x.wr_wrap - x0.wr_wrap),
+          (unsigned)m_wlen_n);
+    stop_ok();
+}
+
 int main(int argc, char **argv)
 {
-    m_verbose = argc > 1 && strcmp(argv[1], "-v") == 0;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-v") == 0) {
+            m_verbose = 1;
+        } else if (strcmp(argv[i], "--exfat-img") == 0 && i + 1 < argc) {
+            g_have_vol = co_volume(argv[++i]) == 0;
+            if (!g_have_vol) {
+                printf("cannot use the exFAT image %s\n", argv[i]);
+                return 2;
+            }
+        }
+    }
     t_ssp_auto_accept();                  /* the release default (C2 / A8) */
     bt_xrec_set_ssp_auto_accept(0);       /* the tests below exercise the local prompt (policy off) */
     t_bring_up_config();
@@ -2243,6 +2480,7 @@ int main(int argc, char **argv)
     t_session6_name_and_link();
     t_session6_review();
     t_bench_tput();
+    t_coalesce();
     bt_xrec_test_reset();
     printf("test_bt_xrec: %d checks, %d failures\n", g_checks, g_fails);
     return g_fails == 0 ? 0 : 1;

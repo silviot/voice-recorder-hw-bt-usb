@@ -22,6 +22,7 @@
 #include "sl6801_regs.h"
 #include "openfw.h"
 #include "openfw_ui.h"
+#include "openfw_bt_ui_pace.h"            /* BT phone-mode screen pacing (pure, host-tested in test_core) */
 #include "ui/ui_port.h"
 #include "openfw_exp.h"
 #include "openfw_wav.h"
@@ -1592,6 +1593,7 @@ static void run_bt_xrec_mode(void)
 #endif
 
     uint32_t last_ui     = 0u;
+    uint32_t last_chg    = 0u;
     uint32_t prev_rx     = 0u;
     uint32_t prev_tx     = 0u;
     uint8_t  prev_acl    = 0u;
@@ -1643,6 +1645,7 @@ static void run_bt_xrec_mode(void)
             while (keys_pop_event(&kev)) {
                 if (kev.pressed) {
                     backlight_wake(kev.t_ms);
+                    last_ui = 0u;        /* a key redraws at once, whatever the pacing (bt_ui_due) */
 #if OPENFW_BT_PROMPT
                     /* A pairing prompt is up: ENTER accepts, BACK rejects (and does not leave BT mode); a key in its
                      * first 0.5 s (-2) or within 1 s after it ended by itself or was answered (-3) is swallowed. */
@@ -1680,12 +1683,14 @@ static void run_bt_xrec_mode(void)
         }
 #endif
         BT_PROF_T(pf_ui);
-        if (((uint32_t)(now - last_ui) >= 150u || last_ui == 0u) && !BT_BENCH_UI_ON()) {
-            last_ui = now;                   /* bench ui=0: charge management only, no telemetry/status/render */
+        if ((uint32_t)(now - last_chg) >= BT_UI_PERIOD_MS || last_chg == 0u) {
+            last_chg = now;                  /* charge management keeps its 150 ms tick whatever the screen does */
             pmu_poll_charge_manage();
-        } else if ((uint32_t)(now - last_ui) >= 150u || last_ui == 0u) {
+        }
+        /* UI block: every 150 ms, every 500 ms while a transfer is shown, at once after a key (openfw_bt_ui_pace.h);
+         * bench ui=0 skips it (charge management only) */
+        if (BT_BENCH_UI_ON() && bt_ui_due(now, last_ui, g_ui.bt_state)) {
             last_ui = now;
-            pmu_poll_charge_manage();
 
             bt_status_t st;
             bt_xrec_get_status(&st);
@@ -1742,7 +1747,7 @@ static void run_bt_xrec_mode(void)
             }
 
             refresh_telemetry();
-            if (show_bt && !g_screen_off) {
+            if (bt_ui_render_ok(show_bt, g_screen_off != SCREEN_AWAKE, g_fade_out_reason != SCREEN_AWAKE)) {
                 ui_render_screen(UI_SCR_BT, &g_ui);
             }
         }

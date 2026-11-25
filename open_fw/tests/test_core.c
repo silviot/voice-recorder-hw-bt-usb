@@ -11,6 +11,7 @@
 #include <string.h>
 
 #include "openfw_apmem.h"
+#include "openfw_bt_ui_pace.h"
 #include "openfw_crypto.h"
 #include "openfw_cwx.h"
 #include "openfw_fs.h"
@@ -3205,6 +3206,26 @@ static void test_xrec_session(void)
     printf("  [PASS] xrec session (auth/LS/DEL/GET/GETS credit stall + cache/small-MTU/PUT/OTA/EXP/LOG/CAS/DFU/RTC/STAT/DSP)\n");
 }
 
+/* BT phone-mode screen pacing (src/main.c run_bt_xrec_mode, openfw_bt_ui_pace.h) */
+static void test_bt_ui_pace(void)
+{
+    printf("Testing BT screen pacing...\n");
+    /* forced: first pass / key press / prompt answer, whatever the state and clock */
+    assert(bt_ui_due(1000u, 0u, 0u) && bt_ui_due(1000u, 0u, 2u) && bt_ui_due(0u, 0u, 2u));
+    /* idle / connected: every 150 ms */
+    assert(!bt_ui_due(1149u, 1000u, 0u) && bt_ui_due(1150u, 1000u, 0u));
+    assert(!bt_ui_due(1149u, 1000u, 1u) && bt_ui_due(1150u, 1000u, 1u));
+    /* transfer shown: every 500 ms, so the progress still moves twice a second */
+    assert(!bt_ui_due(1150u, 1000u, 2u) && !bt_ui_due(1499u, 1000u, 2u) && bt_ui_due(1500u, 1000u, 2u));
+    /* millis() wrap */
+    assert(!bt_ui_due(0xF3u, 0xFFFFFF00u, 2u) && bt_ui_due(0xF4u, 0xFFFFFF00u, 2u));   /* 499 / 500 ms elapsed */
+    assert(!bt_ui_due(0x55u, 0xFFFFFFC0u, 1u) && bt_ui_due(0x56u, 0xFFFFFFC0u, 1u));   /* 149 / 150 ms elapsed */
+    /* render only when shown, on, and not fading out */
+    assert(bt_ui_render_ok(1, 0, 0));
+    assert(!bt_ui_render_ok(0, 0, 0) && !bt_ui_render_ok(1, 1, 0) && !bt_ui_render_ok(1, 0, 1));
+    assert(!bt_ui_render_ok(0, 1, 1));
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 3 && strcmp(argv[1], "--exfat-img") == 0) {
@@ -3232,6 +3253,7 @@ int main(int argc, char **argv)
     test_usb_msc_vendor_e0();
     test_xrec_flow_control();
     test_xrec_session();
+    test_bt_ui_pace();
     printf("All open_fw host unit tests PASSED!\n");
     return 0;
 }

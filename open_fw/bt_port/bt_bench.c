@@ -56,7 +56,7 @@ void bt_bench_cfg_default(bt_bench_cfg_t *cfg)
     }
     cfg->ui = 1u;
     cfg->smp = 1u;
-    cfg->coalesce = 0u;
+    cfg->coalesce = BT_BENCH_COALESCE_DEF;
     cfg->spp_wr = BT_BENCH_SPP_WR_DEF;
     cfg->spp_buf = BT_BENCH_SPP_BUF_DEF;
     cfg->tx_ring = BT_BENCH_TX_RING_DEF;

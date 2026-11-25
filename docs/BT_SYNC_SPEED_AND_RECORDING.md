@@ -44,7 +44,27 @@ A second, smaller cost on every sync start: `STAT` scans the whole exFAT allocat
 | F5 | FW+app: negotiated frames up to `mtu-12` (978 B) | +3–8 % | +3–8 % |
 | — | Ceiling | **90 KB/s** | **~160–180 KB/s** |
 
-A1 alone gives most of the gain, needs **no firmware change** and works with every open_fw build. While the recorder records, sync is deliberately paced (section 2.4). Recording produces 32 KB/s mono and 64 KB/s stereo, so a paced sync still keeps up. Today's ~60 KB/s would barely keep up with stereo.
+**Measured on silicon (2026-11-26, Pixel 8, 64 KiB windows = A1; `docs/BT_SYNC_THROUGHPUT.md` section 6), KB = 1000 B:**
+
+| Firmware TX path | Measured | Note |
+|---|---|---|
+| 2 KiB TX ring, 2 KiB BTC ring, one write per frame (cut at the ring wrap), 150 ms UI | **38.4-39.4 KB/s** | ~545 B ACL packets; A1 alone did not reach the ~85 KB/s above |
+| same, BT screen block skipped (bench `ui=0`) | 42-43 KB/s | the UI block shares the app task with the GETS producer |
+| **F2 + coalesced 990 B writes** (8 KiB ring, 3960 B BTC ring) | **51-58 KB/s** | ~860 B ACL packets |
+| F2 + coalesced + no UI block | 55-57 KB/s | upper bound of the default image (UI paced to 500 ms during a transfer) |
+| 8 ACL credits instead of 4 | no change | air-limited, not credit-limited |
+
+Since `feat/sync-throughput-defaults` the coalesced path and the paced UI are the default of every BT=1 image
+(expected ~55 KB/s, to be confirmed on silicon). The link behaves like **basic rate** (NOCP latency grows ~10-12 ms
+per ~860 B packet, matching three DH5 baseband packets with the master's polls), so the "If EDR on air" column is not
+what the Pixel gets today. **EDR is the next lever** (`docs/BT_SYNC_THROUGHPUT.md` section 7): the device is the slave,
+the Pixel as master picks the packet types, `040F` is gated (the ROM fails any set but its own), and whether
+`LMP_packet_type_table_req` happens is not visible to the host; it needs a Pixel HCI snoop, ROM LMP/LC reverse
+engineering for the packet-type state, and only then a decision on a `040F` path or clearing the EDR feature bits.
+
+A1 was expected to give most of the gain with **no firmware change**. Measured, it did not on its own (39 KB/s, below
+the 53-67 KB/s of 3840 B stop-and-wait bursts): a continuous stream exposed the small-frame TX path, which the table
+above fixes in firmware. A1 still works with every open_fw build. While the recorder records, sync is deliberately paced (section 2.4). Recording produces 32 KB/s mono and 64 KB/s stereo, so a paced sync still keeps up. Today's ~60 KB/s would barely keep up with stereo.
 
 ---
 

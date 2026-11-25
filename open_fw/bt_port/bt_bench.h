@@ -30,14 +30,17 @@
  * Example: "secs=180 pair=1 pair_every=60 autoconfirm=1 xrec_pin=246810 exit=auto"
  *
  * Phone-mode throughput keys (sync-throughput investigation, docs/BT_SYNC_THROUGHPUT.md; refused with mode=hp):
- *   ui=0|1         default 1: 0 skips the BT screen's 150 ms block (telemetry, status, render) during the run
+ * Defaults = the release TX path since 2026-11-26 (coalesce=1 spp_buf=3960 tx_ring=8192); the pre-2026-11-26 path
+ * for A/B is "coalesce=0 spp_buf=2048 tx_ring=2048".
+ *   ui=0|1         default 1: 0 skips the BT screen's UI block (telemetry, status, render) during the run
  *   smp=0|1        default 1: the 2 ms TX-path sampler behind "BENCH tq" (0 = off, to A/B its own cost)
- *   coalesce=0|1   default 0: send only full spp_wr writes while a GETS keeps producing (staged copy, no wrap cut)
+ *   coalesce=0|1   default 1: send only full spp_wr writes while a GETS keeps producing (staged copy, no wrap cut);
+ *                  0 = one write per frame, cut at the ring wrap
  *   spp_wr=N       64..990, default 990: largest esp_spp_write() (one RFCOMM frame at most)
- *   spp_buf=N      spp_wr..9900, default 2048: BTC TX ring (esp_spp_cfg_t.tx_buffer_size) and the in-flight cap
- *   tx_ring=N      2048|4096|8192, default 2048: the session's TX ring (bench images allocate 8192)
+ *   spp_buf=N      spp_wr..9900, default 3960: BTC TX ring (esp_spp_cfg_t.tx_buffer_size) and the in-flight cap
+ *   tx_ring=N      2048|4096|8192, default 8192: the session's TX ring
  *   stat_secs=N    10..300, default 30: period of the status line group (status, ctrl stats, tp, tq, tl)
- * Example: "secs=240 stat_secs=60 coalesce=1 spp_buf=3960 tx_ring=8192"
+ * Example: "secs=240 stat_secs=60 coalesce=0 spp_buf=2048 tx_ring=2048"
  *
  * Headphones mode (docs/BT_A2DP_DESIGN.md §10.2, Exp 4.0-4d; parsed and checked here, run by the headphones bench
  * session; an image without that session refuses mode=hp in bt_bench_boot()):
@@ -97,10 +100,11 @@
 #define BT_BENCH_PAIR_SECS_DEF 60u
 #define BT_BENCH_STATUS_MS     30000u         /* "BENCH status" line period while BT mode runs (stat_secs default) */
 #define BT_BENCH_SPP_WR_DEF    990u           /* = BT_XREC_WRITE_MAX */
-#define BT_BENCH_SPP_BUF_DEF   2048u          /* = BT_XREC_SPP_TX_BUF */
+#define BT_BENCH_SPP_BUF_DEF   3960u          /* = BT_XREC_SPP_TX_BUF */
 #define BT_BENCH_SPP_BUF_MIN   100u           /* ESP_SPP_MIN_TX_BUFFER_SIZE */
 #define BT_BENCH_SPP_BUF_MAX   9900u          /* ESP_SPP_MAX_TX_BUFFER_SIZE */
-#define BT_BENCH_TX_RING_DEF   2048u          /* = BT_XREC_TX_RING */
+#define BT_BENCH_TX_RING_DEF   8192u          /* = BT_XREC_TX_RING */
+#define BT_BENCH_COALESCE_DEF  1u             /* = the release TX path (bt_xrec_bluedroid.c tx_kick) */
 
 #define BT_BENCH_MODE_PHONE    0u
 #define BT_BENCH_MODE_HP       1u

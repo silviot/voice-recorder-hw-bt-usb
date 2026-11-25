@@ -192,12 +192,12 @@ static void test_parse_tput(void)
 {
     bt_bench_cfg_t c;
     uint32_t at = 0u;
-    CHECK(parse("", &c, NULL) == BT_BENCH_OK && c.ui == 1u && c.smp == 1u && c.coalesce == 0u && c.spp_wr == 990u &&
-          c.spp_buf == 2048u && c.tx_ring == 2048u && c.stat_secs == 30u, "tput defaults = release constants");
-    CHECK(parse("secs=240 ui=0 smp=0 coalesce=1 spp_wr=660 spp_buf=3960 tx_ring=8192 stat_secs=60", &c, &at) ==
+    CHECK(parse("", &c, NULL) == BT_BENCH_OK && c.ui == 1u && c.smp == 1u && c.coalesce == 1u && c.spp_wr == 990u &&
+          c.spp_buf == 3960u && c.tx_ring == 8192u && c.stat_secs == 30u, "tput defaults = release constants");
+    CHECK(parse("secs=240 ui=0 smp=0 coalesce=0 spp_wr=660 spp_buf=2048 tx_ring=2048 stat_secs=60", &c, &at) ==
           BT_BENCH_OK, "all tput keys (at %u)", at);
-    CHECK(c.ui == 0u && c.smp == 0u && c.coalesce == 1u && c.spp_wr == 660u && c.spp_buf == 3960u &&
-          c.tx_ring == 8192u && c.stat_secs == 60u, "all tput keys cfg");
+    CHECK(c.ui == 0u && c.smp == 0u && c.coalesce == 0u && c.spp_wr == 660u && c.spp_buf == 2048u &&
+          c.tx_ring == 2048u && c.stat_secs == 60u, "all tput keys cfg (the pre-2026-11-26 TX path)");
     CHECK(parse("spp_wr=64 spp_buf=100", &c, NULL) == BT_BENCH_OK && c.spp_wr == 64u && c.spp_buf == 100u, "minima");
     CHECK(parse("spp_buf=9900 tx_ring=4096 stat_secs=300", &c, NULL) == BT_BENCH_OK && c.spp_buf == 9900u &&
           c.tx_ring == 4096u && c.stat_secs == 300u, "maxima");

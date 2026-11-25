@@ -26,11 +26,16 @@
 
 /* ---- sizing (plan §4 "SPP mode RFCOMM queues + XREC RX stream buffer", heap, per session) ---- */
 #define BT_XREC_RX_RING        2048u   /* SPP payload not yet parsed by the app (XREC PUT is stop-and-wait, <= ~700 B) */
-#define BT_XREC_TX_RING        2048u   /* bytes accepted from xrec_proto, not yet handed to esp_spp_write() */
-#define BT_XREC_SPP_TX_BUF     2048u   /* esp_spp_cfg_t.tx_buffer_size: BTC's per-connection ring */
+/* TX sizing (docs/BT_SYNC_THROUGHPUT.md, silicon 2026-11-26: 2048/2048 + one write per frame cut at the ring wrap gave
+ * ~39 KB/s with ~545 B ACL packets; 8192 + 3960 + coalesced 990 B writes gave 51-57 KB/s with ~860 B packets). */
+#define BT_XREC_TX_RING        8192u   /* bytes accepted from xrec_proto, not yet handed to esp_spp_write() */
+#define BT_XREC_WRITE_MAX      990u    /* one esp_spp_write() (ESP_SPP_MAX_MTU) = one RFCOMM frame */
+#define BT_XREC_SPP_TX_BUF     (4u * BT_XREC_WRITE_MAX)  /* esp_spp_cfg_t.tx_buffer_size: BTC's ring, 4 whole writes */
 #define BT_XREC_INFLIGHT_MAX   BT_XREC_SPP_TX_BUF  /* written but not yet reported by ESP_SPP_WRITE_EVT */
-#define BT_XREC_WRITE_MAX      990u    /* one esp_spp_write() (ESP_SPP_MAX_MTU) */
-#define BT_XREC_BENCH_TX_RING_MAX 8192u   /* bench images: TX ring allocated for bt_xrec_set_bench_tput() */
+/* Coalescing: while a GETS stream keeps producing, a write shorter than BT_XREC_WRITE_MAX waits for more frames, at
+ * most this long (app-task ms clock, so 5-6 ms). Text replies (anything but a GETS data frame) are never held. */
+#define BT_XREC_COALESCE_MS    5u
+#define BT_XREC_BENCH_TX_RING_MAX BT_XREC_TX_RING   /* bench images: largest TX ring bt_xrec_set_bench_tput() takes */
 #define BT_XREC_EVQ_SLOTS      32u     /* GAP/SPP event records (DATA/WRITE coalesce, so this only holds control events) */
 #define BT_XREC_SPP_SCN        1u      /* RFCOMM channel 1: tools/bt_sync.py connects to it directly (no SDP) */
 #define BT_XREC_SPP_NAME       "Cassini"  /* legacy SDP ServiceName (src/bt_spp.c:352) */
@@ -120,10 +125,10 @@ typedef struct {
 void bt_xrec_get_debug(bt_xrec_debug_t *out);
 
 /* ---- BENCH images only (make BT=1 BENCH=1; SD:/BTBENCH.RUN phone keys, docs/BT_SYNC_THROUGHPUT.md) ----
- * TX path knobs for the sync-throughput A/B runs. Defaults = the release constants. Set before the SPP connection
- * (bt_bench_begin, right after bt_xrec_start): refused while TX data is queued. wr_max 64..990, spp_buf wr_max..9900
- * (BTC ring and in-flight cap), tx_ring 2048/4096/8192, coalesce 0|1 (send only full wr_max writes while a GETS keeps
- * producing). NULL restores the defaults. App task. */
+ * TX path knobs for the sync-throughput A/B runs. Defaults = the release behaviour (990, 3960, 8192, coalesce 1). Set
+ * before the SPP connection (bt_bench_begin, right after bt_xrec_start): refused while TX data is queued. wr_max
+ * 64..990, spp_buf wr_max..9900 (BTC ring and in-flight cap), tx_ring 2048/4096/8192, coalesce 0|1 (0 = the pre-
+ * 2026-11-26 path: one write per frame, cut at the ring wrap, never held). NULL restores the defaults. App task. */
 typedef struct {
     uint16_t wr_max;
     uint16_t spp_buf;

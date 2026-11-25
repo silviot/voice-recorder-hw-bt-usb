@@ -136,7 +136,10 @@ test-bt-xrec:
 		-DOPENFW_BT_BENCH_IMAGE=1 \
 		tests/test_bt_xrec.c bt_port/bt_xrec_bluedroid.c src/xrec_proto.c src/crypto.c src/exfat.c src/bench_meas.c \
 		-o $(BT_XREC_TEST_DIR)/test_bt_xrec
-	$(BT_XREC_TEST_DIR)/test_bt_xrec
+	@# [26] streams GETS windows from a real exFAT volume (coalesced TX path)
+	dd if=/dev/zero of=$(BT_XREC_TEST_DIR)/xrec_tx.img bs=512 count=4096 status=none
+	/usr/sbin/mkfs.exfat -q -b 4096 -c 4096 $(BT_XREC_TEST_DIR)/xrec_tx.img
+	$(BT_XREC_TEST_DIR)/test_bt_xrec --exfat-img $(BT_XREC_TEST_DIR)/xrec_tx.img
 	@# A release BT=1 session (no BENCH=1) must not contain the SD bench overrides (autoconfirm, fixed XREC PIN).
 	$(HOST_CC) $(BT_CTRL_TEST_CFLAGS) $(BT_CTRL_BD_DEFS) $(BT_CTRL_BD_INCS) -c bt_port/bt_xrec_bluedroid.c \
 		-o $(BT_XREC_TEST_DIR)/bt_xrec_release.o

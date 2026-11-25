@@ -41,6 +41,7 @@ _Static_assert(BT_XREC_TX_RING >= XREC_REPLY_MAX, "RX flow control waits for thi
 _Static_assert(BT_XREC_SPP_TX_BUF >= ESP_SPP_MIN_TX_BUFFER_SIZE && BT_XREC_SPP_TX_BUF <= ESP_SPP_MAX_TX_BUFFER_SIZE,
                "esp_spp_cfg_t.tx_buffer_size range");
 _Static_assert(BT_XREC_WRITE_MAX <= BT_XREC_SPP_TX_BUF, "a write must fit BTC's ring");
+_Static_assert(BT_XREC_TX_RING >= BT_XREC_WRITE_MAX, "a coalesced write is staged from at most one ring's worth");
 
 /* ---- event records (BTC -> app). DATA and WRITE coalesce with the newest record of the same kind and handle. ---- */
 enum {
@@ -57,20 +58,13 @@ typedef struct {
     uint32_t val;          /* DATA/WRITE: bytes; CFM_REQ: number; SRV_OPEN: peer MTU */
 } ev_t;
 
-/* Bench images allocate the largest TX ring bt_xrec_set_bench_tput() can select, plus a staging buffer for
- * coalesced writes (docs/BT_SYNC_THROUGHPUT.md); a release image keeps BT_XREC_TX_RING and no staging buffer. */
-#if BENCH_IMAGE
-#define TX_RING_ALLOC BT_XREC_BENCH_TX_RING_MAX
-#else
-#define TX_RING_ALLOC BT_XREC_TX_RING
-#endif
+/* stage: a coalesced write that crosses the TX ring wrap is copied here, so the wrap never cuts a write
+ * (docs/BT_SYNC_THROUGHPUT.md). Bench images may select a smaller ring (bt_xrec_set_bench_tput), never a larger one. */
 typedef struct {
     xrec_ctx_t xrec;
     uint8_t    rx[BT_XREC_RX_RING];
-    uint8_t    tx[TX_RING_ALLOC];
-#if BENCH_IMAGE
+    uint8_t    tx[BT_XREC_TX_RING];
     uint8_t    stage[BT_XREC_WRITE_MAX];
-#endif
 } bufs_t;
 
 typedef struct {
@@ -151,6 +145,9 @@ static struct {
     uint8_t  conn_bda[6];
     uint16_t mtu;
     uint32_t tx_head, tx_tail, inflight;
+    uint32_t tx_urgent;         /* ring position (like tx_head) up to which bytes go out unheld: text replies */
+    uint8_t  co_holding;        /* a short write is being held for coalescing since co_t0 (ms) */
+    uint32_t co_t0;
     /* deferred reboot */
     uint8_t  reboot_mode;
     uint32_t reboot_at;
@@ -170,16 +167,21 @@ static volatile uint8_t s_bench_autoconfirm;   /* BENCH ONLY (bt_xrec_set_bench_
 static char s_bench_pin[8];                     /* BENCH ONLY (bt_xrec_set_bench_xrec_pin): "" = DRBG PIN; app task */
 /* BENCH ONLY (bt_xrec_set_bench_tput): TX path knobs of the sync-throughput investigation; defaults = release. */
 static bt_xrec_bench_tput_t s_bench_tput = {
-    BT_XREC_WRITE_MAX, BT_XREC_SPP_TX_BUF, BT_XREC_TX_RING, 0u,
+    BT_XREC_WRITE_MAX, BT_XREC_SPP_TX_BUF, BT_XREC_TX_RING, 1u,
 };
-static uint32_t (*volatile s_bench_clock_us)(void);   /* BENCH ONLY: xrec_poll timing, coalesce wait bound */
+static uint32_t (*volatile s_bench_clock_us)(void);   /* BENCH ONLY: xrec_poll timing */
 static volatile uint8_t s_bench_gets;                 /* xrec_proto has a GETS stream running (app task writes) */
 static uint32_t s_bench_xrec_us, s_bench_xrec_n, s_bench_co_waits, s_bench_co_forced, s_bench_wr_wrap;
-static uint32_t s_bench_co_t0;                        /* clock when the current coalesce wait began (0 = none) */
 #define TXSZ ((uint32_t)s_bench_tput.tx_ring)
+#define TX_WR_MAX ((uint32_t)s_bench_tput.wr_max)
+#define TX_COALESCE (s_bench_tput.coalesce != 0u)
+#define BENCH_CNT(v) ((v)++)
 #endif
 #if !BENCH_IMAGE
 #define TXSZ BT_XREC_TX_RING
+#define TX_WR_MAX BT_XREC_WRITE_MAX
+#define TX_COALESCE true
+#define BENCH_CNT(v) ((void)0)
 #endif
 static volatile uint8_t s_spp_init_posted;
 
@@ -551,7 +553,8 @@ static void fault(uint32_t reason);
 
 static void tx_drop(void)
 {
-    s.tx_head = s.tx_tail = 0u;
+    s.tx_head = s.tx_tail = s.tx_urgent = 0u;
+    s.co_holding = 0u;
 }
 
 /* Disconnect cancels pending work and clears XREC authorization (plan M4), immediately, before Bluedroid's CLOSE.
@@ -641,6 +644,36 @@ static void conn_reset(void)
     tx_drop();
 }
 
+/* Coalescing (docs/BT_SYNC_THROUGHPUT.md): hold a write of n < wr_max bytes while it is worth waiting for more.
+ * - never while text replies are queued (tx_urgent ahead of tx_tail: PONG, OK, STAT, LS lines, ERR go out at once);
+ * - while a GETS stream keeps producing (the producer still has room for a frame): xo_send kicks again per frame;
+ * - while the in-flight cap, not the ring, made the write short: the next ESP_SPP_WRITE_EVT frees room;
+ * - at most BT_XREC_COALESCE_MS, then the short write goes out anyway.
+ * Every RFCOMM frame is then as large as possible: fewer ACL packets, RFCOMM credits and Bluedroid task hops per byte. */
+static bool tx_hold(uint32_t n, uint32_t used)
+{
+    if ((int32_t)(s.tx_urgent - s.tx_tail) > 0) {
+        return false;
+    }
+    const xrec_ctx_t *x = &s.b->xrec;
+    bool more = x->gets_active && TXSZ - used >= 12u + (uint32_t)x->gets_chunk_max;
+    bool capped = n < used && s.inflight > 0u;   /* the in-flight cap (not the ring) made the write short */
+    if (!more && !capped) {
+        return false;
+    }
+    uint32_t now = bt_xrec_plat_now_ms();
+    if (!s.co_holding) {
+        s.co_holding = 1u;
+        s.co_t0 = now;
+    }
+    if (now - s.co_t0 < BT_XREC_COALESCE_MS) {
+        BENCH_CNT(s_bench_co_waits);
+        return true;             /* xo_send / the next poll / ESP_SPP_WRITE_EVT kicks again */
+    }
+    BENCH_CNT(s_bench_co_forced);
+    return false;
+}
+
 /* Hand queued bytes to esp_spp_write() while BTC accepts them. Every result is checked: ESP_ERR_NO_MEM = BTC ring
  * full (congested until ESP_SPP_CONG_EVT), anything else = the connection is gone or broken. */
 static void tx_kick(void)
@@ -648,16 +681,13 @@ static void tx_kick(void)
     while (s.conn_open && !s.conn_closing && !s.cong && s.tx_head != s.tx_tail) {
         uint32_t used = s.tx_head - s.tx_tail;
         uint32_t off = s.tx_tail & (TXSZ - 1u);
-        uint32_t n = TXSZ - off;
-#if BENCH_IMAGE
-        uint32_t wr_max = s_bench_tput.wr_max;
-        uint8_t co = s_bench_tput.coalesce;
-        if (co) {
-            n = used;                 /* staged copy below: the ring wrap does not split a write */
+        const bool co = TX_COALESCE;
+        /* one write = one RFCOMM frame: at most the peer's RFCOMM MTU (BTC would split a longer one into MTU pieces) */
+        uint32_t wr_max = TX_WR_MAX;
+        if (s.mtu != 0u && s.mtu < wr_max) {
+            wr_max = s.mtu;
         }
-#else
-        const uint32_t wr_max = BT_XREC_WRITE_MAX;
-#endif
+        uint32_t n = co ? used : TXSZ - off;   /* coalesced writes are staged across the ring wrap, never cut by it */
         if (n > used) {
             n = used;
         }
@@ -674,45 +704,26 @@ static void tx_kick(void)
         if (n == 0u) {
             return;              /* resumes on ESP_SPP_WRITE_EVT */
         }
-        const uint8_t *src = &s.b->tx[off];
+        if (co && n < wr_max && tx_hold(n, used)) {
+            return;
+        }
 #if BENCH_IMAGE
         if (!co && n < used && n == TXSZ - off) {
-            s_bench_wr_wrap++;   /* a write cut short by the ring wrap */
+            s_bench_wr_wrap++;   /* a write cut short by the ring wrap (coalesce=0) */
         }
-        if (co) {
-            /* Coalesce (bench knob): send full wr_max writes while more GETS data is coming, so every RFCOMM frame is
-             * as large as possible. A shorter write goes out when the producer is idle or blocked (ring full), or after
-             * 5 ms (clock only); an in-flight cap shortfall waits for the next ESP_SPP_WRITE_EVT. */
-            uint32_t (*clk)(void) = s_bench_clock_us;
-            if (n < wr_max) {
-                bool more = s_bench_gets && s.b->xrec.gets_active && TXSZ - used >= 12u + XREC_MAX_CHUNK;
-                bool capped = n < used && s.inflight > 0u;
-                if (more || capped) {
-                    uint32_t now = clk != NULL ? clk() : 0u;
-                    if (clk == NULL || s_bench_co_t0 == 0u || now - s_bench_co_t0 < 5000u) {
-                        if (s_bench_co_t0 == 0u && clk != NULL) {
-                            s_bench_co_t0 = now != 0u ? now : 1u;
-                        }
-                        s_bench_co_waits++;
-                        return;      /* xo_send / the next poll / ESP_SPP_WRITE_EVT kicks again */
-                    }
-                    s_bench_co_forced++;
-                }
-            }
-            s_bench_co_t0 = 0u;
+#endif
+        const uint8_t *src = &s.b->tx[off];
+        if (n > TXSZ - off) {    /* only a coalesced write crosses the wrap */
             uint32_t first = TXSZ - off;
-            if (first > n) {
-                first = n;
-            }
             memcpy(s.b->stage, &s.b->tx[off], first);
             memcpy(&s.b->stage[first], &s.b->tx[0], n - first);
             src = s.b->stage;
         }
-#endif
         esp_err_t r = esp_spp_write(s.conn_handle, (int)n, (uint8_t *)src);
         if (r == ESP_OK) {       /* BTC copied the bytes into its ring (btc_spp.c esp_spp_write CB mode) */
             s.tx_tail += n;
             s.inflight += n;
+            s.co_holding = 0u;
             s.d.tx_writes++;
             s.d.tx_bytes += n;
         } else if (r == ESP_ERR_NO_MEM) {
@@ -754,6 +765,9 @@ static int xo_send(void *user, const uint8_t *data, uint16_t len)
     memcpy(&s.b->tx[off], data, first);
     memcpy(&s.b->tx[0], data + first, (size_t)len - first);
     s.tx_head += len;
+    if (data != s.b->xrec.xfer.gets_frame) {
+        s.tx_urgent = s.tx_head; /* not a GETS data frame: a reply the peer waits for, never held for coalescing */
+    }
     tx_kick();
     return 0;
 }
@@ -2160,7 +2174,7 @@ void bt_xrec_set_bench_autoconfirm(int on)
 
 void bt_xrec_set_bench_tput(const bt_xrec_bench_tput_t *t)
 {
-    bt_xrec_bench_tput_t d = { BT_XREC_WRITE_MAX, BT_XREC_SPP_TX_BUF, BT_XREC_TX_RING, 0u };
+    bt_xrec_bench_tput_t d = { BT_XREC_WRITE_MAX, BT_XREC_SPP_TX_BUF, BT_XREC_TX_RING, 1u };
     if (t != NULL) {
         bool ok = t->wr_max >= 64u && t->wr_max <= BT_XREC_WRITE_MAX &&
                   t->spp_buf >= t->wr_max && t->spp_buf <= ESP_SPP_MAX_TX_BUFFER_SIZE &&
@@ -2175,7 +2189,7 @@ void bt_xrec_set_bench_tput(const bt_xrec_bench_tput_t *t)
         }
     }
     s_bench_tput = d;
-    s_bench_co_t0 = 0u;
+    s.co_holding = 0u;
 }
 
 void bt_xrec_set_bench_clock_us(uint32_t (*now_us)(void))
