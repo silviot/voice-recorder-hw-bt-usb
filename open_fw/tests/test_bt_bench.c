@@ -4,7 +4,9 @@
  *     never runs; bad content is consumed and refused; directories and subdirectories are not requests;
  *   - schedule: pairing windows at the start and every pair_every s, exit after secs (wins over a window), status
  *     lines, a late tick opens one window, millis() wrap;
- *   - log capture from the g_openfw_log ring (wrap, overrun, full buffer, ring reset) and SD:/BTBENCH.LOG.
+ *   - log capture from the g_openfw_log ring (wrap, overrun, full buffer, ring reset) and SD:/BTBENCH.LOG;
+ *   - recording runs: mode=rec, rec=1 with mode=phone and the rec_* / delay_s keys (ranges, conflicts) and the
+ *     recording schedule (pre-roll, READY gate, length, cut at the run end, failed start, stop by itself, wrap).
  * Usage: test_bt_bench <blank exFAT image> (made by mkfs.exfat in make test-bt-port).
  * SPDX-License-Identifier: MIT */
 #include <stdio.h>
@@ -533,6 +535,179 @@ static void test_schedule(void)
 }
 
 /* ---------------------------------------------------------------------------------------------------------------- */
+/* recording runs (docs/BT_HW_RESULTS.md "Sync during recording"): mode=rec, rec=1 with mode=phone, rec_* settings */
+static void test_parse_rec(void)
+{
+    bt_bench_cfg_t c;
+    uint32_t at = 99u;
+    CHECK(parse("", &c, NULL) == BT_BENCH_OK && c.rec == 0u && c.rec_ch == BT_BENCH_REC_KEEP &&
+          c.rec_gain == BT_BENCH_REC_KEEP && c.rec_dsp == BT_BENCH_REC_KEEP && c.rec_vor == BT_BENCH_REC_KEEP &&
+          c.rec_secs == 0u && c.delay_s == 0u, "rec defaults: no recording, current settings");
+    /* mode=rec: the documented example, then the bare form */
+    CHECK(parse("mode=rec secs=75 rec_ch=1 rec_gain=31 rec_dsp=2 rec_vor=0 delay_s=5", &c, &at) == BT_BENCH_OK,
+          "mode=rec example (at %u)", at);
+    CHECK(c.mode == BT_BENCH_MODE_REC && c.secs == 75u && c.rec_ch == 1u && c.rec_gain == 31u && c.rec_dsp == 2u &&
+          c.rec_vor == 0u && c.delay_s == 5u && c.rec == 0u, "mode=rec example cfg");
+    CHECK(parse("MODE=REC", &c, NULL) == BT_BENCH_OK && c.mode == BT_BENCH_MODE_REC && c.secs == 180u &&
+          c.rec_gain == BT_BENCH_REC_KEEP, "mode=rec alone: 180 s, current settings");
+    CHECK(parse("mode=rec secs=10 rec_ch=2 rec_gain=0 rec_dsp=0 rec_vor=1 delay_s=600 reboot=1 exit=auto", &c, NULL) ==
+          BT_BENCH_OK && c.rec_ch == 2u && c.rec_gain == 0u && c.rec_dsp == 0u && c.rec_vor == 1u &&
+          c.delay_s == 600u && c.reboot == 1u, "mode=rec range ends, reboot, exit");
+    CHECK(parse("mode=rec delay_s=0", &c, NULL) == BT_BENCH_OK && c.delay_s == 0u, "delay_s=0");
+    /* phone mode with rec=1 */
+    CHECK(parse("secs=150 rec=1 rec_secs=75 delay_s=10 rec_gain=31 rec_dsp=2 rec_vor=0", &c, &at) == BT_BENCH_OK,
+          "phone rec example (at %u)", at);
+    CHECK(c.mode == BT_BENCH_MODE_PHONE && c.rec == 1u && c.rec_secs == 75u && c.delay_s == 10u && c.rec_gain == 31u &&
+          c.rec_dsp == 2u && c.rec_vor == 0u && c.rec_ch == BT_BENCH_REC_KEEP, "phone rec example cfg");
+    CHECK(parse("mode=phone rec=1", &c, NULL) == BT_BENCH_OK && c.rec == 1u && c.rec_secs == 0u,
+          "rec=1: until the run ends");
+    CHECK(parse("rec=0", &c, NULL) == BT_BENCH_OK && c.rec == 0u, "rec=0 alone");
+    CHECK(parse("secs=85 rec=1 rec_secs=75 delay_s=10", &c, NULL) == BT_BENCH_OK, "delay + length = secs");
+    CHECK(parse("secs=600 pair=1 autoconfirm=1 rec=1 rec_secs=3600", &c, NULL) == BT_BENCH_E_CONFLICT,
+          "rec_secs longer than the run");
+    CHECK(parse("secs=3600 pair=1 autoconfirm=1 rec=1 rec_secs=3600", &c, NULL) == BT_BENCH_OK && c.pair == 1u,
+          "pairing keys with rec=1 (C3p: a phone pairs or syncs during the recording)");
+    CHECK(parse("secs=60 rec=1 delay_s=59", &c, NULL) == BT_BENCH_OK, "delay just inside the run");
+    /* the longest recording request fits the file limit */
+    const char *lng = "mode=phone secs=3600 pair=1 pair_every=600 pair_secs=600 autoconfirm=1 xrec_pin=000000 "
+                      "exit=auto reboot=1 rec=1 rec_secs=3000 rec_ch=2 rec_gain=31 rec_dsp=2 rec_vor=0 delay_s=600";
+    CHECK(strlen(lng) < BT_BENCH_TRIGGER_MAX && parse(lng, &c, &at) == BT_BENCH_OK, "long rec request (at %u)", at);
+
+    static const struct { const char *s; bt_bench_err_t e; } bad[] = {
+        { "mode=record", BT_BENCH_E_VALUE },
+        { "mode=rec mode=rec", BT_BENCH_E_DUP },
+        { "rec=1 mode=hp", BT_BENCH_E_CONFLICT },                    /* the headphones run never records */
+        { "mode=hp rec=0", BT_BENCH_E_CONFLICT },
+        { "mode=hp rec_gain=31", BT_BENCH_E_CONFLICT },
+        { "mode=hp delay_s=5", BT_BENCH_E_CONFLICT },
+        { "mode=hp hp_stage=tone hp_pick=first rec_secs=60", BT_BENCH_E_CONFLICT },
+        { "mode=rec rec=1", BT_BENCH_E_CONFLICT },                   /* the mode records already */
+        { "mode=rec rec_secs=60", BT_BENCH_E_CONFLICT },             /* secs is its length */
+        { "mode=rec pair=1", BT_BENCH_E_CONFLICT },                  /* no Bluetooth this boot */
+        { "mode=rec pair_secs=60", BT_BENCH_E_CONFLICT },
+        { "mode=rec autoconfirm=0", BT_BENCH_E_CONFLICT },
+        { "mode=rec pair=1 xrec_pin=123456", BT_BENCH_E_CONFLICT },
+        { "mode=rec hp_bitpool=35", BT_BENCH_E_CONFLICT },
+        { "rec_gain=31", BT_BENCH_E_CONFLICT },                      /* settings without a recording */
+        { "rec=0 rec_ch=1", BT_BENCH_E_CONFLICT },
+        { "delay_s=5", BT_BENCH_E_CONFLICT },
+        { "rec_secs=60", BT_BENCH_E_CONFLICT },
+        { "rec_vor=0", BT_BENCH_E_CONFLICT },
+        { "rec_dsp=2", BT_BENCH_E_CONFLICT },
+        { "secs=60 rec=1 delay_s=60", BT_BENCH_E_CONFLICT },         /* never starts */
+        { "secs=80 rec=1 rec_secs=75 delay_s=10", BT_BENCH_E_CONFLICT },
+        { "rec=2", BT_BENCH_E_VALUE },
+        { "rec=yes", BT_BENCH_E_VALUE },
+        { "rec=", BT_BENCH_E_VALUE },
+        { "rec=1 rec=1", BT_BENCH_E_DUP },
+        { "rec=1 rec_secs=9", BT_BENCH_E_VALUE },
+        { "rec=1 secs=3600 rec_secs=3601", BT_BENCH_E_VALUE },
+        { "mode=rec rec_ch=0", BT_BENCH_E_VALUE },
+        { "mode=rec rec_ch=3", BT_BENCH_E_VALUE },
+        { "mode=rec rec_ch=stereo", BT_BENCH_E_VALUE },
+        { "mode=rec rec_gain=32", BT_BENCH_E_VALUE },
+        { "mode=rec rec_gain=-1", BT_BENCH_E_VALUE },
+        { "mode=rec rec_dsp=3", BT_BENCH_E_VALUE },
+        { "mode=rec rec_vor=2", BT_BENCH_E_VALUE },
+        { "mode=rec delay_s=601", BT_BENCH_E_VALUE },
+        { "mode=rec delay_s=", BT_BENCH_E_VALUE },
+        { "mode=rec rec_gain=31 rec_gain=20", BT_BENCH_E_DUP },
+        { "mode=rec secs=9", BT_BENCH_E_VALUE },
+        { "mode=rec rec_gian=31", BT_BENCH_E_KEY },
+    };
+    for (size_t i = 0u; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        bt_bench_cfg_default(&c);
+        c.secs = 4321u;
+        bt_bench_err_t e = parse(bad[i].s, &c, &at);
+        CHECK(e == bad[i].e, "rec bad #%zu \"%s\": err %s (want %s)", i, bad[i].s, bt_bench_err_name(e),
+              bt_bench_err_name(bad[i].e));
+        CHECK(c.secs == 4321u, "rec bad #%zu: cfg untouched", i);
+    }
+    /* the hp keys still need mode=hp after the key table grew past 32 */
+    CHECK(parse("hp_pin=1 rec=1", &c, NULL) == BT_BENCH_E_CONFLICT, "hp key with rec=1");
+    CHECK(strcmp(bt_bench_mode_name(BT_BENCH_MODE_REC), "rec") == 0 &&
+          strcmp(bt_bench_mode_name(BT_BENCH_MODE_PHONE), "phone") == 0 &&
+          strcmp(bt_bench_mode_name(BT_BENCH_MODE_HP), "hp") == 0, "mode names");
+}
+
+/* The one recording of a run: pre-roll, length, gate (READY), cut at the run end, a start that fails, a recording
+ * that stops by itself, millis() wrap. */
+static void rec_sched_case(uint32_t t0)
+{
+    bt_bench_rec_t r;
+    /* mode=rec: no gate, 5 s pre-roll, 75 s */
+    bt_bench_rec_init(&r, 5u, 75u, 0, t0);
+    CHECK(r.st == BT_BENCH_REC_PREROLL, "no gate: pre-roll");
+    CHECK(bt_bench_rec_tick(&r, t0, 0) == 0u && bt_bench_rec_tick(&r, t0 + 4999u, 0) == 0u, "pre-roll");
+    CHECK(bt_bench_rec_tick(&r, t0 + 5000u, 0) == BT_BENCH_REC_ACT_START && r.st == BT_BENCH_REC_ON, "start");
+    CHECK(bt_bench_rec_tick(&r, t0 + 5016u, 1) == 0u, "recording");
+    CHECK(bt_bench_rec_tick(&r, t0 + 79999u, 1) == 0u, "not yet");
+    CHECK(bt_bench_rec_tick(&r, t0 + 80000u, 1) == BT_BENCH_REC_ACT_STOP && r.st == BT_BENCH_REC_DONE &&
+          r.why == BT_BENCH_REC_WHY_TIME, "stop at 75 s");
+    CHECK(bt_bench_rec_tick(&r, t0 + 80016u, 1) == 0u && bt_bench_rec_tick(&r, t0 + 90000u, 0) == 0u, "done stays");
+    CHECK(bt_bench_rec_cut(&r, 0) == 0u && r.why == BT_BENCH_REC_WHY_TIME, "cut after done: nothing");
+    /* the start fails (no SD, low battery): the next tick sees it not saving */
+    bt_bench_rec_init(&r, 0u, 75u, 0, t0);
+    CHECK(bt_bench_rec_tick(&r, t0, 0) == BT_BENCH_REC_ACT_START, "start at once");
+    CHECK(bt_bench_rec_tick(&r, t0 + 10u, 0) == 0u && r.st == BT_BENCH_REC_DONE &&
+          r.why == BT_BENCH_REC_WHY_NOSTART, "start failed");
+    /* stops by itself (write error): no STOP */
+    bt_bench_rec_init(&r, 0u, 75u, 0, t0);
+    (void)bt_bench_rec_tick(&r, t0, 0);
+    CHECK(bt_bench_rec_tick(&r, t0 + 1000u, 1) == 0u, "recording");
+    CHECK(bt_bench_rec_tick(&r, t0 + 2000u, 0) == 0u && r.why == BT_BENCH_REC_WHY_ENDED, "ended by itself");
+    /* phone mode: gated on READY, until the run ends (len 0) */
+    bt_bench_rec_init(&r, 10u, 0u, 1, t0);
+    CHECK(r.st == BT_BENCH_REC_GATE, "gated");
+    CHECK(bt_bench_rec_tick(&r, t0 + 60000u, 0) == 0u && r.st == BT_BENCH_REC_GATE, "no start before READY");
+    bt_bench_rec_open(&r, t0 + 7000u);
+    CHECK(r.st == BT_BENCH_REC_PREROLL, "READY: pre-roll");
+    bt_bench_rec_open(&r, t0 + 9000u);
+    CHECK(r.t_gate == t0 + 7000u, "a second open does not move the gate");
+    CHECK(bt_bench_rec_tick(&r, t0 + 16999u, 0) == 0u, "pre-roll from READY");
+    CHECK(bt_bench_rec_tick(&r, t0 + 17000u, 0) == BT_BENCH_REC_ACT_START, "start 10 s after READY");
+    CHECK(bt_bench_rec_tick(&r, t0 + 3600000u, 1) == 0u, "no length: runs on");
+    CHECK(bt_bench_rec_cut(&r, 1) == BT_BENCH_REC_ACT_STOP && r.why == BT_BENCH_REC_WHY_CUT, "cut at the run end");
+    /* rec_secs shorter than the run */
+    bt_bench_rec_init(&r, 0u, 75u, 1, t0);
+    bt_bench_rec_open(&r, t0 + 5000u);
+    CHECK(bt_bench_rec_tick(&r, t0 + 5000u, 0) == BT_BENCH_REC_ACT_START, "start at READY");
+    CHECK(bt_bench_rec_tick(&r, t0 + 80000u, 1) == BT_BENCH_REC_ACT_STOP && r.why == BT_BENCH_REC_WHY_TIME,
+          "75 s after READY");
+    /* the run ends first: before READY, during the pre-roll, with the recorder already stopped */
+    bt_bench_rec_init(&r, 0u, 75u, 1, t0);
+    CHECK(bt_bench_rec_cut(&r, 0) == 0u && r.st == BT_BENCH_REC_DONE && r.why == BT_BENCH_REC_WHY_NOTSTARTED,
+          "never READY");
+    bt_bench_rec_init(&r, 30u, 0u, 1, t0);
+    bt_bench_rec_open(&r, t0);
+    CHECK(bt_bench_rec_cut(&r, 0) == 0u && r.why == BT_BENCH_REC_WHY_NOTSTARTED, "cut in the pre-roll");
+    bt_bench_rec_init(&r, 0u, 0u, 0, t0);
+    (void)bt_bench_rec_tick(&r, t0, 0);
+    (void)bt_bench_rec_tick(&r, t0 + 1u, 1);
+    CHECK(bt_bench_rec_cut(&r, 0) == 0u && r.why == BT_BENCH_REC_WHY_ENDED, "already stopped (BACK)");
+    bt_bench_rec_init(&r, 0u, 0u, 0, t0);
+    (void)bt_bench_rec_tick(&r, t0, 0);
+    CHECK(bt_bench_rec_cut(&r, 0) == 0u && r.why == BT_BENCH_REC_WHY_NOSTART, "cut right after a failed start");
+    /* a late tick: start once, then the length counts from the start */
+    bt_bench_rec_init(&r, 5u, 10u, 0, t0);
+    CHECK(bt_bench_rec_tick(&r, t0 + 60000u, 0) == BT_BENCH_REC_ACT_START, "late start");
+    CHECK(bt_bench_rec_tick(&r, t0 + 69999u, 1) == 0u, "length from the actual start");
+    CHECK(bt_bench_rec_tick(&r, t0 + 70000u, 1) == BT_BENCH_REC_ACT_STOP, "stop");
+}
+
+static void test_rec_schedule(void)
+{
+    rec_sched_case(1000u);
+    rec_sched_case(0xFFFFFFFFu - 40000u);                /* millis() wraps during the recording */
+    CHECK(strcmp(bt_bench_rec_why_name(BT_BENCH_REC_WHY_TIME), "time") == 0 &&
+          strcmp(bt_bench_rec_why_name(BT_BENCH_REC_WHY_CUT), "cut") == 0 &&
+          strcmp(bt_bench_rec_why_name(BT_BENCH_REC_WHY_ENDED), "ended") == 0 &&
+          strcmp(bt_bench_rec_why_name(BT_BENCH_REC_WHY_NOSTART), "nostart") == 0 &&
+          strcmp(bt_bench_rec_why_name(BT_BENCH_REC_WHY_NOTSTARTED), "notstarted") == 0 &&
+          strcmp(bt_bench_rec_why_name(BT_BENCH_REC_WHY_NONE), "-") == 0, "why names");
+}
+
+/* ---------------------------------------------------------------------------------------------------------------- */
 #define RING 64u
 static char g_ring[RING];
 static uint32_t g_widx;
@@ -671,8 +846,10 @@ int main(int argc, char **argv)
 
     test_parse();
     test_parse_hp();
+    test_parse_rec();
     test_take();
     test_schedule();
+    test_rec_schedule();
     test_capture();
     test_log_save();
 
