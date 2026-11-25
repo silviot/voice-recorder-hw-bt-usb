@@ -117,6 +117,25 @@ and never above 16 (1 bit/symbol) without a written reason; the RCT/APT cutoffs 
 `tests/test_bt_entropy.c` (`make -C open_fw test-bt-port` fails if they no longer match the claim). Record the results
 here.
 
+### Entropy source assessment: results (2026-11-25, session 9)
+Image: `DEV_EXP=1` default build from `integ/bt-all-local` `f078c9c` (FIRM CRC `0xA6BA`), gain 8, quiet room,
+device on the desk, warm (after ~1 h of BT use). 16 sequential runs + 63 restart runs (one reboot each) + 3 controls:
+81 / 81 captures with `overruns=0`. NIST `SP800-90B_EntropyAssessment` (GitHub HEAD, built against locally extracted
+`libdivsufsort` / `libjsoncpp` / `libmpfr` packages).
+
+| Data | Result |
+|---|---|
+| `mic_seq.bin` (1,048,576 symbols) | symbol counts 263050 / 261640 / 261249 / 262637; `ea_non_iid -i -a`: H_original **1.853**, H_bitstring 0.839 (compression estimate; next lowest 0.919 collision), **H_I = min(1.853, 2 x 0.839) = 1.677 bit / 2-bit symbol** |
+| `mic_restart.bin` (first 1000 of 1008 rows: `ea_restart` wants exactly 1000 x 1000) | **Restart sanity check passed**; H_r 1.834, H_c 1.896; **validation passed, min(H_r, H_c, H_I) = 1.677** |
+| control: PGA off (`1 << 17`) | H_original 0.206, H_bitstring 0.091, min 0.182 |
+| control: analogue core + MICBIAS off (`1 << 18`) | **one symbol only** ("no entropy awarded"): the low bits collapse to a constant |
+| control: gain 0 literal (`1 << 19`) | H_original 1.146, H_bitstring 0.483, min 0.967 |
+
+Conclusion: the noise is analogue (it disappears with the analogue path off, so it is not a digital dither / idle
+tone generator) and grows with the PGA gain. Assessed min-entropy 1.677 bit/symbol; the firmware credits
+`BT_ENT_MIC_H_X16` = 8 (0.5 bit/symbol), below half the assessed value (0.84): **the claim stands, unchanged**.
+Not yet done (lower priority, same recipe): a second day / cold start, speech near the mic, the user's recording gain.
+
 ### Other observations
 - eFuse words: `w0=0x1510011D w1=0x003D4000 w2=0x00000600 w3=0xC0000440`; the legacy BD_ADDR `02:CA:55:00:01:1D`
   ends with w0's low bytes — candidate stable device-identity input (plan M1 "Local identity").
