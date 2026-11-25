@@ -175,6 +175,7 @@ typedef struct {
     uint32_t evt_dropped_reset;     /* deferred ROM events that did not fit the ring when HCI Reset restarted the ROM */
     uint32_t evt_dropped_stop;      /* deferred ROM events released by teardown */
     uint32_t acl_rx_dropped_restart;  /* held ACL_RX released by HCI Reset or teardown */
+    uint32_t acl_rx_dropped_disc;     /* inbound ACL_RX dropped for a disconnected or reused handle */
     uint32_t c2h_returned, c2h_invalid, c2h_excess, c2h_malformed, c2h_config_mismatch;
     /* delivery */
     uint32_t dlv_evt, dlv_acl, dlv_fail, dlv_stale, dlv_send_avail;

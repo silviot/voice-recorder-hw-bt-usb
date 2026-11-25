@@ -32,6 +32,9 @@
 #include "esp_bt_main.h"
 #include "esp_bt_device.h"
 #include "esp_gap_bt_api.h"
+#include "nvs.h"
+#include "osi/alarm.h"
+#include "osi/config.h"
 #include "osi/fixed_queue.h"
 #include "bt_ctrl.h"
 #include "fake_rom.h"
@@ -459,6 +462,221 @@ static void scenario_fixed_queue_slot(void)
           "(before %zu / %zu)", h1.live_bytes, h1.live_blocks, h0.live_bytes, h0.live_blocks);
 }
 
+/* Patch 0029: if a higher-priority task preempts BTC right after bt_alarm_drain() pops an expired osi_alarm (before
+ * alarm_cb_handler() runs) and frees + reallocates the same alarm_cbs[] slot without arming the new alarm,
+ * alarm_cb_handler() must revalidate under alarm_mutex and drop the stale delivery instead of firing the new
+ * callback with the new cb_data. */
+static TaskHandle_t s_p29_preempt_task, s_p29_btc_task;
+static osi_alarm_t *s_p29_a1, *s_p29_a2;
+static volatile int s_p29_cb1_hits, s_p29_cb2_hits, s_p29_preempted;
+static int s_p29_arg1 = 0x1111, s_p29_arg2 = 0x2222;
+
+static void p29_cb1(void *arg) { if (arg == &s_p29_arg1) s_p29_cb1_hits++; }
+static void p29_cb2(void *arg) { (void)arg; s_p29_cb2_hits++; }
+
+static void p29_drain_hook(void)
+{
+    s_p29_btc_task = xTaskGetCurrentTaskHandle();
+    xTaskNotifyGive(s_p29_preempt_task);
+    (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));   /* deterministic handoff even under BTH_PREEMPTION=0 */
+}
+
+static void p29_preempt_fn(void *arg)
+{
+    (void)arg;
+    if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(4000)) != 0u) {
+        osi_alarm_free(s_p29_a1);
+        s_p29_a1 = NULL;
+        /* Allocate into the freshly-freed alarm_cbs[] slot, WITHOUT calling osi_alarm_set(). */
+        s_p29_a2 = osi_alarm_new("p29_b", p29_cb2, &s_p29_arg2, 0);
+        s_p29_preempted = 1;
+        xTaskNotifyGive(s_p29_btc_task);
+    }
+    vTaskDelete(NULL);
+}
+
+static void scenario_alarm_preempt_revalidate(const baseline_t *base)
+{
+    bth_log("[0b] patch 0029: osi_alarm revalidates under alarm_mutex when preempted by free+new\n");
+    CHECK(do_init() == ESP_OK, "p29 init");
+    s_p29_cb1_hits = s_p29_cb2_hits = s_p29_preempted = 0;
+    s_p29_a1 = s_p29_a2 = NULL;
+    CHECK(xTaskCreate(p29_preempt_fn, "p29_hp", 4096, NULL, configMAX_PRIORITIES - 1, &s_p29_preempt_task) == pdPASS,
+          "create p29_hp");
+    s_p29_a1 = osi_alarm_new("p29_a", p29_cb1, &s_p29_arg1, 0);
+    CHECK(s_p29_a1 != NULL, "osi_alarm_new a1");
+    bth_alarm_arm_drain_exit_hook(p29_drain_hook);
+    CHECK(osi_alarm_set(s_p29_a1, 5) == OSI_ALARM_ERR_PASS, "osi_alarm_set a1");
+    bth_step("patch 0029 preemption", 5000u);
+    CHECK(wait_until(&s_p29_preempted, 1, 3000u), "p29 drain hook never fired");
+    bth_step_done();
+    vTaskDelay(pdMS_TO_TICKS(30));
+    CHECK(s_p29_a2 != NULL, "osi_alarm_new a2");
+    CHECK(s_p29_cb1_hits == 0 && s_p29_cb2_hits == 0,
+          "stale delivery fired across free+new (cb1=%d, unarmed cb2=%d; patch 0029 missing?)",
+          s_p29_cb1_hits, s_p29_cb2_hits);
+    if (s_p29_a2 != NULL) {
+        osi_alarm_free(s_p29_a2);
+        s_p29_a2 = NULL;
+    }
+    do_teardown();
+    baseline_t now;
+    CHECK(settle_to(base, &now), "after patch 0029: heap %zu/%zu, tasks %lu, timers %u",
+          now.bytes, now.blocks, (unsigned long)now.tasks, now.timers);
+}
+
+/* Patch 0030: if hci_host_thread is sleeping in openfw_hcif_handoff_alloc()'s OOM retry loop when
+ * esp_bluedroid_deinit() enters hci_shut_down(), hci_shut_down() must stop hci_host_thread BEFORE tearing down
+ * hal/rx_q and hci_layer_deinit_env() (commands_pending_response_lock, command_queue). */
+static void scenario_deinit_hcif_handoff_oom(const baseline_t *base)
+{
+    bth_log("[0c] patch 0030: hci_shut_down() stops hci_host_thread before freeing HCI env\n");
+    rom_log_clear();
+    CHECK(do_init() == ESP_OK, "p30 init");
+    CHECK(do_enable() == ESP_OK, "p30 enable");
+    bth_rom_lock();
+    fake_rom.hold_replies = true;
+    bth_rom_unlock();
+    uint32_t e025_before = rom_cmd_count(0xE025u);
+    CHECK(esp_bt_gap_set_device_name("p30-hold") == ESP_OK, "p30 set name");
+    for (int i = 0; i < 400 && rom_cmd_count(0xE025u) == e025_before; i++) {
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    CHECK(rom_cmd_count(0xE025u) == e025_before + 1u, "p30 0C13 not held");
+    bth_step("p30 disable", 20000u);
+    CHECK(esp_bluedroid_disable() == ESP_OK, "p30 disable");
+    bth_step_done();
+
+    /* Let host_recv_pkt_cb's 2 allocations (BT_HDR + list node) succeed, then stall openfw_hcif_handoff_alloc. */
+    bth_heap_fail_arm(3u, true);
+    bth_rom_lock();
+    fake_rom.hold_replies = false;
+    fake_rom_release_held();
+    bth_rom_unlock();
+    bth_ctrl_kick();
+    bth_heap_stats_t hs;
+    for (int i = 0; i < 200; i++) {
+        bth_heap_stats(&hs);
+        if (hs.injected >= 1u) {
+            break;
+        }
+        vTaskDelay(1);
+    }
+    bth_heap_fail_disarm();
+    CHECK(bth_ctrl_close(4000u) == BT_CTRL_STOP_OK, "p30 bt_ctrl close");
+    /* Allow esp_bluedroid_deinit()'s 3 entry allocs (future + btc msg), keep openfw_hcif_handoff_alloc failing. */
+    bth_heap_fail_arm(4u, true);
+    bth_step("p30 deinit", 20000u);
+    CHECK(esp_bluedroid_deinit() == ESP_OK, "p30 deinit");
+    bth_step_done();
+    bth_heap_fail_disarm();
+    baseline_t now;
+    CHECK(settle_to(base, &now), "after patch 0030: heap %zu/%zu, tasks %lu, timers %u",
+          now.bytes, now.blocks, (unsigned long)now.tasks, now.timers);
+}
+
+/* Patch 0031: bta_sys_free() left bta_alarm_hash_map non-NULL after hash_map_free(). On a FIRST boot cycle (what
+ * run_sweep.py tests, one fresh process per point), bta_alarm_hash_map starts NULL; on a SECOND init in the same
+ * boot that fails inside btu_init_core() (after btu_core_started = true, before bta_sys_init()), cleanup runs
+ * btu_task_shut_down() -> bta_sys_free() -> double-free of the first cycle's hash map. */
+static void scenario_bta_sys_double_free(const baseline_t *base)
+{
+    bth_log("[0d] patch 0031: bta_sys_free() clears bta_alarm_hash_map across a later failed init\n");
+    bth_heap_count_start();
+    CHECK(do_init() == ESP_OK, "p31 first init");
+    uint64_t total = bth_heap_counted();
+    do_teardown();
+    CHECK(total > 10u, "init allocs = %llu", (unsigned long long)total);
+    /* Sweep every init allocation on a SECOND cycle in the same process (where globals hold post-deinit state). */
+    for (uint64_t k = 1u; k <= total && g_fail == 0; k++) {
+        CHECK(bth_ctrl_open() == 0, "p31 ctrl_open");
+        bth_heap_fail_arm(k, false);
+        esp_err_t e = esp_bluedroid_init();
+        bth_heap_fail_disarm();
+        if (e == ESP_OK) {
+            CHECK(esp_bluedroid_deinit() == ESP_OK, "p31 deinit");
+        }
+        CHECK(bth_ctrl_close(4000u) == BT_CTRL_STOP_OK, "p31 ctrl_close");
+        baseline_t now;
+        CHECK(settle_to(base, &now), "after patch 0031 k=%llu: heap %zu/%zu, tasks %lu, timers %u",
+              (unsigned long long)k, now.bytes, now.blocks, (unsigned long)now.tasks, now.timers);
+    }
+}
+
+/* Patch 0032: (a) config_parse() allocated exact buf_size bytes and ran strchr(p_line_bgn, '\n') without a trailing
+ * NUL guard, reading out-of-bounds heap memory when bt_cfg_key0 has no newline; (b) config_save() left stale
+ * bt_cfg_key1+ blobs in NVS when the config shrank below CONFIG_FILE_MAX_SIZE (1536 B), wasting space in the 4 KiB
+ * bt_store quota (BT_STORE_DATA_MAX). */
+static void scenario_config_parse_and_shrink(const baseline_t *base)
+{
+    bth_log("[0e] patch 0032: osi/config NUL-terminates blob buffer and erases stale chunks on shrink\n");
+    nvs_handle_t h = 0;
+    CHECK(nvs_open("p32_cfg", NVS_READWRITE, &h) == ESP_OK, "p32 nvs_open");
+    static const char k_no_nl[] = "[Sec]\nKey = no_newline!!";
+    CHECK(nvs_set_blob(h, "bt_cfg_key0", k_no_nl, strlen(k_no_nl)) == ESP_OK, "p32 set unterminated blob");
+    config_t *cfg = config_new("p32_cfg");
+    CHECK(cfg != NULL, "p32 config_new on unterminated blob");
+    if (cfg != NULL) {
+        config_free(cfg);
+    }
+
+    /* Multi-chunk save (>1536 B) followed by shrink (<1536 B) must erase bt_cfg_key1. */
+    cfg = config_new_empty();
+    CHECK(cfg != NULL, "p32 config_new_empty");
+    char val[200];
+    memset(val, 'A', sizeof(val) - 1u);
+    val[sizeof(val) - 1u] = '\0';
+    for (int i = 0; i < 9; i++) {
+        char sec[16];
+        snprintf(sec, sizeof(sec), "S%d", i);
+        config_set_string(cfg, sec, "Data", val, false);
+    }
+    CHECK(config_save(cfg, "p32_cfg"), "p32 save >1536 B");
+    size_t c1_len = 0;
+    CHECK(nvs_get_blob(h, "bt_cfg_key1", NULL, &c1_len) == ESP_OK && c1_len > 0u, "p32 bt_cfg_key1 written");
+    for (int i = 1; i < 9; i++) {
+        char sec[16];
+        snprintf(sec, sizeof(sec), "S%d", i);
+        config_remove_section(cfg, sec);
+    }
+    CHECK(config_save(cfg, "p32_cfg"), "p32 save shrunk <1536 B");
+    CHECK(nvs_get_blob(h, "bt_cfg_key1", NULL, &c1_len) == ESP_ERR_NVS_NOT_FOUND,
+          "stale bt_cfg_key1 survived config shrink (patch 0032 missing?)");
+    config_free(cfg);
+    CHECK(nvs_erase_all(h) == ESP_OK, "p32 erase_all");
+    nvs_close(h);
+    baseline_t now;
+    CHECK(settle_to(base, &now), "after patch 0032: heap %zu/%zu", now.bytes, now.blocks);
+}
+
+/* Patch 0033: a valid 4-byte zero-payload L2CAP frame (p_msg->len == 8: 4 B HCI ACL hdr + 4 B L2CAP hdr) arriving
+ * for an unknown handle (e.g. racing ahead of Connection Complete or late on a detached handle) caused
+ * l2c_rcv_acl_data() to read a 9th byte (cmd_code) past the end of the heap-allocated BT_HDR while still needing to
+ * return the C2H ACL credit. */
+static void scenario_short_acl_unknown_handle(const baseline_t *base)
+{
+    bth_log("[0f] patch 0033: 4-byte zero-payload L2CAP ACL on unknown handle returns C2H credit without over-read\n");
+    CHECK(do_init() == ESP_OK, "p33 init");
+    CHECK(do_enable() == ESP_OK, "p33 enable");
+    bth_rom_lock();
+    fake_rom_link(0, true);
+    uint8_t empty_l2c[4] = { 0x00, 0x00, 0x01, 0x00 };   /* L2CAP len=0, CID=0x0001 (signalling), no cmd_code byte */
+    bt_ctrl_stats_t s0 = ctrl_stats();
+    for (int i = 0; i < 4; i++) {
+        CHECK(fake_rom_inject_acl(0x80u, 2u, empty_l2c, sizeof(empty_l2c)) == 0, "p33 inject 4 B ACL %d", i);
+    }
+    bth_rom_unlock();
+    bth_ctrl_kick();
+    CHECK(wait_c2h_returned(s0.c2h_returned + 4u, 3000u), "p33 C2H credits not returned for 4-byte ACL frames");
+    bth_rom_lock();
+    fake_rom_link(0, false);
+    bth_rom_unlock();
+    do_teardown();
+    baseline_t now;
+    CHECK(settle_to(base, &now), "after patch 0033: heap %zu/%zu, tasks %lu, timers %u",
+          now.bytes, now.blocks, (unsigned long)now.tasks, now.timers);
+}
+
 /* Allocation-failure sweep (plan M1 "general rule"; run_sweep.py). One mode per lifecycle call: the stack is brought
  * to the state before that call, the N-th allocation attempt made while the call runs (all tasks) fails, then:
  *   - the call returned ESP_OK, or an error with the API state unchanged (a clean failure);
@@ -640,6 +858,21 @@ void bth_test_task(void *arg)
     } else if (strcmp(mode, "fixedq") == 0) {
         scenario_fixed_queue_slot();
         rc = g_fail ? 1 : 0;
+    } else if (strcmp(mode, "patch29") == 0) {
+        scenario_alarm_preempt_revalidate(&base);
+        rc = g_fail ? 1 : 0;
+    } else if (strcmp(mode, "patch30") == 0) {
+        scenario_deinit_hcif_handoff_oom(&base);
+        rc = g_fail ? 1 : 0;
+    } else if (strcmp(mode, "patch31") == 0) {
+        scenario_bta_sys_double_free(&base);
+        rc = g_fail ? 1 : 0;
+    } else if (strcmp(mode, "patch32") == 0) {
+        scenario_config_parse_and_shrink(&base);
+        rc = g_fail ? 1 : 0;
+    } else if (strcmp(mode, "patch33") == 0) {
+        scenario_short_acl_unknown_handle(&base);
+        rc = g_fail ? 1 : 0;
     } else if (strcmp(mode, "noack") == 0) {
         scenario_noack_zero_credits(&base);
         rc = g_fail ? 1 : 0;
@@ -671,6 +904,21 @@ void bth_test_task(void *arg)
         rc = g_fail ? 1 : 0;
     } else {
         scenario_fixed_queue_slot();
+        if (g_fail == 0) {
+            scenario_alarm_preempt_revalidate(&base);
+        }
+        if (g_fail == 0) {
+            scenario_deinit_hcif_handoff_oom(&base);
+        }
+        if (g_fail == 0) {
+            scenario_bta_sys_double_free(&base);
+        }
+        if (g_fail == 0) {
+            scenario_config_parse_and_shrink(&base);
+        }
+        if (g_fail == 0) {
+            scenario_short_acl_unknown_handle(&base);
+        }
         if (g_fail == 0) {
             scenario_enable_gap_disable(&base);
         }

@@ -41,6 +41,7 @@ int bth_port_init(void);                    /* entropy (TEST ONLY source), store
 uint32_t bth_timers_in_use(void);           /* esp_timer slots held by Bluedroid (osi alarms) */
 uint32_t bth_hci_cmd_timeouts(void);        /* patch 0007 reports (bt_port_on_hci_command_timeout) */
 uint32_t bth_store_flush_requests(void);
+void bth_alarm_arm_drain_exit_hook(void (*fn)(void)); /* fires once right after bt_alarm_drain pops an item */
 
 /* ---- controller side (host_ctrl.c): bt_ctrl tasks over tests/fake_rom.c ---- */
 int  bth_ctrl_init(void);                   /* bt_ctrl_init + bt_ctrl / bt_dlv tasks; once */

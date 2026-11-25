@@ -57,7 +57,7 @@ static TickType_t wait_ticks(uint32_t us)
     if (us == UINT32_MAX) {
         return portMAX_DELAY;
     }
-    uint32_t ms = (us + 999u) / 1000u;
+    uint32_t ms = us / 1000u + ((us % 1000u) != 0u);
     TickType_t t = pdMS_TO_TICKS(ms);
     if (t == 0u) {
         t = 1u;
@@ -96,6 +96,9 @@ int bt_port_init(bt_store_flush_fn_t request_store_flush)
 {
     static int done;
     if (done) {
+        if (request_store_flush != NULL) {
+            s_store_flush = request_store_flush;
+        }
         return 0;
     }
     s_ent_mutex = xSemaphoreCreateMutexStatic(&s_ent_mutex_buf);

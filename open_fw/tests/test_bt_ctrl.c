@@ -1137,7 +1137,7 @@ static void test_bt_stop_sweep(void)
         bt_ctrl_run();
         t_quiet = 0;
         if (fake_rom.stop_fired_at != k || !fake_rom.stop_call_completed || fake_rom.calls_after_stop != 0u ||
-            stats().parked != 1u || fake_rom.errors != 0u) {
+            stats().parked != 1u || bt_ctrl_shutdown_status() != BT_CTRL_STOP_PARKED || fake_rom.errors != 0u) {
             bad++;
             if (bad < 4) {
                 printf("  k=%u fired=%u completed=%u after=%u parked=%u err=%s\n", k, fake_rom.stop_fired_at,
@@ -1519,6 +1519,167 @@ static void test_stale_tx_acl_flush(void)
     CHECK(fake_rom.n_acl == n1 && stats().acl_tx_dropped == d1 + 1u && dbg().h2c_inflight == 0u,
           "stale ACL flushed by Disconnection Complete alone");
     shutdown_and_check();
+}
+
+/* Credit-blocked inbound ACL (g.held[]) must never be delivered after Disconnection Complete or onto a reused handle,
+ * and ACL_RX for a dead or out-of-range handle must be dropped immediately. */
+static void test_stale_rx_acl_flush(void)
+{
+    uint8_t d_a[1024], d_b[64];
+    memset(d_a, 0xAA, sizeof(d_a));
+    memset(d_b, 0xBB, sizeof(d_b));
+    const pkt_t *p;
+
+    /* (a) credit-blocked packets on 0x80 dropped once Disconnection Complete is delivered; never injected onto a
+     *     new connection reusing 0x80 when the host returns the earlier credits */
+    setup();
+    bring_up();
+    link_up(0);
+    for (int i = 0; i < 6; i++) CHECK(fake_rom_inject_acl(0x80, 2, d_a, 64) == 0, "inject A %d", i);
+    pump();
+    t_rx_rd = t_rx_n;
+    CHECK(dbg().c2h_outstanding == 4u && dbg().held_acl == 2u, "4 delivered, 2 held");
+    fake_rom_link(0, false);
+    inject_disc(0x80, 0x13);
+    pump();
+    p = next_pkt();
+    CHECK(is_evt(p, BT_HCI_EVT_DISC) && next_pkt() == NULL, "Disconnection Complete delivered");
+    CHECK(dbg().held_acl == 0u && fake_rom_em_rx_in_use() == 0u,
+          "stale held ACL freed once Disconnection Complete crossed to host (held %u em %u)",
+          dbg().held_acl, fake_rom_em_rx_in_use());
+    fake_rom_link(0, true);
+    inject_conn_cmp(0x80);
+    host_nocp(0x80, 4);
+    pump();
+    uint32_t stale_acl = 0u, saw_conn = 0u;
+    while ((p = next_pkt()) != NULL) {
+        stale_acl += p->d[0] == BT_H4_ACL;
+        saw_conn += is_evt(p, 0x03u);
+    }
+    CHECK(saw_conn == 1u && stale_acl == 0u, "no stale Peer A ACL delivered onto Peer B (stale %u)", stale_acl);
+    shutdown_and_check();
+
+    /* (b) partially delivered >1021 B packet: continuation fragment dropped on Disconnection Complete */
+    setup();
+    bring_up();
+    link_up(0);
+    uint8_t hbs1[7] = { 0xFD, 0x03, 0xFF, 0x01, 0x00, 0x0A, 0x00 };
+    (void)roundtrip(0x0C33u, hbs1, 7u);
+    CHECK(fake_rom_inject_acl(0x80, 2, d_a, 1024) == 0, "inject 1024");
+    pump();
+    p = next_pkt();
+    CHECK(p != NULL && p->d[0] == BT_H4_ACL && dbg().held_acl == 1u, "first fragment delivered, continuation held");
+    fake_rom_link(0, false);
+    inject_disc(0x80, 0x13);
+    pump();
+    p = next_pkt();
+    CHECK(is_evt(p, BT_HCI_EVT_DISC) && dbg().held_acl == 0u && fake_rom_em_rx_in_use() == 0u,
+          "continuation fragment dropped on disconnect");
+    host_nocp(0x80, 1);
+    pump();
+    CHECK(next_pkt() == NULL, "no orphan continuation fragment delivered after disconnect");
+    shutdown_and_check();
+
+    /* (c) non-head held entry for 0x80 behind live 0x81, plus late ACL_RX on dead 0x80 and out-of-range 0x87 */
+    setup();
+    bring_up();
+    link_up(0);
+    link_up(1);
+    for (int i = 0; i < 5; i++) CHECK(fake_rom_inject_acl(0x81, 2, d_b, 32) == 0, "inject B %d", i);
+    CHECK(fake_rom_inject_acl(0x80, 2, d_a, 32) == 0, "inject A behind B");
+    pump();
+    t_rx_rd = t_rx_n;
+    CHECK(dbg().held_acl == 2u, "B#5 and A#1 held");
+    fake_rom_link(0, false);
+    inject_disc(0x80, 0x13);
+    pump();
+    p = next_pkt();
+    CHECK(is_evt(p, BT_HCI_EVT_DISC) && dbg().held_acl == 1u, "A#1 swept while B#5 kept (held %u)", dbg().held_acl);
+    CHECK(fake_rom_inject_acl(0x80, 2, d_a, 32) == 0, "late ACL_RX on dead 0x80");
+    CHECK(fake_rom_inject_acl(0x87, 2, d_a, 32) == 0, "ACL_RX on out-of-range 0x87");
+    pump();
+    CHECK(dbg().held_acl == 1u && fake_rom_em_rx_in_use() == 1u, "dead/out-of-range ACL_RX dropped at upcall");
+    host_nocp(0x81, 4);
+    pump();
+    p = next_pkt();
+    CHECK(p != NULL && p->d[0] == BT_H4_ACL && (p->d[1] | ((p->d[2] & 0x0Fu) << 8)) == 0x81u && p->d[5] == 0xBBu &&
+          next_pkt() == NULL, "only live 0x81 packet delivered");
+    host_nocp(0x81, 1);
+    pump();
+    shutdown_and_check();
+}
+
+/* Unsolicited ROM CC/CS replies (e.g. a second late command reply after g.fwd_late_op was overwritten or expired)
+ * must be counted and consumed, never forwarded with Num_HCI_Command_Packets=1 to Bluedroid. */
+static void test_unsolicited_reply_dropped(void)
+{
+    setup();
+    bring_up();
+    link_up(0);
+    t_rx_rd = t_rx_n;
+    /* Direct unsolicited CC (0xE088 -> 0x0C18) with no command pending */
+    uint8_t cc_ok[2] = { 0x00, 0x00 };
+    fake_rom_inject(0xE088u, cc_ok, 1u);
+    pump();
+    CHECK(stats().evt_unsolicited_reply == 1u && pending_pkts() == 0u,
+          "unsolicited CC must be dropped, not delivered (%u pkts)", pending_pkts());
+    /* Late CS (0xE0CB -> 0x0419) arriving while another command (0x0C1A) is in flight */
+    fake_rom.hold_replies = true;
+    uint8_t one = 1u;
+    send_cmd(0x0C1Au, &one, 1u);
+    pump();
+    CHECK(dbg().fwd_pending == 1u && dbg().rom_cmd_credits == 0u, "0C1A in flight");
+    fake_rom_inject(0xE0CBu, cc_ok, 2u);
+    pump();
+    CHECK(stats().evt_unsolicited_reply == 2u && pending_pkts() == 0u && dbg().fwd_pending == 1u,
+          "unsolicited CS while 0C1A in flight must not reach host (%u pkts)", pending_pkts());
+    fake_rom.hold_replies = false;
+    fake_rom_release_held();
+    pump();
+    const pkt_t *p = next_pkt();
+    CHECK(is_reply(p, 0x0C1Au) && next_pkt() == NULL, "real 0C1A reply delivered intact");
+    shutdown_and_check();
+}
+
+/* 0x0C13 (Write Local Name): a spec-valid 248-byte non-NUL UTF-8 name must still give ROM handler 0x3ED00 a NUL
+ * guard byte at m[248] so its 249-byte scan never reads adjacent g_bt_heap metadata (BT_ROM_HCI_MAP.md §2). */
+static void test_0c13_rom_nul_guard(void)
+{
+    setup();
+    bring_up();
+    uint8_t full_name[250];
+    memset(full_name, 'A', sizeof(full_name));
+    uint32_t c0 = fake_rom.n_cmds;
+    const pkt_t *r = roundtrip(0x0C13u, full_name, 248u);
+    CHECK(r != NULL && status_of(r) == 0u && fake_rom.n_cmds == c0 + 1u, "0C13 248 B accepted");
+    CHECK(fake_rom.cmds[c0].len >= 249u && fake_rom.cmds[c0].data[248] == 0u,
+          "0C13 KE msg must have NUL guard at offset 248 (len %u, byte248 0x%02X)",
+          fake_rom.cmds[c0].len, fake_rom.cmds[c0].data[248]);
+    /* Oversize H4 parameter (> 248 B) must also clamp copied name to 248 B, preserving m[248] == 0 */
+    c0 = fake_rom.n_cmds;
+    r = roundtrip(0x0C13u, full_name, 250u);
+    CHECK(r != NULL && fake_rom.n_cmds == c0 + 1u && fake_rom.cmds[c0].len >= 249u && fake_rom.cmds[c0].data[248] == 0u,
+          "0C13 >248 B clamped before guard byte");
+    shutdown_and_check();
+}
+
+/* If bt_stop latched before bt_ctrl_shutdown_begin(), bt_ctrl_run() must still run do_stop() to report
+ * BT_CTRL_STOP_PARKED and return to ST_OFF instead of stranding BT_CTRL_STOP_PENDING. */
+static void test_parked_shutdown_completes(void)
+{
+    setup();
+    bring_up();
+    t_stop = true;
+    fake_rom_raise_irq(BT_ROM_IRQ_CSCNT);
+    uint32_t c0 = fake_rom.calls;
+    (void)bt_ctrl_run();
+    CHECK(dbg().parked == 1u && fake_rom.calls == c0, "parked on bt_stop without ROM calls");
+    bt_ctrl_shutdown_begin();
+    CHECK(bt_ctrl_shutdown_status() == BT_CTRL_STOP_PENDING, "pending right after shutdown_begin");
+    (void)bt_ctrl_run();
+    CHECK(bt_ctrl_shutdown_status() == BT_CTRL_STOP_PARKED && dbg().state == 0u && fake_rom.calls == c0,
+          "do_stop completed as STOP_PARKED with 0 ROM calls (status %d, state %u)",
+          bt_ctrl_shutdown_status(), dbg().state);
 }
 
 /* Finding 10: send-available only on a full -> not-full transition. */
@@ -2392,6 +2553,28 @@ static void test_fwd_late_same_opcode(void)
     pump();
     while (next_pkt() != NULL) {
     }
+    /* host dispatches next same-opcode command at +0 ms upon receiving 0x22: when the prior late reply never arrives,
+     * the held command must still get a non-zero execution window in the ROM instead of timing out in Pass 1 (0 ms) */
+    fake_rom.hold_replies = true;
+    send_cmd(0x041Du, h80, 2);
+    pump();
+    t_now_ms += BT_CTRL_FWD_DEADLINE_MS;
+    pump();
+    p = next_pkt();
+    CHECK(is_reply(p, 0x041Du) && status_of(p) == BT_HCI_ERR_LMP_TIMEOUT, "E answered 0x22 at deadline");
+    send_cmd(0x041Du, h80, 2);                   /* sent at +0 ms (same tick as 0x22) */
+    pump();
+    t_now_ms += BT_CTRL_FWD_DEADLINE_MS;         /* prior late reply expires -> F forwarded now */
+    pump();
+    CHECK(dbg().fwd_pending == 1u && pending_pkts() == 0u,
+          "held command sent at +0 ms must not 0-ms-timeout in the pass that forwards it");
+    t_now_ms += 20u;
+    fake_rom.hold_replies = false;
+    fake_rom_set_reply_status(0xE407u, 0x00);
+    fake_rom_release_held();
+    pump();
+    p = next_pkt();
+    CHECK(is_reply(p, 0x041Du) && status_of(p) == 0x00u, "F completed with real ROM status within its window");
     shutdown_and_check();
 }
 
@@ -3522,6 +3705,10 @@ int main(void)
         { "reset_failure_masks_irq", test_reset_failure_masks_irq },
         { "fwd_orphan", test_fwd_orphan },
         { "stale_tx_acl_flush", test_stale_tx_acl_flush },
+        { "stale_rx_acl_flush", test_stale_rx_acl_flush },
+        { "unsolicited_reply_dropped", test_unsolicited_reply_dropped },
+        { "0c13_rom_nul_guard", test_0c13_rom_nul_guard },
+        { "parked_shutdown_completes", test_parked_shutdown_completes },
         { "send_avail_only_when_full", test_send_avail_only_when_full },
         { "class_m_fwd_fault", test_class_m_fwd_fault },
         { "deferred_order_after_free", test_deferred_order_after_free },

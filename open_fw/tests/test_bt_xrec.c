@@ -45,6 +45,7 @@ static int m_lock_depth, m_lock_max, m_notifies, m_allocs, m_frees, m_alloc_fail
 static int m_entropy_fail;
 static uint32_t m_entropy_ctr = 0x00123456u;
 static int m_up_calls, m_down_calls, m_hold_up, m_hold_down, m_up_result, m_down_result, m_job_kind, m_job_pending;
+static int m_deinit_needed_at_down;
 static int m_dl_latched, m_hard_reason, m_service, m_session_end, m_reboot_mode, m_saved_key, m_poll_fault;
 static uint16_t m_peer_mtu = 660u;
 static int m_verbose;
@@ -249,6 +250,7 @@ void bt_xrec_plat_set_mode(uint8_t mode, int (*profile_down)(void))
 void bt_xrec_plat_stack_down_begin(void)
 {
     m_down_calls++;
+    m_deinit_needed_at_down = bt_xrec_spp_deinit_needed();
     m_job_kind = 2;
     m_job_pending = 1;
 }
@@ -626,7 +628,7 @@ static void mocks_reset(void)
     m_pair_block = NULL;
     m_pair_block_calls = 0;
     m_up_calls = m_down_calls = m_hold_up = m_hold_down = m_up_result = m_down_result = m_job_kind = 0;
-    m_job_pending = 0;
+    m_job_pending = m_deinit_needed_at_down = 0;
     m_dl_latched = m_hard_reason = m_service = m_session_end = m_reboot_mode = m_saved_key = m_poll_fault = 0;
     m_peer_mtu = 660u;
     m_gap_cb = NULL;
@@ -956,12 +958,34 @@ static void t_rx_overflow(void)
     bt_xrec_poll();
     static uint8_t junk[1000];
     memset(junk, 'x', sizeof(junk));
+
+    /* Secondary (refused) SPP handle flooding DATA_IND before CLOSE_EVT must not starve or close H1 */
+    srv_open(H2, PEER2);
+    bt_xrec_poll();
+    CHECK(m_disc_calls == 1 && m_disc_handle == H2, "H2 refused");
+    rx_raw(H2, junk, sizeof(junk));
+    rx_raw(H2, junk, sizeof(junk));
+    rx_raw(H2, junk, sizeof(junk));
+    rx(H1, "+XREC:PING\r\n");
+    CHECK(dbg().conn_open && !dbg().conn_closing && dbg().rx_overflows == 0u && wire_has("+XREC:PONG"),
+          "secondary handle DATA_IND flood must not overflow or close active session H1");
+    spp_close(H2);
+    bt_xrec_poll();
+    wire_clear();
+
+    /* Burst of >32 overflowing frames on H1 before poll must close H1 without overflowing evq into ST_FAULTED */
     rx_raw(H1, junk, sizeof(junk));
     rx_raw(H1, junk, sizeof(junk));
     rx_raw(H1, junk, sizeof(junk));   /* 3000 > 2048: the third frame overflows */
+    for (int i = 0; i < 40; i++) {
+        rx_raw(H1, junk, 100u);              /* 100 B frames: ring full, so the EVQ fault path is exercised */
+    }
     bt_xrec_poll();
-    CHECK(dbg().rx_overflows == 1u, "overflow counted");
-    CHECK(m_disc_calls == 1 && dbg().conn_closing, "connection closed");
+    CHECK(dbg().rx_overflows == 41u, "overflows counted (%u)", dbg().rx_overflows);
+    CHECK(dbg().state == BT_XREC_ST_READY && dbg().evq_lost == 0u,
+          "repeated RX overflows must coalesce instead of faulting EVQ (state %u, lost %u)",
+          dbg().state, dbg().evq_lost);
+    CHECK(m_disc_calls == 2 && m_disc_handle == H1 && dbg().conn_closing, "connection H1 closed");
     stop_ok();
 }
 
@@ -1284,9 +1308,27 @@ static void t_evq_overflow_and_faults(void)
     mocks_reset();
     CHECK(bt_xrec_start(NULL, 0) == 0, "start");
     bt_xrec_poll();
+    CHECK(dbg().state == BT_XREC_ST_CONFIG && bt_xrec_spp_deinit_needed() == 1,
+          "SPP deinit needed immediately after esp_spp_enhanced_init before INIT_EVT");
+    stop_ok();
+    CHECK(m_deinit_needed_at_down == 1 && bt_xrec_spp_deinit_needed() == 0,
+          "teardown in ST_CONFIG sees deinit_needed=1 and clears it on exit");
+    mocks_reset();
+    CHECK(bt_xrec_start(NULL, 0) == 0, "start");
+    bt_xrec_poll();
+    memset(&p, 0, sizeof(p));
+    p.init.status = ESP_SPP_NO_RESOURCE;
+    spp_evt(ESP_SPP_INIT_EVT, &p);
+    bt_xrec_poll();
+    CHECK(dbg().last_fault == BT_XREC_FAULT_CONFIG && m_deinit_needed_at_down == 0,
+          "failed ESP_SPP_INIT_EVT clears deinit_needed before teardown");
+    mocks_reset();
+    CHECK(bt_xrec_start(NULL, 0) == 0, "start");
+    bt_xrec_poll();
     m_now += BT_XREC_CONFIG_DEADLINE_MS;
     bt_xrec_poll();
-    CHECK(dbg().last_fault == BT_XREC_FAULT_CONFIG_TIMEOUT, "configuration timeout");
+    CHECK(dbg().last_fault == BT_XREC_FAULT_CONFIG_TIMEOUT && m_deinit_needed_at_down == 1,
+          "configuration timeout still requests SPP deinit");
 }
 
 static void t_hard_paths(void)

@@ -114,9 +114,10 @@ static const bt_ctrl_cmd_row_t k_vendor_row = {
  * zero-padded to it, docs/BT_ROM_HCI_MAP.md §1.1). First block: legacy bt_hci.c:882-904 (g_openfw_cmd_tbl min_len,
  * driven on silicon by the legacy phone mode). Second block: stock opcode tables, BT_ROM_HCI_MAP.md §2 "Struct" column
  * (static, cross-checked against the ROM handler). A FWD row without an entry has no verified ROM layout
- * (BT_ROM_INTERFACE §3.2) and fails validation. Parameterless KE messages are listed in k_fwd_zero_len below. */
+ * (BT_ROM_INTERFACE §3.2) and fails validation. 0x0C13 is the 248 B name plus one: the 249th byte is a NUL guard for
+ * ROM handler 0x3ED00's 249-byte scan (review-r1). Parameterless KE messages are listed in k_fwd_zero_len below. */
 static const struct { uint16_t op; uint8_t min_len; } k_fwd_layout[] = {
-    { 0x0C01u,   8u }, { 0x0C13u, 248u }, { 0x0C1Au,   1u }, { 0x0C24u,   3u }, { 0x0C52u, 241u },
+    { 0x0C01u,   8u }, { 0x0C13u, 249u }, { 0x0C1Au,   1u }, { 0x0C24u,   3u }, { 0x0C52u, 241u },
     { 0x0C56u,   1u }, { 0x0401u,   5u }, { 0x0405u,  14u }, { 0x0406u,   4u }, { 0x0409u,   7u },
     { 0x040Au,   7u }, { 0x040Bu,  22u }, { 0x040Cu,   6u }, { 0x040Du,  23u }, { 0x040Eu,   6u },
     { 0x042Bu,   9u }, { 0x042Cu,   6u }, { 0x042Du,   6u },

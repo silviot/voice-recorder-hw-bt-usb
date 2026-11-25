@@ -147,6 +147,8 @@ void bt_xrec_set_bench_xrec_pin(const char *pin6);
 
 /* 1 once ESP_SPP_UNINIT_EVT arrived after the last bt_shutdown() began (the teardown job waits for it). Any task. */
 int bt_xrec_spp_uninit_seen(void);
+/* 1 once esp_spp_enhanced_init() posted BTC_SPP_ACT_INIT (even before BTC_TASK sets spp_inited). Any task. */
+int bt_xrec_spp_deinit_needed(void);
 
 /* ======================================== platform seam ======================================================= */
 /* Any context. */

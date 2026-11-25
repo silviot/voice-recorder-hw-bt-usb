@@ -721,6 +721,51 @@ secret of ~33 predictable bits: bench-only waiver, see the review-round entry be
   screen still shows "connected". **Silicon check list:** after BACK read `disconnect cmd` (status, rom/local), the
   `BENCH status` `links=` / `closing=`, and `notes_lost` in the ctrl stats line (a lost note silently undoes (a)-(c)).
 
+- 2026-11-24: **Review r1 disposition** (agy post-development review, branch `review/r1-28c8def`, 23 commits;
+  triage against HEAD `4c83b3d`). Accepted = cherry-picked; ported = applied by hand to the moved code; review
+  Bluedroid patches 0028-0032 renumbered 0029-0033 (dev already had 0028). Each applied fix keeps its test; every
+  important one was checked to fail without its fix (exceptions noted). Default FIRM CRC unchanged.
+  - port `e7fd4dd` -> `390ce27` bt_ctrl: purge held inbound ACL at the DISC/CONN_CMP delivery marker, drop ACL_RX on
+    dead/out-of-range handles (a credit-blocked old-peer frame could reach a reused handle).
+  - port `61c8d34` -> `a916e6a` bt_ctrl: consume unsolicited ROM CC/CS instead of forwarding a spurious credit/reply.
+  - port `259cac3` -> `cbda816` bt_ctrl: 0x0C13 forwarded as 249 B with a NUL guard for ROM 0x3ED00's scan.
+  - reject `a979fa7` SLOT_FILLING cancel: disconnect is already covered by the dead-handle drop; the Reset/reuse
+    windows are not reachable in practice.
+  - accept `bcd1858` -> `2febed5` bt_ctrl: no 0 ms timeout cascade after a `fwd_late_hold` expiry.
+  - port `3386e7b` -> `230b493` bt_ctrl: ST_STOPPING completes as STOP_PARKED when parked (was stuck PENDING).
+  - reject `7f5d637` NOCP clamp / NULL ROM params: scenario does not match the code (rom_nocp already clamps; packer
+    n <= 7).
+  - accept `3d1456d` -> `f847255` bt_ctrl_rtos: silence RW-BT and unwind a leaked PRIMASK before blocking (no host
+    test possible: no-op portmacro).
+  - reject `b670e8a` EM RX pool pointer validation: breaks continuation-fragment reads (`h->em + h->off`); rationale
+    does not match the diff.
+  - port `801bac8` -> `9b72da3` bt_alarm/esp_timer: (cb,arg) snapshotted inside the drain critical section (preempting
+    `esp_timer_delete()` made the trampoline call NULL); 64-bit timeouts.
+  - reject `693a8d9` bt_store nvs_get_str NUL / bounds: no caller of nvs_get_str; described header layout does not
+    exist.
+  - reject `c26b588` bt_entropy fractional stats: diagnostic counter only; seeding uses the exact x16 credit.
+  - port `d06549a` -> `20d1925` Bluedroid **0029** osi alarm callback revalidated under `alarm_mutex`.
+  - port `2d78e2a` -> `61deb19` Bluedroid **0030** stop `hci_host_thread` before HCI env teardown (negative test
+    aborts in 3 of 4 runs; scheduling dependent).
+  - port `e7effa4` -> `8724266` Bluedroid **0031** `bta_sys_free()` clears `bta_alarm_hash_map`.
+  - port `d50eb0c` -> `e16e354` Bluedroid **0032** `config_parse()` NUL guard + stale `bt_cfg_key1+` erase (quota
+    wording corrected to 4 KiB; the "resurrected sections" claim dropped).
+  - port `f74ce88` -> `8ab815d` Bluedroid **0033** short L2CAP ACL bounds on unknown handles.
+  - reject `3da75d6` bond case-variant shadowing: firmware always writes lowercase sections; only a hand-edited
+    plaintext SD file can produce it.
+  - reject `d33af3c` encryption-off close / cfm_ok expiry / BDA slots: encryption-off needs the authenticated peer
+    itself and the close would kill sessions across a role switch; the cfm_ok/slot parts are wrong or churn at HEAD
+    (NC confirm UI rewrite).
+  - port `28591dc` -> `e9f0e6d` bt_xrec: RX bound to the active SPP handle, overflow latched/coalesced, chunk wiped
+    (test loop uses 100 B frames so the EVQ fault path is exercised).
+  - port `77034e0` -> `d7baca0` bt_xrec: SPP deinit also when the init was posted but not yet processed (test covers
+    the flag lifecycle only).
+  - accept `883f0ac` -> `2ae38ee` bt_xrec_fw: finalise an active recording before an XREC reboot; volatile key wipes
+    (no host test).
+  - accept `8b9dc77` -> `360c188` tools: split `+XREC:ERR` framing, atomic 0600 key file, probe-log token guards
+    (self-test's always-true assert replaced by a real check).
+  Silicon checks owed: disconnect during bulk inbound transfer then reconnect (R1-11); OTA during a recording.
+
 ## 11. Round-1 traceability
 
 | Round-1 item | v3 change |

@@ -198,12 +198,21 @@ static void osi_thread_run(void *arg)
 
         osi_sem_take(&thread->work_sem, OSI_SEM_MAX_TIMEOUT);
 
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+        if (__atomic_load_n(&thread->stop, __ATOMIC_ACQUIRE)) {
+            break;
+        }
+
+        struct work_item item;
+        while (!__atomic_load_n(&thread->stop, __ATOMIC_ACQUIRE) && idx < thread->work_queue_num) {
+#else
         if (thread->stop) {
             break;
         }
 
         struct work_item item;
         while (!thread->stop && idx < thread->work_queue_num) {
+#endif
             if (osi_thead_work_queue_get(thread->work_queues[idx], &item) == true) {
                 #if OSI_THREAD_DEBUG
                 osi_thread_run_item(thread, idx, &item);
@@ -229,6 +238,22 @@ static int osi_thread_join(osi_thread_t *thread, uint32_t wait_ms)
     return osi_sem_take(&thread->stop_sem, wait_ms);
 }
 
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+bool osi_thread_is_stopping(const osi_thread_t *thread)
+{
+    return thread == NULL || __atomic_load_n(&thread->stop, __ATOMIC_ACQUIRE);
+}
+
+void osi_thread_stop(osi_thread_t *thread)
+{
+    int ret;
+
+    if (!thread || !thread->thread_handle) {
+        return;
+    }
+
+    __atomic_store_n(&thread->stop, true, __ATOMIC_RELEASE);
+#else
 static void osi_thread_stop(osi_thread_t *thread)
 {
     int ret;
@@ -237,6 +262,7 @@ static void osi_thread_stop(osi_thread_t *thread)
 
     //stop the thread
     thread->stop = true;
+#endif
     osi_sem_give(&thread->work_sem);
 
     //join

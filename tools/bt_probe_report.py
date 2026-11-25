@@ -127,20 +127,31 @@ def last_run(records: list[dict]) -> tuple[list[dict], list[str]]:
     return run, warnings
 
 
+def _hex(v: Any, width: int) -> str:
+    return f"0x{v:0{width}X}" if isinstance(v, int) else str(v)
+
+
 def _bits(body: dict) -> list[dict]:
     out = []
     for key, val in body.items():
         if key.startswith("b") and key[1:].isdigit() and isinstance(val, str) and val.count("/") == 2:
-            occ, svc, coal = (int(x) for x in val.split("/"))
+            try:
+                occ, svc, coal = (int(x) for x in val.split("/"))
+            except ValueError:
+                continue
             out.append({"bit": int(key[1:]), "occurrences": occ, "serviced": svc, "coalesced": coal})
     return out
 
 
 def _rates(body: dict) -> None:
     us = body.get("us") or 0
+    irq = body.get("irq", 0)
+    cpu_us = body.get("cpu_us", 0)
     if isinstance(us, int) and us > 0:
-        body["irq_rate_hz"] = round(body.get("irq", 0) * 1e6 / us, 1)
-        body["cpu_pct"] = round(100.0 * body.get("cpu_us", 0) / us, 2)
+        if isinstance(irq, int):
+            body["irq_rate_hz"] = round(irq * 1e6 / us, 1)
+        if isinstance(cpu_us, int):
+            body["cpu_pct"] = round(100.0 * cpu_us / us, 2)
 
 
 def build_report(text: str) -> dict:
@@ -174,9 +185,12 @@ def build_report(text: str) -> dict:
         elif k == "CMD":
             body["stage"] = stage
             op = body.get("op")
-            opcode = int(str(op), 16) if op is not None else None
-            body["opcode"] = f"0x{opcode:04X}" if opcode is not None else None
-            body["name"] = OPCODE_NAMES.get(opcode, "")
+            try:
+                opcode = int(str(op), 16) if op is not None else None
+            except ValueError:
+                opcode = None
+            body["opcode"] = f"0x{opcode:04X}" if opcode is not None else (str(op) if op is not None else None)
+            body["name"] = OPCODE_NAMES.get(opcode, "") if opcode is not None else ""
             if "rx" in body:
                 body["rx"] = str(body["rx"])
                 body["truncated"] = "trunc" in body
@@ -257,8 +271,8 @@ def build_report(text: str) -> dict:
                 warnings.append("RW-BT left claimed (hang, hard stop or failed start/stop): legacy BT mode is refused "
                                 "until reboot")
             if body.get("ipr") != body.get("orig"):
-                warnings.append(f"IRQ 26 priority not restored (0x{body.get('ipr', 0):02X}, was "
-                                f"0x{body.get('orig', 0):02X})")
+                warnings.append(f"IRQ 26 priority not restored ({_hex(body.get('ipr', 0), 2)}, was "
+                                f"{_hex(body.get('orig', 0), 2)})")
         elif k == "SKIP":
             rep["skip"] = body
         elif k == "END":
@@ -296,7 +310,7 @@ def to_markdown(rep: dict) -> str:
     if rep.get("off"):
         out.append(f"Not run: request file `{rep['off'].get('file')}` {rep['off'].get('trig')}")
     if rep.get("skip"):
-        out.append(f"Skipped: previous boot left fault record `0x{rep['skip'].get('prev_fault', 0):08X}`")
+        out.append(f"Skipped: previous boot left fault record `{_hex(rep['skip'].get('prev_fault', 0), 8)}`")
     out.append("")
     for w in rep["warnings"]:
         out.append(f"> WARNING: {w}")
@@ -311,7 +325,7 @@ def to_markdown(rep: dict) -> str:
         for c in rep["commands"]:
             rx = c.get("rx", "")
             if c.get("truncated"):
-                rx = f"{rx}... ({c.get('trunc')} B shown, CRC-32 0x{c.get('crc', 0):08X})"
+                rx = f"{rx}... ({c.get('trunc')} B shown, CRC-32 {_hex(c.get('crc', 0), 8)})"
             note = f" bd={c['bd']}" if "bd" in c else ""
             for key in ("fwd", "romd", "hw", "ctrl_free", "waived"):
                 if key in c:
@@ -332,7 +346,7 @@ def to_markdown(rep: dict) -> str:
         for t in rep["teardowns"]:
             out.append(f"- teardown ({t.get('why')}): {t.get('st')} in {t.get('us')} us")
         for h in rep["hardstops"]:
-            out.append(f"- HARD STOP: {h.get('why')}, RWBT_CNTL after the register-only stop 0x{h.get('cntl', 0):08X}")
+            out.append(f"- HARD STOP: {h.get('why')}, RWBT_CNTL after the register-only stop {_hex(h.get('cntl', 0), 8)}")
         if rep.get("hang"):
             h = rep["hang"]
             what = (f"bt_ctrl above {h.get('cpu_pm')} permille CPU for {h.get('cpu_n')} samples (peak {h.get('cpu_pk')})"
@@ -344,9 +358,9 @@ def to_markdown(rep: dict) -> str:
     if rep.get("nvic"):
         n = rep["nvic"]
         out += ["## NVIC", "",
-                f"IRQ {n.get('irq')}: implemented priority mask 0x{n.get('impl', 0):02X} ({n.get('bits')} bits), "
-                f"written 0x{n.get('set', 0):02X}, read back 0x{n.get('rb', 0):02X} "
-                f"(configMAX_SYSCALL_INTERRUPT_PRIORITY 0x{n.get('maxsys', 0):02X}), SHPR3 0x{n.get('shpr3', 0):08X}",
+                f"IRQ {n.get('irq')}: implemented priority mask {_hex(n.get('impl', 0), 2)} ({n.get('bits')} bits), "
+                f"written {_hex(n.get('set', 0), 2)}, read back {_hex(n.get('rb', 0), 2)} "
+                f"(configMAX_SYSCALL_INTERRUPT_PRIORITY {_hex(n.get('maxsys', 0), 2)}), SHPR3 {_hex(n.get('shpr3', 0), 8)}",
                 ""]
 
     if rep.get("idle"):
@@ -366,7 +380,7 @@ def to_markdown(rep: dict) -> str:
         for bit in rep["irq_bits"]:
             out.append(f"| {bit['bit']} | {bit['occurrences']} | {bit['serviced']} | {bit['coalesced']} |")
         if rep.get("irq_unhandled") is not None:
-            out.append(f"\nBits acked but not serviced (cumulative): 0x{rep['irq_unhandled']:08X}")
+            out.append(f"\nBits acked but not serviced (cumulative): {_hex(rep['irq_unhandled'], 8)}")
         out.append("")
 
     if rep.get("stage_b") or rep["verify"] or rep["windows"]:
@@ -677,6 +691,20 @@ def run_self_test() -> int:
     # A request file with bad content.
     bc = build_report("HCIP OFF trig=bad_content file=HCIPROBE.RUN\n")
     assert bc["status"] == "OFF" and "named no stage" in bc["warnings"][0], bc["warnings"]
+
+    # Truncated/corrupted UART ring tokens must degrade gracefully instead of crashing with ValueError/TypeError.
+    corrupt = (
+        "HCIP BEGIN v=1 bd=02CA5500011D\n"
+        "HCIP CMD n=1 op=0CZZ want=CC got=CC lat=10 res=BAD crc=0xZZZZ\n"
+        "HCIP IDLE us=1000 irq=bad cpu_us=bad\n"
+        "HCIP IRQBITS b0=10/bad/0 b1=5/5/0 unh=0xZZZZ\n"
+        "HCIP RELEASE ipr=0xZZ orig=0x00 legacy=refused\n"
+        "HCIP END st=ABORT fails=1 ms=10\n"
+    )
+    cr = build_report(corrupt)
+    assert cr["status"] == "ABORT" and cr["irq_bits"] == [{"bit": 1, "occurrences": 5, "serviced": 5, "coalesced": 0}]
+    md = to_markdown(cr)
+    assert "| 1 | A | 0CZZ |" in md and "Status: **ABORT**" in md, md
 
     # The CRC the firmware prints is plain CRC-32 (zlib): keep both sides in agreement.
     assert zlib.crc32(b"123456789") == 0xCBF43926

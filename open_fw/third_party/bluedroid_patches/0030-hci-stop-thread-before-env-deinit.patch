@@ -1,0 +1,133 @@
+diff --git a/open_fw/third_party/bluedroid/common/osi/include/osi/thread.h b/open_fw/third_party/bluedroid/common/osi/include/osi/thread.h
+index c0e90ee..4f99f11 100644
+--- a/open_fw/third_party/bluedroid/common/osi/include/osi/thread.h
++++ b/open_fw/third_party/bluedroid/common/osi/include/osi/thread.h
+@@ -136,4 +136,9 @@ void osi_dynamic_event_delete(struct osi_dynamic_event *event);
+ int osi_thread_event_init(void);
+ void osi_thread_event_deinit(void);
+ 
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++void osi_thread_stop(osi_thread_t *thread);
++bool osi_thread_is_stopping(const osi_thread_t *thread);
++#endif
++
+ #endif /* __THREAD_H__ */
+diff --git a/open_fw/third_party/bluedroid/common/osi/thread.c b/open_fw/third_party/bluedroid/common/osi/thread.c
+index 0bcc046..aeb67c4 100644
+--- a/open_fw/third_party/bluedroid/common/osi/thread.c
++++ b/open_fw/third_party/bluedroid/common/osi/thread.c
+@@ -198,12 +198,21 @@ static void osi_thread_run(void *arg)
+ 
+         osi_sem_take(&thread->work_sem, OSI_SEM_MAX_TIMEOUT);
+ 
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++        if (__atomic_load_n(&thread->stop, __ATOMIC_ACQUIRE)) {
++            break;
++        }
++
++        struct work_item item;
++        while (!__atomic_load_n(&thread->stop, __ATOMIC_ACQUIRE) && idx < thread->work_queue_num) {
++#else
+         if (thread->stop) {
+             break;
+         }
+ 
+         struct work_item item;
+         while (!thread->stop && idx < thread->work_queue_num) {
++#endif
+             if (osi_thead_work_queue_get(thread->work_queues[idx], &item) == true) {
+                 #if OSI_THREAD_DEBUG
+                 osi_thread_run_item(thread, idx, &item);
+@@ -229,6 +238,22 @@ static int osi_thread_join(osi_thread_t *thread, uint32_t wait_ms)
+     return osi_sem_take(&thread->stop_sem, wait_ms);
+ }
+ 
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++bool osi_thread_is_stopping(const osi_thread_t *thread)
++{
++    return thread == NULL || __atomic_load_n(&thread->stop, __ATOMIC_ACQUIRE);
++}
++
++void osi_thread_stop(osi_thread_t *thread)
++{
++    int ret;
++
++    if (!thread || !thread->thread_handle) {
++        return;
++    }
++
++    __atomic_store_n(&thread->stop, true, __ATOMIC_RELEASE);
++#else
+ static void osi_thread_stop(osi_thread_t *thread)
+ {
+     int ret;
+@@ -237,6 +262,7 @@ static void osi_thread_stop(osi_thread_t *thread)
+ 
+     //stop the thread
+     thread->stop = true;
++#endif
+     osi_sem_give(&thread->work_sem);
+ 
+     //join
+diff --git a/open_fw/third_party/bluedroid/host/bluedroid/hci/hci_layer.c b/open_fw/third_party/bluedroid/host/bluedroid/hci/hci_layer.c
+index deda736..207fb94 100644
+--- a/open_fw/third_party/bluedroid/host/bluedroid/hci/hci_layer.c
++++ b/open_fw/third_party/bluedroid/host/bluedroid/hci/hci_layer.c
+@@ -215,6 +215,13 @@ void hci_shut_down(void)
+     hci_c2h_credit_close();
+ #endif
+ 
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++    /* open_fw patch 0030: stop and join hci_host_thread before tearing down hal->close() (rx_q) and
++     * hci_layer_deinit_env() (commands_pending_response_lock, command_queue), so an in-flight upstream item
++     * (e.g. patch 0016's hand-off OOM retry) cannot wake into freed queues/mutexes. */
++    osi_thread_stop(hci_host_thread);
++#endif
++
+     /* Close HAL and cleanup before freeing thread: hal->open() and osi_event_bind()
+      * stored references to hci_host_thread; they must not use it after osi_thread_free(). */
+     if (hci_host_thread != NULL) {
+diff --git a/open_fw/third_party/bluedroid/host/bluedroid/stack/btu/btu_hcif.c b/open_fw/third_party/bluedroid/host/bluedroid/stack/btu/btu_hcif.c
+index c184f32..e58b4f9 100644
+--- a/open_fw/third_party/bluedroid/host/bluedroid/stack/btu/btu_hcif.c
++++ b/open_fw/third_party/bluedroid/host/bluedroid/stack/btu/btu_hcif.c
+@@ -64,9 +64,16 @@
+ #endif
+ static BT_HDR *openfw_hcif_handoff_alloc(size_t size)
+ {
++    if (osi_thread_is_stopping(hci_get_current_thread())) {
++        return NULL;
++    }
+     BT_HDR *event = osi_calloc(size);
+-    for (int i = 0; event == NULL && i < OPENFW_HCIF_HANDOFF_RETRIES; i++) {
++    for (int i = 0; event == NULL && i < OPENFW_HCIF_HANDOFF_RETRIES &&
++                    !osi_thread_is_stopping(hci_get_current_thread()); i++) {
+         vTaskDelay(1);
++        if (osi_thread_is_stopping(hci_get_current_thread())) {
++            break;
++        }
+         event = osi_calloc(size);
+     }
+     return event;
+@@ -1651,7 +1658,9 @@ static void btu_hcif_command_complete_evt(BT_HDR *response, void *context)
+         uint16_t opcode = openfw_hcif_cmd_opcode(response->data + response->offset + 3);
+         HCI_TRACE_ERROR("%s: no memory, Command Complete 0x%04x dropped", __func__, opcode);
+         osi_free(response);
+-        bt_port_on_hci_command_timeout(opcode);
++        if (!osi_thread_is_stopping(hci_get_current_thread())) {
++            bt_port_on_hci_command_timeout(opcode);
++        }
+         return;
+     }
+ #else
+@@ -2011,7 +2020,9 @@ static void btu_hcif_command_status_evt(uint8_t status, BT_HDR *command, void *c
+         uint16_t opcode = openfw_hcif_cmd_opcode(command->data + command->offset);
+         HCI_TRACE_ERROR("%s: no memory, Command Status 0x%04x dropped", __func__, opcode);
+         HCI_FREE_CMD_BUF(command); /* open_fw patch 0016: the status callback owns the command */
+-        bt_port_on_hci_command_timeout(opcode);
++        if (!osi_thread_is_stopping(hci_get_current_thread())) {
++            bt_port_on_hci_command_timeout(opcode);
++        }
+         return;
+     }
+ #else

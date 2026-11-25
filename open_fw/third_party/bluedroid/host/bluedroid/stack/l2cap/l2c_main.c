@@ -268,10 +268,24 @@ BOOLEAN l2c_rcv_acl_data (BT_HDR *p_msg, UINT16 *p_credit_handle)
     BOOLEAN     credit_on_exit = TRUE;
 #endif
 
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+    if (p_msg->len < 2) {
+        osi_free(p_msg);
+        return FALSE;
+    }
+#endif
     /* Extract the handle */
     STREAM_TO_UINT16 (handle, p);
     pkt_type = HCID_GET_EVENT (handle);
     handle   = HCID_GET_HANDLE (handle);
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+    /* open_fw patch 0033: require the 4 B HCI ACL + 4 B L2CAP basic headers before reading them, and a 9th byte
+     * (cmd_code) before inspecting an unknown-handle packet for L2CAP_CMD_INFO_REQ / L2CAP_CMD_CONN_REQ. */
+    if (p_msg->len < 8) {
+        osi_free(p_msg);
+        goto l2c_rcv_acl_exit;
+    }
+#endif
 
     /* Since the HCI Transport is putting segmented packets back together, we */
     /* should never get a valid packet with the type set to "continuation"    */
@@ -279,6 +293,13 @@ BOOLEAN l2c_rcv_acl_data (BT_HDR *p_msg, UINT16 *p_credit_handle)
         /* Find the LCB based on the handle */
         if ((p_lcb = l2cu_find_lcb_by_handle (handle)) == NULL) {
             UINT8       cmd_code;
+
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+            if (p_msg->len < 9) {
+                osi_free(p_msg);
+                goto l2c_rcv_acl_exit;
+            }
+#endif
 
             /* There is a slight possibility (specifically with USB) that we get an */
             /* L2CAP connection request before we get the HCI connection complete.  */

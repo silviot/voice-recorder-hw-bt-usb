@@ -136,6 +136,8 @@ static struct {
     uint32_t acl_head, acl_tail, acl_epoch;
     held_acl_t held[BT_CTRL_HELD_ACL];
     uint32_t held_head, held_n;
+    uint8_t acl_min_valid;        /* bit i: acl_min_seq[i] set once bt_dlv hands DISC / CONN_CMP to the host */
+    uint32_t acl_min_seq[BT_CTRL_MAX_LINKS];
 
     /* host -> controller ACL accounting (packets handed to the ROM, not yet completed) */
     hcount_t inflight[BT_CTRL_MAX_LINKS];
@@ -754,13 +756,18 @@ static bt_rom_msg_ret_t rom_acl_rx(uint8_t *param, uint16_t len, uint32_t seq)
         g.st.acl_rx_bad++;
         return BT_ROM_MSG_CONSUMED;
     }
-    if (d.length == 0u || d.length > BT_ROM_EM_BUF_PAYLOAD || g.held_n >= BT_CTRL_HELD_ACL) {
-        if (g.held_n >= BT_CTRL_HELD_ACL) {
+    uint16_t conhdl = (uint16_t)(d.conhdl & 0x0FFFu);
+    uint8_t bit = handle_bit(conhdl);
+    if (d.length == 0u || d.length > BT_ROM_EM_BUF_PAYLOAD || bit == 0u || (g.dead & bit) != 0u ||
+        g.held_n >= BT_CTRL_HELD_ACL) {
+        if (d.length == 0u || d.length > BT_ROM_EM_BUF_PAYLOAD || bit == 0u) {
+            g.st.acl_rx_bad++;
+        } else if ((g.dead & bit) != 0u) {
+            g.st.acl_rx_dropped_disc++;
+        } else {
             g.st.acl_rx_overflow++;
             g.st.invariant++;
             defer_fault(BT_CTRL_FAULT_INVARIANT, BT_CTRL_SITE_ACL_RX_HELD, d.conhdl, d.length);
-        } else {
-            g.st.acl_rx_bad++;
         }
         if (!gate()) {
             return BT_ROM_MSG_KEEP;
@@ -772,7 +779,7 @@ static bt_rom_msg_ret_t rom_acl_rx(uint8_t *param, uint16_t len, uint32_t seq)
     h->param = param;
     h->em = d.buf_ptr;
     h->seq = seq;
-    h->handle = (uint16_t)(d.conhdl & 0x0FFFu);
+    h->handle = conhdl;
     h->len = d.length;
     h->off = 0u;
     h->pb = (uint8_t)(d.pb_bc_flag & 0x3u);
@@ -863,6 +870,7 @@ static bt_rom_msg_ret_t up_on_hci_msg(void *ctx, uint16_t id, uint8_t *param, ui
     }
     if (info.kind == BT_CTRL_EVK_CC || info.kind == BT_CTRL_EVK_CS) {
         g.st.evt_unsolicited_reply++;
+        return BT_ROM_MSG_CONSUMED;          /* never forward Num_HCI_Command_Packets=1 without a matching command */
     } else if (info.evt_code == BT_HCI_EVT_DISC) {
         note_add(BT_CTRL_NOTE_DISC, (uint16_t)(info.handle & 0x0FFFu), info.status, len >= 7u ? g.scratch[6] : 0u, 0u);
     } else if (info.evt_code == BT_HCI_EVT_CONN_CMP) {
@@ -930,6 +938,8 @@ static void controller_state_reset(void)
     lv.scan_enable = 0u;
     g.p.exit();
     g.held_head = g.held_n = 0u;
+    g.acl_min_valid = 0u;
+    memset(g.acl_min_seq, 0, sizeof(g.acl_min_seq));
     g.def_head = g.def_n = 0u;
     g.acl_blocked = 0u;
     g.p.enter();
@@ -944,10 +954,14 @@ static bool release_rom_objects(uint32_t *evt_dropped)
 {
     while (g.held_n != 0u) {
         held_acl_t *h = &g.held[g.held_head];
-        if (!gate()) {
-            return false;
+        if (h->em != NULL) {
+            if (!gate()) {
+                return false;
+            }
+            uint8_t *em = h->em;
+            h->em = NULL;
+            g.rom->em_rx_free(em);
         }
-        g.rom->em_rx_free(h->em);
         if (!gate()) {
             return false;
         }
@@ -1143,7 +1157,8 @@ static uint8_t forward_cmd(const bt_ctrl_cmd_row_t *row, uint16_t op, const uint
         }
     }
     uint8_t min_len = bt_ctrl_cmds_fwd_min_len(op);
-    uint16_t alloc_len = plen > min_len ? plen : min_len;
+    uint8_t copy_len = (op == 0x0C13u && plen > BT_CTRL_NAME_LEN) ? BT_CTRL_NAME_LEN : plen;
+    uint16_t alloc_len = copy_len > min_len ? copy_len : min_len;
     if (!gate()) {
         return 0xFFu;
     }
@@ -1152,8 +1167,8 @@ static uint8_t forward_cmd(const bt_ctrl_cmd_row_t *row, uint16_t op, const uint
         g.st.cmd_alloc_refused++;            /* real impl: g_bt_heap budget check refused (ROM itself cannot fail) */
         return BT_HCI_ERR_MEM_FULL;
     }
-    if (plen != 0u) {
-        memcpy(m, prm, plen);                /* verified layouts only (fwd_min_len table) */
+    if (copy_len != 0u) {
+        memcpy(m, prm, copy_len);            /* verified layouts only (fwd_min_len table; 0x0C13 keeps m[248]==0) */
     }
     if (!gate()) {
         return 0xFFu;
@@ -1285,7 +1300,11 @@ static void process_cmd(uint32_t idx)
         if (s == 0u) {
             g.st.cmd_fwd++;
             if (held) {
-                g.fwd_t0 = g.hold_t0;        /* its deadline stays inside the host's 8 s command timeout */
+                /* Keep inside Bluedroid's 8 s command timeout while leaving >= 500 ms for the ROM to execute it. */
+                uint32_t max_age = BT_CTRL_FWD_DEADLINE_MS - 500u;
+                g.fwd_t0 = (g.now_ms != NULL && (uint32_t)(g.fwd_t0 - g.hold_t0) > max_age)
+                               ? (uint32_t)(g.fwd_t0 - max_age)
+                               : g.hold_t0;
             }
             return;
         }
@@ -1500,11 +1519,69 @@ static bool retry_deferred(void)
     return progress;
 }
 
+static bool held_is_stale(const held_acl_t *h)
+{
+    uint8_t bit = handle_bit(h->handle);
+    if (bit == 0u) {
+        return true;
+    }
+    bool stale = false;
+    g.p.enter();
+    if ((g.acl_min_valid & bit) != 0u && seq_before(h->seq, g.acl_min_seq[h->handle - 0x80u])) {
+        stale = true;
+    }
+    g.p.exit();
+    return stale;
+}
+
+/* Drop held ACL_RX whose Disconnection Complete or a newer Connection Complete has already crossed to the host, even
+ * while C2H credits are exhausted (so a dead link neither pins EM RX buffers nor injects stale frames onto a reused
+ * handle once credits return). Returns false if parked. */
+static bool purge_stale_held(bool *progress)
+{
+    for (uint32_t i = 0u; i < g.held_n; ) {
+        uint32_t idx = (g.held_head + i) % BT_CTRL_HELD_ACL;
+        held_acl_t *h = &g.held[idx];
+        if (!held_is_stale(h)) {
+            i++;
+            continue;
+        }
+        if (h->em != NULL) {
+            if (!gate()) {
+                return false;
+            }
+            uint8_t *em = h->em;
+            h->em = NULL;
+            g.rom->em_rx_free(em);
+        }
+        if (!gate()) {
+            return false;
+        }
+        g.rom->msg_free(h->param);
+        for (uint32_t k = i; k + 1u < g.held_n; k++) {
+            g.held[(g.held_head + k) % BT_CTRL_HELD_ACL] = g.held[(g.held_head + k + 1u) % BT_CTRL_HELD_ACL];
+        }
+        g.held_n--;
+        g.st.acl_rx_dropped_disc++;
+        *progress = true;
+    }
+    return true;
+}
+
 static bool dispatch_acl(void)
 {
     bool progress = false;
+    if (!purge_stale_held(&progress)) {
+        return progress;
+    }
     while (g.held_n != 0u) {
         held_acl_t *h = &g.held[g.held_head];
+        if (held_is_stale(h)) {
+            if (!purge_stale_held(&progress)) {
+                return progress;
+            }
+            continue;
+        }
         /* Credit and ring space are checked BEFORE any fragment state changes (plan M1 RX dispatcher (2)). */
         if (g.c2h_fc && g.c2h_out_total >= g.c2h_credits) {
             g.st.acl_rx_credit_blocked++;
@@ -1690,16 +1767,16 @@ static void do_stop(void)
 
 uint32_t bt_ctrl_run(void)
 {
-    if (!g.inited || g.parked) {
+    if (!g.inited) {
         return 0u;
     }
     /* need_dlv is NOT cleared here: it is cleared only when wake_dlv() is actually called (end of this function), so
      * a wake withheld because the ROM lock was held is not lost. */
     if (g.state == ST_STOPPING) {
-        do_stop();
+        do_stop();                           /* gate() inside do_stop() skips all ROM calls if g.parked -> STOP_PARKED */
         return 0u;
     }
-    if (g.state != ST_OPEN) {
+    if (g.parked || g.state != ST_OPEN) {
         return 0u;
     }
     bool more = false;
@@ -1925,6 +2002,15 @@ int bt_ctrl_dlv_run(void)
         if (which == 0) {
             g.p.exit();
             return BT_CTRL_DLV_IDLE;
+        }
+        if (which == 1 && len >= 6u && (data[1] == BT_HCI_EVT_DISC || data[1] == BT_HCI_EVT_CONN_CMP) &&
+            data[3] == BT_HCI_OK) {
+            uint16_t eh = (uint16_t)(rd16(&data[4]) & 0x0FFFu);
+            uint8_t ebit = handle_bit(eh);
+            if (ebit != 0u) {
+                g.acl_min_seq[eh - 0x80u] = es->seq;
+                g.acl_min_valid |= ebit;
+            }
         }
         g.dlv_busy = 1u;
         g.p.exit();

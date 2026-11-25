@@ -10,6 +10,7 @@
 #include "sl6801_regs.h"
 #include "bt_ctrl_rtos.h"
 #include "bt_cpu_guard.h"
+#include "bt_rom_real.h"
 
 #define BT_CTRL_STACK_WORDS  BT_CTRL_RTOS_CTRL_STACK_WORDS   /* probe image: 4 KiB (see bt_ctrl_rtos.h) */
 #define BT_DLV_STACK_WORDS   384u   /* 1.5 KiB (plan §4) */
@@ -107,6 +108,17 @@ static void bt_ctrl_task(void *arg)
         s_run_t0 = t0;
         s_in_run = 1u;
         more = bt_ctrl_run();
+        if (!rom_lock_free()) {
+            /* A ROM path leaked PRIMASK: silence RW-BT and unwind PRIMASK BEFORE taskENTER_CRITICAL() or
+             * ulTaskNotifyTake(), otherwise PendSV cannot pend/fire and the CPU deadlocks with IRQs masked. */
+            bt_ctrl_rtos_hard_stop();
+            if (s_rom == &bt_rom_real) {
+                (void)bt_rom_real_silence();
+                bt_rom_real_force_unlock();
+            }
+            plat_fault(BT_CTRL_FAULT_INVARIANT);
+            more = 1u;
+        }
         uint32_t dt = now32() - t0;
         taskENTER_CRITICAL();
         s_in_run = 0u;               /* with the total update: the CPU guard never sees this run counted 0 times */

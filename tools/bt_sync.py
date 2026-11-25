@@ -59,8 +59,16 @@ def save_device_key(key_file: Path, mac: str, key: bytes) -> None:
         except Exception:
             pass
     data[mac.upper()] = key.hex()
-    key_file.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-    os.chmod(key_file, 0o600)
+    payload = (json.dumps(data, indent=2) + "\n").encode("utf-8")
+    tmp_file = key_file.with_suffix(key_file.suffix + ".tmp")
+    fd = os.open(tmp_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        os.write(fd, payload)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp_file, key_file)
 
 
 def crc16_ccitt_false(data: bytes, init: int = 0xFFFF) -> int:
@@ -333,13 +341,18 @@ class XRecRFCOMMClient:
         return dict(zip(keys, parts))
 
     def _read_xrec_frame(self, expected_offset: int, filename: str) -> bytes:
-        # Wait for either 12-byte binary header "XREC" or text error "+XREC:ERR,"
-        while len(self.rx_buf) < 4:
+        # Wait for either 12-byte binary header "XREC" or text error "+XREC:ERR," (even if split across recv chunks)
+        while True:
+            while self.rx_buf and self.rx_buf[0] in (0x0D, 0x0A):
+                del self.rx_buf[0]
+            if self.rx_buf.startswith(b"+"):
+                line = self._read_line()
+                if line.startswith("+XREC:"):
+                    raise RuntimeError(f"Device error reading {filename}@{expected_offset}: {line}")
+                continue
+            if len(self.rx_buf) >= 4:
+                break
             self._recv_into_buf()
-
-        if self.rx_buf.startswith(b"+XREC:ERR,"):
-            err = self._read_line()
-            raise RuntimeError(f"Device error reading {filename}@{expected_offset}: {err}")
 
         # Sync to "XREC" header (ignoring any stray HFP CR/LF)
         while True:

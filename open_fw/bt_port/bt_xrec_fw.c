@@ -341,6 +341,14 @@ const char *bt_xrec_plat_pairing_block(void)
 }
 
 /* ============================================ files (app task) ================================================== */
+static void wipe_mem(void *p, size_t n)
+{
+    volatile uint8_t *v = (volatile uint8_t *)p;
+    for (size_t i = 0u; i < n; i++) {
+        v[i] = 0u;
+    }
+}
+
 /* Staged replace, as legacy save_root_file_atomic (F:1441-1462). Returns 0 on success. */
 static int save_root_file_atomic(const char *tmp_name, const char *final_name, const void *data, uint32_t len)
 {
@@ -382,7 +390,7 @@ void bt_xrec_plat_load_bound_key(xrec_ctx_t *ctx)
         blob[0] == 'C' && blob[1] == 'S' && blob[2] == 'K' && blob[3] == '5') {
         xrec_set_bound_key(ctx, &blob[4]);
     }
-    memset(blob, 0, sizeof(blob));
+    wipe_mem(blob, sizeof(blob));
 }
 
 void bt_xrec_plat_save_bound_key(const uint8_t key[32])
@@ -396,7 +404,7 @@ void bt_xrec_plat_save_bound_key(const uint8_t key[32])
     if (save_root_file_atomic(".cassini.tmp", "cassini.key", blob, (uint32_t)sizeof(blob)) != 0 && s_sd) {
         bt_xrec_plat_log("BT XREC key not saved (SD write failed)");
     }
-    memset(blob, 0, sizeof(blob));
+    wipe_mem(blob, sizeof(blob));
 }
 
 void bt_xrec_plat_set_mode(uint8_t mode, int (*profile_down)(void))
@@ -443,7 +451,7 @@ static void bonds_load(void)
             bt_xrec_plat_log_u32("BT bond file rejected (store starts empty), err", (uint32_t)r);
         }
     }
-    memset(img, 0, (size_t)ent.size);
+    wipe_mem(img, (size_t)ent.size);
     vPortFree(img);
 }
 
@@ -468,7 +476,7 @@ static void bonds_write(void)
         }
         s_bond_retry_at = millis() + BOND_RETRY_MS;
     }
-    memset(img, 0, BT_STORE_IMAGE_MAX);
+    wipe_mem(img, BT_STORE_IMAGE_MAX);
     vPortFree(img);
 }
 
@@ -768,7 +776,7 @@ static int job_down(void)
     if (esp_bluedroid_get_status() == ESP_BLUEDROID_STATUS_ENABLED) {
         esp_spp_profile_status_t ps;
         memset(&ps, 0, sizeof(ps));
-        if (esp_spp_get_profile_status(&ps) == ESP_OK && ps.spp_inited) {
+        if ((esp_spp_get_profile_status(&ps) == ESP_OK && ps.spp_inited) || bt_xrec_spp_deinit_needed()) {
             if (esp_spp_deinit() == ESP_OK) {
                 while (!bt_xrec_spp_uninit_seen()) {
                     vTaskDelay(1);
@@ -1037,6 +1045,10 @@ void bt_xrec_plat_session_end(void)
 
 void bt_xrec_plat_reboot(uint8_t mode)
 {
+    recorder_poll();
+    if (recorder_is_saving()) {
+        (void)recorder_stop();       /* finalise any active recording before reboot / OTA / DFU */
+    }
     if (mode == 2u) {
         pmu_reboot_to_sd_ota();
     } else if (mode == 3u) {

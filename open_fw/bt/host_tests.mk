@@ -24,7 +24,7 @@ test-bt-port:
 	$(HOST_CC) $(BT_PORT_TEST_CFLAGS) tests/test_bt_rom_rng.c bt_port/bt_rom_rng.c bt_port/bt_p192.c \
 		-o $(BT_PORT_TEST_DIR)/test_bt_rom_rng
 	$(BT_PORT_TEST_DIR)/test_bt_rom_rng $(BT_ROM_DUMP)
-	$(HOST_CC) $(BT_PORT_TEST_CFLAGS) tests/test_bt_alarm.c bt_port/bt_alarm.c -o $(BT_PORT_TEST_DIR)/test_bt_alarm
+	$(HOST_CC) $(BT_PORT_TEST_CFLAGS) tests/test_bt_alarm.c bt_port/bt_alarm.c bt_port/bt_esp_timer.c -o $(BT_PORT_TEST_DIR)/test_bt_alarm
 	$(BT_PORT_TEST_DIR)/test_bt_alarm
 	$(HOST_CC) $(BT_PORT_TEST_CFLAGS) tests/test_bt_store.c bt_port/bt_store.c src/crypto.c -o $(BT_PORT_TEST_DIR)/test_bt_store
 	$(BT_PORT_TEST_DIR)/test_bt_store

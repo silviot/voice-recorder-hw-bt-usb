@@ -559,6 +559,19 @@ bool config_save(const config_t *config, const char *filename)
             }
         }
     }
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+    /* open_fw patch 0032: erase trailing bt_cfg_key<k> chunks left over from a larger previous save so they do not
+     * keep wasting space in the 4 KiB bt_store quota (BT_STORE_DATA_MAX) after the config shrinks. */
+    {
+        unsigned next_chunk = (w_cnt_total < CONFIG_FILE_MAX_SIZE) ? 1u : ((unsigned)(w_cnt_total / CONFIG_FILE_MAX_SIZE) + 1u);
+        for (unsigned k = next_chunk; k <= 0xFFu; k++) {
+            snprintf(keyname, keyname_bufsz, "%s%u", CONFIG_KEY, k);
+            if (nvs_erase_key(fp, keyname) == ESP_ERR_NVS_NOT_FOUND) {
+                break;
+            }
+        }
+    }
+#endif
 
     err = nvs_commit(fp);
     if (err != ESP_OK) {
@@ -633,11 +646,18 @@ static bool config_parse(nvs_handle_t fp, config_t *config)
     if(buf_size == 0) { //First use nvs
         goto ok;
     }
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+    buf = osi_calloc((size_t)buf_size + 1u);
+#else
     buf = osi_calloc(buf_size);
+#endif
     if (!line || !section || !buf || !keyname) {
         err_code |= 0x01;
         goto error;
     }
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+    length = (size_t)buf_size;
+#endif
     snprintf(keyname, keyname_bufsz, "%s%d", CONFIG_KEY, 0);
     err = nvs_get_blob(fp, keyname, buf, &length);
     if (err == ESP_ERR_NVS_NOT_FOUND) {
@@ -649,7 +669,14 @@ static bool config_parse(nvs_handle_t fp, config_t *config)
     }
     total_length += length;
     while (length == CONFIG_FILE_MAX_SIZE) {
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+        if (total_length >= (size_t)buf_size) {
+            break;
+        }
+        length = (size_t)buf_size - total_length;
+#else
         length = CONFIG_FILE_DEFAULE_LENGTH;
+#endif
         snprintf(keyname, keyname_bufsz, "%s%d", CONFIG_KEY, ++i);
         err = nvs_get_blob(fp, keyname, buf + CONFIG_FILE_MAX_SIZE * i, &length);
 
@@ -662,6 +689,9 @@ static bool config_parse(nvs_handle_t fp, config_t *config)
         }
         total_length += length;
     }
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+    buf[total_length] = '\0'; /* open_fw patch 0032: NUL-terminate so strchr() never reads past buf + total_length */
+#endif
     char *p_line_end;
     char *p_line_bgn = buf;
     strcpy(section, CONFIG_DEFAULT_SECTION);

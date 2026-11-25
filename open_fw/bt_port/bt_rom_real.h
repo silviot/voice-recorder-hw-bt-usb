@@ -88,6 +88,9 @@ int  bt_rom_real_busy(void);
  * the call can still write RWBTEN back when it resumes. Returns RWBT_CNTL read back (bit 8 RWBTEN, bit 29 soft reset
  * still pending); RWBTEN clear is what the legacy stop relies on to end inquiry / page scan. */
 uint32_t bt_rom_real_silence(void);
+/* Emergency PRIMASK unwind after bt_ctrl_rtos_hard_stop() + bt_rom_real_silence() when a ROM path returns with
+ * lock_depth() != 0 (otherwise ulTaskNotifyTake() in bt_ctrl_task deadlocks with PRIMASK=1). */
+void bt_rom_real_force_unlock(void);
 /* hci_tl_env.evt_msk (0x00803D04) as the ROM holds it now (Exp 1 stage B read-back of 0C01 Set Event Mask). */
 void bt_rom_real_evt_mask(uint8_t out[8]);
 /* What the legacy hook 0x00803BBC[7] stores for a Set Event Mask parameter: mask | these mandatory bits (F:481-488). */
