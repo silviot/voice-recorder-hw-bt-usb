@@ -120,16 +120,22 @@ here.
 ### Mismatched public key (plan step 6b): result (2026-11-25, session 9)
 Image: `make BT=1 BENCH=1 HP_GATES=1 KEYTEST_MISMATCH=1` from `5d45a5e` (FIRM CRC `0x2A66`): the session's private
 key is staged with the public key of a second, independent `bt_p192_keygen` pair. Run `secs=150 pair=1 pair_secs=120
-autoconfirm=1`; the user paired an Android phone from its Bluetooth settings.
-- `BT KEYTEST: staged public key belongs to another private key`, `BT ROM keys: installed 1 unexpected 0`.
-- Numeric comparison reached the device (`value 47398`, autoconfirmed), then `HCI ev=0x36 st=0x05` (Simple Pairing
-  Complete, Authentication Failure), disconnect reason 0x16; `BT SSP key spent ... no SSP until the next BT-mode
-  entry`. Phone: pairing failed; a second attempt no longer found `Cassini_1D` (window closed, not discoverable).
-- **Result: the ROM uses the staged pair.** A ROM keeping its fixed pair would have paired. Combined with the
-  consistent-pair successes (session 6 laptop numeric comparison, session 9 Jabra Just Works, both `installed 1`),
-  the private key in use is ours as well: our public with the ROM's private would fail every consistent pairing.
-- Same-phone control on the normal image (`029f2a8`, CRC `0x6B6A`) not yet run (staged, then withdrawn when the user
-  left; recipe: same RUN file, pairing must succeed).
+autoconfirm=1`; phone: Pixel 8 (Android), driven over adb (`uiautomator dump` + `input tap`: "Pair new device",
+tap `Cassini_1D`, tap **Pair** in "Check pairing codes").
+
+| Run | Image | Result |
+|---|---|---|
+| control | normal `029f2a8` (CRC `0x6B6A`) | phone code 458211 = device `value 458211`; `ev=0x36 st=0x00`, `BT SSP bonded (numeric comparison, MITM)`; phone stores the link key ~5 s after the tap |
+| mismatch | `KEYTEST_MISMATCH=1` (CRC `0x2A66`) | `BT KEYTEST: staged public key belongs to another private key`, `installed 1 unexpected 0`; phone code 143671 = device value; **`ev=0x36 st=0x05`** (Authentication Failure, DHKey check), disconnect reason 0x16; phone `BOND_NONE hciReason:5` 2.5 s after the user approval, "incorrect PIN or passkey"; `BT SSP key spent` (window closed, device no longer discoverable) |
+
+**Result: the ROM uses the staged pair** (public and private): with a fixed ROM pair the mismatch image would have
+paired; with our public and the ROM's private the control would have failed.
+
+Pitfall (cost two runs): Android's numeric-comparison dialog waits for **Pair** on the phone even when the device
+side auto-accepts. Untapped, the phone gives up after ~36 s with the same "incorrect PIN or passkey" text, and the
+device sees a late `ev=0x36 st=0x05` with disconnect reason **0x08** (timeout). The first mismatch attempt (user,
+unclear whether Pair was tapped) and the first control (not tapped) are therefore not evidence; tell a real key
+failure (reason 0x16, within seconds of the comparison) from a timeout (reason 0x08).
 
 ### Entropy source assessment: results (2026-11-25, session 9)
 Image: `DEV_EXP=1` default build from `integ/bt-all-local` `f078c9c` (FIRM CRC `0xA6BA`), gain 8, quiet room,
