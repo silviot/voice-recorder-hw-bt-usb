@@ -22,6 +22,8 @@ typedef struct {
     uint32_t ctrl_run_max_all_us; /* longest bt_ctrl_run() ever, incl. HCI Reset (RF calibration + ROM start) */
     uint32_t ctrl_run_total_us;  /* sum over ctrl_runs (CPU time of the bt_ctrl task body) */
     uint32_t ctrl_more;          /* bt_ctrl_run() returned "more work" */
+    uint32_t more_streak_max;    /* most consecutive "more" runs (no block in between), ever (review C5) */
+    uint32_t more_streak_max_us; /* longest time from the first run of such a streak to the end of its last run */
     uint32_t dlv_runs, dlv_retries;
     uint32_t faults, first_fault;
     uint32_t lock_violations;    /* FreeRTOS call attempted with the ROM PRIMASK lock held (plan §3 rule (e)) */

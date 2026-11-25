@@ -195,7 +195,7 @@ static struct {
     uint32_t phase;
     uint32_t prev_pkts, prev_frames, prev_acked, prev_pads, prev_el_ms;
     uint32_t prev_us, prev_late, prev_ticks, prev_sbc, prev_irq, prev_ui_fr;
-    uint32_t prev_runs, prev_run_us, prev_svc_us, prev_disp_us, prev_disp_n;
+    uint32_t prev_runs, prev_run_us, prev_svc_us, prev_disp_us, prev_disp_n, prev_more;
 } s_hp BENCH_HI;
 static char s_hp_play_path[BT_BENCH_HP_FILE_MAX + 1u] BENCH_HI;
 
@@ -405,7 +405,22 @@ static void hp_cpu_stats(const hp_tx_t *t)
         lku("glue_us", run_us > isr + ke ? run_us - isr - ke : 0u);
         lku("disp", rd.disp_count - s_hp.prev_disp_n);
         lku("us_run", runs ? run_us / runs : 0u);
+        lku("more", cs.ctrl_more - s_hp.prev_more);
+        lku("streak_max", cs.more_streak_max);
+        lku("streak_us", cs.more_streak_max_us);
         lemit();
+        /* review A11: stack high-water marks (free words, lowest seen) every 5th line */
+        if ((s_hp.stat_n % 5u) == 0u) {
+            lbegin("hp stack");
+            for (UBaseType_t i = 0; i < n; i++) {
+                if (s_ll > 120u) {
+                    lemit();
+                    lbegin("hp stack+");
+                }
+                lku(ts[i].pcTaskName, (uint32_t)ts[i].usStackHighWaterMark);
+            }
+            lemit();
+        }
     }
     s_task_prev_n = 0u;
     for (UBaseType_t i = 0; i < n && i < HPB_TASKS_MAX; i++) {
@@ -421,6 +436,7 @@ static void hp_cpu_stats(const hp_tx_t *t)
     s_hp.prev_ui_fr = ui_fr;
     s_hp.prev_runs = cs.ctrl_runs;
     s_hp.prev_run_us = cs.ctrl_run_total_us;
+    s_hp.prev_more = cs.ctrl_more;
     s_hp.prev_svc_us = rd.svc_sum_us;
     s_hp.prev_disp_us = rd.disp_sum_us;
     s_hp.prev_disp_n = rd.disp_count;

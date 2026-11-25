@@ -112,7 +112,7 @@ static void leak_unwind(void)
 BT_FAST static void bt_ctrl_task(void *arg)
 {
     (void)arg;
-    uint32_t more = 0u;
+    uint32_t more = 0u, streak = 0u, streak_t0 = 0u;
     for (;;) {
         (void)ulTaskNotifyTake(pdTRUE, more ? 0u : portMAX_DELAY);
         uint32_t t0 = now32();
@@ -135,6 +135,17 @@ BT_FAST static void bt_ctrl_task(void *arg)
         s_st.ctrl_run_total_us += dt;
         if (more) {
             s_st.ctrl_more++;
+            if (streak++ == 0u) {
+                streak_t0 = t0;
+            }
+            if (streak > s_st.more_streak_max) {
+                s_st.more_streak_max = streak;
+            }
+            if (t0 + dt - streak_t0 > s_st.more_streak_max_us) {
+                s_st.more_streak_max_us = t0 + dt - streak_t0;
+            }
+        } else {
+            streak = 0u;
         }
         if (dt > s_st.ctrl_run_max_us) {
             s_st.ctrl_run_max_us = dt;
