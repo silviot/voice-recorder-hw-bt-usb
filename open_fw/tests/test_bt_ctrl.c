@@ -3371,6 +3371,55 @@ static void test_hp_connect_fail(void)
     shutdown_and_check();
 }
 
+/* Role Change before Connection Complete (the slave asks for the switch during connection set-up, as TWS earbuds do):
+ * the link view applies it to the paged address's link instead of dropping it; the 0405 packet types / role-switch
+ * permission and the peer's page-0 features are kept for the linkinfo line (design §7, §10.2). */
+static void test_hp_link_view_early_role(void)
+{
+    if (!hp_gated_on()) return;
+    fake_peer_cfg_t c;
+    hp_cfg(&c);
+    c.role_switch_before_connect = true;
+    setup();
+    bt_ctrl_set_clock(clk);
+    t_now_ms = 500u;
+    bring_up();
+    fake_peer_init(&c);
+    uint8_t prm[16];
+    send_cmd(0x0405u, prm, hp_create_params(prm, k_hp));
+    pump();
+    const pkt_t *p = next_pkt();
+    CHECK(is_reply(p, 0x0405u) && status_of(p) == 0u, "0405 CS 0");
+    p = next_pkt();
+    CHECK(is_evt(p, 0x12) && p->d[3] == 0u && p->d[10] == 1u, "Role Change (we: slave) before the Connection Complete");
+    p = next_pkt();
+    CHECK(is_evt(p, 0x03) && p->d[3] == 0u, "Connection Complete");
+    uint16_t h = p != NULL ? (uint16_t)(p->d[4] | (p->d[5] << 8)) : 0u;
+    bt_ctrl_link_info_t li;
+    CHECK(bt_ctrl_link_info(h, &li) == 1 && li.up && li.outgoing && li.role == BT_CTRL_ROLE_SLAVE &&
+          li.role_changes == 1u, "link view after an early role change: role %u (want slave) changes %u", li.role,
+          li.role_changes);
+    CHECK(li.req_pkt_type == 0xCC18u && li.req_allow_rs == 0u, "0405 packet types 0x%04X allow_rs %u kept",
+          li.req_pkt_type, li.req_allow_rs);
+    CHECK(!li.rmt_feat_seen, "no remote features yet");
+    uint8_t hh[2] = { (uint8_t)h, (uint8_t)(h >> 8) };
+    send_cmd(0x041Bu, hh, 2);
+    pump();
+    p = next_pkt();
+    CHECK(is_reply(p, 0x041Bu) && status_of(p) == 0u, "041B CS 0");
+    p = next_pkt();
+    CHECK(is_evt(p, 0x0B) && p->d[3] == 0u, "Read Remote Supported Features Complete");
+    CHECK(bt_ctrl_link_info(h, &li) == 1 && li.rmt_feat_seen && li.rmt_feat0 == 0xBFu && li.rmt_feat3 == 0xFEu,
+          "remote page-0 features kept: seen %u byte0 0x%02X byte3 0x%02X", li.rmt_feat_seen, li.rmt_feat0,
+          li.rmt_feat3);
+    /* a Role Change for an address with no link and no page pending changes nothing */
+    fake_peer_disconnect(0x13);
+    pump();
+    while (next_pkt() != NULL) {}
+    CHECK(bt_ctrl_link_info(h, &li) == 1 && !li.up, "link down");
+    shutdown_and_check();
+}
+
 /* Create Connection Cancel: while paging (CC 0, then Connection Complete 0x02), after the page won (0x0B), with
  * nothing to cancel (0x02); the CC always echoes the address (CC(10)). */
 static void test_hp_create_cancel(void)
@@ -3499,6 +3548,7 @@ int main(void)
         { "hp_connect_fail", test_hp_connect_fail },
         { "hp_create_cancel", test_hp_create_cancel },
         { "hp_link_view_accept", test_hp_link_view_accept },
+        { "hp_link_view_early_role", test_hp_link_view_early_role },
     };
     for (size_t i = 0; i < sizeof(tests) / sizeof(tests[0]); i++) {
         int before = g_fail;

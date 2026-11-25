@@ -117,7 +117,12 @@ typedef struct {
     uint8_t  role_changes;         /* Role Change events (any status) */
     uint8_t  max_slots;            /* last Max Slots Change (0 = none seen) */
     uint8_t  mode;                 /* last successful Mode Change: 0 active, 1 hold, 2 sniff */
-    uint16_t pkt_type;             /* last successful Connection Packet Type Changed (0 = none seen) */
+    uint16_t pkt_type;             /* last successful Connection Packet Type Changed (0 = none seen; only sent after
+                                      040F, which stays REJ: expect 0) */
+    uint16_t req_pkt_type;         /* outgoing link: the Packet_Type of our 0405 (0 for an accepted one) */
+    uint8_t  req_allow_rs;         /* outgoing link: 0405 Allow_Role_Switch */
+    uint8_t  rmt_feat_seen;        /* Read Remote Supported Features Complete (0x0B) seen */
+    uint8_t  rmt_feat0, rmt_feat3; /* its page-0 bytes 0 (bit 0 3-slot, bit 1 5-slot) and 3 (bit 1 EDR 2M, bit 2 3M) */
     uint8_t  bda[6];               /* Bluedroid BD_ADDR order (most significant byte first) */
     uint32_t acl_sent;             /* host ACL packets handed to the ROM on this link */
     uint32_t acl_completed;        /* ...completed by the ROM's NOCP (cumulative, counted before the host sees them) */

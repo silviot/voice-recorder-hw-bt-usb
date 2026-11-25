@@ -149,6 +149,7 @@ typedef struct {
     uint8_t psrm;
     int8_t rssi;
     bool role_switch_on_connect;    /* right after our page the headset takes the master role: E461 (we: slave) */
+    bool role_switch_before_connect;/* ...during connection set-up: E461 before the Connection Complete (TWS earbuds) */
     uint8_t max_slots_on_connect;   /* E468 Max Slots Change after the Connection Complete (0 = none) */
 } fake_peer_cfg_t;
 

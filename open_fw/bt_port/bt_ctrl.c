@@ -174,6 +174,9 @@ static struct {
 static struct {
     bt_ctrl_link_info_t link[BT_CTRL_MAX_LINKS];   /* written by bt_ctrl context and read by any task, under enter() */
     uint8_t page_pending, page_bda[6];       /* 0405 accepted by the ROM (CS 0), Connection Complete still to come */
+    uint16_t page_pkt_type;                  /* that 0405's Packet_Type and Allow_Role_Switch (linkinfo, design §10.2) */
+    uint8_t page_allow_rs;
+    uint8_t early_role_n, early_role, early_bda[6];   /* Role Change(s) before the Connection Complete (wire order) */
     uint8_t accept_pending, accept_bda[6], accept_role;   /* 0409 accepted (CS 0), its Role parameter */
     uint8_t scan_enable;                     /* last 0C1A value the ROM accepted (bt_ctrl_scan_enable) */
     uint8_t inq_active;                      /* 0401 CS 0 seen, no Inquiry Complete / 0402 CC since */
@@ -428,6 +431,7 @@ static void rmt_name_seen(const uint8_t *param, uint16_t param_len)
 #define BT_HCI_EVT_CONN_CMP 0x03u
 #define BT_HCI_EVT_CONN_REQ 0x04u
 #define BT_HCI_EVT_RMT_NAME 0x07u
+#define BT_HCI_EVT_RMT_FEAT 0x0Bu
 #define BT_HCI_EVT_ROLE_CHG 0x12u
 #define BT_HCI_EVT_MODE_CHG 0x14u
 #define BT_HCI_EVT_MAX_SLOTS 0x1Bu
@@ -485,6 +489,9 @@ static void cmd_accepted(uint16_t op)
     if (op == BT_CTRL_OP_CREATE_CONN && g.fwd_plen >= 6u) {
         lv.page_pending = 1u;                 /* the Connection Complete for this address makes an outgoing link */
         memcpy(lv.page_bda, g.fwd_params, 6u);
+        lv.page_pkt_type = g.fwd_plen >= 8u ? rd16(&g.fwd_params[6]) : 0u;
+        lv.page_allow_rs = g.fwd_plen >= 13u ? g.fwd_params[12] : 0u;
+        lv.early_role_n = 0u;
     } else if (op == BT_CTRL_OP_ACCEPT_CONN && g.fwd_plen >= 7u) {
         lv.accept_pending = 1u;
         memcpy(lv.accept_bda, g.fwd_params, 6u);
@@ -509,6 +516,16 @@ static void link_event(const bt_ctrl_evt_info_t *info, const uint8_t *param, uin
         uint8_t acc = lv.accept_pending && memcmp(a, lv.accept_bda, 6u) == 0;
         uint8_t role = out ? BT_CTRL_ROLE_MASTER
                        : acc ? (lv.accept_role == 0u ? BT_CTRL_ROLE_MASTER : BT_CTRL_ROLE_SLAVE) : BT_CTRL_ROLE_UNKNOWN;
+        /* a Role Change for this address that came before its Connection Complete (the slave asked for the switch
+         * during set-up): applied now instead of being lost (it found no link then) */
+        uint8_t early = (out || acc) && lv.early_role_n != 0u && memcmp(a, lv.early_bda, 6u) == 0;
+        if (early && lv.early_role != BT_CTRL_ROLE_UNKNOWN) {
+            role = lv.early_role;
+        }
+        uint8_t early_n = early ? lv.early_role_n : 0u;
+        if (out || acc) {
+            lv.early_role_n = 0u;
+        }
         lv.page_pending = out ? 0u : lv.page_pending;
         lv.accept_pending = acc ? 0u : lv.accept_pending;
         l = link_of(h);
@@ -518,6 +535,11 @@ static void link_event(const bt_ctrl_evt_info_t *info, const uint8_t *param, uin
             l->up = 1u;
             l->outgoing = out;
             l->role = role;
+            l->role_changes = early_n;
+            if (out) {
+                l->req_pkt_type = lv.page_pkt_type;
+                l->req_allow_rs = lv.page_allow_rs;
+            }
             for (uint32_t i = 0u; i < 6u; i++) {
                 l->bda[i] = a[5u - i];
             }
@@ -535,9 +557,11 @@ static void link_event(const bt_ctrl_evt_info_t *info, const uint8_t *param, uin
         break;
     case BT_HCI_EVT_ROLE_CHG: {                        /* {s, bdaddr, role} (8) verbatim */
         uint16_t hh = 0u;
+        bool found = false;
         for (uint32_t i = 0u; i < BT_CTRL_MAX_LINKS; i++) {
             if (lv.link[i].up && bda_is_wire(lv.link[i].bda, &param[1])) {
                 hh = (uint16_t)(0x80u + i);
+                found = true;
                 g.p.enter();
                 lv.link[i].role_changes++;
                 if (info->status == BT_HCI_OK) {
@@ -545,6 +569,21 @@ static void link_event(const bt_ctrl_evt_info_t *info, const uint8_t *param, uin
                 }
                 g.p.exit();
                 break;
+            }
+        }
+        if (!found && ((lv.page_pending && memcmp(&param[1], lv.page_bda, 6u) == 0) ||
+                       (lv.accept_pending && memcmp(&param[1], lv.accept_bda, 6u) == 0))) {
+            /* before the Connection Complete of the link being set up: kept for it (TWS earbuds switch here) */
+            if (lv.early_role_n == 0u || memcmp(&param[1], lv.early_bda, 6u) != 0) {
+                lv.early_role_n = 0u;
+                lv.early_role = BT_CTRL_ROLE_UNKNOWN;
+                memcpy(lv.early_bda, &param[1], 6u);
+            }
+            if (lv.early_role_n < 255u) {
+                lv.early_role_n++;
+            }
+            if (info->status == BT_HCI_OK) {
+                lv.early_role = param[7];
             }
         }
         note_add(BT_CTRL_NOTE_ROLE, hh, info->status, param[7], 0u);
@@ -563,6 +602,16 @@ static void link_event(const bt_ctrl_evt_info_t *info, const uint8_t *param, uin
         if (l != NULL && info->status == BT_HCI_OK) {
             g.p.enter();
             l->mode = param[4];
+            g.p.exit();
+        }
+        break;
+    case BT_HCI_EVT_RMT_FEAT:                          /* {s, pad, h, features[8]@4} (FIX_REM_FEAT) */
+        l = link_of((uint16_t)(rd16(&param[2]) & 0x0FFFu));
+        if (l != NULL && info->status == BT_HCI_OK && l->up) {
+            g.p.enter();
+            l->rmt_feat_seen = 1u;
+            l->rmt_feat0 = param[4];
+            l->rmt_feat3 = param[7];
             g.p.exit();
         }
         break;
@@ -873,6 +922,7 @@ static void controller_state_reset(void)
     memset(g.local_name, 0, sizeof(g.local_name));
     g.ssp_host = 0u;
     lv.page_pending = lv.accept_pending = 0u;
+    lv.early_role_n = 0u;
     lv.inq_active = 0u;
     lv.inq_results = 0u;
     g.p.enter();

@@ -810,6 +810,9 @@ static void page_success(void)
     c[2] = (uint8_t)fake_peer.handle;
     memcpy(&c[5], s_peer.addr, 6u);
     c[11] = 1u;
+    if (s_peer.role_switch_before_connect) {
+        fake_peer_role_switch(1u);           /* the switch happens in LMP set-up, before the Connection Complete */
+    }
     peer_emit(0xE456u, peer_lc_src(), c, 13u);
     f.paging = false;
     lm_set(0u);
