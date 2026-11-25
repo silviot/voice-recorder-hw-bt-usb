@@ -383,29 +383,42 @@ static int xfer_fresh(const xrec_ctx_t *ctx, uint32_t now)
     return ctx->xfer_valid && (!ctx->ops.now_ms || (uint32_t)(now - ctx->xfer_t_ms) < XREC_XFER_HOLD_MS);
 }
 
-/* Display copy: at most XREC_XFER_NAME - 1 bytes, never ending inside a UTF-8 sequence. */
+/* Display copy: at most XREC_XFER_NAME - 1 bytes. A longer name is cut on a UTF-8 character boundary and ends in
+ * U+2026 "\xE2\x80\xA6" (in ui_font_sm), so a cut that still fits the label (2-byte scripts) does not pass for the
+ * full name; the label's own LONG_DOT handles names that are too wide in pixels. */
 static void xfer_copy_name(char *dst, const char *src)
 {
     uint32_t n = 0u;
     while (src[n] != '\0' && n < (XREC_XFER_NAME - 1u)) {
         n++;
     }
-    if (src[n] != '\0') {
-        while (n > 0u && (((uint8_t)src[n]) & 0xC0u) == 0x80u) {
-            n--;                       /* src[n] continues a character: drop its lead byte too */
-        }
+    if (src[n] == '\0') {
+        mem_copy(dst, src, n + 1u);
+        return;
+    }
+    n = XREC_XFER_NAME - 4u;           /* room for the 3-byte ellipsis + NUL */
+    while (n > 0u && (((uint8_t)src[n]) & 0xC0u) == 0x80u) {
+        n--;                           /* src[n] continues a character: drop its lead byte too */
     }
     mem_copy(dst, src, n);
-    dst[n] = '\0';
+    dst[n]      = (char)0xE2;
+    dst[n + 1u] = (char)0x80;
+    dst[n + 2u] = (char)0xA6;
+    dst[n + 3u] = '\0';
 }
 
-/* A GETS / PUT starts: the same file within the hold time continues (done never goes back), anything else restarts. */
+/* A GETS / PUT starts: the same file within the hold time resuming mid-file continues (done never goes back, so a
+ * retried window does not flicker); a start at offset 0, another file, or a stale view restarts. done is clamped to
+ * total (a GETS at or past EOF moves no byte). */
 static void xfer_begin(xrec_ctx_t *ctx, uint8_t upload, const char *name, uint32_t id, uint32_t done, uint32_t total)
 {
     uint32_t now = xfer_now(ctx);
     char shown[XREC_XFER_NAME];
     xfer_copy_name(shown, name);
-    if (!xfer_fresh(ctx, now) || ctx->xfer_upload != upload || ctx->xfer_id != id ||
+    if (total != 0u && done > total) {
+        done = total;
+    }
+    if (done == 0u || !xfer_fresh(ctx, now) || ctx->xfer_upload != upload || ctx->xfer_id != id ||
         !str_eq(ctx->xfer_name, shown)) {
         ctx->xfer_upload = upload;
         ctx->xfer_id     = id;
@@ -780,8 +793,10 @@ static void handle_get_common(xrec_ctx_t *ctx, const char *args, int is_stream)
 
     /* Stop any active LS stream so text lines never interleave with binary GETS frames */
     ctx->ls_active      = 0u;
-    xfer_begin(ctx, 0u, ctx->gets_file.name, ctx->gets_file.first_cluster, off,
-               (ctx->gets_file.size > 0xFFFFFFFFull) ? 0xFFFFFFFFu : (uint32_t)ctx->gets_file.size);
+    if ((uint64_t)off < ctx->gets_file.size) {   /* at/past EOF (a resume probe) no byte moves: no transfer view */
+        xfer_begin(ctx, 0u, ctx->gets_file.name, ctx->gets_file.first_cluster, off,
+                   (ctx->gets_file.size > 0xFFFFFFFFull) ? 0xFFFFFFFFu : (uint32_t)ctx->gets_file.size);
+    }
     ctx->gets_offset    = off;
     ctx->gets_rem       = tot;
     ctx->gets_chunk_max = (uint16_t)chunk;
@@ -1621,7 +1636,9 @@ void xrec_poll(xrec_ctx_t *ctx)
         ctx->gets_staged  = 0u;
         ctx->gets_offset += sent;
         ctx->gets_rem    -= sent;
-        xfer_progress(ctx, 0u, ctx->gets_offset);
+        if (sent > 0u) {   /* an empty EOF frame (GETS at/past the end) began no view: leave the shown one alone */
+            xfer_progress(ctx, 0u, ctx->gets_offset);
+        }
         if (eof || ctx->gets_rem == 0u) {
             ctx->gets_active = 0u;
         }

@@ -85,7 +85,7 @@ typedef enum {
 /* A file transfer kept shown this long after its last chunk: an app sync pauses between GETS bursts (and between
  * LS and the next file), the view must not flicker. */
 #define XREC_XFER_HOLD_MS 2000u
-#define XREC_XFER_NAME    24u      /* display copy of the file name, cut on a UTF-8 character boundary */
+#define XREC_XFER_NAME    24u      /* display copy of the file name; a longer one is cut on a UTF-8 boundary + U+2026 */
 
 /* The current (or last, within XREC_XFER_HOLD_MS) file transfer, for the BT screen. */
 typedef struct {

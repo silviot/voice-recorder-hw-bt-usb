@@ -524,6 +524,20 @@ static void check_bt_ui(ui_model_t *m)
     ui_render_screen(UI_SCR_BT, &b);
     for (int frame = 0; frame < 14; frame++) { s_now += 16u; ui_port_task_handler(); }
     assert(g_written_pixels == px_before);                                      /* same model: nothing redrawn */
+    /* a 2-byte-script name cut by xrec_proto (20 bytes + U+2026) fits the label: the ellipsis itself shows the cut */
+    {
+        static const char cut[] = "\xD0\x98\xD0\xBD\xD1\x82\xD0\xB5\xD1\x80\xD0\xB2\xD1\x8C\xD1\x8E_\xD1\x81_"
+                                  "\xE2\x80\xA6";                     /* "Интервью_с_…" */
+        lv_font_glyph_dsc_t g;
+        assert(lv_font_get_glyph_dsc(&ui_font_sm, &g, 0x2026u, 0u));
+        assert(sizeof(cut) <= sizeof(b.bt_xfer_name));
+        strcpy(b.bt_xfer_name, cut);
+        ui_render_screen(UI_SCR_BT, &b);
+        lv_obj_update_layout(objects.bt_l1_lbl);
+        printf("BT=1 cut name: [%s]\n", lv_label_get_text(objects.bt_l1_lbl));
+        assert(strncmp(lv_label_get_text(objects.bt_l1_lbl), "\xE2\x96\xBC ", 4) == 0 &&
+               strcmp(lv_label_get_text(objects.bt_l1_lbl) + 4, cut) == 0);   /* whole, ends in U+2026 */
+    }
     b.bt_xfer_up = 1u;
     strcpy(b.bt_xfer_name, "notes.cwx");
     b.bt_xfer_done = 12u * 1024u;

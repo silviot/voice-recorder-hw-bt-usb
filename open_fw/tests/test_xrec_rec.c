@@ -462,7 +462,7 @@ int main(int argc, char **argv)
         assert(strncmp(g_out, "XREC", 4) == 0);
         xrec_get_xfer(&g_x, g_now, &x);
         assert(x.active && !x.upload && x.done == 1000u && x.total == 3000u);
-        assert(strcmp(x.name, "XFER_LONG_NAME_01234567") == 0);              /* 23 bytes + NUL */
+        assert(strcmp(x.name, "XFER_LONG_NAME_01234\xE2\x80\xA6") == 0);     /* cut to 20 bytes + U+2026 + NUL */
         g_now += 1900u;                                                        /* a pause between bursts */
         xrec_get_xfer(&g_x, g_now, &x);
         assert(x.active && x.done == 1000u);
@@ -470,9 +470,15 @@ int main(int argc, char **argv)
         xrec_get_xfer(&g_x, g_now, &x);
         assert(x.active && x.done == 3000u && x.total == 3000u);
         g_now += 1500u;
-        cmd("+XREC:GETS,0,500,256,XFER_LONG_NAME_0123456789.wav");             /* a re-read: progress never goes back */
+        cmd("+XREC:GETS,1000,500,256,XFER_LONG_NAME_0123456789.wav");          /* a retried window: never goes back */
         xrec_get_xfer(&g_x, g_now, &x);
         assert(x.active && x.done == 3000u);
+        cmd("+XREC:GETS,3000,100,64,XFER_LONG_NAME_0123456789.wav");           /* EOF probe: no byte moves, no change */
+        xrec_get_xfer(&g_x, g_now, &x);
+        assert(x.active && x.done == 3000u && x.total == 3000u);
+        cmd("+XREC:GETS,0,500,256,XFER_LONG_NAME_0123456789.wav");             /* a fresh download from 0 starts over */
+        xrec_get_xfer(&g_x, g_now, &x);
+        assert(x.active && x.done == 500u && x.total == 3000u);
         g_now += 1999u;
         xrec_get_xfer(&g_x, g_now, &x);
         assert(x.active);
@@ -494,6 +500,13 @@ int main(int argc, char **argv)
         assert(strcmp(cmd("+XREC:GETS,0,100,64,NOPE.wav"), "+XREC:ERR,NOENT\r\n") == 0);
         xrec_get_xfer(&g_x, g_now, &x);
         assert(x.active && strcmp(x.name, "REC_0003.wav") == 0);
+        cmd("+XREC:GETS,5000,100,64,XFER_LONG_NAME_0123456789.wav");           /* past EOF of another file: no view */
+        xrec_get_xfer(&g_x, g_now, &x);
+        assert(x.active && strcmp(x.name, "REC_0003.wav") == 0 && x.done == 100u && x.total == 100u);
+        g_now += 2000u;
+        cmd("+XREC:GETS,5000,100,64,XFER_LONG_NAME_0123456789.wav");
+        xrec_get_xfer(&g_x, g_now, &x);
+        assert(!x.active);
 
         /* upload: bytes staged, total unknown; PUTEND keeps it shown, then it times out */
         g_now += 100u;
@@ -506,6 +519,10 @@ int main(int argc, char **argv)
         assert(strcmp(cmd("+XREC:PUTEND"), "+XREC:OK,PUTEND,640\r\n") == 0);
         xrec_get_xfer(&g_x, g_now, &x);
         assert(x.active && x.upload && x.done == 640u);
+        expect_put_ok(0u, "REC,REC_0001.cwx", b, 40u);                        /* the same file again from 0 */
+        xrec_get_xfer(&g_x, g_now, &x);
+        assert(x.active && x.upload && x.done == 40u);
+        assert(strcmp(cmd("+XREC:PUTEND"), "+XREC:OK,PUTEND,40\r\n") == 0);
         g_now += 2000u;
         xrec_get_xfer(&g_x, g_now, &x);
         assert(!x.active);
@@ -517,7 +534,18 @@ int main(int argc, char **argv)
         snprintf(tgt, sizeof(tgt), "CAS,%s", utf_name);
         expect_put_ok(0u, tgt, c, 32u);
         xrec_get_xfer(&g_x, g_now, &x);
-        assert(x.active && x.upload && strlen(x.name) == 22u && memcmp(x.name, utf_name, 22u) == 0);
+        assert(x.active && x.upload && strlen(x.name) == 23u && memcmp(x.name, utf_name, 20u) == 0 &&
+               memcmp(x.name + 20, "\xE2\x80\xA6", 4u) == 0);                    /* 10 letters + U+2026 */
+        /* an odd cut (2-byte letters after one ASCII byte) backs up to the character boundary */
+        snprintf(tgt, sizeof(tgt), "CAS,x%s", utf_name);
+        expect_put_ok(0u, tgt, c, 32u);
+        xrec_get_xfer(&g_x, g_now, &x);
+        assert(strlen(x.name) == 22u && memcmp(x.name, "x", 1u) == 0 && memcmp(x.name + 1, utf_name, 18u) == 0 &&
+               memcmp(x.name + 19, "\xE2\x80\xA6", 4u) == 0);
+        /* exactly 23 bytes: shown whole, no ellipsis */
+        expect_put_ok(0u, "CAS,ABCDEFGHIJKLMNOPQRSTUVW", c, 32u);
+        xrec_get_xfer(&g_x, g_now, &x);
+        assert(strcmp(x.name, "ABCDEFGHIJKLMNOPQRSTUVW") == 0);
 
         /* the link drops: nothing shown (the staged upload is aborted) */
         xrec_on_disconnect(&g_x);
