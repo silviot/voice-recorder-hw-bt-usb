@@ -358,6 +358,7 @@ static bool peer_handle(msg_t *m)
         fake_peer.encrypted = fake_peer.authenticated = false;
         fake_peer.handle = (uint16_t)(0x80u + fake_peer.link);
         fake_peer.conn_count++;
+        memset(fake_rom.lc_rem_p1[fake_peer.link], 0, 8u);              /* new LC instance: slot empty */
         {
             uint8_t c[13];
             memset(c, 0, sizeof(c));
@@ -400,6 +401,11 @@ static bool peer_handle(msg_t *m)
         t[1] = s_peer.max_page;
         if (p[2] == 0u) memcpy(&t[2], s_peer.features, 8u);
         if (p[2] == 1u) memcpy(&t[2], s_peer.features_p1, 8u);
+        if (p[2] == 2u && s_peer.max_page >= 2u) memcpy(&t[2], s_peer.features_p2, 8u);
+        fake_peer.ext_reads[p[2] < 3u ? p[2] : 3u]++;
+        /* LMP_features_res_ext rx (ROM 0x21E4C): the features land in the link's single "remote page 1" slot
+         * (LC env +0x74) whatever the page number (docs/BT_ROM_HCI_MAP.md §12) */
+        memcpy(fake_rom.lc_rem_p1[fake_peer.link], &t[2], 8u);
         peer_status1(0xE442u, peer_lc_src(), 0u);
         peer_s_h(0xE46Du, 0u, t, 10u);
         return true;
@@ -490,8 +496,45 @@ static bool peer_handle(msg_t *m)
             io[7] = s_peer.oob;
             io[8] = s_peer.auth_req;
             peer_emit(0xE473u, peer_lc_src(), io, 9u);
+        } else if (s_peer.rom_auth_decision &&
+                   (fake_rom.lm_ssp_mode == 0u || (s_peer.features[6] & 0x08u) == 0u ||
+                    (fake_rom.lc_rem_p1[fake_peer.link][0] & 0x01u) == 0u)) {
+            /* initiator (ROM 0x2D85C): !LM[0x44C] || !remote page 0 bit 51 || !bit 0 of the "remote page 1" slot ->
+             * legacy pairing: E464 PIN Code Request (docs/BT_ROM_HCI_MAP.md §12) */
+            fake_peer.pin_requests++;
+            peer_addr_evt(0xE464u, peer_lc_src());
+            return true;
         }
+        fake_peer.io_cap_requests++;
         peer_addr_evt(0xE472u, peer_lc_src());                           /* IO Capability Request */
+        return true;
+    case 0xE00Au: {                                                      /* 040D PIN Code Request Reply */
+        if (!peer_need(m, 23u) || !peer_addr_is(p)) return false;
+        peer_s_addr(0xE06Cu, BT_ROM_TASK_LM, 0u);
+        fake_peer.host_pin_replies++;
+        size_t n = strnlen(s_peer.pin, sizeof(s_peer.pin));
+        if (n == 0u || p[6] != n || memcmp(&p[7], s_peer.pin, n) != 0) {
+            peer_auth_done(0x05u);                                       /* Authentication Failure */
+            return true;
+        }
+        uint8_t ln[23];                                                  /* {bdaddr, key[16], type 0 combination} */
+        for (uint32_t i = 0u; i < 16u; i++) {
+            fake_peer.key[i] = (uint8_t)(s_peer.addr[i % 6u] ^ (i * 41u) ^ 0x5Au);
+        }
+        fake_peer.has_key = true;
+        fake_peer.pairings++;
+        memcpy(ln, s_peer.addr, 6u);
+        memcpy(&ln[6], fake_peer.key, 16u);
+        ln[22] = 0x00u;
+        peer_emit(0xE466u, peer_lc_src(), ln, 23u);
+        peer_auth_done(0u);
+        return true;
+    }
+    case 0xE00Bu:                                                        /* 040E PIN Code Request Negative Reply */
+        if (!peer_need(m, 6u) || !peer_addr_is(p)) return false;
+        peer_s_addr(0xE06Du, BT_ROM_TASK_LM, 0u);
+        fake_peer.host_pin_neg++;
+        peer_auth_done(0x06u);                                           /* PIN or Key Missing */
         return true;
     case 0xE011u:                                                        /* 042B IO Capability Request Reply */
         if (!peer_need(m, 9u) || !peer_addr_is(p)) return false;
@@ -804,6 +847,7 @@ static void page_success(void)
     fake_peer.handle = (uint16_t)(0x80u + f.page_link);
     fake_peer.we_paged = true;
     fake_peer.conn_count++;
+    memset(fake_rom.lc_rem_p1[f.page_link], 0, 8u);  /* new LC instance: "remote page 1" slot empty */
     fake_rom.pages_ok++;
     uint8_t c[13];
     memset(c, 0, sizeof(c));
@@ -1137,6 +1181,9 @@ static bool lmlc_handle(msg_t *m)
     uint8_t p[64];
     memset(p, 0, sizeof(p));
     p[0] = r->status;
+    if (m->id == 0xE04Fu && r->status == 0u && m->len >= 1u) {
+        fake_rom.lm_ssp_mode = m->block[MSG_HDR];   /* 0C56 -> LM[0x44C] (docs/BT_ROM_HCI_MAP.md §12) */
+    }
     if (m->id == 0xE02Cu && r->status == 0u && m->len >= 1u) {
         /* 0C1A Write Scan Enable, ROM handler 0x3EAC4 (docs/BT_ROM_HCI_MAP.md §11): a value with page scan (2, 3) is
          * refused with 0x0C while more than one ACL link is up (LD link count, ROM 0x368FC); > 3 is 0x12. */
@@ -1265,6 +1312,7 @@ static int i_start(const uint8_t bd_addr[6], const bt_rom_upcalls_t *up)
     memset(f.em_rx, 0, sizeof(f.em_rx));
     f.up = *up;
     fake_rom.starts++;
+    fake_rom.lm_ssp_mode = 0u;               /* LM env re-initialised */
     int r = fake_rom.start_result;
     f.running = r == 0;
     leave(c);

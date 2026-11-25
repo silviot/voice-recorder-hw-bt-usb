@@ -242,6 +242,30 @@ The next occurrence on a filtered-log bench image will show the LC/LD bytes and 
 Not yet on silicon: the on-device confirm prompt (needs a person: ENTER/BACK), the mismatched-public-key image
 (step 6b), Just Works refusal, the peer-gone exit, NIST entropy runs.
 
+## Session 7 (2026-11-25): headphones mode, first silicon runs, laptop as sink
+
+Bench images `BT=1 BENCH=1 HP_GATES=1` from the headphones branch (commit `9a6dd5a` holds the fixes); the laptop
+(BlueZ, MediaTek controller, PipeWire) played the headset. Logs: `SD:/BTBENCH.LOG` per stage (8 KiB head: the longer
+runs lost their tails, `LOGCAP lost=2252..2451`), laptop `btmon`.
+
+| Stage | Result |
+|---|---|
+| `scan` (`hp_secs=10`) | `inquiry st=0x00 rom`, `inquiry complete results=13`; the laptop found (`cod=0x6C010C audio=1`), name pass `martianbfg` (`name complete st=0x00 len=10`); teardown 217 ms |
+| `connect` (`hp_addr`, `hp_pair=1`) | page as master: `create connection st=0x00 rom`, link up at **150 ms**; name OK; then **legacy PIN** instead of SSP: `BT hp legacy PIN pairing rejected`, `auth st=9`, `connect failed`, clean `0406`. Bench HCI trace: `0411` CS → `ev=0x17` → `040C` CC → `ev=0x16` (PIN Code Request), two `041C` reads before it. Cause: the ROM's single "remote page 1" slot overwritten by the page-2 read (`docs/BT_ROM_HCI_MAP.md` §12) → **fixed by patch 0040** |
+| `tone` with `hp_pin=1` (before 0040) | legacy pairing with `0000` (`ev=0x18`, `auth st=0 key=0`), then the full path below: the rest of the stack was fine |
+| `tone` with 0040 | one `041C` (page 1), `ev=0x31/0x32/0x33`, `BT hp Just Works pairing accepted`, `auth st=0 key=4`; codec `cie=0x23021511` 48 kHz joint stereo 16 blocks 8 subbands bp 2-35, `mtu=666`, `role=M max_slots=5 edr=3`; delay reports 30.6 / 70.6 ms |
+| streaming (tone, 16 kHz source) | 48 kHz, `bp=35 bp_eff=24` (speech bitpool), `fpp=8`: ~375 SBC frames/s (`sbc=352..432`), `pkts` ~49/s, `Bps` ~23 kB/s (21.1-23.9 k), `acked` = `sbc` ±8, **lost 0 drop 0 pads 0 allocf 0 stalls 0**, `heap_min` 44016; AVRCP CT/TG up, `rn caps bits=0x2D1E abs_vol=1` |
+| `connect` with 0040 + 0041 | SSP Just Works as above; BlueZ kept the bond (without 0041 our IO capability reply asked for no bonding and BlueZ dropped the key at disconnect); teardown with the link up **647-658 ms** |
+| `player` | the run hung past `secs` inside a 120 min recording: the player blocked the bench's time limit → **bench fix** (the player's UI tick drives the bench and injects BACK at the limit, `BENCH hp play: time limit, BACK`) |
+
+Not yet captured: a laptop recording of the stream. PipeWire showed the bluez card in the `audio-gateway` profile with
+no A2DP source node, and the transport stayed idle in the player stage; unexplained (next run: `pactl list cards`,
+`wpctl status`, `btmon` around the AVDTP START, and whether the player stage's media START was sent at all).
+
+Seen in the trace, expected: `080D`, `0C37` (CC `0x01`) and `040F` (CS `0x01`) are refused locally by `bt_ctrl`
+(REJ rows); `ev=0x1B` Max Slots Change right after the Connection Complete. The first trace images also traced
+successful set-up CCs (`0C03`...`0C14`); the committed trace skips successful CCs outside link control.
+
 ## Exp 1 stages A and B: how to run
 
 Probe image for plan M5 Exp 1 stage A and stage B (step 4): `bt_ctrl` (plan M1) drives the real RW-BT ROM through
@@ -765,14 +789,15 @@ Works peers with it). Per the hardware-access rule, leave the latest BT-branch b
 ## Headphones (BT=1) on silicon: how to test
 
 First silicon test of headphones mode (A2DP source + AVRCP, `docs/BT_A2DP_DESIGN.md`; implementation record and
-deviations: `docs/BT_A2DP_HP_SESSION.md`). Nothing of it has run on silicon yet. The host runs the same session end to
+deviations: `docs/BT_A2DP_HP_SESSION.md`). First silicon runs with a laptop as the sink: session 7 above. The host runs the same session end to
 end against a fake headset (`make -C open_fw test-bt-host`, scenario S: `test_bt_host_hp hps`, steps S1-S10). The
 laptop is not involved: the lead flashes and reads logs over USB, the user handles the headphones (and the device's
 keys for the UI part). Exp numbers refer to design §11.
 
 ### The image
 
-**Build the bench image with the headphones rows forwarded**: `make -C open_fw BT=1 BENCH=1 HP_GATES=1`. Release
+**Build the bench image with the headphones rows forwarded**: `make -C open_fw BT=1 BENCH=1 HP_GATES=1` (needed:
+the rows below, and the HCI trace notes `BT HCI trace ...` are only in these images). Release
 `BT=1` images still **refuse** `0401`/`0402`/`0405`/`0408` (inquiry, cancel, create connection, cancel connection),
 so in them headphones mode starts but can neither search nor connect: `Search` and picking a device fail at once with
 the footer `Not in this build` and `BT hp discovery refused=this build's bt_ctrl refuses inquiry/page ...` (no
@@ -817,7 +842,11 @@ writes `SD:/BTBENCH.LOG` (8 KiB head of the log; keep runs short: `secs=60..180`
 | `scan` | `hp_secs` s inquiry + name pass; logs every device (`BENCH hp dev i=.. addr=..:..:.. cod=.. audio=.. name=..`) | 4a |
 | `connect` | picks `hp_addr`, or `hp_pick=first` (a scan, then the first device of major class Audio/Video, headset/headphones/speaker types first; phones and PCs that only set the Audio service bit are never picked), or `hp_pick=last` (the headset stored by an earlier stage: no scan, no pairing); opens its window if `hp_pair=1`, connects, holds the link; stats every second for 15 s, then every 15 s | 4b |
 | `tone` | as `connect`, then streams a 16 kHz mono tone through the full output path (`aout` -> ring -> x3 resampler -> SBC): `hp_tone_hz=1000` (default) or `hp_tone_hz=0` (440/880 Hz alternating each second) | 4c |
-| `player` | as `connect`, then plays `hp_file` (or the first recording of the file list) once in the player, Audio output forced to Headphones for that file | 4d |
+| `player` | as `connect`, then plays `hp_file` (or the first recording of the file list) once in the player, Audio output forced to Headphones for that file; at `secs` the run injects BACK into the player (`BENCH hp play: time limit, BACK`), so a long file ends with the run | 4d |
+
+`hp_pin=1` (any connect stage, diagnostic): answer a **legacy** PIN Code Request from the picked device inside its
+pairing window with `0000` (`BT hp legacy PIN pairing answered 0000 ...`). Not needed since patch 0040 (session 7);
+use it only if a headset pairs with legacy PIN.
 
 Examples (`AA:BB:CC:DD:EE:FF` = the headset address as a phone shows it; with `hp_pick=first` no address is needed):
 ```
@@ -892,20 +921,26 @@ opened again (headphones mode is not started at boot).
   Complete, as TWS earbuds do).
 - Tone: `BT hp media START err=0`, `BT hp media ack cmd=2 st=0`, `BT hp audio STARTED ours=1 tick=1`,
   `BT hp stream rate=48000 bp=35 bp_min=.. speech_bp=24 fpp=N mtu=NNN tick_ms=20`, then per second
-  `BENCH hp t=N link=3 rate=48000 bp=35 bp_eff=24 fpp=N pkts=~37 Bps=~22900 sbc=~375 acked=~375 pads=0 lost=0
+  `BENCH hp t=N link=3 rate=48000 bp=35 bp_eff=24 fpp=N pkts=~37..49 Bps=~22900 sbc=~375 acked=~375 pads=0 lost=0
   drop=0 allocf=0 cs_no=0 txq=0..4 txq_max=.. down=.. nocp_max_ms=.. stalls=0 late=..` (`bp_eff=35 Bps=~31100`
   with `hp_speech_bp=0`; `Bps` = SBC payload bytes/s at `bp_eff`) and `BENCH hp linkinfo role=M pkt_type=0x....
   max_slots=5 mode=0 acl_sent=.. acl_done=.. heap_free=.. heap_min=..`. Healthy: `sbc` ~375/s at 48 kHz (~345 at
   44.1), `acked` close to `sbc`, `pads=0`, `lost=0`, `nocp_max_ms` well under 800, `stalls=0`, `heap_min` > 8000.
   A REC switch while STARTED logs `BT hp media SUSPEND`; a headset that refuses it logs `BT hp SUSPEND refused
   retry=1 n=..` and is asked again up to 3 times, 1 s apart.
-- End: `BENCH exit why=time`, `BT hp teardown ms=NNN profile_ms=NN job_rc=0 reason=0` (ms < 2000; `job_rc=5` =
+- HCI trace (`HP_GATES` bench images only): `BT HCI trace ev=0xEE st=0xSS [op=0xOOOO]` for every event to the host
+  (event code, its first parameter byte or the command's status, the opcode of a CC/CS), up to 64 queued; NOCP,
+  inquiry results and successful CCs outside link control are skipped. Pairing as initiator should read `op=0x0411`,
+  `ev=0x17`, `op=0x040C`, `ev=0x31` (SSP), `op=0x042B`, `ev=0x32`, `ev=0x33`, `op=0x042C`, `ev=0x36`, `ev=0x18`,
+  `ev=0x06 st=0x00`; `ev=0x16` after `040C` = legacy PIN (the ROM decided legacy: `docs/BT_ROM_HCI_MAP.md` §12).
+- End: `BENCH exit why=time`, `BT hp teardown ms=NNN profile_ms=NN job_rc=0 reason=0` (ms < 2000; ~217 idle,
+  ~650 with the A2DP link up, session 7; `job_rc=5` =
   A2DP deinit not confirmed in time), `BT hp stopped`, `BENCH end`, `BENCH LOGFILE ... st=OK`.
 
 **Failure signatures to report verbatim:** `BT HCI inquiry st=0x..` other than 0x00 (ROM refused `0401`; LM state),
 `BT HCI create connection st=0x0C` (`0405` refused: inquiry/page state), `connection complete st=0x04` (page timeout:
 headset not connectable / out of range), `BT hp Just Works pairing refused` (window/gate), `BT hp auth ... st=` non-0
-(pairing failed: also `BT hp SSP key spent`), `BT hp connect failed`, `BT hp connect timed out` (and any
+(pairing failed: also `BT hp SSP key spent`), `BT hp legacy PIN pairing rejected` (the ROM chose legacy pairing), `BT hp connect failed`, `BT hp connect timed out` (and any
 `late a2dp connect closed`), `BT hp codec cfg ... ok=0`, `BT hp media ack cmd=2 st=1|2`, `BT hp START failed, retry`
 / `BT hp START failed twice` (a play press 2 s later tries again: `START: new demand ...`), `BT hp credit stall` (link
 stopped acknowledging), `BT hp stall: no Disconnection Complete after the 0406 then=restarting headphones mode` (the

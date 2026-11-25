@@ -96,6 +96,13 @@ typedef struct {
     uint32_t pages, pages_ok, page_timeouts, page_cancels, page_refused, create_cancels;
     uint32_t saved, saved_reruns;   /* messages SAVED by the fake LM / re-dispatched after a state change */
     uint32_t air_ticks, air_acked, air_acked_bytes, air_nocp_events;
+
+    /* ---- the ROM's initiator pairing decision (docs/BT_ROM_HCI_MAP.md §12). LM[0x44C] = local SSP mode (the last
+     * accepted 0C56; cleared by start()); one 8-byte "remote page 1" slot per link (LC env +0x74), zeroed at link up
+     * and overwritten by EVERY LMP_features_res_ext (the reply to the host's 041C), whatever its page (ROM 0x21E4C).
+     * Used by the scripted peer when fake_peer_cfg_t.rom_auth_decision is set. ---- */
+    uint8_t  lm_ssp_mode;
+    uint8_t  lc_rem_p1[7][8];
 } fake_rom_t;
 
 extern fake_rom_t fake_rom;
@@ -124,8 +131,8 @@ int  fake_rom_deliver_stale(uint16_t id, const uint8_t *param, uint16_t len);
  * aligned layouts (docs/BT_ROM_HCI_MAP.md §2 and §9) instead of the status-only reply table: initial CS/CC first,
  * then the terminal event, from LM (0x38) or the link's LC instance like the ROM. Covered: 0409/040A (+ E456/E0D2),
  * 041B/041C/041D/041F (+ E45D/E46D/E45E/E469), 0419/041A (+ E47C/E0D3), 0411 (+ E465), 040B/040C, 042B/0434,
- * 042C/042D (+ E473/E472/E474/E477/E466/E459), 0413 (+ E45A), 0406 (+ E458). ACL is the existing air model
- * (host -> peer: fake_rom.acl log + NOCP; peer -> host: fake_peer_send_acl). */
+ * 042C/042D (+ E473/E472/E474/E477/E466/E459), 040D/040E (+ E466/E459), 0413 (+ E45A), 0406 (+ E458). ACL is the
+ * existing air model (host -> peer: fake_rom.acl log + NOCP; peer -> host: fake_peer_send_acl). */
 #define FAKE_PEER_ORIGIN_NONE 0u
 #define FAKE_PEER_ORIGIN_PEER 1u    /* the remote authenticates us (we are the SSP responder) */
 #define FAKE_PEER_ORIGIN_HOST 2u    /* the host sent 0411 (we are the SSP initiator) */
@@ -151,6 +158,13 @@ typedef struct {
     bool role_switch_on_connect;    /* right after our page the headset takes the master role: E461 (we: slave) */
     bool role_switch_before_connect;/* ...during connection set-up: E461 before the Connection Complete (TWS earbuds) */
     uint8_t max_slots_on_connect;   /* E468 Max Slots Change after the Connection Complete (0 = none) */
+    /* Model the ROM's initiator pairing decision (LC E009 handler 0x268C0 -> 0x2D85C, docs/BT_ROM_HCI_MAP.md §12): after
+     * the host's 040C to a 0411 we sent, SSP (E472 IO Capability Request) only if the local SSP mode is on, remote
+     * page 0 bit 51 is set and bit 0 of the link's "remote page 1" slot is set; otherwise legacy pairing (E464 PIN Code
+     * Request). Off by default (bt_ctrl unit tests drive 0411 without the reads that fill the slot). */
+    bool rom_auth_decision;
+    uint8_t features_p2[8];         /* 041C page 2 (max_page >= 2); a laptop (BlueZ) reports page 2 with bit 0 (CSB) 0 */
+    char pin[17];                   /* legacy pairing: the PIN the peer's user enters ("" = the peer refuses) */
 } fake_peer_cfg_t;
 
 typedef struct {
@@ -195,6 +209,11 @@ typedef struct {
     uint16_t host_pkt_type, host_clk_off;
     uint32_t host_creates;          /* 0405 that reached the fake LM (incl. refused) */
     uint32_t role_changes;
+    /* the ROM's initiator decision (rom_auth_decision) */
+    uint32_t ext_reads[4];          /* 041C by page (page >= 3 counted in [3]) */
+    uint32_t pin_requests;          /* E464 PIN Code Request sent (legacy pairing chosen) */
+    uint32_t io_cap_requests;       /* E472 IO Capability Request sent (SSP) */
+    uint32_t host_pin_replies, host_pin_neg;
 } fake_peer_t;
 
 extern fake_peer_t fake_peer;

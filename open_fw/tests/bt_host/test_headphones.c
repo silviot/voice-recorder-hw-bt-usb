@@ -1018,7 +1018,12 @@ static void world(void)
     static const uint8_t f0[8] = { 0xBF, 0xFE, 0xCF, 0xFE, 0xDB, 0xFF, 0x7B, 0x87 };
     memcpy(c.features, f0, 8);
     c.features_p1[0] = 0x01;
-    c.max_page = 1;
+    /* like the laptop of silicon 2026-11-25 (BlueZ): max_page 2, page 2 bit 0 (CSB) clear, and the fake ROM makes the
+     * initiator pairing decision from the single "remote page 1" slot (docs/BT_ROM_HCI_MAP.md §12, patch 0040) */
+    c.features_p2[0] = 0x00;
+    c.features_p2[1] = 0x03;                                   /* SC host/controller-ish bits: anything but bit 0 */
+    c.max_page = 2;
+    c.rom_auth_decision = true;
     c.lmp_ver = 0x09;
     c.manuf = 0x001D;
     c.clk_off = 0x2468;
@@ -1190,6 +1195,17 @@ int bth_headphones_scenario(const char *img_path)
                d0.jw_refused);
         SCHECK(fake_peer.pairings == 1u && fake_peer.we_paged, "pairings %u we_paged %u", fake_peer.pairings,
                fake_peer.we_paged);
+        /* patch 0040: page 1 only, so the ROM's slot keeps the host-SSP bit and the initiator decision picks SSP */
+        SCHECK(fake_peer.ext_reads[1] >= 1u && fake_peer.ext_reads[2] == 0u,
+               "remote ext features read page 1 %u, page 2 %u (want page 1 only, patch 0040)", fake_peer.ext_reads[1],
+               fake_peer.ext_reads[2]);
+        SCHECK(fake_peer.pin_requests == 0u && fake_peer.io_cap_requests >= 1u && d0.pin_rejected == 0u,
+               "initiator pairing: PIN requests %u (legacy), IO capability requests %u (SSP), PIN rejected %u",
+               fake_peer.pin_requests, fake_peer.io_cap_requests, d0.pin_rejected);
+        /* patch 0041: our IO Capability Reply as initiator asks for general bonding (BTM_AUTH_GB_BIT 0x04, MITM bit
+         * unchanged); without it 0x01 (MITM, no bonding), whose key BlueZ dropped at disconnect */
+        SCHECK(fake_peer.host_io_replies >= 1u && (fake_peer.host_auth_req & 0x06u) == 0x04u,
+               "042B auth_req 0x%02X (want general bonding, patch 0041)", fake_peer.host_auth_req);
         SCHECK(H.sdp_a2dp >= 1u, "no A2DP SDP query");
         SCHECK(H.avdt_cmds[1] >= 1u && (H.avdt_cmds[2] + H.avdt_cmds[12]) >= 1u && H.avdt_cmds[3] == 1u &&
                H.avdt_cmds[6] == 1u, "AVDTP discover %u caps %u/%u setcfg %u open %u", H.avdt_cmds[1], H.avdt_cmds[2],

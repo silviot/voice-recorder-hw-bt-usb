@@ -193,7 +193,7 @@ static void test_parse_hp(void)
     bt_bench_cfg_t c;
     uint32_t at = 99u;
     CHECK(parse("", &c, NULL) == BT_BENCH_OK && c.mode == BT_BENCH_MODE_PHONE && c.hp_stage == BT_BENCH_HP_SCAN &&
-          !c.hp_addr_set && !c.hp_pick_first && !c.hp_pair && !c.hp_pscan && !c.hp_mono && c.hp_secs == 10u &&
+          !c.hp_addr_set && !c.hp_pick_first && !c.hp_pair && !c.hp_pscan && !c.hp_pin && !c.hp_mono && c.hp_secs == 10u &&
           c.hp_rate == 0u && c.hp_bitpool == 35u && c.hp_speech_bp == 24u && c.hp_tick_ms == 20u &&
           c.hp_pkt_per_tick == 2u && c.hp_txq == 4u && c.hp_credit_ticks == 2u && c.hp_tone_hz == 1000u &&
           c.hp_credits == 4u && c.hp_file[0] == '\0', "hp defaults");
@@ -209,18 +209,23 @@ static void test_parse_hp(void)
     /* every key at once, mixed case, lower-case hex */
     const char *all = "MODE=HP Hp_Stage=Player hp_pick=FIRST hp_pair=1 hp_pscan=1 hp_secs=61 hp_rate=44100 "
                       "hp_bitpool=53 hp_speech_bp=0 hp_mono=1 hp_tick_ms=10 hp_pkt_per_tick=1 hp_txq=8 "
-                      "hp_credit_ticks=4 hp_file=/MUSIC/A_1.WAV hp_credits=9 pair_secs=120";
+                      "hp_credit_ticks=4 hp_file=/MUSIC/A_1.WAV hp_credits=9 pair_secs=120 HP_PIN=1";
     CHECK(parse(all, &c, &at) == BT_BENCH_OK, "all keys (at %u)", at);
     CHECK(c.hp_stage == BT_BENCH_HP_PLAYER && c.hp_pick_first && c.hp_pair && c.hp_pscan && c.hp_secs == 61u &&
           c.hp_rate == 44100u && c.hp_bitpool == 53u && c.hp_speech_bp == 0u && c.hp_mono && c.hp_tick_ms == 10u &&
           c.hp_pkt_per_tick == 1u && c.hp_txq == 8u && c.hp_credit_ticks == 4u && strcmp(c.hp_file, "/MUSIC/A_1.WAV") == 0
-          && c.hp_credits == 9u && c.pair_secs == 120u, "all keys cfg");
+          && c.hp_credits == 9u && c.pair_secs == 120u && c.hp_pin == 1u, "all keys cfg");
     CHECK(parse("mode=hp hp_stage=connect hp_addr=a0:b1:c2:d3:e4:f5 hp_rate=48000 hp_rate_x=1", &c, NULL) ==
           BT_BENCH_E_KEY, "unknown hp key");
     CHECK(parse("mode=hp hp_stage=connect hp_addr=a0:b1:c2:d3:e4:f5 hp_rate=48000", &c, NULL) == BT_BENCH_OK &&
           c.hp_addr[0] == 0xA0u && c.hp_addr[5] == 0xF5u && c.hp_rate == 48000u, "lower-case address, 48 kHz");
     CHECK(parse("mode=hp hp_stage=connect hp_pick=first hp_rate=auto", &c, NULL) == BT_BENCH_OK && c.hp_pick_first &&
           c.hp_rate == 0u, "pick first");
+    /* hp_pin (silicon 2026-11-25): answer a legacy PIN request from the picked headset with 0000 */
+    CHECK(parse("mode=hp hp_stage=tone hp_pick=first hp_pair=1 hp_pin=1", &c, NULL) == BT_BENCH_OK && c.hp_pin == 1u,
+          "hp_pin=1");
+    CHECK(parse("mode=hp hp_stage=connect hp_pick=first hp_pin=0", &c, NULL) == BT_BENCH_OK && c.hp_pin == 0u,
+          "hp_pin=0");
     CHECK(parse("mode=hp hp_bitpool=20", &c, NULL) == BT_BENCH_OK && c.hp_speech_bp == 20u,
           "default speech bitpool lowered to an explicit smaller max");
     CHECK(parse("mode=hp hp_bitpool=20 hp_speech_bp=18", &c, NULL) == BT_BENCH_OK && c.hp_speech_bp == 18u,
@@ -278,6 +283,13 @@ static void test_parse_hp(void)
         { "mode=hp hp_speech_bp=17", BT_BENCH_E_VALUE },
         { "mode=hp hp_speech_bp=36", BT_BENCH_E_VALUE },
         { "mode=hp hp_mono=2", BT_BENCH_E_VALUE },
+        { "hp_pin=1", BT_BENCH_E_CONFLICT },                            /* hp_* without mode=hp */
+        { "mode=phone hp_pin=1", BT_BENCH_E_CONFLICT },
+        { "mode=hp hp_pin=2", BT_BENCH_E_VALUE },
+        { "mode=hp hp_pin=-1", BT_BENCH_E_VALUE },
+        { "mode=hp hp_pin=yes", BT_BENCH_E_VALUE },
+        { "mode=hp hp_pin=", BT_BENCH_E_VALUE },
+        { "mode=hp hp_pin=1 hp_pin=1", BT_BENCH_E_DUP },
         { "mode=hp hp_tick_ms=9", BT_BENCH_E_VALUE },
         { "mode=hp hp_tick_ms=31", BT_BENCH_E_VALUE },
         { "mode=hp hp_pkt_per_tick=0", BT_BENCH_E_VALUE },

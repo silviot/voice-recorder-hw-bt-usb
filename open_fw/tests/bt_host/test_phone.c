@@ -1195,6 +1195,8 @@ static bool step_pair_window_and_bond(uint8_t key_out[16])
     bth_log("[P2] laptop A pages; SSP numeric comparison inside the pairing window; link key stored\n");
     fake_peer_cfg_t a;
     peer_cfg(&a, 0xA1u, 0x01u, 0x05u, 0x05u, "laptop-A");     /* DisplayYesNo, MITM general bonding, auth P-192 */
+    a.max_page = 2u;                          /* BlueZ: page 2 with bit 0 clear; the ROM's initiator decision modelled */
+    a.rom_auth_decision = true;               /* (docs/BT_ROM_HCI_MAP.md §12): the responder never reaches it */
     peer_attach(&a, NULL);
     if (!peer_page_and_connect()) {
         return false;
@@ -1219,6 +1221,13 @@ static bool step_pair_window_and_bond(uint8_t key_out[16])
     PCHECK(paired, "pairing (pairings %u, encrypted %u, confirms %u, rejects %u)", fake_peer.pairings,
            fake_peer.encrypted, fake_peer.host_confirms, fake_peer.host_rejects);
     PCHECK(fake_peer.host_io_cap == 0x01u, "our IO capability %u, want DisplayYesNo", fake_peer.host_io_cap);
+    bth_log("    P2: responder IO capability reply auth_req 0x%02X, PIN requests %u\n", fake_peer.host_auth_req,
+            fake_peer.pin_requests);
+    /* patch 0041 changes the initiator's reply only: the responder's stays 0x00 (as before 0041), and the ROM's
+     * initiator decision (legacy PIN with page 2 in the slot) is never reached as responder */
+    PCHECK(fake_peer.host_auth_req == 0x00u && fake_peer.pin_requests == 0u && fake_peer.io_cap_requests >= 1u,
+           "responder auth_req 0x%02X (want 0x00), PIN requests %u, IO capability requests %u",
+           fake_peer.host_auth_req, fake_peer.pin_requests, fake_peer.io_cap_requests);
     PCHECK(fake_peer.host_confirms == 1u && fake_peer.host_rejects == 0u, "user confirmation reply");
     bool seen = WAIT(S().d.ssp_accepted == 1u && S().bonds == 1, 3000);
     bthx_snap_t s = S();
