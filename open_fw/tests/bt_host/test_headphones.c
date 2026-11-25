@@ -20,6 +20,10 @@
  *       reconnect
  *   S9  headset forgets the key: a reconnect needs pairing, the window is closed -> Just Works refused (0036)
  *   S10 teardown while STARTED with a frozen headset: < 2 s, no hard path; a second full start/READY/stop works
+ *   S11 (STEP10 C3) the Just Works hook reads the RNG latch live (pool ran dry since the last poll: refused);
+ *       (A3, patch 0042) a headset bonded with numeric comparison (MITM key) is re-paired by a keyless NoIO peer with its
+ *       address inside an open window: Just Works refused before a key exists, the failed pairing keeps the stored
+ *       bond, and the real headset reconnects with its MITM key after a restart
  * Review fixes (each check fails without its fix):
  *   S1  a headphones stop never writes phone mode's bt_bonds.bin; the M2.3 gate is never evaluated inside the
  *       session lock (a critical section on target)
@@ -29,6 +33,13 @@
  *       (bt_vol changes only through the player); S6b keys and player events from before a file are dropped by
  *       bt_hp_player_begin()
  *   S8b credit stall without a Disconnection Complete: the escalation restarts headphones mode, which reconnects
+ *   S10 (A6) the frozen stop with BTU_TASK's BT_HDR-sized allocations failing still confirms the A2DP deinit (0039's
+ *       local close is allocation-free, patch 0043); with AVCTP up, the frozen teardowns leave no AVDTP/AVCTP blocks
+ *   S10a (C13) late CONNECTED / DISCONNECTED / AUDIO_CFG of another device leave the stream's transmitter alone
+ *   S10d (A6) a failed profile teardown (job rc 5) ends FAULTED (the screen's "BT fault"), the next start refused
+ *   S12 (silicon 2026-11-25 bond loss) a bond file whose bonds a session cannot take over (bt_store_load rejects it,
+ *       or Bluedroid's config parse fails: patch 0045) is never replaced by the empty config btc_config_init() saves
+ *       at every start; the next clean start loads the bond again
  *   G   (test_bt_host, rows refused) scan and connect fail at once with BT_HP_MSG_UNSUPPORTED, no reconnect
  * Not covered here (listed in docs/BT_A2DP_HP_SESSION.md): 44.1 kHz-only peers (SEID 1 fallback), page-scan / LM
  * state variants, AVRCP FF/REW scrub, the player integration (test_player BT=1 variant), soak runs.
@@ -45,6 +56,7 @@
 #include "hp_tx.h"   /* HP_MAX_BITPOOL */
 #include "esp_bt_main.h"
 #include "esp_gap_bt_api.h"
+#include "esp_a2dp_api.h"
 #include "bt_ctrl.h"
 #include "bt_hp.h"
 #include "bt_store.h"
@@ -95,7 +107,8 @@ static uint32_t rdbe32(const uint8_t *p) { return ((uint32_t)p[0] << 24) | ((uin
 static const uint8_t k_hp_wire[6] = { 0xC1, 0xC2, 0xC3, 0x1B, 0x00, 0x88 };     /* 88:00:1B:C3:C2:C1 */
 static const uint8_t k_ph_wire[6] = { 0x61, 0x62, 0x63, 0x64, 0x65, 0x66 };
 static const uint8_t k_sp_wire[6] = { 0x71, 0x72, 0x73, 0x74, 0x75, 0x76 };
-static uint8_t s_hp_bda[6];
+static const uint8_t k_hp2_wire[6] = { 0xD1, 0xD2, 0xD3, 0x1B, 0x00, 0x88 };    /* S11: a headset with a display */
+static uint8_t s_hp_bda[6], s_hp2_bda[6];
 
 /* ============================================ platform seam for bt_hp (host) ================================== */
 #define CFG_FILE "bt_hp_cfg.bin"
@@ -197,6 +210,17 @@ static int fn_scan(uint32_t a) { return bt_hp_scan((uint8_t)a); }
 static int fn_pair_hp(uint32_t a) { return bt_hp_connect_addr(s_hp_bda, (int)a); }
 static int fn_suspend(uint32_t a) { (void)a; bt_hp_suspend(); return 0; }
 static int fn_forget(uint32_t a) { (void)a; return bt_hp_forget(); }
+static int fn_set_out(uint32_t a) { bt_hp_set_out_mode((uint8_t)a); return (int)bt_hp_out_mode(); }
+static int fn_pair_hp2(uint32_t a) { return bt_hp_connect_addr(s_hp2_bda, (int)a); }
+static int fn_disconnect(uint32_t a) { (void)a; return bt_hp_disconnect(); }
+/* STEP10 C3: in one app-task step (no poll in between), the ROM RNG pool runs dry (a nonce drawn from the legacy
+ * generator) and then the Just Works hook decides, still with the gate_ok of the poll before */
+static int fn_jw_after_starve(uint32_t a)
+{
+    (void)a;
+    bthx_rng_starve();
+    return openfw_just_works_allowed(s_hp2_bda);
+}
 static int fn_player_begin(uint32_t a) { (void)a; bt_hp_player_begin(); return 0; }
 static int fn_fmt(uint32_t a)
 {
@@ -1006,11 +1030,11 @@ static void rom_log_clear(void)
     bth_rom_unlock();
 }
 
-static void world(void)
+static void hp_peer_cfg(fake_peer_cfg_t *cp, const uint8_t wire[6])
 {
     fake_peer_cfg_t c;
     memset(&c, 0, sizeof(c));
-    memcpy(c.addr, k_hp_wire, 6);
+    memcpy(c.addr, wire, 6);
     c.cod[0] = 0x18; c.cod[1] = 0x04; c.cod[2] = 0x24;         /* 0x240418 headphones */
     c.io_cap = 0x03;                                           /* NoInputNoOutput: Just Works */
     c.auth_req = 0x04;
@@ -1033,6 +1057,13 @@ static void world(void)
     c.rssi = -48;
     c.discoverable = true;
     memcpy(c.name, "HP-Fake", 7);
+    *cp = c;
+}
+
+static void world(void)
+{
+    fake_peer_cfg_t c;
+    hp_peer_cfg(&c, k_hp_wire);
     fake_dev_t d;
     bth_rom_lock();
     fake_peer_init(&c);
@@ -1053,6 +1084,7 @@ static void world(void)
     bth_rom_unlock();
     for (int i = 0; i < 6; i++) {
         s_hp_bda[i] = k_hp_wire[5 - i];
+        s_hp2_bda[i] = k_hp2_wire[5 - i];
     }
 }
 
@@ -1086,6 +1118,25 @@ static uint32_t stop_session(const char *what)
 
 static bool wait_link(uint8_t link, uint32_t ms) { return WAIT(UI().link == link, ms); }
 
+/* A late A2DP event of another device (STEP10 C13), delivered to the session's A2DP callback on BTC_TASK, where
+ * btc_av delivers its own (bth_btc_run). */
+static esp_a2d_cb_event_t s_late_ev;
+static esp_a2d_cb_param_t s_late_p;
+static void late_cb(void *arg)
+{
+    (void)arg;
+    esp_a2d_cb_t cb = (esp_a2d_cb_t)bth_a2dp_app_cb();
+    if (cb != NULL) {
+        cb(s_late_ev, &s_late_p);
+    }
+}
+static bool late_a2d(esp_a2d_cb_event_t ev, const esp_a2d_cb_param_t *p)
+{
+    s_late_ev = ev;
+    s_late_p = *p;
+    return bth_btc_run(late_cb, NULL, 2000u) == 0;
+}
+
 /* ============================================ scenario ========================================================= */
 #define CARD_SECTORS 4096u
 static uint8_t s_disk[CARD_SECTORS * 512u];
@@ -1110,6 +1161,44 @@ static int bond_file_size(void)
 {
     static uint8_t img[BT_STORE_IMAGE_MAX];
     return bthx_read_root_file("bt_hp_bonds.bin", img, sizeof(img));
+}
+
+/* S11: the card's bt_hp_bonds.bin replaced by a test image (BT off). */
+static bool put_bond_file(const uint8_t *img, uint32_t n)
+{
+    exfat_writer_t w;
+    (void)exfat_delete_file(&s_card, "/", "bt_hp_bonds.bin");
+    return exfat_create_file(&s_card, "/", "bt_hp_bonds.bin", &w) == 0 && exfat_write(&w, img, n) == 0 &&
+           exfat_close_file(&w) == 0;
+}
+
+/* Length of the first entry named key in a BTS1 image (bt_store.h layout), 0 if absent. */
+static uint32_t bts1_value_len(const uint8_t *img, uint32_t n, const char *key)
+{
+    if (n < 14u || memcmp(img, "BTS1", 4u) != 0) {
+        return 0u;
+    }
+    uint32_t count = (uint32_t)img[4] | ((uint32_t)img[5] << 8), o = 6u;
+    for (uint32_t i = 0u; i < count && o < n - 8u; i++) {
+        uint32_t nl = img[o++];
+        o += nl;
+        uint32_t kl = img[o++];
+        bool hit = kl == strlen(key) && memcmp(&img[o], key, kl) == 0;
+        o += kl;
+        uint32_t vl = (uint32_t)img[o] | ((uint32_t)img[o + 1u] << 8);
+        o += 2u;
+        if (hit) {
+            return vl;
+        }
+        o += vl;
+    }
+    return 0u;
+}
+
+static int fn_bond_num(uint32_t a)
+{
+    (void)a;
+    return esp_bt_gap_get_bond_device_num();
 }
 
 int bth_headphones_scenario(const char *img_path)
@@ -1148,6 +1237,18 @@ int bth_headphones_scenario(const char *img_path)
                "a headphones stop wrote phone mode's bt_bonds.bin");
         SCHECK(bthx_gate_in_lock() == 0u, "pairing gate evaluated inside the session lock %u times",
                bthx_gate_in_lock());
+    }
+    {
+        /* Settings -> Audio output (main.c UI_SET_ROW_AOUT): the mode is saved in bt_hp_cfg.bin (byte 5, after magic
+         * and version), only when it changes, and survives the session */
+        uint32_t saves = s_cfg_saves;
+        SCHECK(bthx_call_fn(fn_set_out, BT_HP_OUT_BOTH, 1000u) == (int)BT_HP_OUT_BOTH, "out mode Both not taken");
+        SCHECK(s_cfg_saves == saves + 1u && s_cfg_len >= 6u && s_cfg_blob[5] == BT_HP_OUT_BOTH,
+               "out mode Both not saved (saves %u -> %u, byte %u)", saves, s_cfg_saves, s_cfg_blob[5]);
+        SCHECK(bthx_call_fn(fn_set_out, BT_HP_OUT_BOTH, 1000u) == (int)BT_HP_OUT_BOTH && s_cfg_saves == saves + 1u,
+               "unchanged out mode saved again");
+        SCHECK(bthx_call_fn(fn_set_out, BT_HP_OUT_SPEAKER, 1000u) == (int)BT_HP_OUT_SPEAKER &&
+               s_cfg_saves == saves + 2u && s_cfg_blob[5] == BT_HP_OUT_SPEAKER, "out mode Speaker not saved");
     }
     controller_clean("S1");
     sbase_t w;
@@ -1462,15 +1563,63 @@ int bth_headphones_scenario(const char *img_path)
     SCHECK(wait_link(BT_HP_LINK_OPEN, 20000), "S10 not OPEN (link %u)", UI().link);
     s_feed = 1;
     SCHECK(wait_link(BT_HP_LINK_STARTED, 5000), "S10 not STARTED");
+    if (!H.avct.open) {
+        l2_connect(&H.avct, 0x0017u, CID_AVCT);              /* AVCTP up too: its link block must not leak (A6) */
+    }
+    SCHECK(WAIT(H.avct.open && H.avct.cfg_in && H.avct.cfg_out, 3000), "S10: AVCTP not open");
     bth_step_done();
     (void)WAIT(0, 300);
+    /* ---- S10a ---- (review STEP10 C13) late A2DP events of another device while streaming: the session ignores or
+     * closes them, and the BTC callback must leave the stream's transmitter alone (before: a DISCONNECTED stopped the
+     * tick, a CONNECTED replaced the connection handle, an AUDIO_CFG the encoder configuration) */
+    bth_log("[S10a] late A2DP events of another device while streaming (heap seq %u)\n", (unsigned)bth_heap_seq());
+    {
+        static const uint8_t other[6] = { 0x00u, 0x1Bu, 0xDCu, 0x5Au, 0x5Au, 0x01u };
+        bth_step("S10a late events", 20000u);
+        uint32_t rate0 = UI().rate;
+        esp_a2d_cb_param_t p;
+        memset(&p, 0, sizeof(p));
+        p.audio_cfg.mcc.type = ESP_A2D_MCT_SBC;
+        memcpy(&p.audio_cfg.mcc.cie, H.cfg_cie, 4u);
+        ((uint8_t *)&p.audio_cfg.mcc.cie)[0] = (uint8_t)((H.cfg_cie[0] & 0x0Fu) | 0x20u);   /* 44.1 kHz, not 48 */
+        memcpy(p.audio_cfg.remote_bda, other, 6u);
+        SCHECK(late_a2d(ESP_A2D_AUDIO_CFG_EVT, &p), "S10a: AUDIO_CFG not delivered");
+        memset(&p, 0, sizeof(p));
+        p.conn_stat.state = ESP_A2D_CONNECTION_STATE_CONNECTED;
+        memcpy(p.conn_stat.remote_bda, other, 6u);
+        p.conn_stat.conn_hdl = ESP_A2D_INVALID_CONN_HDL;  /* the session's close of it is refused: B is not touched */
+        p.conn_stat.audio_mtu = 300u;
+        SCHECK(late_a2d(ESP_A2D_CONNECTION_STATE_EVT, &p), "S10a: CONNECTED not delivered");
+        uint32_t p0 = H.pkts;
+        SCHECK(WAIT(H.pkts > p0 + 20u, 2000), "S10a: the stream stopped after another device's CONNECTED (%u pkts)",
+               H.pkts - p0);
+        p.conn_stat.state = ESP_A2D_CONNECTION_STATE_DISCONNECTED;
+        p.conn_stat.disc_rsn = ESP_A2D_DISC_RSN_ABNORMAL;
+        SCHECK(late_a2d(ESP_A2D_CONNECTION_STATE_EVT, &p), "S10a: DISCONNECTED not delivered");
+        p0 = H.pkts;
+        SCHECK(WAIT(H.pkts > p0 + 20u, 2000), "S10a: the stream stopped after another device's DISCONNECTED (%u pkts)",
+               H.pkts - p0);
+        SCHECK(UI().link == BT_HP_LINK_STARTED, "S10a: link %u after the late events", UI().link);
+        SCHECK(UI().rate == rate0, "S10a: another device's AUDIO_CFG applied (rate %u, was %u)", UI().rate, rate0);
+        SCHECK(H.hdr_err == 0u && H.dec_err == 0u && H.len_err == 0u, "S10a: media errors hdr %u dec %u len %u",
+               H.hdr_err, H.dec_err, H.len_err);
+        bth_step_done();
+    }
     H.frozen = 1u;                                           /* nothing answers any more (L2CAP, AVDTP, AVCTP) */
     bth_rom_lock();
     fake_rom.auto_ack_acl = false;
     fake_peer.defer_detach = true;
     bth_rom_unlock();
     s_feed = 0;
+    /* STEP10 A6: patch 0039's local close must not depend on an allocation (before 0043 it posted a BT_HDR from
+     * BTU_TASK; without it the stream waited for the frozen peer: A2DP deinit timeout, job rc 5) */
+    bth_heap_fail_task_size("BTU_TASK", 8u);                 /* sizeof(BT_HDR): 4 x UINT16, no payload */
     stop_session("S10 frozen stop");
+    bth_heap_fail_task_size(NULL, 0u);
+    bth_log("    S10: %llu BT_HDR-sized BTU allocations failed during the frozen stop\n",
+            (unsigned long long)bth_heap_task_size_injected());
+    SCHECK(bthx_profile_down_rc() == 0u, "S10: profile teardown rc %u (A2DP deinit not confirmed)",
+           bthx_profile_down_rc());
     bth_rom_lock();
     fake_peer.defer_detach = false;
     fake_rom.auto_ack_acl = true;
@@ -1479,8 +1628,8 @@ int bth_headphones_scenario(const char *img_path)
     controller_clean("S10");
     bth_log("[S10b] second cycle (heap seq %u)\n", (unsigned)bth_heap_seq());
     {
-        /* Known (live log): a frozen-peer teardown leaves AVDTP's stream and signalling blocks of that link behind
-         * (their fixed_queues: 5 heap blocks each on the host), freed by nothing; a clean cycle after it adds none. */
+        /* A frozen-peer teardown left AVDTP's stream and signalling blocks (and AVCTP's link block) of that link
+         * behind until patch 0043; a clean cycle after it adds nothing either way. */
         free(H.pcm);                                         /* the receiver's buffer, not the session's */
         H.pcm = NULL;
         H.pcm_cap = H.pcm_n = 0u;
@@ -1493,10 +1642,12 @@ int bth_headphones_scenario(const char *img_path)
                now2.bytes, now2.blocks, after_frozen.bytes, after_frozen.blocks);
         known_leak_blocks = after_frozen.blocks > base.blocks ? after_frozen.blocks - base.blocks : 0u;
         known_leak_bytes = after_frozen.bytes > base.bytes ? after_frozen.bytes - base.bytes : 0u;
-        bth_log("    S10: frozen teardown left %zu blocks / %zu B (AVDTP ccb/scb queues of the dead link + btc's resident "
-                "connect queue)\n", known_leak_blocks, known_leak_bytes);
-        /* two frozen-peer teardowns in this run (S8b's stall escalation, S10), up to 16 blocks / 4 KiB each */
-        SCHECK(known_leak_blocks <= 32u && known_leak_bytes <= 8192u, "frozen teardowns left %zu blocks / %zu B",
+        bth_log("    S10: frozen teardowns left %zu blocks / %zu B (btc's resident connect queue)\n", known_leak_blocks,
+                known_leak_bytes);
+        /* two frozen-peer teardowns in this run (S8b's stall escalation, S10 with AVCTP up): AVDT_Deregister /
+         * AVCT_Deregister free the dead link's AVDTP stream/channel blocks and AVCTP link block (patch 0043, STEP10
+         * A6; before: 31+ blocks / 3.4+ KB). What stays is btc's profile connect queue, allocated once (1 block). */
+        SCHECK(known_leak_blocks <= 1u && known_leak_bytes <= 64u, "frozen teardowns left %zu blocks / %zu B",
                known_leak_blocks, known_leak_bytes);
     }
 
@@ -1512,10 +1663,192 @@ int bth_headphones_scenario(const char *img_path)
         /* C4 / A3: no headphones session -> the patch 0036 hook refuses Just Works (phone mode never keeps it) */
         SCHECK(openfw_just_works_allowed(s_hp_bda) == 0, "S10c: Just Works allowed with no headphones session");
     }
+    if (s_fail) {
+        goto out;
+    }
+
+    int s12_bonds = -1;
+    /* ---- S11 ---- (review STEP10 C3, A3) */
+    bth_log("[S11] C3: RNG latch read by the Just Works hook between polls; A3: a MITM bond survives a Just Works "
+            "re-pair and its failure (patch 0042) (heap seq %u)\n", (unsigned)bth_heap_seq());
+    {
+        fake_peer_cfg_t c2;
+        hp_peer_cfg(&c2, k_hp2_wire);
+        memcpy(c2.name, "HP-Disp", 7);
+        c2.ignores_pages = true;                             /* C3: the window stays open, nothing pairs */
+        bth_rom_lock();
+        fake_peer_init(&c2);
+        bth_rom_unlock();
+        bt_hp_debug_t d0, d1;
+        if (!start_ready("S11 start")) {
+            goto out;
+        }
+        /* the start reconnects to S3's headset, which is not the scripted peer now: that page times out */
+        SCHECK(WAIT((bt_hp_get_debug(&d0), d0.connect_fail >= 1u && UI().link == BT_HP_LINK_NONE), 15000),
+               "S11: reconnect to the old headset did not fail (link %u)", UI().link);
+        bt_hp_get_debug(&d0);
+        SCHECK(bthx_call_fn(fn_pair_hp2, 1u, 2000u) == 0, "S11: pick HP-Disp (pair)");
+        SCHECK(WAIT((bt_hp_get_debug(&d1), d1.connect_fail > d0.connect_fail && UI().link == BT_HP_LINK_NONE), 15000),
+               "S11: page to HP-Disp did not time out (link %u)", UI().link);
+        /* the window is open for HP-Disp and the last poll found the gate holding; the pool runs dry now */
+        SCHECK(bthx_call_fn(fn_jw_after_starve, 0u, 2000u) == 0,
+               "S11 C3: Just Works allowed after the ROM RNG pool ran dry since the last poll");
+        stop_session("S11 stop (C3)");
+
+        /* A3: HP-Disp pairs with numeric comparison: an authenticated (MITM) key, bonded */
+        c2.ignores_pages = false;
+        c2.io_cap = 0x01;                                    /* DisplayYesNo */
+        c2.auth_req = 0x05;                                  /* general bonding, MITM */
+        c2.key_type = 0x05;                                  /* authenticated combination P-192 */
+        c2.numeric = 314159u;
+        bth_rom_lock();
+        fake_peer_init(&c2);
+        bth_rom_unlock();
+        if (!start_ready("S11 start (A3)")) {
+            goto out;
+        }
+        SCHECK(WAIT((bt_hp_get_debug(&d0), d0.connect_fail >= 1u && UI().link == BT_HP_LINK_NONE), 15000),
+               "S11: reconnect to the old headset did not fail (link %u)", UI().link);
+        peer_link_reset();
+        SCHECK(bthx_call_fn(fn_pair_hp2, 1u, 2000u) == 0, "S11: pick HP-Disp (pair, numeric comparison)");
+        bth_step("S11 MITM pairing", 30000u);
+        bool open = wait_link(BT_HP_LINK_OPEN, 20000);
+        bth_step_done();
+        SCHECK(open && fake_peer.pairings == 1u && fake_peer.host_confirms == 1u,
+               "S11: numeric comparison pairing (open %d pairings %u confirms %u)", open, fake_peer.pairings,
+               fake_peer.host_confirms);
+        uint8_t k2[16];
+        memcpy(k2, fake_peer.key, 16u);
+        SCHECK(bthx_call_fn(fn_disconnect, 0u, 2000u) == 0, "S11: disconnect HP-Disp");
+        SCHECK(WAIT(UI().link == BT_HP_LINK_NONE && !fake_peer.connected, 10000), "S11: HP-Disp link not down");
+        if (s_fail) {
+            goto out;
+        }
+        /* the same address now pairs as NoInputNoOutput without the key (a spoofer, or the headset reset): our
+         * authentication gets Key Missing, BTM retries with SSP, Just Works comes inside the picked device's open
+         * window. 0042 refuses it before a key exists; the failed pairing (0x05) leaves the stored bond alone. */
+        fake_peer_cfg_t cj = c2;
+        cj.io_cap = 0x03;
+        cj.auth_req = 0x04;
+        cj.key_type = 0x04;
+        cj.numeric = 271828u;                                /* the fake LM derives the key from it: a different key */
+        /* the reconnect does not read page 1 again, so the modelled ROM slot would pick legacy PIN (rejected anyway);
+         * the case here is the SSP Just Works one */
+        cj.rom_auth_decision = false;
+        bth_rom_lock();
+        fake_peer_init(&cj);
+        bth_rom_unlock();
+        peer_link_reset();
+        bt_hp_get_debug(&d0);
+        SCHECK(bthx_call_fn(fn_pair_hp2, 1u, 2000u) == 0, "S11: pick HP-Disp again (pair)");
+        bth_step("S11 Just Works over a MITM bond", 30000u);
+        SCHECK(WAIT(fake_peer.host_rejects >= 1u || fake_peer.pairings > 0u, 15000),
+               "S11 A3: no confirmation reply (rejects %u pairings %u)", fake_peer.host_rejects, fake_peer.pairings);
+        SCHECK(fake_peer.host_key_replies >= 1u && fake_peer.io_cap_requests >= 1u && fake_peer.pin_requests == 0u,
+               "S11 A3: want stored key tried, then SSP (key replies %u io cap %u pin %u)", fake_peer.host_key_replies,
+               fake_peer.io_cap_requests, fake_peer.pin_requests);
+        SCHECK(fake_peer.pairings == 0u && fake_peer.host_confirms == 0u,
+               "S11 A3: Just Works key made over the stored MITM key (pairings %u confirms %u)", fake_peer.pairings,
+               fake_peer.host_confirms);
+        SCHECK(!wait_link(BT_HP_LINK_OPEN, 2000), "S11 A3: opened after a refused Just Works");
+        bth_step_done();
+        SCHECK(bthx_call_fn(fn_disconnect, 0u, 2000u) == 0, "S11: disconnect after the refusal");
+        SCHECK(WAIT(UI().link == BT_HP_LINK_NONE && !fake_peer.connected, 10000), "S11: link not down after refusal");
+        stop_session("S11 stop (A3)");
+
+        /* the real headset (its MITM key) comes back after a restart: the stored bond reconnects it, no pairing */
+        bth_rom_lock();
+        fake_peer_init(&c2);
+        fake_peer_set_key(k2);
+        bth_rom_unlock();
+        peer_link_reset();
+        if (!start_ready("S11 restart (A3)")) {
+            goto out;
+        }
+        bth_step("S11 reconnect with the MITM key", 30000u);
+        open = wait_link(BT_HP_LINK_OPEN, 20000);
+        bth_step_done();
+        SCHECK(open && fake_peer.pairings == 0u && memcmp(fake_peer.host_key, k2, 16u) == 0,
+               "S11 A3: stored MITM bond lost or replaced (open %d pairings %u key %s)", open, fake_peer.pairings,
+               memcmp(fake_peer.host_key, k2, 16u) == 0 ? "same" : "different");
+        s12_bonds = bthx_call_fn(fn_bond_num, 0u, 2000u);   /* S12c expects these back (S3's headset, HP-Disp) */
+        stop_session("S11 stop (A3 reconnect)");
+    }
+    if (s_fail) {
+        goto out;
+    }
+
+    /* ---- S12 ---- silicon 2026-11-25: bt_hp_bonds.bin 152 -> 43 B on the first headphones start of a boot */
+    bth_log("[S12] a bond file this session cannot take over is never replaced (heap seq %u)\n", (unsigned)bth_heap_seq());
+    {
+        static uint8_t good[BT_STORE_IMAGE_MAX], bad[BT_STORE_IMAGE_MAX], now_img[BT_STORE_IMAGE_MAX];
+        int gn = bthx_read_root_file("bt_hp_bonds.bin", good, sizeof(good));
+        uint32_t cfg_len = gn > 0 ? bts1_value_len(good, (uint32_t)gn, "bt_cfg_key0") : 0u;
+        SCHECK(gn > 0 && cfg_len > 0u && UI().state == BT_HP_ST_OFF, "S12: no bond file with a config (%d B, cfg %u)",
+               gn, cfg_len);
+        if (gn > 0 && cfg_len > 0u) {
+            /* S12a: torn / corrupted image (digest), as a different store version would be: bt_store_load rejects it,
+             * the store starts empty and btc_config_init() saves that empty config at once */
+            memcpy(bad, good, (size_t)gn);
+            bad[gn - 1] ^= 0x5Au;
+            SCHECK(put_bond_file(bad, (uint32_t)gn), "S12a: could not plant the corrupted image");
+            uint32_t w0 = bthx_bond_writes();
+            if (start_ready("S12a start")) {
+                (void)WAIT(0, 500);                          /* flush requests of the start's config save */
+                stop_session("S12a stop");
+            }
+            int nn = bthx_read_root_file("bt_hp_bonds.bin", now_img, sizeof(now_img));
+            SCHECK(nn == gn && memcmp(now_img, bad, (size_t)gn) == 0,
+                   "S12a: rejected bond file replaced (%d B -> %d B, writes %u -> %u)", gn, nn, w0, bthx_bond_writes());
+            /* S12b: a valid image whose config Bluedroid cannot parse (config_parse's buffer allocation fails):
+             * btc_config_init() started unconfigured and saved the empty config over the bonds */
+            SCHECK(put_bond_file(good, (uint32_t)gn), "S12b: could not restore the image");
+            bth_heap_fail_size((size_t)cfg_len + 1u);       /* config_parse: osi_calloc(buf_size + 1) (patch 0032; 0045 then skips the save) */
+            w0 = bthx_bond_writes();
+            if (start_ready("S12b start")) {
+                SCHECK(bth_heap_fail_size_pending() == 0u, "S12b: the config buffer allocation was not reached");
+                SCHECK(bthx_call_fn(fn_bond_num, 0u, 2000u) == 0, "S12b: bonds loaded although the parse failed");
+                (void)WAIT(0, 500);
+                stop_session("S12b stop");
+            }
+            bth_heap_fail_size(0u);
+            nn = bthx_read_root_file("bt_hp_bonds.bin", now_img, sizeof(now_img));
+            SCHECK(nn == gn && memcmp(now_img, good, (size_t)gn) == 0,
+                   "S12b: bond file replaced after a config parse failure (%d B -> %d B, writes %u -> %u)", gn, nn, w0,
+                   bthx_bond_writes());
+            /* S12c: the next start takes the file over again: the headset's bond is back */
+            if (start_ready("S12c start")) {
+                int nb = bthx_call_fn(fn_bond_num, 0u, 2000u);
+                SCHECK(nb == s12_bonds, "S12c: the stored bonds were not loaded (%d of %d)", nb, s12_bonds);
+                stop_session("S12c stop");
+            }
+            nn = bthx_read_root_file("bt_hp_bonds.bin", now_img, sizeof(now_img));
+            SCHECK(nn > 0 && bts1_value_len(now_img, (uint32_t)nn, "bt_cfg_key0") == cfg_len,
+                   "S12c: bond file changed by a clean session (%d B)", nn);
+        }
+    }
+
+    /* ---- S10d ---- (review STEP10 A6) last: it leaves headphones mode refused for the rest of the run */
+    bth_log("[S10d] profile teardown failure (job rc 5) is a fault the screen shows, start refused (heap seq %u)\n",
+            (unsigned)bth_heap_seq());
+    if (start_ready("S10d start")) {
+        bthx_force_profile_down_fail();
+        bth_step("S10d stop", 10000u);
+        uint32_t seq = bthx_post_fn(fn_stop, 0u);
+        int r = -1000;
+        SCHECK(WAIT(bthx_done(seq, &r), 8000) && r == 0, "S10d: bt_hp_stop result %d (want 0: no hard path)", r);
+        bth_step_done();
+        SCHECK(bthx_profile_down_rc() == 2u, "S10d: profile rc %u (knob not applied)", bthx_profile_down_rc());
+        SCHECK(UI().state == BT_HP_ST_FAULTED, "S10d: state %u after a failed A2DP teardown (want FAULTED)",
+               UI().state);
+        SCHECK(bthx_hard_path_reason() == 0u, "S10d: hard path %u", bthx_hard_path_reason());
+        SCHECK(bthx_call_fn(fn_start, 0u, 3000u) != 0, "S10d: bt_hp_start accepted after a failed A2DP teardown");
+        SCHECK(UI().state == BT_HP_ST_FAULTED, "S10d: state %u after the refused start", UI().state);
+    }
 
 out:
     s_feed = 0;
-    if (UI().state != BT_HP_ST_OFF) {
+    if (UI().state != BT_HP_ST_OFF && UI().state != BT_HP_ST_FAULTED) {
         stop_session("final stop");
     }
     bthx_set_app_hook(NULL);

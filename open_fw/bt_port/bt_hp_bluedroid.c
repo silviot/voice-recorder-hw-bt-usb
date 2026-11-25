@@ -76,11 +76,14 @@ typedef struct {
     uint8_t  win_open;                 /* pairing window (read by the Just Works hook) */
     uint8_t  win_bda[6];
     uint32_t win_deadline;
-    uint8_t  gate_ok;                  /* the M2.3 gate held at the last poll (the hook cannot call the platform) */
+    uint8_t  gate_ok;                  /* the M2.3 gate held at the last poll (the hook cannot call the platform; it
+                                          reads the gate's RNG latch live, bt_xrec_plat_rng_starved) */
     uint8_t  jw_accepted;              /* a Just Works pairing was accepted for win_bda */
     uint8_t  acl_valid;
     uint8_t  acl_bda[6];
     uint16_t acl_handle;
+    uint8_t  a2d_peer_valid;           /* the app's A2DP target (target / target_valid), mirrored for a2d_cb: a late */
+    uint8_t  a2d_peer[6];              /* CONNECTED / DISCONNECTED / AUDIO_CFG of another peer leaves TX alone (C13) */
     uint8_t  start_pending;            /* we asked for START: the next STARTED is ours (design §4.5) */
     uint8_t  suspend_pending;          /* we asked for SUSPEND: the next SUSPEND is ours, not the headset's. Kept here,
                                           not in mc_out: the ext-codec source acks a SUSPEND (MEDIA_CTRL_ACK) before
@@ -261,6 +264,35 @@ static void log1(const char *tag)
 /* ============================================ helpers ========================================================= */
 static bool bda_eq(const uint8_t a[6], const uint8_t b[6]) { return memcmp(a, b, 6u) == 0; }
 static bool time_reached(uint32_t now, uint32_t at) { return (int32_t)(now - at) >= 0; }
+
+/* App task: g->target changed (or is about to be paged): mirror it for a2d_cb (STEP10 C13). */
+static void a2d_peer_set(const uint8_t bda[6])
+{
+    bt_xrec_plat_lock();
+    g->a2d_peer_valid = 1u;
+    memcpy(g->a2d_peer, bda, 6u);
+    bt_xrec_plat_unlock();
+}
+
+static void target_set(const uint8_t bda[6])
+{
+    g->target_valid = 1u;
+    memcpy(g->target, bda, 6u);
+    a2d_peer_set(bda);
+}
+
+/* BTC (a2d_cb): the event is about another device than the app's A2DP target, i.e. a late result of a connect the app
+ * gave up on (timeout, new pick). The app ignores or closes it (on_a2d_conn); the transmitter belongs to the target's
+ * stream and is not touched (STEP10 C13: such a DISCONNECTED stopped the current stream's tick, a CONNECTED replaced
+ * its connection handle, an AUDIO_CFG its encoder configuration). No target yet: nothing to protect. */
+static bool a2d_stale_peer(const uint8_t bda[6])
+{
+    bool stale;
+    bt_xrec_plat_lock();
+    stale = g != NULL && g->a2d_peer_valid && !bda_eq(g->a2d_peer, bda);
+    bt_xrec_plat_unlock();
+    return stale;
+}
 
 static void set_state(uint8_t st)
 {
@@ -524,7 +556,9 @@ int openfw_just_works_allowed(const uint8_t bda[6])
     bt_xrec_plat_lock();
     if (g != NULL && g->cb_open) {
         hp = true;
-        allow = (g->win_open && bda_eq(g->win_bda, bda) && g->gate_ok &&
+        /* gate_ok is the last poll's gate; the RNG latch is read live: the ROM may have drawn this pairing's nonce
+         * from a dry pool since that poll (STEP10 C3) */
+        allow = (g->win_open && bda_eq(g->win_bda, bda) && g->gate_ok && !bt_xrec_plat_rng_starved() &&
                  !time_reached(bt_xrec_plat_now_ms(), g->win_deadline)) ? 1 : 0;
         if (allow) {
             g->jw_accepted = 1u;
@@ -568,6 +602,10 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *p)
         e.h = p->conn_stat.conn_hdl;
         e.v = p->conn_stat.audio_mtu;
         memcpy(e.bda, p->conn_stat.remote_bda, 6u);
+        if ((p->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTED ||
+             p->conn_stat.state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) && a2d_stale_peer(p->conn_stat.remote_bda)) {
+            break;                            /* not the target's link: on_a2d_conn ignores / closes it */
+        }
         if (p->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTED) {
             hp_tx_bd_set_conn(p->conn_stat.conn_hdl, p->conn_stat.audio_mtu);
             uint16_t h = 0xFFFFu;
@@ -633,8 +671,12 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *p)
         e.type = EV_A2D_CFG;
         uint8_t cie[4];
         memcpy(cie, &p->audio_cfg.mcc.cie, 4u);
-        e.a = (uint8_t)(hp_tx_bd_on_audio_cfg(cie) == 0 ? 1u : 0u);
         e.v = (uint32_t)cie[0] | ((uint32_t)cie[1] << 8) | ((uint32_t)cie[2] << 16) | ((uint32_t)cie[3] << 24);
+        memcpy(e.bda, p->audio_cfg.remote_bda, 6u);
+        if (a2d_stale_peer(p->audio_cfg.remote_bda)) {
+            break;                            /* ok=0 in the log: another device's codec, not applied (C13) */
+        }
+        e.a = (uint8_t)(hp_tx_bd_on_audio_cfg(cie) == 0 ? 1u : 0u);
         hp_sbc_cfg_t c;
         if (hp_sbc_cfg_from_cie(cie, &c) == 0) {
             bt_xrec_plat_lock();
@@ -1016,6 +1058,7 @@ static void connect_now(const uint8_t bda[6])
         lend();
         return;
     }
+    a2d_peer_set(bda);                           /* before the page: its first events may beat the next line */
     esp_err_t r = esp_a2d_source_connect((uint8_t *)bda);
     lbegin("a2dp connect");
     lka("peer", bda);
@@ -1026,14 +1069,16 @@ static void connect_now(const uint8_t bda[6])
     if (r != ESP_OK) {
         g->d.connect_fail++;
         set_msg(BT_HP_MSG_CONNECT_FAIL);
+        if (g->target_valid) {
+            a2d_peer_set(g->target);             /* nothing paged: the mirror follows the target again */
+        }
         return;
     }
     g->d.connects++;
     g->conn_hdl = ESP_A2D_INVALID_CONN_HDL;      /* never the previous link's handle (STEP10 C12) */
     g->link = BT_HP_LINK_CONNECTING;
     g->connect_t0 = bt_xrec_plat_now_ms() + BT_HP_CONNECT_TO_MS;   /* deadline */
-    g->target_valid = 1u;
-    memcpy(g->target, bda, 6u);
+    target_set(bda);
 }
 
 static void rc_schedule(bool first)
@@ -1132,8 +1177,7 @@ static void on_a2d_conn(const ev_t *e)
     if (e->a == ESP_A2D_CONNECTION_STATE_CONNECTED) {
         g->link = BT_HP_LINK_OPEN;
         g->conn_hdl = e->h;
-        g->target_valid = 1u;
-        memcpy(g->target, e->bda, 6u);
+        target_set(e->bda);
         g->rc_active = 0u;
         g->rc_step = 0u;
         g->user_disc = 0u;
@@ -1468,8 +1512,8 @@ static void on_event(const ev_t *e)
     case EV_CFM_REQ: {
         /* a headset with a display (numeric comparison): accepted for the picked device inside the window only */
         bt_xrec_plat_lock();
-        bool ok = g->win_open && bda_eq(g->win_bda, e->bda) && g->gate_ok &&
-                  !time_reached(bt_xrec_plat_now_ms(), g->win_deadline);   /* as the Just Works hook (STEP10 A8) */
+        bool ok = g->win_open && bda_eq(g->win_bda, e->bda) && g->gate_ok && !bt_xrec_plat_rng_starved() &&
+                  !time_reached(bt_xrec_plat_now_ms(), g->win_deadline);   /* as the Just Works hook (STEP10 A8, C3) */
         if (ok) {
             g->jw_accepted = 1u;
         }
@@ -1491,7 +1535,7 @@ static void on_event(const ev_t *e)
             /* bench only (hp_pin=1): the ROM pairs as initiator with legacy PIN (silicon 2026-11-25); answer "0000"
              * for the picked device inside its window, with the same gate as the Just Works hook */
             bt_xrec_plat_lock();
-            bool ok = g->win_open && bda_eq(g->win_bda, e->bda) && g->gate_ok;
+            bool ok = g->win_open && bda_eq(g->win_bda, e->bda) && g->gate_ok && !bt_xrec_plat_rng_starved();
             if (ok) {
                 g->jw_accepted = 1u;
             }
@@ -1886,9 +1930,9 @@ static int hp_profile_down(void)
                 bt_xrec_plat_wait();
             }
             if (!s_a2d_deinit_seen) {
-                rc = 2;   /* hp_av_deinit_timeout (design §5.5): logged by the app (patch 0039 posts the local AVDT
-                           * disconnect for a stream still closing; the btc_av state reset backstop is deferred:
-                           * BT_A2DP_HP_SESSION.md) */
+                rc = 2;   /* hp_av_deinit_timeout (design §5.5): a fault for the app (patches 0039/0043 close a
+                           * stream still closing locally, without an allocation; the btc_av state reset backstop is
+                           * deferred: BT_A2DP_HP_SESSION.md) */
             }
         } else {
             rc = 3;
@@ -1972,9 +2016,14 @@ static int shutdown_now(void)
          * run on BTC over the sink and ring free_session() returns (STEP10 A4) */
         reason = BT_XREC_FAULT_DOWN_FAIL;
     }
+    bool profile_fault = false;
     if (r == 5 && reason == BT_XREC_FAULT_NONE) {
+        /* the stack itself went down (no hard path), but btc_av / btc_avrc kept their init state: escalated to a
+         * fault the screen shows ("BT fault", design §5.5 "offers a reboot instead of a silent failure"), and no
+         * new session this boot (STEP10 A6; C14 only logged it and reported a normal OFF) */
         log1("A2DP deinit did not confirm in time (hp_av_deinit_timeout): headphones mode off until the next boot");
         s_restart_required = 1u;
+        profile_fault = true;
     }
     if (reason != BT_XREC_FAULT_NONE) {
         /* the hard path first (it reboots on target): BTC may still use the sink / ring, so they are not freed under
@@ -1989,7 +2038,12 @@ static int shutdown_now(void)
     free_session();
     bt_xrec_plat_session_end();        /* final bond flush to bt_hp_bonds.bin: still in headphones mode */
     bt_xrec_plat_set_mode(BT_XREC_MODE_PHONE, NULL);
-    set_state(BT_HP_ST_OFF);
+    if (profile_fault) {
+        s_last_fault = BT_XREC_FAULT_DOWN_FAIL;
+        set_state(BT_HP_ST_FAULTED);
+    } else {
+        set_state(BT_HP_ST_OFF);
+    }
     cfg_save();
     log1("stopped");
     return 0;
@@ -2390,8 +2444,7 @@ int bt_hp_connect_addr(const uint8_t bda[6], int pair)
     g->user_disc = 0u;
     g->rc_active = 0u;
     found_name(bda, g->target_name);
-    g->target_valid = 1u;
-    memcpy(g->target, bda, 6u);
+    target_set(bda);
     bt_hp_scan_cancel();
     lbegin("pick");
     lka("peer", bda);

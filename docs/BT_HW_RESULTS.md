@@ -266,6 +266,28 @@ Seen in the trace, expected: `080D`, `0C37` (CC `0x01`) and `040F` (CS `0x01`) a
 (REJ rows); `ev=0x1B` Max Slots Change right after the Connection Complete. The first trace images also traced
 successful set-up CCs (`0C03`...`0C14`); the committed trace skips successful CCs outside link control.
 
+## Session 8 (2026-11-25): headphones audio captured on the laptop
+
+Image: bench `BT=1 BENCH=1 HP_GATES=1` from `integ/bt-all-local` `64d820e` (FIRM CRC `0xD52F`); laptop as sink
+(PipeWire 1.6.2, BlueZ 5.85). Capture: PipeWire creates `bluez_input.<addr>.N` only while the transport is
+`active` (after AVDTP START); `pw-record --target <node> -P '{ node.dont-reconnect = true }'` records it (without
+`dont-reconnect`, pw-record moves to the default source when the node goes away and records laptop audio).
+WirePlumber auto-links the node to the default sink; `pw-link -d` on those links keeps it off the speakers.
+
+| Run | Result |
+|---|---|
+| first boot of the new image (`player`, `hp_pick=last`) | **bond lost**: the stored key was not used (no `0411` before the SSP attempt, `ev=0x36 st=0x05`), `Just Works pairing refused` (no window: correct), retries 3/10/30 s; `bt_hp_bonds.bin` went from 152 to 43 B (empty store written). Previous boot ran the older image `0edcb61`. Cause not found (ring tail only); same-image reboots afterwards kept the bond (next rows). Analysis and the store hold fix: `docs/reviews/STEP10_JOINT_REVIEW.md` HW8 (an empty start over a non-empty file can no longer replace it; a peer that lost the key still removes the bond) |
+| `connect hp_addr hp_pair=1` (laptop bond removed first) | SSP Just Works accepted inside the window, `auth st=0 key=4`, `bt_hp_bonds.bin` 152 B |
+| `player hp_pick=last secs=70` | reconnect **with the stored key** (no pairing), link 171 ms, `connected` 3.4 s, plays `/cassini/cassini-final-moments.wav` (IMA ADPCM 16 kHz mono); BlueZ `fd(30) ready`; the run ends at `secs` (time-limit BACK works). Capture: audio present but **~42 dB below the source** and **`pads=5..17` per second** (packets with no real PCM) |
+| `tone hp_pick=last secs=40` | capture: continuous **1000 Hz** (zero-crossing count 992-1000 Hz), constant RMS for 31 s, no gaps; device `pkts` 47-55/s, `acked` 368-440, pads 0 |
+
+Findings:
+- **Level**: AVRCP `abs_vol=1` arrived ~1.3 s after the player set the PCM gain, so the gain stayed at `bt_vol` 64
+  (vol31 16, -24 dB) while the sink applied absolute volume 64 as well. Fixed in `ecc8b33` (the player re-applies
+  the gain when `bt_hp_abs_vol()` changes).
+- **Player starvation**: the tone path (same ring, resampler, SBC) has pads 0; the player stage has ~20 % padding
+  packets, i.e. audible gaps. Under investigation on `fix/hp-player-starve`.
+
 ## Exp 1 stages A and B: how to run
 
 Probe image for plan M5 Exp 1 stage A and stage B (step 4): `bt_ctrl` (plan M1) drives the real RW-BT ROM through
@@ -821,13 +843,23 @@ What the image does:
   no headset connected a file does not start and shows `Headphones not connected`), `Both` (DAC and headset, the DAC
   delayed by the headset latency estimate). Stored in `SD:/bt_hp_cfg.bin` with `bt_vol` and the last headset, not in
   `settings.bin` (design §6.6).
-- **Player** with Headphones/Both: speaker amp off, jack plugging ignored, volume = headset volume (AVRCP absolute
-  volume when the headset supports it, else PCM gain; a volume change on the headset is followed by the device's VOL
-  keys); headset buttons PLAY and PAUSE toggle (one-button headsets guess which one to send), STOP pauses, NEXT/PREV
-  skip or seek like the device's arrow taps, VOL+/- step the volume once (`BT hp avrcp key code=.. rel=0 key=N` logs
-  each decision); a link loss, credit stall, START failure or the headset pausing itself (in-ear detection) pauses
-  the player at the last heard sample. Buttons pressed and headset events while no file plays are dropped when the
-  next file starts.
+- **Both, as the user sees it**: with a headset connected and streaming-ready when the file opens, the file plays on
+  the headset and on the speaker (or the wired jack) together, the speaker held back to match the headset. With no
+  headset at that moment the file plays on the speaker alone at the speaker volume (no toast); a headset that connects
+  later is used from the next file. Mono and stereo files both work (the headset gets mono as mono). One volume for
+  both outputs: the headset's `bt_vol` (VOL keys and headset buttons change it; with AVRCP absolute volume the headset
+  applies it and the speaker follows the same level). The speaker amp follows the jack as in Speaker mode, and pulling
+  the jack pauses both. If the app is held up long enough for the speaker to run dry, the speaker skips the missed
+  part to stay in step with the headset (the headset is not interrupted). If the headset drops mid-file the player
+  pauses (if headphones mode itself stopped, Play continues on the speaker; after a lost link reopen the file). If the
+  PCM ring had to borrow the DAC buffer (no heap), Both plays on the headset only.
+- **Player** with Headphones (Both: speaker side above): speaker amp off, jack plugging ignored, volume = headset
+  volume (AVRCP absolute volume when the headset supports it, else PCM gain; a volume change on the headset is
+  followed by the device's VOL keys); headset buttons PLAY and PAUSE toggle (one-button headsets guess which one to
+  send), STOP pauses, NEXT/PREV skip or seek like the device's arrow taps, VOL+/- step the volume once (`BT hp avrcp
+  key code=.. rel=0 key=N` logs each decision); a link loss, credit stall, START failure or the headset pausing itself
+  (in-ear detection) pauses the player at the last heard sample. Buttons pressed and headset events while no file
+  plays are dropped when the next file starts.
 - **Exit paths**: power-off, USB disk mode and phone mode stop headphones mode first; the REC switch suspends the stream
   (link kept).
 

@@ -53,13 +53,39 @@ static int s_trace = -1;
 static bth_heap_stats_t s_st;
 static uint64_t s_fail_at;
 static bool s_fail_persistent;
+static size_t s_fail_size;       /* bth_heap_fail_size(): the next attempt of exactly this size fails (0 = off) */
 
 static void lock(void) { vPortEnterCritical(); }
 static void unlock(void) { vPortExitCritical(); }
 
-/* Decide whether this attempt fails (caller holds the lock). */
-static bool inject(void *ra)
+/* Targeted failure (bth_heap_fail_task_size): every allocation of exactly s_ts_size bytes made by the FreeRTOS task
+ * named s_ts_task fails while set. */
+static char s_ts_task[configMAX_TASK_NAME_LEN];
+static size_t s_ts_size;
+static uint64_t s_ts_injected;
+
+static bool inject_task_size(size_t n)
 {
+    if (s_ts_task[0] == '\0' || n != s_ts_size || xTaskGetSchedulerState() != taskSCHEDULER_RUNNING) {
+        return false;
+    }
+    const char *name = pcTaskGetName(NULL);
+    if (name == NULL || strcmp(name, s_ts_task) != 0) {
+        return false;
+    }
+    s_ts_injected++;
+    return true;
+}
+
+/* Decide whether this attempt fails (caller holds the lock). */
+static bool inject(void *ra, size_t n)
+{
+    if (s_fail_size != 0u && n == s_fail_size) {
+        s_fail_size = 0u;
+        s_st.injected++;
+        s_st.last_injected_ra = ra;
+        return true;
+    }
     s_st.armed_seen++;
     if (s_fail_at != 0u && (s_st.armed_seen == s_fail_at || (s_fail_persistent && s_st.armed_seen > s_fail_at))) {
         s_st.injected++;
@@ -139,7 +165,7 @@ static void *bth_alloc(size_t n, bool zero, void *ra)
     }
     lock();
     void *r = NULL;
-    if (!inject(ra)) {
+    if (!inject_task_size(n) && !bth_oom_take_alloc(n) && !inject(ra, n)) {
         void *raw = zero ? __real_calloc(1, HDR + n) : __real_malloc(HDR + n);
         if (raw != NULL) {
             r = track(raw, n, ra);
@@ -253,6 +279,40 @@ void bth_heap_fail_arm(uint64_t n, bool persistent)
     s_fail_at = n;
     s_fail_persistent = persistent;
     unlock();
+}
+
+void bth_heap_fail_task_size(const char *task, size_t size)
+{
+    lock();
+    memset(s_ts_task, 0, sizeof(s_ts_task));
+    if (task != NULL) {
+        strncpy(s_ts_task, task, sizeof(s_ts_task) - 1u);
+    }
+    s_ts_size = size;
+    unlock();
+}
+
+uint64_t bth_heap_task_size_injected(void)
+{
+    lock();
+    uint64_t n = s_ts_injected;
+    unlock();
+    return n;
+}
+
+void bth_heap_fail_size(size_t n)
+{
+    lock();
+    s_fail_size = n;
+    unlock();
+}
+
+size_t bth_heap_fail_size_pending(void)
+{
+    lock();
+    size_t n = s_fail_size;
+    unlock();
+    return n;
 }
 
 void bth_heap_fail_disarm(void)

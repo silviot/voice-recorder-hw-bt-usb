@@ -84,7 +84,7 @@ static TimerHandle_t s_dl_timer;
 static volatile uint8_t s_dl_armed, s_dl_fired;
 static volatile uint32_t s_dl_fired_total, s_hard_reason, s_bond_writes, s_key_writes, s_reboot_mode;
 static uint32_t s_faults_base, s_hci_to_base, s_flush_seen;
-static uint8_t s_bonds_hold;                  /* as bt_xrec_fw.c: the bond file could not be read, never written */
+static uint8_t s_hold_logged;                 /* as bt_xrec_fw.c: the bond-file hold was reported this session */
 static volatile uint8_t s_fail_bond_reads;    /* test knob: reading the mode's bond file fails (SD error) */
 static volatile uint8_t s_fail_bond_writes;   /* test knob: every /bt_bonds.bin write fails (full / removed card) */
 static volatile uint32_t s_bond_write_fails;
@@ -184,6 +184,10 @@ void bt_xrec_plat_reboot(uint8_t mode) { s_reboot_mode = mode; }
  * collection credited nothing: the XREC PIN and the CHAL nonce fail closed and the M2.3 gate refuses. */
 static volatile uint8_t s_withhold;
 static volatile uint8_t s_key_staged, s_key_installed;   /* bt_rom_real_stage_p192 / start() install, modelled */
+static volatile uint32_t s_rng_starved;                   /* bt_rom_rng `starved`, modelled (bthx_rng_starve) */
+
+void bthx_rng_starve(void) { __atomic_add_fetch(&s_rng_starved, 1u, __ATOMIC_SEQ_CST); }
+int bt_xrec_plat_rng_starved(void) { return __atomic_load_n(&s_rng_starved, __ATOMIC_SEQ_CST) != 0u ? 1 : 0; }
 
 static bool session_entropy_ready(void) { return !s_withhold && bt_entropy_ready(); }
 
@@ -199,7 +203,8 @@ int bt_xrec_plat_entropy(void *out, size_t n)
  * on the firmware's sequence: the key is staged at stack_up_begin only with credited entropy (session_entropy_begin)
  * and "installed" when esp_bluedroid_enable() returned (bt_rom_real start() runs inside its HCI Reset); stop wipes it.
  * A credit arriving later in the session (deferred mic collection) does not install it: SSP stays refused until the
- * next start, exactly as on target. The RNG-pool reason (starved) has no host model (test_bt_rom_rng covers it). */
+ * next start, exactly as on target. The RNG-pool reason is the `starved` latch (bthx_rng_starve), reset at the next
+ * stack_up_begin as bt_rom_rng_reset() does in session_entropy_begin. */
 const char *bt_xrec_plat_pairing_block(void)
 {
     if (s_lock_depth != 0u) {
@@ -215,6 +220,9 @@ const char *bt_xrec_plat_pairing_block(void)
     }
     if (!s_key_installed) {
         return "ROM P-192 key not replaced (re-enter BT mode)";
+    }
+    if (bt_xrec_plat_rng_starved()) {
+        return "ROM RNG pool ran dry this session";
     }
     return NULL;
 }
@@ -299,9 +307,11 @@ void bt_xrec_plat_set_mode(uint8_t mode, int (*profile_down)(void))
 static void bonds_write(void);
 
 /* As bt_xrec_fw.c bonds_load (review STEP10 C10 / A2: unsaved RAM bonds kept over the older file, the other mode's
- * unsaved bonds flushed before the switch, an unreadable file never written over). */
+ * unsaved bonds flushed before the switch; a bond file whose bonds the session cannot take over is held (bt_store_held)
+ * and never written over: silicon 2026-11-25 bond loss). */
 static void bonds_load(void)
 {
+    s_hold_logged = 0u;
     if (s_store_mode != s_mode) {    /* as bt_xrec_fw.c (design §6.4) */
         if (s_store_mode != 0xFFu && bt_store_dirty()) {
             bonds_write();
@@ -311,8 +321,7 @@ static void bonds_load(void)
         }
         bt_store_reset();
         s_store_mode = s_mode;
-        s_bonds_hold = 0u;
-    } else if (bt_store_dirty() && !s_bonds_hold) {
+    } else if (bt_store_dirty() && !bt_store_held()) {
         bt_xrec_plat_log("BT bonds kept from RAM (unsaved changes are newer than the card)");
         return;                      /* the start's config save asks for the flush (bt_xrec_fw.c sets the request) */
     }
@@ -322,26 +331,32 @@ static void bonds_load(void)
     char path[24];
     snprintf(path, sizeof(path), "/%s", BOND_FILE(s_mode));
     exfat_entry_t ent;
-    if (exfat_find_path(s_vol, path, &ent) != 0 || ent.is_dir || ent.size == 0u || ent.size > BT_STORE_IMAGE_MAX) {
-        s_bonds_hold = 0u;
+    if (exfat_find_path(s_vol, path, &ent) != 0 || ent.is_dir || ent.size == 0u) {
+        bt_store_hold(0);
+        return;
+    }
+    if (ent.size > BT_STORE_IMAGE_MAX) {
+        bt_xrec_plat_log_u32("BT bond file too large (kept, not written this session), size", ent.size);
+        bt_store_reset();
+        bt_store_hold(1);
         return;
     }
     uint8_t *img = (uint8_t *)pvPortMalloc(BT_STORE_IMAGE_MAX);
     if (img == NULL) {
         bt_xrec_plat_log("BT bonds not loaded: no memory (bond file kept, not written this session)");
-        s_bonds_hold = 1u;
+        bt_store_hold(1);
         return;
     }
     int n = s_fail_bond_reads ? -1 : read_root_file(s_vol, BOND_FILE(s_mode), img, BT_STORE_IMAGE_MAX);
     if (n > 0) {
-        s_bonds_hold = 0u;
         esp_err_t r = bt_store_load(img, (size_t)n);
         if (r != ESP_OK) {
-            bt_xrec_plat_log_u32("BT bond file rejected (store starts empty), err", (uint32_t)r);
+            bt_xrec_plat_log_u32("BT bond file rejected (kept, not written this session; store starts empty), err",
+                                 (uint32_t)r);
         }
     } else {
         bt_xrec_plat_log("BT bond file unreadable (kept, not written this session)");
-        s_bonds_hold = 1u;
+        bt_store_hold(1);
     }
     wipe_mem(img, BT_STORE_IMAGE_MAX);
     vPortFree(img);
@@ -349,7 +364,14 @@ static void bonds_load(void)
 
 static void bonds_write(void)
 {
-    if (!bt_store_dirty() || !s_sd || s_vol == NULL || s_store_mode == 0xFFu || s_bonds_hold) {
+    if (!bt_store_dirty() || !s_sd || s_vol == NULL || s_store_mode == 0xFFu) {
+        return;
+    }
+    if (bt_store_held()) {
+        if (!s_hold_logged) {
+            s_hold_logged = 1u;
+            bt_xrec_plat_log("BT bonds not saved: the card's bond file was not loaded this session (kept)");
+        }
         return;
     }
     uint8_t *img = (uint8_t *)pvPortMalloc(BT_STORE_IMAGE_MAX);
@@ -406,6 +428,7 @@ static volatile uint8_t s_hold_up;    /* test knob: the up job waits (the app ta
 static volatile uint8_t s_hold_btc;   /* test knob: the up job ends with BTC_TASK suspended (bthx_hold_btc) */
 static TaskHandle_t volatile s_btc_held;
 static volatile uint32_t s_down_spp_checked, s_down_spp_deinit;   /* down jobs past the SPP check / that deinit */
+static volatile uint8_t s_force_profile_fail;   /* test knob: the next down job's profile teardown reports failure */
 
 static int job_up(void)
 {
@@ -440,6 +463,10 @@ static int job_down(void)
     memset(s_down_ms, 0, sizeof(s_down_ms));
     if (esp_bluedroid_get_status() == ESP_BLUEDROID_STATUS_ENABLED && s_profile_down != NULL) {
         int pr = s_profile_down();
+        if (s_force_profile_fail) {
+            s_force_profile_fail = 0u;   /* test knob (one shot): as if the A2DP deinit had not confirmed */
+            pr = 2;
+        }
         s_profile_down_rc_last = (uint32_t)pr;
         if (pr != 0) {
             rc = 5;
@@ -555,6 +582,7 @@ int bt_xrec_plat_stack_up_begin(exfat_vol_t *vol, int sd_mounted, const uint8_t 
     bonds_load();                    /* before esp_bluedroid_init() (plan M2) */
     s_key_installed = 0u;            /* bt_xrec_fw.c session_entropy_begin: key staged only with credited entropy */
     s_key_staged = (uint8_t)session_entropy_ready();
+    __atomic_store_n(&s_rng_starved, 0u, __ATOMIC_SEQ_CST);   /* bt_rom_rng_reset() in session_entropy_begin */
     s_faults_base = bth_ctrl_faults();
     s_hci_to_base = bth_hci_cmd_timeouts();
     s_flush_seen = bth_store_flush_requests();
@@ -661,6 +689,9 @@ void bt_xrec_plat_session_end(void)
 {
     bt_task_sup_disarm(&s_sup);
     bonds_write();                   /* final flush of the bond store */
+    if (bt_store_held() && !s_hold_logged) {
+        bt_xrec_plat_log("BT bond file held this session (its bonds were not loaded; file kept)");
+    }
     s_bond_fails = 0u;
     s_key_staged = s_key_installed = 0u;
     s_vol = NULL;
@@ -716,6 +747,7 @@ static void app_task(void *arg)
             case BTHX_FN: r = s_fn != NULL ? s_fn(s_req_arg) : -1; break;
             default: r = -1; break;
             }
+            snapshot();              /* before "done": a test reading S() right after the call sees its effect */
             taskENTER_CRITICAL();
             s_req_res = r;
             s_req_done = s_req_seq;
@@ -841,5 +873,6 @@ int bthx_hold_btc(int on)
     return 0;
 }
 int bthx_btc_held(void) { return s_btc_held != NULL; }
+void bthx_force_profile_down_fail(void) { s_force_profile_fail = 1u; }
 uint32_t bthx_down_spp_checked(void) { return s_down_spp_checked; }
 uint32_t bthx_down_spp_deinit(void) { return s_down_spp_deinit; }

@@ -121,6 +121,25 @@ void AVCT_Deregister(void)
 #if (AVCT_BROWSE_INCLUDED == TRUE)
     L2CA_Deregister(AVCT_BR_PSM);
 #endif
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+    /* open_fw patch 0043: as AVDT_Deregister(): a link control block still waiting for the L2CAP disconnect of a frozen
+     * peer kept its tx_q and reassembly buffer until the next AVCT_Register()'s memset (STEP10 A6). Every connection
+     * was removed before this; release the link (and browse) blocks so a late L2CAP callback finds none. */
+    for (int i = 0; i < AVCT_NUM_LINKS; i++) {
+        tAVCT_LCB *p_lcb = &avct_cb.lcb[i];
+        if (p_lcb->allocated) {
+            osi_free(p_lcb->p_rx_msg);
+            fixed_queue_free(p_lcb->tx_q, osi_free_func);
+        }
+        tAVCT_BCB *p_bcb = &avct_cb.bcb[i];
+        if (p_bcb->allocated) {
+            osi_free(p_bcb->p_tx_msg);
+        }
+    }
+    memset(avct_cb.lcb, 0, sizeof(avct_cb.lcb));
+    memset(avct_cb.bcb, 0, sizeof(avct_cb.bcb));
+    memset(avct_cb.ccb, 0, sizeof(avct_cb.ccb));
+#endif
 }
 
 /*******************************************************************************

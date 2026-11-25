@@ -144,7 +144,7 @@ uint32_t bt_rom_rng_hook(uint32_t ret_addr, volatile uint8_t *nonce_block, uint3
         s_st.last_unknown = ret_addr;
         return legacy();
     }
-    s_st.starved++;                                 /* security site, pool short: cannot fail here */
+    __atomic_store_n(&s_st.starved, s_st.starved + 1u, __ATOMIC_RELEASE);   /* security site, pool short (latch) */
     return legacy();
 out:
     wipe(b, sizeof(b));
@@ -156,4 +156,9 @@ void bt_rom_rng_stats(bt_rom_rng_stats_t *out)
     if (out != NULL) {
         *out = s_st;
     }
+}
+
+uint32_t bt_rom_rng_starved(void)
+{
+    return __atomic_load_n(&s_st.starved, __ATOMIC_ACQUIRE);
 }

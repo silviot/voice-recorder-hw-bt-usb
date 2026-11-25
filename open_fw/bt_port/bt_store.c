@@ -29,6 +29,7 @@ static struct {
     uint32_t gen;                /* bumped on every change; serialize remembers the one it wrote */
     uint32_t ser_gen;
     int initialised;
+    int hold;                    /* bt_store_held(): the card's image must not be replaced this session */
 } g;
 
 static void lock(void)   { if (g.have_p && g.p.lock) g.p.lock(g.p.ctx); }
@@ -429,10 +430,12 @@ esp_err_t bt_store_load(const uint8_t *img, size_t len)
     if (n != end) {
         goto fail;
     }
+    g.hold = 0;
     unlock();
     return ESP_OK;
 fail:
     reset_entries();
+    g.hold = len != 0u;          /* bonds the store could not take over: never replaced by the empty store */
     unlock();
     return r;
 }
@@ -450,5 +453,33 @@ void bt_store_reset(void)
     lock();
     reset_entries();
     g.gen++;
+    g.hold = 0;
+    unlock();
+}
+
+int bt_store_held(void)
+{
+    lock();
+    int h = g.hold;
+    unlock();
+    return h;
+}
+
+void bt_store_hold(int on)
+{
+    lock();
+    g.hold = on != 0;
+    unlock();
+}
+
+void bt_store_hold_nonempty(void)
+{
+    lock();
+    for (unsigned i = 0; i < BT_STORE_ENTRIES_MAX; i++) {
+        if (g.e[i].used) {
+            g.hold = 1;
+            break;
+        }
+    }
     unlock();
 }

@@ -2049,6 +2049,7 @@ int bt_xrec_start(exfat_vol_t *vol, int sd_mounted)
         xrec_cb_audio_cfg,
         xrec_cb_get_mtu,
         xrec_cb_file_busy,
+        0,  /* tx_free: legacy RFCOMM path keeps no RX backpressure (review STEP10 A5 covers the Bluedroid port) */
     };
 
     g_vol                 = vol;

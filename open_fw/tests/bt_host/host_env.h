@@ -27,11 +27,37 @@ void bth_heap_peak_reset(void);   /* peak_bytes = live_bytes (scenario-local pea
 /* Fail the n-th allocation attempt (1-based) from now on; n = 0 disarms. persistent: fail every attempt >= n. */
 void bth_heap_fail_arm(uint64_t n, bool persistent);
 void bth_heap_fail_disarm(void);
+/* Every allocation of exactly `size` bytes made by the FreeRTOS task named `task` fails until called with NULL (e.g.
+ * BTU_TASK's BT_HDR-sized messages: patch 0039's local close, STEP10 A6). Counts what it failed. */
+void bth_heap_fail_task_size(const char *task, size_t size);
+uint64_t bth_heap_task_size_injected(void);
+/* One-shot: the next allocation attempt of exactly n bytes fails (n = 0 disarms); pending = still armed. */
+void bth_heap_fail_size(size_t n);
+size_t bth_heap_fail_size_pending(void);
 /* Allocation attempts counted since the last arm (also counts while armed with n = 0 via bth_heap_count_start). */
 void bth_heap_count_start(void);
 uint64_t bth_heap_counted(void);
 uint32_t bth_heap_seq(void);                /* allocation sequence number (live blocks carry theirs) */
 void bth_heap_dump_since(uint32_t seq);     /* stderr: live blocks allocated after seq (BTH_HEAP_TRACE=1: stacks) */
+
+/* ---- BTC context (host_glue.c) ---- */
+/* Run fn(arg) on BTC_TASK (a BTC_PID_ALARM work item, the way Bluedroid runs its own alarms) and wait for it, at most
+ * timeout_ms. 0 = it ran. */
+int bth_btc_run(void (*fn)(void *), void *arg, uint32_t timeout_ms);
+void *bth_a2dp_app_cb(void);                /* the callback given to esp_a2d_register_callback(), or NULL */
+/* ---- targeted out-of-memory levers (host_oom.c; patch 0044, review STEP10 A9 / C7 / C11) ---- */
+enum {
+    BTH_OOM_SPP_WRITE_CMPL = 0,   /* BTA -> BTC hand-off of BTA_JV_RFCOMM_WRITE_EVT */
+    BTH_OOM_SPP_DATA_IND,         /* BTA -> BTC hand-off of BTA_JV_RFCOMM_DATA_IND_EVT (bta_co_rfc_data_incoming) */
+    BTH_OOM_SPP_DISCONNECT,       /* esp_spp_disconnect()'s BTC post (the API returns ESP_FAIL) */
+    BTH_OOM_BTU_ENQUEUE,          /* fixed_queue_enqueue() on BTU_TASK (list node) */
+    BTH_OOM_BOND_STORE,           /* btc_storage_add_bonded_device() */
+    BTH_OOM_BTC_FREE_SCN_UD,      /* an allocation of sizeof(tBTA_JV_FREE_SCN_USER_DATA) on BTC_TASK (SPP deinit) */
+    BTH_OOM_N
+};
+void bth_oom_arm(int what, int n);      /* the next n matching calls fail; 0 disarms */
+uint32_t bth_oom_hits(int what);        /* failures injected so far */
+bool bth_oom_take_alloc(size_t n);      /* host_heap.c, under its lock: fail this allocation (BTH_OOM_BTC_FREE_SCN_UD) */
 
 /* ---- logging: serialised (FreeRTOS critical section), safe from any task ---- */
 void bth_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));

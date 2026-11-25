@@ -328,6 +328,27 @@ Acceptance budget per mode: minimum free heap under traffic ≥ 8 KB and largest
 - UI strings through i18n for all 18 languages (one batch). Shared-file diffs (`main.c`, `Makefile`, `startup.c`) stay
   hook-sized; `k_exp_api`, `test-host` and `wasm` targets keep compiling under both flag values.
 
+### Threat model: keys on the SD card (STEP10 C6)
+What is stored, in plaintext, in the card's root: `/bt_bonds.bin` (phone mode) and `/bt_hp_bonds.bin` (headphones
+mode), `bt_store` images ("BTS1", SHA-256 prefix as an integrity check only) holding Bluedroid's bond config: peer
+address, 128-bit BR/EDR link key, key type; and `/cassini.key` ("CSK5" + the 32-byte XREC HMAC key, the stock
+firmware's format, kept so a card moves between stock and open firmware). No device-unique secret exists to encrypt
+them with (the NOR UID follow-up of C18 is the same prerequisite); nothing else on the card is secret.
+
+- **In scope, mitigated**: a radio-only attacker. Phone mode bonds need numeric comparison confirmed on the device
+  inside a user-opened window; Just Works is refused in phone mode, and never replaces a stored MITM key in either mode;
+  a failed authentication or "key missing" from a peer using a bonded address does not remove the bond (patch 0042);
+  pairing is refused while the entropy gate is not met (M2.3, C3 latch). XREC commands need `CHAL`/`AUTH` with the
+  key; `PAIR` needs the device's own window.
+- **Out of scope (accepted)**: anyone who reads the card (seconds with the device in hand, or the card in a reader).
+  With a bond file they can impersonate the bonded phone or headset to the device, and with the peer's address and link
+  key decrypt recorded BR/EDR traffic of that pair or impersonate the device to the phone. With `cassini.key` they pass
+  XREC `AUTH` and can list, download and delete recordings over BT, which the card in hand gives them anyway. Someone
+  who can write the card can plant a bond or replace the XREC key (the same as pairing with physical access).
+- **Recovery**: on a lost or copied card, remove the device from the phone's Bluetooth list, delete the three files
+  (or Forget in headphones mode) and pair again; a new `PAIR` replaces `cassini.key`. Link keys are never logged
+  (`bt_store.h`), and the bench log carries no key material.
+
 ### M5 — Hardware experiments (user runs; tools provided)
 - **Exp 0 (SRAM, separate probe image, scheduler off)**: candidate ranges excluded from all allocation in this image;
   pattern-fill `0x86B000..0x880000` and `0x805C00..0x81A37F`; exercise legacy BT bring-up, UI, recording, USB; verify
@@ -831,6 +852,91 @@ secret of ~33 predictable bits: bench-only waiver, see the review-round entry be
   DEL and PAIR checks fail without their fixes. Gates (0 warnings): FIRM CRC def 0xECB8, bt 0xA199, hp 0x663A,
   hpb 0xD52F, bench 0x4FED. Open: A5 XREC TX flow control, C3, A3 key downgrade, A6/A9/C7/C11 OOM paths, C13; hardware:
   C5, headset IO capability (C2/A8), C18 address, A10, A11, Exp 5.
+- 2026-11-25 (`fix/s10-xrec-flow` from `ab27527`): review STEP10 **A5** XREC TX flow control. `xrec_on_rx()` now returns the bytes consumed and, with the new optional `xrec_ops_t.tx_free`, holds back any byte that would produce a reply (line end, PUT header `:`, last PUT payload byte) while the TX ring has less than `XREC_REPLY_MAX` (576 B) free. `bt_xrec_bluedroid.c`: DATA records move into `rx_pend` (bytes stay in the RX ring until parsed) and are parsed before the next event; while a command is held the control events behind it still run, since the WRITE / CONG events among them are what drains TX; held bytes are dropped on close or a new handle; `rx_held` debug counter. Lesson: blocking the head of the event FIFO on TX room would deadlock (TX room comes back only through WRITE_EVT). Legacy `bt_hci.c` path unchanged (`tx_free` 0). Also the C1 residual: `exfat_delete_file()` no longer frees clusters when the shared-cluster scan fails with an I/O error (returns -1, clusters leaked). Tests: `test_core` `test_xrec_flow_control` and the delete-with-I/O-error check, `test_bt_xrec` [6b] (8 pipelined LOG replies against a congested BTC: 4 dropped without the op); all fail without their fix. `xrec_proto.c` and `exfat.c` are in the default image (as is the `bt_hci.c` ops table), so the BT=0 CRC changes: 0xECB8 -> 0x568B (baseline rebuilt in the same worktree path). Gates (0 warnings, all rc=0 incl. QEMU rtos / bt / hciprobe): FIRM CRC def 0x568B, bt 0xEF4C, hp 0x89B0, hpb 0xEBAB, bench 0x8934 (path-dependent, `voice-recorder-hw-bt-usb-xrecflow` worktree).
+- 2026-11-25 (`test/aout-both-mode`, from `ab27527`): **output mode Both** read end to end (Settings row -> `bt_hp_cfg.bin`
+  `out_mode` -> `aout_set_mode` -> `aout_start` route BOTH -> tap -> DAC; player volume split; PA). Mono files after
+  the mono pass-through (`8983cb7`) are fine: the ring stays mono and `hp_sink_tap_peek` expands to L = R for the DAC.
+  Bug found: when the app task is out longer than the DAC's 4 slots last (silicon 300-480 ms), the DAC runs dry while
+  the headset keeps reading; the tap then trails the headset by the whole gap for good, the speaker stays late and the
+  tap holds that backlog in the ring, so the headset's ring shrinks after each gap and starves (23 empty packets in
+  3 s). Fix (`src/audio_out.c` `pump_dac`): with the DAC found dry and a backlog above what its queue takes at once
+  (`AOUT_RESYNC_FRAMES` = 4 x 512), the tap drops it and restarts in step with the headset
+  (`aout_stats_t.dac_resync_frames`). Tests: `test_player_bt` (test-bt-hp) now plays Both with mono and stereo files,
+  headset connected (both outputs complete, sample exact, speaker never ahead of the headset, one volume = bt_vol) and
+  not connected (speaker only, speaker volume), absolute volume (headset gain unity, speaker at bt_vol), and mono with
+  the app task out 400 ms/s (0 empty packets; 23 without the fix). Headphones S1 checks that the mode is saved
+  (byte 5 of `bt_hp_cfg.bin`, only on change). BT=1 only: default image unchanged (0xECB8); gates 0 warnings, bt
+  0xECD8, hp 0xF183, hpb 0xA698, bench 0xC057 (CRCs depend on the worktree path).
+- 2026-11-25 (STEP10 A6 + C13, branch `fix/s10-avdt-leak` from `ab27527`; host only): patch **0043**:
+  `AVDT_Deregister()` / `AVCT_Deregister()` free the stream/channel/link blocks a frozen headset's link left allocated
+  (they were lost at the next Register's memset: 31 blocks / 3.4 KB per run of S8b + S10, ~600 B more with AVCTP up)
+  and 0039's local close runs the stream state machine directly instead of posting an `osi_malloc`'d `BT_HDR`. The
+  session escalates job rc 5 (A2DP/AVRC deinit not confirmed) to FAULTED (`BT fault` on the Headphones screen,
+  `last_fault` DOWN_FAIL; start still refused until reboot, no hard path). C13: the A2DP target is mirrored under the
+  session lock, and `a2d_cb` leaves TX, ACL handle, pending flags and codec cache alone for another device's late
+  CONNECTED / DISCONNECTED / AUDIO_CFG. Harness levers: `bth_heap_fail_task_size()` (BTU_TASK's 8-byte allocations
+  fail during S10's frozen stop), `bth_btc_run()` (late events injected on BTC_TASK, S10a),
+  `bthx_force_profile_down_fail()` (S10d). Each part reverted alone fails `test_bt_host_hp hps` (AVDT / AVCT: leak 31 /
+  6 blocks; 0039: deinit timeout, FAULTED; session: S10a 5 checks, S10d 2 checks). BT=0 CRC unchanged 0xECB8.
+
+- 2026-11-25 (`fix/s10-oom-paths` from `ab27527`): step-10 review A9 / C7 / C11, out-of-memory paths. Patch 0044
+  (`btc_spp.c`, `btc_dm.c`): SPP DATA_IND and write-completion hand-offs fall back to a by-value BTC work item (a lost
+  write completion left `is_writing` set: TX stalled for good); an RX frame whose queue node cannot be allocated breaks
+  the stream (dropped with later frames, credits returned, reported as DATA_IND status `ESP_SPP_NO_RESOURCE`; the
+  session closes the link); static FreeChannel user data in SPP deinit / stop server; a link key that cannot be stored
+  ends the pairing with NOMEM instead of `BTC_ASSERTC`. Session: a refused `esp_spp_disconnect()` is retried every
+  100 ms, 20 times, then `BT_XREC_FAULT_CLOSE_FAIL` (C11). BT images replace picolibc's `__assert_func`: an assert in a
+  BT task is handed to the app task, which takes the BT hard path (recording finalised, fault 0xB1 reason 11 + line);
+  backstop 1.5 s, then the old reboot. Host levers in `tests/bt_host/host_oom.c` (wrapped `btc_transfer_context`,
+  `fixed_queue_enqueue` on BTU, `btc_storage_add_bonded_device`, one BTC allocation size); phone P7c / P20b / P21 fail
+  without the fixes (stall, three different asserts, open link). The harness publishes its snapshot before a call's
+  "done" (a stop's state could read stale: rare `state 3 after stop`). The assert routing has no host harness
+  (picolibc and `bt_xrec_fw.c` are target only). FIRM CRC: def 0xECB8 (unchanged), bt 0x0022, hp 0xDFFC, hpb 0xBF95,
+  bench 0x88C8 (worktree path). Residual: a lost CLOSE / SRV_OPEN hand-off in `btc_spp` (still logged only).
+- 2026-11-25 (`fix/s10-sec-policy` from `ab27527`): STEP10 **C3**, **A3 second part**, **C6**. C3: `bt_rom_rng_starved()`
+  (lock-free read of the hook's `starved` count, latched until the next session's `bt_rom_rng_reset()`) behind the new
+  platform seam `bt_xrec_plat_rng_starved()`; the headphones Just Works hook (BTC), numeric comparison and bench PIN
+  replies read it next to the polled `gate_ok`, so a nonce drawn from a dry pool after the last poll no longer lets
+  that pairing through (phone mode re-runs the whole gate at the request and at the answer already). A3: Bluedroid
+  patch **0042** (`btc_dm.c`): Just Works is refused before a key exists when the stored bond for that address has an
+  authenticated key (read from the bond config, not BTM's record, which BTM clears on its Key Missing retry); an
+  unauthenticated key reported anyway (legacy PIN) is not stored over it and the pairing is reported failed; stored
+  bonds are no longer removed on `HCI_ERR_AUTH_FAILURE` / `HCI_ERR_KEY_MISSING`. Within the session BTA still drops
+  BTM's RAM record after such a failure; the bond file reloads it at the next BT-mode entry. A headset bonded with
+  numeric comparison that lost its key must be Forgotten before a Just Works re-pair. C6: threat model above (§5).
+  Tests: `test_bt_rom_rng` (latch), headphones **S11** (`test_bt_host_hp hps`): C3 probe fails without the hook's latch
+  read; the Just Works over a MITM bond fails without 0042's confirmation check; the final reconnect with the MITM key
+  fails without the AUTH_FAILURE keep, and without both 0042 checks (the storage check alone keeps the key). Gates
+  (0 warnings, all rc=0): FIRM CRC def 0xECB8 (unchanged), bt 0x4F01, hp 0x3D1D, hpb 0x343F, bench 0x6FC3.
+- 2026-11-25 (`fix/hp-bond-image-change`, from `ab27527`): silicon session 8 bond loss (`bt_hp_bonds.bin` 152 -> 43 B
+  on the first headphones boot of `64d820e` over `0edcb61`). Reading `0edcb61..64d820e`: nothing reaches the first start
+  of a boot differently (`s_store_mode` 0xFF -> reset + load; `bt_store`, Bluedroid, `bt_hp_cfg.bin` unchanged; reconnect
+  only after READY, i.e. after `btc_storage_load_bonded_devices`). The harness reproduces the exact 152 -> 43 B in two
+  ways: a non-empty file the session cannot take over (bt_store reject, or `config_parse` failing) is replaced by the
+  empty config `btc_config_init()` saves at every start; and a peer without the key (S9: Key Missing -> SSP retry ->
+  refused -> Bluedroid removes the bond). Which one hit silicon is not known (ring tail only). Fixed the first:
+  `bt_store` write hold (`bt_store_held`/`bt_store_hold`/`bt_store_hold_nonempty`, replaces `s_bonds_hold`), set by a
+  rejected non-empty image, an oversized or unreadable file and new patch **0042** (renumbered **0045** at integration; `btc_config_init` no longer saves
+  after a failed parse); `bonds_write` refuses while held and logs it; the next start retries the file. Tests: headphones
+  S11a/S11b (S12a/S12b after integration) fail without the fix (152 -> 43 B), S11b also without 0045 alone; `test_bt_store` hold checks. Default
+  image unchanged 0xECB8 (BT=1 code only); bt 0x682B, hp 0x7897, hpb 0x28F1, bench 0x701C, 0 warnings. Next silicon occurrence: look for `BT bond file rejected`, `BT bonds not saved: the
+  card's bond file`, `BT bond file held`, or an `auth st=` failure before the SSP attempt (peer lost the key).
+- 2026-11-25 (step 11 integration on `integ/bt-all-local`, from `ab27527`): merged `fix/s10-xrec-flow` (A5, C1
+  residual), `test/aout-both-mode` (W1), `fix/s10-avdt-leak` (A6, C13; patch 0043), `fix/s10-oom-paths` (A9 / C7 /
+  C11; patch 0044), `fix/s10-sec-policy` (C3, A3 second part, C6 note; patch 0042) and `fix/hp-bond-image-change`
+  (HW8; its patch 0042 **renumbered 0045**, `btc_config.c`). Patch README: rows 0042-0045 in order, next free **0046**;
+  0044's `btc_dm.c` hunk regenerated on top of 0042 (both edit `btc_dm_auth_cmpl_evt`), and 0042-0045 checked to apply
+  in order to `ab27527`'s tree and reproduce the vendored sources byte for byte. Semantics of the combined
+  `btc_dm_auth_cmpl_evt`: 0042 refuses an unauthenticated key over a MITM bond (reported AUTH_REJECTED, nothing stored)
+  and keeps bonds on AUTH_FAILURE / KEY_MISSING; 0044 removes a partly stored new key on OOM (reported NOMEM). With
+  0042, HW8's path (b) (keyless peer -> Bluedroid deletes the bond) is closed too. Headphones scenario order: S11 (C3 /
+  A3) now ends with a stop and records the bond count; the bond-loss scenario became **S12** (S12a/b/c, expects that
+  count back instead of 1) and runs before S10d, which must stay last (it leaves headphones mode FAULTED). Merge fix:
+  `host_heap.c` (two harness levers, `inject_task_size`, `bth_oom_take_alloc`, `inject(ra, n)` chained). Gates `s11m`
+  (0 warnings, all rc=0): FIRM CRC def **0x568B** (changed from 0xECB8 by A5 / C1 in shared code: `xrec_proto.c`,
+  `exfat.c`, `bt_hci.c` ops table), bt 0x640E, hp 0xEDA7, hpb 0x1AA9, bench 0xD790; `test_bt_host` 2331, phone 1260,
+  hp 84, headphones 201, gated 20 checks, 0 failures; sweeps 0 crash / hang / waived. The bthost gate was re-run on the
+  home volume after the /tmp quota filled (link "Disk quota exceeded").
 
 ## 11. Round-1 traceability
 

@@ -37,6 +37,7 @@
 _Static_assert((BT_XREC_RX_RING & (BT_XREC_RX_RING - 1u)) == 0u, "RX ring size must be a power of two");
 _Static_assert((BT_XREC_TX_RING & (BT_XREC_TX_RING - 1u)) == 0u, "TX ring size must be a power of two");
 _Static_assert(BT_XREC_TX_RING >= 12u + XREC_MAX_CHUNK, "one GETS frame must fit the TX ring (send is all-or-nothing)");
+_Static_assert(BT_XREC_TX_RING >= XREC_REPLY_MAX, "RX flow control waits for this much TX room (review STEP10 A5)");
 _Static_assert(BT_XREC_SPP_TX_BUF >= ESP_SPP_MIN_TX_BUFFER_SIZE && BT_XREC_SPP_TX_BUF <= ESP_SPP_MAX_TX_BUFFER_SIZE,
                "esp_spp_cfg_t.tx_buffer_size range");
 _Static_assert(BT_XREC_WRITE_MAX <= BT_XREC_SPP_TX_BUF, "a write must fit BTC's ring");
@@ -76,6 +77,7 @@ static struct {
     ev_t     evq[BT_XREC_EVQ_SLOTS];
     uint32_t ev_head, ev_tail; /* free-running */
     uint32_t rx_head, rx_tail; /* free-running byte counters into b->rx */
+    uint32_t rx_pend, rx_pend_handle; /* app side: dequeued DATA bytes at rx_tail not yet parsed (A5) */
     uint32_t rx_frames;        /* ESP_SPP_DATA_IND_EVT count (status rx_acl_pkts) */
     uint32_t rx_overflows, rx_dropped_cb, evq_lost_n;
     bufs_t  *b;
@@ -133,6 +135,8 @@ static struct {
     uint8_t  ssp_burned;
     /* connection */
     uint8_t  conn_open, conn_authorized, conn_closing, cong, entropy_fail, xrec_reset_pending;
+    uint8_t  close_retry, close_tries;   /* review STEP10 C11: esp_spp_disconnect() refused, retried at close_retry_at */
+    uint32_t close_retry_at;
     uint32_t conn_handle;
     uint8_t  conn_bda[6];
     uint16_t mtu;
@@ -370,6 +374,28 @@ static void on_data_ind(uint32_t handle, const uint8_t *data, uint16_t len)
     }
 }
 
+/* BTC context: patch 0044 reports an RX frame btc_spp could not queue (no memory). The stream has a gap: like an
+ * overflow, nothing more is taken from this connection and the app closes it (EV_RX_OVERFLOW, status 1). */
+static void on_rx_lost(uint32_t handle)
+{
+    bool queued = false;
+    bt_xrec_plat_lock();
+    if (s.cb_open && s.cb_rx_bound && !s.cb_rx_closing && handle == s.cb_rx_handle) {
+        ev_t e = { 0 };
+        e.type = EV_RX_OVERFLOW;
+        e.status = 1u;
+        e.handle = handle;
+        s.cb_rx_overflow = 1u;
+        s.d.rx_lost++;
+        (void)push_locked(&e);
+        queued = true;
+    }
+    bt_xrec_plat_unlock();
+    if (queued) {
+        bt_xrec_plat_notify_app();
+    }
+}
+
 /* BTC hands callbacks the copy it placed right after the 4-byte btc_msg_t: 4-aligned, which is all Cortex-M4 needs
  * for these pointer-holding unions; x86-64 UBSan (make test-bt-host) wants 8. Host-only finding, not a target issue. */
 #define BTC_CB_ARG_ALIGN4 __attribute__((no_sanitize("alignment")))
@@ -407,6 +433,10 @@ static void spp_cb(esp_spp_cb_event_t event, esp_spp_cb_param_t *p)
         e.handle = p->close.handle;
         break;
     case ESP_SPP_DATA_IND_EVT:
+        if (p->data_ind.status != ESP_SPP_SUCCESS) {
+            on_rx_lost(p->data_ind.handle);    /* patch 0044: btc_spp dropped a frame (no memory) */
+            return;
+        }
         on_data_ind(p->data_ind.handle, p->data_ind.data, p->data_ind.len);
         return;
     case ESP_SPP_CONG_EVT:
@@ -517,7 +547,35 @@ static void conn_close_request(const char *why)
     esp_err_t r = esp_spp_disconnect(s.conn_handle);
     if (r != ESP_OK) {
         bt_xrec_plat_log_u32("BT XREC esp_spp_disconnect failed", (uint32_t)r);
+        /* review STEP10 C11: the request was not queued (no memory for BTC's message). Retried by close_retry_poll();
+         * the connection stays closing (no traffic taken or sent) meanwhile. */
+        s.close_retry = 1u;
+        s.close_tries = 0u;
+        s.close_retry_at = bt_xrec_plat_now_ms() + BT_XREC_CLOSE_RETRY_MS;
     }
+}
+
+/* App task. Review STEP10 C11: a refused esp_spp_disconnect() is retried until accepted (the CLOSE event then ends
+ * the connection); after BT_XREC_CLOSE_RETRIES refusals the session faults and the recovery ladder tears it down. */
+static void close_retry_poll(uint32_t now)
+{
+    if (!s.close_retry || !s.conn_open || !time_reached(now, s.close_retry_at)) {
+        return;
+    }
+    s.d.close_retries++;
+    esp_err_t r = esp_spp_disconnect(s.conn_handle);
+    if (r == ESP_OK) {
+        s.close_retry = 0u;
+        bt_xrec_plat_log_u32("BT XREC esp_spp_disconnect accepted, retry", s.close_tries + 1u);
+        return;
+    }
+    if (++s.close_tries >= BT_XREC_CLOSE_RETRIES) {
+        s.close_retry = 0u;
+        bt_xrec_plat_log_u32("BT XREC esp_spp_disconnect refused, giving up after", s.close_tries);
+        fault(BT_XREC_FAULT_CLOSE_FAIL);
+        return;
+    }
+    s.close_retry_at = now + BT_XREC_CLOSE_RETRY_MS;
 }
 
 static void xrec_reset_flush(void)
@@ -546,6 +604,7 @@ static void conn_reset(void)
     }
     s.xrec_reset_pending = 0u;
     s.conn_open = s.conn_authorized = s.conn_closing = s.cong = s.entropy_fail = 0u;
+    s.close_retry = s.close_tries = 0u;
     s.conn_handle = 0u;
     s.mtu = 0u;
     s.inflight = 0u;
@@ -623,6 +682,13 @@ static int xo_send(void *user, const uint8_t *data, uint16_t len)
     s.tx_head += len;
     tx_kick();
     return 0;
+}
+
+/* Flow control (review STEP10 A5): xrec_proto parses no further command while this is below XREC_REPLY_MAX. */
+static uint32_t xo_tx_free(void *user)
+{
+    (void)user;
+    return BT_XREC_TX_RING - (s.tx_head - s.tx_tail);
 }
 
 static uint16_t xo_get_mtu(void *user)
@@ -1163,7 +1229,8 @@ static void on_spp_event(const ev_t *e)
         break;
     case EV_RX_OVERFLOW:
         if (s.conn_open && e->handle == s.conn_handle) {
-            conn_close_request("BT XREC close: RX buffer overflow");
+            conn_close_request(e->status != 0u ? "BT XREC close: RX frame lost (no memory)"
+                                               : "BT XREC close: RX buffer overflow");
         }
         break;
     case EV_WRITE:
@@ -1190,8 +1257,10 @@ static void on_spp_event(const ev_t *e)
  * split changes nothing else). A CHAL that found no entropy (xo_entropy) leaves xrec_proto with chal_active set over
  * an all-zero nonce: nothing after that line may reach it, or an AUTH carrying HMAC(key, 0^16) in the same SPP write
  * would authorize the privileged commands that follow it (review finding). The challenge is disarmed and the link
- * closed before the next line. */
-static void rx_feed(const uint8_t *p, uint32_t n)
+ * closed before the next line.
+ * Returns the bytes taken (parsed or dropped). Fewer than n only when xrec_proto held a command back because the TX
+ * ring lacks room for its reply (xo_tx_free, review STEP10 A5): the rest stays in the RX ring. */
+static uint32_t rx_feed(const uint8_t *p, uint32_t n)
 {
     uint32_t i = 0u;
     while (i < n) {
@@ -1200,68 +1269,107 @@ static void rx_feed(const uint8_t *p, uint32_t n)
             k++;
         }
         uint32_t seg = (k < n ? k + 1u : n) - i;
-        s.d.rx_bytes += seg;
-        xrec_on_rx(&s.b->xrec, &p[i], (uint16_t)seg);
-        i += seg;
+        uint32_t got = xrec_on_rx(&s.b->xrec, &p[i], (uint16_t)seg);
+        s.d.rx_bytes += got;
+        i += got;
         if (s.entropy_fail) {
             s.b->xrec.chal_active = 0u;
             wipe_mem(s.b->xrec.nonce, sizeof(s.b->xrec.nonce));
             conn_close_request("BT XREC close: entropy not ready");
             s.d.rx_dropped += n - i;
-            return;
+            return n;
         }
         if (!s.conn_open || s.conn_closing) {
             s.d.rx_dropped += n - i;          /* closed by a send error inside xrec_proto: nothing more is served */
-            return;
+            return n;
+        }
+        if (got < seg) {
+            return i;                         /* TX backpressure */
         }
     }
+    return n;
 }
 
-/* Drain the event queue in order. DATA is consumed in chunks so the lock is never held while xrec_proto runs. */
+/* Received bytes taken off the event queue but not yet parsed (s.rx_pend at s.rx_tail, for s.rx_pend_handle). */
+static void rx_pend_drop(void)
+{
+    bt_xrec_plat_lock();
+    s.rx_tail += s.rx_pend;
+    bt_xrec_plat_unlock();
+    s.d.rx_dropped += s.rx_pend;
+    s.rx_pend = 0u;
+}
+
+/* Parse pending RX. 0 = all parsed (or dropped), 1 = held for TX room (A5), 2 = this poll's budget is spent. */
+static int rx_pend_feed(uint8_t *chunk, uint32_t cap, uint32_t *budget)
+{
+    while (s.rx_pend > 0u) {
+        if (!(s.conn_open && s.rx_pend_handle == s.conn_handle && s.conn_authorized && !s.conn_closing &&
+              !s.entropy_fail)) {
+            rx_pend_drop();
+            return 0;
+        }
+        uint32_t n = s.rx_pend < cap ? s.rx_pend : cap;
+        bt_xrec_plat_lock();
+        uint32_t off = s.rx_tail & (BT_XREC_RX_RING - 1u);
+        uint32_t first = BT_XREC_RX_RING - off;
+        if (first > n) {
+            first = n;
+        }
+        memcpy(chunk, &s.b->rx[off], first);
+        memcpy(chunk + first, &s.b->rx[0], n - first);
+        bt_xrec_plat_unlock();
+
+        uint32_t used = rx_feed(chunk, n);
+        bt_xrec_plat_lock();
+        s.rx_tail += used;
+        bt_xrec_plat_unlock();
+        s.rx_pend -= used;
+        xrec_reset_flush();
+        if (used < n) {
+            s.d.rx_held++;
+            return 1;
+        }
+        if (*budget <= n) {
+            return 2;
+        }
+        *budget -= n;
+    }
+    return 0;
+}
+
+/* Drain the event queue in order. DATA moves into s.rx_pend and is parsed in chunks before the next event, so the
+ * lock is never held while xrec_proto runs. While xrec_proto holds a command back for TX room (A5), the control events
+ * behind it still run: the WRITE / CONG events among them are what frees that room. */
 static void drain_events(void)
 {
     uint8_t chunk[128];
     uint32_t budget = BT_XREC_RX_RING * 2u;    /* bounded work per poll: the UI loop keeps its cadence */
     for (;;) {
+        if (s.b == NULL || rx_pend_feed(chunk, (uint32_t)sizeof(chunk), &budget) == 2) {
+            break;
+        }
         ev_t e;
-        uint32_t n = 0u;
         bt_xrec_plat_lock();
         if (s.ev_head == s.ev_tail || s.b == NULL) {
             bt_xrec_plat_unlock();
             break;
         }
-        ev_t *head = &s.evq[s.ev_tail % BT_XREC_EVQ_SLOTS];
-        e = *head;
+        e = s.evq[s.ev_tail % BT_XREC_EVQ_SLOTS];
+        s.ev_tail++;
+        if (e.type == EV_DATA && s.rx_pend > 0u && e.handle != s.rx_pend_handle) {
+            s.rx_tail += s.rx_pend;            /* an older link's leftover: never parsed for the new one */
+            s.d.rx_dropped += s.rx_pend;
+            s.rx_pend = 0u;
+        }
         if (e.type == EV_DATA) {
-            n = e.val < sizeof(chunk) ? e.val : (uint32_t)sizeof(chunk);
-            uint32_t off = s.rx_tail & (BT_XREC_RX_RING - 1u);
-            uint32_t first = BT_XREC_RX_RING - off;
-            if (first > n) {
-                first = n;
-            }
-            memcpy(chunk, &s.b->rx[off], first);
-            memcpy(chunk + first, &s.b->rx[0], n - first);
-            s.rx_tail += n;
-            head->val -= n;
-            if (head->val == 0u) {
-                s.ev_tail++;
-            }
-        } else {
-            s.ev_tail++;
+            s.rx_pend += e.val;
+            s.rx_pend_handle = e.handle;
         }
         bt_xrec_plat_unlock();
 
         if (e.type == EV_DATA) {
-            if (s.conn_open && e.handle == s.conn_handle && s.conn_authorized && !s.conn_closing && !s.entropy_fail) {
-                rx_feed(chunk, n);
-            } else {
-                s.d.rx_dropped += n;
-            }
-            xrec_reset_flush();
-            if (budget <= n) {
-                break;
-            }
-            budget -= n;
+            continue;                          /* parsed at the top of the loop, before the next event */
         } else if (e.type >= EV_CFM_REQ) {
             on_gap_event(&e);
         } else {
@@ -1425,6 +1533,7 @@ static void free_session(void)
     s.b = NULL;
     s.ev_head = s.ev_tail = 0u;
     s.rx_head = s.rx_tail = 0u;
+    s.rx_pend = 0u;
     s.evq_lost = 0u;
     s.nm_valid = 0u;
     memset(s.nm, 0, sizeof(s.nm));
@@ -1548,6 +1657,7 @@ int bt_xrec_start(exfat_vol_t *vol, int sd_mounted)
 
     xrec_ops_t ops = *bt_xrec_plat_device_ops();
     ops.send = xo_send;
+    ops.tx_free = xo_tx_free;
     ops.get_entropy = xo_entropy;
     ops.on_bound_key = xo_bound_key;
     ops.on_reboot = xo_reboot;
@@ -1719,6 +1829,10 @@ void bt_xrec_poll(void)
 
     if (s.entropy_fail && s.conn_open && !s.conn_closing) {
         conn_close_request("BT XREC close: entropy not ready");
+    }
+    close_retry_poll(now);
+    if (s.state != BT_XREC_ST_CONFIG && s.state != BT_XREC_ST_READY) {
+        return;                                  /* close_retry_poll() faulted the session */
     }
     if (s.conn_open && s.conn_authorized && !s.conn_closing) {
         xrec_poll(&s.b->xrec);
@@ -1943,6 +2057,19 @@ int bt_xrec_spp_deinit_needed(void)
 }
 
 #if defined(BT_XREC_TEST_HOOKS) && BT_XREC_TEST_HOOKS
+/* Host tests only (app task, via bthx_call_fn): the device closes the open connection, as an RX overflow or a write
+ * error would (test_bt_host phone, step P7c: review STEP10 C11). */
+int bt_xrec_test_close_request(uint32_t arg);
+int bt_xrec_test_close_request(uint32_t arg)
+{
+    (void)arg;
+    if (!s.conn_open || s.conn_closing) {
+        return -1;
+    }
+    conn_close_request("BT XREC close: test request");
+    return 0;
+}
+
 /* Host tests only: forget a DEAD session (on target the hard path reboots). */
 void bt_xrec_test_reset(void);
 void bt_xrec_test_reset(void)

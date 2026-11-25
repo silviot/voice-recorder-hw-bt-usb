@@ -1,0 +1,381 @@
+diff --git a/open_fw/third_party/bluedroid/host/bluedroid/btc/core/btc_dm.c b/open_fw/third_party/bluedroid/host/bluedroid/btc/core/btc_dm.c
+index 0178f11..bd5e896 100644
+--- a/open_fw/third_party/bluedroid/host/bluedroid/btc/core/btc_dm.c
++++ b/open_fw/third_party/bluedroid/host/bluedroid/btc/core/btc_dm.c
+@@ -448,6 +448,7 @@ static void btc_dm_auth_cmpl_evt (tBTA_DM_AUTH_CMPL *p_auth_cmpl)
+     bt_bdaddr_t bd_addr;
+     bt_status_t status;
+ #if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++    bool key_not_stored = false; /* open_fw patch 0044 */
+     BOOLEAN openfw_downgrade = FALSE;
+ #endif
+     BTC_TRACE_DEBUG("%s: bond state success %d, present %d, type%d\n", __func__, p_auth_cmpl->success,
+@@ -482,7 +483,18 @@ static void btc_dm_auth_cmpl_evt (tBTA_DM_AUTH_CMPL *p_auth_cmpl)
+                 ret = btc_storage_add_bonded_device(&bd_addr,
+                                                     p_auth_cmpl->key, p_auth_cmpl->key_type,
+                                                     16, p_auth_cmpl->sc_support);
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++                /* open_fw patch 0044: the config entries are allocated (btc_config_set_*): out of memory, upstream
++                 * asserted (reset while recording). Drop whatever part was written and report the pairing as failed:
++                 * a bond that is not in the store must not look like one to the application. */
++                if (ret != BT_STATUS_SUCCESS) {
++                    BTC_TRACE_ERROR("%s: storing link key failed (%d): pairing reported failed", __func__, ret);
++                    (void)btc_storage_remove_bonded_device(&bd_addr);
++                    key_not_stored = true;
++                }
++#else
+                 BTC_ASSERTC(ret == BT_STATUS_SUCCESS, "storing link key failed", ret);
++#endif
+             } else {
+                 BTC_TRACE_DEBUG("%s: Temporary key. Not storing. key_type=0x%x",
+                           __FUNCTION__, p_auth_cmpl->key_type);
+@@ -544,6 +556,11 @@ static void btc_dm_auth_cmpl_evt (tBTA_DM_AUTH_CMPL *p_auth_cmpl)
+             break;
+         }
+     }
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++    if (key_not_stored) {
++        status = BT_STATUS_NOMEM;
++    }
++#endif
+ #if (BTC_GAP_BT_INCLUDED == TRUE)
+     esp_bt_gap_cb_param_t param;
+     bt_status_t ret;
+diff --git a/open_fw/third_party/bluedroid/host/bluedroid/btc/profile/std/spp/btc_spp.c b/open_fw/third_party/bluedroid/host/bluedroid/btc/profile/std/spp/btc_spp.c
+index ce512c0..2f8beac 100644
+--- a/open_fw/third_party/bluedroid/host/bluedroid/btc/profile/std/spp/btc_spp.c
++++ b/open_fw/third_party/bluedroid/host/bluedroid/btc/profile/std/spp/btc_spp.c
+@@ -75,6 +75,14 @@ typedef struct {
+     RingbufHandle_t ringbuf_write;
+     uint8_t service_uuid[16];
+     char service_name[ESP_SPP_SERVER_NAME_MAX + 1];
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++    /* open_fw patch 0044 (out-of-memory fail-soft) */
++    bool fb_write_set;             /* fb_write holds a write completion whose BTC hand-off could not be allocated */
++    bool rx_broken;                /* an RX frame was lost (no queue node): every later frame is dropped too */
++    bool rx_broken_reported;       /* the loss was reported to the application (DATA_IND, status NO_RESOURCE) */
++    uint16_t rx_lost;              /* frames dropped since the last DATA_IND drain: their credits go back with it */
++    tBTA_JV_RFCOMM_WRITE fb_write;
++#endif
+ } spp_slot_t;
+ 
+ typedef struct {
+@@ -192,6 +200,12 @@ static spp_slot_t *spp_malloc_slot(void)
+             (*slot)->close_alarm = NULL;
+             (*slot)->alarm_arg = NULL;
+             (*slot)->ringbuf_write = NULL;
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++            (*slot)->fb_write_set = false;          /* patch 0044 */
++            (*slot)->rx_broken = false;
++            (*slot)->rx_broken_reported = false;
++            (*slot)->rx_lost = 0;
++#endif
+             /* clear the old event bits */
+             if (s_spp_resident.tx_event_group) {
+                 xEventGroupClearBits(s_spp_resident.tx_event_group, SLOT_WRITE_BIT(i) | SLOT_CLOSE_BIT(i));
+@@ -250,6 +264,120 @@ static spp_slot_t *spp_find_slot_by_id(uint32_t id)
+     return NULL;
+ }
+ 
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++/* open_fw patch 0044: allocation-free fallbacks for the out-of-memory paths (review STEP10 A9 / C7).
++ *
++ * BTA -> BTC hand-offs that must not be lost (a write completion: is_writing would stay set and the TX side of the
++ * connection stall for good; an RX notification: received data would sit in the queue unannounced, and upstream
++ * asserted) are posted by value when btc_transfer_context() cannot allocate: a work item carrying the slot id,
++ * copied into BTC's queue 0 behind the messages already there (the 0018 mechanism), which runs btc_spp_cb_handler()
++ * from a stack message rebuilt from the slot. */
++static bool spp_post_by_value(void (*fn)(void *ctx), uint32_t id)
++{
++    osi_thread_t *t = btc_get_current_thread();
++    return t != NULL && osi_thread_post(t, fn, (void *)(uintptr_t)id, 0, OSI_THREAD_MAX_TIMEOUT);
++}
++
++typedef union {
++    btc_msg_t msg;
++    uint8_t raw[sizeof(btc_msg_t) + sizeof(tBTA_JV)];
++    uint64_t align;               /* arg at +4 of an 8-aligned base, as in btc_transfer_context()'s heap copy */
++} spp_stack_msg_t;
++
++void btc_spp_cb_handler(btc_msg_t *msg);
++
++static void spp_run_stack_msg(uint8_t event, const tBTA_JV *jv)
++{
++    spp_stack_msg_t buf;
++    memset(&buf, 0, sizeof(buf));
++    buf.msg.sig = BTC_SIG_API_CB;
++    buf.msg.pid = BTC_PID_SPP;
++    buf.msg.act = event;
++    memcpy(buf.msg.arg, jv, sizeof(tBTA_JV));
++    btc_spp_cb_handler(&buf.msg);
++}
++
++/* BTC task. */
++static void spp_fb_data_ind_work(void *ctx)
++{
++    tBTA_JV jv;
++    memset(&jv, 0, sizeof(jv));
++    spp_lock();
++    spp_slot_t *slot = is_spp_ready() ? spp_find_slot_by_id((uint32_t)(uintptr_t)ctx) : NULL;
++    if (slot == NULL) {
++        spp_unlock();
++        return;
++    }
++    jv.data_ind.handle = slot->rfc_handle;
++    spp_unlock();
++    spp_run_stack_msg(BTA_JV_RFCOMM_DATA_IND_EVT, &jv);
++}
++
++/* BTC task. */
++static void spp_fb_write_work(void *ctx)
++{
++    tBTA_JV jv;
++    memset(&jv, 0, sizeof(jv));
++    spp_lock();
++    spp_slot_t *slot = is_spp_ready() ? spp_find_slot_by_id((uint32_t)(uintptr_t)ctx) : NULL;
++    if (slot == NULL || !slot->fb_write_set) {
++        spp_unlock();
++        return;
++    }
++    jv.rfc_write = slot->fb_write;
++    slot->fb_write_set = false;
++    spp_unlock();
++    spp_run_stack_msg(BTA_JV_RFCOMM_WRITE_EVT, &jv);
++}
++
++/* BTU task: a write completion's hand-off failed. One write is outstanding per slot (is_writing), so one copy per
++ * slot is enough. */
++static void spp_write_cmpl_by_value(const tBTA_JV_RFCOMM_WRITE *w)
++{
++    bool stored = false;
++    if (!is_spp_ready()) {
++        return;
++    }
++    spp_lock();
++    spp_slot_t *slot = is_spp_ready() ? spp_find_slot_by_id(w->req_id) : NULL;
++    if (slot != NULL) {
++        slot->fb_write = *w;
++        slot->fb_write_set = true;
++        stored = true;
++    }
++    spp_unlock();
++    if (stored && !spp_post_by_value(spp_fb_write_work, w->req_id)) {
++        BTC_TRACE_ERROR("%s write completion lost (BTC gone)", __func__);
++    }
++}
++
++/* tBTA_JV_FREE_SCN_USER_DATA travels from BTA_JvFreeChannel() back to BTA_JV_FREE_SCN_EVT. Upstream asserted when
++ * it could not be allocated (SPP deinit / stop server / failed record: the stack reset in the middle of a teardown).
++ * A static entry per slot serial (one FreeChannel per slot) stands in. */
++static tBTA_JV_FREE_SCN_USER_DATA s_free_scn_ud_fb[MAX_RFC_PORTS + 1];
++
++static tBTA_JV_FREE_SCN_USER_DATA *spp_free_scn_ud_new(const spp_slot_t *slot, tBTA_JV_SERVER_STATUS st)
++{
++    tBTA_JV_FREE_SCN_USER_DATA *ud = osi_malloc(sizeof(tBTA_JV_FREE_SCN_USER_DATA));
++    if (ud == NULL) {
++        BTC_TRACE_WARNING("%s no memory: static user data for slot %u", __func__, slot->serial);
++        ud = &s_free_scn_ud_fb[slot->serial];
++    }
++    ud->server_status = st;
++    ud->slot_id = slot->id;
++    return ud;
++}
++
++static void spp_free_scn_ud_free(void *ud)
++{
++    const uint8_t *p = (const uint8_t *)ud;
++    const uint8_t *lo = (const uint8_t *)&s_free_scn_ud_fb[0];
++    if (p < lo || p >= lo + sizeof(s_free_scn_ud_fb)) {
++        osi_free(ud);
++    }
++}
++#endif
++
+ static spp_slot_t *spp_find_slot_by_handle(uint32_t handle)
+ {
+ #if SPP_DYNAMIC_MEMORY == TRUE
+@@ -622,7 +750,11 @@ static void *btc_spp_rfcomm_inter_cb(tBTA_JV_EVT event, tBTA_JV *p_data, void *u
+                 BTC_TRACE_ERROR("%s unable to find RFCOMM slot, event:%d!", __func__, event);
+                 p_data->free_scn.status = ESP_SPP_NO_CONNECTION;
+             }
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++            spp_free_scn_ud_free(user_data);
++#else
+             osi_free(user_data);
++#endif
+         }
+         break;
+     default:
+@@ -639,6 +771,11 @@ static void *btc_spp_rfcomm_inter_cb(tBTA_JV_EVT event, tBTA_JV *p_data, void *u
+ 
+     if (status != BT_STATUS_SUCCESS) {
+         BTC_TRACE_ERROR("%s btc_transfer_context failed", __func__);
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++        if (event == BTA_JV_RFCOMM_WRITE_EVT) {
++            spp_write_cmpl_by_value(&p_data->rfc_write); /* patch 0044: is_writing must not stay set */
++        }
++#endif
+     }
+     return new_user_data;
+ }
+@@ -700,6 +837,9 @@ static void btc_spp_dm_inter_cb(tBTA_JV_EVT event, tBTA_JV *p_data, void *user_d
+                                     slot->max_session, (tBTA_JV_RFCOMM_CBACK *)btc_spp_rfcomm_inter_cb, (void *)slot->id);
+         } else {
+             BTC_TRACE_ERROR("%s unable to create record, start server fail!", __func__);
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++            tBTA_JV_FREE_SCN_USER_DATA *user_data = spp_free_scn_ud_new(slot, BTA_JV_SERVER_START_FAILED);
++#else
+             tBTA_JV_FREE_SCN_USER_DATA *user_data = osi_malloc(sizeof(tBTA_JV_FREE_SCN_USER_DATA));
+             if (user_data) {
+                 user_data->server_status = BTA_JV_SERVER_START_FAILED;
+@@ -708,10 +848,15 @@ static void btc_spp_dm_inter_cb(tBTA_JV_EVT event, tBTA_JV *p_data, void *user_d
+                 BTC_TRACE_ERROR("%s unable to malloc user data!", __func__);
+                 assert(0);
+             }
++#endif
+             tBTA_JV_STATUS status = BTA_JvFreeChannel(slot->scn, BTA_JV_CONN_TYPE_RFCOMM,
+                                                       (tBTA_JV_RFCOMM_CBACK *)btc_spp_rfcomm_inter_cb, (void *)user_data);
+             if (status != BTA_JV_SUCCESS) {
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++                spp_free_scn_ud_free(user_data);
++#else
+                 osi_free(user_data);
++#endif
+                 spp_free_slot(slot);
+             }
+             spp_unlock();
+@@ -847,6 +992,10 @@ static void btc_spp_uninit(void)
+                                            (void *)spp_local_param.spp_slots[i]->id);
+                 }
+ 
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++                tBTA_JV_FREE_SCN_USER_DATA *user_data = spp_free_scn_ud_new(spp_local_param.spp_slots[i],
++                                                                            BTA_JV_SERVER_RUNNING);
++#else
+                 tBTA_JV_FREE_SCN_USER_DATA *user_data = osi_malloc(sizeof(tBTA_JV_FREE_SCN_USER_DATA));
+                 if (user_data) {
+                     user_data->server_status = BTA_JV_SERVER_RUNNING;
+@@ -855,10 +1004,15 @@ static void btc_spp_uninit(void)
+                     BTC_TRACE_ERROR("%s unable to malloc user data!", __func__);
+                     assert(0);
+                 }
++#endif
+                 tBTA_JV_STATUS status = BTA_JvFreeChannel(spp_local_param.spp_slots[i]->scn, BTA_JV_CONN_TYPE_RFCOMM,
+                                                           (tBTA_JV_RFCOMM_CBACK *)btc_spp_rfcomm_inter_cb, (void *)user_data);
+                 if (status != BTA_JV_SUCCESS) {
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++                    spp_free_scn_ud_free(user_data);
++#else
+                     osi_free(user_data);
++#endif
+                 }
+             }
+         }
+@@ -1103,6 +1257,10 @@ static void btc_spp_stop_srv(btc_spp_args_t *arg)
+                                                (void *)spp_local_param.spp_slots[i]->id);
+                     }
+ 
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++                    tBTA_JV_FREE_SCN_USER_DATA *user_data = spp_free_scn_ud_new(spp_local_param.spp_slots[i],
++                                                                                BTA_JV_SERVER_RUNNING);
++#else
+                     tBTA_JV_FREE_SCN_USER_DATA *user_data = osi_malloc(sizeof(tBTA_JV_FREE_SCN_USER_DATA));
+                     if (user_data) {
+                         user_data->server_status = BTA_JV_SERVER_RUNNING;
+@@ -1111,10 +1269,15 @@ static void btc_spp_stop_srv(btc_spp_args_t *arg)
+                         BTC_TRACE_ERROR("%s unable to malloc user data!", __func__);
+                         assert(0);
+                     }
++#endif
+                     tBTA_JV_STATUS status = BTA_JvFreeChannel(spp_local_param.spp_slots[i]->scn, BTA_JV_CONN_TYPE_RFCOMM,
+                                                               (tBTA_JV_RFCOMM_CBACK *)btc_spp_rfcomm_inter_cb, (void *)user_data);
+                     if (status != BTA_JV_SUCCESS) {
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++                        spp_free_scn_ud_free(user_data);
++#else
+                         osi_free(user_data);
++#endif
+                     }
+                 }
+             }
+@@ -1508,6 +1671,30 @@ void btc_spp_cb_handler(btc_msg_t *msg)
+                     osi_free(p_buf);
+                 }
+             }
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++            /* patch 0044: frames dropped in bta_co_rfc_data_incoming() (no queue node) give their credits back with
++             * this drain, and the first loss is reported once, after the frames queued before it: the stream has a
++             * gap, the application closes the connection (an upstream app sees DATA_IND with status != SUCCESS). */
++            bool report_lost = false;
++            spp_lock();
++            slot = spp_local_param.spp_slots[serial];
++            if (slot != NULL && slot->rfc_handle == p_data->data_ind.handle) {
++                count += slot->rx_lost;
++                slot->rx_lost = 0;
++                if (slot->rx_broken && !slot->rx_broken_reported) {
++                    slot->rx_broken_reported = true;
++                    report_lost = true;
++                }
++            }
++            spp_unlock();
++            if (report_lost) {
++                param.data_ind.status = ESP_SPP_NO_RESOURCE;
++                param.data_ind.handle = p_data->data_ind.handle;
++                param.data_ind.len = 0;
++                param.data_ind.data = NULL;
++                btc_spp_cb_to_app(ESP_SPP_DATA_IND_EVT, &param);
++            }
++#endif
+             if (count != 0) {
+                 spp_lock();
+                 slot = spp_local_param.spp_slots[serial];
+@@ -1601,14 +1788,34 @@ int bta_co_rfc_data_incoming(void *user_data, BT_HDR *p_buf)
+         return 0;
+     }
+ 
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++    bool post_data_ind = false;
++    uint32_t slot_id = slot->id;
++#endif
+     if (spp_local_param.spp_mode == ESP_SPP_MODE_CB) {
+         size_t rx_len = fixed_queue_length(slot->rx.queue);
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++        /* patch 0044: the enqueue allocates a list node. Upstream ignored its failure (frame leaked, its credit never
++         * returned) and asserted when the DATA_IND hand-off could not be allocated (reset while recording). A lost
++         * frame breaks the stream: it and every later frame are dropped (credits returned at the next drain) and the
++         * loss is reported; the hand-off falls back to a by-value post, after the lock is released. */
++        if (slot->rx_broken || !fixed_queue_enqueue(slot->rx.queue, p_buf, FIXED_QUEUE_MAX_TIMEOUT)) {
++            if (!slot->rx_broken) {
++                BTC_TRACE_ERROR("%s no memory: RX frame lost, stream broken (handle 0x%x)", __func__, slot->rfc_handle);
++            }
++            slot->rx_broken = true;
++            slot->rx_lost++;
++            osi_free(p_buf);
++        }
++        post_data_ind = rx_len == 0;
++#else
+         fixed_queue_enqueue(slot->rx.queue, p_buf, FIXED_QUEUE_MAX_TIMEOUT);
+         if (rx_len == 0) {
+             BTC_TRACE_DEBUG("%s data post! %d, %d", __func__, slot->rfc_handle, rx_len);
+             status = btc_transfer_context(&msg, &p_data, sizeof(tBTA_JV), NULL, NULL);
+             assert(status == BT_STATUS_SUCCESS);
+         }
++#endif
+     } else {
+         fixed_queue_enqueue(slot->rx.queue, p_buf, FIXED_QUEUE_MAX_TIMEOUT);
+     }
+@@ -1621,6 +1828,14 @@ int bta_co_rfc_data_incoming(void *user_data, BT_HDR *p_buf)
+         assert(0);
+     }
+     spp_unlock();
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++    if (post_data_ind) {
++        status = btc_transfer_context(&msg, &p_data, sizeof(tBTA_JV), NULL, NULL);
++        if (status != BT_STATUS_SUCCESS && !spp_post_by_value(spp_fb_data_ind_work, slot_id)) {
++            BTC_TRACE_ERROR("%s DATA_IND lost (BTC gone)", __func__);
++        }
++    }
++#endif
+     return ret;
+ }
+ 

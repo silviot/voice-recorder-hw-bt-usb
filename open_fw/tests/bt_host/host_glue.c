@@ -14,6 +14,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
 #include "FreeRTOS.h"
@@ -238,3 +239,48 @@ void bth_assert_failed(const char *file, int line)
     fprintf(stderr, "bt_host: configASSERT failed at %s:%d\n", file, line);
     abort();
 }
+
+/* ---- BTC context for scenario injections (STEP10 C13: a late A2DP event of another device) ---- */
+#include "btc/btc_task.h"
+#include "btc/btc_alarm.h"
+#include "btc/btc_manage.h"
+
+static void (*volatile s_btc_fn)(void *);
+static void *volatile s_btc_arg;
+static volatile int s_btc_done;
+
+static void btc_run_cb(void *unused)
+{
+    (void)unused;
+    s_btc_fn(s_btc_arg);
+    s_btc_done = 1;
+}
+
+int bth_btc_run(void (*fn)(void *), void *arg, uint32_t timeout_ms)
+{
+    s_btc_fn = fn;
+    s_btc_arg = arg;
+    s_btc_done = 0;
+    btc_msg_t msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.sig = BTC_SIG_API_CALL;
+    msg.pid = BTC_PID_ALARM;                 /* btc_alarm_handler runs the callback on BTC_TASK */
+    btc_alarm_args_t a = { btc_run_cb, NULL };
+    if (btc_transfer_context(&msg, &a, sizeof(a), NULL, NULL) != BT_STATUS_SUCCESS) {
+        return -1;
+    }
+    TickType_t t0 = xTaskGetTickCount();
+    while (!s_btc_done) {
+        if (xTaskGetTickCount() - t0 > pdMS_TO_TICKS(timeout_ms)) {
+            return -1;
+        }
+        vTaskDelay(1);
+    }
+    return 0;
+}
+
+void *bth_a2dp_app_cb(void)
+{
+    return btc_profile_cb_get(BTC_PID_A2DP);
+}
+

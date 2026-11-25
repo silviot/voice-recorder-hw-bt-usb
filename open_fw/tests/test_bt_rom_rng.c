@@ -69,9 +69,15 @@ static void test_hook(void)
           st.last_unknown == 0x00012345u, "stats after starvation (%u %u %u %u)", st.starved, st.legacy_calls,
           st.unknown_calls, st.drbg_calls);
     CHECK(g_legacy_calls == 4u, "legacy generator calls %u", g_legacy_calls);
+    /* STEP10 C3: the lock-free latch the BTC-side pairing decisions read; it stays set until the next reset even when
+     * the pool is full again */
+    CHECK(bt_rom_rng_starved() == 2u, "starved latch %u", bt_rom_rng_starved());
+    feed_seq(1u, 64u);
+    CHECK(bt_rom_rng_hook(0x00031401u, NULL, legacy) == 1u && bt_rom_rng_starved() == 2u, "latch cleared by a refill");
 
     /* nonce: the first hook call overwrites the whole 28-byte block, returns byte 29; the next three take one each */
     bt_rom_rng_reset();
+    CHECK(bt_rom_rng_starved() == 0u, "starved latch survived a reset");
     feed_seq(1u, 64u);
     CHECK(bt_rom_rng_space() == BT_ROM_RNG_POOL_BYTES - 64u, "space after feed");
     uint32_t v = bt_rom_rng_hook(0x00031D77u, block, legacy);

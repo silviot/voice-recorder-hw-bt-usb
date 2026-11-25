@@ -14,6 +14,10 @@
 #include "common/bt_trace.h"
 #include "common/bt_target.h"
 #include "btc/btc_storage.h"
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+#include "btc/btc_config.h"   /* patch 0042 */
+#include "device/bdaddr.h"
+#endif
 #include "btc/btc_ble_storage.h"
 #include "btc_gap_ble.h"
 #include "btm_int.h"
@@ -414,16 +418,57 @@ static void btc_dm_link_up_evt(tBTA_DM_LINK_UP *p_link_up)
 }
 
 #if (SMP_INCLUDED == TRUE)
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+/* open_fw patch 0042: a stored bond is never downgraded or dropped by an unverified peer (STEP10 A3).
+ * A bond's key type comes from the stored config (the bond file), not from BTM's record: BTM clears LINK_KEY_KNOWN
+ * for its Key Missing retry and drops the record after a failed pairing, and both are exactly what a peer spoofing a
+ * bonded address can cause. */
+static BOOLEAN openfw_lkey_authenticated(int key_type)
+{
+    return key_type == HCI_LKEY_TYPE_AUTH_COMB || key_type == HCI_LKEY_TYPE_AUTH_COMB_P_256;
+}
+
+static BOOLEAN openfw_stored_key_authenticated(const BD_ADDR bda)
+{
+    bt_bdaddr_t a;
+    bdstr_t bdstr;
+    int type = -1;
+    bdcpy(a.address, bda);
+    bdaddr_to_string(&a, bdstr, sizeof(bdstr));
+    btc_config_lock();
+    bool have = btc_config_get_int(bdstr, BTC_STORAGE_LINK_KEY_TYPE_STR, &type);
+    btc_config_unlock();
+    return (have && openfw_lkey_authenticated(type)) ? TRUE : FALSE;
+}
+#endif
+
 static void btc_dm_auth_cmpl_evt (tBTA_DM_AUTH_CMPL *p_auth_cmpl)
 {
     /* Save link key, if not temporary */
     bt_bdaddr_t bd_addr;
     bt_status_t status;
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+    bool key_not_stored = false; /* open_fw patch 0044 */
+    BOOLEAN openfw_downgrade = FALSE;
+#endif
     BTC_TRACE_DEBUG("%s: bond state success %d, present %d, type%d\n", __func__, p_auth_cmpl->success,
               p_auth_cmpl->key_present, p_auth_cmpl->key_type);
 
     bdcpy(bd_addr.address, p_auth_cmpl->bd_addr);
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+    /* 0042: an unauthenticated key never replaces a stored authenticated (MITM) one. Just Works is refused before it
+     * makes a key (btc_dm_sp_cfm_req_evt); this catches any other path (legacy PIN) and reports the pairing failed. */
+    if (p_auth_cmpl->success == TRUE && p_auth_cmpl->key_present &&
+            p_auth_cmpl->key_type != HCI_LKEY_TYPE_CHANGED_COMB && !openfw_lkey_authenticated(p_auth_cmpl->key_type) &&
+            openfw_stored_key_authenticated(p_auth_cmpl->bd_addr)) {
+        BTC_TRACE_WARNING("%s: unauthenticated key (type %d) not stored over an authenticated bond\n", __func__,
+                          p_auth_cmpl->key_type);
+        openfw_downgrade = TRUE;
+    }
+    if ( (p_auth_cmpl->success == TRUE) && (p_auth_cmpl->key_present) && !openfw_downgrade ) {
+#else
     if ( (p_auth_cmpl->success == TRUE) && (p_auth_cmpl->key_present) ) {
+#endif
 #if 0
         if ((p_auth_cmpl->key_type < HCI_LKEY_TYPE_DEBUG_COMB) ||
                 (p_auth_cmpl->key_type == HCI_LKEY_TYPE_AUTH_COMB) ||
@@ -438,7 +483,18 @@ static void btc_dm_auth_cmpl_evt (tBTA_DM_AUTH_CMPL *p_auth_cmpl)
                 ret = btc_storage_add_bonded_device(&bd_addr,
                                                     p_auth_cmpl->key, p_auth_cmpl->key_type,
                                                     16, p_auth_cmpl->sc_support);
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+                /* open_fw patch 0044: the config entries are allocated (btc_config_set_*): out of memory, upstream
+                 * asserted (reset while recording). Drop whatever part was written and report the pairing as failed:
+                 * a bond that is not in the store must not look like one to the application. */
+                if (ret != BT_STATUS_SUCCESS) {
+                    BTC_TRACE_ERROR("%s: storing link key failed (%d): pairing reported failed", __func__, ret);
+                    (void)btc_storage_remove_bonded_device(&bd_addr);
+                    key_not_stored = true;
+                }
+#else
                 BTC_ASSERTC(ret == BT_STATUS_SUCCESS, "storing link key failed", ret);
+#endif
             } else {
                 BTC_TRACE_DEBUG("%s: Temporary key. Not storing. key_type=0x%x",
                           __FUNCTION__, p_auth_cmpl->key_type);
@@ -446,6 +502,11 @@ static void btc_dm_auth_cmpl_evt (tBTA_DM_AUTH_CMPL *p_auth_cmpl)
     }
 
     // Skip SDP for certain  HID Devices
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+    if (openfw_downgrade) {
+        status = BT_STATUS_AUTH_REJECTED;
+    } else
+#endif
     if (p_auth_cmpl->success) {
         status = BT_STATUS_SUCCESS;
     } else {
@@ -470,7 +531,14 @@ static void btc_dm_auth_cmpl_evt (tBTA_DM_AUTH_CMPL *p_auth_cmpl)
         /* map the auth failure codes, so we can retry pairing if necessary */
         case HCI_ERR_AUTH_FAILURE:
         case HCI_ERR_KEY_MISSING:
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+            /* 0042: kept. Any peer that pages with a bonded address can fail an authentication or claim to have lost
+             * its key; removing the stored bond then would let it unpair the real device. A device that really lost
+             * its key pairs again (the new key replaces the stored one); the app's Forget removes a bond. */
+#else
             btc_storage_remove_bonded_device(&bd_addr);
+#endif
+        /* fall through */
         case HCI_ERR_HOST_REJECT_SECURITY:
         case HCI_ERR_ENCRY_MODE_NOT_ACCEPTABLE:
         case HCI_ERR_UNIT_KEY_USED:
@@ -488,6 +556,11 @@ static void btc_dm_auth_cmpl_evt (tBTA_DM_AUTH_CMPL *p_auth_cmpl)
             break;
         }
     }
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+    if (key_not_stored) {
+        status = BT_STATUS_NOMEM;
+    }
+#endif
 #if (BTC_GAP_BT_INCLUDED == TRUE)
     esp_bt_gap_cb_param_t param;
     bt_status_t ret;
@@ -590,6 +663,13 @@ static void btc_dm_sp_cfm_req_evt(tBTA_DM_SP_CFM_REQ *p_cfm_req)
 {
     if (p_cfm_req->just_works) {
 #if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+        if (openfw_stored_key_authenticated(p_cfm_req->bd_addr)) {
+            /* 0042: Just Works would replace a stored authenticated (MITM) key with an unauthenticated one: refused
+             * before any key is made, whatever the app's policy (the user removes the bond to pair it again) */
+            BTC_TRACE_WARNING("%s: Just Works refused: an authenticated bond exists\n", __func__);
+            BTA_DmConfirm(p_cfm_req->bd_addr, false);
+            return;
+        }
         BTA_DmConfirm(p_cfm_req->bd_addr, openfw_just_works_allowed(p_cfm_req->bd_addr) ? true : false);
 #else
         // just work, not show to users.

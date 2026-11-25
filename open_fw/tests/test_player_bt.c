@@ -11,6 +11,10 @@
  * clock; the app task is descheduled for STALL_MS once a second (at a UI tick). Checks: no packet without real PCM
  * between the first and the last real one, every source frame consumed, the ring is mono for a mono file and fed
  * without expansion; a stereo file keeps a stereo ring; the DAC route still expands mono.
+ * Output mode Both (Settings -> Audio output): mono and stereo files with the headset connected (both outputs get
+ * every frame, sample exact; the speaker never runs ahead of the headset; one volume = bt_vol, the headset at unity
+ * under absolute volume) and not connected (speaker only, speaker volume); with the app task out 400 ms/s the speaker
+ * runs dry and must drop its backlog (audio_out.c pump_dac resync) instead of holding the headset's ring.
  * SPDX-License-Identifier: MIT */
 #include <assert.h>
 #include <stdio.h>
@@ -38,6 +42,8 @@ enum {
 static uint8_t recording[44 + FRAMES * 4];
 static unsigned channels, file_size, now_ms, time_limit_ms;
 static int ended, stall_on;
+static aout_route_t seen_route;
+static uint16_t seen_gain;
 static unsigned last_stall_ms;
 
 /* ---- headset side: real ring, fake hp_tx (app-side calls only), consumer clocked on the virtual time ---- */
@@ -53,7 +59,8 @@ uint32_t hp_tx_app_queued_frames(const hp_tx_t *t) { (void)t; return hp_sink_que
 int hp_tx_app_is_busy(const hp_tx_t *t) { (void)t; return hp_sink_queued(&sink) > 0u; }
 void hp_tx_request_flush(hp_tx_t *t) { (void)t; hp_sink_flush(&sink); }
 void hp_tx_request_drop(hp_tx_t *t) { (void)t; hp_sink_flush(&sink); }
-static int link_ready(void) { return 1; }
+static int bt_ready = 1;                     /* headset connected, stream OPEN / STARTED */
+static int link_ready(void) { return bt_ready; }
 static void link_start(void) { }
 static const aout_bt_link_t k_link = { link_ready, link_start };
 
@@ -86,6 +93,7 @@ static unsigned mid_pads(void)
 
 /* ---- fake DAC (speaker route): 4 slots, mono expansion check ---- */
 static unsigned dac_slots[AUDIO_DAC_QUEUE_SLOTS], dac_head, dac_count, dac_submitted, dac_consumed;
+static unsigned dac_level, dac_starved_ms, dac_writes, max_skew, dac_next, dac_skipped;
 static int dac_running;
 
 static int16_t sample(unsigned frame, unsigned ch) { return (int16_t)((int)(frame % 30000) * (ch ? -1 : 1)); }
@@ -97,6 +105,9 @@ static void advance(unsigned ms)
         assert(now_ms < time_limit_ms);
         btc_run_ms();
         unsigned frames = RATE / 1000;
+        if (dac_running && dac_next && dac_next < FRAMES && !dac_count) {
+            dac_starved_ms++;                   /* the DAC ran dry mid-file (an audible gap on the speaker) */
+        }
         while (frames && dac_count) {
             unsigned take = dac_slots[dac_head] < frames ? dac_slots[dac_head] : frames;
             dac_slots[dac_head] -= take;
@@ -107,18 +118,32 @@ static void advance(unsigned ms)
                 dac_count--;
             }
         }
+        if (dac_consumed && src_consumed && dac_next < FRAMES) {
+            /* BOTH: the speaker must not run ahead of what the headset already took from the ring */
+            unsigned skew = dac_consumed > src_consumed ? dac_consumed - src_consumed : 0u;
+            if (skew > max_skew) max_skew = skew;
+        }
     }
 }
 
-int audio_dac_start(uint32_t rate, uint8_t level) { (void)level; assert(rate == RATE); dac_running = 1; return 0; }
+int audio_dac_start(uint32_t rate, uint8_t level) { assert(rate == RATE); dac_level = level; dac_running = 1; return 0; }
 int audio_dac_write_stereo(const int16_t *pcm, uint32_t frames)
 {
     if (!dac_running || dac_count == AUDIO_DAC_QUEUE_SLOTS) return 0;
     if (frames > 1024u) frames = 1024u;
-    for (unsigned i = 0; i < frames; i++) {
-        assert(pcm[2 * i] == sample(dac_submitted + i, 0));
-        assert(pcm[2 * i + 1] == sample(dac_submitted + i, channels - 1));
+    /* BOTH may drop a backlog after the DAC ran dry (audio_out.c pump_dac): a forward jump, counted */
+    unsigned at = dac_next;
+    while (pcm[0] != sample(at, 0)) {
+        assert(at < FRAMES);
+        at++;
     }
+    dac_skipped += at - dac_next;
+    for (unsigned i = 0; i < frames; i++) {
+        assert(pcm[2 * i] == sample(at + i, 0));
+        assert(pcm[2 * i + 1] == sample(at + i, channels - 1));
+    }
+    dac_next = at + frames;
+    dac_writes++;
     dac_slots[(dac_head + dac_count) % AUDIO_DAC_QUEUE_SLOTS] = frames;
     dac_count++;
     dac_submitted += frames;
@@ -133,7 +158,7 @@ uint32_t audio_dac_queued_frames(void)
     return q;
 }
 void audio_dac_set_mute(int m) { (void)m; }
-void audio_dac_set_volume(uint8_t v, uint16_t d) { (void)v; (void)d; }
+void audio_dac_set_volume(uint8_t v, uint16_t d) { (void)d; dac_level = v; }
 void audio_dac_stop(void) { dac_running = 0; dac_count = 0; }
 void audio_pa_set(int on) { (void)on; }
 
@@ -141,13 +166,15 @@ void audio_pa_set(int on) { (void)on; }
 void bt_hp_poll(void) { }
 int bt_hp_stop(void) { return 0; }
 int bt_hp_active(void) { return 1; }
-int bt_hp_stream_ready(void) { return 1; }
+int bt_hp_stream_ready(void) { return bt_ready; }
 int bt_hp_take_key(void) { return BT_HP_KEY_NONE; }
 uint32_t bt_hp_take_player_events(void) { return 0u; }
 void bt_hp_player_begin(void) { }
-uint8_t bt_hp_vol31(void) { return 18u; }
-void bt_hp_set_vol31(uint8_t v) { (void)v; }
-int bt_hp_abs_vol(void) { return 0; }
+static uint8_t bt_vol31 = 18u;
+static int abs_vol;
+uint8_t bt_hp_vol31(void) { return bt_vol31; }
+void bt_hp_set_vol31(uint8_t v) { bt_vol31 = v; }
+int bt_hp_abs_vol(void) { return abs_vol; }
 int bt_lowbatt_poll(uint32_t now) { (void)now; return 0; }
 const char *ui_tr_bt(ui_bt_str_id_t id) { (void)id; return ""; }
 
@@ -178,6 +205,8 @@ void ui_render_screen(ui_screen_id_t screen, const ui_model_t *m)
 {
     assert(screen == UI_SCR_PLAYER);
     ended = m->play_state == 2;
+    seen_route = aout_route();
+    seen_gain = sink.gain_q15;
     advance(2);
     if (stall_on && now_ms - last_stall_ms >= 1000u) {
         last_stall_ms = now_ms;
@@ -228,7 +257,7 @@ static void play(aout_mode_t mode, unsigned ch, int stall)
     exfat_vol_t vol = {0};
     make_file(ch);
     memset(&m, 0, sizeof(m));
-    m.cfg.spk_vol = 18;
+    m.cfg.spk_vol = 10;                  /* != the headset's bt_vol (18 by default) */
     now_ms = 0;
     time_limit_ms = 60000;
     ended = 0;
@@ -236,6 +265,7 @@ static void play(aout_mode_t mode, unsigned ch, int stall)
     last_stall_ms = 0;
     pkts = src_consumed = pkt_credit = 0;
     dac_head = dac_count = dac_submitted = dac_consumed = 0;
+    dac_level = dac_starved_ms = dac_writes = max_skew = dac_next = dac_skipped = 0;
     hp_sink_init(&sink, ring, sizeof(ring));
     hp_sink_set_out_rate(&sink, CONN_RATE);
     aout_bt_attach(&fake_tx, &sink, &k_link, 0);
@@ -270,5 +300,57 @@ int main(void)
     play(AOUT_MODE_SPEAKER, 1, 0);
     assert(dac_submitted == FRAMES && src_consumed == 0u);
     puts("[OK] 16 kHz mono file to the speaker on BT=1: expanded to stereo for the DAC");
+
+    /* ---- output mode Both (Settings -> Audio output -> Both): speaker / jack and headset together ---- */
+    for (unsigned ch = 1; ch <= 2; ch++) {
+        /* headset connected: one file reaches both outputs complete, sample exact (the fake DAC checks every
+         * sample, so a mono ring's tap must expand to L = R), the headset never starves, and the speaker never
+         * runs ahead of the headset's ring reader */
+        play(AOUT_MODE_BOTH, ch, 0);
+        printf("both/%s: route=%d ring ch=%u, headset src=%u pads=%u, DAC=%u in %u writes, DAC dry %u ms, "
+               "DAC ahead max %u frames, DAC level %u\n", ch == 1 ? "mono" : "stereo", (int)seen_route,
+               (unsigned)hp_sink_channels(&sink), src_consumed, mid_pads(), dac_submitted, dac_writes,
+               dac_starved_ms, max_skew, dac_level);
+        assert(seen_route == AOUT_ROUTE_BOTH);
+        assert(hp_sink_channels(&sink) == ch && sink.ch_mismatch == 0u);
+        assert(src_consumed == FRAMES && mid_pads() == 0u);
+        assert(dac_submitted == FRAMES && dac_consumed == FRAMES && dac_skipped == 0u);
+        assert(max_skew == 0u);
+        assert(dac_level == 18u);           /* one volume for both outputs: the headset's bt_vol */
+        printf("[OK] Both, %s file, headset connected: speaker and headset each get every frame\n",
+               ch == 1 ? "mono" : "stereo");
+
+        /* headset not connected: the file plays on the speaker alone, at the speaker volume */
+        bt_ready = 0;
+        play(AOUT_MODE_BOTH, ch, 0);
+        bt_ready = 1;
+        assert(seen_route == AOUT_ROUTE_DAC);
+        assert(dac_submitted == FRAMES && src_consumed == 0u);
+        assert(dac_level == 10u);
+        printf("[OK] Both, %s file, no headset: speaker only, speaker volume\n", ch == 1 ? "mono" : "stereo");
+    }
+
+    /* Both with absolute volume: the headset's PCM gain stays at unity (its own volume sets its level), the speaker
+     * follows bt_vol (never taken to 31 by the unity gain) */
+    abs_vol = 1;
+    bt_vol31 = 12u;
+    play(AOUT_MODE_BOTH, 1, 0);
+    assert(seen_route == AOUT_ROUTE_BOTH && seen_gain == 32768u && dac_level == 12u);
+    abs_vol = 0;
+    play(AOUT_MODE_BOTH, 1, 0);
+    assert(seen_route == AOUT_ROUTE_BOTH && seen_gain == 990u && dac_level == 12u);   /* level 12 Q15 */
+    bt_vol31 = 18u;
+    puts("[OK] Both volume: absolute volume -> headset gain unity, speaker at bt_vol; else both at bt_vol");
+
+    /* Both, mono file, app task descheduled 400 ms/s: the headset keeps its 512 ms mono ring */
+    play(AOUT_MODE_BOTH, 1, 1);
+    aout_stats_t st;
+    aout_get_stats(&st);
+    printf("both/mono stall: headset pads=%u src=%u, DAC=%u + %u dropped (resync %u), dry %u ms\n", mid_pads(),
+           src_consumed, dac_submitted, dac_skipped, (unsigned)st.dac_resync_frames, dac_starved_ms);
+    assert(hp_sink_channels(&sink) == 1u && src_consumed == FRAMES);
+    assert(mid_pads() == 0u);                /* without the DAC resync: 23 (the tap's backlog holds the ring) */
+    assert(dac_submitted + dac_skipped == FRAMES && dac_skipped == st.dac_resync_frames);
+    puts("[OK] Both, mono file, app task out 400 ms/s: the headset does not starve; the speaker drops its backlog");
     return 0;
 }
