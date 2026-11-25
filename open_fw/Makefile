@@ -55,23 +55,13 @@ else ifeq ($(UNATTENDED_DEV),1)
 CFLAGS   += -DOPENFW_UNATTENDED_DEV=1
 endif
 # HCI_PROBE=1 (requires BT=1): Exp 1 stage A/B probe image (plan M5; bt_port/hci_probe.c, docs/BT_HW_RESULTS.md).
+# Diagnostic only: no phone or headphones mode (the Bluetooth tile shows a toast).
 HCI_PROBE ?= 0
 ifeq ($(HCI_PROBE),1)
 ifneq ($(BT),1)
 $(error HCI_PROBE=1 requires BT=1)
 endif
 CFLAGS   += -DOPENFW_HCI_PROBE=1
-# bt_hci.c's legacy IRQ-26 handler is renamed: bt_port/bt_rom_real.c owns the vector and calls it (bt_hci.c, file end).
-$(BUILD_DIR)/bt_hci.o: CFLAGS += -DRWBT_IRQHandler=bt_hci_legacy_irq_top
-endif
-# BT=1 without HCI_PROBE: phone mode runs on Bluedroid (bt_port/bt_xrec_bluedroid.c, plan M4). bt_hci.c stays linked
-# for the ROM bring-up bt_port/bt_rom_real.c reuses (exported from its end under OPENFW_BT_BLUEDROID); its bt_xrec_*
-# entry points are renamed (unreferenced, dropped by --gc-sections) and so is its IRQ-26 handler (bt_rom_real owns the
-# vector). The probe image keeps the legacy phone mode.
-ifeq ($(BT)$(HCI_PROBE),10)
-$(BUILD_DIR)/bt_hci.o: CFLAGS += -DRWBT_IRQHandler=bt_hci_legacy_irq_top -Dbt_xrec_start=bt_legacy_xrec_start \
-	-Dbt_xrec_poll=bt_legacy_xrec_poll -Dbt_xrec_stop=bt_legacy_xrec_stop \
-	-Dbt_xrec_open_pairing=bt_legacy_xrec_open_pairing -Dbt_xrec_get_status=bt_legacy_xrec_get_status
 endif
 # BENCH=1 (BT=1 phone images only): the bench image for unattended silicon tests (docs/BT_HW_RESULTS.md "Phone mode
 # (BT=1) on silicon"): the one-shot SD:/BTBENCH.RUN trigger and its overrides (SSP autoconfirm, fixed XREC PIN). A
@@ -139,14 +129,15 @@ LVGL_HOST_OBJS := $(patsubst $(LVGL_DIR)/%.c,$(BUILD_DIR)/lvgl_host/%.o,$(LVGL_S
 
 EEZ_SRCS  := src/ui/eez/ui.c src/ui/eez/screens.c src/ui/eez/styles.c src/ui/eez/images.c
 
-# CORE_SRCS: every image (and, minus startup.c / bt_hci.c, the WASM build, which is pinned to the no-BT configuration).
+# CORE_SRCS: every image (and, minus startup.c, the WASM build, which is pinned to the no-BT configuration). The
+# Bluetooth phone/headphones modes are bt_port/ (bt/firmware.mk, BT=1); xrec_proto.c is their XREC protocol.
 CORE_SRCS := src/startup.c src/wdt_timer.c src/rtc.c src/uart.c src/pmu.c \
              src/keys.c src/lcd_st7735s.c src/cpu1_ui.c src/ui_spectrogram.c \
              src/ui/ui_port.c src/ui/ui_theme.c src/ui/ui_fonts.c src/ui/ui_i18n.c src/ui/ui_screens.c \
              $(EEZ_SRCS) \
              src/sdio.c src/audio_dma.c src/audio_dac.c src/audio_dsp.c \
-             src/usb_scsi.c src/usb_musb.c src/bt_rf.c src/bt_spp.c \
-             src/xrec_proto.c src/bt_hci.c src/recorder.c src/player.c \
+             src/usb_scsi.c src/usb_musb.c src/bt_rf.c \
+             src/xrec_proto.c src/recorder.c src/player.c \
              src/exp_runner.c src/crypto.c src/wav.c src/cwx.c src/exfat.c \
              src/persist.c src/apmem.c src/hsprobe_log.c src/hsprobe.c src/main.c
 SRCS      := $(CORE_SRCS)
@@ -226,7 +217,7 @@ $(BUILD_DIR)/liblvgl_host.a: $(LVGL_HOST_OBJS)
 $(BUILD_DIR)/main.o: src/main.c $(SPLASH_HDR) $(CONFIG_STAMP) include/sl6801_regs.h include/openfw.h include/openfw_ui.h include/openfw_i18n.h include/openfw_i18n_bt.h include/openfw_exp.h include/openfw_player.h include/openfw_apmem.h include/openfw_hsprobe.h include/board_config.h src/ui/ui_port.h | $(BUILD_DIR)
 	$(CLANG) $(CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/%.o: src/%.c $(CONFIG_STAMP) include/sl6801_regs.h include/sl6801_rom.h include/openfw.h include/openfw_ui.h include/openfw_i18n.h include/openfw_i18n_bt.h include/audio_dsp.h include/openfw_exp.h include/openfw_crypto.h include/openfw_wav.h include/openfw_cwx.h include/openfw_player.h include/openfw_apmem.h include/openfw_fs.h include/openfw_usb_msc.h include/openfw_bt_spp.h include/openfw_xrec.h include/openfw_hsprobe.h include/board_config.h include/lv_conf.h | $(BUILD_DIR)
+$(BUILD_DIR)/%.o: src/%.c $(CONFIG_STAMP) include/sl6801_regs.h include/sl6801_rom.h include/openfw.h include/openfw_ui.h include/openfw_i18n.h include/openfw_i18n_bt.h include/audio_dsp.h include/openfw_exp.h include/openfw_crypto.h include/openfw_wav.h include/openfw_cwx.h include/openfw_player.h include/openfw_apmem.h include/openfw_fs.h include/openfw_usb_msc.h include/openfw_xrec.h include/openfw_hsprobe.h include/board_config.h include/lv_conf.h | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
 	$(CLANG) $(CFLAGS) -c $< -o $@
 
@@ -252,8 +243,8 @@ $(BUILD_DIR)/xip.bin: $(BUILD_DIR)/open_fw.elf
 $(BUILD_DIR)/open_fw_firm.bin: $(BUILD_DIR)/ram_boot.bin $(BUILD_DIR)/xip.bin tools/pack_firm.py
 	python3 tools/pack_firm.py --ram-boot $(BUILD_DIR)/ram_boot.bin --xip $(BUILD_DIR)/xip.bin --out-firm $@
 
-test-host: $(LVGL_DIR)/lvgl.h $(BUILD_DIR)/liblvgl_host.a tests/test_core.c src/crypto.c src/wav.c src/cwx.c src/exfat.c src/persist.c src/apmem.c src/usb_scsi.c src/bt_spp.c src/xrec_proto.c | $(BUILD_DIR)
-	$(HOST_CC) $(HOST_CFLAGS) tests/test_core.c src/crypto.c src/wav.c src/cwx.c src/exfat.c src/persist.c src/apmem.c src/usb_scsi.c src/bt_spp.c src/xrec_proto.c -o $(BUILD_DIR)/test_core
+test-host: $(LVGL_DIR)/lvgl.h $(BUILD_DIR)/liblvgl_host.a tests/test_core.c src/crypto.c src/wav.c src/cwx.c src/exfat.c src/persist.c src/apmem.c src/usb_scsi.c src/xrec_proto.c | $(BUILD_DIR)
+	$(HOST_CC) $(HOST_CFLAGS) tests/test_core.c src/crypto.c src/wav.c src/cwx.c src/exfat.c src/persist.c src/apmem.c src/usb_scsi.c src/xrec_proto.c -o $(BUILD_DIR)/test_core
 	$(BUILD_DIR)/test_core
 	dd if=/dev/zero of=$(BUILD_DIR)/test_exfat.img bs=512 count=4096 status=none
 	/usr/sbin/mkfs.exfat -q -b 4096 -c 4096 $(BUILD_DIR)/test_exfat.img
@@ -344,7 +335,7 @@ test-qemu-bt:
 		--flash $(OUT_BIN) --skip-keys --png-out $(BT_QEMU_DIR)/qemu_lcd.png
 
 # Exp 1 probe image (BT=1 HCI_PROBE=1). QEMU has no RW-BT controller: the probe must report the IRQ-26
-# liveness timeout, recover once, abort cleanly, put IRQ 26's priority back and release RW-BT for the legacy path,
+# liveness timeout, recover once, abort cleanly, put IRQ 26's priority back and release RW-BT (claimed=0),
 # then write its log copy to the SD card (HCIPROBE.LOG), while the boot checks and the RTOS self-test still pass.
 # HCI_PROBE_AUTORUN=1 (stage A; 2 = stage A + B): the blank QEMU SD card has no HCIPROBE.RUN request (the trigger
 # itself is host-tested in test-bt-port). These images are written to their BUILD_DIR, never to ../dumps (update-up
@@ -356,7 +347,7 @@ test-qemu-hciprobe:
 	python3 tools/run_qemu.py --elf $(HCIPROBE_QEMU_DIR)/open_fw.elf --stub $(HCIPROBE_QEMU_DIR)/qemu_boot_stub.bin \
 		--flash $(HCIPROBE_QEMU_DIR)/firmware_2M_qemu_only.bin --skip-keys --png-out $(HCIPROBE_QEMU_DIR)/qemu_lcd.png \
 		--expect-log "HCIP BEGIN" --expect-log "trig=autorun" --expect-log "HCIP TIMEOUT what=irq26" \
-		--expect-log "claimed=0 owner=0 lockout=0 legacy=allowed" --expect-log "HCIP END st=ABORT" \
+		--expect-log "claimed=0 owner=0 lockout=0" --expect-log "HCIP END st=ABORT" \
 		--expect-log "HCIP LOGFILE file=HCIPROBE.LOG st=OK"
 
 # Dev check of the probe's full sequence (stage A reads, idle window, 5 restarts; stage B writes, read-backs, scan
@@ -372,7 +363,7 @@ test-qemu-hciprobe-full:
 		--flash $(HCIPROBE_FULL_QEMU_DIR)/firmware_2M_qemu_only.bin --skip-keys --png-out $(HCIPROBE_FULL_QEMU_DIR)/qemu_lcd.png --expect-seconds 150 \
 		--expect-log "HCIP RESTART i=5" --expect-log "trig=autorun cpu_pm=700 cpu_n=10" --expect-log "HCIP WIN w=scan" \
 		--expect-log "HCIP STAGE s=B st=DONE" --expect-log "HCIP STACK ctrl_size=4096" \
-		--expect-log "legacy=allowed" --expect-log "HCIP END st=DONE" \
+		--expect-log "claimed=0 owner=0 lockout=0" --expect-log "HCIP END st=DONE" \
 		--expect-log "HCIP LOGFILE file=HCIPROBE.LOG st=OK"
 
 WASM_BUILD_DIR := $(BUILD_DIR)_wasm
@@ -383,7 +374,7 @@ WASM_CFLAGS    := --target=wasm32 -Os -Wall -Wextra -ffreestanding -fno-builtin 
 WASM_LVGL_CFLAGS := --target=wasm32 -O2 -ffreestanding -fno-builtin -fno-stack-protector \
                     -DOPENFW_WASM=1 -Wno-unused-parameter -Wno-sign-compare -Iinclude $(LVGL_INC)
 # No-BT configuration whatever BT is (audio_out.c / ui_i18n_bt.c are BT=1 only; WASM_CFLAGS has no OPENFW_BT_BLUEDROID).
-WASM_SRCS      := $(filter-out src/startup.c src/bt_hci.c,$(CORE_SRCS)) wasm/wasm_platform.c
+WASM_SRCS      := $(filter-out src/startup.c,$(CORE_SRCS)) wasm/wasm_platform.c
 WASM_OBJS      := $(patsubst %.c,$(WASM_BUILD_DIR)/%.o,$(WASM_SRCS))
 WASM_LVGL_OBJS := $(patsubst $(LVGL_DIR)/%.c,$(WASM_BUILD_DIR)/lvgl/%.o,$(LVGL_SRCS))
 
@@ -395,7 +386,7 @@ $(WASM_BUILD_DIR)/src/main.o: src/main.c $(SPLASH_HDR) include/sl6801_regs.h inc
 	@mkdir -p $(dir $@)
 	$(CLANG) $(WASM_CFLAGS) -c $< -o $@
 
-$(WASM_BUILD_DIR)/%.o: %.c include/sl6801_regs.h include/sl6801_rom.h include/openfw.h include/openfw_ui.h include/openfw_i18n.h include/audio_dsp.h include/openfw_exp.h include/openfw_crypto.h include/openfw_wav.h include/openfw_cwx.h include/openfw_player.h include/openfw_apmem.h include/openfw_fs.h include/openfw_usb_msc.h include/openfw_bt_spp.h include/openfw_xrec.h include/openfw_hsprobe.h include/board_config.h include/lv_conf.h
+$(WASM_BUILD_DIR)/%.o: %.c include/sl6801_regs.h include/sl6801_rom.h include/openfw.h include/openfw_ui.h include/openfw_i18n.h include/audio_dsp.h include/openfw_exp.h include/openfw_crypto.h include/openfw_wav.h include/openfw_cwx.h include/openfw_player.h include/openfw_apmem.h include/openfw_fs.h include/openfw_usb_msc.h include/openfw_xrec.h include/openfw_hsprobe.h include/board_config.h include/lv_conf.h
 	@mkdir -p $(dir $@)
 	$(CLANG) $(WASM_CFLAGS) -c $< -o $@
 

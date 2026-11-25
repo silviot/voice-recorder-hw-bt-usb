@@ -1,9 +1,8 @@
 /* Firmware platform for bt_xrec_bluedroid (BT=1 phone mode, plan M4): device callbacks for xrec_proto, the bond store
  * on SD, stack bring-up / teardown jobs in the bt_recover worker, the hard-stop deadline, the hard path.
  *
- * F: = src/bt_hci.c, M: = src/main.c (line numbers of this tree). The device callbacks are the legacy ones
- * (F:1733-1966) with the session's volume; the legacy file keeps its own static copies (renamed and unreferenced in
- * BT=1 images, open_fw/Makefile), which is why they are repeated here rather than shared.
+ * F: = src/bt_hci.c at 7c76b77 (deleted in plan step 9), M: = src/main.c (line numbers of that tree). The device
+ * callbacks are the legacy ones (F:1733-1966) with the session's volume.
  *
  * Contexts: everything runs in the app task except
  *   - the bt_recover worker (priority 2, static TCB/stack in SRAM_HI, created once): up job (bt_ctrl open + HCI

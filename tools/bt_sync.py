@@ -116,7 +116,7 @@ class XRecRFCOMMClient:
             print("Native SPP (OpenFW): no HFP handshake.")
             return
         if self.transport == "auto":
-            # OpenFW (legacy bt_spp.c and the BT=1 Bluedroid SPP server) speaks +XREC directly on channel 1 and stays
+            # OpenFW (the BT=1 Bluedroid SPP server; earlier the legacy bt_spp.c) speaks +XREC directly on channel 1 and stays
             # silent until a command arrives; the stock firmware's HFP unit starts the SLC with AT+BRSF immediately.
             self.sock.settimeout(NATIVE_SPP_PROBE_S)
             try:

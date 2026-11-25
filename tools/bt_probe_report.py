@@ -267,9 +267,11 @@ def build_report(text: str) -> dict:
             rep["stack"] = body
         elif k == "RELEASE":
             rep["release"] = body
-            if body.get("legacy") != "allowed":
-                warnings.append("RW-BT left claimed (hang, hard stop or failed start/stop): legacy BT mode is refused "
-                                "until reboot")
+            # claimed / lockout: RW-BT may be in an unknown state. Logs from before plan step 9 also carry
+            # legacy=allowed|refused (the deleted legacy BT mode), same meaning.
+            if body.get("claimed") or body.get("lockout") or body.get("legacy", "allowed") != "allowed":
+                warnings.append("RW-BT left claimed (hang, hard stop or failed start/stop): reboot before using "
+                                "Bluetooth")
             if body.get("ipr") != body.get("orig"):
                 warnings.append(f"IRQ 26 priority not restored ({_hex(body.get('ipr', 0), 2)}, was "
                                 f"{_hex(body.get('orig', 0), 2)})")
@@ -446,7 +448,7 @@ def to_markdown(rep: dict) -> str:
     out += _md_kv("Timing (us)", rep.get("time"))
     out += _md_kv("bt_ctrl / ROM counters", rep.get("ctrl"))
     out += _md_kv("Free stack (bytes)", rep.get("stack"))
-    out += _md_kv("Left for the legacy path", rep.get("release"))
+    out += _md_kv("RW-BT released", rep.get("release"))
     out += _md_kv("SD log copy", rep.get("logfile"))
 
     if rep["events"]:
@@ -495,7 +497,7 @@ HCIP HEAP bytes=8192 hw=512 used=0 largest=8184 fail=0 refused=0 badfree=0 rtos_
 HCIP TIME rfcal=290000 start=9000 stop=200 ctrl_max_all=301000 starts=7 stops=7 stop_to=0
 HCIP CTRL rom_msgs=0 rom_unk=0 rom_short=0 late=0 resets=7 rfail=0 hung=0 faults=0 first=0 inv=0 lockv=0 eif=0
 HCIP STACK ctrl_free=900 dlv_free=1300 probe_free=1100
-HCIP RELEASE ipr=0x00 orig=0x00 claimed=0 owner=0 lockout=0 legacy=allowed
+HCIP RELEASE ipr=0x00 orig=0x00 claimed=0 owner=0 lockout=0
 HCIP END st=DONE fails=1 ms=14980
 """
 
@@ -509,7 +511,7 @@ HCIP CMD n=2 op=0C03 want=CC got=CC plen=4 st=00 lat=327107 res=OK rx=040E040103
 HCIP TIMEOUT what=irq26 irq=0 wait=905674 deadline=500000
 HCIP FAIL n=2 why=irq26
 HCIP ABORT fails=2
-HCIP RELEASE ipr=0x00 orig=0x00 claimed=0 owner=0 lockout=0 legacy=allowed
+HCIP RELEASE ipr=0x00 orig=0x00 claimed=0 owner=0 lockout=0
 HCIP END st=ABORT fails=2 ms=2715
 """
 
@@ -554,7 +556,7 @@ HCIP TEARDOWN why=end st=OK us=15
 HCIP HEAP bytes=8192 hw=272 used=0 largest=8184 fail=0 refused=0 badfree=0 rtos_free=100000
 HCIP CTRL rom_msgs=7 rom_unk=0 rom_short=0 late=0 resets=6 rfail=0 hung=0 faults=0 first=0 inv=0 lockv=0 eif=0
 HCIP STACK ctrl_size=4096 ctrl_free=2900 dlv_free=1372 probe_free=1196
-HCIP RELEASE ipr=0xF0 orig=0xF0 claimed=0 owner=0 lockout=0 legacy=allowed
+HCIP RELEASE ipr=0xF0 orig=0xF0 claimed=0 owner=0 lockout=0
 HCIP END st=DONE fails=0 ms=40000 vfail=2
 HCIP LOGFILE file=HCIPROBE.LOG st=OK bytes=4400 lost=0
 """
@@ -584,11 +586,11 @@ def run_self_test() -> int:
     assert len(rep["restarts"]) == 2 and rep["restarts"][1]["rlat"] == 300200
     assert len(rep["events"]) == 2 and rep["heap"]["hw"] == 512 and rep["stack"]["ctrl_free"] == 900
     assert rep["failures"] == [{"n": 1, "why": "cmd"}] and rep["warnings"] == []
-    assert rep["release"]["legacy"] == "allowed" and rep["begin"]["trig"] == "taken"
+    assert rep["release"]["claimed"] == 0 and rep["begin"]["trig"] == "taken"
     md = to_markdown(rep)
     for needle in ("| 1 | A | 0x0C03 | Reset |", "CRC-32 0x1234ABCD", "| 0 | 7990 | 7980 | 10 |", "## Clean restart",
                    "| needs disassembly | G-B | 0C18, 0C1C, 0C1E, 0C3A, 0C52 |", "Status: **DONE**",
-                   "**Left for the legacy path:**"):
+                   "**RW-BT released:**"):
         assert needle in md, needle
     json.loads(json.dumps(rep))
 
@@ -603,11 +605,11 @@ def run_self_test() -> int:
     assert off["status"] == "OFF" and off["off"]["trig"] == "absent" and len(off["warnings"]) == 1
     assert "HCIPROBE.RUN" in off["warnings"][0] and "Not run" in to_markdown(off)
 
-    # A hang leaves RW-BT claimed and legacy BT refused; a priority not put back is flagged.
-    hung = SYNTH_QEMU.replace("claimed=0 owner=0 lockout=0 legacy=allowed", "claimed=1 owner=1 lockout=1 legacy=refused")
+    # A hang leaves RW-BT claimed; a priority not put back is flagged.
+    hung = SYNTH_QEMU.replace("claimed=0 owner=0 lockout=0", "claimed=1 owner=1 lockout=1")
     hung = hung.replace("ipr=0x00 orig", "ipr=0x80 orig")
     h = build_report(hung)
-    assert any("legacy BT mode is refused" in x for x in h["warnings"])
+    assert any("reboot before using Bluetooth" in x for x in h["warnings"])
     assert any("IRQ 26 priority not restored (0x80, was 0x00)" in x for x in h["warnings"]), h["warnings"]
 
     # Wrapped ring (no BEGIN), unfinished run, and two runs in one log.
@@ -675,7 +677,7 @@ def run_self_test() -> int:
            "ctrl_free=2900 end=cpu\nHCIP STAGE s=B st=FAIL vfail=0 ms=1700\nHCIP FAIL n=1 why=scan_window\n"
            "HCIP TEARDOWN why=scan_window st=PARKED us=300\nHCIP HANG why=cpu limit=3000000 cpu_pm=700 cpu_n=10 "
            "cpu_pk=990 action=bt_stop+irq26_masked+bt_ctrl_demoted+rwbt_silenced cntl=0x00000000\nHCIP ABORT fails=1\n"
-           "HCIP RELEASE ipr=0x80 orig=0xF0 claimed=1 owner=1 lockout=1 legacy=refused\nHCIP END st=ABORT fails=1 "
+           "HCIP RELEASE ipr=0x80 orig=0xF0 claimed=1 owner=1 lockout=1\nHCIP END st=ABORT fails=1 "
            "ms=9000\n")
     c = build_report(cpu)
     assert c["status"] == "ABORT" and c["windows"]["scan"]["end"] == "cpu" and c["hang"]["why"] == "cpu"
@@ -702,6 +704,7 @@ def run_self_test() -> int:
         "HCIP END st=ABORT fails=1 ms=10\n"
     )
     cr = build_report(corrupt)
+    assert any("reboot before using Bluetooth" in x for x in cr["warnings"]), cr["warnings"]   # pre-step-9 key
     assert cr["status"] == "ABORT" and cr["irq_bits"] == [{"bit": 1, "occurrences": 5, "serviced": 5, "coalesced": 0}]
     md = to_markdown(cr)
     assert "| 1 | A | 0CZZ |" in md and "Status: **ABORT**" in md, md

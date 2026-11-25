@@ -90,7 +90,7 @@ typedef struct {
     uint32_t       (*audio_get_overruns)(void);
     void           (*set_dmac_ch0_irq)(void (*cb)(void));
 
-    /* Classic Bluetooth & RF */
+    /* Classic Bluetooth & RF (bt_xrec_*: NULL in images without phone mode, BT=0 and HCI probe) */
     uint32_t (*bt_rf_init_calibrated)(uint32_t freq_drift, uint32_t clk6_hz);
     int      (*bt_xrec_start)(exfat_vol_t *vol, int sd_mounted);
     void     (*bt_xrec_poll)(void);

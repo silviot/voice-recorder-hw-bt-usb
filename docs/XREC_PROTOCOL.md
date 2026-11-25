@@ -3,7 +3,7 @@
 This document specifies the `+XREC v5` wire protocol over Classic Bluetooth BR/EDR RFCOMM Channel 1, designed for mobile (`cassini-android`) and desktop (`tools/bt_sync.py`) clients.
 
 > **Implementation status:**
-> - **Standalone `open_fw`** (`open_fw/src/xrec_proto.c`, `open_fw/src/bt_spp.c`, `open_fw/src/bt_hci.c`, `open_fw/src/bt_rf.c`): Full protocol state machine, SPP framing, and RF/modem drivers are implemented and host-tested, with end-to-end on-device Bluetooth connectivity bring-up as the next active development milestone. `open_fw` also extends the command set with `+XREC:DSP`, `+XREC:GAIN`, `+XREC:LOG`, `+XREC:DFU`, and staged `PUT`/`PUTEND` uploads (see `open_fw/src/xrec_proto.c`).
+> - **Standalone `open_fw`** (`open_fw/src/xrec_proto.c` protocol state machine; transport: the Bluedroid SPP server in `open_fw/bt_port/bt_xrec_bluedroid.c`, default `BT=1` image; RF calibration `open_fw/src/bt_rf.c`): verified on silicon with `tools/bt_sync.py` (SSP pairing, `PAIR`/`AUTH`/`LS`/byte-exact `GETS`; `docs/BT_HW_RESULTS.md`). The earlier clean-room host (`src/bt_hci.c` + `src/bt_spp.c`) was deleted in plan step 9 (`docs/BLUETOOTH_BLUEDROID_PLAN.md`). `open_fw` also extends the command set with `+XREC:DSP`, `+XREC:GAIN`, `+XREC:LOG`, `+XREC:DFU`, and staged `PUT`/`PUTEND` uploads (see `open_fw/src/xrec_proto.c`).
 > - **Legacy stock-firmware patch** (`fw_mod/bt_filesync.c`, `v5+`): Runs on top of the stock `pen133_2.0.65` Bluetooth stack (requires the HFP `SLC_OPEN` handshake below).
 
 ---

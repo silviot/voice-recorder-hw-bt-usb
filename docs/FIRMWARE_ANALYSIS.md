@@ -651,6 +651,12 @@ Verified via Thumb-2 disassembly (`FIRM` and BootROM `0x000000..0x05FFFF`) for L
 
 ## 22. OpenFW Layer 5c: Clean-Room Classic BT L2CAP/SDP/RFCOMM, `+XREC v5`, and exFAT Delete/Stat
 
+> **Superseded (plan step 9, `docs/BLUETOOTH_BLUEDROID_PLAN.md`):** the clean-room host of §22-§23 (`bt_spp.c`,
+> `openfw_bt_spp.h`, `bt_hci.c`'s HCI transport, SSP responder and XREC bridge) was replaced by the Bluedroid host
+> (`open_fw/bt_port/`, default `BT=1` image) and deleted; `bt_hci.c` is at commit `7c76b77`. Its ROM bring-up (LD/LC/LM
+> layers, hooks, 8 KiB heap) lives on verbatim in `open_fw/bt_port/bt_rom_bringup.c`. `xrec_proto.c` is still the
+> protocol; its session tests now run over a simulated link in `tests/test_core.c` (test-host).
+
 Implemented and host-verified in [open_fw](../open_fw/):
 
 * **exFAT Maintenance (`exfat.c`, `openfw_fs.h`):** Added `exfat_stat_fs()` (reading the `0x81` Allocation Bitmap without 64-bit division helpers) and `exfat_delete_file()` (clearing directory entry sets `0x85`/`0xC0`/`0xC1` across sector/cluster boundaries, clearing the bitmap bits, and unlinking FAT chains). Validated against `/usr/sbin/fsck.exfat -n` (`clean. directories 2, files 1`).

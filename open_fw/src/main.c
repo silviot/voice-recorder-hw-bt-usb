@@ -41,6 +41,14 @@
 #define OPENFW_BT_HP 0
 #define BT_HP_POLL() ((void)0)
 #endif
+/* Phone mode (run_bt_xrec_mode, the bt_xrec_* API): Bluedroid phone images (bt_port/bt_xrec_bluedroid.c) and the web
+ * emulator (wasm/wasm_platform.c simulates bt_xrec_*). A BT=0 image has no Bluetooth at all and the HCI probe image
+ * is diagnostic only: neither links bt_xrec_*, and the Bluetooth tile shows a toast instead. */
+#if OPENFW_BT_HP || (defined(OPENFW_WASM) && OPENFW_WASM)
+#define OPENFW_BT_PHONE 1
+#else
+#define OPENFW_BT_PHONE 0
+#endif
 
 #define MENU_MAX_FILES 96
 #define MENU_MAX_CWX   192
@@ -292,8 +300,10 @@ int ui_poll_power_button(ui_screen_id_t screen, ui_model_t *model, uint32_t now)
 #endif
             if (screen == UI_SCR_USB) {
                 usb_msc_stop();
+#if OPENFW_BT_PHONE
             } else if (screen == UI_SCR_BT) {
                 bt_xrec_stop();
+#endif
             } else if (screen == UI_SCR_PLAYER) {
                 audio_dac_stop();
                 /* last_file is the track being played (set before playback starts) */
@@ -1516,6 +1526,7 @@ static void bt_prompt_ui_update(uint32_t now)
 #define OPENFW_BT_PROMPT 0
 #endif
 
+#if OPENFW_BT_PHONE
 static void run_bt_xrec_mode(void)
 {
     g_ui_screen   = UI_SCR_BT;
@@ -1730,6 +1741,13 @@ static void run_bt_xrec_mode(void)
     backlight_wake(millis());
     reload_files_and_sd_stats();
 }
+#else
+/* BT=0 / HCI probe image: the Bluetooth tile only says so. TODO(i18n): English only. */
+static void run_bt_unavailable(void)
+{
+    ui_show_toast("No Bluetooth in this image", UI_COL_AMBER, millis(), 2000u);
+}
+#endif
 
 /* Settings > Headset button test (diagnostic, see hsprobe.c). Modal. */
 static int hsprobe_poll_cb(uint32_t now_ms)
@@ -2684,17 +2702,18 @@ static const openfw_exp_api_t k_exp_api = {
     .audio_get_overruns    = audio_get_overruns,
     .set_dmac_ch0_irq      = openfw_exp_set_dmac_ch0_irq,
     .bt_rf_init_calibrated = bt_rf_init_calibrated,
+#if OPENFW_BT_PHONE              /* NULL without phone mode (BT=0, HCI probe): exp/exp_bt.c checks */
     .bt_xrec_start         = bt_xrec_start,
     .bt_xrec_poll          = bt_xrec_poll,
     .bt_xrec_stop          = bt_xrec_stop,
     .bt_xrec_open_pairing  = bt_xrec_open_pairing,
     .bt_xrec_get_status    = bt_xrec_get_status,
+#endif
 };
 
 #if defined(OPENFW_HCI_PROBE) && OPENFW_HCI_PROBE
 /* bt_port/hci_probe.c: plan M5 Exp 1 stage A (make BT=1 HCI_PROBE=1). Hooks kept below M:1289 (docs cite lines). */
 void hci_probe_start(exfat_vol_t *vol, int sd_mounted);
-int  hci_probe_active(void);   /* legacy BT mode refused (probe running, or RW-BT left claimed) */
 int  hci_probe_running(void);  /* recording refused, USB MSC deferred until the probe's END */
 void hci_probe_poll(exfat_vol_t *vol, int sd_mounted); /* after END: writes SD:/HCIPROBE.LOG (app task owns the FS) */
 #endif
@@ -3288,14 +3307,12 @@ int openfw_main(void)
                                 g_ui_screen         = (uint32_t)scr;
                                 dirty               = 1;
                             } else {
-#if defined(OPENFW_HCI_PROBE) && OPENFW_HCI_PROBE
-                                if (!hci_probe_active()) { /* the probe owns RW-BT or left it claimed */
-                                    run_bt_xrec_mode();
-                                }
-#elif OPENFW_BT_HP
+#if OPENFW_BT_HP
                                 run_bt_choice();
+#elif OPENFW_BT_PHONE
+                                run_bt_xrec_mode();   /* web emulator */
 #else
-                                run_bt_xrec_mode();
+                                run_bt_unavailable(); /* BT=0, HCI probe */
 #endif
                                 g_ui_screen = (uint32_t)scr;
                                 dirty       = 1;

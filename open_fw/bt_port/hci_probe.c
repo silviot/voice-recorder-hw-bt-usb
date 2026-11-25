@@ -9,8 +9,9 @@
  * BT=1 and logs "HCIP OFF".
  * The probe runs in its own low-priority task (same priority as the app, which keeps feeding the WDT; the probe also
  * feeds it while it waits): stage A ~6 s on silicon, stage B ~33 s more; then BT stays off. While it runs, main.c refuses
- * recording and defers USB MSC (each Reset busy-waits ~0.3-0.5 s in RF calibration at bt_ctrl priority); legacy BT mode
- * stays refused for the rest of the boot if RW-BT may be left in an unknown state (hci_probe_active()).
+ * recording and defers USB MSC (each Reset busy-waits ~0.3-0.5 s in RF calibration at bt_ctrl priority). The probe image
+ * has no phone or headphones mode (plan step 9: diagnostic only); the RELEASE line reports whether RW-BT may be left
+ * in an unknown state (claimed= / lockout=).
  * Stage A:
  *   1. HCI Reset (0C03): bt_ctrl's real controller reset (RF calibration, ROM start, IRQ 26 on), then IRQ-26
  *      liveness (the controller must raise IRQ 26 within 500 ms).
@@ -120,7 +121,7 @@ static StaticTimer_t s_guard_buf RTOS_STATIC;
 static TaskHandle_t s_task;
 static TimerHandle_t s_guard;
 static volatile uint8_t s_active;           /* probe task running (recording refused, USB MSC deferred) */
-static volatile uint8_t s_lockout;          /* bt_ctrl hung or hard-stopped: legacy BT mode refused until reboot */
+static volatile uint8_t s_lockout;          /* bt_ctrl hung or hard-stopped: RW-BT state unknown until reboot */
 static volatile uint8_t s_log_ready;        /* probe task finished: hci_probe_poll() saves the log copy */
 static uint8_t s_decided;                   /* hci_probe_start() ran this boot */
 static uint8_t s_stage;                     /* HCIP_STAGE_A / _B (from the request file) */
@@ -129,9 +130,7 @@ static const char *s_trig = "absent";
 /* main.c hooks (declared there under OPENFW_HCI_PROBE) */
 void hci_probe_start(exfat_vol_t *vol, int sd_mounted);
 void hci_probe_poll(exfat_vol_t *vol, int sd_mounted);
-int  hci_probe_active(void);
 int  hci_probe_running(void);
-static int hci_probe_active_after_end(void);
 
 /* ---- host-side driver stub (bt_dlv context -> probe task) ---- */
 typedef struct {
@@ -795,8 +794,8 @@ static void log_summary(void)
     lb_emit();
 }
 
-/* What the probe leaves behind for the legacy path: IRQ-26 priority (restored by stop()) and whether RW-BT may be in
- * an unknown state (legacy BT mode then stays refused until reboot). */
+/* What the probe leaves behind: IRQ-26 priority (restored by stop()) and whether RW-BT may be in an unknown state
+ * (claimed / lockout: reboot before using Bluetooth). */
 static void log_release(void)
 {
     bt_rom_real_diag(&s_rd1);
@@ -806,7 +805,6 @@ static void log_release(void)
     lb_ku("claimed", s_rd1.claimed);
     lb_ku("owner", s_rd1.owner);
     lb_ku("lockout", s_lockout);
-    lb_ks("legacy", hci_probe_active_after_end() ? "refused" : "allowed");
     lb_emit();
 }
 
@@ -1287,7 +1285,7 @@ void hci_probe_start(exfat_vol_t *vol, int sd_mounted)
 }
 
 /* App task, every main-loop pass: after the probe task's END, write its log copy to SD:/HCIPROBE.LOG (the 4 KiB
- * g_openfw_log ring cannot hold stage A + B), then let recording / USB MSC / legacy BT go (s_active = 0). */
+ * g_openfw_log ring cannot hold stage A + B), then let recording / USB MSC go (s_active = 0). */
 void hci_probe_poll(exfat_vol_t *vol, int sd_mounted)
 {
     if (!s_log_ready) {
@@ -1303,17 +1301,6 @@ void hci_probe_poll(exfat_vol_t *vol, int sd_mounted)
     lb_ku("lost", s_copy_lost);
     lb_emit();
     s_active = 0u;                           /* BT stays off for the rest of this boot */
-}
-
-static int hci_probe_active_after_end(void)
-{
-    return s_lockout != 0u || bt_rom_real_busy();
-}
-
-/* Legacy BT mode must not start: the probe runs, or it left RW-BT claimed (hang, hard stop, failed start/stop). */
-int hci_probe_active(void)
-{
-    return s_active != 0u || hci_probe_active_after_end();
 }
 
 /* Recording and USB MSC wait for END and the log file: the probe's resets take the CPU in bursts of ~0.5 s. */

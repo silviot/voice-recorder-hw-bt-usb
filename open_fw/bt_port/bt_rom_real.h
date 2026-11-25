@@ -31,7 +31,7 @@ typedef struct {
     uint8_t  _pad0;
     /* IRQ 26 top half / bottom half */
     uint32_t irq_total;          /* top-half entries with a nonzero INTSTAT */
-    uint32_t irq_spurious;       /* top-half entries that read INTSTAT == 0 */
+    uint32_t irq_spurious;       /* top-half entries that read INTSTAT == 0, or came while not owner (acked) */
     uint32_t irq_coalesced[32];  /* bit latched again before the bottom half took the previous one */
     uint32_t irq_lat_max_us;     /* first latch -> irq_take() */
     uint32_t irq_lat_sum_us, irq_lat_n;
@@ -41,7 +41,7 @@ typedef struct {
     uint32_t disp_max_ev;        /* event bit of that dispatch */
     uint32_t disp_count;
     uint32_t run_max_us;         /* one run(max_steps) call */
-    /* g_bt_heap (8 KiB, shared with the legacy path, never used by both at once) */
+    /* g_bt_heap (8 KiB, bt_rom_bringup.c) */
     uint32_t heap_bytes, heap_used, heap_hw, alloc_fail, bad_free, alloc_refused;
     /* lifecycle */
     uint32_t starts, stops, stop_timeouts;
@@ -51,7 +51,7 @@ typedef struct {
     uint32_t disp_sum_us;        /* all ke_event dispatches (ROM kernel handlers incl. TASK_HCI upcalls) */
 } bt_rom_real_diag_t;
 
-/* g_bt_heap geometry (legacy bt_hci.c F:233-237) and the msg_alloc admission rule. */
+/* g_bt_heap geometry (legacy bt_hci.c F:233-237, now bt_rom_bringup.h) and the msg_alloc admission rule. */
 #define BT_ROM_REAL_HEAP_BYTES    8192u   /* BT_HEAP_WORDS (2048) x 4 */
 #define BT_ROM_REAL_BLK_HDR       8u      /* bt_blk_hdr_t: size_flags + tag */
 #define BT_ROM_REAL_HEAP_RESERVE  1024u   /* left for the ROM's own allocations (timers, LMP), which never check NULL */
@@ -78,12 +78,12 @@ void bt_rom_real_links(uint8_t lc[BT_ROM_REAL_LINKS], uint8_t ld[BT_ROM_REAL_LIN
 /* Reset the *_max_us fields (window measurements). */
 void bt_rom_real_diag_reset_max(void);
 /* 1 while bt_rom_real owns or may have left RW-BT in an unknown state: from the first rf_calibrate()/start() until a
- * stop() whose soft reset completed. The legacy path must not start while it is 1 (it may stay 1 for the whole boot
- * after a hang, a hard stop, a failed start() or a stop() timeout). */
+ * stop() whose soft reset completed. It may stay 1 for the whole boot after a hang, a hard stop, a failed start() or a
+ * stop() timeout (the HCI probe's RELEASE line reports it as claimed=). */
 int  bt_rom_real_busy(void);
 /* Plan M1 hard path, radio side: the register half of stop() (legacy bt_xrec_stop F:2151-2158: IRQ 26 masked,
  * INTCNTL = 0, INTACK all, RWBTEN cleared, soft reset requested and polled with the same bound) WITHOUT any ROM call
- * and without touching IPR[26], owner or claimed: RW-BT stays claimed, so legacy BT mode stays refused until reboot.
+ * and without touching IPR[26], owner or claimed: RW-BT stays claimed until reboot.
  * For a bt_ctrl that was hard-stopped (teardown deadline) or demoted (hang / CPU guard), whose last ROM call may still be
  * unfinished in its context; call from a task that bt_ctrl cannot preempt at that point (the probe task, priority 1,
  * after bt_stop is latched or bt_ctrl was demoted to idle). Best effort: a ROM read-modify-write interrupted before

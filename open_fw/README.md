@@ -26,7 +26,7 @@ open_fw/
 │   ├── sdio.c / exfat.c      # 1-bit SDIO driver (CMD18/CMD25) & crash-safe exFAT filesystem
 │   ├── persist.c             # Persistent settings (/cassini/settings.bin)
 │   ├── usb_musb.c / usb_scsi.c # Mentor MUSB Full-Speed USB MSC (EP2 2 KiB FIFO) + vendor 0xE0 SCSI
-│   ├── bt_rf.c / bt_hci.c / bt_spp.c / xrec_proto.c # Classic BT RF/HCI/SPP + +XREC v5 (WIP)
+│   ├── bt_rf.c / xrec_proto.c # Classic BT RF calibration + +XREC v5 protocol (Bluetooth host: ../bt_port/, BT=1)
 │   ├── keys.c / pmu.c / rtc.c / uart.c / wdt_timer.c # Platform peripherals & SRAM log ring
 │   ├── crypto.c              # SHA-256, HMAC-SHA256, CRC-16/CCITT-FALSE, constant-time compare
 │   └── exp_runner.c          # SRAM experiment execution bridge (0x00850000 arena, DEV_EXP=1)

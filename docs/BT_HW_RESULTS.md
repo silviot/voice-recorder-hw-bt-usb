@@ -457,7 +457,7 @@ reset still pending). It is the sequence the legacy `bt_xrec_stop()` uses on sil
 call is stuck, and a ROM read-modify-write interrupted before it could set RWBTEN again: **after `HANG` or `HARDSTOP`
 in stage B, reboot the device at once** (`sudo python3 tools/dev_cycle.py dfu`, then `boot`, as soon as USB is back:
 entering DFU resets the chip; if USB does not come back, hold ON/OFF for the PMU long-press power-off, 6–12 s); do not
-assume the device stopped being discoverable. RW-BT stays claimed, so legacy BT mode is refused until that reboot anyway.
+assume the device stopped being discoverable. RW-BT stays claimed until that reboot anyway.
 *CPU-share guard (stage B only):* stage B is the first time the radio is active (inquiry + page scan), and no `bt_ctrl`
 CPU or IRQ-26 rate has been measured on silicon in that state. If an IRQ-26 source re-latches at once (a status bit the
 top half does not clear, a flood of scan-slot IRQs), `bt_ctrl` (priority 8) runs back to back and starves the app
@@ -487,9 +487,11 @@ the CPU inside the IRQ-26 top half itself: the WDT then resets the device (next 
   mode (including the automatic one) waits until the probe has ended and written its log file. Leave the device alone
   until it enumerates over USB again.
 - *After it ends.* `stop()` puts IRQ 26's NVIC priority back to the value found before the first `start()` (legacy never
-  sets one), and legacy Bluetooth mode stays refused for the rest of the boot if RW-BT may be in an unknown state: from
-  the first RF calibration until a `stop()` whose soft reset completed, and after `HANG` / `HARDSTOP`. `HCIP RELEASE`
-  logs both (`ipr`, `orig`, `claimed`, `legacy=allowed|refused`); reboot before using BT mode after a `refused`.
+  sets one), and reports whether RW-BT may be in an unknown state: from the first RF calibration until a `stop()` whose
+  soft reset completed, and after `HANG` / `HARDSTOP`. `HCIP RELEASE` logs both (`ipr`, `orig`, `claimed`, `lockout`);
+  reboot before using Bluetooth after `claimed=1` or `lockout=1`. Since plan step 9 the probe image has no phone or
+  headphones mode at all (the Bluetooth tile shows a toast); logs from before carry `legacy=allowed|refused` too
+  (`tools/bt_probe_report.py` reads both).
 - Do not run `dev_cycle.py exp` experiments during the probe window.
 
 **Run:**
@@ -539,7 +541,7 @@ read-back mismatches, a window that ended early (fault, hang, CPU guard), a `HAN
 QEMU-only image, and a failed log file.
 
 **QEMU** (`make -C open_fw test-qemu-hciprobe`): no RW-BT model, so the expected result is Reset CC → `TIMEOUT
-what=irq26` → teardown → retry → `RELEASE ... legacy=allowed` → `END st=ABORT` → `LOGFILE ... st=OK`, with the normal
+what=irq26` → teardown → retry → `RELEASE ... claimed=0 owner=0 lockout=0` → `END st=ABORT` → `LOGFILE ... st=OK`, with the normal
 boot checks and the RTOS self-test passing. The QEMU SD card is blank, so both QEMU targets build with
 `HCI_PROBE_AUTORUN` (`trig=autorun`; 1 = stage A, 2 = stage A + B; the request-file logic is host-tested in
 `make -C open_fw test-bt-port`, `tests/test_hci_probe.c`). `make -C open_fw test-qemu-hciprobe-full` is a dev check of

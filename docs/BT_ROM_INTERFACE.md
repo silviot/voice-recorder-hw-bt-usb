@@ -1,5 +1,11 @@
 # RW-BT mask-ROM controller interface (how open_fw drives it today)
 
+> **Note (plan step 9):** the legacy host `open_fw/src/bt_hci.c` (and `src/bt_spp.c`) was deleted after the Bluedroid
+> image became the default. Every `F:<line>` and `bt_hci.c:<line>` citation in this document and in the code comments
+> refers to `open_fw/src/bt_hci.c` at commit `7c76b77`, the last commit that has it (`git show 7c76b77:open_fw/src/bt_hci.c`).
+> The bring-up this document describes (LD / LC / LM layers, hooks, `g_bt_heap`) now lives, verbatim, in
+> `open_fw/bt_port/bt_rom_bringup.c`; `bt_port/bt_rom_real.c` owns the controller and IRQ 26 in every BT=1 image.
+
 Status: reference for plan v18 M1 (`bt_ctrl`) and for the host-test **fake ROM**. Describes the *existing* legacy
 path in `open_fw/src/bt_hci.c` (branch `feat/freertos-bluedroid`), plus facts recovered by static disassembly of
 `dumps/bootrom_384K.bin` (llvm-objdump, Thumb-2) while writing this document. Nothing here has been newly measured

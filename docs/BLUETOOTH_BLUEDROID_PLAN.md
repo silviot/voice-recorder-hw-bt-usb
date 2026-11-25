@@ -947,6 +947,36 @@ secret of ~33 predictable bits: bench-only waiver, see the review-round entry be
   `exfat.c`, `bt_hci.c` ops table), bt 0x640E, hp 0xEDA7, hpb 0x1AA9, bench 0xD790; `test_bt_host` 2331, phone 1260,
   hp 84, headphones 201, gated 20 checks, 0 failures; sweeps 0 crash / hang / waived. The bthost gate was re-run on the
   home volume after the /tmp quota filled (link "Disk quota exceeded").
+- 2026-11-25 (step 9, `feat/bt-step9` from `integ/bt-all-local` `695b1f6`): **parity + default switch, legacy host
+  deleted.** Commit `7c76b77`: `BT ?= 1`; `BT=0` stays the supported no-Bluetooth image (CI builds it: no picolibc
+  there); `wasm` pinned to the no-BT configuration (`CORE_SRCS`); `test-qemu-rtos` passes `BT=0`. Next commit: the
+  legacy host is deleted (`src/bt_hci.c`, `src/bt_spp.c`, `include/openfw_bt_spp.h`). **Citations:** every `F:<line>`
+  / `bt_hci.c:<line>` (and `S:` / `bt_spp.c:<line>`) in this plan, `docs/BT_ROM_INTERFACE.md`, the other docs and the
+  code comments refers to those files at **`7c76b77`** (`git show 7c76b77:open_fw/src/bt_hci.c`). The ROM bring-up
+  `bt_rom_real.c` reused (LD / LC / LM layers, their hooks and RF callbacks, TX power / RSSI tables, `bt_memzero` /
+  `bt_memcpy`, `g_bt_heap`) moved verbatim to `bt_port/bt_rom_bringup.c` (+ `.h`; every function body checked
+  identical to F:120-183, 427-479, 490-540, 997-1030, 1109-1351), built in both ROM source sets of
+  `bt/Makefile.bluedroid` with `-ffreestanding -fno-builtin`; `sl6801_firm.ld` keeps its `.bss` in main SRAM, so
+  `g_bt_heap` stays where it was and the RTOS heaps are unchanged (`_srtos_heap0`/`_ertos_heap0` identical).
+  `bt_rom_real.c` owns RW-BT and IRQ 26 in every BT=1 image: the `!s_owner` legacy IRQ fallback is gone (a stray entry
+  while not owner is acked and counted as `irq_spurious`). BT=0 image: no Bluetooth code; `run_bt_xrec_mode` is
+  compiled only with phone mode (`OPENFW_BT_PHONE`: BT=1 non-probe, and the web emulator, whose `wasm_platform.c`
+  simulates `bt_xrec_*`), the Bluetooth tile shows the toast "No Bluetooth in this image" (TODO(i18n)), and the
+  experiment API passes NULL `bt_xrec_*` (`exp/exp_bt.c` checks). HCI probe image: diagnostic only, no phone mode; the
+  `HCIP RELEASE` line drops `legacy=allowed|refused` (`claimed` / `lockout` carry it; `tools/bt_probe_report.py` reads
+  both formats), QEMU expectations updated. `tests/test_core.c`: the SPP-simulator test (L2CAP / SDP / RFCOMM of the
+  deleted `bt_spp.c`) is gone; every XREC protocol case it carried (PING / PAIR incl. ERR,SAVE / CHAL / AUTH / RTC /
+  STAT / LS coalescing / DEL incl. BUSY and traversal / GET / GETS with credit stall, cached retry, EOF frame, small
+  MTU / PUT + OTA / EXP + RUN + LOG / CAS + PUTEND + SDIO failure / DSP / GAIN / CH / VOR / DFU / overlong line) now runs
+  over a simulated credit-flow link (`test_xrec_session`), with `test_xrec_flow_control` unchanged. Gates (both
+  commits, 0 warnings, all rc=0): ARM default / `BT=0` / `BT=1 BENCH=1 HP_GATES=1` / `BT=1 HCI_PROBE=1` / `DEV_EXP=1`;
+  test-host, test-host-san, test-bt-port, test-bt-xrec, test-bt-ctrl, test-bt-hp, test-bt-host (2331 / phone 1260 /
+  hp 84 / headphones 228 / gated 20 checks, sweeps 0 crash / hang / waived); QEMU test-qemu, test-qemu-rtos,
+  test-qemu-bt, test-qemu-hciprobe, test-qemu-hciprobe-full (RTOS self-test 0x7fff); wasm. FIRM CRC: `7c76b77` default
+  (BT=1) **0x1C51** (= the old BT=1 image), BT=0 0x568B (unchanged), bench 0x5673, dev-exp 0x642C; after the deletion
+  default **0x226E**, BT=0 **0x5D32**, bench **0x815D**, dev-exp 0x343A. Not on silicon yet: the deletion moves code
+  (bring-up in `libbt_port.a`, IRQ fallback gone) but no behaviour; a phone + headphones smoke run on the new default
+  image is the remaining check.
 
 ## 11. Round-1 traceability
 

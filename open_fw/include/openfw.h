@@ -331,12 +331,13 @@ void     bt_rf_init(uint32_t freq_drift, uint32_t vco_cal_10a4);
 void     bt_modem_init(uint32_t clk6_hz);
 uint32_t bt_rf_init_calibrated(uint32_t freq_drift, uint32_t clk6_hz);
 
-/* Classic BR/EDR Bluetooth Controller + SPP + +XREC v5 Service (bt_hci.c) */
+/* Classic BR/EDR Bluetooth phone mode: SPP + +XREC v5 service (BT=1: bt_port/bt_xrec_bluedroid.c; web emulator:
+ * wasm/wasm_platform.c). Not linked in BT=0 or HCI probe images. */
 typedef struct {
     uint8_t  active;
     uint8_t  hci_ready;
-    uint8_t  acl_connected;   /* bt_hci.c: an ACL link is up. Bluedroid port: the screen's "connected" (a link the
-                                * host is disconnecting, 0406 sent, is not counted: bt_xrec_debug_t acl_closing) */
+    uint8_t  acl_connected;   /* the screen's "connected": an ACL link is up (a link the host is disconnecting, 0406
+                                * sent, is not counted: bt_xrec_debug_t acl_closing) */
     uint8_t  spp_open;
     uint8_t  xrec_bound;
     uint8_t  xrec_auth;

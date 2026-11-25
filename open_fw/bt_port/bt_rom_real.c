@@ -1,12 +1,12 @@
 /* bt_rom_real: the real bt_rom_if_t over the SL6801 RW-BT mask-ROM controller (plan M1; interface map
- * docs/BT_ROM_INTERFACE.md §2-§10). Ported from the legacy glue that runs on silicon today; every block cites the
- * legacy lines it mirrors (F: = src/bt_hci.c, R: = src/bt_rf.c, M: = src/main.c, line numbers of this tree).
+ * docs/BT_ROM_INTERFACE.md §2-§10). Ported from the legacy glue that ran on silicon before Bluedroid; every block cites
+ * the legacy lines it mirrors (F: = src/bt_hci.c at 7c76b77, the last commit before that file was deleted in plan
+ * step 9; R: = src/bt_rf.c, M: = src/main.c, line numbers of that tree).
  *
  * Reused, not re-derived: RF calibration (R:632 bt_rf_init_calibrated, called with the legacy arguments of M:1275)
- * and the LD / LC / LM bring-up (F:1109 rwbt_init_ld_layer, F:1289 rwbt_init_lc_layer, F:1313 rwbt_init_lm_layer,
- * exported by wrappers at the end of bt_hci.c only in the probe build) run the exact legacy code. g_bt_heap is the
- * legacy 8 KiB heap (bt_hci.c), shared because the two paths never own the controller at the same time: main.c refuses
- * legacy BT mode while bt_rom_real_busy() (from the first rf_calibrate()/start() until a stop() that completed).
+ * and the LD / LC / LM bring-up (F:1109 rwbt_init_ld_layer, F:1289 rwbt_init_lc_layer, F:1313 rwbt_init_lm_layer)
+ * run the exact legacy code, moved verbatim to bt_rom_bringup.c, which also holds g_bt_heap (the legacy 8 KiB ROM
+ * heap). bt_rom_real owns the RW-BT controller and IRQ 26 in every BT=1 image (phone / headphones and HCI probe).
  *
  * Own (bt_ctrl needs different behaviour, BT_ROM_INTERFACE §10 notes):
  *   - kernel hooks (F:1048-1079): own nested PRIMASK lock with a readable depth (plan §3 rule (e)), malloc/free with
@@ -30,18 +30,12 @@
 #include "bt_rom_real.h"
 #include "bt_rom_rng.h"
 
-/* ---- legacy symbols reused (bt_hci.c exports them, from its end, only with OPENFW_HCI_PROBE=1; bt_rf.c always) ---- */
-extern uint32_t *const bt_hci_shared_heap;                    /* = g_bt_heap, F:239, BT_HEAP_WORDS (F:233) words */
-void     bt_hci_shared_init_ld_layer(const uint8_t bd_addr[6]);   /* F:1109-1287 rwbt_init_ld_layer */
-void     bt_hci_shared_init_lc_layer(void);                   /* F:1289-1311 rwbt_init_lc_layer */
-void     bt_hci_shared_init_lm_layer(void);                   /* F:1313-1351 rwbt_init_lm_layer */
-void     bt_hci_legacy_irq_top(void);                         /* F:241-251 (legacy RWBT_IRQHandler, renamed) */
-#define  g_bt_heap  bt_hci_shared_heap
+/* ---- reused legacy code: the ROM bring-up and g_bt_heap (bt_rom_bringup.c, F:1109-1351 / F:239), RF (bt_rf.c) ---- */
+#include "bt_rom_bringup.h"
 uint32_t bt_rf_init_calibrated(uint32_t freq_drift, uint32_t clk6_hz);   /* R:632 */
 uint64_t us_timer_now(void);
 
-#define BT_HEAP_WORDS       2048u                             /* F:233 */
-#define BT_HEAP_BYTES       (BT_HEAP_WORDS * 4u)
+#define BT_HEAP_BYTES       (BT_HEAP_WORDS * 4u)              /* F:233 */
 _Static_assert(BT_HEAP_BYTES == BT_ROM_REAL_HEAP_BYTES, "bt_rom_real_msg_fits() uses the legacy heap size");
 
 #define TASK_HCI            0x3Cu                             /* F:19 */
@@ -137,7 +131,7 @@ static bt_rom_upcalls_t   s_up;            /* copied at start(): a later incarna
 static volatile uint8_t   s_owner;
 /* 1 from the first rf_calibrate()/start() until a stop() whose soft reset completed. A bt_ctrl stuck (and demoted)
  * inside a ROM call, a hard-stopped one, a failed start() and a stop() timeout all leave it set: RW-BT state is then
- * unknown and the legacy path must stay off for the rest of the boot (bt_rom_real_busy()). */
+ * unknown for the rest of the boot (bt_rom_real_busy(); the HCI probe reports it). */
 static volatile uint8_t   s_claimed;
 static uint8_t            s_ipr_orig;      /* IPR[26] found at the first start(): the only value legacy has run with */
 static uint8_t            s_ipr_saved;
@@ -577,12 +571,16 @@ static void rr_init_hci_layer(void)                           /* F:1081-1107 */
     rom_ke_state_set(TASK_HCI, 0u);
 }
 
-/* ---- IRQ 26 top half (F:241-251 + counters). The single RWBT vector of the probe image. ---- */
+/* ---- IRQ 26 top half (F:241-251 + counters). The single RWBT vector of every BT=1 image. ---- */
 __attribute__((section(".fast_ramtext"), used))
 void RWBT_IRQHandler(void)
 {
-    if (!s_owner) {
-        bt_hci_legacy_irq_top();              /* legacy path owns RW-BT: unchanged behaviour */
+    if (!s_owner) {                           /* not started / stopped: IRQ 26 is masked; a stray entry is acked */
+        uint32_t st = RWBT_INTSTAT;
+        if (st != 0u) {
+            RWBT_INTACK = st;
+        }
+        s_d.irq_spurious++;
         return;
     }
     uint32_t stat = RWBT_INTSTAT;
@@ -666,9 +664,9 @@ static int rr_start(const uint8_t bd_addr[6], const bt_rom_upcalls_t *up)   /* F
     rr_heap_init();                                           /* F:1367 */
     rr_install_kernel_hooks();                                /* F:1368 (own hooks) */
     rr_init_hci_layer();                                      /* F:1369 (own TASK_HCI) */
-    bt_hci_shared_init_ld_layer(bd_addr);                     /* F:1370 legacy: hooks, constants, EM, RWBTEN */
-    bt_hci_shared_init_lc_layer();                            /* F:1371 legacy */
-    bt_hci_shared_init_lm_layer();                            /* F:1372 legacy */
+    bt_rom_bringup_ld_layer(bd_addr);                         /* F:1370 legacy: hooks, constants, EM, RWBTEN */
+    bt_rom_bringup_lc_layer();                                /* F:1371 legacy */
+    bt_rom_bringup_lm_layer();                                /* F:1372 legacy */
     rr_install_p192();                                        /* BT_ROM_INTERFACE §2.3: replace the fixed pair */
 
     RWBT_TIMING      = (RWBT_TIMING & 0x8000F000u) | 0x1B460846u;   /* F:1374-1375 */

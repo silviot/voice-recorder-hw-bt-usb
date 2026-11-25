@@ -3,6 +3,8 @@
  * Runs calibrated RF init, starts BT controller + +XREC service, opens 60 s
  * pairing window, polls for `arg` seconds (default 8 s), and logs HCI ready
  * state, RWBT IRQ count, ACL connections, SPP state, and BD_ADDR.
+ * Needs an image with phone mode (default BT=1): BT=0 and HCI probe images
+ * pass NULL bt_xrec_* entries, and the experiment returns 0xFFFFFFFF.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -13,6 +15,10 @@ uint32_t exp_main(const openfw_exp_api_t *api, uint32_t arg)
 {
     uint32_t secs = (arg >= 1u && arg <= 60u) ? arg : 8u;
     api->wdt_feed();
+    if (!api->bt_xrec_start) {
+        api->log_puts("[exp_bt] no phone mode in this image\n");
+        return 0xFFFFFFFFu;
+    }
 
     uint32_t cal = api->bt_rf_init_calibrated(0x53u, 32000000u);
     api->wdt_feed();

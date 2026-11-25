@@ -1,7 +1,7 @@
 /* bt_xrec_bluedroid: phone-mode XREC session over Bluedroid SPP for BT=1 (see bt_xrec_bluedroid.h).
  *
- * Legacy mapping (F: = src/bt_hci.c, S: = src/bt_spp.c, line numbers of this tree; the legacy path drives the same ROM
- * on silicon today and is the reference for names, ids and behaviour):
+ * Legacy mapping (F: = src/bt_hci.c, S: = src/bt_spp.c, both at 7c76b77, the last commit before their deletion in plan
+ * step 9; the legacy path drove the same ROM on silicon and is the reference for names, ids and behaviour):
  *   - Device name "Cassini_" + hex(bd_addr[0]) (F:2005-2012); BD_ADDR from eFuse (F:1990-2003, without the legacy
  *     timer-derived fallback: plan M1 "never timer-derived"; see bt_xrec_plat_identity).
  *   - Class of device 0x200404 (F:1550), SPP server on RFCOMM channel 1 named "Cassini" with an SDP record for

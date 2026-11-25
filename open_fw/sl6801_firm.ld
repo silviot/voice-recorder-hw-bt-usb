@@ -99,6 +99,8 @@ SECTIONS
     .bss (NOLOAD) : ALIGN(4) {
         _sbss = .;
         *(EXCLUDE_FILE(*libbluedroid.a:* *libbt_port.a:* *libc.a:* *libclang_rt_min.a:*) .bss .bss.* COMMON)
+        /* BT=1: the RW-BT ROM heap g_bt_heap (bt_port/bt_rom_bringup.c) stays here, where the legacy bt_hci.c had it */
+        *libbt_port.a:bt_rom_bringup.o(.bss .bss.* COMMON)
         . = ALIGN(4);
         _ebss = .;
     } > SRAM

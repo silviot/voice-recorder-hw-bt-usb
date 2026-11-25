@@ -58,14 +58,18 @@ FW_PORT_SRCS := $(ROOT)/bt_port/bt_port_fw_stubs.c $(ROOT)/bt_port/bt_port_glue.
 HP_PURE_SRCS := $(ROOT)/bt_port/hp_sink.c $(ROOT)/bt_port/hp_tx.c $(ROOT)/bt_port/hp_selftest.c
 FW_PORT_SRCS += $(HP_PURE_SRCS) $(ROOT)/bt_port/hp_sbc.c $(ROOT)/bt_port/hp_tx_bd.c
 $(patsubst $(ROOT)/%.c,$(BUILD_DIR)/%.o,$(HP_PURE_SRCS)): CFLAGS += -Wextra
+# RW-BT ROM bring-up moved verbatim from the deleted legacy src/bt_hci.c (plan step 9): built like the firmware's own
+# sources (freestanding, no builtins: its copy loops stay loops); its .bss (g_bt_heap) stays in main SRAM (sl6801_firm.ld).
+ROM_BRINGUP_SRC := $(ROOT)/bt_port/bt_rom_bringup.c
+$(BUILD_DIR)/bt_port/bt_rom_bringup.o: CFLAGS += -ffreestanding -fno-builtin
 # HCI probe image (make BT=1 HCI_PROBE=1, plan M5 Exp 1 stage A): real ROM interface, bt_ctrl FreeRTOS glue, probe.
-PROBE_SRCS := $(ROOT)/bt_port/bt_rom_real.c $(ROOT)/bt_port/bt_ctrl_rtos.c $(ROOT)/bt_port/hci_probe.c \
+PROBE_SRCS := $(ROOT)/bt_port/bt_rom_real.c $(ROM_BRINGUP_SRC) $(ROOT)/bt_port/bt_ctrl_rtos.c $(ROOT)/bt_port/hci_probe.c \
               $(ROOT)/bt_port/hci_probe_trigger.c
 PROBE_OBJS := $(patsubst $(ROOT)/%.c,$(BUILD_DIR)/%.o,$(PROBE_SRCS))
 # Bluedroid phone mode (every other BT=1 image, plan M4): the same ROM interface and bt_ctrl glue, plus the XREC session
-# (bt_xrec_bluedroid.c provides the bt_xrec_* API; open_fw/Makefile renames the legacy ones in bt_hci.c).
+# (bt_xrec_bluedroid.c provides the bt_xrec_* API).
 # bt_xrec_spp_mtu.c and bt_xrec_bond.c include Bluedroid internals, so it gets the vendored-code warning set only.
-XREC_SRCS := $(ROOT)/bt_port/bt_rom_real.c $(ROOT)/bt_port/bt_ctrl_rtos.c $(ROOT)/bt_port/bt_xrec_bluedroid.c \
+XREC_SRCS := $(ROOT)/bt_port/bt_rom_real.c $(ROM_BRINGUP_SRC) $(ROOT)/bt_port/bt_ctrl_rtos.c $(ROOT)/bt_port/bt_xrec_bluedroid.c \
              $(ROOT)/bt_port/bt_xrec_fw.c $(ROOT)/bt_port/bt_hp_bluedroid.c $(ROOT)/bt_port/bt_task_sup.c
 # Unattended bench runs from SD:/BTBENCH.RUN (bt_port/bt_bench.h; hooks in src/main.c run_bt_xrec_mode): bench images
 # only (make BT=1 BENCH=1, which also compiles the session's autoconfirm / fixed-PIN overrides in). The stamp rebuilds
