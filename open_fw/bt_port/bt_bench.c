@@ -314,11 +314,12 @@ static int rec_rules(uint64_t seen, const bt_bench_cfg_t *c)
     if (!c->rec) {
         return (seen & rec_settings) != 0u ? -1 : 0;   /* recording settings without a recording */
     }
-    if ((uint32_t)c->delay_s >= (uint32_t)c->secs) {
-        return -1;                                       /* the recording could never start */
+    /* the pre-roll starts at READY, not at t0: leave the bring-up's allowance on top */
+    if ((uint32_t)c->delay_s + BT_BENCH_REC_READY_S >= (uint32_t)c->secs) {
+        return -1;                                       /* the recording would not start */
     }
-    if (c->rec_secs != 0u && (uint32_t)c->delay_s + c->rec_secs > (uint32_t)c->secs) {
-        return -1;                                       /* it could never reach its length */
+    if (c->rec_secs != 0u && (uint32_t)c->delay_s + c->rec_secs + BT_BENCH_REC_READY_S > (uint32_t)c->secs) {
+        return -1;                                       /* it would not reach its length */
     }
     return 0;
 }
@@ -621,6 +622,10 @@ const char *bt_bench_rec_why_name(uint8_t why)
         return "nostart";
     case BT_BENCH_REC_WHY_NOTSTARTED:
         return "notstarted";
+    case BT_BENCH_REC_WHY_FAULT:
+        return "fault";
+    case BT_BENCH_REC_WHY_LEFT:
+        return "left";
     default:
         return "?";
     }
@@ -695,6 +700,33 @@ uint32_t bt_bench_rec_cut(bt_bench_rec_t *r, int saving)
     default:
         return 0u;
     }
+}
+
+uint32_t bt_bench_rec_fault(bt_bench_rec_t *r, int saving)
+{
+    switch (r->st) {
+    case BT_BENCH_REC_PREROLL:
+        rec_done(r, BT_BENCH_REC_WHY_FAULT);
+        return 0u;
+    case BT_BENCH_REC_ON:
+        if (!saving) {
+            rec_done(r, r->seen ? BT_BENCH_REC_WHY_ENDED : BT_BENCH_REC_WHY_NOSTART);
+            return 0u;
+        }
+        rec_done(r, BT_BENCH_REC_WHY_FAULT);
+        return BT_BENCH_REC_ACT_STOP;
+    default:
+        return bt_bench_rec_cut(r, saving);
+    }
+}
+
+uint32_t bt_bench_rec_leave(bt_bench_rec_t *r, int saving, int rec_error)
+{
+    if (r->st == BT_BENCH_REC_ON && !saving && r->seen && !rec_error) {
+        rec_done(r, BT_BENCH_REC_WHY_LEFT);
+        return 0u;
+    }
+    return bt_bench_rec_cut(r, saving);
 }
 
 const char *bt_bench_trig_name(bt_bench_trig_t t)

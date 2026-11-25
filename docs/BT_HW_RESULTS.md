@@ -673,8 +673,8 @@ consumed): `BENCH OFF trig=bad_content err=key|value|dup|conflict|char at=<byte 
 | `reboot` | 0/1 (0) | after BT mode and `BTBENCH.LOG`: `sd_flush` + reboot |
 | `mode` | `phone`/`hp`/`rec` (`phone`) | `hp`: the headphones run (keys in `bt_bench.h`); `rec`: a recording **without Bluetooth** (below) |
 | `rec` | 0/1 (0) | phone mode only: record during the run (below) |
-| `rec_secs` | 0 or 10..3600 (0) | `rec=1`: recording length; 0 = until the run ends. `delay_s + rec_secs <= secs` |
-| `delay_s` | 0..600 (0) | pre-roll before the recording starts (`mode=rec`: from the boot hook; `rec=1`: from READY, and `< secs`) |
+| `rec_secs` | 0 or 10..3600 (0) | `rec=1`: recording length; 0 = until the run ends. `delay_s + rec_secs + 15 <= secs` (15 s for the bring-up before READY) |
+| `delay_s` | 0..600 (0) | pre-roll before the recording starts (`mode=rec`: from the boot hook; `rec=1`: from READY, and `delay_s + 15 < secs`) |
 | `rec_ch` / `rec_gain` / `rec_dsp` / `rec_vor` | 1-2 / 0..31 / 0..2 / 0-1 (the current settings) | this recording only, restored afterwards, never saved (`mode=rec` or `rec=1`) |
 
 **Recording runs** (for the M2/M3 recipe below; the REC switch is not touched):
@@ -691,14 +691,23 @@ consumed): `BENCH OFF trig=bad_content err=key|value|dup|conflict|char at=<byte 
   The recording starts `delay_s` after the session is **READY** (SPP listening; not at t=0, so the bring-up, mic
   entropy collection and RF calibration are never inside it), through `recorder_start()` / `recorder_stop()` as
   `+XREC:RECSTART` / `RECSTOP` do, and stops after `rec_secs` or at `secs`, whichever comes first, **before** BT mode is
-  left. A session that faults before READY records nothing (`BENCH recrun done why=notstarted`). The BT loop's
+  left. The parser keeps 15 s (`BT_BENCH_REC_READY_S`) for the bring-up on top of `delay_s` (+ `rec_secs`) within
+  `secs`, since the pre-roll starts at READY, not at t=0; READY usually comes 2-5 s in (up to ~12 s), so a request
+  inside that rule records its full length unless the bring-up is unusually slow (then `why=cut`, shorter: check
+  `secs=` of `BENCH recrun stop`). A session that faults before READY records nothing (`BENCH recrun done
+  why=notstarted`); one that faults after READY stops the recording (or never starts it) with `why=fault` and a
+  `BENCH recrun fault st=<state> rec_st=<schedule state>` line before it: that capture had no radio, reject it. A
+  recording that ends by itself (write error, storage full: `why=ended`) is stopped at once (`recrun done ... rc=`), so
+  capture does not keep running and its counters line is logged. Leaving BT mode early (BACK, REC slide) stops the
+  recording there: `why=left`. The BT loop's
   settings sync is skipped while `rec_*` are applied (a laptop `+XREC` settings change during that time is lost).
   `mode=hp` refuses `rec`, `rec_secs`, `delay_s` and `rec_*`; in phone mode they need `rec=1`.
 - Log: `BENCH start mode=rec secs= delay_s= rec_ch=cur|N ... bt=off` (phone: an extra `BENCH start+ rec=1 rec_secs=
   delay_s= rec_*= gate=ready`) · `BENCH recrun gate st=ready t_ms= delay_s=` (phone) · `BENCH recrun cfg ch= gain=
   dsp= vor= src=request|user` · `BENCH recrun start t= [name=REC_NNNN.wav rc=OK|FAIL | via=rec_switch_path]` · the
   recorder's own `BENCH rec seq= file= ...` counters line at the stop · `BENCH recrun stop why=time|cut secs=` /
-  `BENCH recrun done why=time|cut|ended|nostart|notstarted` · `BENCH recrun cfg_restored ...` · `BENCH end mode=..
+  `BENCH recrun done why=time|cut|ended|nostart|notstarted|fault|left [rc=OK|FAIL]` · (phone) `BENCH recrun fault st=
+  rec_st= t=` · `BENCH recrun cfg_restored ...` · `BENCH end mode=..
   rec=<why>`; the `BTBENCH.LOG` trailer has `BENCH final rec i=0 <counters>` of that recording. The run's own lines
   never carry `file=` (they would look like counter lines to `rf_audio_check.py --bench-log`). `mode=rec` runs no
   CPU window (the 1 s window is a BT-run measurement), so `idle_min_pm` / `cpu_n` stay `-` / 0 there, as in a
@@ -1333,25 +1342,39 @@ boot with a `mode=rec` request, so the radio has never been on in that boot by c
 the request's (the user's stay untouched). The cable stays in (keep it in for every capture of the block, C1-C3
 included: VBUS charging is then a constant of the block, state it with the result):
 ```bash
-c0() {   # one C0 capture: request, reboot, wait for USB disk mode, save the ring and the run's log
-  udisksctl mount -b /dev/sda1 && printf 'mode=rec secs=75 delay_s=5 rec_ch=%s rec_gain=%s rec_dsp=2 rec_vor=0\n' \
-    $CH $G > $M/BTBENCH.RUN && sync && udisksctl unmount -b /dev/sda1
+brun() {   # one bench recording: $1 label, $2 wait (s), $3 request; fresh boot, then the ring and the run's log
+  rm -f $D/btbench_$1.log
+  { udisksctl mount -b /dev/sda1 && rm -f $M/BTBENCH.LOG && printf '%s\n' "$3" > $M/BTBENCH.RUN && sync &&
+    udisksctl unmount -b /dev/sda1; } || { echo "$1: request not written (not in USB disk mode?): nothing run"; return 1; }
   sudo python3 tools/openfw_usb.py --reboot normal
-  sleep 100                                    # boot ~5 s + delay 5 s + 75 s + stop/Saved; USB disk mode after that
+  sleep $2                                     # the run, then USB disk mode again (cable in)
   sudo python3 tools/dev_cycle.py log > $D/ring_$1.log
-  udisksctl mount -b /dev/sda1 && cp $M/BTBENCH.LOG $D/btbench_$1.log && sync && udisksctl unmount -b /dev/sda1
-  grep -q 'BENCH end mode=rec .*rec=time' $D/btbench_$1.log || echo "C0 $1: not a clean run (see the log)"
+  udisksctl mount -b /dev/sda1 && cp $M/BTBENCH.LOG $D/btbench_$1.log; sync; udisksctl unmount -b /dev/sda1
+  [ -s $D/btbench_$1.log ] || { echo "$1: no BTBENCH.LOG: request not taken (BENCH OFF in ring_$1.log)"; return 1; }
+  f=$(grep -o 'file=REC_[0-9]*\.wav' $D/btbench_$1.log | head -n 1)
+  if [ -z "$f" ] || grep -qxF "$f" $D/files.txt 2>/dev/null; then echo "$1: no new recording (${f:-none})"; return 1; fi
+  echo "$f" >> $D/files.txt; echo "$1 $f" >> $D/labels.txt
+}
+c0() {   # one C0 capture: boot ~5 s + delay 5 s + 75 s + stop/Saved, then USB disk mode
+  brun $1 100 "mode=rec secs=75 delay_s=5 rec_ch=$CH rec_gain=$G rec_dsp=2 rec_vor=0" &&
+    { grep -q 'BENCH end mode=rec .*rec=time' $D/btbench_$1.log || echo "C0 $1: not a clean run (see the log)"; }
 }
 mkdir -p $D; c0 A1; c0 A2
 ```
-`ring_A1.log` / `btbench_A1.log` hold that capture's `BENCH rec` / `BENCH final rec i=0` line; `rf_audio_check.py
+`BTBENCH.LOG` is deleted together with writing the request, and nothing is rebooted when that fails, so a request
+that is not taken (bad key, SD not mounted at boot: only `BENCH OFF trig=..` in the ring) leaves no log rather than
+the previous capture's; `files.txt` catches a capture that names a file an earlier one already had.
+`ring_A1.log` / `btbench_A1.log` hold that capture's `BENCH rec` / `BENCH final rec i=0` line, `labels.txt` its
+file; `rf_audio_check.py
 --bench-log` takes either (pass all the files). Blocks C0b and D below can use `c0 C0b_1` ... and `c0 D1` the same
 way (C0b right after the BT session's boot: the radio was on in the previous boot, not in this one; a C0b that must
 follow BT mode **in the same boot** still needs the REC switch, see the confounds). The T blocks need someone for the
 speaker anyway, the REC switch steps stay valid for them.
 
 **B. One BT session: C1, C2, C3 (48 KiB/s cap) and C3 (full speed), x3 each in random order** (~20 min, user hands
-off). Agent, cable in, then the user unplugs once the BT screen shows:
+off). Agent, cable in, then the user unplugs once the BT screen shows (**if block A ran unattended with the cable
+in, the cable stays in here too**, and in C and D: the captures that are compared share one cable state, see
+below):
 ```bash
 sudo python3 tools/dev_cycle.py log > $D/ring_A.log                  # BENCH rec lines of the C0 captures
 udisksctl mount -b /dev/sda1 && printf 'secs=1500 exit=auto\n' > $M/BTBENCH.RUN && sync && udisksctl unmount -b /dev/sda1
@@ -1382,11 +1405,19 @@ the laptop's BlueZ from paging it: `bluetoothctl disconnect $MAC` before the reb
 in `BTBENCH.LOG`; a capture with `acl=1` during the recording is not a C1). **C3p** is the same request with a
 bonded phone in range whose app syncs by itself when it sees the device (the phone connects as a bonded peer; no
 pairing window, no `autoconfirm`): label it C3p, not C3c / C3f, since the phone's rate is its own (`gets_b` in the
-counters says how much moved). Each is one boot: reboot with the request as in `c0` above, `sleep 140`, then save the
-ring and `BTBENCH.LOG` the same way. The confound "C0 on Home, C1 on the BT screen" stays (the start method is now the
+counters says how much moved). Each is one boot, with `brun` from block A (cable in, as for the unattended C0s):
+```bash
+c1() {   # $1 label; laptop not paging the device (C1) or the phone in range (C3p)
+  brun $1 140 "secs=120 rec=1 rec_secs=75 delay_s=10 rec_ch=$CH rec_gain=$G rec_dsp=2 rec_vor=0" &&
+    { grep -q 'BENCH end mode=phone .*rec=time' $D/btbench_$1.log || echo "$1: not a clean run (see the log)"; }
+}
+bluetoothctl disconnect $MAC; c1 C1_1
+```
+A capture with `BENCH recrun fault` or `rec=fault` in its log had no radio during (part of) the recording: reject it. The confound "C0 on Home, C1 on the BT screen" stays (the start method is now the
 same `recorder_start()` for both, the screen is not).
 
-**C. After the BT session, radio off: C0b x3, then C5 x3** (user, ~12 min; skip C5 without a paired headset;
+**C. After the BT session, radio off: C0b x3, then C5 x3** (user, ~12 min; skip C5 without a paired headset; with
+an unattended block A the cable stays in for C0b and C5 as well, the agent saves the ring without replugging;
 unattended C0b: `c0 C0b_1` .. `c0 C0b_3` from block A, each a fresh boot after the BT session's boot):
 C0b: on Home, REC on 75 s / off, then cable in, the agent saves the ring (`sudo python3 tools/dev_cycle.py log >
 $D/ring_C0b_<n>.log`), cable out; three times (one `BENCH rec` line each, the 4 KiB ring cannot wrap). C5: Bluetooth
@@ -1412,8 +1443,11 @@ for f in A C0b_1 C0b_2 C0b_3 C5 D; do grep -h '^BENCH rec' $D/ring_$f.log; done 
   sed 's/.* file=\([^ ]*\) .*/\1/' | awk '!seen[$0]++'   # in time order (B's RECSTART files too: see plan.txt)
 ```
 Label the files from the order above (A: C0_1 C0_2; C: C0b_1..3, C5_1..3; D: C0_3) and `plan.txt` (B), then
-(unattended runs: the file of each capture is in its own `btbench_<label>.log`, `grep -o 'file=REC_[0-9]*.wav'`;
-add those logs as `--bench-log` too):
+(unattended runs: the file of each capture is in `labels.txt`, from its own `btbench_<label>.log`; add those logs as
+`--bench-log` too). **One cable state per block:** every capture compared in a block (the C0 baselines and C0b, C1-C3,
+C5) was recorded with the cable in, or every one with it out; a block that mixes them (e.g. unattended C0s with the
+cable in, then C1-C3 unplugged) compares charging against battery, so redo the odd ones out rather than analyse it.
+State the block's cable state with its result:
 ```bash
 B="--baseline C0_1=$D/REC_a.wav --baseline C0_2=$D/REC_b.wav --baseline C0_3=$D/REC_c.wav"
 python3 tools/rf_audio_check.py $B --capture C0b_1=$D/REC_d.wav ... --capture C3f_3=$D/REC_x.wav \

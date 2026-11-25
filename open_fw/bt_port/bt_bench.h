@@ -221,7 +221,12 @@ enum {
     BT_BENCH_REC_WHY_ENDED,         /* stopped by itself (write error, storage full, low battery, ...) */
     BT_BENCH_REC_WHY_NOSTART,       /* the start failed (no SD, low battery, recorder_start error) */
     BT_BENCH_REC_WHY_NOTSTARTED,    /* the run ended before the gate opened or the pre-roll was over */
+    BT_BENCH_REC_WHY_FAULT,         /* phone mode: the session faulted after READY (radio down: not a C1 / C3p) */
+    BT_BENCH_REC_WHY_LEFT,          /* phone mode: stopped because BT mode was left early (BACK, REC slide, ...) */
 };
+/* rec=1: READY comes a few seconds after the run starts (bring-up up to ~12 s): the parser asks for this much on top
+ * of delay_s (+ rec_secs) within secs, so a request's recording can start (and reach its length) as written. */
+#define BT_BENCH_REC_READY_S   15u
 
 typedef struct {
     uint32_t delay_ms;      /* pre-roll from the gate */
@@ -241,7 +246,13 @@ void bt_bench_rec_open(bt_bench_rec_t *r, uint32_t now);              /* GATE ->
 uint32_t bt_bench_rec_tick(bt_bench_rec_t *r, uint32_t now, int saving);
 /* The run ends: STOP if it is still recording; DONE in every case. */
 uint32_t bt_bench_rec_cut(bt_bench_rec_t *r, int saving);
-const char *bt_bench_rec_why_name(uint8_t why);  /* -, time, cut, ended, nostart, notstarted */
+/* Phone mode, the session faulted after READY: STOP if it is still recording (why fault); a pre-roll never starts
+ * (why fault); DONE in every case. The gate (before READY) is bt_bench_rec_cut()'s notstarted. */
+uint32_t bt_bench_rec_fault(bt_bench_rec_t *r, int saving);
+/* After BT mode was left (bt_bench_end()): as bt_bench_rec_cut(), except that a recording seen saving that is no
+ * longer saving without a recorder error was stopped by leaving BT mode (why left), not by itself (ended). */
+uint32_t bt_bench_rec_leave(bt_bench_rec_t *r, int saving, int rec_error);
+const char *bt_bench_rec_why_name(uint8_t why);  /* -, time, cut, ended, nostart, notstarted, fault, left */
 const char *bt_bench_mode_name(uint8_t mode);    /* phone, hp, rec */
 
 /* ---- log capture: copies what the g_openfw_log ring received since the last drain into buf ---- */
@@ -282,7 +293,6 @@ void bt_bench_hp_finish(uint8_t out_mode);              /* tone off, the user's 
 #define BT_BENCH_HOME_HOLD 0x1
 #define BT_BENCH_HOME_DONE 0x2
 int  bt_bench_home_tick(uint32_t now_ms, int saving);
-int  bt_bench_home_active(void);                        /* mode=rec run not ended: hold USB disk mode off */
 /* REC-switch path (mode=rec), right after apply_cfg_to_recorder(): the run's rec_* settings (no-op otherwise). */
 void bt_bench_rec_apply(void);
 /* rec_* settings applied (phone mode: skip the settings sync, they must not be saved). */

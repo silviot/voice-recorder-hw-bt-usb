@@ -562,15 +562,22 @@ static void test_parse_rec(void)
     CHECK(parse("mode=phone rec=1", &c, NULL) == BT_BENCH_OK && c.rec == 1u && c.rec_secs == 0u,
           "rec=1: until the run ends");
     CHECK(parse("rec=0", &c, NULL) == BT_BENCH_OK && c.rec == 0u, "rec=0 alone");
-    CHECK(parse("secs=85 rec=1 rec_secs=75 delay_s=10", &c, NULL) == BT_BENCH_OK, "delay + length = secs");
+    CHECK(parse("secs=100 rec=1 rec_secs=75 delay_s=10", &c, NULL) == BT_BENCH_OK,
+          "delay + length + READY allowance = secs");
+    CHECK(parse("secs=99 rec=1 rec_secs=75 delay_s=10", &c, NULL) == BT_BENCH_E_CONFLICT,
+          "no room for the bring-up before READY: it would be cut short");
+    CHECK(parse("secs=85 rec=1 rec_secs=75 delay_s=10", &c, NULL) == BT_BENCH_E_CONFLICT,
+          "delay + length = secs: the pre-roll starts at READY, after t0");
+    CHECK(BT_BENCH_REC_READY_S == 15u, "READY allowance");
     CHECK(parse("secs=600 pair=1 autoconfirm=1 rec=1 rec_secs=3600", &c, NULL) == BT_BENCH_E_CONFLICT,
           "rec_secs longer than the run");
-    CHECK(parse("secs=3600 pair=1 autoconfirm=1 rec=1 rec_secs=3600", &c, NULL) == BT_BENCH_OK && c.pair == 1u,
+    CHECK(parse("secs=3600 pair=1 autoconfirm=1 rec=1 rec_secs=3585", &c, NULL) == BT_BENCH_OK && c.pair == 1u,
           "pairing keys with rec=1 (C3p: a phone pairs or syncs during the recording)");
-    CHECK(parse("secs=60 rec=1 delay_s=59", &c, NULL) == BT_BENCH_OK, "delay just inside the run");
+    CHECK(parse("secs=60 rec=1 delay_s=44", &c, NULL) == BT_BENCH_OK, "delay just inside the run");
+    CHECK(parse("secs=3600 rec=1 rec_secs=3600", &c, NULL) == BT_BENCH_E_CONFLICT, "rec_secs = secs: no READY room");
     /* the longest recording request fits the file limit */
     const char *lng = "mode=phone secs=3600 pair=1 pair_every=600 pair_secs=600 autoconfirm=1 xrec_pin=000000 "
-                      "exit=auto reboot=1 rec=1 rec_secs=3000 rec_ch=2 rec_gain=31 rec_dsp=2 rec_vor=0 delay_s=600";
+                      "exit=auto reboot=1 rec=1 rec_secs=2985 rec_ch=2 rec_gain=31 rec_dsp=2 rec_vor=0 delay_s=600";
     CHECK(strlen(lng) < BT_BENCH_TRIGGER_MAX && parse(lng, &c, &at) == BT_BENCH_OK, "long rec request (at %u)", at);
 
     static const struct { const char *s; bt_bench_err_t e; } bad[] = {
@@ -595,6 +602,7 @@ static void test_parse_rec(void)
         { "rec_vor=0", BT_BENCH_E_CONFLICT },
         { "rec_dsp=2", BT_BENCH_E_CONFLICT },
         { "secs=60 rec=1 delay_s=60", BT_BENCH_E_CONFLICT },         /* never starts */
+        { "secs=60 rec=1 delay_s=45", BT_BENCH_E_CONFLICT },         /* starts only if READY comes at once */
         { "secs=80 rec=1 rec_secs=75 delay_s=10", BT_BENCH_E_CONFLICT },
         { "rec=2", BT_BENCH_E_VALUE },
         { "rec=yes", BT_BENCH_E_VALUE },
@@ -688,6 +696,48 @@ static void rec_sched_case(uint32_t t0)
     bt_bench_rec_init(&r, 0u, 0u, 0, t0);
     (void)bt_bench_rec_tick(&r, t0, 0);
     CHECK(bt_bench_rec_cut(&r, 0) == 0u && r.why == BT_BENCH_REC_WHY_NOSTART, "cut right after a failed start");
+    /* phone mode, the session faults after READY: in the pre-roll (never starts), while recording (STOP), after
+     * the recorder stopped by itself (no STOP), before READY (the gate: notstarted, as a cut) */
+    bt_bench_rec_init(&r, 10u, 75u, 1, t0);
+    bt_bench_rec_open(&r, t0 + 5000u);
+    CHECK(bt_bench_rec_fault(&r, 0) == 0u && r.st == BT_BENCH_REC_DONE && r.why == BT_BENCH_REC_WHY_FAULT,
+          "fault in the pre-roll");
+    CHECK(bt_bench_rec_tick(&r, t0 + 60000u, 0) == 0u && r.why == BT_BENCH_REC_WHY_FAULT, "no start after a fault");
+    bt_bench_rec_init(&r, 0u, 75u, 1, t0);
+    bt_bench_rec_open(&r, t0);
+    (void)bt_bench_rec_tick(&r, t0, 0);
+    (void)bt_bench_rec_tick(&r, t0 + 1000u, 1);
+    CHECK(bt_bench_rec_fault(&r, 1) == BT_BENCH_REC_ACT_STOP && r.why == BT_BENCH_REC_WHY_FAULT, "fault recording");
+    CHECK(bt_bench_rec_fault(&r, 1) == 0u && r.why == BT_BENCH_REC_WHY_FAULT, "fault after done: nothing");
+    bt_bench_rec_init(&r, 0u, 75u, 1, t0);
+    bt_bench_rec_open(&r, t0);
+    (void)bt_bench_rec_tick(&r, t0, 0);
+    (void)bt_bench_rec_tick(&r, t0 + 1000u, 1);
+    CHECK(bt_bench_rec_fault(&r, 0) == 0u && r.why == BT_BENCH_REC_WHY_ENDED, "fault after it ended by itself");
+    bt_bench_rec_init(&r, 0u, 75u, 1, t0);
+    CHECK(bt_bench_rec_fault(&r, 0) == 0u && r.why == BT_BENCH_REC_WHY_NOTSTARTED, "fault before READY");
+    /* BT mode left early (bt_bench_end): stopped by leaving (left), by itself (error: ended), still saving (cut) */
+    bt_bench_rec_init(&r, 0u, 75u, 1, t0);
+    bt_bench_rec_open(&r, t0);
+    (void)bt_bench_rec_tick(&r, t0, 0);
+    (void)bt_bench_rec_tick(&r, t0 + 1000u, 1);
+    CHECK(bt_bench_rec_leave(&r, 0, 0) == 0u && r.why == BT_BENCH_REC_WHY_LEFT, "left by BACK / REC slide");
+    bt_bench_rec_init(&r, 0u, 75u, 1, t0);
+    bt_bench_rec_open(&r, t0);
+    (void)bt_bench_rec_tick(&r, t0, 0);
+    (void)bt_bench_rec_tick(&r, t0 + 1000u, 1);
+    CHECK(bt_bench_rec_leave(&r, 0, 1) == 0u && r.why == BT_BENCH_REC_WHY_ENDED, "left after a write error");
+    bt_bench_rec_init(&r, 0u, 75u, 1, t0);
+    bt_bench_rec_open(&r, t0);
+    (void)bt_bench_rec_tick(&r, t0, 0);
+    (void)bt_bench_rec_tick(&r, t0 + 1000u, 1);
+    CHECK(bt_bench_rec_leave(&r, 1, 0) == BT_BENCH_REC_ACT_STOP && r.why == BT_BENCH_REC_WHY_CUT, "still saving");
+    bt_bench_rec_init(&r, 0u, 75u, 1, t0);
+    bt_bench_rec_open(&r, t0);
+    (void)bt_bench_rec_tick(&r, t0, 0);
+    CHECK(bt_bench_rec_leave(&r, 0, 0) == 0u && r.why == BT_BENCH_REC_WHY_NOSTART, "never seen saving: nostart");
+    bt_bench_rec_init(&r, 10u, 75u, 1, t0);
+    CHECK(bt_bench_rec_leave(&r, 0, 0) == 0u && r.why == BT_BENCH_REC_WHY_NOTSTARTED, "left before READY");
     /* a late tick: start once, then the length counts from the start */
     bt_bench_rec_init(&r, 5u, 10u, 0, t0);
     CHECK(bt_bench_rec_tick(&r, t0 + 60000u, 0) == BT_BENCH_REC_ACT_START, "late start");
@@ -704,6 +754,8 @@ static void test_rec_schedule(void)
           strcmp(bt_bench_rec_why_name(BT_BENCH_REC_WHY_ENDED), "ended") == 0 &&
           strcmp(bt_bench_rec_why_name(BT_BENCH_REC_WHY_NOSTART), "nostart") == 0 &&
           strcmp(bt_bench_rec_why_name(BT_BENCH_REC_WHY_NOTSTARTED), "notstarted") == 0 &&
+          strcmp(bt_bench_rec_why_name(BT_BENCH_REC_WHY_FAULT), "fault") == 0 &&
+          strcmp(bt_bench_rec_why_name(BT_BENCH_REC_WHY_LEFT), "left") == 0 &&
           strcmp(bt_bench_rec_why_name(BT_BENCH_REC_WHY_NONE), "-") == 0, "why names");
 }
 

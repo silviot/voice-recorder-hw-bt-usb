@@ -41,6 +41,7 @@ static int s_sd;
 static uint8_t s_rec_run;        /* this run records */
 static uint8_t s_home;           /* mode=rec: the home loop drives the recording, not ended yet */
 static uint8_t s_cfg_held;       /* the request's rec_* settings are applied; s_user_* restore them */
+static uint8_t s_rec_ours;       /* phone mode: this run's recorder_start() succeeded (the recording is the run's) */
 static uint8_t s_user_ch, s_user_gain, s_user_dsp, s_user_vor;
 
 /* Bench SSP auto-confirm override: provided by the phone-mode confirm UI (bt_xrec_bluedroid.c). This weak no-op
@@ -434,6 +435,7 @@ static void phone_rec_act(uint32_t a, uint8_t prev_st, uint32_t now)
             (void)recorder_stop();                    /* as dev_rec_start: a start that is not saving is undone */
             rc = -1;
         }
+        s_rec_ours = (uint8_t)(rc == 0);
         lbegin("recrun start");
         lku("t", (now - s_run.t0) / 1000u);
         lks("name", rc == 0 ? recorder_get_filename() : "-");   /* not file=: rf_audio_check's counter lines */
@@ -453,7 +455,16 @@ static void phone_rec_act(uint32_t a, uint8_t prev_st, uint32_t now)
         lbegin("recrun done");
         lks("why", bt_bench_rec_why_name(s_rec.why));
         lku("t", (now - s_run.t0) / 1000u);
+        if (s_rec_ours) {
+            /* Ended by itself (write error, storage full): the recorder stopped saving but capture still runs
+             * (recorder.c leaves it active until recorder_stop(), as the home loop does on recorder_has_error()).
+             * No-op when it is no longer active. Logs the recorder's counters line. */
+            lks("rc", recorder_stop() == 0 ? "OK" : "FAIL");
+        }
         lemit();
+    }
+    if (s_rec.st == BT_BENCH_REC_DONE) {
+        s_rec_ours = 0u;
     }
     if (s_rec.st == BT_BENCH_REC_DONE) {
         rec_cfg_restore();
@@ -479,6 +490,19 @@ static void phone_rec_tick(uint32_t now)
             phone_rec_act(bt_bench_rec_cut(&s_rec, recorder_is_saving()), prev, now);   /* no C1 without a radio */
             return;
         }
+    } else {
+        /* after READY: a session that faults during the pre-roll or the recording leaves the radio down, so the
+         * capture would be a C0 on the BT screen, not a C1 / C3p: stop it and mark it why=fault */
+        bt_xrec_get_debug(&s_dbg);
+        if (s_dbg.state == BT_XREC_ST_FAULTED || s_dbg.state == BT_XREC_ST_DEAD) {
+            lbegin("recrun fault");
+            lku("st", (uint32_t)s_dbg.state);
+            lku("rec_st", prev);
+            lku("t", (now - s_run.t0) / 1000u);
+            lemit();
+            phone_rec_act(bt_bench_rec_fault(&s_rec, recorder_is_saving()), prev, now);
+            return;
+        }
     }
     phone_rec_act(bt_bench_rec_tick(&s_rec, now, recorder_is_saving()), prev, now);
 }
@@ -493,11 +517,6 @@ void bt_bench_rec_apply(void)
     if (s_home && s_rec.st == BT_BENCH_REC_ON) {
         rec_cfg_apply();
     }
-}
-
-int bt_bench_home_active(void)
-{
-    return s_home;
 }
 
 /* mode=rec, every home-loop pass before the REC switch is read. */
@@ -1069,6 +1088,7 @@ int bt_bench_boot(exfat_vol_t *vol, int sd_mounted)
     s_rec_run = (uint8_t)(s_cfg.mode == BT_BENCH_MODE_REC || s_cfg.rec);
     s_home = 0u;
     s_cfg_held = 0u;
+    s_rec_ours = 0u;
     s_rec.st = BT_BENCH_REC_DONE;
     s_rec.why = BT_BENCH_REC_WHY_NONE;
     if (s_cfg.mode == BT_BENCH_MODE_REC) {
@@ -1231,17 +1251,19 @@ int bt_bench_end(exfat_vol_t *vol, int sd_mounted)
     }
     uint32_t el = millis() - s_run.t0;
     if (s_rec_run && s_rec.st != BT_BENCH_REC_DONE) {
-        /* phone mode left early (BACK, REC slide, low battery): run_bt_xrec_mode() already stopped a recording */
+        /* phone mode left early (BACK, REC slide, low battery): run_bt_xrec_mode() already stopped a recording that
+         * was saving (why=left); one that ended by itself is still active and is stopped here */
         uint8_t prev = s_rec.st;
         int saving = recorder_is_saving();
-        uint32_t a = bt_bench_rec_cut(&s_rec, saving);
-        if (a & BT_BENCH_REC_ACT_STOP) {
-            (void)recorder_stop();
-        }
+        uint32_t a = bt_bench_rec_leave(&s_rec, saving, recorder_has_error());
         lbegin("recrun done");
         lks("why", bt_bench_rec_why_name(s_rec.why));
         lku("from", prev);
+        if ((a & BT_BENCH_REC_ACT_STOP) || s_rec_ours) {
+            lks("rc", recorder_stop() == 0 ? "OK" : "FAIL");   /* no-op when no longer active */
+        }
         lemit();
+        s_rec_ours = 0u;
     }
     rec_cfg_restore();                       /* the user's settings, whatever happened */
     s_home = 0u;
