@@ -99,6 +99,18 @@ def discover_hw_mac(explicit_mac: Optional[str] = None) -> Optional[str]:
 NATIVE_SPP_PROBE_S = 1.5  # OpenFW (native SPP) sends nothing after RFCOMM open; the stock HFP unit sends AT+BRSF at once
 
 
+# STAT pace_ms of a stereo recording (no transfers until it stops) and the wait of ERR,LATER
+LATER_PACE_MS = 30000
+
+
+class DeviceRefused(RuntimeError):
+    """+XREC:ERR,BUSY (the file being recorded) or +XREC:ERR,LATER,<ms> (stereo recording): skip the file for now."""
+
+    def __init__(self, msg: str, reply: str):
+        super().__init__(msg)
+        self.reply = reply
+
+
 class XRecRFCOMMClient:
     def __init__(self, mac: str, channel: int = 1, timeout: float = 8.0, transport: str = "auto"):
         self.mac = mac
@@ -261,12 +273,17 @@ class XRecRFCOMMClient:
             raise RuntimeError(f"Failed to read RTC: {line}")
         return line[len("+XREC:RTC,") :]
 
-    def set_rtc(self, dt: datetime) -> None:
+    def set_rtc(self, dt: datetime) -> bool:
+        """Sets the clock. False: the device records and did not change it (+XREC:OK,RTC,LATER; set it again after
+        the recording, docs/XREC_PROTOCOL.md 5.5)."""
         cmd = f"+XREC:RTC,{dt.year},{dt.month},{dt.day},{dt.hour},{dt.minute},{dt.second},{dt.weekday()}"
         self._send_cmd(cmd)
         line = self._read_line()
+        if line == "+XREC:OK,RTC,LATER":
+            return False
         if line != "+XREC:OK,RTC":
             raise RuntimeError(f"Failed to set RTC: {line}")
+        return True
 
     def rec_start(self, filename: Optional[str] = None) -> str:
         cmd = f"+XREC:RECSTART,{filename}" if filename else "+XREC:RECSTART"
@@ -442,7 +459,8 @@ class XRecRFCOMMClient:
             raise RuntimeError(f"Failed to query status: {line}")
         parts = [int(x) for x in line[len("+XREC:STAT,") :].split(",")]
         # fields 9 / 10 (open_fw with sync while recording, docs/XREC_PROTOCOL.md): the active REC_NNNN number (0 = not
-        # recording) and the pause between GETS windows (0 = none); older firmware sends 8 fields: keys left out
+        # recording) and the shortest interval between GETS window starts (0 = none; the device paces itself, no pause
+        # after a window); older firmware sends 8 fields: keys left out
         keys = ("battery_pct", "voltage_mv", "charge_status", "vbus", "media_status", "rec_sec", "free_mb", "total_mb",
                 "rec_idx", "pace_ms")
         return dict(zip(keys, parts))
@@ -564,6 +582,8 @@ class XRecRFCOMMClient:
                 del self.rx_buf[0]
             if self.rx_buf.startswith(b"+"):
                 line = self._read_line()
+                if line == "+XREC:ERR,BUSY" or line.startswith("+XREC:ERR,LATER"):
+                    raise DeviceRefused(f"Device refused {filename}@{expected_offset}: {line}", line)
                 if line.startswith("+XREC:"):
                     raise RuntimeError(f"Device error reading {filename}@{expected_offset}: {line}")
                 continue
@@ -657,6 +677,10 @@ class XRecRFCOMMClient:
                         else:
                             chunk = self.get_chunk(filename, offset, req)
                         break
+                    except DeviceRefused:
+                        f.close()
+                        tmp_path.unlink(missing_ok=True)
+                        raise                    # BUSY / LATER: not a transfer error, no retry
                     except Exception as exc:
                         if attempt == 2:
                             raise
@@ -680,6 +704,49 @@ class XRecRFCOMMClient:
         print()
         tmp_path.replace(dst_path)
         return h.hexdigest()
+
+    def sync_files(
+        self,
+        files: List[Tuple[str, int]],
+        dest_root: Path,
+        burst_size: int = DEFAULT_BURST_SIZE,
+        chunk_size: int = CHUNK_SIZE,
+    ) -> Tuple[int, List[str]]:
+        """Downloads the listed files not yet in dest_root. While the device records (docs/XREC_PROTOCOL.md 5.5) the
+        file being recorded (STAT rec_idx) is skipped, a stereo recording (pace_ms >= 30000) skips every download,
+        and a file the device answers BUSY / LATER for is skipped for this run. Returns (downloaded, skipped)."""
+        rec_name = ""
+        skip_all = False
+        try:
+            st = self.get_stat()
+        except (RuntimeError, ValueError, OSError):
+            st = {}
+        if st.get("rec_idx", 0):
+            rec_name = f"REC_{st['rec_idx']:04d}.wav".lower()
+        if st.get("pace_ms", 0) >= LATER_PACE_MS:
+            skip_all = True
+            print("The recorder records in stereo: no downloads until it stops.")
+        synced = 0
+        skipped: List[str] = []
+        for name, sz in files:
+            dst = safe_dest_path(dest_root, name)
+            if dst.is_file() and dst.stat().st_size == sz:
+                print(f"Skipping already synced: {name} ({sz:,} bytes)")
+                continue
+            if skip_all or name.lower() == rec_name:
+                print(f"Skipping {name}: " + ("stereo recording" if skip_all else "being recorded"))
+                skipped.append(name)
+                continue
+            try:
+                digest = self.download_file(name, sz, dst, burst_size=burst_size, chunk_size=chunk_size)
+            except DeviceRefused as exc:
+                print(f"\n  Skipping {name} for now ({exc.reply})")
+                self.rx_buf.clear()
+                skipped.append(name)
+                continue
+            print(f"  -> Saved {dst} (SHA-256: {digest[:16]}...)")
+            synced += 1
+        return synced, skipped
 
 
 def safe_dest_path(dest_root: Path, remote_name: str) -> Path:
@@ -838,7 +905,10 @@ def main() -> None:
             return
         if args.rtc_sync or args.rtc_set:
             target = datetime.now().replace(microsecond=0) if args.rtc_sync else datetime.strptime(args.rtc_set, "%Y-%m-%d %H:%M:%S")
-            client.set_rtc(target)
+            if not client.set_rtc(target):
+                print(f"The recorder records: the clock was not changed (set it again after the recording). "
+                      f"Device RTC: {client.read_rtc()}")
+                return
             print(f"Device RTC updated: {client.read_rtc()}")
             return
         if args.delete:
@@ -892,16 +962,9 @@ def main() -> None:
 
         args.dest.mkdir(parents=True, exist_ok=True)
         dest_root = args.dest.resolve()
-        synced = 0
-        for name, sz in files:
-            dst = safe_dest_path(dest_root, name)
-            if dst.is_file() and dst.stat().st_size == sz:
-                print(f"Skipping already synced: {name} ({sz:,} bytes)")
-                continue
-            digest = client.download_file(name, sz, dst, burst_size=args.burst_size, chunk_size=args.chunk_size)
-            print(f"  -> Saved {dst} (SHA-256: {digest[:16]}...)")
-            synced += 1
-        print(f"Bluetooth sync complete ({synced} new file(s) downloaded to {args.dest}).")
+        synced, skipped = client.sync_files(files, dest_root, burst_size=args.burst_size, chunk_size=args.chunk_size)
+        note = f", {len(skipped)} skipped while recording" if skipped else ""
+        print(f"Bluetooth sync complete ({synced} new file(s) downloaded to {args.dest}{note}).")
     finally:
         client.close()
 

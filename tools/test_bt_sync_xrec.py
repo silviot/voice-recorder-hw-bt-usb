@@ -49,6 +49,8 @@ class FakeDevice:
         self.gets_frames = None                 # override: list of payload sizes the next GETS answers with
         self.dbg_calls = 0                      # +XREC:DBG (bench images)
         self.recording = self.rec_done = False
+        self.stereo = False                     # with recording: a stereo recording (GETS -> LATER, pace 30000)
+        self.rtc_sets = 0
         self.pace_bps = 48000
         self.gets_bytes = 0
         self.dels = 0
@@ -183,8 +185,17 @@ class FakeDevice:
                 self._reply("+XREC:ERR,NOENT")
         elif line == "+XREC:STAT":
             # open_fw with sync while recording: fields 9 (rec_idx) and 10 (pace_ms); old_fw: the 8 fields
+            pace = 30000 if self.stereo else 342
             self._reply("+XREC:STAT,80,3900,0,0,1,12,1000,30000" + ("" if self.old_fw else
-                                                                    (",1,342" if self.recording else ",0,0")))
+                                                                    (f",1,{pace}" if self.recording else ",0,0")))
+        elif line.startswith("+XREC:RTC,"):
+            if self.recording and not self.old_fw:
+                self._reply("+XREC:OK,RTC,LATER")
+            else:
+                self.rtc_sets += 1
+                self._reply("+XREC:OK,RTC")
+        elif line == "+XREC:RTC":
+            self._reply("+XREC:RTC,2026-11-25 10:00:00,2")
         elif line.startswith("+XREC:DEL,"):
             self.dels += 1
             self._reply("+XREC:ERR,DEL")
@@ -208,6 +219,12 @@ class FakeDevice:
         data = self.files.get("/record/" + name)
         if data is None:
             self._reply("+XREC:ERR,NOENT")
+            return
+        if self.recording and not self.old_fw and name.lower() == "rec_0001.wav":
+            self._reply("+XREC:ERR,BUSY")        # the file being recorded (F7)
+            return
+        if self.recording and self.stereo and not self.old_fw:
+            self._reply("+XREC:ERR,LATER,30000")  # no transfers during a stereo recording
             return
         if self.gets_frames is not None:
             chunk = self.gets_frames      # MTU clamp emulation: frame size the device really uses
@@ -395,12 +412,79 @@ def test_bench_dbg_and_load() -> None:
     print("[PASS] bt_sync +XREC:DBG and --bench-load (RECSTART, GETS loop with wrap and cap, DBG polls, STAT/LS/DEL storm, RECSTOP, STAT 8/10 fields, DBG,PACE)")
 
 
+def test_sync_while_recording(td: Path) -> None:
+    old = bytes((i * 7) & 0xFF for i in range(3000))
+    grow = bytes(1500)
+    files = {"/record/OLD_0001.wav": old, "/record/REC_0001.wav": grow}
+    # mono recording: the active file (STAT rec_idx) is skipped, the others download
+    dev = FakeDevice(files)
+    dev.recording = True
+    c = client_for(dev)
+    d1 = td / "mono"
+    d1.mkdir()
+    synced, skipped = c.sync_files(c.list_files(), d1, burst_size=3840, chunk_size=640)
+    assert synced == 1 and skipped == ["REC_0001.wav"], (synced, skipped)
+    assert (d1 / "OLD_0001.wav").read_bytes() == old and not (d1 / "REC_0001.wav").exists()
+    # older firmware (8 STAT fields) never answers BUSY: everything downloads as before
+    dev = FakeDevice(files, old_fw=True)
+    dev.recording = True
+    d2 = td / "oldfw"
+    d2.mkdir()
+    c = client_for(dev)
+    assert c.sync_files(c.list_files(), d2, burst_size=3840, chunk_size=640) == (2, [])
+    # a BUSY the STAT did not predict (the recording started after STAT): that file is skipped, the run goes on
+    dev = FakeDevice(files)
+    c = client_for(dev)
+    lst = c.list_files()
+    st0 = c.get_stat()
+    assert st0["rec_idx"] == 0
+    dev.recording = True
+    real_stat = c.get_stat
+    c.get_stat = lambda: st0                   # type: ignore[method-assign]
+    d3 = td / "late"
+    d3.mkdir()
+    synced, skipped = c.sync_files(lst, d3, burst_size=3840, chunk_size=640)
+    assert synced == 1 and skipped == ["REC_0001.wav"], (synced, skipped)
+    assert not list(d3.glob("*.part")), list(d3.iterdir())
+    c.get_stat = real_stat                     # type: ignore[method-assign]
+    # stereo recording: no downloads at all
+    dev = FakeDevice(files)
+    dev.recording = dev.stereo = True
+    d4 = td / "stereo"
+    d4.mkdir()
+    c = client_for(dev)
+    synced, skipped = c.sync_files(c.list_files(), d4, burst_size=3840, chunk_size=640)
+    assert synced == 0 and sorted(skipped) == ["OLD_0001.wav", "REC_0001.wav"] and dev.gets_bytes == 0
+    # LATER answered to a GETS (stereo began after STAT): skipped, no retries, no exception
+    dev = FakeDevice(files)
+    c = client_for(dev)
+    lst = c.list_files()
+    st0 = c.get_stat()
+    dev.recording = dev.stereo = True
+    c.get_stat = lambda: st0                   # type: ignore[method-assign]
+    d5 = td / "later"
+    d5.mkdir()
+    synced, skipped = c.sync_files(lst, d5, burst_size=3840, chunk_size=640)
+    assert synced == 0 and len(skipped) == 2 and not list(d5.iterdir())
+    # RTC set while recording: OK,RTC,LATER -> not applied, no exception; idle: applied
+    from datetime import datetime
+    dev = FakeDevice({})
+    dev.recording = True
+    c = client_for(dev)
+    assert c.set_rtc(datetime(2026, 11, 25, 10, 0, 0)) is False and dev.rtc_sets == 0
+    dev.recording = False
+    assert c.set_rtc(datetime(2026, 11, 25, 10, 0, 0)) is True and dev.rtc_sets == 1
+    print("[PASS] bt_sync while recording: active file skipped (rec_idx / BUSY), stereo skips all (pace / LATER), "
+          "RTC OK,RTC,LATER not applied")
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory(prefix="test_bt_sync_xrec_") as t:
         td = Path(t)
         test_put_happy_and_late_replies(td)
         test_put_errors(td)
         test_get_burst_eof(td)
+        test_sync_while_recording(td)
     test_bench_dbg_and_load()
     print("bt_sync +XREC transfer tests: OK")
     return 0
