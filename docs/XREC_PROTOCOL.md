@@ -130,7 +130,7 @@ next chunk or to `PUTEND`.
 
 | Target | Destination | Commit |
 | :--- | :--- | :--- |
-| `REC,<stem>.cwx` | `/record/<stem>.cwx`: the transcript sidecar of the existing recording `/record/<stem>.wav` (else `ERR,NOENT` at offset 0, and at `PUTEND` if the recording was deleted meanwhile). Staged as `/record/.xrec_rec.tmp` | `+XREC:PUTEND` |
+| `REC,<stem>.cwx` | `/record/<stem>.cwx`: the transcript sidecar of the existing recording `/record/<stem>.wav` (else `ERR,NOENT` at offset 0, and at `PUTEND` if the recording was deleted meanwhile: a `DEL` of `<stem>.wav` drops the staged sidecar at once, and `PUTEND` answers `ERR,NOENT` even if a new recording reused the name first). Staged as `/record/.xrec_rec.tmp` | `+XREC:PUTEND` |
 | `CAS,<name>` | `/cassini/<name>` (`/cassini` is created if missing). Staged as `/cassini/.xrec_cas.tmp` | `+XREC:PUTEND` |
 | `OTA` | `/update.up`. Staged as `/.xrec_ota.tmp` | `+XREC:OTA` (needs >= 64 B; reboots into the SD updater) |
 
@@ -146,7 +146,7 @@ Staging rules (all targets):
 * `+XREC:PUTEND` -> `+XREC:OK,PUTEND,<total>` commits a staged REC or CAS upload by an atomic replace (an existing
   file of that name is replaced; the name never disappears on power loss). `ERR,NOPUT` when no REC/CAS upload is
   staged (PUTEND never commits an OTA image, and `+XREC:OTA` never commits a REC/CAS upload: `ERR,NOOTA`).
-* `PUTEND` is idempotent: until the next PUT header, a repeated `PUTEND` (its reply was lost) answers the same
+* `PUTEND` is idempotent: until the next PUT header (any, even one refused with `ERR,ARG`), a repeated `PUTEND` (its reply was lost) answers the same
   `OK,PUTEND,<total>`. Firmware before this change answers `ERR,NOPUT` instead; a client that gets `NOPUT` on a
   repeated `PUTEND` confirms the commit with `LS` (name and size).
 * A disconnect before the commit discards the staged upload (temp deleted).
