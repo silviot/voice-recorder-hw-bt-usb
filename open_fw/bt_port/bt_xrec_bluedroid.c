@@ -703,6 +703,12 @@ static uint16_t xo_get_mtu(void *user)
     return s.conn_open ? s.mtu : 0u;
 }
 
+static uint32_t xo_now_ms(void *user)
+{
+    (void)user;
+    return bt_xrec_plat_now_ms();
+}
+
 static void xo_entropy(void *user, uint8_t out[16])
 {
     (void)user;
@@ -1685,6 +1691,7 @@ int bt_xrec_start(exfat_vol_t *vol, int sd_mounted)
     ops.on_ota = xo_ota;
     ops.on_dfu = xo_dfu;
     ops.get_mtu = xo_get_mtu;
+    ops.now_ms = xo_now_ms;
     xrec_init(&b->xrec, sd_mounted ? vol : 0, &ops, 0);
     bt_xrec_plat_load_bound_key(&b->xrec);
 
@@ -1913,6 +1920,17 @@ void bt_xrec_get_status(bt_status_t *out)
     out->irq_count = out->active ? bt_xrec_plat_irq_count() : 0u;
     memcpy(out->bd_addr, s.bd, 6u);
     memcpy(out->dev_name, s.name, sizeof(out->dev_name));
+    if (s.b != NULL) {
+        /* xrec_proto runs in this (app) task from bt_xrec_poll, like the bound / auth reads above: no lock */
+        xrec_xfer_t x;
+        xrec_get_xfer(&s.b->xrec, bt_xrec_plat_now_ms(), &x);
+        out->xfer_active = x.active;
+        out->xfer_upload = x.upload;
+        _Static_assert(sizeof(out->xfer_name) == sizeof(x.name), "bt_status_t.xfer_name = xrec_xfer_t.name");
+        memcpy(out->xfer_name, x.name, sizeof(out->xfer_name));
+        out->xfer_done = x.done;
+        out->xfer_total = x.total;
+    }
 }
 
 void bt_xrec_get_debug(bt_xrec_debug_t *out)

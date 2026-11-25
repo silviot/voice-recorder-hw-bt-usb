@@ -501,6 +501,53 @@ static void check_bt_ui(ui_model_t *m)
     assert(strcmp(lv_label_get_text(objects.bt_l1_lbl), connected_line) != 0);
     assert(strcmp(lv_label_get_text(objects.bt_l1_lbl), ui_tr(UI_STR_BT_WAITING)) == 0);
 
+    /* File transfer view (bt_status_t.xfer_*): sizes with their own units, a long name dotted on one line, an upload
+     * (total unknown) without a bar, and back to the connected line with the eez layout. */
+    b.bt_state = 2u;
+    b.bt_bonded = 1u;
+    b.bt_xfer_up = 0u;
+    strcpy(b.bt_xfer_name, "2026-11-25_14-03-22.WAV");
+    b.bt_xfer_done = 700u * 1024u;
+    b.bt_xfer_total = 3u * 1024u * 1024u + 300u * 1024u;
+    b.bt_pct = 21u;
+    ui_render_screen(UI_SCR_BT, &b);
+    for (int frame = 0; frame < 14; frame++) { s_now += 16u; ui_port_task_handler(); }
+    lv_obj_update_layout(objects.bt_l1_lbl);
+    printf("BT=1 transfer: [%s] [%s] bar %d\n", lv_label_get_text(objects.bt_l1_lbl),
+           lv_label_get_text(objects.bt_l2_lbl), (int)lv_bar_get_value(objects.bt_prog));
+    assert(strncmp(lv_label_get_text(objects.bt_l1_lbl), "\xE2\x96\xBC 2026-11-25", 14) == 0);
+    assert(strstr(lv_label_get_text(objects.bt_l1_lbl), "...") != NULL);       /* dotted, not wrapped away */
+    assert(strcmp(lv_label_get_text(objects.bt_l2_lbl), "700 KB / 3.2 MB") == 0);
+    assert(lv_bar_get_value(objects.bt_prog) == 21 && !lv_obj_has_flag(objects.bt_prog, LV_OBJ_FLAG_HIDDEN));
+    assert(lv_obj_get_y(objects.bt_l2_lbl) > lv_obj_get_y(objects.bt_prog));   /* sizes below the bar */
+    uint32_t px_before = g_written_pixels;
+    ui_render_screen(UI_SCR_BT, &b);
+    for (int frame = 0; frame < 14; frame++) { s_now += 16u; ui_port_task_handler(); }
+    assert(g_written_pixels == px_before);                                      /* same model: nothing redrawn */
+    b.bt_xfer_up = 1u;
+    strcpy(b.bt_xfer_name, "notes.cwx");
+    b.bt_xfer_done = 12u * 1024u;
+    b.bt_xfer_total = 0u;
+    b.bt_pct = 0u;
+    ui_render_screen(UI_SCR_BT, &b);
+    printf("BT=1 upload: [%s] [%s]\n", lv_label_get_text(objects.bt_l1_lbl), lv_label_get_text(objects.bt_l2_lbl));
+    assert(strcmp(lv_label_get_text(objects.bt_l1_lbl), "\xE2\x96\xB2 notes.cwx") == 0);
+    assert(strcmp(lv_label_get_text(objects.bt_l2_lbl), "12 KB") == 0);
+    assert(lv_obj_has_flag(objects.bt_prog, LV_OBJ_FLAG_HIDDEN));
+    b.bt_xfer_total = 2048u;
+    b.bt_xfer_done = 1500u;
+    b.bt_xfer_up = 0u;
+    ui_render_screen(UI_SCR_BT, &b);
+    assert(strcmp(lv_label_get_text(objects.bt_l2_lbl), "1.4 / 2.0 KB") == 0);
+    b.bt_state = 1u;
+    ui_render_screen(UI_SCR_BT, &b);
+    printf("BT=1 after the transfer: [%s] [%s]\n", lv_label_get_text(objects.bt_l1_lbl),
+           lv_label_get_text(objects.bt_l2_lbl));
+    assert(strncmp(lv_label_get_text(objects.bt_l1_lbl), connected_line, 8) == 0);   /* may end in "..." */
+    assert(strcmp(lv_label_get_text(objects.bt_l2_lbl), ui_tr_bt(UI_BT_STR_BONDED)) == 0);
+    assert(lv_obj_get_y(objects.bt_l1_lbl) == 41 && lv_obj_get_y(objects.bt_l2_lbl) == 53 &&
+           lv_obj_has_flag(objects.bt_prog, LV_OBJ_FLAG_HIDDEN));   /* eez layout back */
+
     static const char *const msgs[] = { "Pairing unavailable", "PIN 246810", "Saved" };
     b.bt_state = 0u;
     b.bt_bonded = 0u;
@@ -987,13 +1034,21 @@ int main(int argc, char **argv)
     ui_render_screen(UI_SCR_USB, &m);
     assert(g_written_pixels == before);
 
-    /* 12: Bluetooth Sync (sending) */
+    /* 12: Bluetooth Sync (a file going to the phone: name, sizes, real percent; not "Sending 3162 of 41") */
     m.charging = 0;
     m.bt_state = 2;
-    m.bt_sent  = 3;
-    m.bt_total = 12;
-    m.bt_pct   = 45;
+    m.bt_xfer_up = 0;
+    strcpy(m.bt_xfer_name, "REC_0012.WAV");
+    m.bt_xfer_done  = 1310720u;              /* 1.25 MiB: "1.2 MB" */
+    m.bt_xfer_total = 7864320u;              /* 7.5 MB */
+    m.bt_pct   = 16;
     ui_render_screen(UI_SCR_BT, &m);
+    printf("BT transfer view: [%s] [%s] bar %d\n", lv_label_get_text(objects.bt_l1_lbl),
+           lv_label_get_text(objects.bt_l2_lbl), (int)lv_bar_get_value(objects.bt_prog));
+    assert(strcmp(lv_label_get_text(objects.bt_l1_lbl), "\xE2\x96\xBC REC_0012.WAV") == 0);
+    assert(strcmp(lv_label_get_text(objects.bt_l2_lbl), "1.2 / 7.5 MB") == 0);
+    assert(!lv_obj_has_flag(objects.bt_l2_lbl, LV_OBJ_FLAG_HIDDEN) && !lv_obj_has_flag(objects.bt_prog, LV_OBJ_FLAG_HIDDEN));
+    assert(lv_bar_get_value(objects.bt_prog) == 16);
     capture_shot(12);
     before = g_written_pixels;
     ui_render_screen(UI_SCR_BT, &m);

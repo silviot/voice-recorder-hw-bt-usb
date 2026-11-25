@@ -372,6 +372,80 @@ static int ls_dir_cb(const exfat_entry_t *entry, void *user)
     return 0;
 }
 
+/* ---- transfer status for the BT screen (xrec_get_xfer) ---- */
+static uint32_t xfer_now(const xrec_ctx_t *ctx)
+{
+    return ctx->ops.now_ms ? ctx->ops.now_ms(ctx->user) : 0u;
+}
+
+static int xfer_fresh(const xrec_ctx_t *ctx, uint32_t now)
+{
+    return ctx->xfer_valid && (!ctx->ops.now_ms || (uint32_t)(now - ctx->xfer_t_ms) < XREC_XFER_HOLD_MS);
+}
+
+/* Display copy: at most XREC_XFER_NAME - 1 bytes, never ending inside a UTF-8 sequence. */
+static void xfer_copy_name(char *dst, const char *src)
+{
+    uint32_t n = 0u;
+    while (src[n] != '\0' && n < (XREC_XFER_NAME - 1u)) {
+        n++;
+    }
+    if (src[n] != '\0') {
+        while (n > 0u && (((uint8_t)src[n]) & 0xC0u) == 0x80u) {
+            n--;                       /* src[n] continues a character: drop its lead byte too */
+        }
+    }
+    mem_copy(dst, src, n);
+    dst[n] = '\0';
+}
+
+/* A GETS / PUT starts: the same file within the hold time continues (done never goes back), anything else restarts. */
+static void xfer_begin(xrec_ctx_t *ctx, uint8_t upload, const char *name, uint32_t id, uint32_t done, uint32_t total)
+{
+    uint32_t now = xfer_now(ctx);
+    char shown[XREC_XFER_NAME];
+    xfer_copy_name(shown, name);
+    if (!xfer_fresh(ctx, now) || ctx->xfer_upload != upload || ctx->xfer_id != id ||
+        !str_eq(ctx->xfer_name, shown)) {
+        ctx->xfer_upload = upload;
+        ctx->xfer_id     = id;
+        mem_copy(ctx->xfer_name, shown, sizeof(shown));
+        ctx->xfer_done   = done;
+    } else if (done > ctx->xfer_done) {
+        ctx->xfer_done = done;
+    }
+    ctx->xfer_total = total;
+    ctx->xfer_valid = 1u;
+    ctx->xfer_t_ms  = now;
+}
+
+static void xfer_progress(xrec_ctx_t *ctx, uint8_t upload, uint32_t done)
+{
+    if (!ctx->xfer_valid || ctx->xfer_upload != upload) {
+        return;
+    }
+    if (done > ctx->xfer_done) {
+        ctx->xfer_done = done;
+    }
+    ctx->xfer_t_ms = xfer_now(ctx);
+}
+
+void xrec_get_xfer(const xrec_ctx_t *ctx, uint32_t now_ms, xrec_xfer_t *out)
+{
+    if (!out) {
+        return;
+    }
+    mem_zero(out, sizeof(*out));
+    if (!ctx || !xfer_fresh(ctx, now_ms)) {
+        return;
+    }
+    out->active = 1u;
+    out->upload = ctx->xfer_upload;
+    mem_copy(out->name, ctx->xfer_name, sizeof(out->name));
+    out->done   = ctx->xfer_done;
+    out->total  = ctx->xfer_total;
+}
+
 static void handle_ping(xrec_ctx_t *ctx)
 {
     char buf[96];
@@ -706,6 +780,8 @@ static void handle_get_common(xrec_ctx_t *ctx, const char *args, int is_stream)
 
     /* Stop any active LS stream so text lines never interleave with binary GETS frames */
     ctx->ls_active      = 0u;
+    xfer_begin(ctx, 0u, ctx->gets_file.name, ctx->gets_file.first_cluster, off,
+               (ctx->gets_file.size > 0xFFFFFFFFull) ? 0xFFFFFFFFu : (uint32_t)ctx->gets_file.size);
     ctx->gets_offset    = off;
     ctx->gets_rem       = tot;
     ctx->gets_chunk_max = (uint16_t)chunk;
@@ -851,6 +927,7 @@ static void handle_put_complete(xrec_ctx_t *ctx)
         ctx->put_len == ctx->put_last_len &&
         ctx->put_crc == ctx->put_last_crc &&
         (!put_is_named(ctx->put_target) || str_eq(ctx->put_name, ctx->put_stream_name))) {
+        xfer_progress(ctx, 1u, ctx->put_written);   /* resent chunk (lost reply): the upload is alive */
         send_put_ok(ctx, ctx->put_offset, ctx->put_len);
         return;
     }
@@ -884,6 +961,7 @@ static void handle_put_complete(xrec_ctx_t *ctx)
         copy_cstr(ctx->put_stream_name, (uint32_t)sizeof(ctx->put_stream_name), fname);
         ctx->put_written  = 0u;
         ctx->put_has_last = 0u;
+        xfer_begin(ctx, 1u, fname, 0u, 0u, 0u);
     } else if (ctx->put_stream_mode != ctx->put_target ||
                ctx->put_offset != ctx->put_written ||
                (put_is_named(ctx->put_target) && !str_eq(ctx->put_name, ctx->put_stream_name))) {
@@ -913,6 +991,7 @@ static void handle_put_complete(xrec_ctx_t *ctx)
     ctx->put_last_crc   = ctx->put_crc;
     ctx->put_last_mode  = ctx->put_target;
     ctx->put_has_last   = 1u;
+    xfer_progress(ctx, 1u, ctx->put_written);
     send_put_ok(ctx, ctx->put_offset, ctx->put_len);
 }
 
@@ -1395,6 +1474,7 @@ void xrec_on_disconnect(xrec_ctx_t *ctx)
     ctx->put_last_mode      = XREC_PUT_NONE;
     ctx->put_stream_name[0] = '\0';
     ctx->put_written        = 0u;
+    ctx->xfer_valid         = 0u;
 }
 
 /* Flow control (review STEP10 A5): room for the worst-case reply before running anything that replies. */
@@ -1541,6 +1621,7 @@ void xrec_poll(xrec_ctx_t *ctx)
         ctx->gets_staged  = 0u;
         ctx->gets_offset += sent;
         ctx->gets_rem    -= sent;
+        xfer_progress(ctx, 0u, ctx->gets_offset);
         if (eof || ctx->gets_rem == 0u) {
             ctx->gets_active = 0u;
         }

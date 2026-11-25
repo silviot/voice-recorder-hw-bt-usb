@@ -60,6 +60,13 @@ static int file_write_sectors(void *ctx, uint32_t lba, uint32_t count, const voi
 
 static exfat_vol_t g_vol;
 static xrec_ctx_t  g_x;
+static uint32_t    g_now = 1000u;   /* ops.now_ms: the transfer status' clock */
+
+static uint32_t fake_now(void *user)
+{
+    (void)user;
+    return g_now;
+}
 static const uint8_t g_key[32] = {
     0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
     0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
@@ -192,6 +199,7 @@ int main(int argc, char **argv)
     xrec_ops_t ops;
     memset(&ops, 0, sizeof(ops));
     ops.send = cap_send;
+    ops.now_ms = fake_now;
     xrec_init(&g_x, &g_vol, &ops, NULL);
     xrec_set_bound_key(&g_x, g_key);
 
@@ -435,6 +443,88 @@ int main(int argc, char **argv)
         assert(strcmp(cmd("+XREC:PUTEND"), "+XREC:OK,PUTEND,64\r\n") == 0);
         expect_file("/record/REC_0002.cwx", b, 64u);
         assert(!exists("/record/.xrec_rec.tmp"));
+    }
+
+    /* 9. Transfer status for the BT screen (xrec_get_xfer; the user saw "Sending 3162 of 41"): GETS progress is the
+     * highest offset sent of the file's size on the card, held XREC_XFER_HOLD_MS after the last chunk so the pauses
+     * of an app sync do not flicker, a GETS of another file switches the name, PUT shows the staged bytes (total
+     * unknown), a disconnect clears it. */
+    {
+        xrec_xfer_t x;
+        g_now += 5000u;
+        xrec_get_xfer(&g_x, g_now, &x);
+        assert(!x.active && x.name[0] == '\0' && x.done == 0u && x.total == 0u);   /* the earlier uploads timed out */
+
+        static uint8_t big[3000];
+        fill(big, sizeof(big), 0x2Bu);
+        make_wav("XFER_LONG_NAME_0123456789.wav", big, sizeof(big));
+        cmd("+XREC:GETS,0,1000,256,XFER_LONG_NAME_0123456789.wav");
+        assert(strncmp(g_out, "XREC", 4) == 0);
+        xrec_get_xfer(&g_x, g_now, &x);
+        assert(x.active && !x.upload && x.done == 1000u && x.total == 3000u);
+        assert(strcmp(x.name, "XFER_LONG_NAME_01234567") == 0);              /* 23 bytes + NUL */
+        g_now += 1900u;                                                        /* a pause between bursts */
+        xrec_get_xfer(&g_x, g_now, &x);
+        assert(x.active && x.done == 1000u);
+        cmd("+XREC:GETS,1000,2000,640,XFER_LONG_NAME_0123456789.wav");
+        xrec_get_xfer(&g_x, g_now, &x);
+        assert(x.active && x.done == 3000u && x.total == 3000u);
+        g_now += 1500u;
+        cmd("+XREC:GETS,0,500,256,XFER_LONG_NAME_0123456789.wav");             /* a re-read: progress never goes back */
+        xrec_get_xfer(&g_x, g_now, &x);
+        assert(x.active && x.done == 3000u);
+        g_now += 1999u;
+        xrec_get_xfer(&g_x, g_now, &x);
+        assert(x.active);
+        g_now += 1u;
+        xrec_get_xfer(&g_x, g_now, &x);
+        assert(!x.active);                                                     /* 2 s without a chunk */
+        cmd("+XREC:GETS,0,200,64,XFER_LONG_NAME_0123456789.wav");              /* after the timeout: starts over */
+        xrec_get_xfer(&g_x, g_now, &x);
+        assert(x.active && x.done == 200u);
+
+        /* another file: the name switches at once; an LS in between does not touch it */
+        g_now += 100u;
+        cmd("+XREC:GETS,0,100,64,REC_0003.wav");
+        xrec_get_xfer(&g_x, g_now, &x);
+        assert(x.active && !x.upload && strcmp(x.name, "REC_0003.wav") == 0 && x.done == 100u && x.total == 100u);
+        ls();
+        xrec_get_xfer(&g_x, g_now, &x);
+        assert(x.active && strcmp(x.name, "REC_0003.wav") == 0);
+        assert(strcmp(cmd("+XREC:GETS,0,100,64,NOPE.wav"), "+XREC:ERR,NOENT\r\n") == 0);
+        xrec_get_xfer(&g_x, g_now, &x);
+        assert(x.active && strcmp(x.name, "REC_0003.wav") == 0);
+
+        /* upload: bytes staged, total unknown; PUTEND keeps it shown, then it times out */
+        g_now += 100u;
+        expect_put_ok(0u, "REC,REC_0001.cwx", a, 600u);
+        xrec_get_xfer(&g_x, g_now, &x);
+        assert(x.active && x.upload && strcmp(x.name, "REC_0001.cwx") == 0 && x.done == 600u && x.total == 0u);
+        g_now += 1000u;
+        expect_put_ok(600u, "REC,REC_0001.cwx", b, 40u);
+        expect_put_ok(600u, "REC,REC_0001.cwx", b, 40u);                      /* resend: counted once */
+        assert(strcmp(cmd("+XREC:PUTEND"), "+XREC:OK,PUTEND,640\r\n") == 0);
+        xrec_get_xfer(&g_x, g_now, &x);
+        assert(x.active && x.upload && x.done == 640u);
+        g_now += 2000u;
+        xrec_get_xfer(&g_x, g_now, &x);
+        assert(!x.active);
+
+        /* a UTF-8 name longer than the display copy is cut on a character boundary (12 x U+00E0 = 24 bytes) */
+        static const char utf_name[] = "\xC3\xA0\xC3\xA0\xC3\xA0\xC3\xA0\xC3\xA0\xC3\xA0\xC3\xA0\xC3\xA0\xC3\xA0\xC3\xA0"
+                                       "\xC3\xA0\xC3\xA0.bin";
+        char tgt[64];
+        snprintf(tgt, sizeof(tgt), "CAS,%s", utf_name);
+        expect_put_ok(0u, tgt, c, 32u);
+        xrec_get_xfer(&g_x, g_now, &x);
+        assert(x.active && x.upload && strlen(x.name) == 22u && memcmp(x.name, utf_name, 22u) == 0);
+
+        /* the link drops: nothing shown (the staged upload is aborted) */
+        xrec_on_disconnect(&g_x);
+        xrec_get_xfer(&g_x, g_now, &x);
+        assert(!x.active);
+        authenticate();
+        printf("xrec transfer status (BT screen) tests: OK\n");
     }
 
     /* final LS: recordings + sidecars, no temps */

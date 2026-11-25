@@ -69,6 +69,9 @@ typedef struct {
     /* Bytes the transport accepts right now (send is all-or-nothing). Optional: NULL = no RX backpressure (a reply
      * that does not fit is dropped). Review STEP10 A5. */
     uint32_t (*tx_free)(void *user);
+    /* Millisecond clock for the transfer status (xrec_get_xfer). Optional: NULL = a transfer stays shown until the
+     * link drops. */
+    uint32_t (*now_ms)(void *user);
 } xrec_ops_t;
 
 typedef enum {
@@ -78,6 +81,20 @@ typedef enum {
     XREC_PUT_CAS  = 3,   /* CAS,<name>: /cassini/<name> */
     XREC_PUT_REC  = 4,   /* REC,<stem>.cwx: transcript sidecar /record/<stem>.cwx (only .cwx names) */
 } xrec_put_target_t;
+
+/* A file transfer kept shown this long after its last chunk: an app sync pauses between GETS bursts (and between
+ * LS and the next file), the view must not flicker. */
+#define XREC_XFER_HOLD_MS 2000u
+#define XREC_XFER_NAME    24u      /* display copy of the file name, cut on a UTF-8 character boundary */
+
+/* The current (or last, within XREC_XFER_HOLD_MS) file transfer, for the BT screen. */
+typedef struct {
+    uint8_t  active;               /* a chunk moved less than XREC_XFER_HOLD_MS ago */
+    uint8_t  upload;               /* 1: phone -> device (PUT REC / CAS / OTA); 0: device -> phone (GETS / GET) */
+    char     name[XREC_XFER_NAME]; /* the file's name as on the card (OTA: update.up) */
+    uint32_t done;                 /* GETS: highest offset + length sent; PUT: bytes staged */
+    uint32_t total;                /* GETS: the file's size on the card; PUT: 0 = unknown */
+} xrec_xfer_t;
 
 typedef struct {
     exfat_vol_t   *vol;
@@ -142,6 +159,15 @@ typedef struct {
     /* last PUTEND commit, so a repeated PUTEND (lost reply) answers the same OK until the next PUT header */
     uint8_t        put_done_valid;
     uint32_t       put_done_total;
+
+    /* Transfer status (xrec_get_xfer): updated where GETS / PUT chunks move, read by the UI from the same task */
+    uint8_t        xfer_valid;
+    uint8_t        xfer_upload;
+    char           xfer_name[XREC_XFER_NAME];
+    uint32_t       xfer_id;            /* GETS: the file's first cluster (same file = same id) */
+    uint32_t       xfer_done;
+    uint32_t       xfer_total;
+    uint32_t       xfer_t_ms;          /* ops.now_ms at the last chunk */
 } xrec_ctx_t;
 
 void xrec_init(xrec_ctx_t *ctx, exfat_vol_t *vol, const xrec_ops_t *ops, void *user);
@@ -154,5 +180,8 @@ void xrec_on_disconnect(xrec_ctx_t *ctx);
  * hands it in again after the transport drained (xrec_poll() first). */
 uint16_t xrec_on_rx(xrec_ctx_t *ctx, const uint8_t *data, uint16_t len);
 void xrec_poll(xrec_ctx_t *ctx);
+/* The transfer shown on the BT screen; out->active = 0 once no chunk moved for XREC_XFER_HOLD_MS (now_ms: the clock
+ * of ops.now_ms). No SD access. */
+void xrec_get_xfer(const xrec_ctx_t *ctx, uint32_t now_ms, xrec_xfer_t *out);
 
 #endif /* OPENFW_XREC_H */

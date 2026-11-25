@@ -155,7 +155,6 @@ typedef enum {
     UI_STR_BT_OPEN_APP,
     UI_STR_BT_CONNECTED_FMT,   /* "✓ Connected · %s" */
     UI_STR_PHONE,
-    UI_STR_BT_SENDING_FMT,     /* "Sending %u of %u" */
     UI_STR_BT_FOOTER,
     UI_STR_CHARGING,
     UI_STR_CHARGE_FOOTER,

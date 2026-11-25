@@ -1527,13 +1527,27 @@ static void bt_prompt_ui_update(uint32_t now)
 #endif
 
 #if OPENFW_BT_PHONE
+/* Percent of a file transfer for the BT screen's bar (total 0 = unknown: 0). No 64-bit division. */
+static uint8_t bt_xfer_pct(uint32_t done, uint32_t total)
+{
+    if (total == 0u) {
+        return 0u;
+    }
+    if (done >= total) {
+        return 100u;
+    }
+    uint32_t pct = (total > 0xFFFFFFFFu / 100u) ? done / (total / 100u) : (done * 100u) / total;
+    return (uint8_t)((pct > 100u) ? 100u : pct);
+}
+
 static void run_bt_xrec_mode(void)
 {
     g_ui_screen   = UI_SCR_BT;
     g_ui.bt_state = 0u;
-    g_ui.bt_sent  = 0u;
-    g_ui.bt_total = 0u;
-    g_ui.bt_pct   = 0u;
+    g_ui.bt_xfer_name[0] = '\0';
+    g_ui.bt_xfer_done    = 0u;
+    g_ui.bt_xfer_total   = 0u;
+    g_ui.bt_pct          = 0u;
     copy_cstr(g_ui.bt_peer, (int)sizeof(g_ui.bt_peer), "Phone");
 #if OPENFW_BT_PROMPT
     /* The previous session may have ended with a prompt or a window up (REC slide, bench time-up, BT stop): its digits
@@ -1679,11 +1693,14 @@ static void run_bt_xrec_mode(void)
             }
             backlight_update();
 
-            if (st.xrec_auth && st.tx_acl_pkts > 0u) {
+            if (st.xrec_auth && st.xfer_active) {
+                /* a real file transfer (xrec_get_xfer): held ~2 s after its last chunk, so bursts do not flicker */
                 g_ui.bt_state = 2u;
-                g_ui.bt_sent  = (uint16_t)(st.tx_acl_pkts & 0xFFFFu);
-                g_ui.bt_total = (uint16_t)(g_ui.file_count ? g_ui.file_count : 1);
-                g_ui.bt_pct   = (uint8_t)((st.tx_acl_pkts * 7u) % 101u);
+                g_ui.bt_xfer_up = st.xfer_upload;
+                copy_cstr(g_ui.bt_xfer_name, (int)sizeof(g_ui.bt_xfer_name), st.xfer_name);
+                g_ui.bt_xfer_done  = st.xfer_done;
+                g_ui.bt_xfer_total = st.xfer_total;
+                g_ui.bt_pct = bt_xfer_pct(st.xfer_done, st.xfer_total);
             } else if (st.xrec_auth || st.spp_open || st.acl_connected) {
                 g_ui.bt_state = 1u;
             } else {

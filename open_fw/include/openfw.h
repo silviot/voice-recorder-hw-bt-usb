@@ -348,6 +348,12 @@ typedef struct {
     uint32_t irq_count;
     uint8_t  bd_addr[6];
     char     dev_name[16];
+    /* The file transfer of the XREC session (xrec_get_xfer): shown while a chunk moved in the last ~2 s */
+    uint8_t  xfer_active;
+    uint8_t  xfer_upload;     /* 1: phone -> device (PUT); 0: device -> phone (GETS) */
+    char     xfer_name[24];   /* as on the card, cut on a UTF-8 boundary */
+    uint32_t xfer_done;       /* bytes */
+    uint32_t xfer_total;      /* bytes; 0 = unknown (uploads) */
 } bt_status_t;
 
 int  bt_xrec_start(exfat_vol_t *vol, int sd_mounted);

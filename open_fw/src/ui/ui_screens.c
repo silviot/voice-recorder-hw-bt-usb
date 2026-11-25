@@ -1475,12 +1475,50 @@ static void bind_usb(const ui_model_t *m)
     set_changed_text(objects.usb_batt_lbl, bp);
 }
 
+/* "1.2 / 7.5 MB" (one unit when both sizes share it), "512 KB / 7.5 MB", or just "12 KB" when the total is unknown. */
+static void bt_xfer_sizes(char *dst, int cap, uint32_t done, uint32_t total)
+{
+    char ds[16], ts[16];
+    ui_format_bytes_short(ds, (int)sizeof(ds), done);
+    if (total == 0u) {
+        lv_snprintf(dst, (uint32_t)cap, "%s", ds);
+        return;
+    }
+    ui_format_bytes_short(ts, (int)sizeof(ts), total);
+    int du = 0, tu = 0;                       /* the unit: after the last space */
+    for (int i = 0; ds[i] != '\0'; i++) if (ds[i] == ' ') du = i;
+    for (int i = 0; ts[i] != '\0'; i++) if (ts[i] == ' ') tu = i;
+    if (du > 0 && tu > 0 && lv_strcmp(&ds[du], &ts[tu]) == 0) {
+        ds[du] = '\0';
+    }
+    lv_snprintf(dst, (uint32_t)cap, "%s / %s", ds, ts);
+}
+
+/* eez layout: line 1 y 41, line 2 y 53 (bt_prog is only shown in the transfer view). The transfer view packs name,
+ * bar and sizes into the same rows: name y 40, bar y 54..56, sizes y 56 (ink clear of the footer at y 67). */
+#define BT_L1_Y        41
+#define BT_L2_Y        53
+#define BT_L1_XFER_Y   40
+#define BT_BAR_XFER_Y  54
+#define BT_BAR_XFER_H  3
+#define BT_L2_XFER_Y   56
+
 static void bind_bt(const ui_model_t *m)
 {
     bind_status_bar(objects.bt_bar, objects.bt_bar_ic, objects.bt_bar_l, objects.bt_bar_sub,
                     objects.bt_bar_r, objects.bt_bar_hp, objects.bt_batt,
                     objects.bt_batt_fill, objects.bt_batt_nub,
                     m, UI_COL_BAR, UI_COL_TEXT, UI_ICON_NONE, UI_COL_TEXT, ui_tr(UI_STR_BT_SYNC), NULL, NULL, 0);
+    int xfer_view = (m->bt_state == 2u);
+#if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID
+    if (m->bt_prompt) {
+        xfer_view = 0;
+    }
+#endif
+    set_changed_y(objects.bt_l1_lbl, xfer_view ? BT_L1_XFER_Y : BT_L1_Y);
+    set_changed_y(objects.bt_l2_lbl, xfer_view ? BT_L2_XFER_Y : BT_L2_Y);
+    set_changed_y(objects.bt_prog, BT_BAR_XFER_Y);
+    set_changed_height(objects.bt_prog, BT_BAR_XFER_H);
 #if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID
     /* SSP numeric comparison waiting for the local user (plan M4): value in the name's place, peer, countdown, keys.
      * Each label is set once per bind with its final text and colour (a re-render of the same model draws nothing). */
@@ -1513,12 +1551,17 @@ static void bind_bt(const ui_model_t *m)
         l2_col = UI_HEX_GREEN;
     }
     set_changed_text(objects.bt_name_lbl, m->bt_name[0] ? m->bt_name : "HW_76");
-    set_changed_text(objects.bt_l2_lbl, l2);
-    set_changed_text_color(objects.bt_l2_lbl, lv_color_hex(l2_col));
+    if (!xfer_view) {               /* the transfer view sets its own line 2 (one text per bind: no redraw) */
+        set_changed_text(objects.bt_l2_lbl, l2);
+        set_changed_text_color(objects.bt_l2_lbl, lv_color_hex(l2_col));
+    }
     set_changed_text(objects.bt_footer, ui_tr(UI_STR_BT_FOOTER));
 #else
     set_changed_text(objects.bt_name_lbl, m->bt_name[0] ? m->bt_name : "HW_76");
-    set_changed_text(objects.bt_l2_lbl, ui_tr(UI_STR_BT_OPEN_APP));
+    if (!xfer_view) {
+        set_changed_text(objects.bt_l2_lbl, ui_tr(UI_STR_BT_OPEN_APP));
+        set_changed_text_color(objects.bt_l2_lbl, lv_color_hex(UI_HEX_MUTE));   /* after a transfer's sizes */
+    }
     set_changed_text(objects.bt_footer, ui_tr(UI_STR_BT_FOOTER));
 #endif
     if (m->bt_state == 0u) {
@@ -1538,13 +1581,21 @@ static void bind_bt(const ui_model_t *m)
 #endif
         set_hidden(objects.bt_prog, true);
     } else {
-        char ss[40];
-        lv_snprintf(ss, sizeof(ss), ui_tr(UI_STR_BT_SENDING_FMT), (unsigned)m->bt_sent, (unsigned)m->bt_total);
-        set_changed_text(objects.bt_l1_lbl, ss);
-        set_changed_text_color(objects.bt_l1_lbl, lv_color_hex(UI_HEX_TEXT));
-        set_hidden(objects.bt_l2_lbl, true);
-        set_hidden(objects.bt_prog, false);
-        set_changed_bar_value(objects.bt_prog, (int32_t)m->bt_pct);
+        /* File transfer (bt_status_t.xfer_*): direction arrow and the file's name, the sizes, the real percent.
+         * Arrows as on the USB screen: down = out of the recorder (to the phone), up = into it. */
+        if (lv_label_get_long_mode(objects.bt_l1_lbl) != LV_LABEL_LONG_DOT) {
+            lv_label_set_long_mode(objects.bt_l1_lbl, LV_LABEL_LONG_DOT);   /* a long name ends in "..." */
+        }
+        char ns[32], sz[36];
+        lv_snprintf(ns, sizeof(ns), "%s %s", m->bt_xfer_up ? "\xE2\x96\xB2" : "\xE2\x96\xBC", m->bt_xfer_name);
+        set_changed_text(objects.bt_l1_lbl, ns);
+        set_changed_text_color(objects.bt_l1_lbl, lv_color_hex(m->bt_xfer_up ? UI_HEX_AMBER : UI_HEX_CYAN));
+        bt_xfer_sizes(sz, (int)sizeof(sz), m->bt_xfer_done, m->bt_xfer_total);
+        set_changed_text(objects.bt_l2_lbl, sz);
+        set_changed_text_color(objects.bt_l2_lbl, lv_color_hex(UI_HEX_TEXT));
+        set_hidden(objects.bt_l2_lbl, false);
+        set_hidden(objects.bt_prog, m->bt_xfer_total == 0u);   /* upload: size unknown, no bar */
+        set_changed_bar_value(objects.bt_prog, (int32_t)(m->bt_pct > 100u ? 100u : m->bt_pct));
     }
 }
 

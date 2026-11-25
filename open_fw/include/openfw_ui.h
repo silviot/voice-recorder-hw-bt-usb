@@ -292,11 +292,13 @@ typedef struct {
     uint64_t       usb_rx_bytes;    /* host -> device (OUT) */
 
     /* Bluetooth Sync */
-    uint8_t        bt_state;        /* 0=wait, 1=conn, 2=send */
+    uint8_t        bt_state;        /* 0=wait, 1=conn, 2=file transfer (bt_xfer_*) */
     char           bt_peer[24];
-    uint16_t       bt_sent;
-    uint16_t       bt_total;
-    uint8_t        bt_pct;
+    uint8_t        bt_xfer_up;      /* 1: phone -> device; 0: device -> phone */
+    char           bt_xfer_name[24];
+    uint32_t       bt_xfer_done;    /* bytes */
+    uint32_t       bt_xfer_total;   /* bytes; 0 = unknown: no bar */
+    uint8_t        bt_pct;          /* bt_xfer_done of bt_xfer_total, 0..100 */
 #if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID
     /* BT=1 phone mode (bt_xrec_get_ui): SSP numeric-comparison prompt and pairing state; bt_peer = prompt peer */
     uint8_t        bt_prompt;       /* 1: show bt_digits, ENTER accepts, BACK rejects */
