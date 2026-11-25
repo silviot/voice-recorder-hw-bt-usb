@@ -27,6 +27,9 @@ void bth_heap_peak_reset(void);   /* peak_bytes = live_bytes (scenario-local pea
 /* Fail the n-th allocation attempt (1-based) from now on; n = 0 disarms. persistent: fail every attempt >= n. */
 void bth_heap_fail_arm(uint64_t n, bool persistent);
 void bth_heap_fail_disarm(void);
+/* One-shot: the next allocation attempt of exactly n bytes fails (n = 0 disarms); pending = still armed. */
+void bth_heap_fail_size(size_t n);
+size_t bth_heap_fail_size_pending(void);
 /* Allocation attempts counted since the last arm (also counts while armed with n = 0 via bth_heap_count_start). */
 void bth_heap_count_start(void);
 uint64_t bth_heap_counted(void);

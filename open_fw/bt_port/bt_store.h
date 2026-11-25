@@ -33,7 +33,8 @@ typedef struct {
 void bt_store_init(const bt_store_platform_t *platform);
 
 /* Replace the cache with a serialised image. Returns ESP_OK, or ESP_ERR_INVALID_CRC / ESP_ERR_INVALID_SIZE /
- * ESP_ERR_INVALID_VERSION / ESP_ERR_INVALID_ARG; on any error the store is left empty. */
+ * ESP_ERR_INVALID_VERSION / ESP_ERR_INVALID_ARG; on any error the store is left empty and, for a non-empty image, held
+ * (bt_store_held). */
 esp_err_t bt_store_load(const uint8_t *img, size_t len);
 
 /* Serialise into buf. Returns the image length, or 0 if cap is too small. The dirty flag is NOT cleared: a write of the
@@ -47,5 +48,15 @@ int bt_store_dirty(void);
 /* Empty the store (entries and data cleared, not dirty) without touching the platform binding: a mode change between
  * phone and headphones mode (docs/BT_A2DP_DESIGN.md §6.4). App task, stack off. */
 void bt_store_reset(void);
+
+/* Write hold (silicon 2026-11-25: a headphones bond was replaced by an empty store). A card image whose bonds this
+ * session cannot take over must not be replaced by the store Bluedroid saves at every start (btc_config_init()), which
+ * is then empty. The hold is set by a bt_store_load() that rejects a non-empty image, by bt_store_hold_nonempty()
+ * (Bluedroid patch 0042: the config the store holds could not be parsed) and by the app (bond file present but not
+ * readable); a load that succeeds and bt_store_reset() clear it. The app writes nothing while it is set; the card file
+ * is retried at the next start. */
+int  bt_store_held(void);
+void bt_store_hold(int on);
+void bt_store_hold_nonempty(void);
 
 #endif /* BT_STORE_H */

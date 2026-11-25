@@ -29,6 +29,9 @@
  *       (bt_vol changes only through the player); S6b keys and player events from before a file are dropped by
  *       bt_hp_player_begin()
  *   S8b credit stall without a Disconnection Complete: the escalation restarts headphones mode, which reconnects
+ *   S11 (silicon 2026-11-25 bond loss) a bond file whose bonds a session cannot take over (bt_store_load rejects it,
+ *       or Bluedroid's config parse fails: patch 0042) is never replaced by the empty config btc_config_init() saves
+ *       at every start; the next clean start loads the bond again
  *   G   (test_bt_host, rows refused) scan and connect fail at once with BT_HP_MSG_UNSUPPORTED, no reconnect
  * Not covered here (listed in docs/BT_A2DP_HP_SESSION.md): 44.1 kHz-only peers (SEID 1 fallback), page-scan / LM
  * state variants, AVRCP FF/REW scrub, the player integration (test_player BT=1 variant), soak runs.
@@ -1111,6 +1114,44 @@ static int bond_file_size(void)
     return bthx_read_root_file("bt_hp_bonds.bin", img, sizeof(img));
 }
 
+/* S11: the card's bt_hp_bonds.bin replaced by a test image (BT off). */
+static bool put_bond_file(const uint8_t *img, uint32_t n)
+{
+    exfat_writer_t w;
+    (void)exfat_delete_file(&s_card, "/", "bt_hp_bonds.bin");
+    return exfat_create_file(&s_card, "/", "bt_hp_bonds.bin", &w) == 0 && exfat_write(&w, img, n) == 0 &&
+           exfat_close_file(&w) == 0;
+}
+
+/* Length of the first entry named key in a BTS1 image (bt_store.h layout), 0 if absent. */
+static uint32_t bts1_value_len(const uint8_t *img, uint32_t n, const char *key)
+{
+    if (n < 14u || memcmp(img, "BTS1", 4u) != 0) {
+        return 0u;
+    }
+    uint32_t count = (uint32_t)img[4] | ((uint32_t)img[5] << 8), o = 6u;
+    for (uint32_t i = 0u; i < count && o < n - 8u; i++) {
+        uint32_t nl = img[o++];
+        o += nl;
+        uint32_t kl = img[o++];
+        bool hit = kl == strlen(key) && memcmp(&img[o], key, kl) == 0;
+        o += kl;
+        uint32_t vl = (uint32_t)img[o] | ((uint32_t)img[o + 1u] << 8);
+        o += 2u;
+        if (hit) {
+            return vl;
+        }
+        o += vl;
+    }
+    return 0u;
+}
+
+static int fn_bond_num(uint32_t a)
+{
+    (void)a;
+    return esp_bt_gap_get_bond_device_num();
+}
+
 int bth_headphones_scenario(const char *img_path)
 {
     size_t known_leak_blocks = 0u, known_leak_bytes = 0u;
@@ -1509,6 +1550,55 @@ int bth_headphones_scenario(const char *img_path)
                UI().has_last);
         /* C4 / A3: no headphones session -> the patch 0036 hook refuses Just Works (phone mode never keeps it) */
         SCHECK(openfw_just_works_allowed(s_hp_bda) == 0, "S10c: Just Works allowed with no headphones session");
+    }
+
+    /* ---- S11 ---- silicon 2026-11-25: bt_hp_bonds.bin 152 -> 43 B on the first headphones start of a boot */
+    bth_log("[S11] a bond file this session cannot take over is never replaced (heap seq %u)\n", (unsigned)bth_heap_seq());
+    {
+        static uint8_t good[BT_STORE_IMAGE_MAX], bad[BT_STORE_IMAGE_MAX], now_img[BT_STORE_IMAGE_MAX];
+        int gn = bthx_read_root_file("bt_hp_bonds.bin", good, sizeof(good));
+        uint32_t cfg_len = gn > 0 ? bts1_value_len(good, (uint32_t)gn, "bt_cfg_key0") : 0u;
+        SCHECK(gn > 0 && cfg_len > 0u && UI().state == BT_HP_ST_OFF, "S11: no bond file with a config (%d B, cfg %u)",
+               gn, cfg_len);
+        if (gn > 0 && cfg_len > 0u) {
+            /* S11a: torn / corrupted image (digest), as a different store version would be: bt_store_load rejects it,
+             * the store starts empty and btc_config_init() saves that empty config at once */
+            memcpy(bad, good, (size_t)gn);
+            bad[gn - 1] ^= 0x5Au;
+            SCHECK(put_bond_file(bad, (uint32_t)gn), "S11a: could not plant the corrupted image");
+            uint32_t w0 = bthx_bond_writes();
+            if (start_ready("S11a start")) {
+                (void)WAIT(0, 500);                          /* flush requests of the start's config save */
+                stop_session("S11a stop");
+            }
+            int nn = bthx_read_root_file("bt_hp_bonds.bin", now_img, sizeof(now_img));
+            SCHECK(nn == gn && memcmp(now_img, bad, (size_t)gn) == 0,
+                   "S11a: rejected bond file replaced (%d B -> %d B, writes %u -> %u)", gn, nn, w0, bthx_bond_writes());
+            /* S11b: a valid image whose config Bluedroid cannot parse (config_parse's buffer allocation fails):
+             * btc_config_init() started unconfigured and saved the empty config over the bonds */
+            SCHECK(put_bond_file(good, (uint32_t)gn), "S11b: could not restore the image");
+            bth_heap_fail_size((size_t)cfg_len + 1u);       /* config_parse: osi_calloc(buf_size + 1) (patch 0032) */
+            w0 = bthx_bond_writes();
+            if (start_ready("S11b start")) {
+                SCHECK(bth_heap_fail_size_pending() == 0u, "S11b: the config buffer allocation was not reached");
+                SCHECK(bthx_call_fn(fn_bond_num, 0u, 2000u) == 0, "S11b: bonds loaded although the parse failed");
+                (void)WAIT(0, 500);
+                stop_session("S11b stop");
+            }
+            bth_heap_fail_size(0u);
+            nn = bthx_read_root_file("bt_hp_bonds.bin", now_img, sizeof(now_img));
+            SCHECK(nn == gn && memcmp(now_img, good, (size_t)gn) == 0,
+                   "S11b: bond file replaced after a config parse failure (%d B -> %d B, writes %u -> %u)", gn, nn, w0,
+                   bthx_bond_writes());
+            /* S11c: the next start takes the file over again: the headset's bond is back */
+            if (start_ready("S11c start")) {
+                SCHECK(bthx_call_fn(fn_bond_num, 0u, 2000u) == 1, "S11c: the stored bond was not loaded");
+                stop_session("S11c stop");
+            }
+            nn = bthx_read_root_file("bt_hp_bonds.bin", now_img, sizeof(now_img));
+            SCHECK(nn > 0 && bts1_value_len(now_img, (uint32_t)nn, "bt_cfg_key0") == cfg_len,
+                   "S11c: bond file changed by a clean session (%d B)", nn);
+        }
     }
 
 out:

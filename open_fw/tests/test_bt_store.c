@@ -208,11 +208,53 @@ static void test_load_fuzz(void)
     nvs_close(h);
 }
 
+/* Write hold (silicon 2026-11-25 headphones bond loss): a non-empty card image the store could not take over is held,
+ * so the empty store btc_config_init() saves at every start is never written over it. */
+static void test_hold(void)
+{
+    bt_store_init(NULL);
+    CHECK(!bt_store_held(), "fresh store held");
+    nvs_handle_t h;
+    CHECK(nvs_open("bt_config.conf", NVS_READWRITE, &h) == ESP_OK, "open");
+    static const char cfg[] = "[00:11:22:33:44:55]\nLinkKeyType = 4\nLinkKey = 00112233445566778899aabbccddeeff\n";
+    CHECK(nvs_set_blob(h, "bt_cfg_key0", cfg, sizeof(cfg) - 1u) == ESP_OK, "set");
+    static uint8_t good[BT_STORE_IMAGE_MAX], img[BT_STORE_IMAGE_MAX];
+    size_t n = bt_store_serialize(good, sizeof(good));
+    CHECK(n > 0u, "serialise");
+
+    memcpy(img, good, n);
+    img[n - 1u] ^= 0x01u;                                    /* torn / corrupted digest */
+    CHECK(bt_store_load(img, n) == ESP_ERR_INVALID_CRC, "corrupt image accepted");
+    CHECK(bt_store_held(), "rejected non-empty image not held (the empty store would replace the card's bonds)");
+    CHECK(bt_store_load(good, n) == ESP_OK && !bt_store_held(), "a good load did not clear the hold");
+    memcpy(img, good, n); img[0] = 'B'; img[3] = '2'; reseal(img, n);   /* another store version */
+    CHECK(bt_store_load(img, n) == ESP_ERR_INVALID_VERSION && bt_store_held(), "other version not held");
+    bt_store_reset();
+    CHECK(!bt_store_held(), "reset (mode switch) did not clear the hold");
+    CHECK(bt_store_load(img, 0u) != ESP_OK && !bt_store_held(), "an empty file is held");
+
+    /* patch 0042: Bluedroid could not parse the config: held only when the store holds something */
+    bt_store_reset();
+    bt_store_hold_nonempty();
+    CHECK(!bt_store_held(), "empty store held by hold_nonempty");
+    CHECK(bt_store_load(good, n) == ESP_OK, "reload");
+    bt_store_hold_nonempty();
+    CHECK(bt_store_held(), "non-empty store not held by hold_nonempty");
+    bt_store_hold(0);
+    CHECK(!bt_store_held(), "hold(0)");
+    bt_store_hold(1);
+    CHECK(bt_store_held(), "hold(1)");
+    nvs_close(h);
+    bt_store_init(NULL);
+    CHECK(!bt_store_held(), "init did not clear the hold");
+}
+
 int main(void)
 {
     test_api();
     test_random_ops();
     test_load_fuzz();
+    test_hold();
     if (g_fail) {
         printf("test_bt_store: %d FAILURE(S)\n", g_fail);
         return 1;

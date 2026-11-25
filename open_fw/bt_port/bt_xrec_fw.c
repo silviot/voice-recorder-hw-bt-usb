@@ -112,7 +112,7 @@ static uint32_t s_mem_sample_at, s_mem_log_at;
 extern volatile uint32_t g_rtos_malloc_failures;    /* src/rtos/rtos_port.c (BT=1: failures are counted, not fatal) */
 static volatile uint8_t s_store_flush_req;
 static uint8_t s_bond_fails;             /* consecutive failed bond-file writes (store kept dirty) */
-static uint8_t s_bonds_hold;             /* the mode's bond file exists but could not be read: never written over */
+static uint8_t s_hold_logged;            /* the bond-file hold (bt_store_held) was reported this session */
 static uint32_t s_bond_retry_at;
 static uint32_t s_last_check, s_faults_base, s_hci_to_base, s_irq_cache;
 
@@ -441,10 +441,13 @@ static void bonds_write(void);
 /* Bond store (plan M2 "Store"): loaded before esp_bluedroid_init(); written by the app when bt_store asks.
  * Review STEP10 (C10 / A2): unsaved RAM bonds are newer than the card's file, so a restart in the same mode keeps them
  * (and flushes) instead of reloading the older file; a mode switch first tries to flush the other mode's unsaved bonds
- * into their own file; and a file that exists but cannot be read (no memory, SD error) is never replaced this session
- * (btc_config_init() saves even an empty config at every start, which would have erased every bond). */
+ * into their own file. A bond file that exists but whose bonds this session cannot take over (not readable, no memory,
+ * rejected by bt_store_load, too large, or a config Bluedroid cannot parse: patch 0042) is held (bt_store_held) and
+ * never replaced this session: btc_config_init() saves the (then empty) config at every start, which wrote an empty
+ * store over the card's bonds (silicon 2026-11-25, bt_hp_bonds.bin 152 -> 43 B). The next start tries the file again. */
 static void bonds_load(void)
 {
+    s_hold_logged = 0u;
     if (s_store_mode != s_mode) {
         /* the other mode's bonds must not be written into this mode's file (design §6.4) */
         if (s_store_mode != 0xFFu && bt_store_dirty()) {
@@ -453,10 +456,9 @@ static void bonds_load(void)
                 bt_xrec_plat_log("BT bonds of the other mode not saved (SD write failed): dropped");
             }
         }
-        bt_store_reset();
+        bt_store_reset();                /* also clears the hold */
         s_store_mode = s_mode;
-        s_bonds_hold = 0u;
-    } else if (bt_store_dirty() && !s_bonds_hold) {
+    } else if (bt_store_dirty() && !bt_store_held()) {
         bt_xrec_plat_log("BT bonds kept from RAM (unsaved changes are newer than the card)");
         s_store_flush_req = 1u;
         return;
@@ -468,27 +470,32 @@ static void bonds_load(void)
     path[0] = '/';
     memcpy(&path[1], bond_file(s_mode), strlen(bond_file(s_mode)) + 1u);
     exfat_entry_t ent;
-    if (exfat_find_path(s_vol, path, &ent) != 0 || ent.is_dir || ent.size == 0u ||
-        ent.size > BT_STORE_IMAGE_MAX) {
-        s_bonds_hold = 0u;           /* no usable file: the RAM store is the truth (missing / corrupt file replaced) */
+    if (exfat_find_path(s_vol, path, &ent) != 0 || ent.is_dir || ent.size == 0u) {
+        bt_store_hold(0);            /* no file: the RAM store is the truth */
+        return;
+    }
+    if (ent.size > BT_STORE_IMAGE_MAX) {
+        bt_xrec_plat_log_u32("BT bond file too large (kept, not written this session), size", ent.size);
+        bt_store_reset();
+        bt_store_hold(1);
         return;
     }
     uint8_t *img = (uint8_t *)pvPortMalloc((size_t)ent.size);
     if (img == NULL) {
         bt_xrec_plat_log("BT bonds not loaded: no memory (bond file kept, not written this session)");
-        s_bonds_hold = 1u;
+        bt_store_hold(1);
         return;
     }
     uint32_t nread = 0u;
     if (exfat_read_file(s_vol, &ent, 0u, img, (uint32_t)ent.size, &nread) == 0 && nread == ent.size) {
-        s_bonds_hold = 0u;
-        esp_err_t r = bt_store_load(img, nread);
+        esp_err_t r = bt_store_load(img, nread);     /* a rejected image is held by bt_store */
         if (r != ESP_OK) {
-            bt_xrec_plat_log_u32("BT bond file rejected (store starts empty), err", (uint32_t)r);
+            bt_xrec_plat_log_u32("BT bond file rejected (kept, not written this session; store starts empty), err",
+                                 (uint32_t)r);
         }
     } else {
         bt_xrec_plat_log("BT bond file unreadable (kept, not written this session)");
-        s_bonds_hold = 1u;
+        bt_store_hold(1);
     }
     wipe_mem(img, (size_t)ent.size);
     vPortFree(img);
@@ -496,7 +503,14 @@ static void bonds_load(void)
 
 static void bonds_write(void)
 {
-    if (!bt_store_dirty() || !s_sd || s_vol == NULL || s_store_mode == 0xFFu || s_bonds_hold) {
+    if (!bt_store_dirty() || !s_sd || s_vol == NULL || s_store_mode == 0xFFu) {
+        return;
+    }
+    if (bt_store_held()) {
+        if (!s_hold_logged) {
+            s_hold_logged = 1u;
+            bt_xrec_plat_log("BT bonds not saved: the card's bond file was not loaded this session (kept)");
+        }
         return;
     }
     uint8_t *img = (uint8_t *)pvPortMalloc(BT_STORE_IMAGE_MAX);
@@ -1124,6 +1138,9 @@ void bt_xrec_plat_session_end(void)
     }
     s_store_flush_req = 0u;
     bonds_write();                                       /* final flush of the bond store (retried once more) */
+    if (bt_store_held() && !s_hold_logged) {
+        bt_xrec_plat_log("BT bond file held this session (its bonds were not loaded; file kept)");
+    }
     s_bond_fails = 0u;
     mem_sample();                                        /* the Bluedroid tasks are gone: their last samples */
     mem_log("stop");

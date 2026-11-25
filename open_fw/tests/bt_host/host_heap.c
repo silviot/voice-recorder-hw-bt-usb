@@ -53,13 +53,20 @@ static int s_trace = -1;
 static bth_heap_stats_t s_st;
 static uint64_t s_fail_at;
 static bool s_fail_persistent;
+static size_t s_fail_size;       /* bth_heap_fail_size(): the next attempt of exactly this size fails (0 = off) */
 
 static void lock(void) { vPortEnterCritical(); }
 static void unlock(void) { vPortExitCritical(); }
 
 /* Decide whether this attempt fails (caller holds the lock). */
-static bool inject(void *ra)
+static bool inject(void *ra, size_t n)
 {
+    if (s_fail_size != 0u && n == s_fail_size) {
+        s_fail_size = 0u;
+        s_st.injected++;
+        s_st.last_injected_ra = ra;
+        return true;
+    }
     s_st.armed_seen++;
     if (s_fail_at != 0u && (s_st.armed_seen == s_fail_at || (s_fail_persistent && s_st.armed_seen > s_fail_at))) {
         s_st.injected++;
@@ -139,7 +146,7 @@ static void *bth_alloc(size_t n, bool zero, void *ra)
     }
     lock();
     void *r = NULL;
-    if (!inject(ra)) {
+    if (!inject(ra, n)) {
         void *raw = zero ? __real_calloc(1, HDR + n) : __real_malloc(HDR + n);
         if (raw != NULL) {
             r = track(raw, n, ra);
@@ -253,6 +260,21 @@ void bth_heap_fail_arm(uint64_t n, bool persistent)
     s_fail_at = n;
     s_fail_persistent = persistent;
     unlock();
+}
+
+void bth_heap_fail_size(size_t n)
+{
+    lock();
+    s_fail_size = n;
+    unlock();
+}
+
+size_t bth_heap_fail_size_pending(void)
+{
+    lock();
+    size_t n = s_fail_size;
+    unlock();
+    return n;
 }
 
 void bth_heap_fail_disarm(void)
