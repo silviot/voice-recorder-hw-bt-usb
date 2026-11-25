@@ -23,7 +23,8 @@ work: fold it into the design's live log section** (the design file lives in the
 ## Host results (`test_bt_host_hp hps`, ASan/UBSan, 120 checks, 0 failures; scenario G 20 checks)
 
 After the second review round (table below) S also runs S5b, S5c, S6b and S8b; the two frozen-peer teardowns of the
-run (S8b's escalation, S10) leave 31 blocks / 3392 B together (known leak 13, bound 32 blocks / 8 KiB).
+run (S8b's escalation, S10) left 31 blocks / 3392 B together (known leak 13); since patch 0043 (STEP10 A6) they
+leave 1 block / 32 B (btc's resident profile queue, allocated once), bound 1 block / 64 B, with AVCTP up in S10.
 
 
 - S1 start → READY → stop: 213 ms teardown, heap/tasks/timers back to the baseline.
@@ -74,9 +75,9 @@ run (S8b's escalation, S10) leave 31 blocks / 3392 B together (known leak 13, bo
 10. **Idle:** suspend after 20 s without real audio; the 10 min idle disconnect is not implemented.
 11. **Player:** writes stereo (mono pass-through not used yet); the volume overlay keeps its HP/SPK label.
 12. **Headphones mode starts when the Headphones screen opens** (and reconnects then), not at boot.
-13. **Known leak, frozen-peer teardown only:** AVDTP's stream and signalling blocks of the dead link keep their
-    fixed_queues (16 heap blocks, ~1.7 KB on the host) until reboot; a clean cycle afterwards adds nothing. A
-    responsive headset does not leak.
+13. **Frozen-peer teardown leak: fixed by patch 0043** (STEP10 A6). AVDTP's stream and signalling blocks (and
+    AVCTP's link block) of the dead link kept their fixed_queues (16 heap blocks, ~1.7 KB on the host) until reboot;
+    `AVDT_Deregister()` / `AVCT_Deregister()` now free them.
 14. **Bench:** the tone goes through `aout` (Audio output forced to Headphones for the run), -9.5 dBFS; stats every
     second for 15 s, then every 15 s (the 8 KiB log capture); the player stage plays one file once.
 

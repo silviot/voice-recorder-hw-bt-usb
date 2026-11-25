@@ -27,11 +27,21 @@ void bth_heap_peak_reset(void);   /* peak_bytes = live_bytes (scenario-local pea
 /* Fail the n-th allocation attempt (1-based) from now on; n = 0 disarms. persistent: fail every attempt >= n. */
 void bth_heap_fail_arm(uint64_t n, bool persistent);
 void bth_heap_fail_disarm(void);
+/* Every allocation of exactly `size` bytes made by the FreeRTOS task named `task` fails until called with NULL (e.g.
+ * BTU_TASK's BT_HDR-sized messages: patch 0039's local close, STEP10 A6). Counts what it failed. */
+void bth_heap_fail_task_size(const char *task, size_t size);
+uint64_t bth_heap_task_size_injected(void);
 /* Allocation attempts counted since the last arm (also counts while armed with n = 0 via bth_heap_count_start). */
 void bth_heap_count_start(void);
 uint64_t bth_heap_counted(void);
 uint32_t bth_heap_seq(void);                /* allocation sequence number (live blocks carry theirs) */
 void bth_heap_dump_since(uint32_t seq);     /* stderr: live blocks allocated after seq (BTH_HEAP_TRACE=1: stacks) */
+
+/* ---- BTC context (host_glue.c) ---- */
+/* Run fn(arg) on BTC_TASK (a BTC_PID_ALARM work item, the way Bluedroid runs its own alarms) and wait for it, at most
+ * timeout_ms. 0 = it ran. */
+int bth_btc_run(void (*fn)(void *), void *arg, uint32_t timeout_ms);
+void *bth_a2dp_app_cb(void);                /* the callback given to esp_a2d_register_callback(), or NULL */
 
 /* ---- logging: serialised (FreeRTOS critical section), safe from any task ---- */
 void bth_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));

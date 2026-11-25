@@ -406,6 +406,7 @@ static volatile uint8_t s_hold_up;    /* test knob: the up job waits (the app ta
 static volatile uint8_t s_hold_btc;   /* test knob: the up job ends with BTC_TASK suspended (bthx_hold_btc) */
 static TaskHandle_t volatile s_btc_held;
 static volatile uint32_t s_down_spp_checked, s_down_spp_deinit;   /* down jobs past the SPP check / that deinit */
+static volatile uint8_t s_force_profile_fail;   /* test knob: the next down job's profile teardown reports failure */
 
 static int job_up(void)
 {
@@ -440,6 +441,10 @@ static int job_down(void)
     memset(s_down_ms, 0, sizeof(s_down_ms));
     if (esp_bluedroid_get_status() == ESP_BLUEDROID_STATUS_ENABLED && s_profile_down != NULL) {
         int pr = s_profile_down();
+        if (s_force_profile_fail) {
+            s_force_profile_fail = 0u;   /* test knob (one shot): as if the A2DP deinit had not confirmed */
+            pr = 2;
+        }
         s_profile_down_rc_last = (uint32_t)pr;
         if (pr != 0) {
             rc = 5;
@@ -841,5 +846,6 @@ int bthx_hold_btc(int on)
     return 0;
 }
 int bthx_btc_held(void) { return s_btc_held != NULL; }
+void bthx_force_profile_down_fail(void) { s_force_profile_fail = 1u; }
 uint32_t bthx_down_spp_checked(void) { return s_down_spp_checked; }
 uint32_t bthx_down_spp_deinit(void) { return s_down_spp_deinit; }

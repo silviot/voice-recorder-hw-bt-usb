@@ -57,6 +57,25 @@ static bool s_fail_persistent;
 static void lock(void) { vPortEnterCritical(); }
 static void unlock(void) { vPortExitCritical(); }
 
+/* Targeted failure (bth_heap_fail_task_size): every allocation of exactly s_ts_size bytes made by the FreeRTOS task
+ * named s_ts_task fails while set. */
+static char s_ts_task[configMAX_TASK_NAME_LEN];
+static size_t s_ts_size;
+static uint64_t s_ts_injected;
+
+static bool inject_task_size(size_t n)
+{
+    if (s_ts_task[0] == '\0' || n != s_ts_size || xTaskGetSchedulerState() != taskSCHEDULER_RUNNING) {
+        return false;
+    }
+    const char *name = pcTaskGetName(NULL);
+    if (name == NULL || strcmp(name, s_ts_task) != 0) {
+        return false;
+    }
+    s_ts_injected++;
+    return true;
+}
+
 /* Decide whether this attempt fails (caller holds the lock). */
 static bool inject(void *ra)
 {
@@ -139,7 +158,7 @@ static void *bth_alloc(size_t n, bool zero, void *ra)
     }
     lock();
     void *r = NULL;
-    if (!inject(ra)) {
+    if (!inject_task_size(n) && !inject(ra)) {
         void *raw = zero ? __real_calloc(1, HDR + n) : __real_malloc(HDR + n);
         if (raw != NULL) {
             r = track(raw, n, ra);
@@ -253,6 +272,25 @@ void bth_heap_fail_arm(uint64_t n, bool persistent)
     s_fail_at = n;
     s_fail_persistent = persistent;
     unlock();
+}
+
+void bth_heap_fail_task_size(const char *task, size_t size)
+{
+    lock();
+    memset(s_ts_task, 0, sizeof(s_ts_task));
+    if (task != NULL) {
+        strncpy(s_ts_task, task, sizeof(s_ts_task) - 1u);
+    }
+    s_ts_size = size;
+    unlock();
+}
+
+uint64_t bth_heap_task_size_injected(void)
+{
+    lock();
+    uint64_t n = s_ts_injected;
+    unlock();
+    return n;
 }
 
 void bth_heap_fail_disarm(void)

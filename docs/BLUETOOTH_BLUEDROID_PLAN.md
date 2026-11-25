@@ -846,6 +846,17 @@ secret of ~33 predictable bits: bench-only waiver, see the review-round entry be
   the app task out 400 ms/s (0 empty packets; 23 without the fix). Headphones S1 checks that the mode is saved
   (byte 5 of `bt_hp_cfg.bin`, only on change). BT=1 only: default image unchanged (0xECB8); gates 0 warnings, bt
   0xECD8, hp 0xF183, hpb 0xA698, bench 0xC057 (CRCs depend on the worktree path).
+- 2026-11-25 (STEP10 A6 + C13, branch `fix/s10-avdt-leak` from `ab27527`; host only): patch **0043**:
+  `AVDT_Deregister()` / `AVCT_Deregister()` free the stream/channel/link blocks a frozen headset's link left allocated
+  (they were lost at the next Register's memset: 31 blocks / 3.4 KB per run of S8b + S10, ~600 B more with AVCTP up)
+  and 0039's local close runs the stream state machine directly instead of posting an `osi_malloc`'d `BT_HDR`. The
+  session escalates job rc 5 (A2DP/AVRC deinit not confirmed) to FAULTED (`BT fault` on the Headphones screen,
+  `last_fault` DOWN_FAIL; start still refused until reboot, no hard path). C13: the A2DP target is mirrored under the
+  session lock, and `a2d_cb` leaves TX, ACL handle, pending flags and codec cache alone for another device's late
+  CONNECTED / DISCONNECTED / AUDIO_CFG. Harness levers: `bth_heap_fail_task_size()` (BTU_TASK's 8-byte allocations
+  fail during S10's frozen stop), `bth_btc_run()` (late events injected on BTC_TASK, S10a),
+  `bthx_force_profile_down_fail()` (S10d). Each part reverted alone fails `test_bt_host_hp hps` (AVDT / AVCT: leak 31 /
+  6 blocks; 0039: deinit timeout, FAULTED; session: S10a 5 checks, S10d 2 checks). BT=0 CRC unchanged 0xECB8.
 
 ## 11. Round-1 traceability
 
