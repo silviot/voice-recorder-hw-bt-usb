@@ -310,8 +310,15 @@ Run: `mode=hp hp_stage=player hp_addr=08:C8:C2:82:6C:EB hp_pair=1 secs=60`, head
 Notes:
 - `BTBENCH.LOG` (8 KiB) filled after ~11 s of play (`LOGCAP lost=8416`); the per-second `cpu`/`tasks`/`ctrl`
   lines use ~600 B/s. Use `secs=15` for measurement runs; longer runs only for listening.
-- Still to check on this image through the normal UI (no RUN file): Forget row shows the name, `BT` output with
-  the headset, `Both` output (speaker + headset), `BT` output with the headset off shows the toast.
+
+Normal UI on the same image (no RUN file), user report "All worked flawlessly":
+
+| Check | Result |
+|---|---|
+| Settings → Bluetooth Forget row | shows "Forget Jabra Hear Me Out" (name, not MAC) |
+| output `BT`, headset on | plays in the headset; clean, no periodic hiccup |
+| output `Both`, headset on | plays on the speaker and the headset together |
+| output `BT`, headset off, PLAY | shows the not-connected toast instead of a silent stall |
 
 ## Exp 1 stages A and B: how to run
 
