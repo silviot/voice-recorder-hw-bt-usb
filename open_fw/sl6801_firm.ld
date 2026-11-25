@@ -167,6 +167,7 @@ SECTIONS
         *libbluedroid.a:sbc_enc_bit_alloc_ste.o(.text .text.*)
         *libbluedroid.a:sbc_encoder.o(.text .text.*)
         *libbluedroid.a:sbc_packing.o(.text .text.*)
+        *(.bt_fast.text .bt_fast.text.*)   /* BT_FAST (bt_rom_if.h): bt_ctrl / ROM-glue hot path */
         . = ALIGN(8);
         _ebt_fast = .;
     } > RTOS_HEAP_LO AT > XIP

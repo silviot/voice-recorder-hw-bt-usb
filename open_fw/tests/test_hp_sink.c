@@ -8,6 +8,7 @@
 #include <string.h>
 #include <time.h>
 #include "hp_sink.h"
+#include "hp_rs_taps.h"
 #include "hp_test_util.h"
 
 static int16_t g_store[8192];   /* 16 KiB = 4096 frames */
@@ -213,6 +214,55 @@ static void test_resampler(void)
     CHECK(rs.mode == HP_RS_X3, "x3 mode");
 }
 
+/* ---- exact 3x: the 32-bit accumulator of x3_dot (SMLADX on the target) equals the 64-bit reference bit for bit:
+ * no partial sum can overflow (sum|g| * 32768 + rounding < 2^31 per phase), and full-scale noise with -32768 / 32767
+ * runs through the mono fast path and the generic (stereo) path in odd chunk sizes against a direct int64 model. */
+static void test_x3_exact(void)
+{
+    for (int p = 0; p < 3; p++) {
+        int64_t sa = 0;
+        for (int j = 0; j < HP_RS3_TAPS; j++) sa += hp_rs3_taps[p][j] < 0 ? -hp_rs3_taps[p][j] : hp_rs3_taps[p][j];
+        CHECK(sa * 32768 + (1 << 14) < ((int64_t)1 << 31), "x3 phase %d: sum|g| %lld can overflow int32", p, (long long)sa);
+    }
+    enum { N = 3000 };
+    static int16_t x[N], xs[2 * N], y[3 * N], ys[2 * 3 * N];
+    unsigned seed = 7;
+    for (int i = 0; i < N; i++) {
+        int r = rand_r(&seed) % 10;
+        x[i] = r == 0 ? -32768 : r == 1 ? 32767 : (int16_t)(rand_r(&seed) & 0xFFFF);
+        xs[2 * i] = x[i];
+        xs[2 * i + 1] = (int16_t)~x[i];
+    }
+    for (int ch = 1; ch <= 2; ch++) {
+        hp_rs_t rs;
+        hp_rs_reset(&rs, 16000, 48000, (uint8_t)ch);
+        const int16_t *in = ch == 1 ? x : xs;
+        int16_t *out = ch == 1 ? y : ys;
+        uint32_t used_tot = 0, made_tot = 0, step = 1;
+        while (made_tot < 3u * N - 3u) {
+            uint32_t used = 0, want = (step++ % 7u) * 13u + 1u, n_in = N - used_tot < 37u ? N - used_tot : 37u;
+            if (want > 3u * N - made_tot) want = 3u * N - made_tot;
+            made_tot += hp_rs_process(&rs, in + (size_t)used_tot * ch, n_in, &used, out + (size_t)made_tot * ch, want);
+            used_tot += used;
+        }
+        uint32_t bad = 0;
+        for (uint32_t k = 0; k < made_tot; k++) {   /* output 3m + p uses x[m - j], x[<0] = 0 */
+            uint32_t m = k / 3u, p = k % 3u;
+            for (int c = 0; c < ch; c++) {
+                int64_t acc = 0;
+                for (int j = 0; j < HP_RS3_TAPS; j++) {
+                    if ((int64_t)m - j >= 0) acc += (int64_t)hp_rs3_taps[p][j] * in[(m - (uint32_t)j) * (uint32_t)ch + (uint32_t)c];
+                }
+                int64_t v = (acc + (1 << 14)) >> 15;
+                v = v > 32767 ? 32767 : v < -32768 ? -32768 : v;
+                bad += out[k * (uint32_t)ch + (uint32_t)c] != (int16_t)v;
+            }
+        }
+        CHECK(bad == 0u, "x3 ch%d: %u outputs differ from the int64 reference", ch, bad);
+    }
+    printf("  x3 exact: int32 accumulator bound ok, mono and stereo paths match the int64 reference (full scale)\n");
+}
+
 /* ---- two-thread stress: producer writes (epoch, index) pairs with random flushes; the consumer (copy path) checks
  * that epochs never go back and indices are consecutive within an epoch, i.e. no torn or stale slot is ever
  * consumed. Run under TSan by the make target. ---- */
@@ -296,6 +346,7 @@ int main(int argc, char **argv)
         test_format_and_mapping();
         test_tap();
         test_resampler();
+        test_x3_exact();
     }
     test_stress(secs);
     printf("test_hp_sink: %s\n", g_fail ? "FAIL" : "PASS");

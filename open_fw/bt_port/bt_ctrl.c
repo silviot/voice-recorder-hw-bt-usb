@@ -237,7 +237,7 @@ static void defer_fault(uint32_t code, uint32_t site, uint32_t a, uint32_t b)
 
 /* Plan M1: "bt_ctrl checks bt_stop before every ROM call". Once latched, bt_ctrl parks for good: no ROM call, no
  * reply, no ring activity. Diagnostics (lock_depth, stats) are not ROM calls. */
-static bool gate(void)
+BT_FAST static bool gate(void)
 {
     if (g.parked) {
         return false;
@@ -250,7 +250,7 @@ static bool gate(void)
     return true;
 }
 
-static uint32_t hc_get(const hcount_t *t, uint16_t h)
+BT_FAST static uint32_t hc_get(const hcount_t *t, uint16_t h)
 {
     for (uint32_t i = 0u; i < BT_CTRL_MAX_LINKS; i++) {
         if (t[i].count != 0u && t[i].handle == h) {
@@ -260,7 +260,7 @@ static uint32_t hc_get(const hcount_t *t, uint16_t h)
     return 0u;
 }
 
-static bool hc_add(hcount_t *t, uint16_t h, uint32_t n)
+BT_FAST static bool hc_add(hcount_t *t, uint16_t h, uint32_t n)
 {
     hcount_t *free_e = NULL;
     for (uint32_t i = 0u; i < BT_CTRL_MAX_LINKS; i++) {
@@ -285,7 +285,7 @@ static bool hc_add(hcount_t *t, uint16_t h, uint32_t n)
 }
 
 /* Subtract up to n; returns the amount actually subtracted. */
-static uint32_t hc_sub(hcount_t *t, uint16_t h, uint32_t n)
+BT_FAST static uint32_t hc_sub(hcount_t *t, uint16_t h, uint32_t n)
 {
     for (uint32_t i = 0u; i < BT_CTRL_MAX_LINKS; i++) {
         if (t[i].count != 0u && t[i].handle == h) {
@@ -302,7 +302,7 @@ static uint32_t hc_clear(hcount_t *t, uint16_t h)
     return hc_sub(t, h, 0xFFFFFFFFu);
 }
 
-static uint32_t tx_free_locked(void)
+BT_FAST static uint32_t tx_free_locked(void)
 {
     uint32_t n = 0u;
     for (uint32_t i = 0u; i < BT_CTRL_TX_SLOTS; i++) {
@@ -311,7 +311,7 @@ static uint32_t tx_free_locked(void)
     return n;
 }
 
-static uint32_t evt_used(void)
+BT_FAST static uint32_t evt_used(void)
 {
     g.p.enter();
     uint32_t u = g.evt_head - g.evt_tail;
@@ -319,7 +319,7 @@ static uint32_t evt_used(void)
     return u;
 }
 
-static uint32_t acl_used(void)
+BT_FAST static uint32_t acl_used(void)
 {
     g.p.enter();
     uint32_t u = g.acl_head - g.acl_tail;
@@ -367,7 +367,7 @@ static void trace_evt(const uint8_t *h4, uint16_t len)
 }
 #endif
 
-static void evt_push(const uint8_t *h4, uint16_t len, uint32_t seq)
+BT_FAST static void evt_push(const uint8_t *h4, uint16_t len, uint32_t seq)
 {
 #if defined(BT_CTRL_HCI_TRACE) && BT_CTRL_HCI_TRACE
     trace_evt(h4, len);
@@ -385,7 +385,7 @@ static void evt_push(const uint8_t *h4, uint16_t len, uint32_t seq)
 
 /* Free a TX slot owned by bt_ctrl; a full -> not-full transition schedules notify_host_send_available() in bt_dlv
  * (contract §4: the only wake-up for ACL blocked by a full ring). */
-static void tx_release(uint32_t idx)
+BT_FAST static void tx_release(uint32_t idx)
 {
     g.p.enter();
     bool was_full = tx_free_locked() == 0u;
@@ -677,7 +677,7 @@ static uint8_t handle_bit(uint16_t h)
     return (h >= 0x80u && h < 0x80u + BT_CTRL_MAX_LINKS) ? (uint8_t)(1u << (h - 0x80u)) : 0u;
 }
 
-static void apply_event_side_effects(const bt_ctrl_evt_info_t *info)
+BT_FAST static void apply_event_side_effects(const bt_ctrl_evt_info_t *info)
 {
     if (info->kind != BT_CTRL_EVK_EVT || info->status != BT_HCI_OK) {
         return;
@@ -707,7 +707,7 @@ static void apply_event_side_effects(const bt_ctrl_evt_info_t *info)
     }
 }
 
-static bt_rom_msg_ret_t accept_general(uint16_t id, uint8_t *param, uint16_t param_len, const uint8_t *h4,
+BT_FAST static bt_rom_msg_ret_t accept_general(uint16_t id, uint8_t *param, uint16_t param_len, const uint8_t *h4,
                                        uint16_t len, uint32_t seq)
 {
     if (g.def_n == 0u && evt_general_space()) {   /* never ahead of older deferred events */
@@ -736,7 +736,7 @@ void bt_ctrl_set_nocp_observer(void (*obs)(uint16_t handle, uint32_t pkts))
     s_nocp_obs = obs;
 }
 
-static void rom_nocp(const uint8_t *p, uint16_t len)
+BT_FAST static void rom_nocp(const uint8_t *p, uint16_t len)
 {
     g.st.nocp_from_rom++;
     if (len < 2u) {
@@ -774,7 +774,7 @@ static void rom_nocp(const uint8_t *p, uint16_t len)
     }
 }
 
-static bt_rom_msg_ret_t rom_acl_rx(uint8_t *param, uint16_t len, uint32_t seq)
+BT_FAST static bt_rom_msg_ret_t rom_acl_rx(uint8_t *param, uint16_t len, uint32_t seq)
 {
     bt_rom_acl_desc_t d;
     g.st.acl_rx_msgs++;
@@ -819,7 +819,7 @@ static bt_rom_msg_ret_t rom_acl_rx(uint8_t *param, uint16_t len, uint32_t seq)
     return BT_ROM_MSG_KEEP;
 }
 
-static bt_rom_msg_ret_t up_on_hci_msg(void *ctx, uint16_t id, uint8_t *param, uint16_t param_len, uint16_t src_id)
+BT_FAST static bt_rom_msg_ret_t up_on_hci_msg(void *ctx, uint16_t id, uint8_t *param, uint16_t param_len, uint16_t src_id)
 {
     (void)src_id;
     if (g.parked) {
@@ -918,7 +918,7 @@ static bt_rom_msg_ret_t up_on_hci_msg(void *ctx, uint16_t id, uint8_t *param, ui
     return accept_general(id, param, param_len, g.scratch, len, seq);
 }
 
-static void up_on_irq(void *ctx)
+BT_FAST static void up_on_irq(void *ctx)
 {
     (void)ctx;
     g.st.irq_wakes++;
@@ -1357,7 +1357,7 @@ static void process_cmd(uint32_t idx)
 
 enum { ACL_DONE = 0, ACL_BLOCKED = 1, ACL_PARKED = 2 };
 
-static int process_acl(uint32_t idx)
+BT_FAST static int process_acl(uint32_t idx)
 {
     const uint8_t *d = g.tx[idx].data;
     uint16_t hdr = rd16(&d[1]);
@@ -1439,7 +1439,7 @@ static int process_acl(uint32_t idx)
 }
 
 /* Pick the next TX entry: oldest eligible; order kept within ordinary commands and within ACL. */
-static int tx_pick(void)
+BT_FAST static int tx_pick(void)
 {
     int oc = -1, oa = -1, on = -1;
     g.p.enter();
@@ -1476,7 +1476,7 @@ static int tx_pick(void)
     return best;
 }
 
-static bool tx_drain(void)
+BT_FAST static bool tx_drain(void)
 {
     bool progress = false;
     g.acl_blocked = 0u;
@@ -1509,7 +1509,7 @@ static bool tx_drain(void)
 /* ------------------------------------------------------------------------------------------------------------- */
 /* controller -> host dispatcher                                                                                  */
 /* ------------------------------------------------------------------------------------------------------------- */
-static bool emit_nocp(void)
+BT_FAST static bool emit_nocp(void)
 {
     uint16_t hs[BT_CTRL_MAX_LINKS], cs[BT_CTRL_MAX_LINKS];
     uint8_t n = 0u;
@@ -1529,7 +1529,7 @@ static bool emit_nocp(void)
     return true;
 }
 
-static bool retry_deferred(void)
+BT_FAST static bool retry_deferred(void)
 {
     bool progress = false;
     while (g.def_n != 0u && evt_general_space()) {
@@ -1623,7 +1623,7 @@ static bool purge_stale_held(bool *progress)
     return true;
 }
 
-static bool dispatch_acl(void)
+BT_FAST static bool dispatch_acl(void)
 {
     bool progress = false;
     if (!purge_stale_held(&progress)) {
@@ -1703,7 +1703,7 @@ static bool dispatch_acl(void)
 }
 
 /* Order: NOCP and deferred events first (events are never gated by ACL credits), then ACL. */
-static bool rx_dispatch(void)
+BT_FAST static bool rx_dispatch(void)
 {
     bool progress = false;
     progress |= emit_nocp();
@@ -1721,7 +1721,7 @@ static bool rx_dispatch(void)
 /* The top half has already acked INTSTAT (BT_ROM_INTERFACE §7), so "loop until the status register reads clear"
  * (plan M1) is a loop until the latched software pending word reads clear. Bounded; leftovers make run() report
  * more work. */
-static bool bottom_half(bool *more)
+BT_FAST static bool bottom_half(bool *more)
 {
     uint32_t loops = 0u;
     for (;;) {
@@ -1737,19 +1737,15 @@ static bool bottom_half(bool *more)
         if (bits == 0u) {
             break;
         }
-        for (uint32_t b = 0u; b < 32u; b++) {
-            if (bits & (1u << b)) {
-                g.st.bh_serviced[b]++;
-            }
+        for (uint32_t m = bits; m != 0u; m &= m - 1u) {   /* set bits only: this runs ~1700 times a second */
+            g.st.bh_serviced[__builtin_ctz(m)]++;
         }
         if (!gate()) {
             return false;
         }
         uint32_t un = g.rom->irq_service(bits);
-        for (uint32_t b = 0u; b < 32u; b++) {
-            if (un & (1u << b)) {
-                g.st.bh_unhandled[b]++;
-            }
+        for (uint32_t m = un; m != 0u; m &= m - 1u) {
+            g.st.bh_unhandled[__builtin_ctz(m)]++;
         }
         loops++;
     }
@@ -1761,7 +1757,7 @@ static bool bottom_half(bool *more)
 }
 
 /* Returns true if kernel events remain after the budget. */
-static bool kernel_run(void)
+BT_FAST static bool kernel_run(void)
 {
     for (uint32_t k = 0u; k < BT_CTRL_RUN_CALLS; k++) {
         if (!gate()) {
@@ -1820,7 +1816,7 @@ static void do_stop(void)
     g.p.exit();
 }
 
-uint32_t bt_ctrl_run(void)
+BT_FAST uint32_t bt_ctrl_run(void)
 {
     if (!g.inited) {
         return 0u;
@@ -1909,7 +1905,7 @@ uint32_t bt_ctrl_run(void)
 /* ------------------------------------------------------------------------------------------------------------- */
 /* HCI driver ops (hciT)                                                                                          */
 /* ------------------------------------------------------------------------------------------------------------- */
-bool bt_ctrl_check_send_available(void)
+BT_FAST bool bt_ctrl_check_send_available(void)
 {
     if (!g.inited) {
         return false;
@@ -1920,7 +1916,7 @@ bool bt_ctrl_check_send_available(void)
     return ok;
 }
 
-static bool h4_tx_valid(const uint8_t *data, uint16_t len)
+BT_FAST static bool h4_tx_valid(const uint8_t *data, uint16_t len)
 {
     if (data == NULL || len < 1u || len > BT_CTRL_TX_SLOT_BYTES) {
         return false;
@@ -1938,7 +1934,7 @@ static bool h4_tx_valid(const uint8_t *data, uint16_t len)
     return false;                            /* 0x03 SCO is not compiled in; anything else is a host bug */
 }
 
-void bt_ctrl_send(uint8_t *data, uint16_t len)
+BT_FAST void bt_ctrl_send(uint8_t *data, uint16_t len)
 {
     if (!g.inited) {
         return;

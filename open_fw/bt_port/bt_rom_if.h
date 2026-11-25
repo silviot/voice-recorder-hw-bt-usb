@@ -22,6 +22,15 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Hot controller-glue functions (IRQ 26 bottom half, ROM kernel dispatch, ROM heap / lock / EM hooks, the bt_ctrl task
+ * loop): placed in .bt_fast (sl6801_firm.ld), executed from SRAM instead of XIP. Silicon 2026-11-25: bt_ctrl took
+ * 21-33 % of the CPU during A2DP streaming at ~1700 IRQ 26 per second. Empty on the host. */
+#if defined(__arm__) && !defined(OPENFW_HOST_MMIO)
+#define BT_FAST __attribute__((section(".bt_fast.text")))
+#else
+#define BT_FAST
+#endif
+
 /* ---- kernel task ids (BT_ROM_INTERFACE §3.2) ---- */
 #define BT_ROM_TASK_LM          0x38u
 #define BT_ROM_TASK_LC          0x39u   /* per-link instance: (link_id << 8) | 0x39 */

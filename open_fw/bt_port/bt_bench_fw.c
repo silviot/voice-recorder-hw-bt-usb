@@ -176,6 +176,7 @@ static void act(uint32_t a, uint32_t now)
 #include "hp_tx.h"
 #include "hp_tx_bd.h"
 #include "bt_rom_real.h"
+#include "bt_ctrl_rtos.h"
 #ifndef OPENFW_BT_BLUEDROID
 #define OPENFW_BT_BLUEDROID 1                /* BT=1 only; the bt_port library is built without the app's -D */
 #endif
@@ -194,6 +195,7 @@ static struct {
     uint32_t phase;
     uint32_t prev_pkts, prev_frames, prev_acked, prev_pads, prev_el_ms;
     uint32_t prev_us, prev_late, prev_ticks, prev_sbc, prev_irq, prev_ui_fr;
+    uint32_t prev_runs, prev_run_us, prev_svc_us, prev_disp_us, prev_disp_n;
 } s_hp BENCH_HI;
 static char s_hp_play_path[BT_BENCH_HP_FILE_MAX + 1u] BENCH_HI;
 
@@ -363,6 +365,8 @@ static void hp_cpu_stats(const hp_tx_t *t)
     }
     bt_rom_real_diag_t rd;
     bt_rom_real_diag(&rd);
+    bt_ctrl_rtos_stats_t cs;
+    bt_ctrl_rtos_stats(&cs);
     uint32_t sbc = t->st.frames_sbc - s_hp.prev_sbc, ui_fr = g_ui_frames;
     if (s_hp.prev_us != 0u && dt != 0u) {
         lbegin("hp cpu");
@@ -389,6 +393,19 @@ static void hp_cpu_stats(const hp_tx_t *t)
         uint32_t sum_pm = (uint32_t)((uint64_t)sum * 1000u / dt);
         lku("other", sum_pm < 1000u ? 1000u - sum_pm : 0u);
         lemit();
+        /* bt_ctrl split: its task time = ROM ISR work (irq_service) + ROM kernel dispatches (incl. TASK_HCI upcalls)
+         * + our glue (the rest: bottom half, rings, ACL/event paths, FreeRTOS calls). us per interval, per run. */
+        uint32_t runs = cs.ctrl_runs - s_hp.prev_runs, run_us = cs.ctrl_run_total_us - s_hp.prev_run_us;
+        uint32_t isr = rd.svc_sum_us - s_hp.prev_svc_us, ke = rd.disp_sum_us - s_hp.prev_disp_us;
+        lbegin("hp ctrl");
+        lku("runs", runs);
+        lku("run_us", run_us);
+        lku("rom_isr_us", isr);
+        lku("rom_ke_us", ke);
+        lku("glue_us", run_us > isr + ke ? run_us - isr - ke : 0u);
+        lku("disp", rd.disp_count - s_hp.prev_disp_n);
+        lku("us_run", runs ? run_us / runs : 0u);
+        lemit();
     }
     s_task_prev_n = 0u;
     for (UBaseType_t i = 0; i < n && i < HPB_TASKS_MAX; i++) {
@@ -402,6 +419,11 @@ static void hp_cpu_stats(const hp_tx_t *t)
     s_hp.prev_sbc = t->st.frames_sbc;
     s_hp.prev_irq = rd.irq_total;
     s_hp.prev_ui_fr = ui_fr;
+    s_hp.prev_runs = cs.ctrl_runs;
+    s_hp.prev_run_us = cs.ctrl_run_total_us;
+    s_hp.prev_svc_us = rd.svc_sum_us;
+    s_hp.prev_disp_us = rd.disp_sum_us;
+    s_hp.prev_disp_n = rd.disp_count;
 }
 
 static void hp_stats(uint32_t el_ms)

@@ -68,12 +68,12 @@ void bt_bench_cfg_default(bt_bench_cfg_t *cfg)
     cfg->hp_mono = 0u;
     cfg->hp_secs = 10u;
     cfg->hp_rate = 0u;
-    cfg->hp_bitpool = 35u;
-    cfg->hp_speech_bp = 24u;
+    cfg->hp_bitpool = 53u;
+    cfg->hp_speech_bp = 0u;
     cfg->hp_tick_ms = 20u;
     cfg->hp_pkt_per_tick = 2u;
     cfg->hp_txq = 4u;
-    cfg->hp_credit_ticks = 2u;
+    cfg->hp_credit_ticks = 4u;
     cfg->hp_credits = 4u;
     cfg->hp_tone_hz = 1000u;
     for (uint32_t i = 0u; i < sizeof(cfg->hp_file); i++) {
@@ -280,7 +280,7 @@ static int hp_rules(uint32_t seen, bt_bench_cfg_t *c)
         if (SEEN(K_HP_SPEECH_BP)) {
             return -1;
         }
-        c->hp_speech_bp = c->hp_bitpool;                 /* default 24 under a smaller explicit max */
+        c->hp_speech_bp = c->hp_bitpool;                 /* a nonzero default under a smaller explicit max */
     }
     return 0;
 #undef SEEN

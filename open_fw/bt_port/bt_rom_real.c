@@ -173,7 +173,7 @@ static void zero_ram(void *dst, uint32_t n)
 }
 
 /* ---- nested PRIMASK lock (F:253-272), hooked at 0x00803C1C/20 ---- */
-static void rr_lock(void)
+BT_FAST static void rr_lock(void)
 {
     uint32_t primask;
     __asm__ volatile ("mrs %0, primask\n cpsid i" : "=r"(primask) :: "memory");
@@ -183,7 +183,7 @@ static void rr_lock(void)
     s_nest++;
 }
 
-static void rr_unlock(void)
+BT_FAST static void rr_unlock(void)
 {
     if (s_nest > 0u) {
         s_nest--;
@@ -219,7 +219,7 @@ static inline void raw_irq_restore(uint32_t pm)
  * rr_rand80 is the legacy generator (F:293-309 verbatim): it still serves the radio-timing call sites and any
  * untraced one, so they keep the exact 0..79 behaviour tested on silicon. rr_rand_hook is what the slot holds: it
  * routes the SSP nonce, LMP random and passkey sites to DRBG bytes the app pre-filled (bt_rom_rng_feed). */
-static uint32_t rr_rand80(void)
+BT_FAST static uint32_t rr_rand80(void)
 {
     uint32_t x = s_prng ^ (uint32_t)us_timer_now();
     x ^= x << 13;
@@ -232,7 +232,7 @@ static uint32_t rr_rand80(void)
     return x % 80u;
 }
 
-__attribute__((noinline)) static uint32_t rr_rand_hook(void)
+BT_FAST __attribute__((noinline)) static uint32_t rr_rand_hook(void)
 {
     /* Entered by `bx r3` from the thunk at ROM 0x3DE98, which every caller reaches with `bl`: LR is the ROM call
      * site + 4 (test_bt_rom_rng re-derives the 11 sites from the ROM image). */
@@ -308,7 +308,7 @@ static void rr_heap_init(void)
     s_d.heap_used = 0u;
 }
 
-static void *rr_malloc(uint32_t size, uint8_t type)
+BT_FAST static void *rr_malloc(uint32_t size, uint8_t type)
 {
     if (size > BT_HEAP_BYTES - (uint32_t)sizeof(bt_blk_hdr_t) - 7u) {
         s_d.alloc_fail++;
@@ -366,7 +366,7 @@ static void *rr_malloc(uint32_t size, uint8_t type)
     return 0;
 }
 
-static void rr_free(void *ptr)
+BT_FAST static void rr_free(void *ptr)
 {
     if (!ptr) {
         return;
@@ -392,7 +392,7 @@ static void rr_free(void *ptr)
     rr_unlock();
 }
 
-static uint32_t heap_largest_free(void)
+BT_FAST static uint32_t heap_largest_free(void)
 {
     uint32_t best = 0u;
     uint32_t pm = raw_irq_save();                             /* allocator state changes only under PRIMASK */
@@ -421,7 +421,7 @@ static uint32_t heap_largest_free(void)
 }
 
 /* ---- ke_event scheduler hooks (F:393-425) ---- */
-static uint32_t rr_schedule(uint32_t max_steps)
+BT_FAST static uint32_t rr_schedule(uint32_t max_steps)
 {
     volatile uint32_t *ev_field = (volatile uint32_t *)KE_EVT_FIELD;
     void (*const *cbs)(void) = (void (*const *)(void))KE_EVT_CBS;
@@ -442,6 +442,7 @@ static uint32_t rr_schedule(uint32_t max_steps)
                 }
                 uint32_t dt = now32() - t0;
                 s_d.disp_count++;
+                s_d.disp_sum_us += dt;
                 if (dt > s_d.disp_max_us) {
                     s_d.disp_max_us = dt;
                     s_d.disp_max_ev = (uint32_t)b;
@@ -454,12 +455,12 @@ static uint32_t rr_schedule(uint32_t max_steps)
 }
 
 /* Installed at 0x00804200 like the legacy scheduler (F:1073), in case a ROM path calls ke_event_schedule itself. */
-static void rr_ke_event_schedule(void)
+BT_FAST static void rr_ke_event_schedule(void)
 {
     (void)rr_schedule(64u);
 }
 
-static void rr_ke_event_set(uint8_t ev)                       /* F:418-425 */
+BT_FAST static void rr_ke_event_set(uint8_t ev)                       /* F:418-425 */
 {
     if (ev <= 5u) {
         rr_lock();
@@ -469,7 +470,7 @@ static void rr_ke_event_set(uint8_t ev)                       /* F:418-425 */
 }
 
 /* ---- HCI layer: TASK_HCI + the hci_tl_env the ROM expects at 0x00803C28 (F:1081-1107) ---- */
-static uint32_t rr_hook_ret0(void) { return 0u; }             /* F:428 */
+BT_FAST static uint32_t rr_hook_ret0(void) { return 0u; }             /* F:428 */
 
 static void rr_hook_3bbc_7_set_evt_mask(const uint8_t *mask)  /* F:481-488 verbatim */
 {
@@ -723,7 +724,7 @@ static void rr_irq_enable(int on)
     }
 }
 
-static uint32_t rr_irq_take(void)                             /* F:274-280 fetch-and-clear under PRIMASK */
+BT_FAST static uint32_t rr_irq_take(void)                             /* F:274-280 fetch-and-clear under PRIMASK */
 {
     uint32_t pm = raw_irq_save();
     uint32_t stat = s_irq_pending;
@@ -741,7 +742,7 @@ static uint32_t rr_irq_take(void)                             /* F:274-280 fetch
     return stat;
 }
 
-static uint32_t rr_irq_service(uint32_t bits)                 /* F:282-290 */
+BT_FAST static uint32_t rr_irq_service(uint32_t bits)                 /* F:282-290 */
 {
     uint32_t t0 = now32();
     if (bits & (1u << 0)) {
@@ -754,6 +755,7 @@ static uint32_t rr_irq_service(uint32_t bits)                 /* F:282-290 */
         rom_ke_event_set(1u);
     }
     uint32_t dt = now32() - t0;
+    s_d.svc_sum_us += dt;
     if (dt > s_d.svc_max_us) {
         s_d.svc_max_us = dt;
     }
@@ -762,12 +764,12 @@ static uint32_t rr_irq_service(uint32_t bits)                 /* F:282-290 */
     return un;
 }
 
-static uint32_t rr_events(void)
+BT_FAST static uint32_t rr_events(void)
 {
     return REG32(KE_EVT_FIELD) & 0x3Fu;
 }
 
-static uint32_t rr_run(uint32_t max_steps)
+BT_FAST static uint32_t rr_run(uint32_t max_steps)
 {
     uint32_t t0 = now32();
     uint32_t ev = rr_schedule(max_steps);
@@ -778,7 +780,7 @@ static uint32_t rr_run(uint32_t max_steps)
     return ev;
 }
 
-static uint8_t *rr_msg_alloc(uint16_t id, uint16_t dst, uint16_t src, uint16_t len)
+BT_FAST static uint8_t *rr_msg_alloc(uint16_t id, uint16_t dst, uint16_t src, uint16_t len)
 {
     /* The ROM's ke_msg_alloc never returns NULL (BT_ROM_INTERFACE §3.1): refuse here, before it can run dry. Both the
      * total and the largest contiguous free run count (first fit, no back-coalescing: a fragmented heap can be under
@@ -790,22 +792,22 @@ static uint8_t *rr_msg_alloc(uint16_t id, uint16_t dst, uint16_t src, uint16_t l
     return (uint8_t *)rom_ke_msg_alloc(id, dst, src, len);    /* zero-filled param pointer */
 }
 
-static void rr_msg_send(uint8_t *param)
+BT_FAST static void rr_msg_send(uint8_t *param)
 {
     rom_ke_msg_send(param);                                   /* takes the PARAM pointer (F:952) */
 }
 
-static void rr_msg_free(uint8_t *param)
+BT_FAST static void rr_msg_free(uint8_t *param)
 {
     rom_ke_msg_free(param - 0x10);                            /* takes the HEADER pointer (F:944) */
 }
 
-static uint16_t rr_conhdl_to_task(uint16_t conhdl) { return rom_hci_conhdl_to_task(conhdl); }
-static uint8_t  rr_conhdl_type(uint16_t conhdl)    { return rom_hci_conhdl_type(conhdl); }
-static uint8_t *rr_em_tx_alloc(void)               { return rom_em_buf_tx_alloc(); }
-static void     rr_em_rx_free(uint8_t *em)         { rom_em_buf_rx_free(em); }
+BT_FAST static uint16_t rr_conhdl_to_task(uint16_t conhdl) { return rom_hci_conhdl_to_task(conhdl); }
+BT_FAST static uint8_t  rr_conhdl_type(uint16_t conhdl)    { return rom_hci_conhdl_type(conhdl); }
+BT_FAST static uint8_t *rr_em_tx_alloc(void)               { return rom_em_buf_tx_alloc(); }
+BT_FAST static void     rr_em_rx_free(uint8_t *em)         { rom_em_buf_rx_free(em); }
 
-static void rr_em_write(uint8_t *em, const uint8_t *src, uint16_t len)   /* F:185-207 */
+BT_FAST static void rr_em_write(uint8_t *em, const uint8_t *src, uint16_t len)   /* F:185-207 */
 {
     volatile uint8_t *d = (volatile uint8_t *)em;
     const uint8_t *s = src;
@@ -831,7 +833,7 @@ static void rr_em_write(uint8_t *em, const uint8_t *src, uint16_t len)   /* F:18
     }
 }
 
-static void rr_em_read(uint8_t *dst, const uint8_t *em, uint16_t len)
+BT_FAST static void rr_em_read(uint8_t *dst, const uint8_t *em, uint16_t len)
 {
     const volatile uint8_t *s = (const volatile uint8_t *)em;
     for (uint32_t i = 0u; i < len; i++) {
@@ -839,7 +841,7 @@ static void rr_em_read(uint8_t *dst, const uint8_t *em, uint16_t len)
     }
 }
 
-static uint32_t rr_lock_depth(void)
+BT_FAST static uint32_t rr_lock_depth(void)
 {
     return s_nest;
 }

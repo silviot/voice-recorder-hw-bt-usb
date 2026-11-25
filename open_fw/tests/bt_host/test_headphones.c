@@ -9,7 +9,7 @@
  *   S2  discovery: headset + phone + speaker found, CoD audio filter, the headset's name
  *   S3  pick the headset with the pairing window: discovery off, 0405 as master, Just Works accepted through patch
  *       0036 (window + gate), bond in bt_hp_bonds.bin, SDP, AVDTP discover/caps/set config/open -> CONNECTED; 48 kHz
- *       chosen (SEID 0), bitpool <= 35; delay report reaches the pacer
+ *       chosen (SEID 0), bitpool <= HP_MAX_BITPOOL (53); delay report reaches the pacer
  *   S4  stream a 1 kHz tone (16 kHz mono through hp_sink, resampled x3) for 4 s: RTP sequence and timestamps
  *       contiguous, frames per packet = fpp, packets <= MTU, decoded tone at 1 kHz, rate within 10 % of real time
  *   S5  remote SUSPEND (player pause event), demand START resumes; media again
@@ -42,6 +42,7 @@
 #include "FreeRTOS.h"
 #include "task.h"
 #include "openfw.h"
+#include "hp_tx.h"   /* HP_MAX_BITPOOL */
 #include "esp_bt_main.h"
 #include "esp_gap_bt_api.h"
 #include "bt_ctrl.h"
@@ -1212,7 +1213,8 @@ int bth_headphones_scenario(const char *img_path)
                H.avdt_cmds[6] == 1u, "AVDTP discover %u caps %u/%u setcfg %u open %u", H.avdt_cmds[1], H.avdt_cmds[2],
                H.avdt_cmds[12], H.avdt_cmds[3], H.avdt_cmds[6]);
         SCHECK((H.cfg_cie[0] >> 4) == 0x1u, "configured freq bits 0x%X (want 48 kHz)", H.cfg_cie[0] >> 4);
-        SCHECK(H.cfg_cie[3] <= 35u && H.cfg_cie[3] >= 2u, "configured max bitpool %u (want <= 35)", H.cfg_cie[3]);
+        SCHECK(H.cfg_cie[3] <= HP_MAX_BITPOOL && H.cfg_cie[3] >= 2u, "configured max bitpool %u (want <= %u)", H.cfg_cie[3],
+               HP_MAX_BITPOOL);
         SCHECK(WAIT(UI().rate == 48000u, 2000), "session rate %u", UI().rate);
         SCHECK(strcmp(u.target_name, "HP-Fake") == 0, "target name '%s'", u.target_name);
         SCHECK(u.has_last && memcmp(u.last, s_hp_bda, 6) == 0, "last headset not stored");

@@ -14,6 +14,33 @@ static inline int16_t sat16(int64_t v)
 
 /* ------------------------------------------------------------------------------------------------ resampler */
 
+/* Exact 3x: one output = sum_j g[j] * x[m - j] over 24 taps, rounded and saturated to Q0. A 32-bit accumulator is
+ * exact: every partial sum is bounded by sum|g| * 32768 <= 58580 * 32768 = 1.92e9 (hp_rs_taps.h phase 1; test_hp_sink
+ * checks the bound), so this equals the int64 reference bit for bit (HP_SELFTEST_GOLDEN unchanged). On the Cortex-M4
+ * the taps go two at a time through SMLADX (g[j] * x[m-j] + g[j+1] * x[m-j-1] from one word of each): 12 dual MACs
+ * instead of 24 MACs plus 64-bit bookkeeping, about a quarter of the BTC tick's per-frame instructions (silicon
+ * 2026-11-25, qemu-arm instruction count: 208 -> ~60 per output). */
+static inline int16_t x3_dot(const int16_t *g, const int16_t *h)
+{
+    int32_t acc = 1 << 14;
+#if defined(__ARM_FEATURE_DSP) && __ARM_FEATURE_DSP
+    typedef int32_t pair_t __attribute__((aligned(2), may_alias));   /* one LDR (unaligned is fine on the M4) */
+    _Static_assert(HP_RS3_TAPS == 24, "x3_dot is unrolled for 24 taps");
+    /* taps j, j+1: lo g[j] hi g[j+1] against lo x[m-j-1] hi x[m-j]; unrolled (-Os keeps loops rolled) */
+#define X3_PAIR(j) acc = __builtin_arm_smladx(*(const pair_t *)&g[j], *(const pair_t *)&h[-(j) - 1], acc)
+    X3_PAIR(0);  X3_PAIR(2);  X3_PAIR(4);  X3_PAIR(6);  X3_PAIR(8);  X3_PAIR(10);
+    X3_PAIR(12); X3_PAIR(14); X3_PAIR(16); X3_PAIR(18); X3_PAIR(20); X3_PAIR(22);
+#undef X3_PAIR
+    return (int16_t)__builtin_arm_ssat(acc >> 15, 16);
+#else
+    for (uint32_t j = 0; j < HP_RS3_TAPS; j++) {
+        acc += (int32_t)g[j] * h[-(int32_t)j];
+    }
+    acc >>= 15;
+    return (int16_t)(acc > 32767 ? 32767 : (acc < -32768 ? -32768 : acc));
+#endif
+}
+
 void hp_rs_reset(hp_rs_t *rs, uint32_t src, uint32_t dst, uint8_t ch)
 {
     memset(rs, 0, sizeof(*rs));
@@ -53,6 +80,29 @@ uint32_t hp_rs_process(hp_rs_t *rs, const int16_t *in, uint32_t n_in, uint32_t *
         *used_in = made;
         return made;
     }
+    if (rs->mode == HP_RS_X3 && ch == 1u) {
+        /* mono (the recorder's format): locals instead of the state struct in the per-output loop */
+        uint32_t phase = rs->x3_phase, w = rs->widx;
+        int16_t *hist = rs->hist[0];
+        while (made < n_out) {
+            if (phase >= 3u) {
+                if (used == n_in) {
+                    break;
+                }
+                int16_t x = in[used++];
+                hist[w] = x;
+                hist[w + HP_RS_HIST] = x;
+                w = (w + 1u) & (HP_RS_HIST - 1u);
+                phase = 0u;
+            }
+            out[made++] = x3_dot(hp_rs3_taps[phase], &hist[w + HP_RS_HIST - 1u]);
+            phase++;
+        }
+        rs->x3_phase = (uint8_t)phase;
+        rs->widx = w;
+        *used_in = used;
+        return made;
+    }
     if (rs->mode == HP_RS_X3) {
         while (made < n_out) {
             if (rs->x3_phase >= 3u) {
@@ -66,11 +116,7 @@ uint32_t hp_rs_process(hp_rs_t *rs, const int16_t *in, uint32_t n_in, uint32_t *
             const int16_t *g = hp_rs3_taps[rs->x3_phase];
             for (uint32_t c = 0; c < ch; c++) {
                 const int16_t *h = &rs->hist[c][rs->widx + HP_RS_HIST - 1u];   /* x[m], then x[m - j] */
-                int64_t acc = 0;
-                for (uint32_t j = 0; j < HP_RS3_TAPS; j++) {
-                    acc += (int32_t)g[j] * h[-(int32_t)j];
-                }
-                out[(size_t)made * ch + c] = sat16((acc + (1 << 14)) >> 15);
+                out[(size_t)made * ch + c] = x3_dot(g, h);
             }
             made++;
             rs->x3_phase++;

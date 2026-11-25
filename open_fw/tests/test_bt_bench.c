@@ -194,8 +194,8 @@ static void test_parse_hp(void)
     uint32_t at = 99u;
     CHECK(parse("", &c, NULL) == BT_BENCH_OK && c.mode == BT_BENCH_MODE_PHONE && c.hp_stage == BT_BENCH_HP_SCAN &&
           !c.hp_addr_set && !c.hp_pick_first && !c.hp_pair && !c.hp_pscan && !c.hp_pin && !c.hp_mono && c.hp_secs == 10u &&
-          c.hp_rate == 0u && c.hp_bitpool == 35u && c.hp_speech_bp == 24u && c.hp_tick_ms == 20u &&
-          c.hp_pkt_per_tick == 2u && c.hp_txq == 4u && c.hp_credit_ticks == 2u && c.hp_tone_hz == 1000u &&
+          c.hp_rate == 0u && c.hp_bitpool == 53u && c.hp_speech_bp == 0u && c.hp_tick_ms == 20u &&
+          c.hp_pkt_per_tick == 2u && c.hp_txq == 4u && c.hp_credit_ticks == 4u && c.hp_tone_hz == 1000u &&
           c.hp_credits == 4u && c.hp_file[0] == '\0', "hp defaults");
     CHECK(parse("mode=phone secs=60", &c, NULL) == BT_BENCH_OK && c.mode == BT_BENCH_MODE_PHONE, "mode=phone");
     CHECK(parse("mode=hp", &c, NULL) == BT_BENCH_OK && c.mode == BT_BENCH_MODE_HP && c.hp_stage == BT_BENCH_HP_SCAN,
@@ -226,8 +226,8 @@ static void test_parse_hp(void)
           "hp_pin=1");
     CHECK(parse("mode=hp hp_stage=connect hp_pick=first hp_pin=0", &c, NULL) == BT_BENCH_OK && c.hp_pin == 0u,
           "hp_pin=0");
-    CHECK(parse("mode=hp hp_bitpool=20", &c, NULL) == BT_BENCH_OK && c.hp_speech_bp == 20u,
-          "default speech bitpool lowered to an explicit smaller max");
+    CHECK(parse("mode=hp hp_bitpool=20", &c, NULL) == BT_BENCH_OK && c.hp_speech_bp == 0u,
+          "default speech bitpool 0 (always the max) under an explicit smaller max");
     CHECK(parse("mode=hp hp_bitpool=20 hp_speech_bp=18", &c, NULL) == BT_BENCH_OK && c.hp_speech_bp == 18u,
           "explicit speech bitpool under the max");
     CHECK(parse("mode=hp hp_stage=tone hp_pick=first hp_tone_hz=440 hp_tick_ms=15 hp_pkt_per_tick=1", &c, NULL) ==

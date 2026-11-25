@@ -45,15 +45,14 @@
  *   hp_pscan=0|1        default 0: leave page scan on during 0401/0405 (Exp 4a/4b variant, design §6.2)
  *   hp_secs=N           2..61, default 10: discovery length in s (0401 Inquiry_Length = ceil(N / 1.28 s))
  *   hp_rate=44100|48000|auto   default auto: register only that SEP
- *   hp_bitpool=N        18..53, default 35: max bitpool advertised
- *   hp_speech_bp=N      0 or 18..35, default 24 (lowered to hp_bitpool when that is smaller and hp_speech_bp is not
- *                       given): per-frame bitpool for <= 16 kHz sources, 0 = use the max; given explicitly it must not
- *                       exceed hp_bitpool
+ *   hp_bitpool=N        18..53, default 53: max bitpool advertised
+ *   hp_speech_bp=N      0 or 18..35, default 0: per-frame bitpool for <= 16 kHz sources, 0 = use the max; given
+ *                       explicitly it must not exceed hp_bitpool
  *   hp_mono=0|1         default 0: prefer mono SBC
  *   hp_tick_ms=N        10..30, default 20: pacer tick
  *   hp_pkt_per_tick=N   1..2, default 2: packets per tick; 1 needs hp_tick_ms <= 15 (design §4.3 headroom rule)
  *   hp_txq=N            2..8, default 4: TXQ_PKT_CAP
- *   hp_credit_ticks=N   1..4, default 2: elapsed clamp and the tick term of CREDIT_MAX
+ *   hp_credit_ticks=N   1..4, default 4: elapsed clamp and the tick term of CREDIT_MAX
  *   hp_tone_hz=N        0 or 100..8000, default 1000: tone stage only; 0 = 440 / 880 Hz alternating each second
  *   hp_file=/DIR/NAME.EXT   player stage only (default: the first file of /record): an absolute path of 8.3
  *                       components, <= 47 chars

@@ -32,7 +32,7 @@ static bt_cpu_guard_t s_cg;
 static volatile uint8_t s_cg_armed, s_cg_tripped;
 
 
-static inline uint32_t now32(void)
+BT_FAST static inline uint32_t now32(void)
 {
     return US_TIMER_LO;
 }
@@ -47,17 +47,17 @@ static bool rom_lock_free(void)
     return true;
 }
 
-static void plat_enter(void) { taskENTER_CRITICAL(); }
-static void plat_exit(void) { taskEXIT_CRITICAL(); }
+BT_FAST static void plat_enter(void) { taskENTER_CRITICAL(); }
+BT_FAST static void plat_exit(void) { taskEXIT_CRITICAL(); }
 
-static void plat_wake_ctrl(void)
+BT_FAST static void plat_wake_ctrl(void)
 {
     if (s_ctrl_task != NULL && rom_lock_free()) {
         xTaskNotifyGive(s_ctrl_task);
     }
 }
 
-static void plat_wake_ctrl_from_isr(void)
+BT_FAST static void plat_wake_ctrl_from_isr(void)
 {
     BaseType_t woken = pdFALSE;
     if (s_ctrl_task != NULL) {
@@ -66,14 +66,14 @@ static void plat_wake_ctrl_from_isr(void)
     portYIELD_FROM_ISR(woken);
 }
 
-static void plat_wake_dlv(void)
+BT_FAST static void plat_wake_dlv(void)
 {
     if (s_dlv_task != NULL && rom_lock_free()) {
         xTaskNotifyGive(s_dlv_task);
     }
 }
 
-static bool plat_stop_requested(void)
+BT_FAST static bool plat_stop_requested(void)
 {
     return s_bt_stop != 0u;
 }
@@ -109,7 +109,7 @@ static void leak_unwind(void)
     }
 }
 
-static void bt_ctrl_task(void *arg)
+BT_FAST static void bt_ctrl_task(void *arg)
 {
     (void)arg;
     uint32_t more = 0u;
@@ -146,7 +146,7 @@ static void bt_ctrl_task(void *arg)
     }
 }
 
-static void bt_dlv_task(void *arg)
+BT_FAST static void bt_dlv_task(void *arg)
 {
     (void)arg;
     for (;;) {

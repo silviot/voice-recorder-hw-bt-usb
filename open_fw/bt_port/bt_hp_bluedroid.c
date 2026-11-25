@@ -1780,7 +1780,7 @@ static void config_begin(void)
 
 static void config_seps(void)
 {
-    uint8_t bp = 35u, f0 = ESP_A2D_SBC_CIE_SF_44K | ESP_A2D_SBC_CIE_SF_48K, f1 = ESP_A2D_SBC_CIE_SF_44K;
+    uint8_t bp = HP_MAX_BITPOOL, f0 = ESP_A2D_SBC_CIE_SF_44K | ESP_A2D_SBC_CIE_SF_48K, f1 = ESP_A2D_SBC_CIE_SF_44K;
 #if BENCH_IMAGE
     if (s_tun_set) {
         if (s_tun.bitpool) {

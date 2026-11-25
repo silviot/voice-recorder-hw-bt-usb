@@ -47,6 +47,8 @@ typedef struct {
     uint32_t starts, stops, stop_timeouts;
     uint32_t rf_cal_us, start_us, stop_us;   /* last call */
     uint32_t eif_writes;         /* ROM calls of the hci_tl_env ext_if (not expected: the ROM has no HCI transport) */
+    uint32_t svc_sum_us;         /* all irq_service() calls (ROM cscnt / rx ISRs): the ROM part of the bottom half */
+    uint32_t disp_sum_us;        /* all ke_event dispatches (ROM kernel handlers incl. TASK_HCI upcalls) */
 } bt_rom_real_diag_t;
 
 /* g_bt_heap geometry (legacy bt_hci.c F:233-237) and the msg_alloc admission rule. */

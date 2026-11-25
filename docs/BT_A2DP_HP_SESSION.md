@@ -211,6 +211,26 @@ Settings > Headset button test) merged on top of the BT branch. The BT=0 image s
     permille and `other` (1000 - sum; FreeRTOS charges ISRs to the interrupted task, and the busy ISRs, SysTick and
     the IRQ 26 top half, are short and in RAM). Run `stage=tone` as well: its `hp tasks` line is the baseline the
     player stage's extra load is measured against (CPU1 UI and SD reads only happen in the player stage).
+- **Third run (image 0x2046, the user's headset 08:C8:C2:82:6C:EB, sink caps `cie=0x3502FF3F`, max bitpool 53)**:
+  pads 0, 362.8 SBC frames/s (96.7 %: a hiccup every ~5 s), late 0-6 per interval; per mille: idle 15-74, BTC
+  325-385 (`btc_us_sbc` 867-1085), bt_ctrl 208-327, app 126-296, BTU 55-93, hciT 27-60, bt_dlv 12-23; irq26
+  ~1700/s. Changes:
+  - **Resampler** (`hp_sink.c`): the exact 3x dot product runs as 12 `SMLADX` dual MACs on a 32-bit accumulator
+    (bit-exact: every partial sum is bounded by 58580 x 32768 < 2^31; `test_hp_sink` checks the bound and both paths
+    against an int64 model at full scale, and a qemu-arm run of the ARM path gave 0 mismatches), plus a mono loop
+    with the state in locals. Instruction count of the BTC per-frame path (hp_sink_pull + SBC encode, qemu-arm
+    `-one-insn-per-tb -d exec`, harness in the session scratchpad): 55.7k -> 36.2k at bitpool 24 (resampler 26.6k ->
+    7.1k); at bitpool 53 42.0k (EncPacking 5.1k -> 10.1k, bit allocation +0.8k).
+  - **bt_ctrl**: the IRQ 26 bottom half, ROM kernel dispatch, the ROM heap / lock / EM / rand hooks, the ACL and
+    event paths and the bt_ctrl / bt_dlv task loops (`BT_FAST`, `bt_rom_if.h`) join `.bt_fast` (17.5 KiB in all,
+    heap -10 KiB more: the player stage's heap low point was 37.9 KB). The per-IRQ statistics loops walk set bits
+    only. New `hp ctrl` line: runs, run_us, rom_isr_us (irq_service), rom_ke_us (ROM kernel dispatches incl.
+    TASK_HCI upcalls), glue_us (the rest), disp, us_run, so the next run shows how much of bt_ctrl is the ROM.
+  - **Late ticks**: `HP_CREDIT_TICKS` 2 -> 4 (bench default too): a tick held up < 80 ms keeps its credit, so the
+    stream no longer loses 3.3 % of real time to late ticks; bursts stay <= 2 packets per tick.
+  - **Quality**: SEPs advertise max bitpool 53 (`HP_MAX_BITPOOL`; bench default 53), `HP_SPEECH_BP` 0 (16 kHz
+    sources go out at the negotiated max instead of 24; bench default 0). At 53: 119-byte frames, 7 per packet with
+    an 882-byte MTU, ~54 packets/s, ~357 kbit/s.
 
 ## Not tested / open
 
