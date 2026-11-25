@@ -2,13 +2,14 @@
 """
 Bluetooth RFCOMM File Sync Client (`+XREC` protocol) for Smartlink SL6801 (`HW_76`).
 
-Works with the `fw_mod/bt_filesync.c` XIP extension installed at 0x00D74000.
-Connects to `HW_76` on RFCOMM Channel 1, completes the SL6801 HFP Service Level
-Connection (`SLC_OPEN`), and then uses the custom `+XREC:` commands to:
-  - Ping the extension (`+XREC:PING`)
+Primary target: open_fw (`Cassini_XX`, native SPP on RFCOMM channel 1, no HFP handshake; docs/XREC_PROTOCOL.md).
+Also works with the legacy `fw_mod/bt_filesync.c` stock-firmware patch (`HW_XX`), completing its HFP Service Level
+Connection (`SLC_OPEN`) first (--transport auto/hfp). It uses the custom `+XREC:` commands to:
+  - Ping the device (`+XREC:PING`)
   - List all recordings in `0:\record` with exact sizes (`+XREC:LS`)
   - Download recordings as bit-exact binary chunks with CRC-16 verification (`+XREC:GET` / `+XREC:GETS`)
   - Skip files that already exist locally with the same filename and byte size (stateless, rsync-style).
+  - Upload a CWX1 transcript sidecar next to a recording (`+XREC:PUT,...,REC,<stem>.cwx:` + `+XREC:PUTEND`, open_fw).
 
 SPDX-License-Identifier: MIT
 """
@@ -32,6 +33,7 @@ DEFAULT_NAME_PREFIX = "HW_"
 DEFAULT_NAME_PREFIXES = ("Cassini_", "HW_")
 DEFAULT_KEY_FILE = Path.home() / ".config" / "hw76-sync" / "keys.json"
 CHUNK_SIZE = 640  # 12 B header + 640 B = 652 B <= 660 B RFCOMM MTU (with bt-rfcomm-turbo; use 480 on stock MTU)
+PUT_CHUNK_SIZE = 600  # +XREC:PUT payload (<= 640); header + payload stays one ~650 B write, one chunk in flight
 DEFAULT_BURST_SIZE = 3840  # 6 x 640 B frames per +XREC:GETS burst (~92-96 KB/s, safe within K=7 credits)
 
 
@@ -331,6 +333,61 @@ class XRecRFCOMMClient:
             raise RuntimeError(f"OTA trigger failed: {resp}")
         print("Device acknowledged +XREC:OTA — rebooting to flash 0:\\update.up and auto-boot new firmware!")
 
+    def put_file(self, target: str, data: bytes, chunk_size: int = PUT_CHUNK_SIZE) -> int:
+        """Staged upload: stop-and-wait +XREC:PUT chunks (one in flight: the device RX ring is 2 KiB) then
+        +XREC:PUTEND, which commits atomically. target is "REC,<stem>.cwx" (sidecar next to /record/<stem>.wav) or
+        "CAS,<name>" (/cassini/<name>). Returns the committed size."""
+        assert self.sock is not None
+        if not data:
+            raise ValueError("nothing to upload (empty file)")
+        if not 1 <= chunk_size <= PUT_CHUNK_SIZE:
+            raise ValueError(f"PUT chunk size must be 1..{PUT_CHUNK_SIZE}")
+        total = len(data)
+        offset = 0
+        while offset < total:
+            chunk = data[offset : offset + chunk_size]
+            header = f"+XREC:PUT,{offset},{len(chunk)},{crc16_ccitt_false(chunk)},{target}:".encode("ascii")
+            want = f"+XREC:OK,PUT,{offset},{len(chunk)}"
+            err_msg = ""
+            for attempt in range(3):
+                try:
+                    self.sock.sendall(header + chunk)
+                    resp = self._read_line()
+                    if resp == want:
+                        break
+                    err_msg = resp
+                    if resp in ("+XREC:ERR,ARG", "+XREC:ERR,UNSUP", "+XREC:ERR,NAME"):
+                        # header refused: its payload went to the device's line parser; a bare CR re-syncs it
+                        self.sock.sendall(b"\r")
+                        if offset == 0 and resp != "+XREC:ERR,NAME" and target.startswith("REC,"):
+                            raise RuntimeError(f"recorder firmware too old for transcript upload ({resp})")
+                        raise RuntimeError(f"PUT {target} refused: {resp}")
+                except (TimeoutError, socket.timeout) as exc:
+                    err_msg = str(exc)
+                    self.rx_buf.clear()
+                if attempt == 2:
+                    raise RuntimeError(f"PUT {target} failed at offset {offset}: {err_msg}")
+                # resending the same chunk (same offset/len/crc/name) is acknowledged without a second write
+                print(f"\n  Retry {attempt + 1} at offset {offset}: {err_msg}")
+            offset += len(chunk)
+            print(f"\r  PUT {target}: {offset:,}/{total:,} B", end="", flush=True)
+        print()
+        self._send_cmd("+XREC:PUTEND")
+        resp = self._read_line()
+        if resp != f"+XREC:OK,PUTEND,{total}":
+            raise RuntimeError(f"PUTEND failed for {target}: {resp}")
+        return total
+
+    def upload_cwx(self, cwx_path: Path, remote_name: str, chunk_size: int = PUT_CHUNK_SIZE) -> int:
+        """Upload a CWX1 transcript sidecar as /record/<remote_name> (must end in .cwx) via the REC target."""
+        data = cwx_path.read_bytes()
+        if data[:4] != b"CWX1":
+            raise ValueError(f"{cwx_path} is not a CWX1 file")
+        if not re.fullmatch(r"[\x20-\x7e]{1,26}\.[cC][wW][xX]", remote_name) or remote_name.startswith(".") or \
+                any(ch in remote_name for ch in '/\\:*?"<>|'):
+            raise ValueError(f"invalid sidecar name {remote_name!r} (printable ASCII, <= 30 chars, ends in .cwx)")
+        return self.put_file(f"REC,{remote_name}", data, chunk_size)
+
     def get_stat(self) -> Dict[str, int]:
         self._send_cmd("+XREC:STAT")
         line = self._read_line()
@@ -388,15 +445,18 @@ class XRecRFCOMMClient:
         return self._read_xrec_frame(offset, filename)
 
     def get_burst(self, filename: str, offset: int, total_len: int, chunk_size: int = CHUNK_SIZE) -> bytes:
+        """One +XREC:GETS burst. total_len must not run past the file's LS size: the device may lower the frame size
+        to its RFCOMM MTU - 12, so a SHORT FRAME IS NOT EOF. The burst ends when total_len bytes arrived or on an
+        empty frame (read at/after EOF)."""
         self._send_cmd(f"+XREC:GETS,{offset},{total_len},{chunk_size},{filename}")
         out = bytearray()
         cur = offset
         while len(out) < total_len:
             frame = self._read_xrec_frame(cur, filename)
+            if not frame:
+                break  # N=0: at/after EOF (the file is shorter than its LS size)
             out.extend(frame)
             cur += len(frame)
-            if len(frame) < min(chunk_size, total_len - (len(out) - len(frame))):
-                break  # EOF
         return bytes(out)
 
     def download_file(
@@ -491,6 +551,18 @@ def main() -> None:
     parser.add_argument("--rec-stop", action="store_true", help="Stop an active local stereo WAV recording")
     parser.add_argument("--reboot", action="store_true", help="Cleanly reboot the device over Bluetooth (+XREC:REBOOT)")
     parser.add_argument("--ota", type=Path, metavar="UPDATE_UP", help="Upload 0:\\update.up over Bluetooth (+XREC:PUT) and auto-flash (+XREC:OTA)")
+    parser.add_argument(
+        "--upload-cwx",
+        type=Path,
+        metavar="CWX_FILE",
+        help="Upload a CWX1 transcript sidecar into 0:\\record via +XREC:PUT REC,<stem>.cwx (open_fw). The remote "
+        "name is <stem of --for-recording>.cwx, else the local file name",
+    )
+    parser.add_argument(
+        "--for-recording",
+        metavar="REC_NAME",
+        help="Recording the --upload-cwx sidecar belongs to (e.g. REC_0001.wav -> REC_0001.cwx); checked against LS",
+    )
     parser.add_argument("--pair", metavar="PIN", help="Bind to recorder using the 6-digit PIN shown on its Bluetooth menu LCD (v5)")
     parser.add_argument(
         "--key-file",
@@ -586,6 +658,18 @@ def main() -> None:
             return
         if args.ota:
             client.ota_upload_and_flash(args.ota, chunk_size=args.ota_chunk_size)
+            return
+        if args.upload_cwx:
+            if args.for_recording:
+                names = {n for n, _ in client.list_files()}
+                if args.for_recording not in names:
+                    print(f"{args.for_recording} is not in 0:\\record (LS); not uploading.")
+                    sys.exit(1)
+                remote = Path(args.for_recording).stem + ".cwx"
+            else:
+                remote = args.upload_cwx.name
+            n = client.upload_cwx(args.upload_cwx, remote)
+            print(f"Uploaded transcript 0:\\record\\{remote} ({n:,} bytes)")
             return
 
         files = client.list_files()
