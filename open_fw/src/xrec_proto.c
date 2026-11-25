@@ -196,6 +196,80 @@ static void send_err(xrec_ctx_t *ctx, const char *reason)
     send_text(ctx, buf, pos);
 }
 
+/* ---- sync while recording (openfw_xrec.h; docs/BT_SYNC_SPEED_AND_RECORDING.md F1, F1b, F6, F7) ---- */
+static uint8_t rec_channels(const xrec_ctx_t *ctx)
+{
+    return ctx->ops.rec_channels ? ctx->ops.rec_channels(ctx->user) : 0u;
+}
+
+/* Recorder-first: the recorder has audio blocks to take, so no XREC card work now (retried at the next poll). */
+static int rec_ring_busy(xrec_ctx_t *ctx)
+{
+    if (rec_channels(ctx) == 0u || !ctx->ops.rec_pending || ctx->ops.rec_pending(ctx->user) == 0u) {
+        return 0;
+    }
+    ctx->pace.ring_waits++;
+    return 1;
+}
+
+static uint32_t pace_now_us(const xrec_ctx_t *ctx)
+{
+    if (ctx->ops.now_us) {
+        return ctx->ops.now_us(ctx->user);
+    }
+    return ctx->ops.now_ms ? ctx->ops.now_ms(ctx->user) * 1000u : 0u;
+}
+
+/* +XREC:ERR,LATER,<ms>: the command is valid but waits for the end of the recording (F6). */
+static void send_later(xrec_ctx_t *ctx)
+{
+    char reason[24];
+    int pos = 0;
+    append_str(reason, &pos, (int)sizeof(reason), "LATER,");
+    append_u32(reason, &pos, (int)sizeof(reason), XREC_LATER_MS);
+    reason[pos] = '\0';
+    ctx->pace.later++;
+    send_err(ctx, reason);
+}
+
+/* STAT field 10: 0 = not recording; mono: the time one XREC_PACE_WINDOW takes at the cap (the client's pause between
+ * windows); stereo: XREC_LATER_MS (no transfers until REC stops). */
+static uint32_t pace_ms(const xrec_ctx_t *ctx)
+{
+    uint8_t ch = rec_channels(ctx);
+    if (ch == 0u) {
+        return 0u;
+    }
+    if (ch != 1u || ctx->pace.rate_bps == 0u) {
+        return XREC_LATER_MS;
+    }
+    return (uint32_t)(((uint64_t)XREC_PACE_WINDOW * 1000u + ctx->pace.rate_bps - 1u) / ctx->pace.rate_bps);
+}
+
+/* Token bucket refill (bytes at pace.rate_bps). The bucket starts full at the first pass of a recording. */
+static void pace_refill(xrec_ctx_t *ctx, uint32_t now_us)
+{
+    if (!ctx->pace_live) {
+        ctx->pace_live   = 1u;
+        ctx->pace_tokens = XREC_REC_GETS_BURST;
+        ctx->pace_t_us   = now_us;
+        return;
+    }
+    uint32_t dt = now_us - ctx->pace_t_us;               /* wraps every ~71 min: fine for a delta */
+    uint64_t add = ((uint64_t)dt * ctx->pace.rate_bps) / 1000000u;
+    if (add == 0u) {
+        return;                                          /* keep pace_t_us: the fraction is not lost */
+    }
+    uint64_t t = (uint64_t)ctx->pace_tokens + add;
+    if (t >= XREC_REC_GETS_BURST) {
+        ctx->pace_tokens = XREC_REC_GETS_BURST;
+        ctx->pace_t_us   = now_us;
+    } else {
+        ctx->pace_tokens = (uint32_t)t;
+        ctx->pace_t_us  += (uint32_t)((add * 1000000u) / ctx->pace.rate_bps);
+    }
+}
+
 static int is_safe_filename(const char *s)
 {
     if (!s || s[0] == '\0') {
@@ -481,6 +555,10 @@ static void handle_pair(xrec_ctx_t *ctx, const char *args)
         send_err(ctx, "PAIRCLOSED");
         return;
     }
+    if (rec_channels(ctx) != 0u) {
+        send_later(ctx);                         /* the key is saved to the card first (F6): no PIN attempt used */
+        return;
+    }
     /* Expect <6-digit-pin>,<64-hex-key> without reading past NUL */
     uint32_t alen = 0u;
     while (args[alen] != '\0' && alen < 7u) {
@@ -585,7 +663,11 @@ static void handle_stat(xrec_ctx_t *ctx)
     if (st.total_mb == 0u && ctx->vol) {
         (void)exfat_stat_fs(ctx->vol, &st.free_mb, &st.total_mb);
     }
-    char buf[128];
+    if (rec_channels(ctx) == 0u) {
+        st.rec_idx = 0u;                         /* only a running recording is named */
+    }
+    st.pace_ms = pace_ms(ctx);
+    char buf[160];
     int pos = 0;
     append_str(buf, &pos, (int)sizeof(buf), "+XREC:STAT,");
     append_u32(buf, &pos, (int)sizeof(buf), st.bat_pct);
@@ -603,6 +685,11 @@ static void handle_stat(xrec_ctx_t *ctx)
     append_u32(buf, &pos, (int)sizeof(buf), st.free_mb);
     append_str(buf, &pos, (int)sizeof(buf), ",");
     append_u32(buf, &pos, (int)sizeof(buf), st.total_mb);
+    /* fields 9 and 10 (F7): appended, numeric, so clients that read the first 8 by position are unaffected */
+    append_str(buf, &pos, (int)sizeof(buf), ",");
+    append_u32(buf, &pos, (int)sizeof(buf), st.rec_idx);
+    append_str(buf, &pos, (int)sizeof(buf), ",");
+    append_u32(buf, &pos, (int)sizeof(buf), st.pace_ms);
     append_str(buf, &pos, (int)sizeof(buf), "\r\n");
     send_text(ctx, buf, pos);
 }
@@ -666,6 +753,14 @@ static void handle_rtc(xrec_ctx_t *ctx, const char *args)
         send_err(ctx, "RTCRNG");
         return;
     }
+    if (rec_channels(ctx) != 0u) {
+        /* F6: the clock is not changed under a running recording (its file times and length). OK (old clients treat
+         * any other reply to a clock set as a failed sync) with LATER: not applied, set it again after REC. */
+        static const char later[] = "+XREC:OK,RTC,LATER\r\n";
+        ctx->pace.later++;
+        send_text(ctx, later, (int)(sizeof(later) - 1u));
+        return;
+    }
     xrec_rtc_t rt = {
         (uint16_t)y, (uint8_t)m, (uint8_t)d,
         (uint8_t)hh, (uint8_t)mm, (uint8_t)ss, (uint8_t)wd
@@ -682,6 +777,9 @@ static void xrec_poll_ls(xrec_ctx_t *ctx)
 {
     if (!ctx || !ctx->ls_active || !ctx->ops.send) {
         return;
+    }
+    if (rec_ring_busy(ctx)) {
+        return;                                  /* recorder first: the directory is read at a later poll */
     }
     ls_ctx_t lc;
     lc.ctx         = ctx;
@@ -780,6 +878,16 @@ static void handle_get_common(xrec_ctx_t *ctx, const char *args, int is_stream)
         send_err(ctx, "NAME");
         return;
     }
+    /* F7: the file being recorded grows and is rewritten (header, checkpoints): never sent, the client skips it */
+    if (ctx->ops.file_busy && ctx->ops.file_busy(ctx->user, p) != 0) {
+        ctx->pace.busy++;
+        send_err(ctx, "BUSY");
+        return;
+    }
+    if (rec_channels(ctx) > 1u) {
+        send_later(ctx);                         /* decision 5: no transfers during a stereo recording */
+        return;
+    }
 
     char path[96];
     int pos = 0;
@@ -821,6 +929,10 @@ static void handle_del(xrec_ctx_t *ctx, const char *filename)
     if ((ctx->ops.file_busy && ctx->ops.file_busy(ctx->user, filename) != 0) ||
         (ctx->put_stream_mode == XREC_PUT_REC && str_eq_ci(filename, XREC_REC_TMP))) {
         send_err(ctx, "BUSY");
+        return;
+    }
+    if (rec_channels(ctx) != 0u) {
+        send_later(ctx);                         /* F6: no second card writer while recording */
         return;
     }
     if (exfat_delete_file(ctx->vol, "/record", filename) != 0) {
@@ -936,6 +1048,10 @@ static void handle_put_complete(xrec_ctx_t *ctx)
         send_err(ctx, "NOSD");
         return;
     }
+    if (rec_channels(ctx) != 0u) {
+        send_later(ctx);                         /* F6 (recording began after the header): the staged upload stays */
+        return;
+    }
 
     if (ctx->put_stream_mode == ctx->put_target && ctx->put_has_last &&
         ctx->put_last_mode == ctx->put_target &&
@@ -1027,6 +1143,10 @@ static void handle_putend(xrec_ctx_t *ctx)
         send_err(ctx, "NOSD");
         return;
     }
+    if (rec_channels(ctx) != 0u && put_is_named(ctx->put_stream_mode)) {
+        send_later(ctx);                         /* F6: the commit (replace) waits; the staged upload stays */
+        return;
+    }
     if (!put_is_named(ctx->put_stream_mode)) {
         if (ctx->put_done_valid) {
             /* repeated PUTEND after a lost reply: the commit already happened, answer it again */
@@ -1068,6 +1188,10 @@ static void handle_ota(xrec_ctx_t *ctx)
 {
     if (!ctx->vol) {
         send_err(ctx, "NOSD");
+        return;
+    }
+    if (rec_channels(ctx) != 0u && ctx->put_stream_mode == XREC_PUT_OTA) {
+        send_later(ctx);                         /* F6: commit + reboot wait for the end of the recording */
         return;
     }
     if (ctx->put_stream_mode != XREC_PUT_OTA || ctx->put_written < 64u) {
@@ -1269,6 +1393,50 @@ static void handle_dbg(xrec_ctx_t *ctx, const char *args)
     char line[24u + BENCH_MEAS_LINE_MAX];
     int pos = 0;
     const bench_meas_rec_t *r = &g_bench_meas.cur;
+    if (str_starts_with(args, ",PACE")) {
+        /* +XREC:DBG,PACE[,<bytes/s>[,<budget us>]]: the sync-while-recording cap (M3 runs it at 24/48/64/96 KB/s) */
+        const char *p = args + 5;
+        uint32_t rate = 0u, budget = 0u;
+        if (*p == ',') {
+            p++;
+            if (parse_u32_step(&p, &rate) != 0 || rate < 1000u || rate > 1000000u) {
+                send_err(ctx, "ARGS");
+                return;
+            }
+            if (*p == ',') {
+                p++;
+                if (parse_u32_step(&p, &budget) != 0 || budget < 500u || budget > 100000u) {
+                    send_err(ctx, "ARGS");
+                    return;
+                }
+            }
+        }
+        if (*p != '\0') {
+            send_err(ctx, "ARGS");
+            return;
+        }
+        xrec_set_rec_pace(ctx, rate, budget);
+        const xrec_pace_stats_t *ps = &ctx->pace;
+        append_str(line, &pos, (int)sizeof(line), "+XREC:DBG,PACE,rate=");
+        append_u32(line, &pos, (int)sizeof(line), ps->rate_bps);
+        append_str(line, &pos, (int)sizeof(line), ",budget_us=");
+        append_u32(line, &pos, (int)sizeof(line), ps->budget_us);
+        append_str(line, &pos, (int)sizeof(line), ",ring_waits=");
+        append_u32(line, &pos, (int)sizeof(line), ps->ring_waits);
+        append_str(line, &pos, (int)sizeof(line), ",budget_stops=");
+        append_u32(line, &pos, (int)sizeof(line), ps->budget_stops);
+        append_str(line, &pos, (int)sizeof(line), ",cap_stops=");
+        append_u32(line, &pos, (int)sizeof(line), ps->cap_stops);
+        append_str(line, &pos, (int)sizeof(line), ",later=");
+        append_u32(line, &pos, (int)sizeof(line), ps->later);
+        append_str(line, &pos, (int)sizeof(line), ",busy=");
+        append_u32(line, &pos, (int)sizeof(line), ps->busy);
+        append_str(line, &pos, (int)sizeof(line), ",rec_b=");
+        append_u32(line, &pos, (int)sizeof(line), ps->rec_bytes);
+        append_str(line, &pos, (int)sizeof(line), "\r\n");
+        send_text(ctx, line, pos);
+        return;
+    }
     if (*args == '\0') {
         append_str(line, &pos, (int)sizeof(line), "+XREC:DBG,LIVE,");
     } else if (str_starts_with(args, ",REC,")) {
@@ -1368,6 +1536,16 @@ static void try_start_put_header(xrec_ctx_t *ctx)
         copy_cstr(tgt_name, (uint32_t)sizeof(tgt_name), p + 4);
     } else {
         put_refuse(ctx, chunk_len, "ARG");
+        return;
+    }
+    if (target != XREC_PUT_EXP && rec_channels(ctx) != 0u) {
+        char reason[24];                         /* F6: card uploads wait; the payload is eaten unparsed */
+        int rp = 0;
+        append_str(reason, &rp, (int)sizeof(reason), "LATER,");
+        append_u32(reason, &rp, (int)sizeof(reason), XREC_LATER_MS);
+        reason[rp] = '\0';
+        ctx->pace.later++;
+        put_refuse(ctx, chunk_len, reason);
         return;
     }
 
@@ -1479,6 +1657,29 @@ void xrec_init(xrec_ctx_t *ctx, exfat_vol_t *vol, const xrec_ops_t *ops, void *u
     if (ops) {
         ctx->ops = *ops;
     }
+    ctx->pace.rate_bps  = XREC_REC_GETS_RATE_BPS;
+    ctx->pace.budget_us = XREC_REC_PASS_BUDGET_US;
+}
+
+void xrec_set_rec_pace(xrec_ctx_t *ctx, uint32_t rate_bps, uint32_t budget_us)
+{
+    if (!ctx) {
+        return;
+    }
+    if (rate_bps != 0u) {
+        ctx->pace.rate_bps = rate_bps;
+    }
+    if (budget_us != 0u) {
+        ctx->pace.budget_us = budget_us;
+    }
+    ctx->pace_live = 0u;                         /* the bucket restarts full at the next pass */
+}
+
+void xrec_get_pace_stats(const xrec_ctx_t *ctx, xrec_pace_stats_t *out)
+{
+    if (ctx && out) {
+        *out = ctx->pace;
+    }
 }
 
 void xrec_set_bound_key(xrec_ctx_t *ctx, const uint8_t key[32])
@@ -1540,10 +1741,15 @@ void xrec_on_disconnect(xrec_ctx_t *ctx)
     ctx->xfer_valid         = 0u;
 }
 
-/* Flow control (review STEP10 A5): room for the worst-case reply before running anything that replies. */
-static int tx_room(const xrec_ctx_t *ctx)
+/* Flow control (review STEP10 A5): room for the worst-case reply before running anything that replies. Recorder
+ * first (F1): while recording, nothing runs while the recorder has audio blocks pending; the bytes are offered again
+ * after the caller polled the recorder. */
+static int tx_room(xrec_ctx_t *ctx)
 {
-    return !ctx->ops.tx_free || ctx->ops.tx_free(ctx->user) >= XREC_REPLY_MAX;
+    if (ctx->ops.tx_free && ctx->ops.tx_free(ctx->user) < XREC_REPLY_MAX) {
+        return 0;
+    }
+    return !rec_ring_busy(ctx);
 }
 
 uint16_t xrec_on_rx(xrec_ctx_t *ctx, const uint8_t *data, uint16_t len)
@@ -1633,8 +1839,24 @@ void xrec_poll(xrec_ctx_t *ctx)
         xrec_poll_ls(ctx);
         return;
     }
+    uint8_t rec_ch = rec_channels(ctx);
+    if (rec_ch == 0u) {
+        ctx->pace_live = 0u;                     /* the next recording starts with a full bucket */
+    }
     if (!ctx->gets_active || ctx->put_active) {
         return;
+    }
+    if (rec_ch > 1u) {
+        /* a stereo recording began during a stream: it ends here (decision 5), the client asks again later */
+        ctx->gets_active = 0u;
+        ctx->gets_staged = 0u;
+        send_later(ctx);
+        return;
+    }
+    uint32_t pass_t0 = 0u;
+    if (rec_ch != 0u) {
+        pass_t0 = pace_now_us(ctx);
+        pace_refill(ctx, pass_t0);
     }
 
     while (ctx->gets_active && ctx->gets_rem > 0u) {
@@ -1643,6 +1865,21 @@ void xrec_poll(xrec_ctx_t *ctx)
             uint32_t max_off_rem = 0xFFFFFFFFu - ctx->gets_offset;
             if (want > max_off_rem) {
                 want = max_off_rem;
+            }
+            if (rec_ch != 0u && want > 0u) {
+                /* recorder first (F1): card reads only with the audio ring drained, within the pass budget, and
+                 * within the rate cap (F1b). A frame already staged is still sent (no card access). */
+                if (rec_ring_busy(ctx)) {
+                    return;
+                }
+                if ((uint32_t)(pace_now_us(ctx) - pass_t0) >= ctx->pace.budget_us) {
+                    ctx->pace.budget_stops++;
+                    return;
+                }
+                if (ctx->pace_tokens < want) {
+                    ctx->pace.cap_stops++;
+                    return;
+                }
             }
             uint32_t got = 0u;
             if (want > 0u &&
@@ -1668,6 +1905,10 @@ void xrec_poll(xrec_ctx_t *ctx)
             ctx->xfer.gets_frame[10] = (uint8_t)(crc);
             ctx->xfer.gets_frame[11] = (uint8_t)(crc >> 8);
 
+            if (rec_ch != 0u) {
+                ctx->pace_tokens -= (got < ctx->pace_tokens) ? got : ctx->pace_tokens;
+                ctx->pace.rec_bytes += got;
+            }
             ctx->gets_staged     = 1u;
             ctx->gets_staged_len = (uint16_t)got;
             ctx->gets_staged_eof = (uint8_t)((got < want || got >= ctx->gets_rem ||

@@ -1598,6 +1598,10 @@ static void run_bt_xrec_mode(void)
     /* Home consumed the opening ENTER edge. Keep subsequent queued taps. */
     while (1) {
         wdt_feed();
+        /* Recorder first (docs/BT_SYNC_SPEED_AND_RECORDING.md F1): the audio ring is drained before XREC runs (xrec_proto
+         * reads the card for GETS / LS only while it stays drained, within a 5 ms budget and the rate cap), and again
+         * right after any XREC work. */
+        recorder_poll();
         bt_xrec_poll();
         recorder_poll();
 
@@ -1732,7 +1736,13 @@ static void run_bt_xrec_mode(void)
         }
 
         /* Sleep via WFI when idle (woken immediately by RW-BT IRQ or 1 ms SysTick) */
-        if (!keys_event_pending() && !recorder_is_saving()) {
+        if (keys_event_pending()) {
+            /* a key to handle: loop at once */
+        } else if (recorder_is_saving()) {
+            /* F1d: while recording, one tick (or a BT wake-up) per pass instead of spinning: the ring holds 384 ms
+             * (stereo) / 896 ms (mono), the GETS pump is paced anyway (F1b), and the CPU is left to the BT tasks */
+            OPENFW_TASK_WAIT();
+        } else {
             bt_status_t cur_st;
             bt_xrec_get_status(&cur_st);
             if (cur_st.rx_acl_pkts == iter_rx && cur_st.tx_acl_pkts == iter_tx) {

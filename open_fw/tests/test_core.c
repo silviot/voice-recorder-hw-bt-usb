@@ -3037,6 +3037,7 @@ static void test_xrec_session(void)
         mock_xrec_exp_write, mock_xrec_exp_run, mock_xrec_read_log,
         mock_xrec_reset_log, mock_xrec_on_dfu, mock_xrec_audio_cfg,
         mock_xrec_get_mtu, mock_xrec_file_busy, NULL, NULL,
+        NULL, NULL, NULL,
     };
     xrec_init(&xrec, &vol, &ops, &sp);
 
@@ -3098,7 +3099,7 @@ static void test_xrec_session(void)
     assert(strstr(phone_text(&sp), "+XREC:ERR,RTCRNG") != NULL);
     assert(strstr(phone_text(&sp), "+XREC:OK,RTC") != NULL);
     assert(strstr(phone_text(&sp), "+XREC:RTC,2026-11-19 17:05:30,3") != NULL);
-    assert(strstr(phone_text(&sp), "+XREC:STAT,87,4095,1,1,16,0,30100,30500") != NULL);
+    assert(strstr(phone_text(&sp), "+XREC:STAT,87,4095,1,1,16,0,30100,30500,0,0\r\n") != NULL);   /* + rec_idx, pace_ms (F7) */
 
     /* Replenish credits & test coalesced 10-file +XREC:LS + +XREC:DEL + path traversal block */
     sp.credits += 10u;

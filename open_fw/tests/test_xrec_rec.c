@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #include "openfw_crypto.h"
 #include "openfw_fs.h"
@@ -185,6 +186,233 @@ static void fill(uint8_t *b, uint32_t n, uint8_t seed)
     for (uint32_t i = 0u; i < n; i++) {
         b[i] = (uint8_t)(seed + i * 13u);
     }
+}
+
+/* ---- 11. Sync while recording (docs/BT_SYNC_SPEED_AND_RECORDING.md F1, F1b, F6, F7): fake recorder state ---- */
+static uint8_t  g_rec_ch;           /* 0 idle, 1 mono, 2 stereo */
+static uint32_t g_rec_pending;      /* audio blocks the recorder has not taken */
+static uint32_t g_now_us = 5000000u;
+static uint32_t g_us_step;          /* added to g_now_us at every now_us() read: card reads that take time */
+static int      g_rtc_sets;
+
+static uint8_t  fake_rec_channels(void *u) { (void)u; return g_rec_ch; }
+static uint32_t fake_rec_pending(void *u) { (void)u; return g_rec_pending; }
+static uint32_t fake_now_us(void *u)
+{
+    (void)u;
+    uint32_t t = g_now_us;
+    g_now_us += g_us_step;
+    return t;
+}
+static int fake_file_busy(void *u, const char *name)
+{
+    (void)u;
+    return g_rec_ch != 0u && strcasecmp(name, "REC_0009.wav") == 0;
+}
+static void fake_get_stat(void *u, xrec_stat_t *st)
+{
+    (void)u;
+    st->media_status = g_rec_ch ? 0x21u : 0x10u;
+    st->rec_idx = 9u;                /* xrec_proto reports it only while recording */
+}
+static int fake_set_rtc(void *u, const xrec_rtc_t *rt)
+{
+    (void)u;
+    (void)rt;
+    g_rtc_sets++;
+    return 0;
+}
+
+/* Payload bytes of the GETS frames in g_out (all frames well formed and in offset order from *next_off). */
+static uint32_t frames_payload(uint32_t *next_off)
+{
+    uint32_t i = 0u, total = 0u;
+    while (i + 12u <= g_out_len) {
+        const uint8_t *f = (const uint8_t *)&g_out[i];
+        assert(memcmp(f, "XREC", 4) == 0);
+        uint32_t off = (uint32_t)f[4] | ((uint32_t)f[5] << 8) | ((uint32_t)f[6] << 16) | ((uint32_t)f[7] << 24);
+        uint32_t n = (uint32_t)f[8] | ((uint32_t)f[9] << 8);
+        assert(off == *next_off && i + 12u + n <= g_out_len);
+        *next_off += n;
+        total += n;
+        i += 12u + n;
+    }
+    assert(i == g_out_len);
+    return total;
+}
+
+static void test_sync_while_recording(void)
+{
+    xrec_ops_t ops;
+    memset(&ops, 0, sizeof(ops));
+    ops.send = cap_send;
+    ops.now_ms = fake_now;
+    ops.get_stat = fake_get_stat;
+    ops.set_rtc = fake_set_rtc;
+    ops.file_busy = fake_file_busy;
+    ops.rec_channels = fake_rec_channels;
+    ops.rec_pending = fake_rec_pending;
+    ops.now_us = fake_now_us;
+    xrec_init(&g_x, &g_vol, &ops, NULL);
+    xrec_set_bound_key(&g_x, g_key);
+    authenticate();
+    xrec_pace_stats_t ps;
+
+    static uint8_t big[60000];
+    fill(big, sizeof(big), 0x3Cu);
+    make_wav("OLD_0001.wav", big, sizeof(big));
+    make_wav("REC_0009.wav", big, 4096u);         /* "the file being recorded" while g_rec_ch != 0 */
+
+    /* STAT fields 9 (rec_idx) and 10 (pace_ms): 0,0 when idle; mono: 16 KiB at 48000 B/s = 342 ms; stereo: LATER */
+    const char *r = cmd("+XREC:STAT");
+    assert(strncmp(r, "+XREC:STAT,", 11) == 0 && strstr(r, ",0,0\r\n") != NULL);
+    g_rec_ch = 1u;
+    r = cmd("+XREC:STAT");
+    assert(strstr(r, ",9,342\r\n") != NULL);
+    g_rec_ch = 2u;
+    r = cmd("+XREC:STAT");
+    assert(strstr(r, ",9,30000\r\n") != NULL);
+    {
+        int commas = 0;                          /* 10 numeric fields: old parsers read the first 8 */
+        for (const char *q = r; *q; q++) {
+            commas += *q == ',';
+        }
+        assert(commas == 10);
+    }
+
+    /* F7: the active file is never sent (any case), in mono and stereo */
+    for (uint8_t ch = 1u; ch <= 2u; ch++) {
+        g_rec_ch = ch;
+        assert(strcmp(cmd("+XREC:GETS,0,4096,640,REC_0009.wav"), "+XREC:ERR,BUSY\r\n") == 0);
+        assert(strcmp(cmd("+XREC:GET,0,640,rec_0009.WAV"), "+XREC:ERR,BUSY\r\n") == 0);
+    }
+    /* decision 5: stereo recording -> other files LATER too */
+    g_rec_ch = 2u;
+    assert(strcmp(cmd("+XREC:GETS,0,4096,640,OLD_0001.wav"), "+XREC:ERR,LATER,30000\r\n") == 0);
+    assert(strcmp(cmd("+XREC:GET,0,640,OLD_0001.wav"), "+XREC:ERR,LATER,30000\r\n") == 0);
+    /* the old file is fine once REC stopped */
+    g_rec_ch = 0u;
+    r = cmd("+XREC:GET,0,640,REC_0009.wav");
+    assert(g_out_len == 12u + 640u && memcmp(r, "XREC", 4) == 0);
+
+    /* F6: no card writer while recording: DEL, PUT (sidecar / CAS / OTA), PUTEND, OTA, PAIR -> LATER; RTC not set */
+    make_wav("REC_0007.wav", big, 100u);
+    expect_put_ok(0u, "REC,REC_0007.cwx", big, 64u);   /* staged before the recording starts */
+    g_rec_ch = 1u;
+    assert(strcmp(cmd("+XREC:DEL,OLD_0001.wav"), "+XREC:ERR,LATER,30000\r\n") == 0);
+    assert(strcmp(cmd("+XREC:DEL,REC_0009.wav"), "+XREC:ERR,BUSY\r\n") == 0);
+    assert(exists("/record/OLD_0001.wav") && exists("/record/REC_0009.wav"));
+    assert(strcmp(put(64u, "REC,REC_0007.cwx", big, 32u), "+XREC:ERR,LATER,30000\r\n") == 0);
+    assert(strcmp(put(0u, "CAS,NOTE.TXT", big, 32u), "+XREC:ERR,LATER,30000\r\n") == 0);
+    assert(strcmp(put(0u, "OTA", big, 32u), "+XREC:ERR,LATER,30000\r\n") == 0);
+    assert(!exists("/cassini/.xrec_cas.tmp") && !exists("/.xrec_ota.tmp"));
+    assert(strcmp(put(0u, "EXP", big, 32u), "+XREC:ERR,UNSUP\r\n") == 0);  /* RAM target: not a card writer */
+    assert(strcmp(cmd("+XREC:PUTEND"), "+XREC:ERR,LATER,30000\r\n") == 0);
+    assert(exists("/record/.xrec_rec.tmp") && !exists("/record/REC_0007.cwx"));   /* staged upload kept */
+    assert(strcmp(cmd("+XREC:RTC,2026,11,25,10,00,00,2"), "+XREC:OK,RTC,LATER\r\n") == 0 && g_rtc_sets == 0);
+    xrec_open_pairing(&g_x, "123456");
+    {
+        char pl[128];
+        snprintf(pl, sizeof(pl), "+XREC:PAIR,123456,%064d", 0);
+        assert(strcmp(cmd(pl), "+XREC:ERR,LATER,30000\r\n") == 0);
+        assert(g_x.pair_active && g_x.pair_fails == 0u);   /* no PIN attempt used */
+    }
+    xrec_close_pairing(&g_x);
+    assert(strcmp(cmd("+XREC:LS"), "") != 0);            /* LS (read only) still works */
+    /* after REC: the same upload resumes and commits, the clock can be set, DEL works */
+    g_rec_ch = 0u;
+    expect_put_ok(64u, "REC,REC_0007.cwx", big + 64, 32u);
+    assert(strcmp(cmd("+XREC:PUTEND"), "+XREC:OK,PUTEND,96\r\n") == 0);
+    assert(strcmp(cmd("+XREC:RTC,2026,11,25,10,00,00,2"), "+XREC:OK,RTC\r\n") == 0 && g_rtc_sets == 1);
+    xrec_get_pace_stats(&g_x, &ps);
+    assert(ps.later == 9u && ps.busy == 4u);   /* 2 GETS/GET + DEL + 3 PUT + PUTEND + RTC + PAIR */
+
+    /* F1: recorder first. A command waits (bytes not consumed) while the recorder has blocks pending. */
+    g_rec_ch = 1u;
+    g_rec_pending = 1u;
+    clear_out();
+    {
+        const char *line = "+XREC:STAT\r";
+        uint16_t n = (uint16_t)strlen(line);
+        uint16_t took = xrec_on_rx(&g_x, (const uint8_t *)line, n);
+        assert(took == n - 1u && g_out_len == 0u);   /* everything but the CR that would run it */
+        g_rec_pending = 0u;
+        assert(xrec_on_rx(&g_x, (const uint8_t *)&line[took], (uint16_t)(n - took)) == n - took);
+        assert(strncmp(g_out, "+XREC:STAT,", 11) == 0);
+    }
+    /* LS waits too, and resumes */
+    g_rec_pending = 1u;
+    clear_out();
+    rx_str("+XREC:LS");
+    g_rec_pending = 0u;
+    rx_str("\r");
+    assert(strstr(g_out, "+XREC:END\r\n") != NULL);
+    g_rec_pending = 0u;
+
+    /* F1b: rate cap. A 60000 B GETS while recording mono: 1 s of fake time moves at most 48000 + the 2048 B bucket */
+    g_us_step = 0u;
+    clear_out();
+    rx_str("+XREC:GETS,0,60000,640,OLD_0001.wav");
+    rx_str("\r");
+    uint32_t next = 0u, moved = frames_payload(&next);
+    assert(moved == 3u * 640u);                         /* the full bucket: 3 chunks, then cap */
+    uint32_t moved_1s = moved;
+    for (int ms = 0; ms < 1000; ms++) {
+        g_now_us += 1000u;
+        clear_out();
+        xrec_poll(&g_x);
+        moved_1s += frames_payload(&next);
+    }
+    assert(moved_1s <= 48000u + 2048u && moved_1s >= 48000u - 640u);
+    /* a pending audio block stops reading at once, even with tokens */
+    g_now_us += 100000u;
+    g_rec_pending = 2u;
+    clear_out();
+    xrec_poll(&g_x);
+    assert(g_out_len == 0u);
+    g_rec_pending = 0u;
+    clear_out();
+    xrec_poll(&g_x);
+    assert(frames_payload(&next) > 0u);
+    /* F1: 5 ms budget per pass. Slow card reads (2 ms per clock read) and a huge cap: at most 3 chunks per pass */
+    xrec_set_rec_pace(&g_x, 1000000u, 0u);
+    g_us_step = 2000u;
+    xrec_get_pace_stats(&g_x, &ps);
+    uint32_t stops0 = ps.budget_stops;
+    clear_out();
+    xrec_poll(&g_x);
+    uint32_t one = frames_payload(&next);
+    assert(one > 0u && one <= 3u * 640u);
+    xrec_get_pace_stats(&g_x, &ps);
+    assert(ps.budget_stops == stops0 + 1u && ps.rate_bps == 1000000u && ps.budget_us == XREC_REC_PASS_BUDGET_US);
+    g_us_step = 0u;
+    /* not recording: no cap, the rest of the window moves in one pass */
+    g_rec_ch = 0u;
+    clear_out();
+    xrec_poll(&g_x);
+    uint32_t rest = frames_payload(&next);
+    assert(next == 60000u && rest > 3u * 640u && !g_x.gets_active);
+    /* a stereo recording that starts during a stream ends it with LATER */
+    g_rec_ch = 0u;
+    xrec_set_rec_pace(&g_x, 48000u, 0u);
+    clear_out();
+    rx_str("+XREC:GETS,0,60000,640,OLD_0001.wav");
+    g_rec_ch = 1u;                                     /* mono from here: the stream is paced */
+    rx_str("\r");
+    next = 0u;
+    (void)frames_payload(&next);
+    assert(g_x.gets_active);
+    g_rec_ch = 2u;
+    clear_out();
+    xrec_poll(&g_x);
+    assert(strcmp(g_out, "+XREC:ERR,LATER,30000\r\n") == 0 && !g_x.gets_active);
+    g_rec_ch = 0u;
+
+    assert(exfat_delete_file(&g_vol, "/record", "OLD_0001.wav") == 0);
+    assert(exfat_delete_file(&g_vol, "/record", "REC_0009.wav") == 0);
+    assert(exfat_delete_file(&g_vol, "/record", "REC_0007.wav") == 0);
+    assert(exfat_delete_file(&g_vol, "/record", "REC_0007.cwx") == 0);
+    printf("xrec sync while recording (recorder first, cap, budget, LATER, BUSY, STAT 9/10): OK\n");
 }
 
 int main(int argc, char **argv)
@@ -587,12 +815,26 @@ int main(int argc, char **argv)
         assert(strcmp(cmd("+XREC:DBG,REC,0,1"), "+XREC:ERR,ARGS\r\n") == 0);
         assert(strcmp(cmd("+XREC:DBG,FOO"), "+XREC:ERR,ARGS\r\n") == 0);
         assert(strcmp(cmd("+XREC:DBGX"), "+XREC:ERR,CMD\r\n") == 0);
+        /* DBG,PACE: the sync-while-recording cap for M3 (read, set, set with budget, bad values) */
+        assert(strncmp(cmd("+XREC:DBG,PACE"), "+XREC:DBG,PACE,rate=48000,budget_us=5000,ring_waits=0,", sizeof("+XREC:DBG,PACE,rate=48000,budget_us=5000,ring_waits=0,") - 1u) == 0);
+        assert(strncmp(cmd("+XREC:DBG,PACE,24000"), "+XREC:DBG,PACE,rate=24000,budget_us=5000,", sizeof("+XREC:DBG,PACE,rate=24000,budget_us=5000,") - 1u) == 0);
+        assert(strncmp(cmd("+XREC:DBG,PACE,96000,8000"), "+XREC:DBG,PACE,rate=96000,budget_us=8000,", sizeof("+XREC:DBG,PACE,rate=96000,budget_us=8000,") - 1u) == 0);
+        assert(strcmp(cmd("+XREC:DBG,PACE,10"), "+XREC:ERR,ARGS\r\n") == 0);
+        assert(strcmp(cmd("+XREC:DBG,PACE,48000,1"), "+XREC:ERR,ARGS\r\n") == 0);
+        assert(strcmp(cmd("+XREC:DBG,PACE,48000,5000,1"), "+XREC:ERR,ARGS\r\n") == 0);
+        assert(strncmp(cmd("+XREC:DBG,PACE,48000,5000"), "+XREC:DBG,PACE,rate=48000,budget_us=5000,", sizeof("+XREC:DBG,PACE,rate=48000,budget_us=5000,") - 1u) == 0);
         xrec_on_disconnect(&g_x);                            /* a new link: DBG needs AUTH like every data command */
         assert(strcmp(cmd("+XREC:DBG"), "+XREC:ERR,LOCKED\r\n") == 0);
         authenticate();
         printf("xrec bench DBG / GETS count tests: OK\n");
     }
 #endif
+
+    /* 11. Sync while recording (own ops; the context is set up again afterwards) */
+    test_sync_while_recording();
+    xrec_init(&g_x, &g_vol, &ops, NULL);
+    xrec_set_bound_key(&g_x, g_key);
+    authenticate();
 
     /* final LS: recordings + sidecars, no temps */
     {

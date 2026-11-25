@@ -49,6 +49,7 @@ class FakeDevice:
         self.gets_frames = None                 # override: list of payload sizes the next GETS answers with
         self.dbg_calls = 0                      # +XREC:DBG (bench images)
         self.recording = self.rec_done = False
+        self.pace_bps = 48000
         self.gets_bytes = 0
         self.dels = 0
 
@@ -167,6 +168,11 @@ class FakeDevice:
                 if k.startswith("/record/"):
                     self._reply(f"+XREC:F,{len(v)},{k[len('/record/'):]}")
             self._reply("+XREC:END")
+        elif line == "+XREC:DBG,PACE" or line.startswith("+XREC:DBG,PACE,"):
+            if line != "+XREC:DBG,PACE":
+                self.pace_bps = int(line.split(",")[2])
+            self._reply(f"+XREC:DBG,PACE,rate={self.pace_bps},budget_us=5000,ring_waits=0,budget_stops=0,cap_stops=0,"
+                        "later=0,busy=0,rec_b=0")
         elif line == "+XREC:DBG" or line.startswith("+XREC:DBG,"):
             self.dbg_calls += 1
             if line == "+XREC:DBG":
@@ -176,7 +182,9 @@ class FakeDevice:
             else:
                 self._reply("+XREC:ERR,NOENT")
         elif line == "+XREC:STAT":
-            self._reply("+XREC:STAT,80,3900,0,0,1,12,1000,30000")
+            # open_fw with sync while recording: fields 9 (rec_idx) and 10 (pace_ms); old_fw: the 8 fields
+            self._reply("+XREC:STAT,80,3900,0,0,1,12,1000,30000" + ("" if self.old_fw else
+                                                                    (",1,342" if self.recording else ",0,0")))
         elif line.startswith("+XREC:DEL,"):
             self.dels += 1
             self._reply("+XREC:ERR,DEL")
@@ -365,7 +373,26 @@ def test_bench_dbg_and_load() -> None:
                                      log=lambda s: None, storm_every=0.1)
     assert res["bytes"] <= 8 * 1024 * 0.5 + 1024 + 1, res
     assert res["storms"] >= 3 and dev.dels == res["storms"] and dev.files, res   # DEL of a missing name only
-    print("[PASS] bt_sync +XREC:DBG and --bench-load (RECSTART, GETS loop with wrap and cap, DBG polls, STAT/LS/DEL storm, RECSTOP)")
+    # STAT: 10 fields from firmware with sync while recording, 8 from older firmware (keys left out)
+    dev = FakeDevice({})
+    c = client_for(dev)
+    st = c.get_stat()
+    assert st["total_mb"] == 30000 and st["rec_idx"] == 0 and st["pace_ms"] == 0, st
+    dev.recording = True
+    st = c.get_stat()
+    assert st["rec_idx"] == 1 and st["pace_ms"] == 342, st
+    st = client_for(FakeDevice({}, old_fw=True)).get_stat()
+    assert st["total_mb"] == 30000 and "rec_idx" not in st and "pace_ms" not in st, st
+    # DBG,PACE: read / set, and bench_load(pace_bps=...) sets the cap first and logs the counters last
+    assert c.pace()["rate"] == "48000"
+    assert c.pace(24000)["rate"] == "24000" and dev.pace_bps == 24000
+    dev = FakeDevice({"/record/OLD.wav": bytes(4000)})
+    lines = []
+    client_for(dev).bench_load(0.2, "OLD.wav", 4000, burst_size=1024, chunk_size=512, dbg_every=0, log=lines.append,
+                               pace_bps=64000)
+    assert dev.pace_bps == 64000 and "+XREC:DBG,PACE,rate=64000" in lines[0], lines
+    assert sum("+XREC:DBG,PACE," in ln for ln in lines) == 2, lines
+    print("[PASS] bt_sync +XREC:DBG and --bench-load (RECSTART, GETS loop with wrap and cap, DBG polls, STAT/LS/DEL storm, RECSTOP, STAT 8/10 fields, DBG,PACE)")
 
 
 def main() -> int:

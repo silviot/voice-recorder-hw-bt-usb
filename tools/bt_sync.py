@@ -441,8 +441,27 @@ class XRecRFCOMMClient:
         if not line.startswith("+XREC:STAT,"):
             raise RuntimeError(f"Failed to query status: {line}")
         parts = [int(x) for x in line[len("+XREC:STAT,") :].split(",")]
-        keys = ("battery_pct", "voltage_mv", "charge_status", "vbus", "media_status", "rec_sec", "free_mb", "total_mb")
+        # fields 9 / 10 (open_fw with sync while recording, docs/XREC_PROTOCOL.md): the active REC_NNNN number (0 = not
+        # recording) and the pause between GETS windows (0 = none); older firmware sends 8 fields: keys left out
+        keys = ("battery_pct", "voltage_mv", "charge_status", "vbus", "media_status", "rec_sec", "free_mb", "total_mb",
+                "rec_idx", "pace_ms")
         return dict(zip(keys, parts))
+
+    def pace(self, rate_bps: int = 0, budget_us: int = 0) -> Dict[str, str]:
+        """+XREC:DBG,PACE[,<bytes/s>[,<budget us>]] (bench images only, after AUTH): read / set the firmware's GETS cap
+        while recording (design M3 runs at 24 / 48 / 64 / 96 KB/s) and its pacing counters; "_line" = raw reply."""
+        cmd = "+XREC:DBG,PACE"
+        if rate_bps > 0:
+            cmd += f",{int(rate_bps)}"
+            if budget_us > 0:
+                cmd += f",{int(budget_us)}"
+        self._send_cmd(cmd)
+        line = self._read_line()
+        if not line.startswith("+XREC:DBG,PACE,"):
+            raise RuntimeError(f"DBG,PACE failed: {line} (bench image with sync-while-recording pacing only)")
+        kv = dict(t.split("=", 1) for t in line.split(",") if "=" in t)
+        kv["_line"] = line
+        return kv
 
     def dbg(self, rec: Optional[int] = None) -> Dict[str, str]:
         """+XREC:DBG (bench images only, after AUTH): the recorder's measurement counters as a dict, "_line" = the raw
@@ -468,13 +487,18 @@ class XRecRFCOMMClient:
         rec: bool = False,
         log=print,
         storm_every: float = 0.0,
+        pace_bps: int = 0,
     ) -> Dict[str, float]:
         """Measurement session (docs/BT_HW_RESULTS.md, "Sync during recording"): hold this link for `seconds`,
         optionally RECSTART first / RECSTOP last, pull GETS bursts of load_file in a loop (from 0 again at its end;
         kbps > 0 caps the average rate in KiB/s, 0 = as fast as the link goes) and log a +XREC:DBG line every
         dbg_every s (0 = only at the end). storm_every > 0: every storm_every s also STAT, LS and a DEL of a name that
-        does not exist (ERR,DEL: the directory scan without deleting anything), design M3. Returns the bytes / seconds /
-        KiB/s actually moved."""
+        does not exist (ERR,DEL: the directory scan without deleting anything; while recording, firmware with sync
+        while recording answers ERR,LATER without touching the card), design M3. pace_bps > 0 first sets the
+        firmware's own GETS cap while recording (+XREC:DBG,PACE), and the pacing counters are logged at the end.
+        Returns the bytes / seconds / KiB/s actually moved."""
+        if pace_bps > 0:
+            log(f"{0.0:8.1f} {self.pace(pace_bps)['_line']}")
         t0 = time.monotonic()
         nstorm = t0 + storm_every if storm_every > 0 else float("inf")
         storms = 0
@@ -526,6 +550,8 @@ class XRecRFCOMMClient:
             log(f"{el:8.1f} {self.dbg(0)['_line']}")
         else:
             log(f"{el:8.1f} {self.dbg()['_line']}")
+        if pace_bps > 0:
+            log(f"{el:8.1f} {self.pace()['_line']}")
         res = {"bytes": float(moved), "seconds": el, "kib_s": moved / 1024.0 / max(el, 1e-6), "errors": float(errors),
                "storms": float(storms)}
         log(f"{el:8.1f} LOAD bytes={moved} kib_s={res['kib_s']:.1f} errors={errors} storms={storms}")
@@ -724,6 +750,8 @@ def main() -> None:
     parser.add_argument("--load-rec", action="store_true", help="--bench-load: RECSTART at the start, RECSTOP at the end")
     parser.add_argument("--load-storm", type=float, default=0.0,
                         help="--bench-load: every N s also STAT + LS + DEL of a missing name (0 = off)")
+    parser.add_argument("--load-pace", type=int, default=0, metavar="BYTES_S",
+                        help="--bench-load: set the firmware's GETS cap while recording first (+XREC:DBG,PACE; M3)")
     parser.add_argument("--dbg-every", type=float, default=5.0, help="--bench-load: DBG poll period in s (0 = end only)")
     parser.add_argument("--dbg-log", type=Path, help="--bench-load / --dbg: also append the lines to this file")
     parser.add_argument("--pair", metavar="PIN", help="Bind to recorder using the 6-digit PIN shown on its Bluetooth menu LCD (v5)")
@@ -803,7 +831,7 @@ def main() -> None:
                     sys.exit(1)
             client.bench_load(args.bench_load, args.load_file, size, burst_size=max(args.burst_size, args.chunk_size),
                               chunk_size=args.chunk_size, kbps=args.load_kbps, dbg_every=args.dbg_every,
-                              rec=args.load_rec, log=out, storm_every=args.load_storm)
+                              rec=args.load_rec, log=out, storm_every=args.load_storm, pace_bps=args.load_pace)
             return
         if args.rtc_read:
             print(f"Device RTC: {client.read_rtc()}")
