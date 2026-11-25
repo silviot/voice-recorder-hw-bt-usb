@@ -34,7 +34,7 @@ PORT_SRCS := $(addprefix $(ROOT)/bt_port/,bt_alarm.c bt_esp_timer.c bt_entropy.c
              bt_ctrl_cmds.c bt_ctrl_evt.c bt_xrec_bluedroid.c bt_hp_bluedroid.c hp_sink.c hp_tx.c \
              bt_task_sup.c)
 HOST_SRCS := $(HT)/host_heap.c $(HT)/host_glue.c $(HT)/host_ctrl.c $(HT)/test_bt_host.c $(HT)/host_link_stubs.c \
-             $(HT)/host_xrec.c $(HT)/test_phone.c $(HT)/test_hp_link.c $(HT)/test_headphones.c \
+             $(HT)/host_xrec.c $(HT)/host_oom.c $(HT)/test_phone.c $(HT)/test_hp_link.c $(HT)/test_headphones.c \
              $(ROOT)/tests/fake_rom.c
 KERN_SRCS := $(addprefix $(FR)/,tasks.c queue.c list.c timers.c event_groups.c stream_buffer.c) $(HT)/host_main.c
 PPORT_SRCS:= $(POSIX)/port.c $(POSIX)/utils/wait_for_event.c
@@ -104,7 +104,9 @@ $(OUT)/third_party/bluedroid/common/osal/src/bt_osal_freertos.o: CFLAGS_BD += -W
     -Wno-tautological-constant-out-of-range-compare
 
 comma   := ,
-WRAPS   := malloc calloc realloc free esp_timer_create esp_timer_delete
+# host_oom.c (patch 0044): btc_transfer_context fixed_queue_enqueue btc_storage_add_bonded_device
+WRAPS   := malloc calloc realloc free esp_timer_create esp_timer_delete \
+           btc_transfer_context fixed_queue_enqueue btc_storage_add_bonded_device
 # --gc-sections as in the firmware link: unused BLE/GATT/SMP-OOB entry points reference code that is not built.
 LDFLAGS := $(SANFLAGS) -no-pie -pthread -Wl,--gc-sections $(addprefix -Wl$(comma)--wrap=,$(WRAPS))
 

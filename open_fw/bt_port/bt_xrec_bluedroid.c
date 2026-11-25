@@ -133,6 +133,8 @@ static struct {
     uint8_t  ssp_burned;
     /* connection */
     uint8_t  conn_open, conn_authorized, conn_closing, cong, entropy_fail, xrec_reset_pending;
+    uint8_t  close_retry, close_tries;   /* review STEP10 C11: esp_spp_disconnect() refused, retried at close_retry_at */
+    uint32_t close_retry_at;
     uint32_t conn_handle;
     uint8_t  conn_bda[6];
     uint16_t mtu;
@@ -370,6 +372,28 @@ static void on_data_ind(uint32_t handle, const uint8_t *data, uint16_t len)
     }
 }
 
+/* BTC context: patch 0044 reports an RX frame btc_spp could not queue (no memory). The stream has a gap: like an
+ * overflow, nothing more is taken from this connection and the app closes it (EV_RX_OVERFLOW, status 1). */
+static void on_rx_lost(uint32_t handle)
+{
+    bool queued = false;
+    bt_xrec_plat_lock();
+    if (s.cb_open && s.cb_rx_bound && !s.cb_rx_closing && handle == s.cb_rx_handle) {
+        ev_t e = { 0 };
+        e.type = EV_RX_OVERFLOW;
+        e.status = 1u;
+        e.handle = handle;
+        s.cb_rx_overflow = 1u;
+        s.d.rx_lost++;
+        (void)push_locked(&e);
+        queued = true;
+    }
+    bt_xrec_plat_unlock();
+    if (queued) {
+        bt_xrec_plat_notify_app();
+    }
+}
+
 /* BTC hands callbacks the copy it placed right after the 4-byte btc_msg_t: 4-aligned, which is all Cortex-M4 needs
  * for these pointer-holding unions; x86-64 UBSan (make test-bt-host) wants 8. Host-only finding, not a target issue. */
 #define BTC_CB_ARG_ALIGN4 __attribute__((no_sanitize("alignment")))
@@ -407,6 +431,10 @@ static void spp_cb(esp_spp_cb_event_t event, esp_spp_cb_param_t *p)
         e.handle = p->close.handle;
         break;
     case ESP_SPP_DATA_IND_EVT:
+        if (p->data_ind.status != ESP_SPP_SUCCESS) {
+            on_rx_lost(p->data_ind.handle);    /* patch 0044: btc_spp dropped a frame (no memory) */
+            return;
+        }
         on_data_ind(p->data_ind.handle, p->data_ind.data, p->data_ind.len);
         return;
     case ESP_SPP_CONG_EVT:
@@ -517,7 +545,35 @@ static void conn_close_request(const char *why)
     esp_err_t r = esp_spp_disconnect(s.conn_handle);
     if (r != ESP_OK) {
         bt_xrec_plat_log_u32("BT XREC esp_spp_disconnect failed", (uint32_t)r);
+        /* review STEP10 C11: the request was not queued (no memory for BTC's message). Retried by close_retry_poll();
+         * the connection stays closing (no traffic taken or sent) meanwhile. */
+        s.close_retry = 1u;
+        s.close_tries = 0u;
+        s.close_retry_at = bt_xrec_plat_now_ms() + BT_XREC_CLOSE_RETRY_MS;
     }
+}
+
+/* App task. Review STEP10 C11: a refused esp_spp_disconnect() is retried until accepted (the CLOSE event then ends
+ * the connection); after BT_XREC_CLOSE_RETRIES refusals the session faults and the recovery ladder tears it down. */
+static void close_retry_poll(uint32_t now)
+{
+    if (!s.close_retry || !s.conn_open || !time_reached(now, s.close_retry_at)) {
+        return;
+    }
+    s.d.close_retries++;
+    esp_err_t r = esp_spp_disconnect(s.conn_handle);
+    if (r == ESP_OK) {
+        s.close_retry = 0u;
+        bt_xrec_plat_log_u32("BT XREC esp_spp_disconnect accepted, retry", s.close_tries + 1u);
+        return;
+    }
+    if (++s.close_tries >= BT_XREC_CLOSE_RETRIES) {
+        s.close_retry = 0u;
+        bt_xrec_plat_log_u32("BT XREC esp_spp_disconnect refused, giving up after", s.close_tries);
+        fault(BT_XREC_FAULT_CLOSE_FAIL);
+        return;
+    }
+    s.close_retry_at = now + BT_XREC_CLOSE_RETRY_MS;
 }
 
 static void xrec_reset_flush(void)
@@ -546,6 +602,7 @@ static void conn_reset(void)
     }
     s.xrec_reset_pending = 0u;
     s.conn_open = s.conn_authorized = s.conn_closing = s.cong = s.entropy_fail = 0u;
+    s.close_retry = s.close_tries = 0u;
     s.conn_handle = 0u;
     s.mtu = 0u;
     s.inflight = 0u;
@@ -1163,7 +1220,8 @@ static void on_spp_event(const ev_t *e)
         break;
     case EV_RX_OVERFLOW:
         if (s.conn_open && e->handle == s.conn_handle) {
-            conn_close_request("BT XREC close: RX buffer overflow");
+            conn_close_request(e->status != 0u ? "BT XREC close: RX frame lost (no memory)"
+                                               : "BT XREC close: RX buffer overflow");
         }
         break;
     case EV_WRITE:
@@ -1720,6 +1778,10 @@ void bt_xrec_poll(void)
     if (s.entropy_fail && s.conn_open && !s.conn_closing) {
         conn_close_request("BT XREC close: entropy not ready");
     }
+    close_retry_poll(now);
+    if (s.state != BT_XREC_ST_CONFIG && s.state != BT_XREC_ST_READY) {
+        return;                                  /* close_retry_poll() faulted the session */
+    }
     if (s.conn_open && s.conn_authorized && !s.conn_closing) {
         xrec_poll(&s.b->xrec);
     }
@@ -1943,6 +2005,19 @@ int bt_xrec_spp_deinit_needed(void)
 }
 
 #if defined(BT_XREC_TEST_HOOKS) && BT_XREC_TEST_HOOKS
+/* Host tests only (app task, via bthx_call_fn): the device closes the open connection, as an RX overflow or a write
+ * error would (test_bt_host phone, step P7c: review STEP10 C11). */
+int bt_xrec_test_close_request(uint32_t arg);
+int bt_xrec_test_close_request(uint32_t arg)
+{
+    (void)arg;
+    if (!s.conn_open || s.conn_closing) {
+        return -1;
+    }
+    conn_close_request("BT XREC close: test request");
+    return 0;
+}
+
 /* Host tests only: forget a DEAD session (on target the hard path reboots). */
 void bt_xrec_test_reset(void);
 void bt_xrec_test_reset(void)

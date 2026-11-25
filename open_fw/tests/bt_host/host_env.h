@@ -33,6 +33,20 @@ uint64_t bth_heap_counted(void);
 uint32_t bth_heap_seq(void);                /* allocation sequence number (live blocks carry theirs) */
 void bth_heap_dump_since(uint32_t seq);     /* stderr: live blocks allocated after seq (BTH_HEAP_TRACE=1: stacks) */
 
+/* ---- targeted out-of-memory levers (host_oom.c; patch 0044, review STEP10 A9 / C7 / C11) ---- */
+enum {
+    BTH_OOM_SPP_WRITE_CMPL = 0,   /* BTA -> BTC hand-off of BTA_JV_RFCOMM_WRITE_EVT */
+    BTH_OOM_SPP_DATA_IND,         /* BTA -> BTC hand-off of BTA_JV_RFCOMM_DATA_IND_EVT (bta_co_rfc_data_incoming) */
+    BTH_OOM_SPP_DISCONNECT,       /* esp_spp_disconnect()'s BTC post (the API returns ESP_FAIL) */
+    BTH_OOM_BTU_ENQUEUE,          /* fixed_queue_enqueue() on BTU_TASK (list node) */
+    BTH_OOM_BOND_STORE,           /* btc_storage_add_bonded_device() */
+    BTH_OOM_BTC_FREE_SCN_UD,      /* an allocation of sizeof(tBTA_JV_FREE_SCN_USER_DATA) on BTC_TASK (SPP deinit) */
+    BTH_OOM_N
+};
+void bth_oom_arm(int what, int n);      /* the next n matching calls fail; 0 disarms */
+uint32_t bth_oom_hits(int what);        /* failures injected so far */
+bool bth_oom_take_alloc(size_t n);      /* host_heap.c, under its lock: fail this allocation (BTH_OOM_BTC_FREE_SCN_UD) */
+
 /* ---- logging: serialised (FreeRTOS critical section), safe from any task ---- */
 void bth_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 

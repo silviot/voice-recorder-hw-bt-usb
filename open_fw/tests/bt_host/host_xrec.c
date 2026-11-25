@@ -716,6 +716,7 @@ static void app_task(void *arg)
             case BTHX_FN: r = s_fn != NULL ? s_fn(s_req_arg) : -1; break;
             default: r = -1; break;
             }
+            snapshot();              /* before "done": a test reading S() right after the call sees its effect */
             taskENTER_CRITICAL();
             s_req_res = r;
             s_req_done = s_req_seq;

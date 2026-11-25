@@ -139,7 +139,7 @@ static void *bth_alloc(size_t n, bool zero, void *ra)
     }
     lock();
     void *r = NULL;
-    if (!inject(ra)) {
+    if (!bth_oom_take_alloc(n) && !inject(ra)) {
         void *raw = zero ? __real_calloc(1, HDR + n) : __real_malloc(HDR + n);
         if (raw != NULL) {
             r = track(raw, n, ra);

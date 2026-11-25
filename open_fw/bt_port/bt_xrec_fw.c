@@ -147,8 +147,9 @@ void bt_xrec_plat_log_u32(const char *msg, uint32_t v)
 
 void *bt_xrec_plat_alloc(size_t n) { return pvPortMalloc(n); }
 void bt_xrec_plat_free(void *p) { vPortFree(p); }
-void bt_xrec_plat_service(void) { recorder_poll(); }
-void bt_xrec_plat_wait(void) { vTaskDelay(1); }
+static void assert_check(void);
+void bt_xrec_plat_service(void) { assert_check(); recorder_poll(); }
+void bt_xrec_plat_wait(void) { assert_check(); vTaskDelay(1); }
 uint32_t bt_xrec_plat_irq_count(void) { return s_irq_cache; }
 
 /* "BT ROM links lc=.. ld=.. rep=..", two hex digits per link 0..6 (bt_rom_real_links): tells a link the ROM still
@@ -1041,7 +1042,8 @@ void bt_xrec_plat_stack_down_begin(void)
     post_job(JOB_DOWN);
 }
 
-void bt_xrec_plat_hard_path(uint32_t reason)
+static void hard_path_rec(uint32_t reason, uint32_t b) __attribute__((noreturn));
+static void hard_path_rec(uint32_t reason, uint32_t b)
 {
     bt_ctrl_rtos_hard_stop();                            /* bt_stop + IRQ 26 masked (no ROM call) */
     if (bt_rom_real_busy()) {
@@ -1051,11 +1053,89 @@ void bt_xrec_plat_hard_path(uint32_t reason)
     if (recorder_is_saving()) {
         (void)recorder_stop();                           /* finalise the recording (static buffers only) */
     }
-    openfw_rtos_fatal(BT_FAULT_RECORD_CODE, reason, 0u); /* AON fault record + reboot; BT off next boot */
+    openfw_rtos_fatal(BT_FAULT_RECORD_CODE, reason, b);  /* AON fault record + reboot; BT off next boot */
+}
+
+void bt_xrec_plat_hard_path(uint32_t reason)
+{
+    hard_path_rec(reason, 0u);
+}
+
+/* ============================================ assert() (review STEP10 A9) ====================================== */
+/* BT images build Bluedroid with its assert()s live (no NDEBUG): picolibc's __assert_func printed and called abort()
+ * -> _exit() -> reboot, without finalising a recording in progress. A failed assert in a task is now handed to the
+ * session's app task, which takes the BT hard path (bt_stop, recorder finalised, fault record 0xB1 with reason
+ * BT_XREC_FAULT_ASSERT and the line, reboot) at its next platform poll / service / wait. The asserting task stops
+ * there, still holding whatever lock it held. Backstop: if the app task has not taken the hard path after
+ * BT_ASSERT_BACKSTOP_MS (e.g. blocked on such a lock), the old reboot (0xF0, recording not finalised).
+ * From an ISR, a critical section, before any BT session, or a second assert in the app task: the old reboot at once. */
+#define BT_ASSERT_BACKSTOP_MS 1500u
+static volatile uint8_t s_assert_pending;
+static volatile uint32_t s_assert_line;
+
+static void assert_fail(const char *file, int line) __attribute__((noreturn));
+static void assert_fail(const char *file, int line)
+{
+    uint32_t ipsr, primask, basepri;
+    __asm__ volatile ("mrs %0, ipsr" : "=r"(ipsr));
+    __asm__ volatile ("mrs %0, primask" : "=r"(primask));
+    __asm__ volatile ("mrs %0, basepri" : "=r"(basepri));
+    TaskHandle_t app = s_app;
+    if ((ipsr & 0x1FFu) != 0u || primask != 0u || basepri != 0u || app == NULL ||
+        xTaskGetSchedulerState() != taskSCHEDULER_RUNNING) {
+        openfw_rtos_fatal(0xF0u, (uint32_t)line, (uint32_t)(uintptr_t)file);
+    }
+    taskENTER_CRITICAL();
+    uint8_t was = s_assert_pending;
+    if (!was) {
+        s_assert_line = (uint32_t)line;
+        s_assert_pending = 1u;
+    }
+    taskEXIT_CRITICAL();
+    if (xTaskGetCurrentTaskHandle() == app) {
+        if (was) {
+            openfw_rtos_fatal(0xF0u, (uint32_t)line, (uint32_t)(uintptr_t)file);   /* asserted inside the hard path */
+        }
+        openfw_log_puts("BT assert (app task), line ");
+        openfw_log_u32((uint32_t)line);
+        openfw_log_putc('\n');
+        hard_path_rec(BT_XREC_FAULT_ASSERT, (uint32_t)line);
+    }
+    for (uint32_t t = 0u; t < BT_ASSERT_BACKSTOP_MS; t += 10u) {
+        vTaskDelay(pdMS_TO_TICKS(10u));
+    }
+    openfw_rtos_fatal(0xF0u, (uint32_t)line, (uint32_t)(uintptr_t)file);
+}
+
+/* App task: take the hard path for an assert another task reported. */
+static void assert_check(void)
+{
+    if (s_assert_pending && s_app != NULL && xTaskGetCurrentTaskHandle() == s_app) {
+        openfw_log_puts("BT assert in a BT task, line ");
+        openfw_log_u32(s_assert_line);
+        openfw_log_puts(": hard path\n");
+        hard_path_rec(BT_XREC_FAULT_ASSERT, s_assert_line);
+    }
+}
+
+/* picolibc's assert() targets (libc.a members of their own: these definitions replace them in BT images). */
+void __assert_func(const char *file, int line, const char *func, const char *expr) __attribute__((noreturn));
+void __assert_func(const char *file, int line, const char *func, const char *expr)
+{
+    (void)func;
+    (void)expr;
+    assert_fail(file, line);
+}
+
+void __assert_no_args(void) __attribute__((noreturn));
+void __assert_no_args(void)
+{
+    assert_fail(NULL, 0);
 }
 
 uint32_t bt_xrec_plat_poll(void)
 {
+    assert_check();
     uint32_t now = millis();
     session_entropy_poll(now);
     if (s_store_flush_req) {
