@@ -853,9 +853,11 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
     int bt_only = aout_route() == AOUT_ROUTE_BT;   /* the headset alone: jack edges change nothing (R-14) */
     int bt_route = aout_is_bt();                    /* the session can stop under us (BT off, fault) */
     int lowbatt_stop = 0;                           /* this loop stopped headphones mode at low battery */
+    int abs_on = 0;                                 /* absolute volume in effect when the gain was last set */
     if (aout_is_bt()) {
         bt_hp_player_begin();                       /* keys / headset events from before this file do not apply */
         volume = bt_hp_vol31();
+        abs_on = bt_hp_abs_vol();
         PLAYER_SET_VOL(volume);
     }
 #endif
@@ -967,10 +969,13 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
             (void)bt_hp_stop();                  /* plan step 8: low battery stops headphones mode (bt_lowbatt.h) */
             lowbatt_stop = 1;
         }
-        if (aout_is_bt() && bt_hp_vol31() != volume) {
+        if (aout_is_bt() && (bt_hp_vol31() != volume || bt_hp_abs_vol() != abs_on)) {
             /* the headset changed its volume (absolute volume CHANGED / SetAbsoluteVolume): follow it, so the next
-             * VOL key steps from the headset's value instead of jumping back */
+             * VOL key steps from the headset's value instead of jumping back. Absolute volume itself is known only
+             * once the AVRCP capabilities arrive, often after playback started (silicon 2026-11-25: ~1.3 s late):
+             * then the PCM gain goes back to unity, or the headset's own volume would attenuate a second time. */
             volume = bt_hp_vol31();
+            abs_on = bt_hp_abs_vol();
             PLAYER_SET_VOL(volume);
             ui_dirty = 1;
         }
