@@ -230,7 +230,22 @@ Backward compatibility:
 
 ---
 
-## 5. Open questions for the user
+## 5. Decisions (user, 2026-11-25)
+
+1. **Radio up on Home: option (b).** The background session is brought up after a recording ends and stays up,
+   including through the next recording, until N minutes pass with nothing left to sync (N to be set from M6).
+   It is not up at boot or on Home without a preceding recording.
+2. **Acceptance bar: as proposed** (within the radio-never-on baseline's spread: ±0.5 dB noise floor, no spur > +3 dB,
+   zero continuity errors, ABX at chance; gain 20 and 31, mono and stereo; Pixel at 5 cm is information).
+3. (Only relevant if M2 selects L3; not asked yet.)
+4. **Headphones win:** output=BT (auto-connect on PLAY) takes the controller from the background phone session;
+   never during a recording.
+5. **Mono only at first:** transfers during stereo recordings wait until REC stops; stereo may be enabled later if
+   M3 shows margin.
+
+The original questions follow for reference.
+
+## 5b. Original open questions
 
 1. **When is the radio up on Home?** (a) Always, when background sync is ON and a phone is bonded (simplest; costs idle power, quantified in M6); (b) brought up on Home only after a recording ends, and kept up (including through the next recording) until N minutes pass with nothing left to sync; (c) only after REC stops, until the phone has synced (this is then "sync between recordings", not during). Recommendation: (a), revisited after M6.
 2. **Acceptance strictness for M2.** The proposed thresholds are "within measurement spread of the radio-never-on baseline" (± 0.5 dB, no spur > +3 dB, zero continuity errors). Is that your meaning of "never affect", or do you want a stricter bar (e.g. also tested at gain 31 in stereo with the Pixel at 5 cm as the pass condition, not just as information)?
