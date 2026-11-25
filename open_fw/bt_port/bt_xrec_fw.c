@@ -53,12 +53,19 @@
 #define BT_FAULT_RECORD_CODE    0xB1u     /* plan M1: AON fault record, BT stays off on the next boot */
 #define BOND_FILE               "bt_bonds.bin"
 #define BOND_TMP                ".bt_bonds.tmp"
+#define HP_BOND_FILE            "bt_hp_bonds.bin"    /* headphones mode (docs/BT_A2DP_DESIGN.md §6.4) */
+#define HP_BOND_TMP             ".bt_hp_bonds.tmp"
+#define HP_CFG_FILE             "bt_hp_cfg.bin"      /* headphones settings: output mode, bt_vol, last headset */
+#define HP_CFG_TMP              ".bt_hp_cfg.tmp"
 #define BOND_RETRY_MS           1000u     /* a failed bond-file write is retried this often ... */
 #define BOND_RETRY_MAX          8u        /* ... this many times per session (then at the next change / session end) */
 
 /* ---- session ---- */
 static exfat_vol_t *s_vol;
 static int s_sd;
+static uint8_t s_mode;                   /* BT_XREC_MODE_* of the running / next session */
+static uint8_t s_store_mode = 0xFFu;     /* mode whose bond file the RAM store holds (0xFF: none loaded yet) */
+static int (*s_profile_down)(void);      /* headphones: AVRCP + A2DP deinit, run by the down job */
 static uint8_t s_bd[6];
 static TaskHandle_t s_app;
 
@@ -392,14 +399,32 @@ void bt_xrec_plat_save_bound_key(const uint8_t key[32])
     memset(blob, 0, sizeof(blob));
 }
 
+void bt_xrec_plat_set_mode(uint8_t mode, int (*profile_down)(void))
+{
+    s_mode = mode;
+    s_profile_down = profile_down;
+}
+
+static const char *bond_file(void) { return s_mode == BT_XREC_MODE_HP ? HP_BOND_FILE : BOND_FILE; }
+static const char *bond_tmp(void) { return s_mode == BT_XREC_MODE_HP ? HP_BOND_TMP : BOND_TMP; }
+
 /* Bond store (plan M2 "Store"): loaded before esp_bluedroid_init(); written by the app when bt_store asks. */
 static void bonds_load(void)
 {
+    if (s_store_mode != s_mode) {
+        /* the other mode's bonds must not be written into this mode's file (design §6.4); within one mode the RAM
+         * store keeps its bonds when the file is missing (no SD: RAM-only bonds for the boot, as before) */
+        bt_store_reset();
+        s_store_mode = s_mode;
+    }
     if (!s_sd || s_vol == NULL) {
         return;                      /* no SD: RAM-only bonds for the session (whatever this boot already holds) */
     }
+    char path[24];
+    path[0] = '/';
+    memcpy(&path[1], bond_file(), strlen(bond_file()) + 1u);
     exfat_entry_t ent;
-    if (exfat_find_path(s_vol, "/" BOND_FILE, &ent) != 0 || ent.is_dir || ent.size == 0u ||
+    if (exfat_find_path(s_vol, path, &ent) != 0 || ent.is_dir || ent.size == 0u ||
         ent.size > BT_STORE_IMAGE_MAX) {
         return;
     }
@@ -430,7 +455,7 @@ static void bonds_write(void)
         return;
     }
     size_t n = bt_store_serialize(img, BT_STORE_IMAGE_MAX);
-    if (n != 0u && save_root_file_atomic(BOND_TMP, BOND_FILE, img, (uint32_t)n) == 0) {
+    if (n != 0u && save_root_file_atomic(bond_tmp(), bond_file(), img, (uint32_t)n) == 0) {
         bt_store_mark_saved();       /* only now: a failed write keeps the store dirty (review finding) */
         s_bond_fails = 0u;
     } else {
@@ -733,6 +758,10 @@ static int job_up(void)
 static int job_down(void)
 {
     int rc = 0;
+    if (esp_bluedroid_get_status() == ESP_BLUEDROID_STATUS_ENABLED && s_profile_down != NULL &&
+        s_profile_down() != 0) {
+        rc = 5;                      /* headphones: AVRCP/A2DP deinit reported an error (logged by the session) */
+    }
     if (esp_bluedroid_get_status() == ESP_BLUEDROID_STATUS_ENABLED) {
         esp_spp_profile_status_t ps;
         memset(&ps, 0, sizeof(ps));
@@ -1011,4 +1040,67 @@ void bt_xrec_plat_reboot(uint8_t mode)
         pmu_reboot_to_usb_bootloader();
     }
     system_reboot();
+}
+
+/* ============================================ headphones settings file (bt_hp.h seam) ============================= */
+#include "bt_hp.h"
+#ifndef OPENFW_BT_BLUEDROID
+#define OPENFW_BT_BLUEDROID 1        /* this file is BT=1 only; the bt_port library is built without the app's -D */
+#endif
+#include "audio_out.h"
+
+/* SD:/bt_hp_cfg.bin. Read with the boot volume (main.c hands it over once, bt_hp_set_boot_volume; the session's s_vol
+ * is only set while BT runs), so the settings screen can show the output mode with BT off. */
+static exfat_vol_t *s_boot_vol;
+static const int *s_boot_sd;
+
+void bt_hp_set_boot_volume(exfat_vol_t *vol, const int *mounted)
+{
+    s_boot_vol = vol;
+    s_boot_sd = mounted;
+}
+
+int bt_hp_plat_cfg_load(uint8_t *buf, uint32_t cap, uint32_t *len)
+{
+    if (s_boot_vol == NULL || s_boot_sd == NULL || !*s_boot_sd) {
+        return -1;
+    }
+    exfat_entry_t ent;
+    if (exfat_find_path(s_boot_vol, "/" HP_CFG_FILE, &ent) != 0 || ent.is_dir || ent.size == 0u || ent.size > cap) {
+        return -1;
+    }
+    uint32_t nread = 0u;
+    if (exfat_read_file(s_boot_vol, &ent, 0u, buf, (uint32_t)ent.size, &nread) != 0 || nread != ent.size) {
+        return -1;
+    }
+    *len = nread;
+    return 0;
+}
+
+int bt_hp_plat_cfg_save(const uint8_t *buf, uint32_t len)
+{
+    exfat_vol_t *v = s_vol;
+    int sd = s_sd;
+    if (v == NULL) {                 /* BT off: the boot volume */
+        v = s_boot_vol;
+        sd = (s_boot_vol != NULL && s_boot_sd != NULL) ? *s_boot_sd : 0;
+    }
+    exfat_vol_t *keep_v = s_vol;
+    int keep_sd = s_sd;
+    s_vol = v;
+    s_sd = sd;
+    int r = save_root_file_atomic(HP_CFG_TMP, HP_CFG_FILE, buf, len);
+    s_vol = keep_v;
+    s_sd = keep_sd;
+    return r;
+}
+
+void bt_hp_plat_attach_sink(void *tx, void *sink, const void *link, int ring_is_dac_buf)
+{
+    aout_bt_attach(tx, sink, (const aout_bt_link_t *)link, ring_is_dac_buf);
+}
+
+int16_t *bt_hp_plat_borrow_dac_buf(uint32_t *bytes)
+{
+    return audio_dac_borrow_buf(bytes);
 }

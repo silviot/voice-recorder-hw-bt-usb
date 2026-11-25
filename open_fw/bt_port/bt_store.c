@@ -444,3 +444,11 @@ int bt_store_dirty(void)
     unlock();
     return d;
 }
+
+void bt_store_reset(void)
+{
+    lock();
+    reset_entries();
+    g.gen++;
+    unlock();
+}

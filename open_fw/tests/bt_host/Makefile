@@ -29,11 +29,12 @@ OPT       := -O1 -g -ffunction-sections -fdata-sections
 include $(ROOT)/bt/bluedroid_srcs.mk
 # bt_xrec_spp_mtu.c / bt_xrec_bond.c (phone mode) include Bluedroid internals: built like vendored code, as in bt/Makefile.bluedroid.
 BD_SRCS   := $(addprefix $(ROOT)/,$(BLUEDROID_SRCS)) $(ROOT)/bt_port/bt_xrec_spp_mtu.c \
-             $(ROOT)/bt_port/bt_xrec_bond.c
+             $(ROOT)/bt_port/bt_xrec_bond.c $(ROOT)/bt_port/hp_sbc.c $(ROOT)/bt_port/hp_tx_bd.c
 PORT_SRCS := $(addprefix $(ROOT)/bt_port/,bt_alarm.c bt_esp_timer.c bt_entropy.c bt_drbg.c bt_store.c bt_ctrl.c \
-             bt_ctrl_cmds.c bt_ctrl_evt.c bt_xrec_bluedroid.c)
+             bt_ctrl_cmds.c bt_ctrl_evt.c bt_xrec_bluedroid.c bt_hp_bluedroid.c hp_sink.c hp_tx.c)
 HOST_SRCS := $(HT)/host_heap.c $(HT)/host_glue.c $(HT)/host_ctrl.c $(HT)/test_bt_host.c $(HT)/host_link_stubs.c \
-             $(HT)/host_xrec.c $(HT)/test_phone.c $(HT)/test_hp_link.c $(ROOT)/tests/fake_rom.c
+             $(HT)/host_xrec.c $(HT)/test_phone.c $(HT)/test_hp_link.c $(HT)/test_headphones.c \
+             $(ROOT)/tests/fake_rom.c
 KERN_SRCS := $(addprefix $(FR)/,tasks.c queue.c list.c timers.c event_groups.c stream_buffer.c) $(HT)/host_main.c
 PPORT_SRCS:= $(POSIX)/port.c $(POSIX)/utils/wait_for_event.c
 # Firmware sources the phone scenario runs unmodified: XREC protocol and the exFAT layer (RAM SD card).
@@ -45,7 +46,11 @@ PORT_OBJS := $(call obj,$(PORT_SRCS))
 HOST_OBJS := $(call obj,$(HOST_SRCS))
 KERN_OBJS := $(call obj,$(KERN_SRCS) $(PPORT_SRCS))
 FW_OBJS   := $(call obj,$(FW_SRCS))
-ALL_OBJS  := $(BD_OBJS) $(PORT_OBJS) $(HOST_OBJS) $(KERN_OBJS) $(FW_OBJS)
+# Headphones scenario (test_headphones.c): the fake headset decodes what it receives with the vendored SBC decoder
+# (host only; the target build excludes it), as test-bt-hp does.
+SBC_DEC_SRCS := $(wildcard $(BD)/host/bluedroid/external/sbc/decoder/srce/*.c)
+SBC_DEC_OBJS := $(patsubst $(ROOT)/%.c,$(OUT)/sbcdec/%.o,$(SBC_DEC_SRCS))
+ALL_OBJS  := $(BD_OBJS) $(PORT_OBJS) $(HOST_OBJS) $(KERN_OBJS) $(FW_OBJS) $(SBC_DEC_OBJS)
 
 BD_INC_DIRS := $(shell find $(BD)/host/bluedroid $(BD)/common -type d \( -name include -o -path '*/api/include/api' \) \
                -not -path '*/test*' 2>/dev/null) $(BD)/host/bluedroid/bta/pan $(BD)/common/btc/profile/esp/blufi/include
@@ -117,6 +122,16 @@ $(CMDS_HP_OBJ): $(ROOT)/bt_port/bt_ctrl_cmds.c $(THIS_MK)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS_PORT) -DBT_CTRL_EXP1_PASSED_LIST=BT_CTRL_HP_GATE_LIST -MMD -MP -c $< -o $@
 
+# The vendored SBC codec shifts negative values and lets fixed-point sums wrap (its idiom; 2s complement on both
+# targets): the encoder now runs in the headphones scenario.
+SBC_ENC_OBJS := $(filter $(OUT)/third_party/bluedroid/host/bluedroid/external/sbc/%,$(BD_OBJS))
+$(SBC_ENC_OBJS): CFLAGS_BD += -fno-sanitize=shift,signed-integer-overflow
+$(OUT)/bt_port/hp_sbc.o $(OUT)/bt_port/hp_tx_bd.o: CFLAGS_BD += -Wno-unused-parameter
+$(SBC_DEC_OBJS): $(OUT)/sbcdec/%.o: $(ROOT)/%.c
+	@mkdir -p $(dir $@)
+	@$(CC) $(CFLAGS_BD) -DSBC_DEC_INCLUDED=1 -w -fno-sanitize=shift,signed-integer-overflow -MMD -MP -c $< -o $@
+$(OUT)/tests/bt_host/test_headphones.o: CFLAGS_HOST += -DSBC_DEC_INCLUDED=1 -Wno-unused-parameter \
+    -I$(BD)/host/bluedroid/external/sbc/decoder/include -I$(BD)/host/bluedroid/external/sbc/encoder/include
 $(BD_OBJS): $(OUT)/%.o: $(ROOT)/%.c
 	@mkdir -p $(dir $@)
 	@$(CC) $(CFLAGS_BD) -MMD -MP -c $< -o $@

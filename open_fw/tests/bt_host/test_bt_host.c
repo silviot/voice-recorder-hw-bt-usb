@@ -604,6 +604,7 @@ int s_argc;
 char **s_argv;
 int bth_phone_scenario(const char *img_path);   /* test_phone.c */
 int bth_hp_scenario(void);                      /* test_hp_link.c (test_bt_host_hp: headphones rows forwarded) */
+int bth_headphones_scenario(const char *img);   /* test_headphones.c (test_bt_host_hp: scenario S) */
 
 extern char _end[];   /* end of .bss (GNU ld) */
 
@@ -649,6 +650,13 @@ void bth_test_task(void *arg)
             rc = 2;
         } else {
             rc = bth_hp_scenario() == 0 ? 0 : 1;
+        }
+    } else if (strcmp(mode, "hps") == 0 && s_argc > 2) {
+        if (bt_ctrl_cmds_eff(bt_ctrl_cmds_lookup(0x0401u)) != BTC_FWD) {
+            bth_log("hps: this binary refuses the headphones rows (run test_bt_host_hp)\n");
+            rc = 2;
+        } else {
+            rc = bth_headphones_scenario(s_argv[2]) == 0 ? 0 : 1;
         }
     } else if (strcmp(mode, "cycles") == 0 && s_argc > 2) {
         scenario_cycles(&base, atoi(s_argv[2]));

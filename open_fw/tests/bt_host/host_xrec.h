@@ -50,4 +50,12 @@ uint32_t bthx_ssp_value_logged(void);    /* value of the last "numeric compariso
 /* Read a root file of the RAM SD card (test task, only while the session is OFF or idle). Returns bytes or -1. */
 int  bthx_read_root_file(const char *name, uint8_t *buf, uint32_t cap);
 
+/* Headphones scenario: run fn(arg) in the app task (as main.c would call bt_hp_*), blocking / not blocking. */
+int  bthx_call_fn(int (*fn)(uint32_t), uint32_t arg, uint32_t timeout_ms);
+uint32_t bthx_post_fn(int (*fn)(uint32_t), uint32_t arg);
+/* Called on every app-task loop after bt_xrec_poll() (NULL = none). */
+void bthx_set_app_hook(void (*hook)(void));
+uint32_t bthx_profile_down_rc(void);     /* the last down job's profile teardown result (0xFFFFFFFF = none ran) */
+exfat_vol_t *bthx_card(void);
+
 #endif /* BT_HOST_XREC_H */

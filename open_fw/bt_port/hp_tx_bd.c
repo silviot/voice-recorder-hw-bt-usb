@@ -8,6 +8,7 @@
 #include "btc_a2dp_source.h"
 #include "btc_av.h"
 #include "bt_ctrl.h"
+#include "stack/hcimsgs.h"
 
 #if !((BTC_AV_SRC_INCLUDED == TRUE) && (BTC_AV_EXT_CODEC == TRUE))
 #error "hp_tx_bd.c needs the external-codec A2DP source (CONFIG_BT_A2DP_USE_EXTERNAL_CODEC)"
@@ -224,4 +225,14 @@ void hp_tx_bd_delay_report(uint16_t delay_0p1ms)
 hp_tx_t *hp_tx_bd(void)
 {
     return &s_bd.tx;
+}
+
+void hp_tx_bd_close_acl(uint16_t acl_handle)
+{
+    /* design §4.6 (rev 3 R-4): 0406 through Bluedroid's HCI layer (hci_layer transmit_command: a locked queue drained by
+     * hciT, the one producer bt_ctrl allows), never straight to bt_ctrl. An HCI command is not held back by the zero
+     * ACL credits of a stalled link, where an AVDTP/L2CAP close would wait behind the stuck data. BTA_DmCloseACL (the
+     * design's choice) is declared by this Bluedroid but not implemented (live log). BTM learns about the link end
+     * from the Disconnection Complete as usual. */
+    (void)btsnd_hcic_disconnect(acl_handle, HCI_ERR_PEER_USER);
 }

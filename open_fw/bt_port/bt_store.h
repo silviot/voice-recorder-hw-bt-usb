@@ -44,4 +44,8 @@ void bt_store_mark_saved(void);
 
 int bt_store_dirty(void);
 
+/* Empty the store (entries and data cleared, not dirty) without touching the platform binding: a mode change between
+ * phone and headphones mode (docs/BT_A2DP_DESIGN.md §6.4). App task, stack off. */
+void bt_store_reset(void);
+
 #endif /* BT_STORE_H */

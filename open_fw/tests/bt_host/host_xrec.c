@@ -36,8 +36,12 @@
 #include "host_xrec.h"
 
 #define BTHX_RECOVER_PRIO 2u
-#define BOND_FILE "bt_bonds.bin"
-#define BOND_TMP ".bt_bonds.tmp"
+#define BOND_FILE (s_mode == BT_XREC_MODE_HP ? "bt_hp_bonds.bin" : "bt_bonds.bin")
+#define BOND_TMP (s_mode == BT_XREC_MODE_HP ? ".bt_hp_bonds.tmp" : ".bt_bonds.tmp")
+static uint8_t s_mode;
+static uint8_t s_store_mode = 0xFFu;
+static int (*s_profile_down)(void);
+static uint32_t s_profile_down_rc_last = 0xFFFFFFFFu;
 #define HOST_TIMESTAMP 0x5B2A6000u    /* 2025-09-10 12:00:00 DOS timestamp: no RTC on the host */
 
 static const uint8_t k_bd_addr[6] = { 0x11, 0x22, 0x33, 0x44, 0x55, 0xC6 };   /* host_ctrl.c k_bd_addr */
@@ -53,7 +57,9 @@ static volatile uint32_t s_req_arg, s_req_seq, s_req_done;
 static const char *volatile s_rd_name;
 static uint8_t *volatile s_rd_buf;
 static volatile uint32_t s_rd_cap;
-enum { BTHX_READ_FILE = 100 };
+enum { BTHX_READ_FILE = 100, BTHX_FN = 101 };
+static int (*volatile s_fn)(uint32_t);
+static void (*volatile s_app_hook)(void);
 
 static bthx_snap_t s_snap;
 
@@ -218,8 +224,18 @@ void bt_xrec_plat_save_bound_key(const uint8_t key[32])
     memset(blob, 0, sizeof(blob));
 }
 
+void bt_xrec_plat_set_mode(uint8_t mode, int (*profile_down)(void))
+{
+    s_mode = mode;
+    s_profile_down = profile_down;
+}
+
 static void bonds_load(void)
 {
+    if (s_store_mode != s_mode) {    /* as bt_xrec_fw.c (design §6.4) */
+        bt_store_reset();
+        s_store_mode = s_mode;
+    }
     if (!s_sd || s_vol == NULL) {
         return;
     }
@@ -321,6 +337,13 @@ static int job_down(void)
     int rc = 0;
     uint64_t t = us_timer_now();
     memset(s_down_ms, 0, sizeof(s_down_ms));
+    if (esp_bluedroid_get_status() == ESP_BLUEDROID_STATUS_ENABLED && s_profile_down != NULL) {
+        int pr = s_profile_down();
+        s_profile_down_rc_last = (uint32_t)pr;
+        if (pr != 0) {
+            rc = 5;
+        }
+    }
     if (esp_bluedroid_get_status() == ESP_BLUEDROID_STATUS_ENABLED) {
         esp_spp_profile_status_t ps;
         memset(&ps, 0, sizeof(ps));
@@ -532,6 +555,7 @@ static void app_task(void *arg)
                 break;
             }
             case BTHX_READ_FILE: r = read_root_file(s_card, s_rd_name, s_rd_buf, s_rd_cap); break;
+            case BTHX_FN: r = s_fn != NULL ? s_fn(s_req_arg) : -1; break;
             default: r = -1; break;
             }
             taskENTER_CRITICAL();
@@ -540,8 +564,27 @@ static void app_task(void *arg)
             taskEXIT_CRITICAL();
         }
         bt_xrec_poll();
+        if (s_app_hook != NULL) {
+            s_app_hook();            /* headphones scenario: bt_hp_poll() and the fake player in the app task */
+        }
         snapshot();
     }
+}
+
+void bthx_set_app_hook(void (*hook)(void)) { s_app_hook = hook; }
+uint32_t bthx_profile_down_rc(void) { return s_profile_down_rc_last; }
+exfat_vol_t *bthx_card(void) { return s_card; }
+
+int bthx_call_fn(int (*fn)(uint32_t), uint32_t arg, uint32_t timeout_ms)
+{
+    s_fn = fn;
+    return bthx_call(BTHX_FN, arg, timeout_ms);
+}
+
+uint32_t bthx_post_fn(int (*fn)(uint32_t), uint32_t arg)
+{
+    s_fn = fn;
+    return bthx_post(BTHX_FN, arg);
 }
 
 int bthx_init(exfat_vol_t *vol)

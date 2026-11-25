@@ -69,6 +69,7 @@ typedef struct {   /* tunables (§10.2 bench keys); zero fields take the default
 typedef struct {
     uint32_t pkts, frames_sbc, pad_pcm, real_pcm, pad_pkts, can_send_no, alloc_fail, tx_lost_sbc, txq_max;
     uint32_t stalls, flush_drop_sbc, ticks, tick_late, max_burst, rec_overflow;
+    uint32_t nocp_gap_max_ms;   /* longest gap between two acks while frames were downstream (bench: Exp 4c) */
 } hp_tx_stats_t;
 
 typedef struct {           /* one media packet, in send order */

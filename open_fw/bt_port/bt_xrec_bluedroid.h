@@ -182,6 +182,14 @@ void     bt_xrec_plat_save_bound_key(const uint8_t key[32]);
 int      bt_xrec_plat_stack_up_begin(exfat_vol_t *vol, int sd_mounted, const uint8_t bd_addr[6]);
 /* Posts the graceful "down" job (esp_spp_deinit, disable, bt_ctrl stop, deinit) and arms the hard-stop deadline. */
 void     bt_xrec_plat_stack_down_begin(void);
+/* App task, before bt_xrec_plat_stack_up_begin(): the session mode (one bt_ctrl owner: phone and headphones mode never
+ * run at once). Picks the bond file (phone: bt_bonds.bin, headphones: bt_hp_bonds.bin) and resets the RAM bond store
+ * when the mode differs from the one whose file it last loaded (docs/BT_A2DP_DESIGN.md §6.4: a missing file must not
+ * leave the other mode's bonds in the store, to be written into this mode's file). profile_down (NULL for none) runs
+ * in the down job before esp_bluedroid_disable() (headphones: AVRCP + A2DP deinit); nonzero = teardown error. */
+#define BT_XREC_MODE_PHONE 0u
+#define BT_XREC_MODE_HP    1u
+void     bt_xrec_plat_set_mode(uint8_t mode, int (*profile_down)(void));
 /* 1 when the last posted job finished (*result: 0 = OK). */
 int      bt_xrec_plat_job_done(int *result);
 /* Disarm the hard-stop deadline; returns 1 if it had already latched (bt_stop + IRQ 26 masked). */

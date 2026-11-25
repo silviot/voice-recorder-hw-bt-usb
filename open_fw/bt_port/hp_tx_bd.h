@@ -30,4 +30,6 @@ void     hp_tx_bd_stopped(int reason);
 /* ESP_A2D_REPORT_SNK_DELAY_VALUE_EVT (1/10 ms). */
 void     hp_tx_bd_delay_report(uint16_t delay_0p1ms);
 hp_tx_t *hp_tx_bd(void);
+/* Credit stall (design §4.6): 0406 for the headset's ACL through Bluedroid's HCI layer. Any task. */
+void     hp_tx_bd_close_acl(uint16_t acl_handle);
 #endif

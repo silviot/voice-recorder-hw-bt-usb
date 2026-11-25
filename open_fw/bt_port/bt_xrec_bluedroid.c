@@ -1377,10 +1377,14 @@ static void free_session(void)
     }
 }
 
+/* Headphones mode (bt_hp_bluedroid.c) overrides these; the phone-only images and tests keep the defaults. */
+__attribute__((weak)) int bt_hp_shutdown_hook(void) { return 0; }
+__attribute__((weak)) int bt_hp_active(void) { return 0; }
+
 int bt_shutdown(void)
 {
     if (s.state == BT_XREC_ST_OFF || s.state == BT_XREC_ST_FAULTED) {
-        return 0;
+        return bt_hp_shutdown_hook();          /* one exit path for both modes (docs/BT_A2DP_DESIGN.md §6.7) */
     }
     if (s.state == BT_XREC_ST_DEAD) {
         return (int)s.last_fault;
@@ -1462,6 +1466,10 @@ int bt_xrec_start(exfat_vol_t *vol, int sd_mounted)
         bt_xrec_plat_log("BT start refused: BT fault recorded this boot");
         return -1;
     }
+    if (bt_hp_active()) {
+        bt_xrec_plat_log("BT start refused: headphones mode is running (one controller owner)");
+        return -1;
+    }
     bufs_t *b = (bufs_t *)bt_xrec_plat_alloc(sizeof(bufs_t));
     if (b == NULL) {
         bt_xrec_plat_log("BT start failed: no memory");
@@ -1497,6 +1505,7 @@ int bt_xrec_start(exfat_vol_t *vol, int sd_mounted)
 
     bt_xrec_plat_log("BT start (Bluedroid):");
     bt_xrec_plat_log(s.name);
+    bt_xrec_plat_set_mode(BT_XREC_MODE_PHONE, NULL);   /* bt_bonds.bin, SPP teardown only */
     if (bt_xrec_plat_stack_up_begin(vol, sd_mounted, s.bd) != 0) {
         bt_xrec_plat_log("BT start failed: platform");
         free_session();

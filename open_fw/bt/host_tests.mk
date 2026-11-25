@@ -87,6 +87,10 @@ test-bt-host:
 	$(BT_HOST_TEST_DIR)/asan/test_bt_host phone $(BT_HOST_TEST_DIR)/phone_exfat.img
 	@# headphones-path smoke (docs/BT_A2DP_DESIGN.md H2): bt_ctrl with BT_CTRL_HP_GATE_LIST, inquiry/name/cancel/page
 	$(BT_HOST_TEST_DIR)/asan/test_bt_host_hp hp
+	@# scenario S (docs/BT_A2DP_DESIGN.md §8.2): the headphones session against a fake headset (AVDTP/AVCTP/SDP)
+	dd if=/dev/zero of=$(BT_HOST_TEST_DIR)/hp_exfat.img bs=512 count=4096 status=none
+	/usr/sbin/mkfs.exfat -q -b 4096 -c 4096 $(BT_HOST_TEST_DIR)/hp_exfat.img
+	$(BT_HOST_TEST_DIR)/asan/test_bt_host_hp hps $(BT_HOST_TEST_DIR)/hp_exfat.img
 	set -e; for m in init enable disable deinit; do \
 		python3 tests/bt_host/run_sweep.py $(BT_HOST_TEST_DIR)/asan/test_bt_host --mode $$m --jobs $(BT_HOST_JOBS) \
 			--timeout 120 --waivers tests/bt_host/sweep_waivers.txt; done

@@ -148,6 +148,12 @@ static void fold(hp_tx_t *t, int64_t now, uint32_t cur)
         }
         uint32_t frames = t->acked_sbc - before;
         if (frames) {
+            if (t->started && now > t->last_ack_us) {
+                uint32_t gap_ms = (uint32_t)((now - t->last_ack_us) / 1000);
+                if (gap_ms > t->st.nocp_gap_max_ms) {
+                    t->st.nocp_gap_max_ms = gap_ms;   /* longest wait for an ack with packets downstream (§3.5) */
+                }
+            }
             t->last_ack_us = now;
         }
         for (uint32_t i = t->rh; i != t->rt && frames; i++) {

@@ -240,6 +240,12 @@ int bt_xrec_plat_stack_up_begin(exfat_vol_t *vol, int sd_mounted, const uint8_t 
     m_job_pending = 1;
     return 0;
 }
+static uint8_t m_mode = 0xFFu;
+void bt_xrec_plat_set_mode(uint8_t mode, int (*profile_down)(void))
+{
+    m_mode = mode;
+    (void)profile_down;
+}
 void bt_xrec_plat_stack_down_begin(void)
 {
     m_down_calls++;
@@ -717,6 +723,7 @@ static void t_bring_up_config(void)
     mocks_reset();
     CHECK(bt_xrec_start(NULL, 0) == 0, "start");
     CHECK(m_up_calls == 1, "up job posted");
+    CHECK(m_mode == 0u, "phone mode selected (bt_bonds.bin, SPP teardown only)");
     bt_status_t st = status();
     CHECK(st.active == 1u && st.hci_ready == 0u, "active, not ready yet");
     CHECK(strcmp(st.dev_name, "Cassini_1D") == 0, "legacy device name scheme, got '%s'", st.dev_name);
