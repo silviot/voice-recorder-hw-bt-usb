@@ -576,11 +576,25 @@ static void btc_dm_pin_req_evt(tBTA_DM_PIN_REQ *p_pin_req)
 #endif // #if (SMP_INCLUDED == TRUE)
 
 #if (CLASSIC_BT_INCLUDED == TRUE)
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+/* open_fw patch 0036: Just Works is confirmed here without any app event, so an app pairing policy (a pairing window,
+ * an entropy gate) never sees it. The app answers first; this weak default allows everything (upstream behaviour). */
+__attribute__((weak)) int openfw_just_works_allowed(const uint8_t bda[6])
+{
+    (void)bda;
+    return 1;
+}
+#endif
+
 static void btc_dm_sp_cfm_req_evt(tBTA_DM_SP_CFM_REQ *p_cfm_req)
 {
     if (p_cfm_req->just_works) {
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+        BTA_DmConfirm(p_cfm_req->bd_addr, openfw_just_works_allowed(p_cfm_req->bd_addr) ? true : false);
+#else
         // just work, not show to users.
         BTA_DmConfirm(p_cfm_req->bd_addr, true);
+#endif
         return;
     }
 
