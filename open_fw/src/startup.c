@@ -350,9 +350,13 @@ static uint8_t xip_enable_best(uint32_t pll_hz)
  * after xip_enable_best() and the .data copy in reset_c_entry(). */
 __attribute__((noinline)) static void bt_static_init(void)
 {
-    extern uint32_t _sibt_data, _sbt_data, _ebt_data, _sbt_bss, _ebt_bss;
+    extern uint32_t _sibt_data, _sbt_data, _ebt_data, _sbt_bss, _ebt_bss, _sibt_fast, _sbt_fast, _ebt_fast;
     const volatile uint32_t *src = &_sibt_data;
     for (volatile uint32_t *dst = &_sbt_data; dst < &_ebt_data; dst++, src++) {
+        *dst = *src;
+    }
+    src = &_sibt_fast;   /* .bt_fast: headphones hot path executed from SRAM */
+    for (volatile uint32_t *dst = &_sbt_fast; dst < &_ebt_fast; dst++, src++) {
         *dst = *src;
     }
     for (volatile uint32_t *dst = &_sbt_bss; dst < &_ebt_bss; dst++) {

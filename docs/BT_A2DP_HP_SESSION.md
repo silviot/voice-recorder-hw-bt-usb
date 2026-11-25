@@ -197,6 +197,20 @@ Settings > Headset button test) merged on top of the BT branch. The BT=0 image s
   The bench stats now take the clock, not the player's loop-top time, and add `hp cpu` (idle / BTC / app permille,
   late and run ticks per interval) to tell CPU load from a producer stall on the next run. Stereo files keep a
   256 ms ring (44.1 kHz stereo: 93 ms); a 32 KiB ring is the next step if they starve too.
+- **Second run (image 0x6A0C, same file)**: pads 0 everywhere, but the stream ran at ~89 % of real time (~335 SBC
+  frames/s; the laptop capture drifted: capture 20/35/50 s = source 17.5/30.6/44.0 s). `hp cpu`: idle 0-12 permille,
+  BTC 420-476, app 48-120, late 0-7 per interval: ~45 % of the CPU outside BTC and the app, and BTC itself at
+  ~117k cycles per SBC frame (resampler + encoder, ~50k instructions) from XIP. Changes:
+  - `sl6801_firm.ld` `.bt_fast` (BT=1 only; empty and CRC-neutral at BT=0): `hp_sink.o` and the SBC encoder's
+    `sbc_analysis.o`, `sbc_dct.o`, `sbc_enc_bit_alloc_ste.o`, `sbc_encoder.o`, `sbc_packing.o` text (7.4 KiB) run
+    from SRAM at the start of RTOS_HEAP_LO (the high heap region keeps its 32 KiB floor; heap total -7.4 KiB),
+    copied by `startup.c` `bt_static_init()`. Same idea as the UI's hot code in `.data`. `test-qemu-bt` (T_HPCORE)
+    runs the encoder and resampler from there against the host golden.
+  - Bench: `hp cpu` adds `btc_us_sbc` (BTC us per SBC frame), `irq26`, `ui_fr` / `ui_us` (CPU1 frames and the last
+    render time; CPU1 is outside the FreeRTOS accounting) and `xip` (flash mode); `hp tasks` lists every task's
+    permille and `other` (1000 - sum; FreeRTOS charges ISRs to the interrupted task, and the busy ISRs, SysTick and
+    the IRQ 26 top half, are short and in RAM). Run `stage=tone` as well: its `hp tasks` line is the baseline the
+    player stage's extra load is measured against (CPU1 UI and SD reads only happen in the player stage).
 
 ## Not tested / open
 

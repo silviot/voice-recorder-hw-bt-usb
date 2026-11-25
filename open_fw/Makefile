@@ -233,7 +233,7 @@ $(BUILD_DIR)/ram_boot.bin: $(BUILD_DIR)/open_fw.elf
 
 $(BUILD_DIR)/xip.bin: $(BUILD_DIR)/open_fw.elf
 	@test -n "$(OBJCOPY)" || (echo "Error: llvm-objcopy not found (set OBJCOPY=/path/to/llvm-objcopy)" >&2; exit 1)
-	$(OBJCOPY) -O binary -j .text -j .data -j .bt_data $< $@
+	$(OBJCOPY) -O binary -j .text -j .data -j .bt_data -j .bt_fast $< $@
 
 $(BUILD_DIR)/open_fw_firm.bin: $(BUILD_DIR)/ram_boot.bin $(BUILD_DIR)/xip.bin tools/pack_firm.py
 	python3 tools/pack_firm.py --ram-boot $(BUILD_DIR)/ram_boot.bin --xip $(BUILD_DIR)/xip.bin --out-firm $@

@@ -175,6 +175,7 @@ static void act(uint32_t a, uint32_t now)
 #include "bt_hp.h"
 #include "hp_tx.h"
 #include "hp_tx_bd.h"
+#include "bt_rom_real.h"
 #ifndef OPENFW_BT_BLUEDROID
 #define OPENFW_BT_BLUEDROID 1                /* BT=1 only; the bt_port library is built without the app's -D */
 #endif
@@ -192,7 +193,7 @@ static struct {
     uint32_t next_stat, stat_n, t_tone;
     uint32_t phase;
     uint32_t prev_pkts, prev_frames, prev_acked, prev_pads, prev_el_ms;
-    uint32_t prev_us, prev_idle, prev_btc, prev_app, prev_late, prev_ticks;
+    uint32_t prev_us, prev_late, prev_ticks, prev_sbc, prev_irq, prev_ui_fr;
 } s_hp BENCH_HI;
 static char s_hp_play_path[BT_BENCH_HP_FILE_MAX + 1u] BENCH_HI;
 
@@ -309,42 +310,98 @@ static void hp_found_log(void)
     }
 }
 
-/* Run time of a task so far (run-time stats clock: us_timer, FreeRTOSConfig.h); 0 if there is no such task. */
-static uint32_t task_run_us(const char *name)
+/* CPU over the stats interval (run-time stats clock: us_timer, FreeRTOSConfig.h), permille of wall time.
+ * "hp cpu": idle, the BTC task (hp_tx tick: resampler + SBC), the app task (player), BTC microseconds per SBC frame,
+ * late = BTC ticks past the credit clamp (air time lost), ticks run, RW-BT IRQ 26 entries, CPU1 UI frames and the
+ * last frame's render time. "hp tasks": every task (FreeRTOS charges an ISR to the task it interrupted; the only
+ * busy ISRs here are SysTick and the IRQ 26 top half, which is in RAM and short), then other = 1000 - sum (time not
+ * charged to any task: counter wrap or a task created/deleted in the interval).
+ * Silicon 2026-11-25: the player stage ran BTC at ~46 % with ~45 % of the CPU outside BTC and the app. */
+#define HPB_TASKS_MAX 16u
+static struct {
+    uint32_t num, rt;
+} s_task_prev[HPB_TASKS_MAX] BENCH_HI;
+static uint32_t s_task_prev_n BENCH_HI;
+
+static void lk_task(const char *name, uint32_t v)
 {
-    TaskHandle_t h = xTaskGetHandle(name);
-    if (h == NULL) {
-        return 0u;
+    char k[9];
+    uint32_t i = 0u;
+    for (; i < 8u && name[i] != '\0'; i++) {
+        char c = name[i];
+        k[i] = (c == ' ' || c == '=') ? '_' : c;
     }
-    TaskStatus_t ts;
-    vTaskGetInfo(h, &ts, pdFALSE, eRunning);
-    return (uint32_t)ts.ulRunTimeCounter;
+    k[i] = '\0';
+    lku(k, v);
 }
 
-/* CPU over the stats interval, permille of wall time: idle, the BTC task (hp_tx tick: resampler + SBC), the app task
- * (player); late = BTC ticks past the credit clamp (air time lost). Silicon 2026-11-25: the player stage starved the
- * ring while the tone stage did not; this line tells CPU load apart from a producer stall. */
 static void hp_cpu_stats(const hp_tx_t *t)
 {
-    uint32_t now = (uint32_t)us_timer_now(), idle = (uint32_t)ulTaskGetIdleRunTimeCounter();
-    uint32_t btc = task_run_us("BTC_TASK"), app = task_run_us("app");
+    TaskStatus_t ts[HPB_TASKS_MAX];
+    UBaseType_t n = uxTaskGetSystemState(ts, HPB_TASKS_MAX, NULL);
+    uint32_t now = (uint32_t)us_timer_now();
     uint32_t dt = now - s_hp.prev_us;
+    uint32_t idle = 0u, btc = 0u, app = 0u, sum = 0u;
+    uint32_t d[HPB_TASKS_MAX];
+    for (UBaseType_t i = 0; i < n; i++) {
+        uint32_t rt = (uint32_t)ts[i].ulRunTimeCounter, prev = rt;
+        for (uint32_t j = 0u; j < s_task_prev_n; j++) {
+            if (s_task_prev[j].num == (uint32_t)ts[i].xTaskNumber) {
+                prev = s_task_prev[j].rt;
+                break;
+            }
+        }
+        d[i] = rt - prev;
+        sum += d[i];
+        if (ts[i].xHandle == xTaskGetIdleTaskHandle()) {
+            idle = d[i];
+        } else if (strcmp(ts[i].pcTaskName, "BTC_TASK") == 0) {
+            btc = d[i];
+        } else if (strcmp(ts[i].pcTaskName, "app") == 0) {
+            app = d[i];
+        }
+    }
+    bt_rom_real_diag_t rd;
+    bt_rom_real_diag(&rd);
+    uint32_t sbc = t->st.frames_sbc - s_hp.prev_sbc, ui_fr = g_ui_frames;
     if (s_hp.prev_us != 0u && dt != 0u) {
         lbegin("hp cpu");
         lku("ms", dt / 1000u);
-        lku("idle_pm", (uint32_t)((uint64_t)(idle - s_hp.prev_idle) * 1000u / dt));
-        lku("btc_pm", (uint32_t)((uint64_t)(btc - s_hp.prev_btc) * 1000u / dt));
-        lku("app_pm", (uint32_t)((uint64_t)(app - s_hp.prev_app) * 1000u / dt));
+        lku("idle_pm", (uint32_t)((uint64_t)idle * 1000u / dt));
+        lku("btc_pm", (uint32_t)((uint64_t)btc * 1000u / dt));
+        lku("app_pm", (uint32_t)((uint64_t)app * 1000u / dt));
+        lku("btc_us_sbc", sbc ? btc / sbc : 0u);
         lku("late", t->st.tick_late - s_hp.prev_late);
         lku("ticks", t->st.ticks - s_hp.prev_ticks);
+        lku("irq26", rd.irq_total - s_hp.prev_irq);
+        lku("ui_fr", ui_fr - s_hp.prev_ui_fr);
+        lku("ui_us", g_ui_last_render_us);
+        lku("xip", g_openfw_xip_mode);
+        lemit();
+        lbegin("hp tasks");
+        for (UBaseType_t i = 0; i < n; i++) {
+            if (s_ll > 120u) {
+                lemit();
+                lbegin("hp tasks+");
+            }
+            lk_task(ts[i].pcTaskName, (uint32_t)((uint64_t)d[i] * 1000u / dt));
+        }
+        uint32_t sum_pm = (uint32_t)((uint64_t)sum * 1000u / dt);
+        lku("other", sum_pm < 1000u ? 1000u - sum_pm : 0u);
         lemit();
     }
+    s_task_prev_n = 0u;
+    for (UBaseType_t i = 0; i < n && i < HPB_TASKS_MAX; i++) {
+        s_task_prev[i].num = (uint32_t)ts[i].xTaskNumber;
+        s_task_prev[i].rt = (uint32_t)ts[i].ulRunTimeCounter;
+        s_task_prev_n++;
+    }
     s_hp.prev_us = now;
-    s_hp.prev_idle = idle;
-    s_hp.prev_btc = btc;
-    s_hp.prev_app = app;
     s_hp.prev_late = t->st.tick_late;
     s_hp.prev_ticks = t->st.ticks;
+    s_hp.prev_sbc = t->st.frames_sbc;
+    s_hp.prev_irq = rd.irq_total;
+    s_hp.prev_ui_fr = ui_fr;
 }
 
 static void hp_stats(uint32_t el_ms)
