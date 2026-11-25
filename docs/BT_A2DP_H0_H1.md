@@ -71,6 +71,9 @@ Paths are relative to `open_fw/`.
 
 ## Open items for H5 (the session)
 
+Done on this branch since (session, UI, bench, scenario S): see `docs/BT_A2DP_HP_SESSION.md`; the list below is kept
+as written at H1.
+
 - Wire `hp_tx_bd_*` into bt_hp: AUDIO_CFG -> `hp_tx_bd_on_audio_cfg`, a STARTED it asked for ->
   `hp_tx_bd_started`, SUSPEND/CLOSE/link loss -> `hp_tx_bd_stopped(reason)`, delay report, ACL handle for NOCP,
   `HP_TX_EVT_STALL` -> `BTA_DmCloseACL`; teardown with `hp_tx_bd_stop_wait(100, ...)` then `hp_tx_bd_deinit`.
