@@ -16,7 +16,7 @@ static int g_fail;
 
 /* ---- fake DAC: 4 slots of up to 1024 frames, drained at the sample rate on the virtual clock ---- */
 static struct {
-    int running, muted, busy_calls, flushes, stops, starts, vol_calls;
+    int running, muted, busy_calls, flushes, stops, starts, vol_calls, vol;
     uint32_t rate, slots[4], h, n, played, written;
     int16_t first_l[4];       /* first left sample of each slot (alignment probe) */
     uint32_t first_idx[4];
@@ -36,7 +36,7 @@ int audio_dac_is_busy(void) { D.busy_calls++; return D.n != 0; }
 void audio_dac_flush(void) { D.flushes++; D.n = 0; }
 uint32_t audio_dac_queued_frames(void) { uint32_t q = 0; for (uint32_t k = 0; k < D.n; k++) q += D.slots[(D.h + k) % 4]; return q; }
 void audio_dac_set_mute(int m) { D.muted = m; }
-void audio_dac_set_volume(uint8_t v, uint16_t d) { (void)v; (void)d; D.vol_calls++; }
+void audio_dac_set_volume(uint8_t v, uint16_t d) { (void)d; D.vol = v; D.vol_calls++; }
 void audio_dac_stop(void) { D.stops++; D.running = 0; D.n = 0; }
 static __attribute__((unused)) void dac_run_us(int64_t us)
 {
@@ -229,10 +229,54 @@ static void test_both_alignment(void)
     hp_tx_stop(&T, HP_STOP_SUSPEND);
 }
 
+/* BOTH, merge review r3 #1: the player stops writing (speed dial at 8x+, or at its end) and only asks
+ * aout_queued_frames. The DAC must keep being fed until it has every frame the headset got, and the output must not
+ * count as drained (the dial's end flushes then) while the DAC still holds some. */
+static void test_both_drain(void)
+{
+    setup_bt();
+    aout_bt_attach(&T, &S, &k_link, 0);
+    aout_set_mode(AOUT_MODE_BOTH);
+    memset(&D, 0, sizeof(D));
+    g_src_idx = 0;
+    CHECK(aout_start(16000, 31) == 0 && aout_route() == AOUT_ROUTE_BOTH, "both route");
+    uint32_t tick = hp_tx_start(&T);
+    int64_t next = g_now;
+    for (int ms = 0; ms < 1000; ms++) {   /* 1 s of normal playback */
+        g_now += 1000; dac_run_us(1000); stack_run();
+        if (g_now >= next) { hp_tx_tick(&T); next += tick * 1000; }
+        write_some(2);
+    }
+    uint32_t total = g_src_idx;
+    CHECK(D.written < total, "the tap holds frames back while writing (%u of %u)", D.written, total);
+    int drained_ms = -1, early = 0;
+    for (int ms = 0; ms < 2000; ms++) {   /* silent: no writes, no aout_is_busy */
+        g_now += 1000; dac_run_us(1000); stack_run();
+        if (g_now >= next) { hp_tx_tick(&T); next += tick * 1000; }
+        if (aout_queued_frames() == 0u && drained_ms < 0) {
+            drained_ms = ms;
+            early = D.n != 0 || hp_sink_tap_avail(&S) != 0u;
+        }
+    }
+    printf("  BOTH drain without writes: queued 0 after %d ms, DAC got %u of %u frames\n", drained_ms, D.written, total);
+    CHECK(D.written == total, "the DAC got every frame (%u of %u)", D.written, total);
+    CHECK(drained_ms >= 0 && !early, "queued 0 only once the DAC played everything (at %d ms, early %d)", drained_ms,
+          early);
+    /* volume, audit r3 bug 2: an absolute-volume headset at unity must not take the DAC to 31 */
+    aout_set_volume_split(9, 31, 0x1FF);
+    CHECK(D.vol == 9 && HP_LD(&S.gain_q15) == 32768u, "split volume: DAC %d, headset gain %u", D.vol,
+          HP_LD(&S.gain_q15));
+    aout_set_volume(12, 0x1FF);
+    CHECK(D.vol == 12 && HP_LD(&S.gain_q15) == 990u, "same volume on both: DAC %d, gain %u", D.vol, HP_LD(&S.gain_q15));
+    aout_stop();
+    hp_tx_stop(&T, HP_STOP_SUSPEND);
+}
+
 int main(void)
 {
     test_routes();
     test_both_alignment();
+    test_both_drain();
     printf("test_audio_out (BT=1): %s\n", g_fail ? "FAIL" : "PASS");
     return g_fail ? 1 : 0;
 }

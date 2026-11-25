@@ -10,6 +10,9 @@ static inline uint32_t umin32(uint32_t a, uint32_t b) { return a < b ? a : b; }
 /* wrap-safe a - b clamped at 0 */
 static inline uint32_t pos_diff(uint32_t a, uint32_t b) { return (int32_t)(a - b) > 0 ? a - b : 0u; }
 
+/* audio_mtu is ESP_A2D_CONNECTION_STATE_EVT's: the peer L2CAP MTU less the 12-byte RTP header (bta_av_aact.c) and
+ * less the 1-byte SBC media payload header (btc_av.c BTC_AV_AUDIO_MTU_RESERVE), the bound the send path checks
+ * (btc_a2d_src_audio_mtu_check: data_len <= mtu). So the SBC frames may fill it exactly. */
 uint32_t hp_tx_fpp(uint32_t audio_mtu, uint32_t frame_len)
 {
     if (frame_len == 0u || audio_mtu < frame_len) {
@@ -296,7 +299,7 @@ uint32_t hp_tx_start(hp_tx_t *t)
     hp_sink_set_out_rate(t->sink, t->conn_rate);
     t->seen_flush_req = HP_LD(&t->flush_req);
     t->seen_drop_req = HP_LD(&t->drop_req);
-    t->tx_paused = 0u;
+    t->send_failing = 0u;
     t->stalled = 0u;
     t->started = 1u;
     publish(t, now, cur);
@@ -333,7 +336,7 @@ void hp_tx_set_delay_report(hp_tx_t *t, uint32_t d)
 }
 
 /* Bitpool for the next packet: the max, or the speech bitpool for sources <= 16 kHz (§3.5). */
-static uint8_t packet_bitpool(const hp_tx_t *t)
+uint8_t hp_tx_packet_bitpool(const hp_tx_t *t)
 {
     uint8_t bp = t->cfg.max_bp;
     if (t->tun.speech_bp && t->sink->c_rate && t->sink->c_rate <= 16000u && t->tun.speech_bp < bp) {
@@ -344,7 +347,7 @@ static uint8_t packet_bitpool(const hp_tx_t *t)
 
 void hp_tx_tick(hp_tx_t *t)
 {
-    if (!t->started || t->tx_paused || t->stalled) {
+    if (!t->started || t->stalled) {
         return;
     }
     int64_t now = t->ops.now_us(t->ops.ctx);
@@ -396,7 +399,7 @@ void hp_tx_tick(hp_tx_t *t)
             t->st.alloc_fail++;   /* nothing was pulled from the ring: no audio lost, the next tick retries */
             break;
         }
-        const uint8_t bp = packet_bitpool(t);
+        const uint8_t bp = hp_tx_packet_bitpool(t);
         uint32_t len = 0, real_src = 0, epoch = t->sink->c_seen_gen;
         for (uint32_t f = 0; f < t->fpp; f++) {
             uint32_t used = 0;
@@ -412,13 +415,20 @@ void hp_tx_tick(hp_tx_t *t)
         }
         int rc = t->ops.send(t->ops.ctx, buf, len, (uint16_t)t->fpp, t->ts);
         if (rc != HP_SEND_OK) {
-            /* should not happen after can_send: count it, keep its real frames as unheard (a rewind replays them) */
+            /* should not happen after can_send (heap node allocation, handle mismatch): count it, keep its real frames
+             * as unheard (a rewind replays them) and go on at the next tick; a refusal that lasts stall_ms is
+             * handled as a stall below (rewind snapshot, event): on an already STARTED stream no further STARTED
+             * would come to resume a paused tick (audit r3 item 2) */
             t->ops.free(t->ops.ctx, buf);
             t->st.tx_lost_sbc += t->fpp;
             lose(t, epoch, real_src, epoch);
-            t->tx_paused = 1u;   /* until the next STARTED */
+            if (!t->send_failing) {
+                t->send_failing = 1u;
+                t->send_fail_us = now;
+            }
             break;
         }
+        t->send_failing = 0u;
         t->ts += t->fpp * t->spf;
         t->credit -= need;
         t->sent_sbc += t->fpp;
@@ -441,7 +451,9 @@ void hp_tx_tick(hp_tx_t *t)
     /* Credit-stall watchdog (§4.6): stop (rewind snapshot) and tell the session. */
     if (hp_tx_down_sbc(t) == 0u) {
         t->last_ack_us = now;
-    } else if (now - t->last_ack_us > (int64_t)t->tun.stall_ms * 1000) {
+    }
+    if ((hp_tx_down_sbc(t) != 0u && now - t->last_ack_us > (int64_t)t->tun.stall_ms * 1000) ||
+        (t->send_failing && now - t->send_fail_us > (int64_t)t->tun.stall_ms * 1000)) {
         t->st.stalls++;
         hp_tx_stop(t, HP_STOP_LINK);
         t->stalled = 1u;

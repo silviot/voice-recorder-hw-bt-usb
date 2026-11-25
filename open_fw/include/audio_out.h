@@ -29,6 +29,9 @@ void     aout_flush(void);                                      /* drop everythi
 uint32_t aout_queued_frames(void);                              /* source-rate frames written but not yet heard */
 void     aout_set_mute(int muted);
 void     aout_set_volume(uint8_t vol_0_31, uint16_t dig_0_511);
+/* BT=1: the DAC at dac_vol, the headset's PCM gain at bt_vol (31 = unity while the headset does absolute volume:
+ * its own volume then sets the level; output mode BOTH must not take the speaker / jack to 31 with it). */
+void     aout_set_volume_split(uint8_t dac_vol_0_31, uint8_t bt_vol_0_31, uint16_t dig_0_511);
 void     aout_stop(void);                                       /* end of this file, not end of the BT session */
 int      aout_is_bt(void);                                      /* the current file goes to a headset */
 

@@ -120,6 +120,8 @@ typedef struct {
     uint8_t  start_failed;
     uint32_t start_failed_at;
     uint8_t  start_demand;             /* demand arrived while start_failed: START again after the cooldown */
+    uint8_t  susp_retries, susp_retry_due;   /* refused SUSPENDs retried (audit r3 item 5) */
+    uint32_t susp_refused_at;
     uint32_t last_real_pcm, last_real_t;
     uint8_t  ct_conn, abs_vol, ct_tl;
     uint16_t ct_hdl;                   /* the AVRCP CT connection's handle (AVCTP may open before A2DP CONNECTED) */
@@ -1203,12 +1205,15 @@ static void on_a2d_audio(const ev_t *e)
         if (e->b) {
             g->link = BT_HP_LINK_STARTED;
             g->start_retries = 0u;
+            g->susp_retries = 0u;
+            g->susp_retry_due = 0u;
             g->last_real_t = bt_xrec_plat_now_ms();
             hp_tx_t *t = hp_tx_bd();
             lbegin("stream");
             lku("rate", t->conn_rate);
             lku("bp", t->cfg.max_bp);
             lku("bp_min", t->cfg.min_bp);
+            lku("speech_bp", t->tun.speech_bp);   /* sources <= 16 kHz go out at this bitpool (0 = always bp) */
             lku("fpp", t->fpp);
             lku("mtu", t->audio_mtu);
             lku("tick_ms", t->tick_ms_eff);
@@ -1225,6 +1230,8 @@ static void on_a2d_audio(const ev_t *e)
         if (g->link == BT_HP_LINK_STARTED) {
             g->link = BT_HP_LINK_OPEN;
         }
+        g->susp_retries = 0u;
+        g->susp_retry_due = 0u;
         if (was_started && !e->b && !e->c) {
             g->d.remote_suspends++;
             player_event(BT_HP_PEV_REMOTE_SUSPEND);
@@ -1248,6 +1255,17 @@ static void on_a2d_ack(const ev_t *e)
     }
     if (e->a == ESP_A2D_MEDIA_CTRL_START && e->b != ESP_A2D_MEDIA_CTRL_ACK_SUCCESS && out == MC_START) {
         start_failure("ack", false);
+    }
+    if (e->a == ESP_A2D_MEDIA_CTRL_SUSPEND && e->b != ESP_A2D_MEDIA_CTRL_ACK_SUCCESS && out == MC_SUSPEND &&
+        g->link == BT_HP_LINK_STARTED) {
+        /* refused: the stream stays STARTED and sends silence (e.g. a whole recording after the REC switch). Send it
+         * again a few times (ready_poll); otherwise only the next idle suspend would. */
+        g->susp_refused_at = bt_xrec_plat_now_ms();
+        g->susp_retry_due = g->susp_retries < BT_HP_SUSPEND_RETRIES ? 1u : 0u;
+        lbegin("SUSPEND refused");
+        lku("retry", g->susp_retry_due);
+        lku("n", g->susp_retries);
+        lend();
     }
     mc_pump();
 }
@@ -1843,7 +1861,9 @@ static int hp_profile_down(void)
                 bt_xrec_plat_wait();
             }
             if (!s_a2d_deinit_seen) {
-                rc = 2;   /* hp_av_deinit_timeout (design §5.5): logged by the app; patch E is not in yet */
+                rc = 2;   /* hp_av_deinit_timeout (design §5.5): logged by the app (patch 0039 posts the local AVDT
+                           * disconnect for a stream still closing; the btc_av state reset backstop is deferred:
+                           * BT_A2DP_HP_SESSION.md) */
             }
         } else {
             rc = 3;
@@ -2102,6 +2122,16 @@ static void ready_poll(uint32_t now)
             log1("idle: suspending the stream");
             g->mc_want = MC_SUSPEND;
             g->last_real_t = now;
+        }
+    }
+    /* refused SUSPEND (audit r3 item 5): again after BT_HP_SUSPEND_RETRY_MS, unless the stream is no longer STARTED
+     * or real audio / demand came since the refusal (playing again: the player wants the stream) */
+    if (g->susp_retry_due && time_reached(now, g->susp_refused_at + BT_HP_SUSPEND_RETRY_MS) && g->mc_out == MC_NONE) {
+        g->susp_retry_due = 0u;
+        if (g->link == BT_HP_LINK_STARTED && (int32_t)(g->last_real_t - g->susp_refused_at) <= 0) {
+            g->susp_retries++;
+            log1("SUSPEND: trying again");
+            g->mc_want = MC_SUSPEND;
         }
     }
     /* a media command that was never acknowledged */

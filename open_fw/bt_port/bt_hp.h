@@ -32,6 +32,8 @@
 #define BT_HP_IDLE_SUSPEND_MS 20000u   /* design §6.5: STARTED with no real audio for this long -> SUSPEND */
 #define BT_HP_START_RETRY_MS  500u     /* design §4.5: a failed START is retried once after this */
 #define BT_HP_START_COOLDOWN_MS 2000u  /* after START failed twice: new demand (play pressed) starts again after this */
+#define BT_HP_SUSPEND_RETRY_MS  1000u  /* a SUSPEND the headset refused (REC switch, idle) is sent again after this ... */
+#define BT_HP_SUSPEND_RETRIES   3u     /* ... at most this often, while no new audio or demand came meanwhile */
 #define BT_HP_AUTO_RESTART_MIN_MS 300000u  /* stall escalation: at most one automatic restart per 5 minutes */
 #define BT_HP_CONNECT_TO_MS   30000u   /* an A2DP connect that has not reported CONNECTED/DISCONNECTED by then */
 #define BT_HP_STALL_DISC_MS   8000u    /* design §4.6: no Disconnection Complete after the stall's 0406 -> restart

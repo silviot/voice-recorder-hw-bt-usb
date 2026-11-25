@@ -54,7 +54,8 @@ typedef struct {
     void    *ctx;
 } hp_tx_ops_t;
 
-#define HP_TX_EVT_STALL  1   /* acked_sbc stuck for stall_ms with frames downstream (§4.6); the tick has stopped */
+#define HP_TX_EVT_STALL  1   /* acked_sbc stuck for stall_ms with frames downstream (§4.6), or send() refused for
+                              * stall_ms; the tick has stopped */
 
 /* hp_tx_stop reasons */
 #define HP_STOP_SUSPEND  0   /* local / remote SUSPEND, CLOSE, shutdown */
@@ -93,7 +94,9 @@ typedef struct {
     uint32_t audio_mtu, conn_rate, spf;   /* spf = PCM frames per SBC frame */
     uint32_t fpp, frame_len_max, tick_ms_eff;
     /* pacer (BTC) */
-    uint8_t  started, tx_paused, stalled;
+    uint8_t  started, send_failing, stalled;   /* send_failing: send() refused since send_fail_us (stall after
+                                                 * stall_ms) */
+    int64_t  send_fail_us;
     int64_t  last_us;
     uint64_t credit;          /* PCM frames x 1e6 (exact integer credit) */
     uint64_t credit_max;
@@ -157,7 +160,11 @@ int      hp_tx_app_is_busy(const hp_tx_t *t);
 uint32_t hp_tx_lat_ms(const hp_tx_t *t);
 
 /* ---- helpers (exposed for tests) ---- */
+/* SBC frames per packet: as many as fit the connection's audio_mtu (it already excludes the RTP and SBC media headers),
+ * at most HP_FPP_MAX; 0 = none fit. */
 uint32_t hp_tx_fpp(uint32_t audio_mtu, uint32_t frame_len);
+/* Bitpool the next packet is encoded at (the speech bitpool for sources <= 16 kHz, else the max; BTC / bench). */
+uint8_t  hp_tx_packet_bitpool(const hp_tx_t *t);
 uint64_t hp_tx_credit_max(uint32_t tick_ms, uint32_t credit_ticks, uint32_t conn_rate, uint32_t max_pkt,
                           uint32_t fpp, uint32_t spf);
 /* Largest tick period (<= tick_ms) satisfying the headroom rule max_pkt * fpp * spf * 1000 / tick >= 1.2 * rate. */

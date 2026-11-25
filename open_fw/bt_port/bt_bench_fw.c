@@ -191,7 +191,7 @@ static struct {
     uint32_t last_msg_seq;
     uint32_t next_stat, stat_n, t_tone;
     uint32_t phase;
-    uint32_t prev_pkts, prev_frames, prev_acked, prev_pads;
+    uint32_t prev_pkts, prev_frames, prev_acked, prev_pads, prev_el_ms;
 } s_hp BENCH_HI;
 static char s_hp_play_path[BT_BENCH_HP_FILE_MAX + 1u] BENCH_HI;
 
@@ -317,8 +317,14 @@ static void hp_stats(uint32_t el_ms)
     lku("link", u->link);
     lku("rate", t->conn_rate);
     lku("bp", t->cfg.max_bp);
+    /* on air: the speech bitpool for a source <= 16 kHz (the tone stage: hp_speech_bp=0 for bp), payload bytes/s */
+    uint8_t bp_eff = t->cfg_valid ? hp_tx_packet_bitpool(t) : 0u;
+    lku("bp_eff", bp_eff);
     lku("fpp", t->fpp);
     lku("pkts", t->st.pkts - s_hp.prev_pkts);
+    uint32_t dt_ms = el_ms - s_hp.prev_el_ms ? el_ms - s_hp.prev_el_ms : 1000u;
+    lku("Bps", t->cfg_valid ? (uint32_t)((uint64_t)(t->st.frames_sbc - s_hp.prev_frames) *
+                                         hp_sbc_frame_len(&t->cfg, bp_eff) * 1000u / dt_ms) : 0u);
     lku("sbc", t->st.frames_sbc - s_hp.prev_frames);
     lku("acked", t->acked_sbc - s_hp.prev_acked);
     lku("pads", t->st.pad_pkts - s_hp.prev_pads);
@@ -337,6 +343,7 @@ static void hp_stats(uint32_t el_ms)
     s_hp.prev_frames = t->st.frames_sbc;
     s_hp.prev_acked = t->acked_sbc;
     s_hp.prev_pads = t->st.pad_pkts;
+    s_hp.prev_el_ms = el_ms;
     uint16_t h = bt_hp_acl_handle();
     bt_ctrl_link_info_t li;
     if (h != 0xFFFFu && bt_ctrl_link_info(h, &li)) {

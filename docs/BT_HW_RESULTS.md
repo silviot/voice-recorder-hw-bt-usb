@@ -827,7 +827,11 @@ mode=hp hp_stage=tone hp_pick=first hp_pair=1 secs=120
 mode=hp hp_stage=tone hp_addr=AA:BB:CC:DD:EE:FF secs=120 hp_tone_hz=0
 mode=hp hp_stage=player hp_pick=last secs=180
 mode=hp hp_stage=tone hp_addr=AA:BB:CC:DD:EE:FF secs=120 hp_rate=44100 hp_bitpool=28
+mode=hp hp_stage=tone hp_pick=last secs=120 hp_speech_bp=0
 ```
+The tone (and any 16 kHz recording in the player stage) goes out at the speech bitpool (`hp_speech_bp`, default 24)
+while `bp=` prints the negotiated maximum: the per-second line's `bp_eff=` is what is on air. A throughput run at
+the max bitpool (the H3 gate, a bitpool sweep) needs `hp_speech_bp=0`, as in the last line.
 `hp_pair=1` is needed once per headset (first pairing, or after `Forget`); afterwards the stored key in
 `SD:/bt_hp_bonds.bin` reconnects without pairing. In bench runs the pairing window is opened by the run instead of the
 user (logged `BENCH hp pair window note=bench, no user...`); the policy is otherwise the same.
@@ -887,11 +891,14 @@ opened again (headphones mode is not started at boot).
   `role=S` with `role_chg>=1` = the headset took the master role (also when it switched before the Connection
   Complete, as TWS earbuds do).
 - Tone: `BT hp media START err=0`, `BT hp media ack cmd=2 st=0`, `BT hp audio STARTED ours=1 tick=1`,
-  `BT hp stream rate=48000 bp=35 bp_min=.. fpp=N mtu=NNN tick_ms=20`, then per second
-  `BENCH hp t=N link=3 rate=48000 bp=35 fpp=N pkts=~37 sbc=~375 acked=~375 pads=0 lost=0 drop=0 allocf=0 cs_no=0
-  txq=0..4 txq_max=.. down=.. nocp_max_ms=.. stalls=0 late=..` and `BENCH hp linkinfo role=M pkt_type=0x....
+  `BT hp stream rate=48000 bp=35 bp_min=.. speech_bp=24 fpp=N mtu=NNN tick_ms=20`, then per second
+  `BENCH hp t=N link=3 rate=48000 bp=35 bp_eff=24 fpp=N pkts=~37 Bps=~22900 sbc=~375 acked=~375 pads=0 lost=0
+  drop=0 allocf=0 cs_no=0 txq=0..4 txq_max=.. down=.. nocp_max_ms=.. stalls=0 late=..` (`bp_eff=35 Bps=~31100`
+  with `hp_speech_bp=0`; `Bps` = SBC payload bytes/s at `bp_eff`) and `BENCH hp linkinfo role=M pkt_type=0x....
   max_slots=5 mode=0 acl_sent=.. acl_done=.. heap_free=.. heap_min=..`. Healthy: `sbc` ~375/s at 48 kHz (~345 at
-  44.1), `acked` close to `sbc`, `pads=0`, `nocp_max_ms` well under 800, `stalls=0`, `heap_min` > 8000.
+  44.1), `acked` close to `sbc`, `pads=0`, `lost=0`, `nocp_max_ms` well under 800, `stalls=0`, `heap_min` > 8000.
+  A REC switch while STARTED logs `BT hp media SUSPEND`; a headset that refuses it logs `BT hp SUSPEND refused
+  retry=1 n=..` and is asked again up to 3 times, 1 s apart.
 - End: `BENCH exit why=time`, `BT hp teardown ms=NNN profile_ms=NN job_rc=0 reason=0` (ms < 2000; `job_rc=5` =
   A2DP deinit not confirmed in time), `BT hp stopped`, `BENCH end`, `BENCH LOGFILE ... st=OK`.
 

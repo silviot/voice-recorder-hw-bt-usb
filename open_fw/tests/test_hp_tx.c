@@ -35,6 +35,7 @@ static struct {
     uint32_t bufs_out, qmax;
     uint32_t refuse_next;                /* refuse the next N sends after can_send said yes (must not happen) */
     uint32_t alloc_fail_next;            /* fail the next N allocations */
+    uint32_t mtu_over;                   /* payloads over the audio MTU (btc_a2d_src_audio_mtu_check would refuse) */
     /* peer: SBC payload as received, plus per-packet metadata */
     uint8_t *peer; size_t peer_len, peer_cap;
     uint32_t peer_pkts, peer_frames, last_ts, ts_gaps, nf_bad;
@@ -66,6 +67,7 @@ static int f_send(void *c, void *buf, uint32_t len, uint16_t nf, uint32_t ts)
     (void)c;
     if (!F.started || F.flushing || F.qn > F.cap_len) return HP_SEND_FAIL;
     if (F.refuse_next) { F.refuse_next--; return HP_SEND_FAIL; }
+    if (len > T.audio_mtu) F.mtu_over++;
     fbuf_t *b = buf;
     fpkt_t *p = &F.q[(F.qh + F.qn) % FQ];
     p->data = malloc(len);
@@ -318,15 +320,43 @@ static void test_refusals_and_pads(void)
     CHECK(T.st.tx_lost_sbc == 0, "tx_lost_sbc %u", T.st.tx_lost_sbc);
     CHECK(T.st.pad_pcm > 0 && T.st.pad_pkts > 0, "pads after EOF counted apart: %u", T.st.pad_pcm);
     CHECK(F.bufs_out == 0, "buffers outstanding %u", F.bufs_out);
-    /* a refusal after can_send (must not happen): counted, the tick pauses until the next STARTED, its real frames
-     * stay unheard so a rewind replays them */
+    /* a refusal after can_send (must not happen): counted, its real frames stay unheard so a rewind replays them,
+     * and the tick goes on by itself (an already STARTED stream gets no further STARTED to resume it) */
     setup(48000, 2, 48000, 10, 35, NULL, 600, 6);
     run_ms(300, 1);
     F.refuse_next = 1;
+    uint32_t pk0 = T.st.pkts;
     run_ms(100, 1);
-    CHECK(T.st.tx_lost_sbc == 10 && T.tx_paused, "lost %u paused %u", T.st.tx_lost_sbc, T.tx_paused);
+    CHECK(T.st.tx_lost_sbc == 10 && !T.send_failing && !T.stalled, "lost %u failing %u stalled %u",
+          T.st.tx_lost_sbc, T.send_failing, T.stalled);
     CHECK(T.lost_src > 0, "lost frames kept as unheard (%u)", T.lost_src);
-    CHECK(hp_tx_start(&T) != 0 && !T.tx_paused, "resumes on the next STARTED");
+    CHECK(T.st.pkts > pk0 + 2u, "sending again after one refusal (%u -> %u)", pk0, T.st.pkts);
+    CHECK(g_events == 0, "no stall for one refusal (%d)", g_events);
+    /* refusals that last: a stall after stall_ms (rewind snapshot, event), not a silent freeze */
+    F.refuse_next = 1000000;
+    run_ms(HP_STALL_MS + 200u, 1);
+    CHECK(g_events == 1 && T.stalled && !T.started, "lasting refusal -> one stall event (%d), tick latched", g_events);
+    CHECK(hp_tx_app_queued_frames(&T) > 0u, "rewind snapshot holds the unheard frames");
+    F.refuse_next = 0;
+    CHECK(hp_tx_start(&T) != 0 && !T.stalled && !T.send_failing, "resumes on the next STARTED");
+    /* audit r3 "bug 1" (rejected): the connection's audio_mtu already excludes the RTP header and the 1-byte SBC
+     * header (btc_av.c BTC_AV_AUDIO_MTU_RESERVE; the bt_host harness logs mtu 829 for a peer MTU of 842), so frames
+     * may fill it exactly: an MTU that is an exact multiple of the frame length takes that many frames */
+    {
+        hp_sbc_cfg_t c = { 48000, HP_SBC_JOINT_STEREO, 16, 8, HP_SBC_LOUDNESS, 2, 35 };
+        uint32_t fl = hp_sbc_frame_len(&c, 35);
+        CHECK(fl == 83u && hp_tx_fpp(10u * fl, fl) == 10u && hp_tx_fpp(10u * fl - 1u, fl) == 9u,
+              "MTU an exact multiple of the frame length: fpp %u (want 10)", hp_tx_fpp(10u * fl, fl));
+        CHECK(hp_tx_fpp(fl, fl) == 1u && hp_tx_set_cfg(&T, &c, fl - 1u) != 0 && hp_tx_set_cfg(&T, &c, fl) == 0,
+              "MTU = one frame");
+        setup(48000, 2, 48000, 10, 35, NULL, 600, 6);
+        CHECK(hp_tx_set_cfg(&T, &c, 10u * fl) == 0, "set_cfg 830");
+        CHECK(hp_tx_start(&T) != 0 && T.fpp == 10u, "fpp %u at audio MTU %u", T.fpp, T.audio_mtu);
+        F.want_nf = (uint16_t)T.fpp;
+        uint32_t p0 = T.st.pkts;
+        run_ms(300, 1);
+        CHECK(T.st.pkts > p0 && F.mtu_over == 0u, "%u packets over the MTU (of %u)", F.mtu_over, T.st.pkts - p0);
+    }
 
     /* EOF under congestion: a slow link (NOCP 50 ms per packet); is_busy must settle while pads keep flowing */
     setup(48000, 2, 48000, 10, 35, NULL, 50000, 6);

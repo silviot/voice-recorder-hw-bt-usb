@@ -310,8 +310,9 @@ Recipe:
      - `esp_a2d_source_audio_data_send(conn_hdl, buf)`: on `ESP_OK`, `ts += 128 × fpp` (RTP units = samples),
        `credit −= fpp × 128`, `sent_sbc += fpp` (SBC frames, §4.4), push the packet record (§4.4); on any error
        (should not happen after the pre-checks) `esp_a2d_audio_buff_free(buf)`, count `tx_lost_sbc += fpp`, keep
-       the packet's real frames in `unheard_real_pcm` as "lost unheard" so a later rewind replays them, set
-       `tx_paused` and leave; the tick resumes only after the next STARTED. Host tests assert `tx_lost_sbc == 0`.
+       the packet's real frames in `unheard_real_pcm` as "lost unheard" so a later rewind replays them and leave;
+       the next tick goes on (an already STARTED stream gets no further STARTED), and refusals lasting `stall_ms`
+       raise the stall event (§4.6; live log §19.6). Host tests assert `tx_lost_sbc == 0`.
   5. Remaining credit carries over (bounded by step 2).
 - **Result.** At the max bitpool packets are full, about every 27 ms at 48 kHz / bitpool 35 / fpp 10. A 1 s stall
   produces at most `CREDIT_MAX` of catch-up (40-64 ms of audio: 2 ticks, or 2 packets at fpp 7-11), never a burst
@@ -1197,3 +1198,29 @@ reorder, declined here in favour of moving only the pairing helpers.
 3. A controller restart after a credit stall with no disconnect event (8 s) is accepted.
 4. Milestone order stays H3 (silicon spike) before H4 (session-core refactor); only the store reset and key-staging helpers move early.
 5. The Codex review (`docs/reviews/A2DP_DESIGN_REVIEW_CODEX.md`) was obtained after rev 3 was written; its 12 findings overlap rev 3 on Just Works, teardown, AVRCP notifications and position tracking. The remaining ones (SBC frame geometry from the accepted config, enqueue-failure propagation and packet retention, acquire/release ring indices with consumer ack, pacing µs→frames remainder, START/SUSPEND failure transitions, RAM for FIR taps in flash, H3 throughput gate with speech-bitpool override disabled) are to be applied to the implementation in the follow-up pass and recorded in §18.
+
+### 19.6 Live log: the §19.5 follow-up items at `integ/bt-all-local` (2026-11-25)
+
+Audit of be8db84 plus the merge review of `integ/bt-all-local` (triage and fixes: `BT_A2DP_HP_SESSION.md`,
+"Third review round"). How the §19.5 items landed, deviations included:
+
+- **SBC geometry** from the negotiated CIE (applied again at CONNECTED, session deviation 4). **Audio MTU:** the
+  connection event's `audio_mtu` already excludes the RTP header and the 1-byte SBC media header
+  (`btc_av.c` `BTC_AV_AUDIO_MTU_RESERVE`); the audit's "one byte over the MTU" was a false positive, frames may fill
+  it exactly (`test_hp_tx` checks an exact multiple).
+- **Enqueue failure:** patch 0034 reports it and the buffer stays ours. Deviation: the refused packet is not held
+  and resent; it is freed and its real frames count as unheard (a rewind replays them). The tick no longer pauses
+  until a STARTED that an already started stream never gets: it goes on, and refusals lasting `stall_ms` raise the
+  stall event (rewind snapshot, ACL close, reconnect).
+- **Ring indices:** acquire/release; after a flush the consumer's copy is validated by a seqlock-style flush
+  generation check instead of waiting for a consumer acknowledgement (TSan stress, `BT_A2DP_H0_H1.md`).
+- **µs → frames** carried exactly (credit in µs × frames). **START failures:** one retry, then final, 2 s cooldown.
+  **SUSPEND refused:** retried up to 3 times 1 s apart while no new audio or demand arrived; REC → disconnect
+  fallback still open (Exp 4h).
+- **Local SUSPEND** no longer stops the tick first (§4.5): the stack's flushing flag makes `can_send` fail, which
+  also keeps a rejected SUSPEND's stream fed.
+- **FIR taps** in flash (`.rodata` in XIP). **H3 throughput gate:** the bench line now prints the bitpool on air
+  (`bp_eff`) and payload bytes per second (`Bps`); a throughput run at the max bitpool needs `hp_speech_bp=0`
+  (`BT_HW_RESULTS.md` recipe).
+- **Patch E backstop** (forced `btc_av` state reset at deinit, §19.2) not in yet: deferred, only a headset that
+  freezes during a stop reaches it (patch 0039 already closes a stream stuck closing).

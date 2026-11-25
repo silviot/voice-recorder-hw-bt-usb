@@ -101,6 +101,35 @@ Each host-testable one has a check that failed before the fix (scenario S unless
 | `pkt_type` in linkinfo is always 0 (040F REJ) | linkinfo also logs `req_pt` / `allow_rs` (our 0405) and the peer's `edr` / `slots35` (event 0x0B) | `hp_link_view_early_role` |
 | Recipe deleted the bond between stages; `hp_pick=first` could pick a phone/PC | recipe split (bond kept), `hp_pick=last` (stored headset); `bt_bench_hp_pick`: AV major class only, headset types first | `test-bt-port` (`test_bt_bench`) |
 
+## Third review round (audit of be8db84 + merge review of `integ/bt-all-local`)
+
+| Finding | Decision / fix | Test |
+|---|---|---|
+| Merge #1: output mode Both, the speed dial silent (8x+) or at its end: nothing calls `pump_dac()`, the speaker misses the tail (click instead of the fade), plays ~150 ms of stale audio when the dial turns audible, and `scrub_stop` drops the rest | `aout_queued_frames()` pumps the DAC in Both and reports the later of both outputs (headset queue vs tap + DAC queue); the silent branch, `scrub_done` and `scrub_heard` all ask it every loop pass (1 ms wait). The suggested drop of the tap when the dial turns audible is not needed (and would desync): the tap now drains as the headset does | `test_audio_out` "BOTH drain without writes" (before: 12943 of 21135 frames reached the DAC, queued 0 early) |
+| Merge #2: a link event and NEXT/PREV (or PLAY/TOGGLE) in one loop pass start the dial / resume on the dead or suspended link | an event that pauses the player (link lost / stalled / remote suspend / START failed, or headphones mode stopped) drops a play/pause or seek action of the same pass (`PLAYER_DROP_RESUME_KEY`) | none (no BT=1 `test_player`) |
+| Merge #3 = audit bug 2: Both + absolute-volume headset: the DAC (speaker / jack) at level 31 | `aout_set_volume_split(dac, bt, dig)`; the player gives the DAC its volume and the headset unity only while absolute volume is on (`PLAYER_SET_VOL`). A jack edge on the headset route keeps `bt_vol` instead of loading the jack/speaker volume for one loop | `test_audio_out` split volume |
+| Audit bug 1: packets one byte over the MTU | **rejected**: `ESP_A2D_CONNECTION_STATE_EVT`'s `audio_mtu` is the peer MTU less the RTP header **and** the 1-byte SBC header (`btc_av.c` `BTC_AV_AUDIO_MTU_RESERVE`; scenario S logs `mtu 829` for peer MTU 842), the bound `btc_a2d_src_audio_mtu_check` applies | `test_hp_tx`: an MTU that is an exact multiple takes that many frames and no packet exceeds it |
+| Audit 2: a refused send paused the tick until a STARTED that a started stream never gets (frozen player, no toast) | no pause: the packet is freed (its real frames stay unheard), the next tick goes on; refusals lasting `stall_ms` raise the stall event (rewind snapshot, the session's stall path) | `test_hp_tx` refusal cases (before: no event after a lasting refusal) |
+| Audit 3: ring seqlock instead of a consumer acknowledgement | recorded (design §19.6) | TSan stress (`BT_A2DP_H0_H1.md`) |
+| Audit 5a: a refused SUSPEND (REC switch, idle) left the stream STARTED, sending silence | retried up to `BT_HP_SUSPEND_RETRIES` (3) times `BT_HP_SUSPEND_RETRY_MS` (1 s) apart while STARTED and no new audio / demand since the refusal; log `SUSPEND refused retry=.. n=..` | none (the fake headset cannot refuse SUSPEND) |
+| Audit 11: tone stage logs `bp=35` while 24 is on air (speech bitpool, 16 kHz source) | per-second `BENCH hp` line adds `bp_eff` (bitpool on air) and `Bps` (SBC payload bytes/s); the `stream` log adds `speech_bp`; recipe: `hp_speech_bp=0` for a throughput run at the max | build only |
+| Audit 7: stale "patch E is not in yet" comment | comment updated | - |
+| Audit "smaller": tick not stopped before a local SUSPEND | recorded (design §19.6) | - |
+| Audit items 1, 4, 6, 8, 9, 10 | implemented, no change | - |
+
+**Deferred** (one line each):
+- Held-packet resend after a refused send (audit 2): the stall path now bounds it; a refusal needs a heap
+  node-allocation failure or a handle mismatch, watch `lost` in the bench line.
+- REC → disconnect after the SUSPEND retries (audit 5a): needs a REC-aware session flag and a reconnect policy for
+  the end of the recording; headsets rarely refuse SUSPEND (design Exp 4h).
+- Unasked STARTED after the 5 s START no-ack timeout (audit 5b): needs the stack to send STARTED > 5 s late; fix
+  when seen on silicon (SUSPEND it after ~500 ms).
+- Just Works hook allows when the session is gone (audit 6): harmless while headphones mode is never connectable;
+  tightening it touches phone mode's pairing path.
+- Patch E backstop (`btc_av` state reset at deinit, new patch 0040) and refusing `bt_hp_start` after `job_rc=5`
+  (audit 7): only a headset frozen during a stop reaches it, and 0039 covers the stream stuck closing.
+- `mc_issue` clearing both pending flags on a send error: harmless (one command outstanding at a time).
+
 ## Integration with the local features (`integ/bt-all-local`: BT + `test/main-combo`)
 
 `test/main-combo` (backlight fade, `.autoplay` folders + position memory, speed dial, screen transitions, idle-key fix,
@@ -118,7 +147,9 @@ Settings > Headset button test) merged on top of the BT branch. The BT=0 image s
   `BT_HP_IDLE_SUSPEND_MS` (20 s) of it the session suspends; the next audible grain or 1x audio demands START again.
   The speed dial is a lasting state now (not a hold), so link lost / stalled / remote suspend / START failed and
   "headphones mode stopped" end it at the heard position before pausing, and starting the dial from pause on the
-  headset route is refused like PLAY when no stream is ready ("Headphones not connected").
+  headset route is refused like PLAY when no stream is ready ("Headphones not connected"). Such an event also drops
+  a play/pause or seek key of the same loop pass. In Both, the DAC keeps being fed through `aout_queued_frames()`
+  while the dial is silent or ending (third review round).
 - **AVRCP keys**: FORWARD / BACKWARD = one fresh RIGHT / LEFT press (`keys.repeat` cleared): with the "Speed" skip
   setting one speed-dial step (1x -> 2x, ...; at another speed toward it), with "Track" (or FORWARD at the end) the
   next / previous file. PLAY/PAUSE toggle = OK (at another speed: back to 1x). STOP (`BT_HP_KEY_PAUSE`) during the
@@ -139,6 +170,7 @@ Settings > Headset button test) merged on top of the BT branch. The BT=0 image s
 - Not on the host: the speed dial on the headset route (silent clock, link loss mid-dial), a 44.1 kHz-only sink (SEID 1 fallback), bitpool-limited peers, page-scan variants, the player and
   UI integration (no `test_player` BT=1 variant yet), wasm rendering of `UI_SCR_LIST`, TSan for scenario S, soak.
 - Design items still open: patches B/C, `bt_ctrl_rnr_pending()`, AVRCP scrub, Home PLAY, idle disconnect, mono
-  pass-through, "BT" volume label, LRU of 2 headset bonds, REC → disconnect fallback (Exp 4h).
+  pass-through, "BT" volume label, LRU of 2 headset bonds, REC → disconnect fallback (Exp 4h; a refused SUSPEND is
+  now retried 3 times), the third round's deferred list above.
 - The controller branch's H2 findings are still only in `docs/BT_CTRL_OPCODE_TABLE.md` §7 and
   `docs/BT_ROM_HCI_MAP.md` §6: fold them into the design's live log with this file.

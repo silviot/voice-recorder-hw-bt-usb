@@ -16,11 +16,17 @@
 #include "../bt_port/bt_hp.h"
 #define PLAYER_BT 1
 #define PA_SET(on) audio_pa_set((on) && aout_route() != AOUT_ROUTE_BT)
-#define PLAYER_VOL_GAIN(v) ((aout_is_bt() && bt_hp_abs_vol()) ? 31u : (v))
+/* With absolute volume the headset sets its own level: its PCM gain stays at unity (31), the DAC (output mode BOTH:
+ * speaker or wired jack) keeps the player's volume. */
+#define PLAYER_SET_VOL(v) aout_set_volume_split((v), (aout_is_bt() && bt_hp_abs_vol()) ? 31u : (v), 0x1FFu)
+/* A headset event that pauses the player in this loop pass also drops a play/pause or speed-dial key of the same
+ * pass, which would otherwise un-pause onto the dead or suspended link (merge review r3 #2). */
+#define PLAYER_DROP_RESUME_KEY(a) do { if ((a) == PLAYER_ACT_PLAY_PAUSE || (a) == PLAYER_ACT_SEEK_FWD || \
+                                          (a) == PLAYER_ACT_SEEK_BACK) (a) = PLAYER_ACT_NONE; } while (0)
 #else
 #define PLAYER_BT 0
 #define PA_SET(on) audio_pa_set(on)
-#define PLAYER_VOL_GAIN(v) (v)
+#define PLAYER_SET_VOL(v) aout_set_volume((v), 0x1FFu)
 #endif
 
 #define PLAYER_DAC_CHUNK_FRAMES 1024u
@@ -847,7 +853,7 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
     if (aout_is_bt()) {
         bt_hp_player_begin();                       /* keys / headset events from before this file do not apply */
         volume = bt_hp_vol31();
-        aout_set_volume(PLAYER_VOL_GAIN(volume), 0x1FFu);
+        PLAYER_SET_VOL(volume);
     }
 #endif
     /* Route audio to built-in speaker PA (PB30) when no 3.5 mm jack is inserted */
@@ -958,7 +964,7 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
             /* the headset changed its volume (absolute volume CHANGED / SetAbsoluteVolume): follow it, so the next
              * VOL key steps from the headset's value instead of jumping back */
             volume = bt_hp_vol31();
-            aout_set_volume(PLAYER_VOL_GAIN(volume), 0x1FFu);
+            PLAYER_SET_VOL(volume);
             ui_dirty = 1;
         }
         if (act == PLAYER_ACT_NONE && aout_is_bt()) {
@@ -996,6 +1002,7 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
         }
         if (bt_route && !aout_is_bt() && !paused && !eof_reached) {
             bt_route = 0;                            /* headphones mode stopped under the file: hold it */
+            PLAYER_DROP_RESUME_KEY(act);
             if (scrub.speed) {
                 scrub_stop(&scrub, &winfo, &data_off, &played_frames, &skip_frames, &buf_pos, &buf_frames);
             }
@@ -1015,6 +1022,7 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
                 if (scrub.speed) {
                     scrub_stop(&scrub, &winfo, &data_off, &played_frames, &skip_frames, &buf_pos, &buf_frames);
                 }
+                PLAYER_DROP_RESUME_KEY(act);
                 paused = 1;
                 aout_set_mute(1);
                 player_pause_rewind(&winfo, &data_off, &played_frames, &buf_pos, &buf_frames, &skip_frames);
@@ -1038,7 +1046,12 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
             int was_hp = hp_in;
             hp_in  = cur_hp;
             volume = hp_in ? m->cfg.hp_vol : m->cfg.spk_vol;
-            aout_set_volume(volume, 0x1FFu);
+#if PLAYER_BT
+            if (aout_is_bt()) {
+                volume = bt_hp_vol31();              /* BOTH: one volume for both outputs (the headset's bt_vol) */
+            }
+#endif
+            PLAYER_SET_VOL(volume);
             if (was_hp && !hp_in && !paused && !eof_reached) {
                 paused = 1;
                 PA_SET(0);
@@ -1106,7 +1119,7 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
             } else {
                 m->cfg.spk_vol = volume;
             }
-            aout_set_volume(PLAYER_VOL_GAIN(volume), 0x1FFu);
+            PLAYER_SET_VOL(volume);
             last_vol_ms = now ? now : 1u;
             ui_dirty    = 1;
         } else if (act == PLAYER_ACT_SEEK_BACK || act == PLAYER_ACT_SEEK_FWD) {

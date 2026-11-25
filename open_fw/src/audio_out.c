@@ -239,8 +239,16 @@ uint32_t aout_queued_frames(void)
     case AOUT_ROUTE_DAC:
         return audio_dac_queued_frames();
     case AOUT_ROUTE_BT:
-    case AOUT_ROUTE_BOTH:
-        return hp_tx_app_queued_frames(g_ao.tx);   /* BOTH: the DAC is aligned to the headset */
+        return hp_tx_app_queued_frames(g_ao.tx);
+    case AOUT_ROUTE_BOTH: {
+        /* The DAC only gets audio when pump_dac runs: do it here too, so it keeps being fed while the player writes
+         * nothing (speed-dial silence, the dial's end: the player then only asks this). What is not yet heard is the
+         * later of both outputs (equal while aligned); the DAC side counts its frames still held in the tap. */
+        pump_dac();
+        uint32_t q_bt = hp_tx_app_queued_frames(g_ao.tx);
+        uint32_t q_dac = hp_sink_tap_avail(g_ao.sink) + audio_dac_queued_frames();
+        return q_bt > q_dac ? q_bt : q_dac;
+    }
     default:
         return 0u;
     }
@@ -259,14 +267,19 @@ void aout_set_mute(int muted)
     }
 }
 
-void aout_set_volume(uint8_t vol, uint16_t dig)
+void aout_set_volume_split(uint8_t dac_vol, uint8_t bt_vol, uint16_t dig)
 {
     if (g_ao.route == AOUT_ROUTE_DAC || g_ao.route == AOUT_ROUTE_BOTH) {
-        audio_dac_set_volume(vol, dig);
+        audio_dac_set_volume(dac_vol, dig);
     }
     if (g_ao.route == AOUT_ROUTE_BT || g_ao.route == AOUT_ROUTE_BOTH) {
-        hp_sink_set_gain_q15(g_ao.sink, s_gain_q15[vol & 31u]);   /* absolute volume (bt_vol) comes with H5/H6 */
+        hp_sink_set_gain_q15(g_ao.sink, s_gain_q15[bt_vol & 31u]);
     }
+}
+
+void aout_set_volume(uint8_t vol, uint16_t dig)
+{
+    aout_set_volume_split(vol, vol, dig);
 }
 
 void aout_stop(void)
