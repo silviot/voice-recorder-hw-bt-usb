@@ -159,6 +159,7 @@ typedef struct {
     uint16_t       put_last_crc;
     /* last PUTEND commit, so a repeated PUTEND (lost reply) answers the same OK until the next PUT header */
     uint8_t        put_done_valid;
+    uint8_t        put_rec_deleted;
     uint32_t       put_done_total;
 
     /* Transfer status (xrec_get_xfer): updated where GETS / PUT chunks move, read by the UI from the same task */

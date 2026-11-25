@@ -258,6 +258,11 @@ int main(int argc, char **argv)
     assert(!exists("/cassini/REC_0001.cwx"));
     /* PUTEND is idempotent until the next PUT: a retry after a lost reply gets the same OK */
     assert(strcmp(cmd("+XREC:PUTEND"), "+XREC:OK,PUTEND,700\r\n") == 0);
+    /* Any next PUT header (even one rejected early on length/offset with ERR,ARG) invalidates the previous PUTEND */
+    clear_out();
+    rx_str("+XREC:PUT,0,9999,0,REC,REC_0001.cwx:");
+    assert(strcmp(g_out, "+XREC:ERR,ARG\r\n") == 0);
+    assert(strcmp(cmd("+XREC:PUTEND"), "+XREC:ERR,NOPUT\r\n") == 0);
     {
         const char *l = ls();
         assert(strstr(l, "+XREC:F,700,REC_0001.cwx\r\n") != NULL && strstr(l, "+XREC:F,300,REC_0001.wav\r\n") != NULL);
@@ -421,10 +426,11 @@ int main(int argc, char **argv)
     make_wav("REC_0003.wav", c, 100u);
     expect_put_ok(0u, "REC,REC_0003.cwx", a, 100u);
     assert(strcmp(cmd("+XREC:DEL,REC_0003.WAV"), "+XREC:OK,DEL\r\n") == 0);
-    assert(strcmp(cmd("+XREC:PUTEND"), "+XREC:ERR,NOENT\r\n") == 0);
+    assert(!exists("/record/.xrec_rec.tmp"));                  /* temp closed & removed at once when its .wav is deleted */
+    make_wav("REC_0003.wav", c, 100u);                         /* next recording reuses REC_0003.wav before PUTEND */
+    assert(strcmp(cmd("+XREC:PUTEND"), "+XREC:ERR,NOENT\r\n") == 0);   /* old sidecar NEVER attaches to the new .wav */
     assert(!exists("/record/REC_0003.cwx") && !exists("/record/.xrec_rec.tmp"));
     assert(strcmp(cmd("+XREC:PUTEND"), "+XREC:ERR,NOPUT\r\n") == 0);
-    make_wav("REC_0003.wav", c, 100u);
     expect_put_ok(0u, "REC,REC_0003.cwx", a, 100u);
     assert(strcmp(cmd("+XREC:PUTEND"), "+XREC:OK,PUTEND,100\r\n") == 0);
 
@@ -539,6 +545,15 @@ int main(int argc, char **argv)
         assert(x.active && x.upload && x.done == 40u);
         assert(strcmp(cmd("+XREC:PUTEND"), "+XREC:OK,PUTEND,40\r\n") == 0);
         g_now += 2000u;
+        xrec_get_xfer(&g_x, g_now, &x);
+        assert(!x.active);
+        /* an upload that aborts mid-way (SDIO) clears the upload view at once instead of holding stale progress */
+        expect_put_ok(0u, "REC,REC_0001.cwx", a, 600u);
+        xrec_get_xfer(&g_x, g_now, &x);
+        assert(x.active && x.upload && x.done == 600u);
+        g_fail_writes = 1;
+        assert(strcmp(put(600u, "REC,REC_0001.cwx", b, 40u), "+XREC:ERR,SDIO\r\n") == 0);
+        g_fail_writes = 0;
         xrec_get_xfer(&g_x, g_now, &x);
         assert(!x.active);
 
