@@ -1,18 +1,16 @@
 diff --git a/open_fw/third_party/bluedroid/host/bluedroid/btc/core/btc_dm.c b/open_fw/third_party/bluedroid/host/bluedroid/btc/core/btc_dm.c
-index 3a87f2b..e23bb8b 100644
+index 0178f11..bd5e896 100644
 --- a/open_fw/third_party/bluedroid/host/bluedroid/btc/core/btc_dm.c
 +++ b/open_fw/third_party/bluedroid/host/bluedroid/btc/core/btc_dm.c
-@@ -419,6 +419,9 @@ static void btc_dm_auth_cmpl_evt (tBTA_DM_AUTH_CMPL *p_auth_cmpl)
-     /* Save link key, if not temporary */
+@@ -448,6 +448,7 @@ static void btc_dm_auth_cmpl_evt (tBTA_DM_AUTH_CMPL *p_auth_cmpl)
      bt_bdaddr_t bd_addr;
      bt_status_t status;
-+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+ #if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
 +    bool key_not_stored = false; /* open_fw patch 0044 */
-+#endif
+     BOOLEAN openfw_downgrade = FALSE;
+ #endif
      BTC_TRACE_DEBUG("%s: bond state success %d, present %d, type%d\n", __func__, p_auth_cmpl->success,
-               p_auth_cmpl->key_present, p_auth_cmpl->key_type);
- 
-@@ -438,7 +441,18 @@ static void btc_dm_auth_cmpl_evt (tBTA_DM_AUTH_CMPL *p_auth_cmpl)
+@@ -482,7 +483,18 @@ static void btc_dm_auth_cmpl_evt (tBTA_DM_AUTH_CMPL *p_auth_cmpl)
                  ret = btc_storage_add_bonded_device(&bd_addr,
                                                      p_auth_cmpl->key, p_auth_cmpl->key_type,
                                                      16, p_auth_cmpl->sc_support);
@@ -31,7 +29,7 @@ index 3a87f2b..e23bb8b 100644
              } else {
                  BTC_TRACE_DEBUG("%s: Temporary key. Not storing. key_type=0x%x",
                            __FUNCTION__, p_auth_cmpl->key_type);
-@@ -488,6 +502,11 @@ static void btc_dm_auth_cmpl_evt (tBTA_DM_AUTH_CMPL *p_auth_cmpl)
+@@ -544,6 +556,11 @@ static void btc_dm_auth_cmpl_evt (tBTA_DM_AUTH_CMPL *p_auth_cmpl)
              break;
          }
      }
