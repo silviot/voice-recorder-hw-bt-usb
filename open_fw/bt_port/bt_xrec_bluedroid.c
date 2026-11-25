@@ -149,6 +149,12 @@ static struct {
 } s;
 
 static volatile uint8_t s_spp_uninit_seen;
+static volatile uint8_t s_ssp_auto_accept = BT_XREC_SSP_AUTO_ACCEPT_DEFAULT;   /* outside s: survives start */
+
+void bt_xrec_set_ssp_auto_accept(int on)
+{
+    s_ssp_auto_accept = on ? 1u : 0u;
+}
 #if BENCH_IMAGE
 static volatile uint8_t s_bench_autoconfirm;   /* BENCH ONLY (bt_xrec_set_bench_autoconfirm); outside s: survives start */
 static char s_bench_pin[8];                     /* BENCH ONLY (bt_xrec_set_bench_xrec_pin): "" = DRBG PIN; app task */
@@ -977,6 +983,21 @@ static void on_cfm_req(const ev_t *e)
         return;
     }
 #endif
+    if (s_ssp_auto_accept) {
+        /* C2 / A8 policy: the open window is the protection; no local confirmation (header). */
+        if (s.cfm_pending) {
+            prompt_withdraw("BT SSP prompt withdrawn: auto-accept policy");
+        }
+        cfm_reply(e->bda, true);
+        cfm_accepted(e->bda);
+        s.d.ssp_auto_accepted++;
+        digits6(s.ssp_digits, e->val);
+        s.ssp_showing = 1u;
+        s.ssp_deadline = bt_xrec_plat_now_ms() + BT_XREC_SSP_SHOW_MS;
+        bt_xrec_plat_log_u32("BT SSP numeric comparison accepted (pairing window open, auto-accept), value",
+                             e->val % 1000000u);
+        return;
+    }
     if (s.cfm_pending) {
         /* One prompt at a time: the digits on screen never change under the user's finger. The same peer asking again
          * means its first pairing is gone, so that prompt goes too (BTM pairs one peer at a time: one reply). */

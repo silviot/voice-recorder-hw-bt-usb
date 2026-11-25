@@ -1692,6 +1692,39 @@ static void t_pairing_gate(void)
     stop_ok();
 }
 
+static void t_ssp_auto_accept(void)
+{
+    printf("[0] SSP auto-accept policy (default on, C2 / A8)\n");
+    mocks_reset();
+    bring_up();
+    cfm_req(PEER, 5u);
+    bt_xrec_poll();
+    CHECK(m_cfm_calls == 1 && m_cfm_accept == 0, "outside the window: rejected");
+    bt_xrec_open_pairing(60000u);
+    cfm_req(PEER, 4242u);
+    bt_xrec_poll();
+    CHECK(m_cfm_calls == 2 && m_cfm_accept == 1 && !ui().prompt && dbg().ssp_auto_accepted == 1u,
+          "inside the window: accepted at once, no prompt");
+    CHECK(strcmp(status().pair_pin, "004242") == 0, "value shown through pair_pin, got '%s'", status().pair_pin);
+    auth_cmpl(PEER, ESP_BT_STATUS_SUCCESS, ESP_BT_LINK_KEY_AUTHED_COMB_P192);
+    add_bond(PEER);
+    bt_xrec_poll();
+    CHECK(m_remove_calls == 0 && !dbg().ssp_window, "MITM bond kept, SSP window closed after it");
+    cfm_req(PEER2, 7u);
+    bt_xrec_poll();
+    CHECK(m_cfm_calls == 3 && m_cfm_accept == 0, "after the first bond: rejected (window's SSP part closed)");
+    stop_ok();
+    mocks_reset();
+    m_entropy_fail = 1;
+    bring_up();
+    bt_xrec_open_pairing(60000u);
+    cfm_req(PEER, 1u);
+    bt_xrec_poll();
+    CHECK(m_cfm_accept == 0 && dbg().ssp_auto_accepted == 0u, "gate refusing (no entropy): not accepted");
+    m_entropy_fail = 0;
+    stop_ok();
+}
+
 static void t_bench_autoconfirm(void)
 {
     printf("[15] BENCH autoconfirm override (bt_xrec_set_bench_autoconfirm)\n");
@@ -2125,6 +2158,8 @@ static void t_session6_review(void)
 int main(int argc, char **argv)
 {
     m_verbose = argc > 1 && strcmp(argv[1], "-v") == 0;
+    t_ssp_auto_accept();                  /* the release default (C2 / A8) */
+    bt_xrec_set_ssp_auto_accept(0);       /* the tests below exercise the local prompt (policy off) */
     t_bring_up_config();
     t_pairing_and_data();
     t_policy();

@@ -100,6 +100,7 @@ typedef struct {
     uint32_t conns_authorized;   /* SPP connections marked authorized for XREC */
     uint8_t  ssp_prompt;         /* a numeric comparison waits for the local user */
     uint32_t ssp_user_accepted, ssp_user_rejected, ssp_timeouts, ssp_withdrawn, ssp_bench_autoconfirmed;
+    uint32_t ssp_auto_accepted;  /* accepted by the auto-accept policy (bt_xrec_set_ssp_auto_accept) */
     uint32_t name_requests;      /* esp_bt_gap_read_remote_name() calls */
     uint32_t name_failed;        /* ESP_BT_GAP_READ_REMOTE_NAME_EVT with a failure status */
     uint32_t names_from_ctrl;    /* remote names taken from a Remote Name Request Complete (bt_xrec_plat_ctrl_name) */
@@ -143,6 +144,15 @@ void bt_xrec_get_ui(bt_xrec_ui_t *out);
  * -3 no prompt pending but one ended less than BT_XREC_SSP_AFTER_MS ago (swallowed: the key was meant for it).
  * The caller treats every value but -1 as consumed. Accepting re-checks the M2.3 gate first (rejects if it fails). */
 int  bt_xrec_ssp_answer(int accept);
+/* SSP numeric-comparison policy (C2 / A8, user decision 2026-11-25: convenience over local confirmation). On
+ * (BT_XREC_SSP_AUTO_ACCEPT_DEFAULT, 1): a comparison inside an open pairing window that passes the M2.3 gate is
+ * accepted at once, no ENTER / BACK prompt; the value is shown through bt_status_t.pair_pin for BT_XREC_SSP_SHOW_MS
+ * and logged. The pairing window (opened by the user on the device, time-limited, closed by the first MITM bond, key
+ * spent after a failed accepted pairing) is the protection. Off: the plan M4 prompt. Survives bt_xrec_start. Any task. */
+#ifndef BT_XREC_SSP_AUTO_ACCEPT_DEFAULT
+#define BT_XREC_SSP_AUTO_ACCEPT_DEFAULT 1
+#endif
+void bt_xrec_set_ssp_auto_accept(int on);
 #if defined(OPENFW_BT_BENCH_IMAGE) && OPENFW_BT_BENCH_IMAGE
 /* Bench images only (make BT=1 BENCH=1; a release BT=1 image has neither function nor the code behind them).
  * BENCH ONLY (default off; survives bt_xrec_start): numeric comparisons inside the pairing window are accepted without

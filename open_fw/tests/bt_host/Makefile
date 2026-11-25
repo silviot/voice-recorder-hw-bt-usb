@@ -96,6 +96,9 @@ $(OUT)/tests/fake_rom.o: CFLAGS_HOST += -include $(HT)/real_alloc.h
 $(OUT)/bt_port/bt_xrec_bluedroid.o: CFLAGS_PORT += -DBT_XREC_TEST_HOOKS=1
 # The phone scenario drives the bench overrides (P17-P19): built as a bench image (make BT=1 BENCH=1) would be.
 $(OUT)/bt_port/bt_xrec_bluedroid.o: CFLAGS_PORT += -DOPENFW_BT_BENCH_IMAGE=1
+# scenario P drives the local ENTER/BACK prompt: the C2/A8 auto-accept policy (release default) off here;
+# test_bt_xrec [0] covers it on.
+$(OUT)/bt_port/bt_xrec_bluedroid.o: CFLAGS_PORT += -DBT_XREC_SSP_AUTO_ACCEPT_DEFAULT=0
 $(OUT)/tests/bt_host/host_xrec.o: CFLAGS_HOST += -DOPENFW_BT_BENCH_IMAGE=1
 # bt_osal_time_t is uint32_t while the POSIX port's TickType_t is 64-bit: portMAX_DELAY truncates to 0xFFFFFFFF (an
 # "infinite" osal wait becomes 49.7 days). Host-only difference (the firmware tick is 32-bit); bt_osal is not on the
