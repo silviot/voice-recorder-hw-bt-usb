@@ -63,6 +63,7 @@
 
 int bth_phone_scenario(const char *img_path);
 void bt_xrec_test_set_inflight_max(uint32_t n);   /* bt_xrec_bluedroid.c test hook (0 = default) */
+int bt_xrec_test_close_request(uint32_t arg);      /* bt_xrec_bluedroid.c test hook: the device closes the link */
 
 /* Host regression ceiling for the scenario's heap peak above the post-warm-up baseline: measured 189,170 B on x86-64
  * (2026-11-24) + ~18 %. NOT the target budget (plan §4: >= 8 KiB free of the BT=1 image's 118,264 B heap): on the host,
@@ -1586,6 +1587,78 @@ int bth_phone_scenario(const char *img_path)
     sup_quiet("idle bonded phone", 3u * SUP_STALL_MS);
     PCHECK(S().d.state == BT_XREC_ST_READY && S().d.conn_open, "idle link lost (state %u)", S().d.state);
 
+    /* ---- 7c ---- */
+    /* Review STEP10 A9 / C7 / C11, patch 0044: allocation failures on an open, authorized connection (host_oom.c
+     * levers). Upstream: a lost write completion stalled the transfer for good (is_writing stuck), a lost DATA_IND
+     * hand-off asserted, a lost RX queue node leaked the frame and its credit, and a refused esp_spp_disconnect() left
+     * the session "closing" until the peer went away. */
+    bth_log("[P7c] out of memory on the open connection: write completion, DATA_IND, RX frame, disconnect request\n");
+    {
+        bth_oom_arm(BTH_OOM_SPP_WRITE_CMPL, 1);
+        PCHECK(gets_verify("REC0001.WAV", 1u, 1000u, 5000u, 640u, -1, NULL), "GETS with a write completion's BTC "
+               "hand-off lost (C7)");
+        PCHECK(bth_oom_hits(BTH_OOM_SPP_WRITE_CMPL) == 1u, "write completion lever not hit (%u)",
+               bth_oom_hits(BTH_OOM_SPP_WRITE_CMPL));
+        bth_oom_arm(BTH_OOM_SPP_WRITE_CMPL, 0);
+        if (p_fail) {
+            goto out;
+        }
+
+        bth_oom_arm(BTH_OOM_SPP_DATA_IND, 1);
+        PCHECK(x_send("+XREC:PING\r") && x_line(line, sizeof(line), 3000u), "PING with its DATA_IND hand-off lost (A9)");
+        PCHECK(strncmp(line, "+XREC:PONG", 10) == 0, "PONG '%s'", line);
+        PCHECK(bth_oom_hits(BTH_OOM_SPP_DATA_IND) == 1u, "DATA_IND lever not hit (%u)", bth_oom_hits(BTH_OOM_SPP_DATA_IND));
+        bth_oom_arm(BTH_OOM_SPP_DATA_IND, 0);
+        if (p_fail) {
+            goto out;
+        }
+
+        /* the RX queue node cannot be allocated: the frame is lost, the stream has a gap; btc_spp reports it and the
+         * session closes the connection (its credit goes back first) */
+        uint32_t lost0 = S().d.rx_lost;
+        bth_oom_arm(BTH_OOM_BTU_ENQUEUE, 1);
+        PCHECK(x_send("+XREC:PING\r"), "PING (RX queue node lost)");
+        PCHECK(WAIT(!S().d.conn_open, 3000), "connection still open after a lost RX frame (rx_lost %u)",
+               S().d.rx_lost - lost0);
+        PCHECK(S().d.rx_lost == lost0 + 1u && bth_oom_hits(BTH_OOM_BTU_ENQUEUE) == 1u, "rx_lost %u, lever hits %u",
+               S().d.rx_lost - lost0, bth_oom_hits(BTH_OOM_BTU_ENQUEUE));
+        bth_oom_arm(BTH_OOM_BTU_ENQUEUE, 0);
+        PCHECK(S().d.state == BT_XREC_ST_READY, "state %u after the lost frame", S().d.state);
+        if (p_fail) {
+            goto out;
+        }
+        for (int round = 0; round < 2; round++) {
+            peer_drop(0x13u);
+            PCHECK(WAIT(!S().d.conn_open && S().d.acl_links == 0u, 3000), "link not down (round %d)", round);
+            if (!peer_page_and_connect()) {
+                goto out;
+            }
+            peer_authenticate();
+            PCHECK(WAIT(fake_peer.authenticated && fake_peer.encrypted, 3000), "re-authentication (round %d)", round);
+            if (!step_rfcomm_open()) {
+                goto out;
+            }
+            PCHECK(xrec_auth_chal(xkey), "CHAL/AUTH (round %d)", round);
+            if (p_fail || round == 1) {
+                break;
+            }
+            /* C11: the device closes the connection and esp_spp_disconnect() is refused 3 times */
+            uint32_t r0 = S().d.close_retries;
+            bth_oom_arm(BTH_OOM_SPP_DISCONNECT, 3);
+            PCHECK(bthx_call_fn(bt_xrec_test_close_request, 0u, 2000u) == 0, "close request");
+            PCHECK(WAIT(!S().d.conn_open, 3000), "SPP still open after 3 refused disconnect requests (retries %u, "
+                   "closing %u)", S().d.close_retries - r0, S().d.conn_closing);
+            PCHECK(bth_oom_hits(BTH_OOM_SPP_DISCONNECT) == 3u && S().d.close_retries - r0 == 3u,
+                   "disconnect lever hits %u, retries %u (want 3 / 3)", bth_oom_hits(BTH_OOM_SPP_DISCONNECT),
+                   S().d.close_retries - r0);
+            PCHECK(S().d.state == BT_XREC_ST_READY, "state %u after the retried close", S().d.state);
+            bth_oom_arm(BTH_OOM_SPP_DISCONNECT, 0);
+        }
+        if (p_fail) {
+            goto out;
+        }
+    }
+
     /* ---- 8 ---- */
     /* The laptop's app stops reading (RFCOMM credits withheld: data backs up in RFCOMM, BTC and the session) while
      * its stack stays responsive (baseband acks, RFCOMM DISC/UA, L2CAP, detach): the user leaves BT mode mid-sync. */
@@ -2344,6 +2417,42 @@ int bth_phone_scenario(const char *img_path)
         goto out;
     }
 
+    /* ---- 20b ---- */
+    /* Review STEP10 A9, patch 0044: btc_dm_auth_cmpl_evt() asserted (BTC_ASSERTC) when the link key could not be
+     * stored (config entries allocated). Now the pairing is reported failed (no bond, nothing persisted). */
+    bth_log("[P20b] window open, laptop F pairs (ENTER) but its link key cannot be stored: pairing failed, no bond\n");
+    {
+        bthx_call(BTHX_OPEN_PAIRING, 60000u, 2000u);
+        PCHECK(WAIT(S().d.ssp_window, 2000), "window not opened (ssp %u)", S().d.ssp_window);
+        fake_peer_cfg_t f;
+        peer_cfg(&f, 0xF6u, 0x01u, 0x05u, 0x05u, "laptop-F");
+        peer_attach(&f, NULL);
+        bthx_snap_t s0 = S();
+        if (!peer_page_and_connect()) {
+            goto out;
+        }
+        peer_authenticate();
+        PCHECK(WAIT(S().ui.prompt, 3000), "no prompt for F");
+        vTaskDelay(pdMS_TO_TICKS(BT_XREC_SSP_ARM_MS + 50u));
+        bth_oom_arm(BTH_OOM_BOND_STORE, 1);
+        PCHECK(bthx_call(BTHX_SSP_ANSWER, 1u, 2000u) == 0, "ENTER on F's prompt");
+        PCHECK(WAIT(bth_oom_hits(BTH_OOM_BOND_STORE) == 1u, 5000), "F's link key was never stored (lever hits %u)",
+               bth_oom_hits(BTH_OOM_BOND_STORE));
+        bth_oom_arm(BTH_OOM_BOND_STORE, 0);
+        vTaskDelay(pdMS_TO_TICKS(300));
+        bthx_snap_t s1 = S();
+        /* the session saw AUTH_CMPL fail after the user's accept (status NOMEM): key spent, no bond */
+        PCHECK(s1.d.state == BT_XREC_ST_READY && s1.bonds == s0.bonds && s1.d.ssp_burned && !s0.d.ssp_burned,
+               "after the failed store: state %u, bonds %d (was %d), ssp_burned %u (was %u)", s1.d.state, s1.bonds,
+               s0.bonds, s1.d.ssp_burned, s0.d.ssp_burned);
+        peer_drop(0x13u);
+        PCHECK(WAIT(S().d.acl_links == 0u, 3000), "F link not down");
+        bthx_call(BTHX_OPEN_PAIRING, 1u, 2000u);         /* window closes (deadline passed at once) */
+    }
+    if (p_fail) {
+        goto out;
+    }
+
     /* ---- 22 ---- */
     bth_log("[P22] WDT supervisor: BTC stuck in a work item -> platform fault 4 -> graceful recovery; restart\n");
     {
@@ -2379,15 +2488,23 @@ int bth_phone_scenario(const char *img_path)
     }
 
     /* ---- 21 ---- */
-    bth_log("[P21] bt_xrec_stop\n");
+    bth_log("[P21] bt_xrec_stop; SPP deinit cannot allocate the server's FreeChannel user data (patch 0044)\n");
+    /* Review STEP10 A9: btc_spp_uninit() asserted when that 8-byte allocation failed (reset in the middle of a BT-mode
+     * exit); a static entry stands in. The stop stays graceful and the heap returns to the baseline. */
+    bth_oom_arm(BTH_OOM_BTC_FREE_SCN_UD, 1);
     stop_session(&base, "final stop");
+    PCHECK(bth_oom_hits(BTH_OOM_BTC_FREE_SCN_UD) == 1u, "FreeChannel user data lever not hit (%u)",
+           bth_oom_hits(BTH_OOM_BTC_FREE_SCN_UD));
+    bth_oom_arm(BTH_OOM_BTC_FREE_SCN_UD, 0);
     {
         static uint8_t img[BT_STORE_IMAGE_MAX];
         int n = bthx_read_root_file("bt_bonds.bin", img, sizeof(img));
         static const char c_addr[] = "00:5b:1a:51:7e:c3";
         static const char b_addr[] = "00:5b:1a:51:7e:b2";
         static const char a_addr[] = "00:5b:1a:51:7e:a1";
+        static const char f_addr[] = "00:5b:1a:51:7e:f6";
         PCHECK(n > 0 && mem_has(img, (uint32_t)n, a_addr, 17u), "A missing from /bt_bonds.bin");
+        PCHECK(n > 0 && !mem_has(img, (uint32_t)n, f_addr, 17u), "F (key never stored) persisted in /bt_bonds.bin");
         PCHECK(n > 0 && !mem_has(img, (uint32_t)n, b_addr, 17u) && !mem_has(img, (uint32_t)n, c_addr, 17u),
                "B or C persisted in /bt_bonds.bin");
     }

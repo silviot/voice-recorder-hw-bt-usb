@@ -40,6 +40,10 @@
 #define BT_XREC_CONFIG_DEADLINE_MS   5000u   /* SPP INIT + START events after enable */
 #define BT_XREC_REBOOT_DELAY_MS      250u    /* legacy F:1827: deferred reboot / OTA / DFU */
 #define BT_XREC_REBOOT_DRAIN_MAX_MS  2000u   /* longest wait for the final reply to leave before rebooting anyway */
+/* Review STEP10 C11: esp_spp_disconnect() fails only when BTC's message cannot be allocated. The close is retried
+ * every BT_XREC_CLOSE_RETRY_MS; after BT_XREC_CLOSE_RETRIES refusals the session faults (graceful recovery). */
+#define BT_XREC_CLOSE_RETRY_MS       100u
+#define BT_XREC_CLOSE_RETRIES        20u
 #define BT_XREC_SSP_SHOW_MS          30000u  /* numeric-comparison value shown at most this long (bench autoconfirm) */
 #define BT_XREC_SSP_PROMPT_MS        30000u  /* plan M4: local accept/reject prompt, rejected when it runs out */
 #define BT_XREC_SSP_ARM_MS           500u    /* answers in the first 0.5 s are ignored (a key meant for something else) */
@@ -62,6 +66,8 @@ enum {
     BT_XREC_FAULT_DOWN_DEADLINE = 7,  /* graceful teardown did not finish within BT_XREC_SHUTDOWN_DEADLINE_MS */
     BT_XREC_FAULT_DOWN_FAIL = 8,      /* graceful teardown reported an error */
     BT_XREC_FAULT_DOWN_LATCHED = 9,   /* teardown finished, but the deadline had already latched bt_stop */
+    BT_XREC_FAULT_CLOSE_FAIL = 10,    /* esp_spp_disconnect() refused BT_XREC_CLOSE_RETRIES times (review STEP10 C11) */
+    BT_XREC_FAULT_ASSERT = 11,        /* assert() in a BT image (review STEP10 A9): hard path; fault record b = line */
 };
 
 /* Session states (bt_xrec_debug_t.state). */
@@ -106,6 +112,8 @@ typedef struct {
     uint32_t scan_refused;       /* scan mode refused by the controller (more than one ACL link) */
     uint32_t scan_reapplied;     /* scan mode re-applied after a refusal (a link went down, or BT_XREC_SCAN_RETRY_MS) */
     uint32_t scan_failsafe;      /* scan switched off (0x00) because a write dropping discoverability was refused */
+    uint32_t rx_lost;            /* SPP reported an RX frame lost for lack of memory (patch 0044): link closed */
+    uint32_t close_retries;      /* esp_spp_disconnect() retried after a refusal (review STEP10 C11) */
 } bt_xrec_debug_t;
 void bt_xrec_get_debug(bt_xrec_debug_t *out);
 

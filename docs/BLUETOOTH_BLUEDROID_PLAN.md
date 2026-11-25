@@ -858,6 +858,21 @@ secret of ~33 predictable bits: bench-only waiver, see the review-round entry be
   `bthx_force_profile_down_fail()` (S10d). Each part reverted alone fails `test_bt_host_hp hps` (AVDT / AVCT: leak 31 /
   6 blocks; 0039: deinit timeout, FAULTED; session: S10a 5 checks, S10d 2 checks). BT=0 CRC unchanged 0xECB8.
 
+- 2026-11-25 (`fix/s10-oom-paths` from `ab27527`): step-10 review A9 / C7 / C11, out-of-memory paths. Patch 0044
+  (`btc_spp.c`, `btc_dm.c`): SPP DATA_IND and write-completion hand-offs fall back to a by-value BTC work item (a lost
+  write completion left `is_writing` set: TX stalled for good); an RX frame whose queue node cannot be allocated breaks
+  the stream (dropped with later frames, credits returned, reported as DATA_IND status `ESP_SPP_NO_RESOURCE`; the
+  session closes the link); static FreeChannel user data in SPP deinit / stop server; a link key that cannot be stored
+  ends the pairing with NOMEM instead of `BTC_ASSERTC`. Session: a refused `esp_spp_disconnect()` is retried every
+  100 ms, 20 times, then `BT_XREC_FAULT_CLOSE_FAIL` (C11). BT images replace picolibc's `__assert_func`: an assert in a
+  BT task is handed to the app task, which takes the BT hard path (recording finalised, fault 0xB1 reason 11 + line);
+  backstop 1.5 s, then the old reboot. Host levers in `tests/bt_host/host_oom.c` (wrapped `btc_transfer_context`,
+  `fixed_queue_enqueue` on BTU, `btc_storage_add_bonded_device`, one BTC allocation size); phone P7c / P20b / P21 fail
+  without the fixes (stall, three different asserts, open link). The harness publishes its snapshot before a call's
+  "done" (a stop's state could read stale: rare `state 3 after stop`). The assert routing has no host harness
+  (picolibc and `bt_xrec_fw.c` are target only). FIRM CRC: def 0xECB8 (unchanged), bt 0x0022, hp 0xDFFC, hpb 0xBF95,
+  bench 0x88C8 (worktree path). Residual: a lost CLOSE / SRV_OPEN hand-off in `btc_spp` (still logged only).
+
 ## 11. Round-1 traceability
 
 | Round-1 item | v3 change |

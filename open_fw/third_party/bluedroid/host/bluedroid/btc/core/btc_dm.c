@@ -419,6 +419,9 @@ static void btc_dm_auth_cmpl_evt (tBTA_DM_AUTH_CMPL *p_auth_cmpl)
     /* Save link key, if not temporary */
     bt_bdaddr_t bd_addr;
     bt_status_t status;
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+    bool key_not_stored = false; /* open_fw patch 0044 */
+#endif
     BTC_TRACE_DEBUG("%s: bond state success %d, present %d, type%d\n", __func__, p_auth_cmpl->success,
               p_auth_cmpl->key_present, p_auth_cmpl->key_type);
 
@@ -438,7 +441,18 @@ static void btc_dm_auth_cmpl_evt (tBTA_DM_AUTH_CMPL *p_auth_cmpl)
                 ret = btc_storage_add_bonded_device(&bd_addr,
                                                     p_auth_cmpl->key, p_auth_cmpl->key_type,
                                                     16, p_auth_cmpl->sc_support);
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+                /* open_fw patch 0044: the config entries are allocated (btc_config_set_*): out of memory, upstream
+                 * asserted (reset while recording). Drop whatever part was written and report the pairing as failed:
+                 * a bond that is not in the store must not look like one to the application. */
+                if (ret != BT_STATUS_SUCCESS) {
+                    BTC_TRACE_ERROR("%s: storing link key failed (%d): pairing reported failed", __func__, ret);
+                    (void)btc_storage_remove_bonded_device(&bd_addr);
+                    key_not_stored = true;
+                }
+#else
                 BTC_ASSERTC(ret == BT_STATUS_SUCCESS, "storing link key failed", ret);
+#endif
             } else {
                 BTC_TRACE_DEBUG("%s: Temporary key. Not storing. key_type=0x%x",
                           __FUNCTION__, p_auth_cmpl->key_type);
@@ -488,6 +502,11 @@ static void btc_dm_auth_cmpl_evt (tBTA_DM_AUTH_CMPL *p_auth_cmpl)
             break;
         }
     }
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+    if (key_not_stored) {
+        status = BT_STATUS_NOMEM;
+    }
+#endif
 #if (BTC_GAP_BT_INCLUDED == TRUE)
     esp_bt_gap_cb_param_t param;
     bt_status_t ret;
