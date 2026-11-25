@@ -132,7 +132,7 @@ Tests (core, app-logic, app) as listed in the app report, section 4: one GETS pe
 | **SD busy timeout** (up to 500 ms, exists without BT) | timing | Not BT-specific; F1c raises mono tolerance to 896 ms. F6 means BT adds no extra writes during REC. | M3 counters |
 | **Active file** | wrong / duplicate notes | **Eliminated:** firmware refuses GETS (BUSY) and names the file (`rec_idx`); the app skips it; LS before STAT. | host tests + M5 |
 | **RF/digital coupling into the mic** (1600 Hz slot tick, 800/400/267 Hz packet rhythms, 40 Hz poll, page scan 0.78 Hz, VBAT sag, the phone's own TX) | electrical | **Unmeasured — the main risk.** Bounded by: no idle link, no discoverability, bursty paced transfers, rate cap. Release gated on M2. Fallback ladder 2.6. | M2 |
-| **Silent sample loss** from long ROM PRIMASK sections (masks the audio DMA ISR) | timing | Unmeasured. Detected by the tone phase-continuity test and sample accounting. | M2(e), M3 |
+| **Silent sample loss** from long ROM PRIMASK sections (masks the audio DMA ISR) | timing | Unmeasured. Detected by the block clock (DMA ISR `us_timer` stamps, resolves a few samples, silence captures too), the tone phase-continuity test (blind to 1-3 ms at 997 Hz) and sample accounting. | M2(e), M3 |
 | **Power** | battery | Measured; affects defaults, not audio. | M6 |
 
 ### 2.6 Fallback ladder (chosen by measurement, applied per firmware build)

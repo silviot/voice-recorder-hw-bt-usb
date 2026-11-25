@@ -18,19 +18,24 @@ void bench_meas_reset(bench_meas_t *m)
     zero(m, (uint32_t)sizeof(*m));
 }
 
+/* ms + us remainder accumulator (32-bit only, no 64-bit division) */
+static void ms_add(uint32_t *ms, uint32_t *us_rem, uint32_t dt_us)
+{
+    *ms += dt_us / 1000u;
+    *us_rem += dt_us % 1000u;
+    if (*us_rem >= 1000u) {
+        *ms += *us_rem / 1000u;
+        *us_rem %= 1000u;
+    }
+}
+
 static void elapsed_add(bench_meas_rec_t *r, uint32_t now_us)
 {
     if (r->ended) {
         return;
     }
     if (r->polled) {
-        uint32_t dt = now_us - r->last_us;
-        r->el_ms += dt / 1000u;
-        r->el_us_rem += dt % 1000u;
-        if (r->el_us_rem >= 1000u) {
-            r->el_ms += r->el_us_rem / 1000u;
-            r->el_us_rem %= 1000u;
-        }
+        ms_add(&r->el_ms, &r->el_us_rem, now_us - r->last_us);
     }
     r->last_us = now_us;
     r->polled = 1u;
@@ -54,6 +59,7 @@ void bench_meas_rec_start(bench_meas_t *m, const char *file, uint8_t ch, uint8_t
     m->cur.dsp = dsp;
     m->cur.vor = vor;
     m->cur.idle_min_pm = BENCH_MEAS_NONE16;
+    m->cur.last_enter_us = now_us;
     elapsed_add(&m->cur, now_us);
 }
 
@@ -63,11 +69,11 @@ void bench_meas_poll_enter(bench_meas_t *m, uint32_t now_us)
     if (!r->active) {
         return;
     }
-    uint32_t gap = r->polled ? now_us - r->last_us : 0u;
+    uint32_t gap = now_us - r->last_enter_us;
     if (gap > r->gap_max_us) {
         r->gap_max_us = gap;
     }
-    elapsed_add(r, now_us);
+    r->last_enter_us = now_us;
 }
 
 void bench_meas_poll_exit(bench_meas_t *m, uint32_t enter_us, uint32_t exit_us, uint32_t dma_blk)
@@ -80,7 +86,45 @@ void bench_meas_poll_exit(bench_meas_t *m, uint32_t enter_us, uint32_t exit_us, 
     if (d > r->poll_max_us) {
         r->poll_max_us = d;
     }
+    elapsed_add(r, exit_us);   /* the clock side at the moment dma_blk is read (a long poll counts on both sides) */
     r->dma_blk = dma_blk;
+}
+
+void bench_meas_dma_stamp(bench_meas_t *m, uint32_t blk, uint32_t blk_us)
+{
+    bench_meas_rec_t *r = &m->cur;
+    if (!r->active || blk == 0u) {
+        return;
+    }
+    if (!r->b_valid) {
+        r->b_valid = 1u;
+        r->b_first_blk = blk;
+        r->b_last_blk = blk;
+        r->b_last_us = blk_us;
+        return;
+    }
+    if (blk == r->b_last_blk) {
+        return;
+    }
+    ms_add(&r->b_el_ms, &r->b_el_us_rem, blk_us - r->b_last_us);
+    r->b_last_blk = blk;
+    r->b_last_us = blk_us;
+}
+
+void bench_meas_sd_err(bench_meas_t *m, const char *tag)
+{
+    static const char mdto[] = "SDW_MDTO";
+    uint32_t i = 0u;
+    while (tag != 0 && mdto[i] != '\0' && tag[i] == mdto[i]) {
+        i++;
+    }
+    uint32_t is_mdto = (tag != 0 && mdto[i] == '\0' && tag[i] == '\0') ? 1u : 0u;
+    m->sd_err_total++;
+    m->sd_mdto_total += is_mdto;
+    if (m->cur.active) {
+        m->cur.sd_err++;
+        m->cur.sd_mdto += is_mdto;
+    }
 }
 
 void bench_meas_overrun(bench_meas_t *m, uint32_t dropped, uint32_t comp)
@@ -164,6 +208,13 @@ void bench_meas_cpu(bench_meas_t *m, uint32_t idle_pm, uint32_t app_pm, uint32_t
     }
 }
 
+void bench_meas_cpu_take(bench_meas_t *m, uint32_t take_us)
+{
+    if (take_us > m->take_max_us) {
+        m->take_max_us = take_us;
+    }
+}
+
 const bench_meas_rec_t *bench_meas_hist(const bench_meas_t *m, uint32_t i)
 {
     if (i >= m->hist_n || i >= BENCH_MEAS_HIST) {
@@ -186,6 +237,19 @@ uint32_t bench_meas_clk_frames(const bench_meas_rec_t *r)
 int32_t bench_meas_drift(const bench_meas_rec_t *r)
 {
     return (int32_t)(r->dma_blk * BENCH_MEAS_BLOCK_FRAMES - bench_meas_clk_frames(r));
+}
+
+uint32_t bench_meas_bclk_frames(const bench_meas_rec_t *r)
+{
+    return r->b_el_ms * (BENCH_MEAS_RATE_HZ / 1000u) + r->b_el_us_rem * (BENCH_MEAS_RATE_HZ / 1000u) / 1000u;
+}
+
+int32_t bench_meas_bdrift(const bench_meas_rec_t *r)
+{
+    if (!r->b_valid) {
+        return 0;
+    }
+    return (int32_t)((r->b_last_blk - r->b_first_blk) * BENCH_MEAS_BLOCK_FRAMES - bench_meas_bclk_frames(r));
 }
 
 /* ---- formatting ---- */
@@ -311,6 +375,15 @@ uint32_t bench_meas_format_rec(const bench_meas_rec_t *r, char sep, char *buf, u
         fku(&f, "idle_min_pm", r->idle_min_pm);
     }
     fku(&f, "cpu_n", r->cpu_n);
+    if (r->b_valid) {
+        fku(&f, "bclk_smp", bench_meas_bclk_frames(r));
+        fki(&f, "bdrift", bench_meas_bdrift(r));
+    } else {
+        fks(&f, "bclk_smp", "");
+        fks(&f, "bdrift", "");
+    }
+    fku(&f, "sd_err", r->sd_err);
+    fku(&f, "sd_mdto", r->sd_mdto);
     return f.len;
 }
 
@@ -333,5 +406,6 @@ uint32_t bench_meas_format_cpu(const bench_meas_t *m, char sep, char *buf, uint3
         fku(&f, "btc_pm", m->btc_pm);
     }
     fku(&f, "cpu_ms", m->cpu_win_ms);
+    fku(&f, "take_us", m->take_max_us);
     return f.len;
 }

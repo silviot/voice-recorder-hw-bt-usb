@@ -133,7 +133,7 @@ static void t_live_cpu_gets(void)
     bench_meas_reset(&m);
     char line[BENCH_MEAS_LINE_MAX];
     bench_meas_format_cpu(&m, ',', line, sizeof(line));
-    CHECK(strcmp(line, "gets_tot=0,gets_fr=0,idle_pm=-,app_pm=-,btc_pm=-,cpu_ms=0") == 0, "empty cpu '%s'", line);
+    CHECK(strcmp(line, "gets_tot=0,gets_fr=0,idle_pm=-,app_pm=-,btc_pm=-,cpu_ms=0,take_us=0") == 0, "empty cpu '%s'", line);
     bench_meas_gets(&m, 640u);                              /* not recording: total only */
     bench_meas_cpu(&m, 800u, 100u, 50u, 1000u);
     bench_meas_rec_start(&m, "REC_0003.wav", 1u, 20u, 0u, 1u, 0u);
@@ -183,6 +183,11 @@ static void t_widths(void)
     r->comp = 0xFFFFFFFFu;
     r->el_ms = 0xFFFFFFFFu;
     r->el_us_rem = 999u;
+    r->b_el_us_rem = 999u;
+    r->b_first_blk = 0u;
+    r->b_last_blk = 0x7FFFFu;
+    m.take_max_us = 0xFFFFFFFFu;
+    m.sd_err_total = 0xFFFFFFFFu;
     m.gets_b_total = m.gets_frames_total = 0xFFFFFFFFu;
     m.idle_pm = m.app_pm = m.btc_pm = 1000u;
     m.cpu_win_ms = 0xFFFFu;
@@ -203,12 +208,93 @@ static void t_widths(void)
     CHECK(strcmp(field(line, "file", ','), "A_B_C_D") == 0, "sanitised '%s'", line);
 }
 
+/* A long poll (SD stall): blocks that complete during it count against the clock at the same moment. */
+static void t_live_consistent(void)
+{
+    printf("[5] live drift from a consistent snapshot (clock and DMA blocks both at poll exit)\n");
+    bench_meas_reset(&m);
+    bench_meas_rec_start(&m, "REC_0010.wav", 1u, 20u, 2u, 0u, 0u);
+    bench_meas_poll_enter(&m, 128000u);
+    bench_meas_poll_exit(&m, 128000u, 428000u, 3u);       /* 300 ms poll: 2 more blocks completed in it */
+    int32_t d = bench_meas_drift(&m.cur);
+    CHECK(d <= 0 && d >= -2048, "live drift %d within 0..-2048", d);
+    CHECK(m.cur.el_ms == 428u && m.cur.poll_max_us == 300000u && m.cur.gap_max_us == 128000u,
+          "el %u poll %u gap %u", m.cur.el_ms, m.cur.poll_max_us, m.cur.gap_max_us);
+    bench_meas_poll_enter(&m, 500000u);                    /* gap entry to entry, not exit to entry */
+    bench_meas_poll_exit(&m, 500000u, 501000u, 3u);
+    CHECK(m.cur.gap_max_us == 372000u, "gap %u", m.cur.gap_max_us);
+}
+
+/* Block clock: the ISR stamps resolve a sub-block loss; start-up offsets cancel; wrap-safe. */
+static void t_block_clock(void)
+{
+    printf("[6] block clock: sub-block sample loss, wrap, no stamps\n");
+    bench_meas_reset(&m);
+    char line[BENCH_MEAS_LINE_MAX];
+    bench_meas_rec_start(&m, "REC_0011.wav", 1u, 20u, 2u, 0u, 7u);
+    bench_meas_dma_stamp(&m, 0u, 5u);                      /* no block yet: ignored */
+    bench_meas_format_rec(&m.cur, ' ', line, sizeof(line));
+    CHECK(strcmp(field(line, "bdrift", ' '), "-") == 0 && strcmp(field(line, "bclk_smp", ' '), "-") == 0,
+          "no stamps '%s'", line);
+    uint32_t us = 0xFFFFFFFFu - 200000u;                   /* wraps between the stamps */
+    bench_meas_dma_stamp(&m, 2u, us);                      /* the first block this recording saw: reference */
+    bench_meas_dma_stamp(&m, 2u, us);                      /* same block again: no change */
+    for (uint32_t b = 3u; b <= 600u; b++) {
+        bench_meas_dma_stamp(&m, b, us + (b - 2u) * 128000u);
+    }
+    CHECK(bench_meas_bdrift(&m.cur) == 0 && bench_meas_bclk_frames(&m.cur) == 598u * 2048u, "clean bdrift %d bclk %u",
+          bench_meas_bdrift(&m.cur), bench_meas_bclk_frames(&m.cur));
+    us += 598u * 128000u;
+    bench_meas_dma_stamp(&m, 601u, us + 128000u + 1000u);  /* 1 ms (16 samples) the DMA did not capture */
+    bench_meas_dma_stamp(&m, 604u, us + 4u * 128000u + 1000u);   /* polls may skip blocks */
+    CHECK(bench_meas_bdrift(&m.cur) == -16, "16-sample loss: bdrift %d", bench_meas_bdrift(&m.cur));
+    bench_meas_dma_stamp(&m, 605u, us + 5u * 128000u + 1000u + 63u);   /* 63 us = 1 sample (16 kHz) */
+    CHECK(bench_meas_bdrift(&m.cur) == -17, "1 more sample: bdrift %d", bench_meas_bdrift(&m.cur));
+    bench_meas_capture_end(&m, us);
+    bench_meas_rec_stop(&m, 605u, 0u);
+    bench_meas_format_rec(bench_meas_hist(&m, 0u), ' ', line, sizeof(line));
+    CHECK(strcmp(field(line, "bdrift", ' '), "-17") == 0, "line '%s'", line);
+    bench_meas_dma_stamp(&m, 700u, 1u);                    /* not recording: ignored */
+    CHECK(bench_meas_hist(&m, 0u)->b_last_blk == 605u && !m.cur.active, "idle stamp ignored");
+}
+
+static void t_sd_take(void)
+{
+    printf("[7] SD error counters (whole recording, since boot) and the CPU take maximum\n");
+    bench_meas_reset(&m);
+    bench_meas_sd_err(&m, "SDW_MDTO");                     /* before any recording: totals only */
+    bench_meas_rec_start(&m, "REC_0012.wav", 1u, 20u, 2u, 0u, 0u);
+    bench_meas_sd_err(&m, "SDW_MDTO");
+    bench_meas_sd_err(&m, "SDW_MFAIL");
+    bench_meas_sd_err(&m, "SDW_MDTOX");
+    bench_meas_sd_err(&m, "SDW_MDT");
+    bench_meas_sd_err(&m, NULL);
+    CHECK(m.cur.sd_err == 5u && m.cur.sd_mdto == 1u && m.sd_err_total == 6u && m.sd_mdto_total == 2u,
+          "rec %u/%u total %u/%u", m.cur.sd_err, m.cur.sd_mdto, m.sd_err_total, m.sd_mdto_total);
+    char line[BENCH_MEAS_LINE_MAX];
+    bench_meas_format_rec(&m.cur, ',', line, sizeof(line));
+    CHECK(strcmp(field(line, "sd_err", ','), "5") == 0 && strcmp(field(line, "sd_mdto", ','), "1") == 0, "line '%s'",
+          line);
+    bench_meas_capture_end(&m, 1u);
+    bench_meas_rec_stop(&m, 0u, 0u);
+    bench_meas_rec_start(&m, "REC_0013.wav", 1u, 20u, 2u, 0u, 0u);
+    CHECK(m.cur.sd_err == 0u && m.cur.sd_mdto == 0u && m.sd_err_total == 6u, "reset per recording");
+    bench_meas_cpu_take(&m, 120u);
+    bench_meas_cpu_take(&m, 90u);
+    bench_meas_format_cpu(&m, ',', line, sizeof(line));
+    CHECK(strcmp(field(line, "take_us", ','), "120") == 0,
+          "cpu '%s'", line);
+}
+
 int main(void)
 {
     t_clean();
     t_overruns();
     t_live_cpu_gets();
     t_widths();
+    t_live_consistent();
+    t_block_clock();
+    t_sd_take();
     printf("test_bench_meas: %d checks, %d failures\n", g_checks, g_fails);
     return g_fails == 0 ? 0 : 1;
 }
