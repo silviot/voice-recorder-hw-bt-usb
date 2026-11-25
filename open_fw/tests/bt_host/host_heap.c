@@ -296,6 +296,10 @@ uint64_t bth_heap_task_size_injected(void)
 {
     lock();
     uint64_t n = s_ts_injected;
+    unlock();
+    return n;
+}
+
 void bth_heap_fail_size(size_t n)
 {
     lock();

@@ -921,6 +921,22 @@ secret of ~33 predictable bits: bench-only waiver, see the review-round entry be
   S11a/S11b (S12a/S12b after integration) fail without the fix (152 -> 43 B), S11b also without 0045 alone; `test_bt_store` hold checks. Default
   image unchanged 0xECB8 (BT=1 code only); bt 0x682B, hp 0x7897, hpb 0x28F1, bench 0x701C, 0 warnings. Next silicon occurrence: look for `BT bond file rejected`, `BT bonds not saved: the
   card's bond file`, `BT bond file held`, or an `auth st=` failure before the SSP attempt (peer lost the key).
+- 2026-11-25 (step 11 integration on `integ/bt-all-local`, from `ab27527`): merged `fix/s10-xrec-flow` (A5, C1
+  residual), `test/aout-both-mode` (W1), `fix/s10-avdt-leak` (A6, C13; patch 0043), `fix/s10-oom-paths` (A9 / C7 /
+  C11; patch 0044), `fix/s10-sec-policy` (C3, A3 second part, C6 note; patch 0042) and `fix/hp-bond-image-change`
+  (HW8; its patch 0042 **renumbered 0045**, `btc_config.c`). Patch README: rows 0042-0045 in order, next free **0046**;
+  0044's `btc_dm.c` hunk regenerated on top of 0042 (both edit `btc_dm_auth_cmpl_evt`), and 0042-0045 checked to apply
+  in order to `ab27527`'s tree and reproduce the vendored sources byte for byte. Semantics of the combined
+  `btc_dm_auth_cmpl_evt`: 0042 refuses an unauthenticated key over a MITM bond (reported AUTH_REJECTED, nothing stored)
+  and keeps bonds on AUTH_FAILURE / KEY_MISSING; 0044 removes a partly stored new key on OOM (reported NOMEM). With
+  0042, HW8's path (b) (keyless peer -> Bluedroid deletes the bond) is closed too. Headphones scenario order: S11 (C3 /
+  A3) now ends with a stop and records the bond count; the bond-loss scenario became **S12** (S12a/b/c, expects that
+  count back instead of 1) and runs before S10d, which must stay last (it leaves headphones mode FAULTED). Merge fix:
+  `host_heap.c` (two harness levers, `inject_task_size`, `bth_oom_take_alloc`, `inject(ra, n)` chained). Gates `s11m`
+  (0 warnings, all rc=0): FIRM CRC def **0x568B** (changed from 0xECB8 by A5 / C1 in shared code: `xrec_proto.c`,
+  `exfat.c`, `bt_hci.c` ops table), bt 0x640E, hp 0xEDA7, hpb 0x1AA9, bench 0xD790; `test_bt_host` 2331, phone 1260,
+  hp 84, headphones 201, gated 20 checks, 0 failures; sweeps 0 crash / hang / waived. The bthost gate was re-run on the
+  home volume after the /tmp quota filled (link "Disk quota exceeded").
 
 ## 11. Round-1 traceability
 
