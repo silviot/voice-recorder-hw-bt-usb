@@ -29,6 +29,10 @@
  *       (bt_vol changes only through the player); S6b keys and player events from before a file are dropped by
  *       bt_hp_player_begin()
  *   S8b credit stall without a Disconnection Complete: the escalation restarts headphones mode, which reconnects
+ *   S10 (A6) the frozen stop with BTU_TASK's BT_HDR-sized allocations failing still confirms the A2DP deinit (0039's
+ *       local close is allocation-free, patch 0043); with AVCTP up, the frozen teardowns leave no AVDTP/AVCTP blocks
+ *   S10a (C13) late CONNECTED / DISCONNECTED / AUDIO_CFG of another device leave the stream's transmitter alone
+ *   S10d (A6) a failed profile teardown (job rc 5) ends FAULTED (the screen's "BT fault"), the next start refused
  *   G   (test_bt_host, rows refused) scan and connect fail at once with BT_HP_MSG_UNSUPPORTED, no reconnect
  * Not covered here (listed in docs/BT_A2DP_HP_SESSION.md): 44.1 kHz-only peers (SEID 1 fallback), page-scan / LM
  * state variants, AVRCP FF/REW scrub, the player integration (test_player BT=1 variant), soak runs.
@@ -44,6 +48,7 @@
 #include "openfw.h"
 #include "esp_bt_main.h"
 #include "esp_gap_bt_api.h"
+#include "esp_a2dp_api.h"
 #include "bt_ctrl.h"
 #include "bt_hp.h"
 #include "bt_store.h"
@@ -1085,6 +1090,25 @@ static uint32_t stop_session(const char *what)
 
 static bool wait_link(uint8_t link, uint32_t ms) { return WAIT(UI().link == link, ms); }
 
+/* A late A2DP event of another device (STEP10 C13), delivered to the session's A2DP callback on BTC_TASK, where
+ * btc_av delivers its own (bth_btc_run). */
+static esp_a2d_cb_event_t s_late_ev;
+static esp_a2d_cb_param_t s_late_p;
+static void late_cb(void *arg)
+{
+    (void)arg;
+    esp_a2d_cb_t cb = (esp_a2d_cb_t)bth_a2dp_app_cb();
+    if (cb != NULL) {
+        cb(s_late_ev, &s_late_p);
+    }
+}
+static bool late_a2d(esp_a2d_cb_event_t ev, const esp_a2d_cb_param_t *p)
+{
+    s_late_ev = ev;
+    s_late_p = *p;
+    return bth_btc_run(late_cb, NULL, 2000u) == 0;
+}
+
 /* ============================================ scenario ========================================================= */
 #define CARD_SECTORS 4096u
 static uint8_t s_disk[CARD_SECTORS * 512u];
@@ -1460,15 +1484,63 @@ int bth_headphones_scenario(const char *img_path)
     SCHECK(wait_link(BT_HP_LINK_OPEN, 20000), "S10 not OPEN (link %u)", UI().link);
     s_feed = 1;
     SCHECK(wait_link(BT_HP_LINK_STARTED, 5000), "S10 not STARTED");
+    if (!H.avct.open) {
+        l2_connect(&H.avct, 0x0017u, CID_AVCT);              /* AVCTP up too: its link block must not leak (A6) */
+    }
+    SCHECK(WAIT(H.avct.open && H.avct.cfg_in && H.avct.cfg_out, 3000), "S10: AVCTP not open");
     bth_step_done();
     (void)WAIT(0, 300);
+    /* ---- S10a ---- (review STEP10 C13) late A2DP events of another device while streaming: the session ignores or
+     * closes them, and the BTC callback must leave the stream's transmitter alone (before: a DISCONNECTED stopped the
+     * tick, a CONNECTED replaced the connection handle, an AUDIO_CFG the encoder configuration) */
+    bth_log("[S10a] late A2DP events of another device while streaming (heap seq %u)\n", (unsigned)bth_heap_seq());
+    {
+        static const uint8_t other[6] = { 0x00u, 0x1Bu, 0xDCu, 0x5Au, 0x5Au, 0x01u };
+        bth_step("S10a late events", 20000u);
+        uint32_t rate0 = UI().rate;
+        esp_a2d_cb_param_t p;
+        memset(&p, 0, sizeof(p));
+        p.audio_cfg.mcc.type = ESP_A2D_MCT_SBC;
+        memcpy(&p.audio_cfg.mcc.cie, H.cfg_cie, 4u);
+        ((uint8_t *)&p.audio_cfg.mcc.cie)[0] = (uint8_t)((H.cfg_cie[0] & 0x0Fu) | 0x20u);   /* 44.1 kHz, not 48 */
+        memcpy(p.audio_cfg.remote_bda, other, 6u);
+        SCHECK(late_a2d(ESP_A2D_AUDIO_CFG_EVT, &p), "S10a: AUDIO_CFG not delivered");
+        memset(&p, 0, sizeof(p));
+        p.conn_stat.state = ESP_A2D_CONNECTION_STATE_CONNECTED;
+        memcpy(p.conn_stat.remote_bda, other, 6u);
+        p.conn_stat.conn_hdl = ESP_A2D_INVALID_CONN_HDL;  /* the session's close of it is refused: B is not touched */
+        p.conn_stat.audio_mtu = 300u;
+        SCHECK(late_a2d(ESP_A2D_CONNECTION_STATE_EVT, &p), "S10a: CONNECTED not delivered");
+        uint32_t p0 = H.pkts;
+        SCHECK(WAIT(H.pkts > p0 + 20u, 2000), "S10a: the stream stopped after another device's CONNECTED (%u pkts)",
+               H.pkts - p0);
+        p.conn_stat.state = ESP_A2D_CONNECTION_STATE_DISCONNECTED;
+        p.conn_stat.disc_rsn = ESP_A2D_DISC_RSN_ABNORMAL;
+        SCHECK(late_a2d(ESP_A2D_CONNECTION_STATE_EVT, &p), "S10a: DISCONNECTED not delivered");
+        p0 = H.pkts;
+        SCHECK(WAIT(H.pkts > p0 + 20u, 2000), "S10a: the stream stopped after another device's DISCONNECTED (%u pkts)",
+               H.pkts - p0);
+        SCHECK(UI().link == BT_HP_LINK_STARTED, "S10a: link %u after the late events", UI().link);
+        SCHECK(UI().rate == rate0, "S10a: another device's AUDIO_CFG applied (rate %u, was %u)", UI().rate, rate0);
+        SCHECK(H.hdr_err == 0u && H.dec_err == 0u && H.len_err == 0u, "S10a: media errors hdr %u dec %u len %u",
+               H.hdr_err, H.dec_err, H.len_err);
+        bth_step_done();
+    }
     H.frozen = 1u;                                           /* nothing answers any more (L2CAP, AVDTP, AVCTP) */
     bth_rom_lock();
     fake_rom.auto_ack_acl = false;
     fake_peer.defer_detach = true;
     bth_rom_unlock();
     s_feed = 0;
+    /* STEP10 A6: patch 0039's local close must not depend on an allocation (before 0043 it posted a BT_HDR from
+     * BTU_TASK; without it the stream waited for the frozen peer: A2DP deinit timeout, job rc 5) */
+    bth_heap_fail_task_size("BTU_TASK", 8u);                 /* sizeof(BT_HDR): 4 x UINT16, no payload */
     stop_session("S10 frozen stop");
+    bth_heap_fail_task_size(NULL, 0u);
+    bth_log("    S10: %llu BT_HDR-sized BTU allocations failed during the frozen stop\n",
+            (unsigned long long)bth_heap_task_size_injected());
+    SCHECK(bthx_profile_down_rc() == 0u, "S10: profile teardown rc %u (A2DP deinit not confirmed)",
+           bthx_profile_down_rc());
     bth_rom_lock();
     fake_peer.defer_detach = false;
     fake_rom.auto_ack_acl = true;
@@ -1477,8 +1549,8 @@ int bth_headphones_scenario(const char *img_path)
     controller_clean("S10");
     bth_log("[S10b] second cycle (heap seq %u)\n", (unsigned)bth_heap_seq());
     {
-        /* Known (live log): a frozen-peer teardown leaves AVDTP's stream and signalling blocks of that link behind
-         * (their fixed_queues: 5 heap blocks each on the host), freed by nothing; a clean cycle after it adds none. */
+        /* A frozen-peer teardown left AVDTP's stream and signalling blocks (and AVCTP's link block) of that link
+         * behind until patch 0043; a clean cycle after it adds nothing either way. */
         free(H.pcm);                                         /* the receiver's buffer, not the session's */
         H.pcm = NULL;
         H.pcm_cap = H.pcm_n = 0u;
@@ -1491,10 +1563,12 @@ int bth_headphones_scenario(const char *img_path)
                now2.bytes, now2.blocks, after_frozen.bytes, after_frozen.blocks);
         known_leak_blocks = after_frozen.blocks > base.blocks ? after_frozen.blocks - base.blocks : 0u;
         known_leak_bytes = after_frozen.bytes > base.bytes ? after_frozen.bytes - base.bytes : 0u;
-        bth_log("    S10: frozen teardown left %zu blocks / %zu B (AVDTP ccb/scb queues of the dead link + btc's resident "
-                "connect queue)\n", known_leak_blocks, known_leak_bytes);
-        /* two frozen-peer teardowns in this run (S8b's stall escalation, S10), up to 16 blocks / 4 KiB each */
-        SCHECK(known_leak_blocks <= 32u && known_leak_bytes <= 8192u, "frozen teardowns left %zu blocks / %zu B",
+        bth_log("    S10: frozen teardowns left %zu blocks / %zu B (btc's resident connect queue)\n", known_leak_blocks,
+                known_leak_bytes);
+        /* two frozen-peer teardowns in this run (S8b's stall escalation, S10 with AVCTP up): AVDT_Deregister /
+         * AVCT_Deregister free the dead link's AVDTP stream/channel blocks and AVCTP link block (patch 0043, STEP10
+         * A6; before: 31+ blocks / 3.4+ KB). What stays is btc's profile connect queue, allocated once (1 block). */
+        SCHECK(known_leak_blocks <= 1u && known_leak_bytes <= 64u, "frozen teardowns left %zu blocks / %zu B",
                known_leak_blocks, known_leak_bytes);
     }
 
@@ -1511,9 +1585,27 @@ int bth_headphones_scenario(const char *img_path)
         SCHECK(openfw_just_works_allowed(s_hp_bda) == 0, "S10c: Just Works allowed with no headphones session");
     }
 
+    /* ---- S10d ---- (review STEP10 A6) last: it leaves headphones mode refused for the rest of the run */
+    bth_log("[S10d] profile teardown failure (job rc 5) is a fault the screen shows, start refused (heap seq %u)\n",
+            (unsigned)bth_heap_seq());
+    if (start_ready("S10d start")) {
+        bthx_force_profile_down_fail();
+        bth_step("S10d stop", 10000u);
+        uint32_t seq = bthx_post_fn(fn_stop, 0u);
+        int r = -1000;
+        SCHECK(WAIT(bthx_done(seq, &r), 8000) && r == 0, "S10d: bt_hp_stop result %d (want 0: no hard path)", r);
+        bth_step_done();
+        SCHECK(bthx_profile_down_rc() == 2u, "S10d: profile rc %u (knob not applied)", bthx_profile_down_rc());
+        SCHECK(UI().state == BT_HP_ST_FAULTED, "S10d: state %u after a failed A2DP teardown (want FAULTED)",
+               UI().state);
+        SCHECK(bthx_hard_path_reason() == 0u, "S10d: hard path %u", bthx_hard_path_reason());
+        SCHECK(bthx_call_fn(fn_start, 0u, 3000u) != 0, "S10d: bt_hp_start accepted after a failed A2DP teardown");
+        SCHECK(UI().state == BT_HP_ST_FAULTED, "S10d: state %u after the refused start", UI().state);
+    }
+
 out:
     s_feed = 0;
-    if (UI().state != BT_HP_ST_OFF) {
+    if (UI().state != BT_HP_ST_OFF && UI().state != BT_HP_ST_FAULTED) {
         stop_session("final stop");
     }
     bthx_set_app_hook(NULL);

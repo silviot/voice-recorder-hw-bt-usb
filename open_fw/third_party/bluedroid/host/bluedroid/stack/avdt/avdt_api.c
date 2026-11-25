@@ -170,6 +170,32 @@ void AVDT_Deregister(void)
 {
     /* deregister PSM with L2CAP */
     L2CA_Deregister(AVDT_PSM);
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+    /* open_fw patch 0043: a link whose peer froze (headset off / out of range during an A2DP deinit; 0039 closes the
+     * BTA stream locally) leaves its stream and channel blocks allocated here, waiting for an L2CAP disconnect that
+     * comes after this or never: their fixed_queues, timers and buffers were lost at the next AVDT_Register()'s
+     * memset or at the free of avdt_cb (~1.7 KB per frozen-peer teardown, STEP10 A6). Nothing above AVDTP uses them
+     * any more (deregistering is the last step); release them all and forget the L2CAP channel map, so a late L2CAP
+     * callback for the old channel finds no table entry (avdt_l2c.c ignores it). Idempotent (bta_av may deregister
+     * twice). */
+    tAVDT_SCB *p_scb = &avdt_cb.scb[0];
+    for (int i = 0; i < AVDT_NUM_SEPS; i++, p_scb++) {
+        if (p_scb->allocated) {
+            if (p_scb->p_pkt != NULL) {
+                osi_free(p_scb->p_pkt);
+                p_scb->p_pkt = NULL;
+            }
+            avdt_scb_dealloc(p_scb, NULL);
+        }
+    }
+    tAVDT_CCB *p_ccb = &avdt_cb.ccb[0];
+    for (int i = 0; i < AVDT_NUM_LINKS; i++, p_ccb++) {
+        if (p_ccb->allocated) {
+            avdt_ccb_dealloc(p_ccb, NULL);
+        }
+    }
+    avdt_ad_init();
+#endif
 }
 
 /*******************************************************************************

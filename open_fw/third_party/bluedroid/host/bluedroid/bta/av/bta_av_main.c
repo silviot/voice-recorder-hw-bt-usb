@@ -951,15 +951,16 @@ void bta_av_api_deregister(tBTA_AV_DATA *p_data)
          * or out-of-range headset the 2 s teardown deadline passed first, BTU stopped before BTA_AV_DISABLE_EVT,
          * and btc_av kept its "deinit ongoing" statics for the rest of the boot (the next esp_a2d_source_init
          * failed; test_bt_host_hp hps S10). The requests already sent still go out; the ACL goes when Bluedroid
-         * disables (patch 0026 detaches it). Posted: this runs on BTU, after the state machine step above. */
+         * disables (patch 0026 detaches it).
+         * Patch 0043 (STEP10 A6): run directly, as bta_av_disconnect_req() and bta_av_sig_chg() do, instead of a
+         * posted message whose allocation could fail (the stream then waited for the peer again: A2DP deinit
+         * timeout, headphones mode off until reboot). We are on BTU, after the state machine step above; the CLOSING
+         * state's STR_CLOSED action ignores p_data, and a stream freed by it is looked up by handle by the caller
+         * (bta_av_disable() loops by handle; bta_av_cleanup() -> bta_av_dereg_comp() frees it, as for an idle
+         * stream). The disconnect reason was the message's offset, 0. */
         if (p_scb != NULL && p_scb->state == 5 /* BTA_AV_CLOSING_SST: the stream state enum is private to bta_av_ssm.c */) {
-            BT_HDR *p_buf = (BT_HDR *)osi_malloc(sizeof(BT_HDR));
-            if (p_buf != NULL) {
-                memset(p_buf, 0, sizeof(BT_HDR));   /* offset is read as the disconnect reason */
-                p_buf->event = BTA_AV_AVDT_DISCONNECT_EVT;
-                p_buf->layer_specific = p_scb->hndl;
-                bta_sys_sendmsg(p_buf);
-            }
+            p_scb->disc_rsn = 0;
+            bta_av_ssm_execute(p_scb, BTA_AV_AVDT_DISCONNECT_EVT, NULL);
         }
 #endif
     } else {

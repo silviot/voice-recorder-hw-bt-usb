@@ -1,0 +1,96 @@
+diff --git a/open_fw/third_party/bluedroid/host/bluedroid/bta/av/bta_av_main.c b/open_fw/third_party/bluedroid/host/bluedroid/bta/av/bta_av_main.c
+index a9473f7..9a27222 100644
+--- a/open_fw/third_party/bluedroid/host/bluedroid/bta/av/bta_av_main.c
++++ b/open_fw/third_party/bluedroid/host/bluedroid/bta/av/bta_av_main.c
+@@ -951,15 +951,16 @@ void bta_av_api_deregister(tBTA_AV_DATA *p_data)
+          * or out-of-range headset the 2 s teardown deadline passed first, BTU stopped before BTA_AV_DISABLE_EVT,
+          * and btc_av kept its "deinit ongoing" statics for the rest of the boot (the next esp_a2d_source_init
+          * failed; test_bt_host_hp hps S10). The requests already sent still go out; the ACL goes when Bluedroid
+-         * disables (patch 0026 detaches it). Posted: this runs on BTU, after the state machine step above. */
++         * disables (patch 0026 detaches it).
++         * Patch 0043 (STEP10 A6): run directly, as bta_av_disconnect_req() and bta_av_sig_chg() do, instead of a
++         * posted message whose allocation could fail (the stream then waited for the peer again: A2DP deinit
++         * timeout, headphones mode off until reboot). We are on BTU, after the state machine step above; the CLOSING
++         * state's STR_CLOSED action ignores p_data, and a stream freed by it is looked up by handle by the caller
++         * (bta_av_disable() loops by handle; bta_av_cleanup() -> bta_av_dereg_comp() frees it, as for an idle
++         * stream). The disconnect reason was the message's offset, 0. */
+         if (p_scb != NULL && p_scb->state == 5 /* BTA_AV_CLOSING_SST: the stream state enum is private to bta_av_ssm.c */) {
+-            BT_HDR *p_buf = (BT_HDR *)osi_malloc(sizeof(BT_HDR));
+-            if (p_buf != NULL) {
+-                memset(p_buf, 0, sizeof(BT_HDR));   /* offset is read as the disconnect reason */
+-                p_buf->event = BTA_AV_AVDT_DISCONNECT_EVT;
+-                p_buf->layer_specific = p_scb->hndl;
+-                bta_sys_sendmsg(p_buf);
+-            }
++            p_scb->disc_rsn = 0;
++            bta_av_ssm_execute(p_scb, BTA_AV_AVDT_DISCONNECT_EVT, NULL);
+         }
+ #endif
+     } else {
+diff --git a/open_fw/third_party/bluedroid/host/bluedroid/stack/avct/avct_api.c b/open_fw/third_party/bluedroid/host/bluedroid/stack/avct/avct_api.c
+index 72cba35..9585d37 100644
+--- a/open_fw/third_party/bluedroid/host/bluedroid/stack/avct/avct_api.c
++++ b/open_fw/third_party/bluedroid/host/bluedroid/stack/avct/avct_api.c
+@@ -121,6 +121,25 @@ void AVCT_Deregister(void)
+ #if (AVCT_BROWSE_INCLUDED == TRUE)
+     L2CA_Deregister(AVCT_BR_PSM);
+ #endif
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++    /* open_fw patch 0043: as AVDT_Deregister(): a link control block still waiting for the L2CAP disconnect of a frozen
++     * peer kept its tx_q and reassembly buffer until the next AVCT_Register()'s memset (STEP10 A6). Every connection
++     * was removed before this; release the link (and browse) blocks so a late L2CAP callback finds none. */
++    for (int i = 0; i < AVCT_NUM_LINKS; i++) {
++        tAVCT_LCB *p_lcb = &avct_cb.lcb[i];
++        if (p_lcb->allocated) {
++            osi_free(p_lcb->p_rx_msg);
++            fixed_queue_free(p_lcb->tx_q, osi_free_func);
++        }
++        tAVCT_BCB *p_bcb = &avct_cb.bcb[i];
++        if (p_bcb->allocated) {
++            osi_free(p_bcb->p_tx_msg);
++        }
++    }
++    memset(avct_cb.lcb, 0, sizeof(avct_cb.lcb));
++    memset(avct_cb.bcb, 0, sizeof(avct_cb.bcb));
++    memset(avct_cb.ccb, 0, sizeof(avct_cb.ccb));
++#endif
+ }
+ 
+ /*******************************************************************************
+diff --git a/open_fw/third_party/bluedroid/host/bluedroid/stack/avdt/avdt_api.c b/open_fw/third_party/bluedroid/host/bluedroid/stack/avdt/avdt_api.c
+index 852744f..0873bac 100644
+--- a/open_fw/third_party/bluedroid/host/bluedroid/stack/avdt/avdt_api.c
++++ b/open_fw/third_party/bluedroid/host/bluedroid/stack/avdt/avdt_api.c
+@@ -170,6 +170,32 @@ void AVDT_Deregister(void)
+ {
+     /* deregister PSM with L2CAP */
+     L2CA_Deregister(AVDT_PSM);
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++    /* open_fw patch 0043: a link whose peer froze (headset off / out of range during an A2DP deinit; 0039 closes the
++     * BTA stream locally) leaves its stream and channel blocks allocated here, waiting for an L2CAP disconnect that
++     * comes after this or never: their fixed_queues, timers and buffers were lost at the next AVDT_Register()'s
++     * memset or at the free of avdt_cb (~1.7 KB per frozen-peer teardown, STEP10 A6). Nothing above AVDTP uses them
++     * any more (deregistering is the last step); release them all and forget the L2CAP channel map, so a late L2CAP
++     * callback for the old channel finds no table entry (avdt_l2c.c ignores it). Idempotent (bta_av may deregister
++     * twice). */
++    tAVDT_SCB *p_scb = &avdt_cb.scb[0];
++    for (int i = 0; i < AVDT_NUM_SEPS; i++, p_scb++) {
++        if (p_scb->allocated) {
++            if (p_scb->p_pkt != NULL) {
++                osi_free(p_scb->p_pkt);
++                p_scb->p_pkt = NULL;
++            }
++            avdt_scb_dealloc(p_scb, NULL);
++        }
++    }
++    tAVDT_CCB *p_ccb = &avdt_cb.ccb[0];
++    for (int i = 0; i < AVDT_NUM_LINKS; i++, p_ccb++) {
++        if (p_ccb->allocated) {
++            avdt_ccb_dealloc(p_ccb, NULL);
++        }
++    }
++    avdt_ad_init();
++#endif
+ }
+ 
+ /*******************************************************************************

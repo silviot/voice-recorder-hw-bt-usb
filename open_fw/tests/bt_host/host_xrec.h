@@ -64,6 +64,9 @@ uint32_t bthx_post_fn(int (*fn)(uint32_t), uint32_t arg);
 /* Called on every app-task loop after bt_xrec_poll() (NULL = none). */
 void bthx_set_app_hook(void (*hook)(void));
 uint32_t bthx_profile_down_rc(void);     /* the last down job's profile teardown result (0xFFFFFFFF = none ran) */
+/* The next down job runs the session's profile teardown, then reports it failed (rc 2: A2DP deinit not confirmed),
+ * so the job ends with rc 5 (STEP10 A6: the session's escalation of rc 5). One shot. */
+void bthx_force_profile_down_fail(void);
 exfat_vol_t *bthx_card(void);
 /* bt_xrec_plat_pairing_block() calls made inside bt_xrec_plat_lock() (must stay 0: a critical section on target). */
 uint32_t bthx_gate_in_lock(void);
