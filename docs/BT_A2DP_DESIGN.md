@@ -315,7 +315,7 @@ Recipe:
        raise the stall event (§4.6; live log §19.6). Host tests assert `tx_lost_sbc == 0`.
   5. Remaining credit carries over (bounded by step 2).
 - **Result.** At the max bitpool packets are full, about every 27 ms at 48 kHz / bitpool 35 / fpp 10. A 1 s stall
-  produces at most `CREDIT_MAX` of catch-up (40-64 ms of audio: 2 ticks, or 2 packets at fpp 7-11), never a burst
+  produces at most `CREDIT_MAX` of catch-up (up to 4 ticks, 80 ms, since silicon 2026-11-25: late ticks lost air time at 2), never a burst
   of 1.9× real time. Sustained capacity is `HP_MAX_PKT_PER_TICK × fpp × 128` samples per tick: at 20 ms and 2
   packets that is 1.87× real time in the worst case (fpp 7, 48 kHz) and 2.67× in the common one (fpp 10).
 - **Per-tick encode cost.** §12.2 puts SBC at 15-19 % CPU for 375 frames/s, so **0.40-0.51 ms per frame** from SRAM.
@@ -919,7 +919,7 @@ QEMU has no RW-BT controller. Image: `BT=1 RTOS_SELFTEST=1 HP_SELFTEST=1` in `/t
 | `hp_tick_ms` | 10..30 (20) | Pacer tick; lowered at STARTED if it breaks the §4.3 headroom rule |
 | `hp_pkt_per_tick` | 1..2 (2) | `HP_MAX_PKT_PER_TICK`; 1 only with `hp_tick_ms` ≤ 15 (§4.3) |
 | `hp_txq` | 2..8 (4) | `TXQ_PKT_CAP` |
-| `hp_credit_ticks` | 1..4 (2) | Elapsed clamp and the tick term of `CREDIT_MAX` |
+| `hp_credit_ticks` | 1..4 (4) | Elapsed clamp and the tick term of `CREDIT_MAX` |
 | `hp_tone_hz` | 100..8000 (1000) | `tone` stage, 16 kHz mono through the full `hp_sink` path |
 | `hp_file` | 8.3 path | `player` stage |
 | `hp_credits` | 4..9 (4) | Experimental `1005` credit count; checked against the image's build-time `HP_CREDITS` (§7) and refused on mismatch |
