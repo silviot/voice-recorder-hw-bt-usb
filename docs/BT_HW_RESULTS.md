@@ -1188,8 +1188,10 @@ at every REC start, also for recordings started with the REC switch and with no 
 
 | field | meaning | M2/M3 use |
 |---|---|---|
-| `file`, `seq`, `ch`, `gain`, `dsp`, `vor` | the first WAV of the recording and its settings | map counters to WAVs; check settings |
-| `dma_smp`, `clk_smp`, `drift` | DMA blocks x 2048 vs us_timer x 16 kHz since capture start; drift = dma - clk | M2(e) length, M3 sample accounting |
+| `file`, `seq`, `ch`, `gain`, `dsp`, `vor` | the first WAV of the recording and its settings | map counters to WAVs; check settings (`rf_audio_check.py` fails a capture whose settings differ from the C0 captures') |
+| `dma_smp`, `clk_smp`, `drift` | DMA blocks x 2048 vs us_timer x 16 kHz since capture start, both read at the same moment (poll exit / stop); drift = dma - clk, 0..-2048 plus clock mismatch | M2(e) length (+-2048), M3 sample accounting |
+| `bclk_smp`, `bdrift` | block clock: the DMA ISR stamps `us_timer` at every completed block; from the first to the last block this recording saw, blocks x 2048 - stamped time x 16 kHz. Start-up offsets cancel: on a clean recording only the codec / us_timer ppm (the same in every capture), negative by the samples the DMA did not capture (ISR masked until the I2S FIFO overflowed). `-` before two stamps | M2(e) silent sub-block loss: `rf_audio_check.py` compares it with the C0 captures' range +- 8 samples |
+| `sd_err`, `sd_mdto` | SD driver errors during the recording (every `sdio_log_err()`, also past its 8-line log cap), `SDW_MDTO` among them | M3 "no SDW_MDTO" over the whole recording (the ring and `BTBENCH.LOG` hold only parts of a long run) |
 | `wav_smp`, `ov`, `comp`, `lost`, `acct` | frames in the WAV, ring overruns, zero blocks written for them, ov - comp, (dma - ov + comp) x 2048 - wav | M2(e) overruns = 0; M3 accounting exact (acct = 0 at stop, VOR off) |
 | `gap_max_us`, `poll_max_us` | largest gap between two `recorder_poll()` calls (the app-loop gap the 384 ms ring must cover), longest poll | M3 "max recorder-loop gap" |
 | `wr_max_us`, `wr_n`, `ckpt_max_us` | longest SD write of one 128 ms block, writes, longest WAV checkpoint | M3 SD latency |
@@ -1202,11 +1204,16 @@ Where they appear:
 - **`+XREC:DBG`** (bench images, after AUTH; `docs/XREC_PROTOCOL.md` 5.4): `+XREC:DBG,LIVE,<fields>,gets_tot=..,
   gets_fr=..,idle_pm=..,app_pm=..,btc_pm=..,cpu_ms=..` for the running recording, `+XREC:DBG,REC,<i>,<fields>` for
   the i-th latest finished one (8 kept). Laptop: `python3 tools/bt_sync.py --mac $MAC --dbg` / `--dbg-rec 0`.
-- **Phone-mode bench runs (`SD:/BTBENCH.RUN`):** with every `BENCH status` line (30 s): `BENCH cpu ms= idle_pm=
-  app_pm= btc_pm= rec=`, `BENCH tasks <task>=<permille> ... other=` (per-task CPU over the 30 s, the headphones bench
-  machinery), `BENCH meas <rec fields>` and `BENCH meas+ <cpu fields>`. `SD:/BTBENCH.LOG` ends with `BENCH final
-  gets_tot=.. ... recs=N` and `BENCH final rec i=live|0|1 <fields>` (the capture buffer keeps the head of a long run,
-  this trailer always survives).
+- **Phone-mode bench runs (`SD:/BTBENCH.RUN`):** with every 5th `BENCH status` line (every 2.5 min, and at the
+  end): `BENCH cpu ms= take_us= idle_pm= app_pm= btc_pm= rec=`, `BENCH tasks <task>=<permille> ... other=` (per-task
+  CPU over those 2.5 min, the headphones bench machinery; `take_us` is that full task scan's own cost),
+  `BENCH meas <rec fields>` and `BENCH meas+ <cpu fields>`. The 1 s CPU window behind `idle_pm` / `idle_min_pm`
+  reads only the idle, app and `BTC_TASK` counters (no stack scan, no scheduler suspension); its longest run is
+  `take_us` in the cpu fields, so the measurement's own cost is known (it runs only in BT bench runs, never in C0).
+  `SD:/BTBENCH.LOG` keeps only the head of a long run (8 KiB, a few minutes) and ends with `BENCH final gets_tot=..
+  ... recs=N sd_err_tot=.. sd_mdto_tot=..` and `BENCH final rec i=0|1 <fields>` (the two latest finished
+  recordings; a running recording is stopped before the run ends, so there is never a live one). Checks over a
+  whole recording use the counters (`BENCH rec`, `+XREC:DBG,REC,0`, this trailer), never grep over the log text.
 
 Laptop side (`tools/bt_sync.py`): `--bench-load SECONDS` holds one link for SECONDS and logs a `+XREC:DBG` line every
 `--dbg-every` s (0 = only at the end); `--load-rec` sends RECSTART first and RECSTOP last (then logs `DBG,REC,0`);
@@ -1217,7 +1224,14 @@ of a name that does not exist every S s (directory scans, nothing deleted); `--d
 Analysis: `tools/rf_audio_check.py` (numpy; `--self-test`, also run by `make -C open_fw test-host` and
 `tools/test_tools.py`) implements the M2 metrics (a)-(e) against the C0 repeats and prints a Markdown table (`--md`,
 `--json`); `--bench-log` adds the device counters per WAV (length vs `clk_smp` within +-2048, samples = `wav_smp`,
-`ov` = `lost` = `acct` = 0). Exit status 1 = a capture failed. Thresholds are the design's (`--lim-*` to change).
+`ov` = `lost` = `acct` = 0, `bdrift` within the C0 captures' range +- 8 samples, settings = the C0 captures'); with
+`--bench-log` a capture without a counter line FAILS unless waived with `--no-device-counters LABEL` (a finished
+record, `rec=0`, wins over mid-recording lines). Verdicts are PASS / FAIL / INCONCLUSIVE: inconclusive when the C0
+repeats disagree (floor spread > 0.5 dB, median PSD offset > 1 dB, fewer than 2 repeats, `bdrift` range > 16
+samples) or the tone level differs from C0 by > 0.3 dB; only PASS passes. Exit status 1 = a capture did not pass.
+Thresholds are the design's (`--lim-*` to change). Known blind spot: a 1-3 ms loss is near-invisible to a 997 Hz
+phase step (16 samples are 0.02 rad); the block clock (`bdrift`) is the detector for those, and the only one in
+silence captures.
 
 ### Roles
 
@@ -1232,10 +1246,13 @@ Analysis: `tools/rf_audio_check.py` (numpy; `--self-test`, also run by `make -C 
 
 Fixed for every capture: **USB cable unplugged** while recording (VBUS charging is its own noise source and USB disk
 mode would take over the Home screen); laptop at 1 m; DSP `2` (BYPASS) for the metrics, then one block with DSP 1
-(Voice Clarity) for listening; VOR off (`acct` is only exact without VOR); 75 s per capture, analysed 7.5 s in from
-each end (the 60 s window; RECSTART / RECSTOP and C1's connects happen outside it). Signals: **S** silence (speaker
-off), **T** a **997 Hz** sine from the external speaker at about -20 dBFS (adjust once per gain from the first C0 T
-capture: the report's header prints `tone ... at X dBFS`). Not 1000 Hz: a lost 2048-sample block is exactly 128
+(Voice Clarity) for listening; VOR off (`acct` is only exact without VOR); 75 s per capture. The spectral metrics
+(a)-(d) use the middle 60 s (7.5 s in from each end); the continuity checks (e) cover the whole file but 0.5 s at
+each end (the REC switch click), so RECSTART, the link set-up and C1's connect / disconnect are inside them.
+Signals: **S** silence (speaker off), **T** a **997 Hz** sine from the external speaker at about -20 dBFS. Set the
+level per gain with a throwaway REC switch capture before C0_1 (`rf_audio_check.py --baseline X.wav --capture X.wav`
+prints `tone ... at X dBFS`), then do not touch the speaker volume for the block: SNR moves 1:1 with tone level, so a
+capture more than 0.3 dB off the C0 level is INCONCLUSIVE. Not 1000 Hz: a lost 2048-sample block is exactly 128
 periods of 1 kHz and leaves no phase step; at 997 Hz it is a 2.4 rad step.
 
 ### Setup (once)
@@ -1260,7 +1277,8 @@ sudo python3 tools/openfw_usb.py --audio-cfg > $S/user_audio_cfg.txt     # the u
 
 Blocks, in this order (most sensitive first; stereo blocks may go to a second session): gain 31 mono S, 31 mono T,
 20 mono S, 20 mono T, 31 stereo S, 31 stereo T, 20 stereo S, 20 stereo T; then **Cm** (gain 31 mono S, mic covered:
-C0 x1 + C2 x1) and one **listening** block (gain 31 mono, DSP 1, speech or the tone: C0 x1 + C3 full speed x1).
+C0 x2 + C2 x1) and one **listening** block (gain 31 mono, DSP 1, speech or the tone: C0 x2 + C3 full speed x1). Every
+comparison needs at least two C0 repeats (their spread is the reference; one alone is INCONCLUSIVE).
 Each block, with `G` = gain, `CH` = 1 or 2, `D=$S/m2/g${G}_ch${CH}_<S|T>`:
 
 **A. Fresh boot, radio never on: C0 x2** (agent, cable in; then user, ~4 min):
@@ -1284,7 +1302,8 @@ sudo python3 tools/openfw_usb.py --reboot normal                     # boots int
 sleep 20                                  # BT mode up (entropy + bring-up); user: unplug when the BT screen shows
 L=$D/dbg_B.log; for c in $(printf '%s\n' C1 C1 C1 C2 C2 C2 C3c C3c C3c C3f C3f C3f | shuf); do
   case $c in
-    C1)  python3 tools/bt_sync.py --mac $MAC --rec-start; bluetoothctl disconnect $MAC; sleep 75   # page scan only
+    C1)  python3 tools/bt_sync.py --mac $MAC --rec-start; bluetoothctl disconnect $MAC; sleep 2     # page scan only
+         for i in $(seq 73); do bluetoothctl info $MAC | grep -q 'Connected: yes' && echo "C1 ACL at ${i}s" >> $D/plan.txt; sleep 1; done
          python3 tools/bt_sync.py --mac $MAC --rec-stop; python3 tools/bt_sync.py --mac $MAC --dbg-rec 0 --dbg-log $L ;;
     C2)  python3 tools/bt_sync.py --mac $MAC --bench-load 75 --load-rec --dbg-every 0 --dbg-log $L ;;     # link, no data
     C3c) python3 tools/bt_sync.py --mac $MAC --bench-load 75 --load-rec --load-file LOAD.WAV --load-kbps 48 \
@@ -1297,14 +1316,17 @@ L=$D/dbg_B.log; for c in $(printf '%s\n' C1 C1 C1 C2 C2 C2 C3c C3c C3c C3f C3f C
 done
 ```
 Cm block: only C2 x1. The session ends by itself at `secs` (Home). C3c's 48 KiB/s is the design's F1b starting cap;
-C3f with 64 KiB windows is the worst case a fast client produces today.
+C3f with 64 KiB windows is the worst case a fast client produces today. A C1 capture with a `C1 ACL at ..` line in
+`plan.txt` (BlueZ or the device re-linked during it) is not a C1: label it C2 or repeat it.
 
 **C. After the BT session, radio off: C0b x3, then C5 x3** (user, ~12 min; skip C5 without a paired headset):
-C0b: on Home, REC on 75 s / off, three times; then cable in, the agent saves the ring (`sudo python3
-tools/dev_cycle.py log > $D/ring_C0b.log`: headphones mode logs into the same 4 KiB ring), cable out. C5: Bluetooth
+C0b: on Home, REC on 75 s / off, then cable in, the agent saves the ring (`sudo python3 tools/dev_cycle.py log >
+$D/ring_C0b_<n>.log`), cable out; three times (one `BENCH rec` line each, the 4 KiB ring cannot wrap). C5: Bluetooth
 tile -> Headphones, wait until the headset is connected, back to Home (headphones stay on in the background), then
 REC on 75 s / off three times (the stream is suspended while recording, the link stays). Then cable in (USB disk
-mode stops headphones mode first).
+mode stops headphones mode first) and save the ring at once (`$D/ring_C5.log`; headphones mode logs into the same
+ring: if a C5 `BENCH rec` line is missing, the analysis FAILS that capture; repeat C5 with one capture per
+headphones session rather than waiving it).
 
 **D. Fresh boot again: C0 x1** (agent then user, ~3 min):
 ```bash
@@ -1315,22 +1337,32 @@ User: unplug, REC 75 s once (third C0 repeat: catches drift over the block), cab
 
 **E. Pull and analyse** (agent):
 ```bash
-sudo python3 tools/dev_cycle.py log > $D/ring_D.log
+sudo python3 tools/dev_cycle.py log > $D/ring_D.log      # (ring_C.log above: C5's lines too, saved before reboot)
 udisksctl mount -b /dev/sda1 && cp $M/record/REC_*.wav $M/BTBENCH.LOG $D/ && rm -f $M/record/REC_*.wav && sync && \
   udisksctl unmount -b /dev/sda1
-grep -h '^BENCH rec' $D/ring_*.log | sed 's/.* file=\([^ ]*\) .*/\1/'   # REC switch captures, in time order
+for f in A C0b_1 C0b_2 C0b_3 C5 D; do grep -h '^BENCH rec' $D/ring_$f.log; done | \
+  sed 's/.* file=\([^ ]*\) .*/\1/' | awk '!seen[$0]++'   # in time order (B's RECSTART files too: see plan.txt)
 ```
 Label the files from the order above (A: C0_1 C0_2; C: C0b_1..3, C5_1..3; D: C0_3) and `plan.txt` (B), then:
 ```bash
 B="--baseline C0_1=$D/REC_a.wav --baseline C0_2=$D/REC_b.wav --baseline C0_3=$D/REC_c.wav"
 python3 tools/rf_audio_check.py $B --capture C0b_1=$D/REC_d.wav ... --capture C3f_3=$D/REC_x.wav \
-  --bench-log $D/ring_A.log --bench-log $D/ring_C0b.log --bench-log $D/ring_C.log --bench-log $D/ring_D.log \
-  --bench-log $D/dbg_B.log \
+  $(for f in $D/ring_*.log $D/dbg_B.log; do printf -- '--bench-log %s ' $f; done) \
   --trim-start-s 7.5 --trim-end-s 7.5 --md $D/report.md --json $D/report.json
 ```
-A capture whose `BENCH rec` line is missing (the ring wrapped) is analysed without the device counters (its row says
-`(e) length ... not checked`); the audio metrics still apply. Every condition must pass at both gains and both channel modes (design decision 2); a single (e) finding fails its
-condition. (f) blind ABX (user, headphones): C0 vs C3f of the gain 31 mono T block and of the listening block, 20
+A capture whose counter line is missing FAILS (`(e) device counters missing`): the block clock is the only detector
+of a sub-block loss in a silence capture, so repeat the capture; `--no-device-counters LABEL` waives it only on
+purpose, and the waiver goes into the results. Every condition must pass at both gains and both channel modes
+(design decision 2); a single (e) finding fails its condition, an INCONCLUSIVE row (C0 repeats disagree, tone level
+moved) means redo the C0 captures or the capture, not pass.
+
+**Confounds this recipe keeps** (state them with the result): C0 / C0b / C5 run on Home and start with the REC switch,
+C1-C3 run on the BT screen and start with `+XREC:RECSTART`, so the screen, its refresh and the start method change
+together with the radio state; the order is random only inside the BT session, C0 runs before and after it. Today's
+firmware has no BT screen with the controller off, so there is no radio-off control on the BT screen. A C1-C3
+difference that C0b does not show is the radio's; a difference that C1 already shows can also be the BT screen: in
+that case run C1 against a C0 recorded on the BT screen of a release image with the session never linked, or report
+it as "radio or BT screen". (f) blind ABX (user, headphones): C0 vs C3f of the gain 31 mono T block and of the listening block, 20
 trials with any ABX tool on the laptop; pass at <= 12/20 correct.
 
 **What the result selects** (design 2.6): all of C1, C2, C3c, C3f pass -> L0 (C3c only -> L1 at a lower cap); C1
@@ -1347,14 +1379,16 @@ D=$S/m3; mkdir -p $D
 sudo python3 tools/openfw_usb.py --set-dsp 1 --set-gain 20 --set-ch 1 --set-vor 0   # user: unplug, wait for Home, plug
 udisksctl mount -b /dev/sda1 && printf 'secs=3600 exit=auto\n' > $M/BTBENCH.RUN && sync && udisksctl unmount -b /dev/sda1
 sudo python3 tools/openfw_usb.py --reboot normal; sleep 20
-python3 tools/bt_sync.py --mac $MAC --bench-load 2400 --load-rec --load-file LOAD.WAV --load-kbps 48 --load-storm 30 \
-  --dbg-every 10 --dbg-log $D/m3_48.log                                   # 40 min at the F1b starting cap + storm
+python3 tools/bt_sync.py --mac $MAC --bench-load 2100 --load-rec --load-file LOAD.WAV --load-kbps 48 --load-storm 30 \
+  --dbg-every 10 --dbg-log $D/m3_48.log                                   # 35 min at the F1b starting cap + storm
 for k in 24 64 96 0; do
   python3 tools/bt_sync.py --mac $MAC --bench-load 240 --load-rec --load-file LOAD.WAV --load-kbps $k --load-storm 30 \
     --burst-size 65536 --dbg-every 10 --dbg-log $D/m3_$k.log; sleep 5
 done
 ```
-(The session's `secs` caps the total at 60 min; the 3600 s maximum of `BTBENCH.RUN` is why the long run is 40 min.)
+(The session's `secs` caps the total at 60 min, the `BTBENCH.RUN` maximum: 20 + 2100 + 4 x 245 s plus five link
+set-ups is about 3150 s, so the last run ends well before the session does. A run cut by the session end shows as
+FAIL below with "no DBG,REC,0".)
 User: nothing; do not touch the device or the REC switch. Afterwards (cable in, USB disk mode comes back by itself):
 ```bash
 sudo python3 tools/dev_cycle.py log > $D/ring.log
@@ -1362,23 +1396,31 @@ udisksctl mount -b /dev/sda1 && cp $M/BTBENCH.LOG $D/ && rm -f $M/record/REC_*.w
 python3 - $D/m3_*.log <<'PY'
 import re, sys
 for p in sys.argv[1:]:
-    rec = [l for l in open(p) if "DBG,REC,0," in l][-1]
-    kv = dict(t.split("=", 1) for t in re.split(r"[ ,]", rec.strip()) if "=" in t)
+    recs = [l for l in open(p) if "DBG,REC,0," in l]
+    if not recs:
+        print(f"{p}: FAIL no DBG,REC,0 (the run did not finish: session end, link lost?)")
+        continue
+    kv = dict(t.split("=", 1) for t in re.split(r"[ ,]", recs[-1].strip()) if "=" in t)
     live = [dict(t.split("=", 1) for t in l.strip().split(",") if "=" in t) for l in open(p) if "DBG,LIVE," in l]
     idle = min((int(d["idle_pm"]) for d in live if d.get("idle_pm", "-") != "-"), default=-1)
-    ok = (kv["ov"] == kv["lost"] == kv["acct"] == "0" and int(kv["gap_max_us"]) <= 96000
-          and int(kv["idle_min_pm"] if kv["idle_min_pm"] != "-" else 0) >= 200)
-    print(f"{p}: {'PASS' if ok else 'FAIL'} t_ms={kv['t_ms']} gets_b={kv['gets_b']} ov={kv['ov']} lost={kv['lost']} "
-          f"acct={kv['acct']} drift={kv['drift']} gap_max_us={kv['gap_max_us']} wr_max_us={kv['wr_max_us']} "
-          f"ckpt_max_us={kv['ckpt_max_us']} idle_min_pm={kv['idle_min_pm']} (DBG polls: {idle})")
+    num = lambda k, bad: int(kv[k]) if kv.get(k, "-") not in ("-", "") else bad
+    ok = (kv.get("ov") == kv.get("lost") == kv.get("acct") == "0" and num("gap_max_us", 1 << 31) <= 96000
+          and num("idle_min_pm", 0) >= 200 and num("sd_mdto", 1) == 0 and abs(num("bdrift", 1 << 31)) <= 64)
+    print(f"{p}: {'PASS' if ok else 'FAIL'} " + " ".join(f"{k}={kv.get(k)}" for k in (
+        "t_ms", "gets_b", "ov", "lost", "acct", "drift", "bdrift", "bclk_smp", "gap_max_us", "wr_max_us",
+        "ckpt_max_us", "sd_err", "sd_mdto", "idle_min_pm")) + f" (DBG polls: idle {idle})")
 PY
-grep -c SDW_MDTO $D/ring.log $D/BTBENCH.LOG                             # must be 0
+grep -h 'BENCH final' $D/BTBENCH.LOG                                    # sd_err_tot / sd_mdto_tot, take_us
 ```
-Pass per run (design M3): `ov` = `lost` = 0, `acct` = 0, `drift` within the C0 captures' range (+-1 block), max
-recorder-loop gap `gap_max_us` <= 96000 (25 % of today's 384 ms ring), idle >= 20 % (`idle_min_pm` >= 200), no
-`SDW_MDTO`. The highest passing cap, halved, is the F1b default for S3. Today's firmware has no recorder-first
-scheduling (F1), so failing caps here are the S3 baseline, not a verdict on the design. Also report `BENCH tasks`
-lines from `BTBENCH.LOG` (which task takes the CPU while GETS runs) and the `gets_b` / time actually reached per cap.
+Pass per run (design M3): `ov` = `lost` = 0, `acct` = 0, `bdrift` within a few samples of the C0 captures' (M2;
+the check above uses a loose +-64 samples = 4 ms for runs without a C0 of their own), max recorder-loop gap
+`gap_max_us` <= 96000 (25 % of today's 384 ms ring), idle >= 20 % (`idle_min_pm` >= 200), `sd_mdto` = 0 (counted
+over the whole recording, also past the SD driver's 8-line log cap; `grep SDW_MDTO` over `ring.log` / `BTBENCH.LOG`
+sees only the last 4 KiB / the first few minutes). The highest passing cap, halved, is the F1b default for S3.
+Today's firmware has no recorder-first scheduling (F1), so failing caps here are the S3 baseline, not a verdict on
+the design. Also report the `BENCH tasks` lines that `BTBENCH.LOG` holds (every 2.5 min from the start of the long
+48 KiB/s run: which task takes the CPU while GETS runs), `take_us` from `BENCH final` (the 1 s CPU window's own
+cost), and the `gets_b` / time actually reached per cap.
 
 **Afterwards:** restore the user's settings (`sudo python3 tools/openfw_usb.py --set-dsp .. --set-gain .. --set-ch ..
 --set-vor ..` from `$S/user_audio_cfg.txt`), delete `record/LOAD.WAV`, and leave the latest BT-branch build on the

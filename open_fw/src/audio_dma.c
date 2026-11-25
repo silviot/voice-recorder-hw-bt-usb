@@ -10,6 +10,7 @@
 #include <stdint.h>
 #include "sl6801_regs.h"
 #include "openfw.h"
+#include "openfw_bench_meas.h"   /* block clock stamp: bench images only (OPENFW_BENCH_MEAS), compiled out otherwise */
 
 #define AUDIO_DMA_CH           1u
 #define AUDIO_RING_SLOTS       4u
@@ -38,6 +39,14 @@ static volatile uint32_t g_frames         = 0u;
 static volatile uint32_t g_wr_idx         = 0u;
 static volatile uint32_t g_rd_idx         = 0u;
 static volatile uint32_t g_overruns       = 0u;
+#if OPENFW_BENCH_MEAS
+static volatile uint32_t g_bench_dma_us;   /* us_timer at the latest completed block (include/openfw_bench_meas.h) */
+
+uint32_t audio_bench_dma_us(void)
+{
+    return g_bench_dma_us;
+}
+#endif
 
 static void wait_mmio_mask(uint32_t addr, uint32_t mask, uint32_t expect)
 {
@@ -134,6 +143,9 @@ void DMAC_CH1_IRQHandler(void)
     }
 
     if (st & DMAC_IRQ_TC) {
+#if OPENFW_BENCH_MEAS
+        g_bench_dma_us = openfw_mmio_rd32(US_TIMER_LO_ADDR);   /* inline MMIO read: this ISR runs from RAM */
+#endif
         uint8_t done_slot = g_dma_slot;
         uint8_t next_slot = (uint8_t)((done_slot + 1u) & (AUDIO_RING_SLOTS - 1u));
         g_dma_slot = next_slot;

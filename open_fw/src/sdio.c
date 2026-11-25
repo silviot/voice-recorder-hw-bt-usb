@@ -11,6 +11,7 @@
 #include "sl6801_regs.h"
 #include "sl6801_rom.h"
 #include "openfw.h"
+#include "openfw_bench_meas.h"   /* SD error counters: bench images only (OPENFW_BENCH_MEAS), compiled out otherwise */
 
 #define SDIO_CMD_START      0x80000000u
 #define SDIO_CMD_UPD_CLK    0x80200000u
@@ -42,6 +43,9 @@
 static void sdio_log_err(const char *tag, uint32_t a, uint32_t b)
 {
 #if !defined(OPENFW_HOST_MMIO) || defined(OPENFW_WASM)
+#if OPENFW_BENCH_MEAS
+    bench_meas_sd_err(&g_bench_meas, tag);   /* every error, also past the 8-line log cap */
+#endif
     static uint8_t s_err_logs = 0u;
     if (s_err_logs >= 8u) {
         return;

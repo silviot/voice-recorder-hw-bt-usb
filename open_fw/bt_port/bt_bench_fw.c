@@ -221,11 +221,22 @@ static void log_tasks(const char *tag, const cpu_take_t *c)
 
 /* ---- phone-mode measurement (docs/BT_SYNC_SPEED_AND_RECORDING.md F0) ----
  * Every second: a 1 s CPU window into g_bench_meas (the +XREC:DBG idle/app/btc values and the recording's lowest
- * idle). With every status line (30 s): "BENCH cpu" + "BENCH tasks" over the 30 s and "BENCH meas" (the recording
- * counters, live). */
-#define BENCH_CPU1_MS 1000u
-static cpu_win_t s_win1 BENCH_HI, s_win30 BENCH_HI;
+ * idle). It reads only the idle, app and BTC_TASK run-time counters (vTaskGetInfo without the stack high-water scan,
+ * no scheduler suspension), and its own duration goes into take_us: the measurement must not be a 1 Hz load that
+ * only the BT captures carry. With every BENCH_MEAS_EVERY-th status line (2.5 min) and at the end: "BENCH cpu" +
+ * "BENCH tasks" over that window (the full uxTaskGetSystemState) and "BENCH meas" (the recording counters, live):
+ * the 8 KiB capture keeps the head of the run, so fewer lines leave room for more of it. Whole-recording checks use
+ * the counters (BENCH rec, +XREC:DBG), never the log text. */
+#define BENCH_CPU1_MS     1000u
+#define BENCH_MEAS_EVERY  5u
+static cpu_win_t s_win30 BENCH_HI;
 static uint32_t s_cpu1_next BENCH_HI;
+static uint32_t s_status_n BENCH_HI;
+static struct {
+    TaskHandle_t btc;           /* BTC_TASK, looked up once it exists */
+    uint32_t idle, app, btc_rt; /* run-time counters at the window start */
+    uint32_t prev_us;           /* 0 = no baseline yet */
+} s_win1 BENCH_HI;
 
 /* Append the F0 fields to the line being built (formatted in place: no second buffer in the tight .bss_hi). */
 static void lmeas_rec(const bench_meas_rec_t *r)
@@ -238,17 +249,41 @@ static void lmeas_cpu(void)
     s_ll += bench_meas_format_cpu(&g_bench_meas, ' ', &s_line[s_ll], (uint32_t)(sizeof(s_line) - 2u - s_ll));
 }
 
+static uint32_t task_rt(TaskHandle_t h)
+{
+    TaskStatus_t st;
+    if (h == NULL) {
+        return 0u;
+    }
+    vTaskGetInfo(h, &st, pdFALSE, eInvalid);   /* pdFALSE: no stack scan; eInvalid: state read in a short critical */
+    return (uint32_t)st.ulRunTimeCounter;
+}
+
 static void meas_cpu1(uint32_t now)
 {
     if ((int32_t)(now - s_cpu1_next) < 0) {
         return;
     }
     s_cpu1_next = now + BENCH_CPU1_MS;
-    cpu_take_t c;
-    cpu_win_take(&s_win1, &c);
-    if (c.dt != 0u) {
-        bench_meas_cpu(&g_bench_meas, pm_of(c.idle, c.dt), pm_of(c.app, c.dt), pm_of(c.btc, c.dt), c.dt / 1000u);
+    uint32_t t0 = (uint32_t)us_timer_now();
+    if (s_win1.btc == NULL) {
+        s_win1.btc = xTaskGetHandle("BTC_TASK");   /* a list walk: only until the task exists */
+        s_win1.prev_us = 0u;                       /* its counter starts now: new baseline */
     }
+    uint32_t idle = task_rt(xTaskGetIdleTaskHandle());
+    uint32_t app = task_rt(xTaskGetCurrentTaskHandle());   /* app task only */
+    uint32_t btc = task_rt(s_win1.btc);
+    uint32_t t1 = (uint32_t)us_timer_now();
+    if (s_win1.prev_us != 0u) {
+        uint32_t dt = t1 - s_win1.prev_us;
+        bench_meas_cpu(&g_bench_meas, pm_of(idle - s_win1.idle, dt), pm_of(app - s_win1.app, dt),
+                       pm_of(btc - s_win1.btc_rt, dt), dt / 1000u);
+    }
+    s_win1.idle = idle;
+    s_win1.app = app;
+    s_win1.btc_rt = btc;
+    s_win1.prev_us = t1 != 0u ? t1 : 1u;
+    bench_meas_cpu_take(&g_bench_meas, t1 - t0);
 }
 
 static void log_meas(void)
@@ -264,12 +299,15 @@ static void log_meas(void)
 static void log_cpu30(void)
 {
     cpu_take_t c;
+    uint32_t t0 = (uint32_t)us_timer_now();
     cpu_win_take(&s_win30, &c);
+    uint32_t take_us = (uint32_t)us_timer_now() - t0;
     if (c.dt == 0u) {
         return;
     }
     lbegin("cpu");
     lku("ms", c.dt / 1000u);
+    lku("take_us", take_us);                 /* this full take's own cost (stack scans, scheduler suspended) */
     lku("idle_pm", pm_of(c.idle, c.dt));
     lku("app_pm", pm_of(c.app, c.dt));
     lku("btc_pm", pm_of(c.btc, c.dt));
@@ -278,7 +316,7 @@ static void log_cpu30(void)
     log_tasks("tasks", &c);
 }
 
-static void log_status(uint32_t el_ms)
+static void log_status(uint32_t el_ms, int last)
 {
     bt_status_t st;
     bt_xrec_get_status(&st);
@@ -301,8 +339,10 @@ static void log_status(uint32_t el_ms)
     (void)bt_ctrl_stats_format(cl, (uint16_t)sizeof(cl));
     lbegin(cl);                              /* "BENCH BT ctrl stats unk=.. short=.. ...": bt_ctrl's silent drops */
     lemit();
-    log_cpu30();
-    log_meas();
+    if (last || (s_status_n++ % BENCH_MEAS_EVERY) == 0u) {
+        log_cpu30();
+        log_meas();
+    }
 }
 
 static void act(uint32_t a, uint32_t now)
@@ -317,7 +357,7 @@ static void act(uint32_t a, uint32_t now)
         lemit();
     }
     if (a & BT_BENCH_ACT_STATUS) {
-        log_status(el);
+        log_status(el, 0);
     }
 }
 
@@ -884,7 +924,9 @@ void bt_bench_begin(void)
     uint32_t now = millis();
     bt_bench_run_begin(&s_run, &s_cfg, now);
     s_win1.prev_us = 0u;                     /* CPU windows start with this run (baselines) */
+    s_win1.btc = NULL;
     s_win30.prev_us = 0u;
+    s_status_n = 0u;
     s_cpu1_next = now;
     meas_cpu1(now);
     cpu_take_t c;
@@ -903,7 +945,7 @@ int bt_bench_tick(uint32_t now_ms)
     if (a & BT_BENCH_ACT_EXIT) {
         if (!s_why_time) {
             s_why_time = 1u;
-            log_status(now_ms - s_run.t0);
+            log_status(now_ms - s_run.t0, 1);
             lbegin("exit");
             lks("why", "time");
             lku("ms", now_ms - s_run.t0);
@@ -918,7 +960,7 @@ int bt_bench_tick(uint32_t now_ms)
 }
 
 #define BENCH_TAIL_RECS 2u                   /* finished recordings in the BTBENCH.LOG trailer */
-static char s_tail[1408] BENCH_HI;           /* LOGCAP + final + live + 2 recordings (<= ~390 B each) */
+static char s_tail[1408] BENCH_HI;           /* LOGCAP + final + 2 recordings (<= ~470 B each) */
 
 /* Append the line builder's content (one whole line) to s_tail at tl; a line that does not fit is dropped. */
 static uint32_t tail_add(uint32_t tl)
@@ -953,8 +995,9 @@ int bt_bench_end(exfat_vol_t *vol, int sd_mounted)
     s_in = 0u;
 
     /* The file's trailer: the capture counters, then the F0 measurement summary (the capture keeps the head of a long
-     * run, so these always survive): "BENCH final" (GETS, last CPU window), the running recording (if any) and the
-     * latest finished ones, newest first ("BENCH final rec i=<n|live> <fields>"). */
+     * run, so these always survive): "BENCH final" (GETS, SD errors, last CPU window) and the latest finished
+     * recordings, newest first ("BENCH final rec i=<n> <fields>"). No running one: run_bt_xrec_mode() stops a
+     * recording before it returns, and this runs after it. */
     uint32_t tl = 0u;
     s_ll = 0u;                               /* reuse the line builder for the file's trailer */
     ls("BENCH LOGCAP");
@@ -967,26 +1010,19 @@ int bt_bench_end(exfat_vol_t *vol, int sd_mounted)
     ls("BENCH final ");
     lmeas_cpu();
     lku("recs", g_bench_meas.hist_n);
+    lku("sd_err_tot", g_bench_meas.sd_err_total);   /* SD errors since boot (the recordings carry their own) */
+    lku("sd_mdto_tot", g_bench_meas.sd_mdto_total);
     lc('\n');
     tl = tail_add(tl);
-    for (uint32_t i = 0u; i <= BENCH_TAIL_RECS; i++) {
-        const bench_meas_rec_t *rec;
+    for (uint32_t i = 0u; i < BENCH_TAIL_RECS; i++) {
+        const bench_meas_rec_t *rec = bench_meas_hist(&g_bench_meas, i);
+        if (rec == NULL) {
+            break;
+        }
         s_ll = 0u;
         ls("BENCH final rec i=");
-        if (i == 0u) {
-            if (!g_bench_meas.cur.active) {
-                continue;
-            }
-            rec = &g_bench_meas.cur;
-            ls("live ");
-        } else {
-            rec = bench_meas_hist(&g_bench_meas, i - 1u);
-            if (rec == NULL) {
-                break;
-            }
-            lu(i - 1u);
-            lc(' ');
-        }
+        lu(i);
+        lc(' ');
         lmeas_rec(rec);
         lc('\n');
         tl = tail_add(tl);

@@ -1290,7 +1290,7 @@ static void handle_dbg(xrec_ctx_t *ctx, const char *args)
         send_err(ctx, "ARGS");
         return;
     }
-    /* room for ",<cpu fields>\r\n" is kept by BENCH_MEAS_LINE_MAX (rec ~330 B + cpu ~70 B worst case) */
+    /* room for ",<cpu fields>\r\n" is kept by BENCH_MEAS_LINE_MAX (rec 432 B + cpu 107 B worst case) */
     pos += (int)bench_meas_format_rec(r, ',', &line[pos], (uint32_t)((int)sizeof(line) - pos - 2));
     if (*args == '\0') {
         append_str(line, &pos, (int)sizeof(line) - 2, ",");

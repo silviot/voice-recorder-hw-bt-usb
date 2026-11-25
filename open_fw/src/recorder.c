@@ -21,6 +21,9 @@
 #include "audio_dsp.h"
 #include "openfw_wav.h"
 #include "openfw_bench_meas.h"   /* F0 counters: bench images only (OPENFW_BENCH_MEAS), compiled out otherwise */
+#if OPENFW_BENCH_MEAS
+#include "sl6801_regs.h"         /* OPENFW_IRQ_SAVE for the whole "BENCH rec" line */
+#endif
 
 /* Checkpoint every ~160 KiB (~5s mono / ~2.5s stereo) and after first 4 KiB */
 #define REC_CKPT_INTERVAL_BYTES 163840u
@@ -406,6 +409,19 @@ int recorder_start(exfat_vol_t *vol, int sd_mounted)
     return 0;
 }
 
+#if OPENFW_BENCH_MEAS
+/* The DMA ISR's latest block count and its us_timer stamp, read as a consistent pair (block clock). */
+static void bm_dma_stamp(void)
+{
+    uint32_t f1, us;
+    do {
+        f1 = audio_get_frames();
+        us = audio_bench_dma_us();
+    } while (audio_get_frames() != f1);
+    bench_meas_dma_stamp(&g_bench_meas, f1, us);
+}
+#endif
+
 void recorder_poll(void)
 {
     if (!g_rec_active) {
@@ -455,9 +471,36 @@ void recorder_poll(void)
         }
     }
 #if OPENFW_BENCH_MEAS
+    bm_dma_stamp();
     bench_meas_poll_exit(&g_bench_meas, bm_enter, (uint32_t)us_timer_now(), audio_get_frames());
 #endif
 }
+
+#if OPENFW_BENCH_MEAS
+/* "BENCH rec ..." at every REC stop (docs/BT_HW_RESULTS.md, M2/M3 recipe; read with dev_cycle.py log or +XREC:LOG).
+ * Pushed whole with interrupts off (no task switch: BT tasks log into the same ring), at a line start. */
+static void bm_log_rec(void)
+{
+    static char bm_line[16u + BENCH_MEAS_LINE_MAX];
+    static const char k_tag[] = "BENCH rec ";
+    uint32_t n = 0u;
+    while (k_tag[n] != '\0') {
+        bm_line[n] = k_tag[n];
+        n++;
+    }
+    n += bench_meas_format_rec(&g_bench_meas.cur, ' ', &bm_line[n], (uint32_t)sizeof(bm_line) - n - 1u);
+    bm_line[n++] = '\n';
+    bm_line[n] = '\0';
+    uint32_t pm;
+    OPENFW_IRQ_SAVE(pm);
+    uint32_t w = g_openfw_log.write_idx;
+    if (w != 0u && g_openfw_log.buf[(w - 1u) & (OPENFW_LOG_SIZE - 1u)] != '\n') {
+        openfw_log_putc('\n');   /* another task was mid-line */
+    }
+    openfw_log_puts(bm_line);
+    OPENFW_IRQ_RESTORE(pm);
+}
+#endif
 
 int recorder_stop(void)
 {
@@ -475,14 +518,7 @@ int recorder_stop(void)
     g_rec_active = 0;
 #if OPENFW_BENCH_MEAS
     bench_meas_rec_stop(&g_bench_meas, audio_get_frames(), audio_get_overruns());
-    {
-        /* "BENCH rec ..." (docs/BT_HW_RESULTS.md, M2/M3 recipe): read with dev_cycle.py log or +XREC:LOG */
-        static char bm_line[BENCH_MEAS_LINE_MAX];
-        (void)bench_meas_format_rec(&g_bench_meas.cur, ' ', bm_line, (uint32_t)sizeof(bm_line));
-        openfw_log_puts("BENCH rec ");
-        openfw_log_puts(bm_line);
-        openfw_log_putc('\n');
-    }
+    bm_log_rec();
 #endif
 
     if (fin_rc != 0 || g_rec_error != 0) {
