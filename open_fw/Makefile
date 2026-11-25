@@ -87,6 +87,16 @@ ifneq ($(BENCH),1)
 $(error HP_GATES=1 requires BENCH=1)
 endif
 endif
+# KEYTEST_MISMATCH=1 (with BENCH=1; plan step 6b): stage the session private key with the PUBLIC key of a second,
+# unrelated key pair. If the ROM really uses the staged pair, SSP pairing must fail (DHKey check); if it silently
+# keeps its fixed key, pairing succeeds. Test image only: it can never pair.
+KEYTEST_MISMATCH ?= 0
+ifeq ($(KEYTEST_MISMATCH),1)
+ifneq ($(BENCH),1)
+$(error KEYTEST_MISMATCH=1 requires BENCH=1)
+endif
+CFLAGS   += -DOPENFW_BT_KEYTEST_MISMATCH=1
+endif
 
 LVGL_CFLAGS := --target=thumbv7em-none-eabi -mcpu=cortex-m4 -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb \
                -O2 -ffreestanding -fno-builtin -fno-stack-protector \

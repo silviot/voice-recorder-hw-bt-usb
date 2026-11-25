@@ -308,6 +308,19 @@ static void session_entropy_begin(const uint8_t bd_addr[6])
     uint8_t d[BT_P192_BYTES], q[2u * BT_P192_BYTES];
     uint32_t t0 = millis();
     if (bt_p192_keygen(drbg_rng, NULL, d, q) == 0) {
+#if defined(OPENFW_BT_KEYTEST_MISMATCH) && OPENFW_BT_KEYTEST_MISMATCH
+        {   /* plan step 6b: advertise a valid public key that does NOT belong to d (Makefile KEYTEST_MISMATCH) */
+            uint8_t d2[BT_P192_BYTES];
+            if (bt_p192_keygen(drbg_rng, NULL, d2, q) == 0) {
+                bt_xrec_plat_log("BT KEYTEST: staged public key belongs to another private key; pairing MUST fail");
+            } else {
+                bt_xrec_plat_log("BT KEYTEST: second keygen failed, pair is consistent (test invalid)");
+            }
+            for (size_t i = 0; i < sizeof(d2); i++) {
+                ((volatile uint8_t *)d2)[i] = 0u;
+            }
+        }
+#endif
         bt_rom_real_stage_p192(d, q);
         /* public value only: the top word of X, to compare across sessions and with the ROM's FA2B96D3... */
         uint32_t xhi = (uint32_t)q[20] | ((uint32_t)q[21] << 8) | ((uint32_t)q[22] << 16) | ((uint32_t)q[23] << 24);
