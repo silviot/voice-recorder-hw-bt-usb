@@ -832,6 +832,20 @@ secret of ~33 predictable bits: bench-only waiver, see the review-round entry be
   hpb 0xD52F, bench 0x4FED. Open: A5 XREC TX flow control, C3, A3 key downgrade, A6/A9/C7/C11 OOM paths, C13; hardware:
   C5, headset IO capability (C2/A8), C18 address, A10, A11, Exp 5.
 - 2026-11-25 (`fix/s10-xrec-flow` from `ab27527`): review STEP10 **A5** XREC TX flow control. `xrec_on_rx()` now returns the bytes consumed and, with the new optional `xrec_ops_t.tx_free`, holds back any byte that would produce a reply (line end, PUT header `:`, last PUT payload byte) while the TX ring has less than `XREC_REPLY_MAX` (576 B) free. `bt_xrec_bluedroid.c`: DATA records move into `rx_pend` (bytes stay in the RX ring until parsed) and are parsed before the next event; while a command is held the control events behind it still run, since the WRITE / CONG events among them are what drains TX; held bytes are dropped on close or a new handle; `rx_held` debug counter. Lesson: blocking the head of the event FIFO on TX room would deadlock (TX room comes back only through WRITE_EVT). Legacy `bt_hci.c` path unchanged (`tx_free` 0). Also the C1 residual: `exfat_delete_file()` no longer frees clusters when the shared-cluster scan fails with an I/O error (returns -1, clusters leaked). Tests: `test_core` `test_xrec_flow_control` and the delete-with-I/O-error check, `test_bt_xrec` [6b] (8 pipelined LOG replies against a congested BTC: 4 dropped without the op); all fail without their fix. `xrec_proto.c` and `exfat.c` are in the default image (as is the `bt_hci.c` ops table), so the BT=0 CRC changes: 0xECB8 -> 0x568B (baseline rebuilt in the same worktree path). Gates (0 warnings, all rc=0 incl. QEMU rtos / bt / hciprobe): FIRM CRC def 0x568B, bt 0xEF4C, hp 0x89B0, hpb 0xEBAB, bench 0x8934 (path-dependent, `voice-recorder-hw-bt-usb-xrecflow` worktree).
+- 2026-11-25 (`test/aout-both-mode`, from `ab27527`): **output mode Both** read end to end (Settings row -> `bt_hp_cfg.bin`
+  `out_mode` -> `aout_set_mode` -> `aout_start` route BOTH -> tap -> DAC; player volume split; PA). Mono files after
+  the mono pass-through (`8983cb7`) are fine: the ring stays mono and `hp_sink_tap_peek` expands to L = R for the DAC.
+  Bug found: when the app task is out longer than the DAC's 4 slots last (silicon 300-480 ms), the DAC runs dry while
+  the headset keeps reading; the tap then trails the headset by the whole gap for good, the speaker stays late and the
+  tap holds that backlog in the ring, so the headset's ring shrinks after each gap and starves (23 empty packets in
+  3 s). Fix (`src/audio_out.c` `pump_dac`): with the DAC found dry and a backlog above what its queue takes at once
+  (`AOUT_RESYNC_FRAMES` = 4 x 512), the tap drops it and restarts in step with the headset
+  (`aout_stats_t.dac_resync_frames`). Tests: `test_player_bt` (test-bt-hp) now plays Both with mono and stereo files,
+  headset connected (both outputs complete, sample exact, speaker never ahead of the headset, one volume = bt_vol) and
+  not connected (speaker only, speaker volume), absolute volume (headset gain unity, speaker at bt_vol), and mono with
+  the app task out 400 ms/s (0 empty packets; 23 without the fix). Headphones S1 checks that the mode is saved
+  (byte 5 of `bt_hp_cfg.bin`, only on change). BT=1 only: default image unchanged (0xECB8); gates 0 warnings, bt
+  0xECD8, hp 0xF183, hpb 0xA698, bench 0xC057 (CRCs depend on the worktree path).
 
 ## 11. Round-1 traceability
 

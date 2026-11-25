@@ -42,6 +42,7 @@ Decision key: **accept** (fixed here), **defer** (open, reason given), **reject*
 | C18 | low | all units without an eFuse BD_ADDR share `02:CA:55:00:01:00` | defer, **hardware** | known follow-up: derive from the NOR unique ID (read path to validate on silicon) | - |
 | A10 | low | RF calibration before `bt_xrec_start()` repeats `bt_rom_real`'s and precedes mic entropy collection; start result ignored | defer, **hardware** | RF/mic coupling must be measured on silicon before reordering | - |
 | A11 | low | BTC stack 3072 B unmeasured under streaming + pairing | defer, **hardware** | read the per-task high-water marks (`BT mem` log) during Exp streaming / pairing; raise to 4096 if headroom < 512 B | - |
+| W1 | medium (ours) | output mode **Both** (follow-up check, not a reviewer finding): after a DAC underrun the speaker stayed late for good and the tap's backlog held the ring, so the headset starved after a few app-task gaps (the mono pass-through itself is correct in Both) | accept | `pump_dac`: DAC dry + backlog > 4 x 512 frames -> tap drops it and restarts aligned (`dac_resync_frames`); branch `test/aout-both-mode` | `test_player_bt` Both mono, app task out 400 ms/s: 0 empty packets (23 without) *M*; Both mono/stereo, connected / not, volume split; headphones S1 out_mode saved |
 
 ## Effect on the images
 
