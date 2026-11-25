@@ -3,6 +3,8 @@
 Status: **design approved (decisions in section 5).** S2 tooling implemented on `feat/bt-sync-measure`: F0 counters
 (bench images), `+XREC:DBG`, `tools/bt_sync.py --bench-load`, `tools/rf_audio_check.py`; the M2/M3 run recipe is in
 `docs/BT_HW_RESULTS.md` ("Sync during recording: M2/M3 measurement recipe"). No silicon data yet.
+S3 (firmware hardening for concurrent REC: F1, F1b, F1c, F1d, F4, F6, F7, F8) implemented on
+`feat/bt-sync-rec-hardening`, host-tested; section 4a lists what it does and what M3 must verify on silicon.
 Based on three read-only research passes (throughput, firmware concurrency, app), firmware `feat/bt-step9` @ b3fa6c6, app `feat/recorder-sync`.
 
 User requirement: *sync is extremely slow; when a phone is paired, sync should happen during recording, but must never, ever affect recording quality.*
@@ -223,6 +225,30 @@ Branch: a feature branch off `feat/bt-step9`, committed and pushed at milestones
 | **S4 — app: sync while recording** | A2, A4, A5, A6 (poll trigger), A7, tests | app ~600 LOC + tests | G2: Pixel sync during a 2 h recording in BT mode; M2 C3p passes; overruns 0. |
 | **S5 — background session** | F9, F10, A6 (CDM presence), UI icon + setting (default OFF) | fw ~500–800 LOC, app ~250 LOC | G3: M4 + M5 + M6. Default ON only after this. |
 | **S6 — throughput polish** | F2, F3, F5 (+ app `gmax`), optional page-scan interval via 0C1C | fw ~300 LOC, app ~50 LOC | M1 rerun, M3 rerun at the new rates |
+
+### 4a. S3 as implemented (feat/bt-sync-rec-hardening)
+
+| ID | Where | What it does |
+|---|---|---|
+| F1 | `xrec_proto.c` (ops `rec_channels`, `rec_pending`, `now_us`), `main.c` BT loop | While recording: no XREC command runs and no GETS / LS chunk is read while `audio_ring_pending() != 0` (bytes stay in the RX ring like TX back-pressure); one `xrec_poll` pass reads for <= `XREC_REC_PASS_BUDGET_US` (5000). The BT loop is `recorder_poll(); bt_xrec_poll(); recorder_poll();`. |
+| F1b | `xrec_proto.c` | Token bucket on GETS payload while recording: `XREC_REC_GETS_RATE_BPS` 48000, depth `XREC_REC_GETS_BURST` 2048 (compile-time); bench: `+XREC:DBG,PACE[,<B/s>[,<us>]]`, `bt_sync.py --load-pace`. |
+| F1c | `audio_dma.c` | One 32 KiB buffer: mono 8 x 4 KiB slots (7 queue = 896 ms), stereo 4 x 8 KiB (384 ms). No RAM change. DMAC CH1 (IRQ 61) stays at priority 0x00. |
+| F1d | `main.c` | While recording the BT loop waits one tick (`OPENFW_TASK_WAIT`, woken early by BT) instead of spinning. |
+| F4 | `exfat.c` | Free-cluster cache: first `exfat_stat_fs` after a mount scans, every bitmap change through the volume adjusts it, any bitmap I/O error drops it; MSC is followed by the existing remount. |
+| F6 | `xrec_proto.c`, `bt_xrec_fw.c` | While recording: DEL, PUT REC / CAS / OTA, PUTEND, OTA, PAIR -> `ERR,LATER,30000` (staged uploads kept); RTC set -> `OK,RTC,LATER` (not applied: old apps fail a sync on any ERR to a clock set); bond-file flush deferred to REC end. Stereo: GETS / GET -> LATER, a running stream ends with LATER. |
+| F7 | `xrec_proto.c`, `bt_xrec_fw.c` | GETS / GET of the active file -> `ERR,BUSY`. STAT + `rec_idx`, `pace_ms` (0; mono 342; stereo 30000). `tools/bt_sync.py` and the app's `XrecReplies.status` (numeric fields, size >= 8) accept 10 fields. |
+| F8 | `bt_xrec_bluedroid.c`, `bt_hp_bluedroid.c`, `bt_xrec_fw.c` | A session fault while recording parks: no teardown / ladder / reboot; `bt_ctrl_rtos_hard_stop` + `bt_rom_real_silence`, task supervisor (WDT hold) and hang guard disarmed, no Bluedroid call, no card write, session memory kept, BT start refused. A BT-task assert parks too (the task suspends once parked). The hard path (0xB1 + reboot) runs at the first session poll / stop after REC stops. |
+
+Left for silicon (M3) and later stages:
+- the 5 ms budget and 48000 B/s are host-tested logic only: M3 must show the recorder-loop gap, `poll_max_us`, idle
+  and `wr_max_us` with the pacing on (`--load-pace`), and choose the cap;
+- `bt_rom_real_silence()` while a recording runs (no ROM call, a soft-reset poll) was only ever used on the reboot
+  path: fault injection during REC on the bench (M5) must confirm the recording continues glitch-free;
+- the BT loop now sleeps one tick per pass while recording: confirm with the M3 counters (`gap_max_us`);
+- an assert raised in the app task itself still takes the old hard path (finalise + reboot): its stack is inside a
+  Bluedroid call that cannot be unwound;
+- the session-end bond flush and the headphones settings save still write at the end of a session even if a
+  recording runs (in BT mode the recording is stopped first; on Home this is S5 territory).
 
 Backward compatibility:
 - New app + old open_fw: 64 KiB window works; no STAT fields → today's all-skip-while-recording rule; no LATER/gmax.

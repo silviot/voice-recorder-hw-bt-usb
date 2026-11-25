@@ -1220,6 +1220,14 @@ Laptop side (`tools/bt_sync.py`): `--bench-load SECONDS` holds one link for SECO
 `--load-file NAME` pulls GETS bursts of that `/record` file in a loop (`--load-kbps N` caps the average in KiB/s,
 0 = as fast as the link goes; `--burst-size`, `--chunk-size` as for a sync); `--load-storm S` adds STAT + LS + a DEL
 of a name that does not exist every S s (directory scans, nothing deleted); `--dbg-log FILE` appends every line.
+From stage S3 on (docs/BT_SYNC_SPEED_AND_RECORDING.md F1-F8) the firmware paces itself while recording: GETS
+payload is capped (48000 B/s by default), card reads wait for a drained audio ring and stop after 5 ms per pass,
+STAT reads a cached free count, and a DEL during a recording answers `ERR,LATER` without touching the card (so the
+storm's DEL no longer scans the directory while recording; STAT and LS still run). `--load-pace B` sets that cap
+first (`+XREC:DBG,PACE,<B>`; M3 runs B = 24000 / 48000 / 64000 / 96000) and logs the pacing counters
+(`ring_waits`, `budget_stops`, `cap_stops`, `later`, `busy`, `rec_b`) at the end; `--load-kbps` stays the laptop's
+own cap. Mono capture now queues 7 x 128 ms = 896 ms before an overrun (stereo 384 ms): the M3 gap limit (25 % of
+the ring tolerance) is 224 ms mono, 96 ms stereo. Stereo recordings refuse GETS (`ERR,LATER`): M3 load runs are mono.
 
 Analysis: `tools/rf_audio_check.py` (numpy; `--self-test`, also run by `make -C open_fw test-host` and
 `tools/test_tools.py`) implements the M2 metrics (a)-(e) against the C0 repeats and prints a Markdown table (`--md`,

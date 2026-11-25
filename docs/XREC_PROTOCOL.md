@@ -72,10 +72,20 @@ The earlier clean-room host (`src/bt_hci.c` + `src/bt_spp.c`) was deleted in pla
 ## 5. Authenticated commands (else `+XREC:ERR,LOCKED`)
 
 ### 5.1 STAT, RTC
-* `+XREC:STAT` -> `+XREC:STAT,<bat_pct>,<mV>,<chg 0/1/2>,<vbus 0/1>,<media>,<rec_sec>,<free_mb>,<total_mb>`.
+* `+XREC:STAT` -> `+XREC:STAT,<bat_pct>,<mV>,<chg 0/1/2>,<vbus 0/1>,<media>,<rec_sec>,<free_mb>,<total_mb>,<rec_idx>,<pace_ms>`.
   `chg`: 0 discharging, 1 charging, 2 full. `media`: **33 (0x21) while recording**, else 16 (0x10).
+  `free_mb` comes from a cache kept by the file system (one allocation-bitmap scan per mount): STAT is cheap.
+  * Fields 9 and 10 (sync while recording, section 5.5) are appended and numeric. Parse STAT by position, read the
+    first 8 fields as numbers and ignore further ones. Older open_fw sends 8 fields: then treat the recorder as one
+    that cannot sync while recording (skip every download while `media == 33`).
+  * `rec_idx`: the `NNNN` of the `REC_NNNN.wav` being recorded, 0 = not recording.
+  * `pace_ms`: 0 = no pacing (not recording). Mono recording: the time one 16 KiB GETS window takes at the device's
+    rate cap (342 ms at 48000 B/s); pause about this long between windows. Stereo recording: 30000 (no transfers
+    until the recording stops, see 5.5).
 * `+XREC:RTC` -> `+XREC:RTC,YYYY-MM-DD HH:MM:SS,<wd 0=Mon..6=Sun>`.
-* `+XREC:RTC,y,m,d,h,mi,s,wd` -> `+XREC:OK,RTC` | `ERR,ARGS` | `ERR,RTCRNG` | `ERR,RTC`.
+* `+XREC:RTC,y,m,d,h,mi,s,wd` -> `+XREC:OK,RTC` | `ERR,ARGS` | `ERR,RTCRNG` | `ERR,RTC`. While recording:
+  `+XREC:OK,RTC,LATER`: **the clock is not changed** (set it again after the recording; an `OK` and not an `ERR`
+  because older apps treat any other reply to a clock set as a failed sync).
 
 ### 5.2 LS
 `+XREC:LS` -> zero or more `+XREC:F,<size dec>,<name>` lines, then `+XREC:END`.
@@ -100,20 +110,46 @@ The earlier clean-room host (`src/bt_hci.c` + `src/bt_spp.c`) was deleted in pla
   shorter than requested, e.g. it was replaced after `LS`) ends with one short frame and **no** N = 0 frame: treat a
   frame shorter than the burst's first frame as its end, and a silence after a short first frame as EOF (then ask
   again from the new offset; that burst gets the N = 0 frame).
-* Errors come as text instead of a frame: `+XREC:ERR,<NOENT|NOSD|NAME|ARGS|SDIO>`.
+* Errors come as text instead of a frame: `+XREC:ERR,<NOENT|NOSD|NAME|ARGS|SDIO|BUSY|LATER,<ms>>`. `BUSY`: the
+  file being recorded (never sent; skip it). `LATER,<ms>`: a stereo recording runs (also sent in place of further
+  frames when one starts during a stream); ask again after `<ms>`. See 5.5.
 * Do not send another command while a GETS streams (LS, PUT and GETS cancel it).
-* Recommended: `total = 3840`, `chunk = 640`; verify offset and CRC of every frame; on any error retry from the last
-  good offset (downloads are resumable).
+* `total` may be any size: open_fw streams it with back-pressure (there is no credit window to respect). Use large
+  windows (64 KiB when idle, 16 KiB while recording, docs/BT_SYNC_SPEED_AND_RECORDING.md A1): each GETS costs a
+  round trip and a directory lookup. Stock firmware (`pen133` in `PONG`) needs `total = 3840`. `chunk = 640` (the
+  device lowers it to `MTU - 12`). Verify offset and CRC of every frame; on any error retry from the last good offset
+  (downloads are resumable).
 * `+XREC:GET,<off>,<len <= 640>,<name>` -> one frame.
 
 ### 5.4 DEL, RECSTART / RECSTOP, other
 * `+XREC:DEL,<name>` -> `+XREC:OK,DEL` | `ERR,NOSD` | `ERR,NAME` | `ERR,BUSY` (the file being recorded, or the
-  staging temp of a REC upload in progress) | `ERR,DEL` (missing). Only in `/record`. Deleting a recording
+  staging temp of a REC upload in progress) | `ERR,LATER,<ms>` (another file while recording, 5.5) | `ERR,DEL`
+  (missing). Only in `/record`. Deleting a recording
   `<stem>.wav` also deletes its transcript sidecar `<stem>.cwx` (as the on-device delete does): the recorder reuses
   the number of a deleted newest recording, and the new recording must not inherit the old transcript.
 * `+XREC:RECSTART` -> `+XREC:OK,RECSTART,<name>`; `+XREC:RECSTOP` -> `+XREC:OK,RECSTOP` | `ERR,NOTREC`.
 * `REBOOT`, `DFU`, `OTA`, `LOG`, `RUN`, `DSP` / `GAIN` / `CH` / `VOR`: maintenance and development commands, not
-  needed by a sync client (see `xrec_proto.c`).
+  needed by a sync client (see `xrec_proto.c`). Bench images only (`make BT=1 BENCH=1`): `DBG` (measurement counters)
+  and `DBG,PACE[,<bytes/s>[,<budget us>]]` (read / set the GETS rate cap of 5.5 and its counters:
+  `+XREC:DBG,PACE,rate=..,budget_us=..,ring_waits=..,budget_stops=..,cap_stops=..,later=..,busy=..,rec_b=..`).
+
+### 5.5 While the recorder records (open_fw with STAT field 9)
+The recording always wins (docs/BT_SYNC_SPEED_AND_RECORDING.md): the device never lets a transfer delay it, so a
+client sees slower replies, and some commands wait for the end of the recording.
+* **Recorder first.** A command is taken, and a GETS / LS chunk read from the card, only when the recorder has no
+  audio waiting; one pass reads for at most 5 ms. Replies are later, never lost.
+* **Rate cap (mono).** GETS payload is limited to about 48000 B/s (+ a 2 KiB burst); `pace_ms` says how long a 16 KiB
+  window takes. Downloads of finished recordings continue at that pace.
+* **The active file** (`rec_idx`): `GETS` / `GET` answer `ERR,BUSY`, `DEL` answers `ERR,BUSY`. Skip only that file.
+* **No second card writer.** `DEL` of another file, `PUT` to `REC` / `CAS` / `OTA` (the payload is discarded
+  unparsed), `PUTEND`, `OTA` and `PAIR` answer `+XREC:ERR,LATER,<ms>` (`<ms>` = 30000): nothing changed, ask again
+  after that long, at the latest when `STAT` shows `media != 33`. An upload staged before the recording started is
+  kept and continues with the same chunk after the recording. `PUT ... EXP` (RAM) is unaffected. A clock set answers
+  `OK,RTC,LATER` (not applied). The bond file of a new Bluetooth pairing is written when the recording stops.
+* **Stereo recordings: no transfers.** `GETS` / `GET` answer `ERR,LATER,<ms>`; a stream running when a stereo
+  recording starts ends with `ERR,LATER,<ms>` in place of the next frame. `LS` and `STAT` still answer.
+* Older clients: `LATER` is an unknown reason (the file fails for that sync, nothing is lost); extra STAT fields are
+  ignored by position-based parsers.
 
 ## 6. PUT uploads
 
@@ -121,7 +157,8 @@ The earlier clean-room host (`src/bt_hci.c` + `src/bt_spp.c`) was deleted in pla
 +XREC:PUT,<offset>,<len 1..640>,<crc16 decimal>,<target>:<exactly len raw bytes, no CR>
 ```
 Reply per chunk: `+XREC:OK,PUT,<offset>,<len>`. Errors: `ERR,LOCKED`, `ERR,CRC`, `ERR,OFF`, `ERR,NAME`, `ERR,ARG`,
-`ERR,SDIO`, `ERR,NOSD`, `ERR,UNSUP`, `ERR,NOENT` (REC: no `/record/<stem>.wav`).
+`ERR,SDIO`, `ERR,NOSD`, `ERR,UNSUP`, `ERR,NOENT` (REC: no `/record/<stem>.wav`), `ERR,LATER,<ms>` (recording: resend
+the same chunk after `<ms>`, 5.5).
 
 Client retry policy: resend the same chunk only after a timeout or `ERR,CRC`. `SDIO`, `NOSD`, `LOCKED`, `NOENT` and
 `OFF` are final (after `SDIO` the device has already dropped the staged upload). A late `OK,PUT` for an earlier
@@ -188,8 +225,9 @@ transcript mark in the Files list right away; the player opens the sidecar from 
 
 ### 7.1 Recordings
 `/record/REC_NNNN.wav`, RIFF WAV PCM 16-bit, 16 kHz, mono or stereo (files written by tools may be IMA-ADPCM).
-Ignore files of 44 bytes or less. A file being recorded grows: call `STAT` first and skip downloads while
-`media == 33`. Key sync state on (device address, name, size), optionally plus a hash of the first 4 KiB, because
+Ignore files of 44 bytes or less. A file being recorded grows: call `LS`, then `STAT`. With STAT field 9 (`rec_idx`)
+skip only `REC_<rec_idx>.wav` (the device refuses it anyway, `ERR,BUSY`) and download the others at the paced rate
+(5.5); without it skip every download while `media == 33`. Key sync state on (device address, name, size), optionally plus a hash of the first 4 KiB, because
 numbering restarts after the card is wiped.
 
 ### 7.2 CWX1 format (summary)
