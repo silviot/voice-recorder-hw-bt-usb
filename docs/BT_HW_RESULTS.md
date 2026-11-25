@@ -724,8 +724,8 @@ BT screen opens a 60 s window, BACK leaves BT mode; while a prompt is up ENTER /
   first 0.5 s does nothing; `no` on the laptop while the prompt is up withdraws it; a window that ends during the
   prompt rejects it (`... window closed while waiting for the user`).
 - The XREC PIN on the screen (`PIN NNNNNN` toast, a fresh DRBG value per window without the bench override) works for
-  `--pair`. The toast must show the text, not a `...` pill (fixed for BT=1 images, `make test-host` renders and
-  checks it; the default image on main still has the bug, its toasts show `...`). ENTER again within the first
+  `--pair`. The toast must show the text, not a `...` pill (fixed for every image, BT=0 and BT=1; `make test-host`
+  renders and checks it for both). ENTER again within the first
   ~50 s of a window keeps the same PIN.
 - *Keys around the prompt:* `no` on the laptop and BACK on the device at the same moment: the device stays in BT
   mode (a BACK within 1 s after the prompt ended is swallowed); ENTER twice on the prompt: no new window, no new PIN.

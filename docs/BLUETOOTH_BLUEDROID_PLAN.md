@@ -639,7 +639,8 @@ secret of ~33 predictable bits: bench-only waiver, see the review-round entry be
   after start; BT status line `LONG_DOT`; toast label sized to its text (BT=1 only). Lessons: (a) **every toast in
   every image renders as a "..." pill** (`LV_LABEL_LONG_DOT` on a `LV_SIZE_CONTENT` label dots against the pre-layout
   0 px width) and the old render test only checked the pill's bounds: fixed under `OPENFW_BT_BLUEDROID` here (the
-  default image must not move), **the same fix belongs on main**; `make test-host` now also renders the BT=1 UI and
+  default image must not move), **the same fix belongs on main** (done later: the guard is gone, every image sizes the toast label and
+  `test_ui_render` checks toast text for BT=0 and BT=1); `make test-host` now also renders the BT=1 UI and
   asserts label texts. (b) The ADC analogue state is shared with the PB11 jack detect (`ANA_CTRL0 0x22`, keys.c):
   "power the codec down" must stop at what the capture added. (c) Health tests sized for H = 0.5 on 2-bit symbols
   are blind to anything but a stuck value; a source-specific plausibility check on the raw samples has to sit in
