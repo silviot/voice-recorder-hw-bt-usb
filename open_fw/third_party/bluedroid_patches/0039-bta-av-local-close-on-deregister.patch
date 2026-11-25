@@ -1,0 +1,34 @@
+diff --git a/open_fw/third_party/bluedroid/host/bluedroid/bta/av/bta_av_main.c b/open_fw/third_party/bluedroid/host/bluedroid/bta/av/bta_av_main.c
+index ad04328..a9473f7 100644
+--- a/open_fw/third_party/bluedroid/host/bluedroid/bta/av/bta_av_main.c
++++ b/open_fw/third_party/bluedroid/host/bluedroid/bta/av/bta_av_main.c
+@@ -939,7 +939,29 @@ void bta_av_api_deregister(tBTA_AV_DATA *p_data)
+ 
+     if (p_scb) {
+         p_scb->deregistring = TRUE;
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++        tBTA_AV_HNDL openfw_hndl = p_scb->hndl;
++#endif
+         bta_av_ssm_execute(p_scb, BTA_AV_API_CLOSE_EVT, p_data);
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++        p_scb = bta_av_hndl_to_scb(openfw_hndl);   /* the close above may have freed it (INIT: cleanup) */
++        /* open_fw patch 0039 (docs/BT_A2DP_DESIGN.md §5.2 "patch E"): a stream being deregistered (A2DP deinit) that
++         * is still closing is closed locally at once instead of waiting for the peer: the AVDTP CLOSE / L2CAP
++         * disconnect waits up to BTA_AV_CLOSE_REQ_TIME_VAL (4 s) and L2CAP_CHNL_DISCONNECT_TOUT (10 s). With a frozen
++         * or out-of-range headset the 2 s teardown deadline passed first, BTU stopped before BTA_AV_DISABLE_EVT,
++         * and btc_av kept its "deinit ongoing" statics for the rest of the boot (the next esp_a2d_source_init
++         * failed; test_bt_host_hp hps S10). The requests already sent still go out; the ACL goes when Bluedroid
++         * disables (patch 0026 detaches it). Posted: this runs on BTU, after the state machine step above. */
++        if (p_scb != NULL && p_scb->state == 5 /* BTA_AV_CLOSING_SST: the stream state enum is private to bta_av_ssm.c */) {
++            BT_HDR *p_buf = (BT_HDR *)osi_malloc(sizeof(BT_HDR));
++            if (p_buf != NULL) {
++                memset(p_buf, 0, sizeof(BT_HDR));   /* offset is read as the disconnect reason */
++                p_buf->event = BTA_AV_AVDT_DISCONNECT_EVT;
++                p_buf->layer_specific = p_scb->hndl;
++                bta_sys_sendmsg(p_buf);
++            }
++        }
++#endif
+     } else {
+         bta_av_dereg_comp(p_data);
+     }
