@@ -54,6 +54,13 @@ void bt_bench_cfg_default(bt_bench_cfg_t *cfg)
     for (uint32_t i = 0u; i < sizeof(cfg->xrec_pin); i++) {
         cfg->xrec_pin[i] = '\0';
     }
+    cfg->ui = 1u;
+    cfg->smp = 1u;
+    cfg->coalesce = 0u;
+    cfg->spp_wr = BT_BENCH_SPP_WR_DEF;
+    cfg->spp_buf = BT_BENCH_SPP_BUF_DEF;
+    cfg->tx_ring = BT_BENCH_TX_RING_DEF;
+    cfg->stat_secs = BT_BENCH_STATUS_MS / 1000u;
     cfg->mode = BT_BENCH_MODE_PHONE;
     cfg->hp_stage = BT_BENCH_HP_SCAN;
     cfg->hp_addr_set = 0u;
@@ -177,17 +184,19 @@ const char *bt_bench_hp_stage_name(uint8_t stage)
 
 enum {
     K_SECS = 0, K_PAIR, K_PAIR_EVERY, K_PAIR_SECS, K_AUTOCONFIRM, K_EXIT, K_REBOOT, K_XREC_PIN,
+    K_UI, K_SMP, K_COALESCE, K_SPP_WR, K_SPP_BUF, K_TX_RING, K_STAT_SECS,   /* phone-mode throughput keys */
     K_MODE, K_HP_FIRST,                      /* K_HP_FIRST.. are the hp_* keys (need mode=hp) */
     K_HP_STAGE = K_HP_FIRST, K_HP_ADDR, K_HP_PICK, K_HP_PAIR, K_HP_PSCAN, K_HP_SECS, K_HP_RATE, K_HP_BITPOOL,
     K_HP_SPEECH_BP, K_HP_MONO, K_HP_TICK_MS, K_HP_PKT_PER_TICK, K_HP_TXQ, K_HP_CREDIT_TICKS, K_HP_TONE_HZ, K_HP_FILE,
     K_HP_CREDITS, K_HP_PIN, K_N
 };
 static const char *const k_keys[K_N] = { "secs", "pair", "pair_every", "pair_secs", "autoconfirm", "exit", "reboot",
-                                         "xrec_pin", "mode", "hp_stage", "hp_addr", "hp_pick", "hp_pair", "hp_pscan",
+                                         "xrec_pin", "ui", "smp", "coalesce", "spp_wr", "spp_buf", "tx_ring",
+                                         "stat_secs", "mode", "hp_stage", "hp_addr", "hp_pick", "hp_pair", "hp_pscan",
                                          "hp_secs", "hp_rate", "hp_bitpool", "hp_speech_bp", "hp_mono", "hp_tick_ms",
                                          "hp_pkt_per_tick", "hp_txq", "hp_credit_ticks", "hp_tone_hz", "hp_file",
                                          "hp_credits", "hp_pin" };
-_Static_assert(K_N <= 32, "seen is a 32-bit key mask");
+_Static_assert(K_N <= 64, "seen is a 64-bit key mask");
 
 /* Numeric hp_* keys: range and field. */
 static int hp_num(uint32_t k, int32_t n, bt_bench_cfg_t *c)
@@ -245,14 +254,15 @@ static int hp_num(uint32_t k, int32_t n, bt_bench_cfg_t *c)
 }
 
 /* Cross-key rules of mode=hp (bt_bench.h). Returns 0 when consistent. */
-static int hp_rules(uint32_t seen, bt_bench_cfg_t *c)
+static int hp_rules(uint64_t seen, bt_bench_cfg_t *c)
 {
-#define SEEN(k) ((seen & (1u << (k))) != 0u)
-    uint32_t hp_keys = ~((1u << K_HP_FIRST) - 1u);
+#define SEEN(k) ((seen & (1ull << (k))) != 0u)
+    uint64_t hp_keys = ~((1ull << K_HP_FIRST) - 1u);
     if (c->mode != BT_BENCH_MODE_HP) {
         return (seen & hp_keys) != 0u ? -1 : 0;
     }
-    if (SEEN(K_PAIR) || SEEN(K_PAIR_EVERY) || SEEN(K_AUTOCONFIRM) || SEEN(K_XREC_PIN)) {
+    if (SEEN(K_PAIR) || SEEN(K_PAIR_EVERY) || SEEN(K_AUTOCONFIRM) || SEEN(K_XREC_PIN) || SEEN(K_UI) || SEEN(K_SMP) ||
+        SEEN(K_COALESCE) || SEEN(K_SPP_WR) || SEEN(K_SPP_BUF) || SEEN(K_TX_RING) || SEEN(K_STAT_SECS)) {
         return -1;                                       /* phone-session overrides */
     }
     if (c->hp_stage >= BT_BENCH_HP_CONNECT && !c->hp_addr_set && !c->hp_pick_first && !c->hp_pick_last) {
@@ -288,7 +298,8 @@ static int hp_rules(uint32_t seen, bt_bench_cfg_t *c)
 
 bt_bench_err_t bt_bench_parse(const uint8_t *buf, uint32_t len, bt_bench_cfg_t *cfg, uint32_t *err_at)
 {
-    uint32_t i = 0u, seen = 0u;
+    uint32_t i = 0u;
+    uint64_t seen = 0u;
     bt_bench_cfg_t c;
     bt_bench_cfg_default(&c);
     if (err_at != NULL) {
@@ -338,10 +349,10 @@ bt_bench_err_t bt_bench_parse(const uint8_t *buf, uint32_t len, bt_bench_cfg_t *
         if (k == K_N) {
             return BT_BENCH_E_KEY;
         }
-        if (seen & (1u << k)) {
+        if (seen & (1ull << k)) {
             return BT_BENCH_E_DUP;
         }
-        seen |= 1u << k;
+        seen |= 1ull << k;
         const uint8_t *v = &buf[eq + 1u];
         uint32_t vn = i - eq - 1u;
         int32_t n = number(v, vn);
@@ -424,6 +435,44 @@ bt_bench_err_t bt_bench_parse(const uint8_t *buf, uint32_t len, bt_bench_cfg_t *
             }
             c.pair_secs = (uint16_t)n;
             break;
+        case K_UI:
+        case K_SMP:
+        case K_COALESCE:
+            if (n != 0 && n != 1) {
+                return BT_BENCH_E_VALUE;
+            }
+            if (k == K_UI) {
+                c.ui = (uint8_t)n;
+            } else if (k == K_SMP) {
+                c.smp = (uint8_t)n;
+            } else {
+                c.coalesce = (uint8_t)n;
+            }
+            break;
+        case K_SPP_WR:
+            if (n < 64 || n > (int32_t)BT_BENCH_SPP_WR_DEF) {
+                return BT_BENCH_E_VALUE;
+            }
+            c.spp_wr = (uint16_t)n;
+            break;
+        case K_SPP_BUF:
+            if (n < (int32_t)BT_BENCH_SPP_BUF_MIN || n > (int32_t)BT_BENCH_SPP_BUF_MAX) {
+                return BT_BENCH_E_VALUE;
+            }
+            c.spp_buf = (uint16_t)n;
+            break;
+        case K_TX_RING:
+            if (n != 2048 && n != 4096 && n != 8192) {
+                return BT_BENCH_E_VALUE;
+            }
+            c.tx_ring = (uint16_t)n;
+            break;
+        case K_STAT_SECS:
+            if (n < 10 || n > 300) {
+                return BT_BENCH_E_VALUE;
+            }
+            c.stat_secs = (uint16_t)n;
+            break;
         case K_EXIT:
             if (!word_is(v, vn, "auto")) {
                 return BT_BENCH_E_VALUE;
@@ -455,7 +504,7 @@ bt_bench_err_t bt_bench_parse(const uint8_t *buf, uint32_t len, bt_bench_cfg_t *
             break;
         }
     }
-    if (((c.pair_every != 0u || c.xrec_pin[0] != '\0') && !c.pair) || hp_rules(seen, &c) != 0) {
+    if (((c.pair_every != 0u || c.xrec_pin[0] != '\0') && !c.pair) || c.spp_buf < c.spp_wr || hp_rules(seen, &c) != 0) {
         if (err_at != NULL) {
             *err_at = 0u;
         }
@@ -556,12 +605,17 @@ const char *bt_bench_err_name(bt_bench_err_t e)
     return "?";
 }
 
+static uint32_t status_ms(const bt_bench_cfg_t *c)
+{
+    return c->stat_secs != 0u ? (uint32_t)c->stat_secs * 1000u : BT_BENCH_STATUS_MS;
+}
+
 void bt_bench_run_begin(bt_bench_run_t *r, const bt_bench_cfg_t *cfg, uint32_t now)
 {
     r->cfg = *cfg;
     r->t0 = now;
     r->next_pair = cfg->pair ? 0u : NONE;
-    r->next_status = BT_BENCH_STATUS_MS;
+    r->next_status = status_ms(&r->cfg);
     r->pairs = 0u;
     r->exited = 0u;
 }
@@ -589,7 +643,7 @@ uint32_t bt_bench_run_tick(bt_bench_run_t *r, uint32_t now)
     if (el >= r->next_status) {
         act |= BT_BENCH_ACT_STATUS;
         while (r->next_status <= el) {
-            r->next_status += BT_BENCH_STATUS_MS;
+            r->next_status += status_ms(&r->cfg);
         }
     }
     return act;

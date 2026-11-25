@@ -30,6 +30,7 @@
 #define BT_XREC_SPP_TX_BUF     2048u   /* esp_spp_cfg_t.tx_buffer_size: BTC's per-connection ring */
 #define BT_XREC_INFLIGHT_MAX   BT_XREC_SPP_TX_BUF  /* written but not yet reported by ESP_SPP_WRITE_EVT */
 #define BT_XREC_WRITE_MAX      990u    /* one esp_spp_write() (ESP_SPP_MAX_MTU) */
+#define BT_XREC_BENCH_TX_RING_MAX 8192u   /* bench images: TX ring allocated for bt_xrec_set_bench_tput() */
 #define BT_XREC_EVQ_SLOTS      32u     /* GAP/SPP event records (DATA/WRITE coalesce, so this only holds control events) */
 #define BT_XREC_SPP_SCN        1u      /* RFCOMM channel 1: tools/bt_sync.py connects to it directly (no SDP) */
 #define BT_XREC_SPP_NAME       "Cassini"  /* legacy SDP ServiceName (src/bt_spp.c:352) */
@@ -117,6 +118,27 @@ typedef struct {
     uint32_t close_retries;      /* esp_spp_disconnect() retried after a refusal (review STEP10 C11) */
 } bt_xrec_debug_t;
 void bt_xrec_get_debug(bt_xrec_debug_t *out);
+
+/* ---- BENCH images only (make BT=1 BENCH=1; SD:/BTBENCH.RUN phone keys, docs/BT_SYNC_THROUGHPUT.md) ----
+ * TX path knobs for the sync-throughput A/B runs. Defaults = the release constants. Set before the SPP connection
+ * (bt_bench_begin, right after bt_xrec_start): refused while TX data is queued. wr_max 64..990, spp_buf wr_max..9900
+ * (BTC ring and in-flight cap), tx_ring 2048/4096/8192, coalesce 0|1 (send only full wr_max writes while a GETS keeps
+ * producing). NULL restores the defaults. App task. */
+typedef struct {
+    uint16_t wr_max;
+    uint16_t spp_buf;
+    uint16_t tx_ring;
+    uint8_t  coalesce;
+} bt_xrec_bench_tput_t;
+void bt_xrec_set_bench_tput(const bt_xrec_bench_tput_t *t);
+void bt_xrec_set_bench_clock_us(uint32_t (*now_us)(void));   /* xrec_poll timing + coalesce wait bound; NULL = off */
+typedef struct {
+    uint32_t tx_used, tx_size, inflight, inflight_cap, handle;
+    uint8_t  cong, gets, conn;
+    uint32_t xrec_us, xrec_n;   /* cumulative: time in xrec_poll (GETS: SD read + CRC + framing), calls */
+    uint32_t co_waits, co_forced, wr_wrap;   /* coalesce holds, 5 ms forced short writes, writes cut by the ring wrap */
+} bt_xrec_bench_tput_snap_t;
+void bt_xrec_bench_tput_snap(bt_xrec_bench_tput_snap_t *o);   /* any task: racy reads, diagnostics only */
 
 /* ---- local pairing prompt (plan M4 "Pairing security policy"; replaces interim deviation 1) ----
  * An SSP numeric comparison that arrives inside the user-opened pairing window is held for the local user: the BT

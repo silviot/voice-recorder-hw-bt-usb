@@ -114,10 +114,34 @@ ifeq ($(HCI_PROBE),1)
 FW_PORT_SRCS += $(PROBE_SRCS)
 else
 FW_PORT_SRCS += $(XREC_SRCS) $(ROOT)/bt_port/bt_xrec_spp_mtu.c $(ROOT)/bt_port/bt_xrec_bond.c
+ifeq ($(BENCH),1)
+# bench sampler's RFCOMM / L2CAP reads (Bluedroid internals: vendored-code warning set, like bt_xrec_spp_mtu.c)
+FW_PORT_SRCS += $(ROOT)/bt_port/bt_bench_probe.c
+endif
 $(XREC_OBJS): CFLAGS += -Wextra $(BENCH_FLAGS)
 $(XREC_OBJS): $(BENCH_STAMP)
 endif
 FW_PORT_OBJS := $(patsubst $(ROOT)/%.c,$(BUILD_DIR)/%.o,$(FW_PORT_SRCS))
+# ACL_CREDITS=n (bench images only, 4..9; sync-throughput investigation docs/BT_SYNC_THROUGHPUT.md): the 1005
+# HC_Total_Num_ACL_Data_Packets bt_ctrl reports and enforces. Every port object sees it (bt_ctrl, the 1005 reply, the
+# headphones clamp, the bench sampler); the stamp rebuilds them when it changes in the same BUILD_DIR.
+ACL_CREDITS ?=
+ifneq ($(ACL_CREDITS),)
+ifneq ($(BENCH),1)
+$(error ACL_CREDITS requires BENCH=1)
+endif
+ifeq ($(filter 4 5 6 7 8 9,$(ACL_CREDITS)),)
+$(error ACL_CREDITS must be 4..9 (the ROM's EM TX pool is 9 buffers))
+endif
+ACL_FLAGS := -DBT_CTRL_H2C_ACL_CREDITS=$(ACL_CREDITS)u
+endif
+ACL_STAMP := $(BUILD_DIR)/.acl_flags
+$(FW_PORT_OBJS): CFLAGS += $(ACL_FLAGS)
+$(FW_PORT_OBJS): $(ACL_STAMP)
+$(ACL_STAMP): probe-flags-force
+	@mkdir -p $(dir $@)
+	@printf '%s\n' '$(ACL_FLAGS)' > $@.tmp
+	@if cmp -s $@.tmp $@ 2>/dev/null; then rm -f $@.tmp; else mv $@.tmp $@; fi
 # QEMU-only checks (open_fw/Makefile test-qemu-hciprobe*): waive the IRQ-26 liveness check / run without the SD request
 # file. Both 0 for every silicon image. The stamp rebuilds the probe objects when they change in the same BUILD_DIR.
 HCI_PROBE_WAIVE_LIVENESS ?= 0

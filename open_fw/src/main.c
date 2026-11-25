@@ -1477,8 +1477,15 @@ static void bench_hp_play_tick(uint32_t now_ms)
         keys_inject(KEY_BACK, 0u);
     }
 }
+/* Phone-mode loop profile and the ui=0 knob (sync-throughput investigation, docs/BT_SYNC_THROUGHPUT.md). */
+#define BT_PROF_T(v)         uint32_t v = (uint32_t)us_timer_now()
+#define BT_PROF_ADD(slot, v) bt_bench_prof_add((slot), (uint32_t)us_timer_now() - (v))
+#define BT_BENCH_UI_ON()     bt_bench_ui()
 #else
 #define OPENFW_BT_BENCH 0
+#define BT_PROF_T(v)         do { } while (0)
+#define BT_PROF_ADD(slot, v) do { } while (0)
+#define BT_BENCH_UI_ON()     1
 #endif
 
 #if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID && !(defined(OPENFW_HCI_PROBE) && OPENFW_HCI_PROBE)
@@ -1597,9 +1604,14 @@ static void run_bt_xrec_mode(void)
 #endif
     /* Home consumed the opening ENTER edge. Keep subsequent queued taps. */
     while (1) {
+        BT_PROF_T(pf_loop);
         wdt_feed();
+        BT_PROF_T(pf_xrec);
         bt_xrec_poll();
+        BT_PROF_ADD(BT_BENCH_PROF_XREC, pf_xrec);
+        BT_PROF_T(pf_rec);
         recorder_poll();
+        BT_PROF_ADD(BT_BENCH_PROF_REC, pf_rec);
 
         /* Keep remote settings when the REC switch hands control to the menu. */
         if (g_ui.cfg.mic_gain != recorder_get_gain() ||
@@ -1667,7 +1679,11 @@ static void run_bt_xrec_mode(void)
             break;
         }
 #endif
-        if ((uint32_t)(now - last_ui) >= 150u || last_ui == 0u) {
+        BT_PROF_T(pf_ui);
+        if (((uint32_t)(now - last_ui) >= 150u || last_ui == 0u) && !BT_BENCH_UI_ON()) {
+            last_ui = now;                   /* bench ui=0: charge management only, no telemetry/status/render */
+            pmu_poll_charge_manage();
+        } else if ((uint32_t)(now - last_ui) >= 150u || last_ui == 0u) {
             last_ui = now;
             pmu_poll_charge_manage();
 
@@ -1730,20 +1746,27 @@ static void run_bt_xrec_mode(void)
                 ui_render_screen(UI_SCR_BT, &g_ui);
             }
         }
+        BT_PROF_ADD(BT_BENCH_PROF_UI, pf_ui);
 
         /* Sleep via WFI when idle (woken immediately by RW-BT IRQ or 1 ms SysTick) */
         if (!keys_event_pending() && !recorder_is_saving()) {
             bt_status_t cur_st;
             bt_xrec_get_status(&cur_st);
             if (cur_st.rx_acl_pkts == iter_rx && cur_st.tx_acl_pkts == iter_tx) {
+                BT_PROF_T(pf_wait);
                 OPENFW_TASK_WAIT();
+                BT_PROF_ADD(BT_BENCH_PROF_WAIT, pf_wait);
             } else {
                 iter_rx = cur_st.rx_acl_pkts;
                 iter_tx = cur_st.tx_acl_pkts;
             }
         }
+        BT_PROF_ADD(BT_BENCH_PROF_LOOP, pf_loop);
     }
 
+#if OPENFW_BT_BENCH
+    bt_bench_loop_exit();                /* the sampler reads Bluedroid state: stopped before the stack goes */
+#endif
     keys_ignore_held();
     if (recorder_is_saving()) {
         (void)recorder_stop();

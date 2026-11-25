@@ -57,10 +57,20 @@ typedef struct {
     uint32_t val;          /* DATA/WRITE: bytes; CFM_REQ: number; SRV_OPEN: peer MTU */
 } ev_t;
 
+/* Bench images allocate the largest TX ring bt_xrec_set_bench_tput() can select, plus a staging buffer for
+ * coalesced writes (docs/BT_SYNC_THROUGHPUT.md); a release image keeps BT_XREC_TX_RING and no staging buffer. */
+#if BENCH_IMAGE
+#define TX_RING_ALLOC BT_XREC_BENCH_TX_RING_MAX
+#else
+#define TX_RING_ALLOC BT_XREC_TX_RING
+#endif
 typedef struct {
     xrec_ctx_t xrec;
     uint8_t    rx[BT_XREC_RX_RING];
-    uint8_t    tx[BT_XREC_TX_RING];
+    uint8_t    tx[TX_RING_ALLOC];
+#if BENCH_IMAGE
+    uint8_t    stage[BT_XREC_WRITE_MAX];
+#endif
 } bufs_t;
 
 typedef struct {
@@ -158,6 +168,18 @@ void bt_xrec_set_ssp_auto_accept(int on)
 #if BENCH_IMAGE
 static volatile uint8_t s_bench_autoconfirm;   /* BENCH ONLY (bt_xrec_set_bench_autoconfirm); outside s: survives start */
 static char s_bench_pin[8];                     /* BENCH ONLY (bt_xrec_set_bench_xrec_pin): "" = DRBG PIN; app task */
+/* BENCH ONLY (bt_xrec_set_bench_tput): TX path knobs of the sync-throughput investigation; defaults = release. */
+static bt_xrec_bench_tput_t s_bench_tput = {
+    BT_XREC_WRITE_MAX, BT_XREC_SPP_TX_BUF, BT_XREC_TX_RING, 0u,
+};
+static uint32_t (*volatile s_bench_clock_us)(void);   /* BENCH ONLY: xrec_poll timing, coalesce wait bound */
+static volatile uint8_t s_bench_gets;                 /* xrec_proto has a GETS stream running (app task writes) */
+static uint32_t s_bench_xrec_us, s_bench_xrec_n, s_bench_co_waits, s_bench_co_forced, s_bench_wr_wrap;
+static uint32_t s_bench_co_t0;                        /* clock when the current coalesce wait began (0 = none) */
+#define TXSZ ((uint32_t)s_bench_tput.tx_ring)
+#endif
+#if !BENCH_IMAGE
+#define TXSZ BT_XREC_TX_RING
 #endif
 static volatile uint8_t s_spp_init_posted;
 
@@ -168,6 +190,8 @@ static volatile uint32_t s_inflight_max = BT_XREC_INFLIGHT_MAX;
 #define INFLIGHT_MAX s_inflight_max
 void bt_xrec_test_set_inflight_max(uint32_t n);
 void bt_xrec_test_set_inflight_max(uint32_t n) { s_inflight_max = n != 0u ? n : BT_XREC_INFLIGHT_MAX; }
+#elif BENCH_IMAGE
+#define INFLIGHT_MAX ((uint32_t)s_bench_tput.spp_buf)
 #else
 #define INFLIGHT_MAX BT_XREC_INFLIGHT_MAX
 #endif
@@ -623,13 +647,22 @@ static void tx_kick(void)
 {
     while (s.conn_open && !s.conn_closing && !s.cong && s.tx_head != s.tx_tail) {
         uint32_t used = s.tx_head - s.tx_tail;
-        uint32_t off = s.tx_tail & (BT_XREC_TX_RING - 1u);
-        uint32_t n = BT_XREC_TX_RING - off;
+        uint32_t off = s.tx_tail & (TXSZ - 1u);
+        uint32_t n = TXSZ - off;
+#if BENCH_IMAGE
+        uint32_t wr_max = s_bench_tput.wr_max;
+        uint8_t co = s_bench_tput.coalesce;
+        if (co) {
+            n = used;                 /* staged copy below: the ring wrap does not split a write */
+        }
+#else
+        const uint32_t wr_max = BT_XREC_WRITE_MAX;
+#endif
         if (n > used) {
             n = used;
         }
-        if (n > BT_XREC_WRITE_MAX) {
-            n = BT_XREC_WRITE_MAX;
+        if (n > wr_max) {
+            n = wr_max;
         }
         uint32_t cap = INFLIGHT_MAX;
         if (s.inflight >= cap) {
@@ -641,7 +674,42 @@ static void tx_kick(void)
         if (n == 0u) {
             return;              /* resumes on ESP_SPP_WRITE_EVT */
         }
-        esp_err_t r = esp_spp_write(s.conn_handle, (int)n, &s.b->tx[off]);
+        const uint8_t *src = &s.b->tx[off];
+#if BENCH_IMAGE
+        if (!co && n < used && n == TXSZ - off) {
+            s_bench_wr_wrap++;   /* a write cut short by the ring wrap */
+        }
+        if (co) {
+            /* Coalesce (bench knob): send full wr_max writes while more GETS data is coming, so every RFCOMM frame is
+             * as large as possible. A shorter write goes out when the producer is idle or blocked (ring full), or after
+             * 5 ms (clock only); an in-flight cap shortfall waits for the next ESP_SPP_WRITE_EVT. */
+            uint32_t (*clk)(void) = s_bench_clock_us;
+            if (n < wr_max) {
+                bool more = s_bench_gets && s.b->xrec.gets_active && TXSZ - used >= 12u + XREC_MAX_CHUNK;
+                bool capped = n < used && s.inflight > 0u;
+                if (more || capped) {
+                    uint32_t now = clk != NULL ? clk() : 0u;
+                    if (clk == NULL || s_bench_co_t0 == 0u || now - s_bench_co_t0 < 5000u) {
+                        if (s_bench_co_t0 == 0u && clk != NULL) {
+                            s_bench_co_t0 = now != 0u ? now : 1u;
+                        }
+                        s_bench_co_waits++;
+                        return;      /* xo_send / the next poll / ESP_SPP_WRITE_EVT kicks again */
+                    }
+                    s_bench_co_forced++;
+                }
+            }
+            s_bench_co_t0 = 0u;
+            uint32_t first = TXSZ - off;
+            if (first > n) {
+                first = n;
+            }
+            memcpy(s.b->stage, &s.b->tx[off], first);
+            memcpy(&s.b->stage[first], &s.b->tx[0], n - first);
+            src = s.b->stage;
+        }
+#endif
+        esp_err_t r = esp_spp_write(s.conn_handle, (int)n, (uint8_t *)src);
         if (r == ESP_OK) {       /* BTC copied the bytes into its ring (btc_spp.c esp_spp_write CB mode) */
             s.tx_tail += n;
             s.inflight += n;
@@ -674,12 +742,12 @@ static int xo_send(void *user, const uint8_t *data, uint16_t len)
         return -1;
     }
     uint32_t used = s.tx_head - s.tx_tail;
-    if ((uint32_t)len > BT_XREC_TX_RING - used) {
+    if ((uint32_t)len > TXSZ - used) {
         s.d.tx_busy++;
         return -1;               /* all-or-nothing, like S:845 bt_spp_send: xrec_proto retries LS/GETS next poll */
     }
-    uint32_t off = s.tx_head & (BT_XREC_TX_RING - 1u);
-    uint32_t first = BT_XREC_TX_RING - off;
+    uint32_t off = s.tx_head & (TXSZ - 1u);
+    uint32_t first = TXSZ - off;
     if (first > len) {
         first = len;
     }
@@ -694,7 +762,7 @@ static int xo_send(void *user, const uint8_t *data, uint16_t len)
 static uint32_t xo_tx_free(void *user)
 {
     (void)user;
-    return BT_XREC_TX_RING - (s.tx_head - s.tx_tail);
+    return TXSZ - (s.tx_head - s.tx_tail);
 }
 
 static uint16_t xo_get_mtu(void *user)
@@ -1423,7 +1491,11 @@ static void config_begin(void)
     memset(&cfg, 0, sizeof(cfg));
     cfg.mode = ESP_SPP_MODE_CB;
     cfg.enable_l2cap_ertm = false;              /* basic mode, as the legacy RFCOMM (S:) and the desktop tools */
+#if BENCH_IMAGE
+    cfg.tx_buffer_size = s_bench_tput.spp_buf;
+#else
     cfg.tx_buffer_size = BT_XREC_SPP_TX_BUF;
+#endif
 
     set_state(BT_XREC_ST_CONFIG);
     if ((r = esp_bt_gap_register_callback(gap_cb)) != ESP_OK ||
@@ -1863,8 +1935,25 @@ void bt_xrec_poll(void)
         return;                                  /* close_retry_poll() faulted the session */
     }
     if (s.conn_open && s.conn_authorized && !s.conn_closing) {
+#if BENCH_IMAGE
+        uint32_t (*clk)(void) = s_bench_clock_us;
+        uint32_t t0 = clk != NULL ? clk() : 0u;
+        s_bench_gets = s.b->xrec.gets_active;
         xrec_poll(&s.b->xrec);
+        s_bench_gets = s.b->xrec.gets_active;
+        if (clk != NULL) {
+            s_bench_xrec_us += clk() - t0;
+        }
+        s_bench_xrec_n++;
+#else
+        xrec_poll(&s.b->xrec);
+#endif
     }
+#if BENCH_IMAGE
+    else {
+        s_bench_gets = 0u;
+    }
+#endif
     tx_kick();
     xrec_reset_flush();
 
@@ -2069,6 +2158,52 @@ void bt_xrec_set_bench_autoconfirm(int on)
                         : "BT SSP BENCH autoconfirm off");
 }
 
+void bt_xrec_set_bench_tput(const bt_xrec_bench_tput_t *t)
+{
+    bt_xrec_bench_tput_t d = { BT_XREC_WRITE_MAX, BT_XREC_SPP_TX_BUF, BT_XREC_TX_RING, 0u };
+    if (t != NULL) {
+        bool ok = t->wr_max >= 64u && t->wr_max <= BT_XREC_WRITE_MAX &&
+                  t->spp_buf >= t->wr_max && t->spp_buf <= ESP_SPP_MAX_TX_BUFFER_SIZE &&
+                  (t->tx_ring == 2048u || t->tx_ring == 4096u || t->tx_ring == 8192u) &&
+                  t->tx_ring <= BT_XREC_BENCH_TX_RING_MAX && t->coalesce <= 1u;
+        if (!ok) {
+            bt_xrec_plat_log("BT XREC BENCH tput refused (out of range): defaults kept");
+        } else if (s.tx_head != s.tx_tail || s.inflight != 0u) {
+            bt_xrec_plat_log("BT XREC BENCH tput refused (TX busy): defaults kept");
+        } else {
+            d = *t;
+        }
+    }
+    s_bench_tput = d;
+    s_bench_co_t0 = 0u;
+}
+
+void bt_xrec_set_bench_clock_us(uint32_t (*now_us)(void))
+{
+    s_bench_clock_us = now_us;
+}
+
+/* Racy reads from another task (the bench sampler): diagnostics only. */
+void bt_xrec_bench_tput_snap(bt_xrec_bench_tput_snap_t *o)
+{
+    if (o == NULL) {
+        return;
+    }
+    o->tx_used = s.tx_head - s.tx_tail;
+    o->tx_size = TXSZ;
+    o->inflight = s.inflight;
+    o->inflight_cap = INFLIGHT_MAX;
+    o->cong = s.cong;
+    o->gets = s_bench_gets;
+    o->conn = (uint8_t)(s.conn_open && !s.conn_closing);
+    o->handle = o->conn ? s.conn_handle : 0u;
+    o->xrec_us = s_bench_xrec_us;
+    o->xrec_n = s_bench_xrec_n;
+    o->co_waits = s_bench_co_waits;
+    o->co_forced = s_bench_co_forced;
+    o->wr_wrap = s_bench_wr_wrap;
+}
+
 void bt_xrec_set_bench_xrec_pin(const char *pin6)
 {
     bool ok = pin6 != NULL;
@@ -2121,6 +2256,7 @@ void bt_xrec_test_reset(void)
 #if BENCH_IMAGE
     s_bench_autoconfirm = 0u;
     memset(s_bench_pin, 0, sizeof(s_bench_pin));
+    bt_xrec_set_bench_tput(NULL);
 #endif
     s_spp_init_posted = 0u;
 }

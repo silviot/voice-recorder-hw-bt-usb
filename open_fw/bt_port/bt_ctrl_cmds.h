@@ -27,7 +27,9 @@ typedef struct {
 
 /* ---- synthesized constants (BT_CTRL_OPCODE_TABLE.md §8 tail) ---- */
 #define BT_CTRL_H2C_ACL_LEN          1021u   /* 1005 HC_ACL_Data_Packet_Length */
+#ifndef BT_CTRL_H2C_ACL_CREDITS          /* bench images may override: make BT=1 BENCH=1 ACL_CREDITS=n (4..9) */
 #define BT_CTRL_H2C_ACL_CREDITS      4u      /* 1005 HC_Total_Num_ACL_Data_Packets; <= EM TX pool (Exp 1 C) */
+#endif
 #define BT_CTRL_C2H_ACL_LEN          1021u   /* enforced from 0C33 */
 #define BT_CTRL_C2H_ACL_CREDITS      4u      /* enforced from 0C33 */
 #define BT_CTRL_HCI_VERSION          0x06u

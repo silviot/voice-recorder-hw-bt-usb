@@ -420,6 +420,7 @@ esp_err_t esp_spp_disconnect(uint32_t handle)
 static uint8_t m_wire[1 << 16];
 static uint32_t m_wire_len, m_btc_used, m_btc_cap = 100000u;
 static int m_writes, m_upper_cong, m_write_calls_after_stop;
+static uint32_t m_write_max;   /* longest esp_spp_write() since the last reset (bench TX knobs test) */
 static esp_err_t m_write_err = ESP_OK;
 static int m_stopped;
 esp_err_t esp_spp_write(uint32_t handle, int len, uint8_t *data)
@@ -440,6 +441,9 @@ esp_err_t esp_spp_write(uint32_t handle, int len, uint8_t *data)
     }
     memcpy(&m_wire[m_wire_len], data, (size_t)len);
     m_wire_len += (uint32_t)len;
+    if ((uint32_t)len > m_write_max) {
+        m_write_max = (uint32_t)len;
+    }
     m_btc_used += (uint32_t)len;
     m_writes++;
     return ESP_OK;
@@ -668,6 +672,7 @@ static void mocks_reset(void)
     m_wire_len = m_btc_used = 0u;
     m_btc_cap = 100000u;
     m_writes = m_upper_cong = m_write_calls_after_stop = 0;
+    m_write_max = 0u;
     m_write_err = ESP_OK;
     m_stopped = 0;
     for (uint32_t i = 0; i < sizeof(m_logbuf); i++) {
@@ -2156,6 +2161,60 @@ static void t_session6_review(void)
     stop_ok();
 }
 
+/* Bench TX knobs (sync-throughput investigation, bt_xrec_set_bench_tput): the write cap, the BTC ring size handed to
+ * esp_spp_enhanced_init, the TX ring size, staged (coalesced) writes that cross the ring wrap without a cut, and the
+ * range check. LOG replies stand in for GETS frames (no volume here): the stream must stay byte-exact. */
+static void t_bench_tput(void)
+{
+    printf("[25] bench TX knobs: write cap, BTC ring, TX ring, staged writes across the wrap, range check\n");
+    for (int co = 0; co <= 1; co++) {
+        mocks_reset();
+        bt_xrec_bench_tput_t t = { 300u, 3960u, (uint16_t)(co ? 4096u : 2048u), (uint8_t)co };
+        bt_xrec_set_bench_tput(&t);
+        bring_up();
+        CHECK(m_spp_cfg.tx_buffer_size == 3960u, "BTC ring = spp_buf (%u)", (unsigned)m_spp_cfg.tx_buffer_size);
+        pair_and_auth();
+        wire_clear();
+        m_write_max = 0u;
+        bt_xrec_bench_tput_snap_t x0;
+        bt_xrec_bench_tput_snap(&x0);       /* the counters are cumulative: deltas below */
+        for (uint32_t k = 0u; k < 8u; k++) {
+            char cmd[48];
+            snprintf(cmd, sizeof(cmd), "+XREC:LOG,%u,512\r\n", (unsigned)(k * 512u));
+            rx(H1, cmd);
+            bt_xrec_poll();
+            btc_drain(H1, m_btc_used, 100000u);
+            bt_xrec_poll();
+        }
+        btc_drain(H1, m_btc_used, 100000u);
+        bt_xrec_poll();
+        CHECK(check_log_frames(0u, 8) == 0, "co=%d: 8 LOG replies intact and in order (%d)", co,
+              check_log_frames(0u, 8));
+        CHECK(m_write_max <= 300u && m_write_max >= 200u, "co=%d: writes capped at spp_wr (max %u)", co,
+              (unsigned)m_write_max);
+        bt_xrec_bench_tput_snap_t x;
+        bt_xrec_bench_tput_snap(&x);
+        CHECK(x.tx_size == (co ? 4096u : 2048u) && x.inflight_cap > 0u && x.conn == 1u && x.handle == H1,
+              "co=%d: snapshot (ring %u, conn %u)", co, (unsigned)x.tx_size, (unsigned)x.conn);
+        if (co) {
+            CHECK(x.wr_wrap == x0.wr_wrap, "staged writes are never cut by the ring wrap (%u)",
+                  (unsigned)(x.wr_wrap - x0.wr_wrap));
+        } else {
+            CHECK(x.wr_wrap > x0.wr_wrap, "2048 B ring: some writes end at the wrap (%u)",
+                  (unsigned)(x.wr_wrap - x0.wr_wrap));
+        }
+        stop_ok();
+    }
+    mocks_reset();
+    bt_xrec_bench_tput_t bad = { 300u, 200u, 2048u, 0u };   /* spp_buf below spp_wr */
+    bt_xrec_set_bench_tput(&bad);
+    bring_up();
+    CHECK(m_spp_cfg.tx_buffer_size == BT_XREC_SPP_TX_BUF, "out-of-range knobs refused: release BTC ring (%u)",
+          (unsigned)m_spp_cfg.tx_buffer_size);
+    stop_ok();
+    bt_xrec_set_bench_tput(NULL);
+}
+
 int main(int argc, char **argv)
 {
     m_verbose = argc > 1 && strcmp(argv[1], "-v") == 0;
@@ -2183,6 +2242,7 @@ int main(int argc, char **argv)
     t_scan_refused_retry();
     t_session6_name_and_link();
     t_session6_review();
+    t_bench_tput();
     bt_xrec_test_reset();
     printf("test_bt_xrec: %d checks, %d failures\n", g_checks, g_fails);
     return g_fails == 0 ? 0 : 1;
