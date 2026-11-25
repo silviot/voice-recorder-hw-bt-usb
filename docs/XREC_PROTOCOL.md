@@ -64,7 +64,7 @@ The earlier clean-room host (`src/bt_hci.c` + `src/bt_spp.c`) was deleted in pla
 
 | Command | Reply |
 | :--- | :--- |
-| `+XREC:PING` | `+XREC:PONG,openfw_v5,v5,bound=<0\|1>,auth=<0\|1>,pair=<0\|1>` (`pair` = XREC PIN window open) |
+| `+XREC:PING` | `+XREC:PONG,openfw_v5,v5,bound=<0\|1>,auth=<0\|1>,pair=<0\|1>,rec=1` (`pair` = XREC PIN window open; then capability flags: `rec=1` = the `PUT ... REC,<stem>.cwx` sidecar target exists. Parse `key=value` fields and ignore unknown keys; firmware without the flag has no REC target) |
 | `+XREC:PAIR,<6 digits>,<64 hex>` | `+XREC:OK,PAIR`, or `ERR,PAIRCLOSED`, `ERR,PIN` (5 failures close the window), `ERR,BADKEY`, `ERR,SAVE` (key not written to the card; old binding kept) |
 | `+XREC:CHAL` | `+XREC:CHAL,<32 lowercase hex nonce>` (16 bytes). If the entropy pool is not ready: no reply and the link is closed |
 | `+XREC:AUTH,<64 hex>` | HMAC-SHA256(key, nonce bytes): `+XREC:OK,AUTH`, or `ERR,UNBOUND`, `ERR,NOCHAL` (one AUTH per CHAL), `ERR,AUTH` |

@@ -831,6 +831,7 @@ static void t_pairing_and_data(void)
     uint32_t rx0 = status().rx_acl_pkts;
     rx(H1, "+XREC:PING\r\n");
     CHECK(wire_has("+XREC:PONG,openfw_v5,v5,bound=0,auth=0,pair=1"), "PONG on the wire");
+    CHECK(wire_has("+XREC:PONG,openfw_v5,v5,bound=0,auth=0,pair=1,rec=1\r\n"), "PONG advertises the REC sidecar target");
     CHECK(status().rx_acl_pkts == rx0 + 1u && status().tx_acl_pkts >= 1u, "activity counters");
     wire_clear();
     char cmd[128];

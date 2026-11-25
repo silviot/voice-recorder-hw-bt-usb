@@ -382,7 +382,8 @@ static void handle_ping(xrec_ctx_t *ctx)
     append_u32(buf, &pos, (int)sizeof(buf), ctx->auth ? 1u : 0u);
     append_str(buf, &pos, (int)sizeof(buf), ",pair=");
     append_u32(buf, &pos, (int)sizeof(buf), ctx->pair_active ? 1u : 0u);
-    append_str(buf, &pos, (int)sizeof(buf), "\r\n");
+    /* capability flags (clients parse key=value and ignore unknown keys): rec=1 = PUT target REC,<stem>.cwx */
+    append_str(buf, &pos, (int)sizeof(buf), ",rec=1\r\n");
     send_text(ctx, buf, pos);
 }
 
