@@ -288,6 +288,31 @@ Findings:
 - **Player starvation**: the tone path (same ring, resampler, SBC) has pads 0; the player stage has ~20 % padding
   packets, i.e. audible gaps. Under investigation on `fix/hp-player-starve`.
 
+## Session 9 (2026-11-25): user headset (Jabra Hear Me Out) after the rate/quality fixes
+
+Image: bench `BT=1 BENCH=1 HP_GATES=1` from `integ/bt-all-local` `d6ca189` (FIRM version `0x0B03`). Fixes under
+test: mono source writes on the headset route, `.bt_fast` SRAM section, `HP_CREDIT_TICKS` 4, SMLADX resampler,
+`bt_ctrl` in SRAM, advertised max bitpool 53 (was 35), names/toasts UX (`d6ca189`).
+
+Run: `mode=hp hp_stage=player hp_addr=08:C8:C2:82:6C:EB hp_pair=1 secs=60`, headset in pairing mode, no stored key.
+
+| Item | Result |
+|---|---|
+| pairing | SSP Just Works, `auth st=0 key=4`, connected 4.3 s after start |
+| name | `name saved ... name=Jabra Hear Me Out` (remote name request after auth) |
+| codec | 48 kHz, `bp=53 bp_eff=53`, 7 frames/packet |
+| rate | `sbc` 378-399 frames/s per 1 s window (real time = 375; before the fixes 362.8 = 96.7 %) |
+| gaps | `pads=2` in the first second, then `pads=0`; `lost=0 drop=0` |
+| CPU | idle 6-16 %; BTC_TASK (SBC) 28-34 %, app (player) 22-32 %, bt_ctrl 13-17 %, BTU 8-12 %, hciT 4-7 % |
+| bt_ctrl split (per s) | ROM ISR ~48 ms, ROM kernel 5-8 ms, glue 44-56 ms over ~1750 runs |
+| listening | user: "It worked nicely. I think. I can hear it" |
+
+Notes:
+- `BTBENCH.LOG` (8 KiB) filled after ~11 s of play (`LOGCAP lost=8416`); the per-second `cpu`/`tasks`/`ctrl`
+  lines use ~600 B/s. Use `secs=15` for measurement runs; longer runs only for listening.
+- Still to check on this image through the normal UI (no RUN file): Forget row shows the name, `BT` output with
+  the headset, `Both` output (speaker + headset), `BT` output with the headset off shows the toast.
+
 ## Exp 1 stages A and B: how to run
 
 Probe image for plan M5 Exp 1 stage A and stage B (step 4): `bt_ctrl` (plan M1) drives the real RW-BT ROM through
