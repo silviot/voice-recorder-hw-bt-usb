@@ -272,6 +272,11 @@ uint32_t       audio_get_frames(void);
 const int16_t *audio_pop_frame(uint32_t *out_bytes);
 int            audio_pop_frame_copy(int16_t *dst, uint32_t max_bytes, uint32_t *out_bytes);
 uint32_t       audio_get_overruns(void);
+/* 128 ms blocks the ISR completed that the recorder has not taken yet (0 when capture is off): background work
+ * (XREC GETS / LS while recording) runs only when this is 0 (docs/BT_SYNC_SPEED_AND_RECORDING.md F1). */
+uint32_t       audio_ring_pending(void);
+/* Ring slots of the current (or last) capture: 8 mono, 4 stereo; slots - 1 may queue before an overrun (F1c). */
+uint32_t       audio_ring_slots(void);
 
 /* Audio DAC0+DAC1 Stereo Headphone + Built-in Speaker PA (PB30) + DMAC CH0 TX (audio_dac.c) */
 void     audio_pll_set(uint32_t sample_rate);

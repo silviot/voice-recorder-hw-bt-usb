@@ -543,20 +543,42 @@ static void test_audio_dma(void)
     assert(f1 != NULL && nbytes == 4096u && f1[0] == 4100);
     assert(audio_pop_frame(&nbytes) == NULL);
 
-    /* Ring overrun test: > 3 unconsumed frames drops oldest (4200), keeping 4300, 4400, 4500 */
-    sim_dma_deliver_frame(4200, 16384, NULL);
-    sim_dma_deliver_frame(4300, 16384, NULL);
-    sim_dma_deliver_frame(4400, 16384, NULL);
+    /* Ring overrun test (F1c, docs/BT_SYNC_SPEED_AND_RECORDING.md): mono has 8 slots of 128 ms in the same 32 KiB,
+     * one reserved for the DMAC, so 7 unconsumed blocks (896 ms) queue without loss; the 8th drops the oldest (4200) */
+    assert(audio_ring_slots() == 8u && audio_ring_pending() == 0u);
+    for (int32_t k = 0; k < 7; k++) {
+        sim_dma_deliver_frame(4200 + 100 * k, 16384, NULL);   /* 4200 .. 4800 */
+        assert(audio_ring_pending() == (uint32_t)k + 1u);
+    }
     assert(audio_get_overruns() == 0u);
-    sim_dma_deliver_frame(4500, 16384, NULL);
-    assert(audio_get_overruns() == 1u);
+    {
+        /* the 7 queued slots and the DMAC's next one are 8 distinct 4 KiB slots inside the one 32 KiB buffer */
+        const uint8_t *dma_next = (const uint8_t *)g_soc.dmac_buf[1];
+        uint32_t peek_n = 0u;
+        const int16_t *q[7];
+        for (int k = 0; k < 7; k++) {
+            q[k] = audio_pop_frame(&nbytes);
+            assert(q[k] != NULL && nbytes == 4096u && q[k][0] == 4200 + 100 * k);
+            assert((const uint8_t *)q[k] != dma_next);
+            for (int j = 0; j < k; j++) {
+                intptr_t d = (const uint8_t *)q[k] - (const uint8_t *)q[j];
+                assert(d >= 4096 || d <= -4096);
+            }
+            peek_n++;
+        }
+        assert(peek_n == 7u && audio_pop_frame(&nbytes) == NULL && audio_ring_pending() == 0u);
+    }
+    for (int32_t k = 0; k < 8; k++) {
+        sim_dma_deliver_frame(5000 + 100 * k, 16384, NULL);   /* 5000 .. 5700: one more than fits */
+    }
+    assert(audio_get_overruns() == 1u && audio_ring_pending() == 7u);
 
     const int16_t *r0 = audio_pop_frame(&nbytes);
-    const int16_t *r1 = audio_pop_frame(&nbytes);
-    const int16_t *r2 = audio_pop_frame(&nbytes);
-    assert(r0 != NULL && r0[0] == 4300);
-    assert(r1 != NULL && r1[0] == 4400);
-    assert(r2 != NULL && r2[0] == 4500);
+    assert(r0 != NULL && r0[0] == 5100);                      /* 5000 was dropped */
+    for (int32_t k = 2; k < 8; k++) {
+        const int16_t *rk = audio_pop_frame(&nbytes);
+        assert(rk != NULL && rk[0] == 5000 + 100 * k);
+    }
     assert(audio_pop_frame(&nbytes) == NULL);
 
     /* Race-free audio_pop_frame_copy(): preserves FIFO order when 3 slots queued */
@@ -581,7 +603,24 @@ static void test_audio_dma(void)
 
     g_soc.dmac_regs[1][9] |= 0x02u; /* Transfer complete */
     DMAC_CH1_IRQHandler();
-    assert(audio_get_frames() == 9u);
+    assert(audio_get_frames() == 20u);
+    assert(audio_ring_pending() == 0u);            /* capture off: nothing pending for the XREC gate */
+
+    /* Stereo keeps 4 slots of 8 KiB (384 ms of queue) in the same buffer: 3 queue, the 4th drops the oldest */
+    assert(audio_capture_start_ex(24u, 2u) == 0);
+    assert(audio_ring_slots() == 4u);
+    for (int32_t k = 0; k < 3; k++) {
+        sim_dma_deliver_stereo_frame(6000 + 100 * k, 0, 0, 0);
+    }
+    assert(audio_get_overruns() == 0u && audio_ring_pending() == 3u);
+    sim_dma_deliver_stereo_frame(6300, 0, 0, 0);
+    assert(audio_get_overruns() == 1u && audio_ring_pending() == 3u);
+    for (int32_t k = 1; k < 4; k++) {
+        const int16_t *sk = audio_pop_frame(&nbytes);
+        assert(sk != NULL && nbytes == 8192u && sk[0] == 6000 + 100 * k);
+    }
+    assert(audio_pop_frame(&nbytes) == NULL);
+    audio_capture_stop();
     printf("[OK] audio_dma MMIO + DMAC CH1 ring + audio_pop_frame_copy + on-demand AC VU\n");
 }
 
