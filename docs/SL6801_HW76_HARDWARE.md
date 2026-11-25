@@ -86,6 +86,14 @@ Whether the jack's 4th (mic/button) contact is wired to anything readable is sti
 
 How to read the log: a wired button line shows up as a KADC channel (other than K1, the key ladder) with `D`/`U` edges at the prompt times, roughly 4-5 in total. If those edges appear only in phases B/C, the line needs MICBIAS. A `G<port>` bit that toggles at the prompts, or `AE` codec events at the prompts that do not follow one mux value, also count. Edges that only appear with PB11 analog (phase C), or `P` changes at the prompts, point at the jack-detect switch, not a button line. If nothing correlates with the prompts, while the plug state reads `YES` and the user pressed, there is no readable button line on this board through these paths.
 
+**Result (silicon, 2026-11-25, wired earbuds with an in-line button, plug detected `hp_detect=1`, five presses at the prompts): no readable button line.**
+- KADC: K1 (key ladder) stayed at idle, 4063-4077, except one rise at 148 ms (boot). K0, K3, K5, K6 and K9 were flat, with no drops or rises. K2, K4, K7 and K8 are floating or noisy: about 200 edges per phase, with the same rate inside and outside the prompt windows. The 1 Hz snapshots show no change at 5, 12, 16, 23 or 27 s.
+- PB11 (jack detect): no change in any phase, low 100 % of the time. No GPIO bit changed on ports A-D.
+- Codec mux 0..15 with MICBIAS on: one `AE` event, the capture start transient at 10.15 s, and none at the prompts. That holds in phase C too, with PB11 on analog mux 15.
+- `HINT candidates=none`. The self-check restored every register (`DIFF` only on `ADC_START` / `ADC_FIFO`, which the codec start changes by design).
+
+Conclusion: the jack's 4th (mic/button) contact is not routed to anything that firmware can read on HW_76, so wired-remote buttons cannot be supported. Headset control is possible only over Bluetooth (AVRCP keys, already handled by the player). Raw log: `HSPROBE.LOG` from that run (12.6 KB, not committed).
+
 ---
 
 ## 4. Audio Subsystem
