@@ -555,19 +555,36 @@ def execute_flash_plan(
     flash_id = _with_retries(client, "read_id", client.read_id, retries)
     print(f"BootROM SPI NOR ID: 0x{flash_id:08X}", file=out)
 
-    for start, length in ranges:
-        # 1. Erase every 4 KiB sector in range
-        for sec_off in range(start, start + length, SECTOR_SIZE):
-            _with_retries(
-                client,
-                f"erase_4k@0x{sec_off:06X}",
-                lambda o=sec_off: client.erase_4k(o),
-                retries,
-            )
-            stats["sectors_erased"] += 1
+    BOOT_HEADER_OFFSET = 0x00D000
 
-        # 2. Program chunks in order
+    # 1. Erase every 4 KiB sector across all ranges, invalidating the boot
+    #    header sector (0x00D000) first so any interrupted flash falls back
+    #    to 301a:2800 BootROM mode even when PD0 sits on an ADC button ladder.
+    erase_sectors: list[int] = []
+    for start, length in ranges:
+        for sec_off in range(start, start + length, SECTOR_SIZE):
+            erase_sectors.append(sec_off)
+    if BOOT_HEADER_OFFSET in erase_sectors:
+        erase_sectors.remove(BOOT_HEADER_OFFSET)
+        erase_sectors.insert(0, BOOT_HEADER_OFFSET)
+
+    for sec_off in erase_sectors:
+        _with_retries(
+            client,
+            f"erase_4k@0x{sec_off:06X}",
+            lambda o=sec_off: client.erase_4k(o),
+            retries,
+        )
+        stats["sectors_erased"] += 1
+
+    # 2. Program all payload chunks first, deferring the boot header sector
+    #    (0x00D000..0x00DFFF) to the very end ("header-last" power-safe order).
+    deferred_header_chunks: list[int] = []
+    for start, length in ranges:
         for off in range(start, start + length, chunk):
+            if BOOT_HEADER_OFFSET <= off < BOOT_HEADER_OFFSET + SECTOR_SIZE:
+                deferred_header_chunks.append(off)
+                continue
             data = expected_sector_data(image, off, chunk)
             _with_retries(
                 client,
@@ -578,6 +595,18 @@ def execute_flash_plan(
             stats["chunks_written"] += 1
             stats["bytes_written"] += len(data)
 
+    for off in deferred_header_chunks:
+        data = expected_sector_data(image, off, chunk)
+        _with_retries(
+            client,
+            f"write_page@0x{off:06X}",
+            lambda o=off, d=data: client.write_page(o, d),
+            retries,
+        )
+        stats["chunks_written"] += 1
+        stats["bytes_written"] += len(data)
+
+    for start, length in ranges:
         # 3. Verify both hardware CRC-16 and exact byte readback
         if verify:
             exp = expected_sector_data(image, start, length)

@@ -939,6 +939,11 @@ void usb_msc_poll(void)
             }
             openfw_mmio_wr16(MUSB_RXCSR_ADDR, (uint16_t)(openfw_mmio_rd16(MUSB_RXCSR_ADDR) & ~0x0001u)); /* Clear RxPktRdy */
             usb_msc_on_rx_packet(&g_msc, g_usb_pkt, cnt);
+            /* Zero CBW signature bytes so stale RX buffer contents can never replay a SCSI command */
+            g_usb_pkt[0] = 0u;
+            g_usb_pkt[1] = 0u;
+            g_usb_pkt[2] = 0u;
+            g_usb_pkt[3] = 0u;
             g_rx_pkts++;
             g_rx_bytes += (uint64_t)cnt;
         }

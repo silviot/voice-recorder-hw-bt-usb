@@ -1779,6 +1779,111 @@ static void test_usb_msc(void)
     printf("  [PASS] usb_msc (SCSI INQUIRY, TUR, READCAP, WRITE10, READ10, ZLP, Ho>Do, PhaseErr, SENSE)\n");
 }
 
+static int msc_host_read_sectors(void *ctx, uint32_t lba, uint32_t count, void *buf)
+{
+    usb_msc_state_t *st = (usb_msc_state_t *)ctx;
+    uint8_t *out = (uint8_t *)buf;
+    uint32_t rem = count;
+    uint32_t cur_lba = lba;
+    while (rem > 0u) {
+        uint32_t chunk = (rem > 8u) ? 8u : rem;
+        uint8_t rd_cdb[10] = { 0x28u, 0u };
+        put_be32(&rd_cdb[2], cur_lba);
+        put_be16(&rd_cdb[7], (uint16_t)chunk);
+        uint8_t status = 0xFFu;
+        uint32_t res = 0u, got = 0u;
+        scsi_xfer(st, 500u + cur_lba, 0x80u, rd_cdb, 10u, NULL, out, chunk * 512u, &status, &res, &got);
+        if (status != 0u || res != 0u || got != chunk * 512u) {
+            return -1;
+        }
+        cur_lba += chunk;
+        out += chunk * 512u;
+        rem -= chunk;
+    }
+    return 0;
+}
+
+static void test_exfat_usb_msc_sha256_parity(void)
+{
+    /* Write a multi-sector file via local exFAT, then read the entire filesystem
+     * back through USB MSC READ(10) and verify exact SHA-256 parity (Betaflight #5838 guard). */
+    memset(g_disk, 0, sizeof(g_disk));
+    g_disk[510] = 0x55u;
+    g_disk[511] = 0xAAu;
+    g_disk[0x1BEu + 4u] = 0x07u;
+    put_le32(&g_disk[0x1BEu + 8u], 4u);
+    put_le32(&g_disk[0x1BEu + 12u], MEM_DISK_SECTORS - 4u);
+
+    uint8_t *vbr = &g_disk[4u * 512u];
+    memcpy(&vbr[3], "EXFAT   ", 8u);
+    put_le64(&vbr[0x40], 4u);
+    put_le64(&vbr[0x48], MEM_DISK_SECTORS - 4u);
+    put_le32(&vbr[0x50], 12u);
+    put_le32(&vbr[0x54], 4u);
+    put_le32(&vbr[0x58], 16u);
+    put_le32(&vbr[0x5C], 64u);
+    put_le32(&vbr[0x60], 2u);
+    vbr[0x6C] = 9u;
+    vbr[0x6D] = 0u;
+    vbr[510]  = 0x55u;
+    vbr[511]  = 0xAAu;
+
+    uint8_t *fat = &g_disk[16u * 512u];
+    put_le32(fat + 0u * 4u, 0xFFFFFFF8u);
+    put_le32(fat + 1u * 4u, 0xFFFFFFFFu);
+    put_le32(fat + 2u * 4u, 0xFFFFFFFFu);
+    put_le32(fat + 3u * 4u, 0xFFFFFFFFu);
+
+    uint8_t *bmp_ent = &g_disk[20u * 512u];
+    bmp_ent[0] = 0x81u;
+    bmp_ent[1] = 0x00u;
+    put_le32(bmp_ent + 20u, 3u);
+    put_le64(bmp_ent + 24u, 8u);
+    g_disk[21u * 512u] = 0x03u;
+
+    blkdev_t local_dev = { mem_read_sectors, mem_write_sectors, MEM_DISK_SECTORS, NULL };
+    exfat_vol_t local_vol;
+    assert(exfat_mount(&local_vol, &local_dev) == 0);
+    assert(exfat_mkdir(&local_vol, "record") == 0);
+
+    static uint8_t payload[10000];
+    for (uint32_t i = 0u; i < sizeof(payload); i++) {
+        payload[i] = (uint8_t)((i * 73u + 19u) ^ (i >> 5));
+    }
+    uint8_t sha_written[32];
+    openfw_sha256(payload, (uint32_t)sizeof(payload), sha_written);
+
+    exfat_writer_t wr;
+    assert(exfat_create_file(&local_vol, "/record", "REC_PARITY.WAV", &wr) == 0);
+    assert(exfat_write(&wr, payload, (uint32_t)sizeof(payload)) == 0);
+    assert(exfat_checkpoint_file(&wr, payload, 44u) == 0);
+    assert(exfat_close_file(&wr) == 0);
+
+    /* Expose the same backing store over USB MSC (High-Speed 512 B MPS) */
+    usb_msc_state_t msc;
+    usb_msc_init_state(&msc, &local_dev);
+    usb_msc_set_max_packet(&msc, 512u);
+
+    blkdev_t msc_dev = { msc_host_read_sectors, NULL, MEM_DISK_SECTORS, &msc };
+    exfat_vol_t host_vol;
+    assert(exfat_mount(&host_vol, &msc_dev) == 0);
+
+    exfat_entry_t ent;
+    assert(exfat_find_path(&host_vol, "/record/REC_PARITY.WAV", &ent) == 0);
+    assert(ent.size == sizeof(payload));
+
+    static uint8_t readback[10000];
+    uint32_t nread = 0u;
+    assert(exfat_read_file(&host_vol, &ent, 0u, readback, (uint32_t)sizeof(readback), &nread) == 0);
+    assert(nread == sizeof(payload));
+
+    uint8_t sha_msc[32];
+    openfw_sha256(readback, nread, sha_msc);
+    assert(memcmp(sha_written, sha_msc, 32u) == 0);
+
+    printf("  [PASS] exfat_usb_msc_sha256_parity (10000 B exFAT write == USB MSC READ10 SHA-256)\n");
+}
+
 typedef struct {
     blkdev_t *dev;
     int       start_calls;
@@ -3122,6 +3227,7 @@ int main(int argc, char **argv)
     test_apmem_policy();
     test_apmem_storage();
     test_usb_msc();
+    test_exfat_usb_msc_sha256_parity();
     test_usb_msc_async_pingpong();
     test_usb_msc_vendor_e0();
     test_xrec_flow_control();
