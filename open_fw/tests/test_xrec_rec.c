@@ -25,10 +25,20 @@
 
 static char     g_out[16384];
 static uint32_t g_out_len;
+static uint32_t g_tx_room_cap;   /* 0 = unlimited; else all-or-nothing send limit (like bt_xrec_bluedroid xo_send) */
+
+static uint32_t fake_tx_free(void *user)
+{
+    (void)user;
+    return g_tx_room_cap ? g_tx_room_cap : 65536u;
+}
 
 static int cap_send(void *user, const uint8_t *data, uint16_t len)
 {
     (void)user;
+    if (g_tx_room_cap != 0u && len > g_tx_room_cap) {
+        return -1;
+    }
     assert(g_out_len + len < sizeof(g_out));
     memcpy(&g_out[g_out_len], data, len);
     g_out_len += len;
@@ -203,6 +213,7 @@ int main(int argc, char **argv)
     xrec_ops_t ops;
     memset(&ops, 0, sizeof(ops));
     ops.send = cap_send;
+    ops.tx_free = fake_tx_free;
     ops.now_ms = fake_now;
     xrec_init(&g_x, &g_vol, &ops, NULL);
     xrec_set_bound_key(&g_x, g_key);
@@ -587,6 +598,33 @@ int main(int argc, char **argv)
         assert(strcmp(cmd("+XREC:DBG,REC,0,1"), "+XREC:ERR,ARGS\r\n") == 0);
         assert(strcmp(cmd("+XREC:DBG,FOO"), "+XREC:ERR,ARGS\r\n") == 0);
         assert(strcmp(cmd("+XREC:DBGX"), "+XREC:ERR,CMD\r\n") == 0);
+        /* Worst-case +XREC:DBG,LIVE with exactly XREC_REPLY_MAX bytes free in the TX ring must not be dropped */
+        {
+            bench_meas_rec_t *wr = &g_bench_meas.cur;
+            memset(wr, 0xFF, sizeof(*wr));
+            memcpy(wr->file, "ABCDEFGHIJKLMNO", 16u);
+            wr->idle_min_pm = 65534u;
+            wr->dma_blk = 0x1FFFFFu;
+            wr->ov = 4000000000u;
+            wr->comp = 1000000000u;
+            wr->wav_frames = 3219126272u;
+            wr->el_ms = 134217600u;
+            wr->el_us_rem = 0u;
+            wr->b_el_ms = 134217600u;
+            wr->b_el_us_rem = 0u;
+            wr->b_first_blk = 0u;
+            wr->b_last_blk = 0x1FFFFFu;
+            g_bench_meas.take_max_us = 0xFFFFFFFFu;
+            g_bench_meas.gets_b_total = g_bench_meas.gets_frames_total = 0xFFFFFFFFu;
+            g_bench_meas.idle_pm = g_bench_meas.app_pm = g_bench_meas.btc_pm = 0xFFFFu;
+            g_bench_meas.cpu_win_ms = 0xFFFFu;
+            g_tx_room_cap = XREC_REPLY_MAX;
+            r = cmd("+XREC:DBG");
+            g_tx_room_cap = 0u;
+            n = strlen(r);
+            assert(n > 0u && n <= XREC_REPLY_MAX && strncmp(r, "+XREC:DBG,LIVE,", 15) == 0);
+            assert(strstr(r, ",take_us=4294967295\r\n") != NULL);
+        }
         xrec_on_disconnect(&g_x);                            /* a new link: DBG needs AUTH like every data command */
         assert(strcmp(cmd("+XREC:DBG"), "+XREC:ERR,LOCKED\r\n") == 0);
         authenticate();

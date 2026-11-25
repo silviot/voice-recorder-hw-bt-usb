@@ -1266,11 +1266,12 @@ static void handle_log_cmd(xrec_ctx_t *ctx, const char *args)
  *                       +XREC:ERR,NOENT when there is none (BENCH_MEAS_HIST are kept) */
 static void handle_dbg(xrec_ctx_t *ctx, const char *args)
 {
-    char line[24u + BENCH_MEAS_LINE_MAX];
+    _Static_assert(24u + BENCH_MEAS_LINE_MAX <= XREC_REPLY_MAX, "+XREC:DBG reply must fit XREC_REPLY_MAX");
+    char line[XREC_REPLY_MAX + 1u];
     int pos = 0;
     const bench_meas_rec_t *r = &g_bench_meas.cur;
     if (*args == '\0') {
-        append_str(line, &pos, (int)sizeof(line), "+XREC:DBG,LIVE,");
+        append_str(line, &pos, (int)XREC_REPLY_MAX - 1, "+XREC:DBG,LIVE,");
     } else if (str_starts_with(args, ",REC,")) {
         const char *p = args + 5;
         uint32_t i = 0u;
@@ -1283,18 +1284,18 @@ static void handle_dbg(xrec_ctx_t *ctx, const char *args)
             send_err(ctx, "NOENT");
             return;
         }
-        append_str(line, &pos, (int)sizeof(line), "+XREC:DBG,REC,");
-        append_u32(line, &pos, (int)sizeof(line), i);
-        append_str(line, &pos, (int)sizeof(line), ",");
+        append_str(line, &pos, (int)XREC_REPLY_MAX - 1, "+XREC:DBG,REC,");
+        append_u32(line, &pos, (int)XREC_REPLY_MAX - 1, i);
+        append_str(line, &pos, (int)XREC_REPLY_MAX - 1, ",");
     } else {
         send_err(ctx, "ARGS");
         return;
     }
-    /* room for ",<cpu fields>\r\n" is kept by BENCH_MEAS_LINE_MAX (rec 432 B + cpu 107 B worst case) */
-    pos += (int)bench_meas_format_rec(r, ',', &line[pos], (uint32_t)((int)sizeof(line) - pos - 2));
+    /* Cap at XREC_REPLY_MAX - 2 before "\r\n" (rec 457 B + ',' + cpu 110 B = 568 B, reply <= 585 B <= 600 B) */
+    pos += (int)bench_meas_format_rec(r, ',', &line[pos], (uint32_t)XREC_REPLY_MAX - 1u - (uint32_t)pos);
     if (*args == '\0') {
-        append_str(line, &pos, (int)sizeof(line) - 2, ",");
-        pos += (int)bench_meas_format_cpu(&g_bench_meas, ',', &line[pos], (uint32_t)((int)sizeof(line) - pos - 2));
+        append_str(line, &pos, (int)XREC_REPLY_MAX - 1, ",");
+        pos += (int)bench_meas_format_cpu(&g_bench_meas, ',', &line[pos], (uint32_t)XREC_REPLY_MAX - 1u - (uint32_t)pos);
     }
     line[pos++] = '\r';
     line[pos++] = '\n';

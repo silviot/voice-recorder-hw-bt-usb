@@ -41,7 +41,7 @@
 #define BENCH_MEAS_RATE_HZ      16000u
 #define BENCH_MEAS_HIST         8u         /* finished recordings kept */
 #define BENCH_MEAS_NONE16       0xFFFFu    /* idle_min_pm: no CPU window during the recording */
-#define BENCH_MEAS_LINE_MAX     560u       /* longest formatted line (fits one XREC reply: 576 B) */
+#define BENCH_MEAS_LINE_MAX     576u       /* longest formatted line (rec 457 B + ',' + cpu 110 B = 568 B < 576 B) */
 
 typedef struct {
     uint32_t seq;           /* recording number since boot (1..), 0 = none yet */
