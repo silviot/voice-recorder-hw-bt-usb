@@ -369,7 +369,8 @@ static const struct { ui_bt_str_id_t id; uint8_t kind; } k_bt_kinds[] = {
     { UI_BT_STR_HP_FORGOTTEN, BK_FOOT },      { UI_BT_STR_LINK_STALLED_RECONN, BK_FOOT },
     { UI_BT_STR_HP_NOT_READY, BK_TOAST },     { UI_BT_STR_NOT_IN_BUILD, BK_FOOT },
     { UI_BT_STR_HP_NOT_CONNECTED, BK_TOAST }, { UI_BT_STR_HP_PAUSED, BK_TOAST },
-    { UI_BT_STR_LOWBATT_BT_OFF, BK_TOAST },
+    { UI_BT_STR_LOWBATT_BT_OFF, BK_TOAST },   { UI_BT_STR_HP_PAIR_AGAIN, BK_FOOT },
+    { UI_BT_STR_HP_SPK_ONLY, BK_TOAST },
 };
 
 static void check_bt_i18n(void)

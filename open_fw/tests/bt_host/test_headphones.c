@@ -210,6 +210,14 @@ static int fn_scan(uint32_t a) { return bt_hp_scan((uint8_t)a); }
 static int fn_pair_hp(uint32_t a) { return bt_hp_connect_addr(s_hp_bda, (int)a); }
 static int fn_suspend(uint32_t a) { (void)a; bt_hp_suspend(); return 0; }
 static int fn_forget(uint32_t a) { (void)a; return bt_hp_forget(); }
+/* the remembered headset's key removed without Forget (what a Forget that left the name behind did) */
+static int fn_remove_last_bond(uint32_t a)
+{
+    (void)a;
+    bt_hp_ui_t u;
+    bt_hp_get_ui(&u);
+    return u.has_last && esp_bt_gap_remove_bond_device(u.last) == ESP_OK ? 0 : -1;
+}
 static int fn_set_out(uint32_t a) { bt_hp_set_out_mode((uint8_t)a); return (int)bt_hp_out_mode(); }
 static int fn_pair_hp2(uint32_t a) { return bt_hp_connect_addr(s_hp2_bda, (int)a); }
 static int fn_disconnect(uint32_t a) { (void)a; return bt_hp_disconnect(); }
@@ -232,6 +240,18 @@ static int fn_fmt(uint32_t a)
     hp_sink_set_mute(sk, 0);
     hp_sink_set_gain_q15(sk, 32768u);
     return 0;
+}
+
+static bt_hp_ui_t UI(void);
+static bool found_named(const uint8_t bda[6])
+{
+    bt_hp_ui_t u = UI();
+    for (int i = 0; i < u.n_found; i++) {
+        if (memcmp(u.found[i].bda, bda, 6) == 0) {
+            return u.found[i].name[0] != '\0';
+        }
+    }
+    return false;
 }
 
 static bt_hp_ui_t UI(void)
@@ -1263,9 +1283,16 @@ int bth_headphones_scenario(const char *img_path)
         goto out;
     }
     rom_log_clear();
+    /* user report 2026-11-25: the headset's name missed by BTA's name pass stayed a MAC (list, Forget row,
+     * bt_hp_cfg.bin). Its first remote name request fails here; the session asks again after the search. */
+    bth_rom_lock();
+    fake_peer.name_fail_n = 1u;
+    bth_rom_unlock();
     SCHECK(bthx_call_fn(fn_scan, 4u, 2000u) == 0, "bt_hp_scan");
     SCHECK(WAIT(UI().scanning == 0u && UI().n_found >= 3u, 20000), "discovery did not finish (found %u)",
            UI().n_found);
+    SCHECK(WAIT(found_named(s_hp_bda), 15000), "S2: headset name not resolved after BTA's failed name request");
+    SCHECK(fake_peer.name_fail_n == 0u, "S2: BTA's name request for the headset did not fail (knob unused)");
     {
         bt_hp_ui_t u = UI();
         int hp = -1, audio = 0;
@@ -1717,6 +1744,10 @@ int bth_headphones_scenario(const char *img_path)
         SCHECK(open && fake_peer.pairings == 1u && fake_peer.host_confirms == 1u,
                "S11: numeric comparison pairing (open %d pairings %u confirms %u)", open, fake_peer.pairings,
                fake_peer.host_confirms);
+        /* picked by address, no search: the name is asked over the link and remembered (user report 2026-11-25:
+         * the Forget row showed the MAC) */
+        SCHECK(WAIT(strcmp(UI().last_name, "HP-Disp") == 0 && strcmp(UI().target_name, "HP-Disp") == 0, 5000),
+               "S11: remembered name '%s' target '%s' (want HP-Disp)", UI().last_name, UI().target_name);
         uint8_t k2[16];
         memcpy(k2, fake_peer.key, 16u);
         SCHECK(bthx_call_fn(fn_disconnect, 0u, 2000u) == 0, "S11: disconnect HP-Disp");
@@ -1826,6 +1857,55 @@ int bth_headphones_scenario(const char *img_path)
             SCHECK(nn > 0 && bts1_value_len(now_img, (uint32_t)nn, "bt_cfg_key0") == cfg_len,
                    "S12c: bond file changed by a clean session (%d B)", nn);
         }
+    }
+
+    /* ---- S13 ---- (user report 2026-11-25) Forget: the bond, the remembered headset (also on the card) and the
+     * reconnects go; no page to it afterwards */
+    bth_log("[S13] no key for the remembered headset: no reconnect, PAIR_AGAIN; Forget clears it (heap seq %u)\n",
+            (unsigned)bth_heap_seq());
+    if (start_ready("S13a start")) {
+        /* S13a: bt_hp_cfg.bin names a headset whose key is gone (user report: Forget had removed the bond and left
+         * the name; every reconnect paged it, SSP refused without a window, auth st=9, again and again). The key is
+         * removed behind the session's back here: the link drops and the session wants to reconnect. */
+        SCHECK(UI().has_last, "S13a: no remembered headset");
+        SCHECK(wait_link(BT_HP_LINK_OPEN, 20000), "S13a: the remembered headset did not reconnect (link %u)", UI().link);
+        int nb0 = bthx_call_fn(fn_bond_num, 0u, 2000u);
+        SCHECK(bthx_call_fn(fn_remove_last_bond, 0u, 2000u) == 0, "S13a: bond removal not posted");
+        SCHECK(WAIT(UI().link == BT_HP_LINK_NONE && bthx_call_fn(fn_bond_num, 0u, 2000u) == nb0 - 1, 5000),
+               "S13a: link %u bonds %d (was %d)", UI().link, bthx_call_fn(fn_bond_num, 0u, 2000u), nb0);
+        SCHECK(WAIT(UI().msg == BT_HP_MSG_PAIR_AGAIN, 5000), "S13a: no PAIR_AGAIN (msg %u)", UI().msg);
+        bt_hp_debug_t a0, a1;
+        bt_hp_get_debug(&a0);
+        uint32_t pages0 = fake_peer.conn_count;
+        (void)WAIT(0, 12000);                            /* past the 3 s and 10 s backoff steps */
+        bt_hp_get_debug(&a1);
+        SCHECK(a1.reconnect_tries == a0.reconnect_tries && fake_peer.conn_count == pages0 && UI().has_last,
+               "S13a: the keyless headset was paged again (%u -> %u tries, %u pages)", a0.reconnect_tries,
+               a1.reconnect_tries, fake_peer.conn_count - pages0);
+        stop_session("S13a stop");
+    }
+    /* S13b: a fresh pairing with the headset, then Forget */
+    peer_link_reset();
+    if (start_ready("S13 start")) {
+        SCHECK(bthx_call_fn(fn_pair_hp2, 1u, 2000u) == 0, "S13: pick the headset again (pair)");
+        SCHECK(wait_link(BT_HP_LINK_OPEN, 20000), "S13: re-pairing did not open (link %u)", UI().link);
+        SCHECK(UI().has_last, "S13: no remembered headset to forget");
+        int nb0 = bthx_call_fn(fn_bond_num, 0u, 2000u);
+        SCHECK(bthx_call_fn(fn_forget, 0u, 2000u) == 0, "S13: Forget refused in READY");
+        SCHECK(!UI().has_last && UI().last_name[0] == '\0', "S13: still remembered (last %u '%s')", UI().has_last,
+               UI().last_name);
+        SCHECK(WAIT(bthx_call_fn(fn_bond_num, 0u, 2000u) == nb0 - 1, 3000), "S13: bond not removed (%d -> %d)", nb0,
+               bthx_call_fn(fn_bond_num, 0u, 2000u));
+        SCHECK(s_cfg_len >= 8u && s_cfg_blob[7] == 0u, "S13: the saved settings still name a headset (last_valid %u)",
+               s_cfg_len >= 8u ? s_cfg_blob[7] : 0xFFu);
+        bt_hp_debug_t f0, f1;
+        bt_hp_get_debug(&f0);
+        uint32_t pages0 = fake_peer.conn_count;
+        (void)WAIT(0, 5000);
+        bt_hp_get_debug(&f1);
+        SCHECK(f1.reconnect_tries == f0.reconnect_tries && fake_peer.conn_count == pages0,
+               "S13: reconnect after Forget (%u -> %u tries)", f0.reconnect_tries, f1.reconnect_tries);
+        stop_session("S13 stop");
     }
 
     /* ---- S10d ---- (review STEP10 A6) last: it leaves headphones mode refused for the rest of the run */

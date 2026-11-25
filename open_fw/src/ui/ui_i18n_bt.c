@@ -50,6 +50,8 @@ static const char *const k_bt_strings[UI_LANG_COUNT][UI_BT_STR_COUNT] = {
         [UI_BT_STR_HP_NOT_CONNECTED]     = "Headset not connected",
         [UI_BT_STR_HP_PAUSED]            = "Headset paused",
         [UI_BT_STR_LOWBATT_BT_OFF]       = "Low battery: BT off",
+        [UI_BT_STR_HP_PAIR_AGAIN]        = "Pair headset again",   /* TODO(i18n): English in every language for now */
+        [UI_BT_STR_HP_SPK_ONLY]          = "No headset: speaker",   /* TODO(i18n) */
     },
     [UI_LANG_IT] = {
         [UI_BT_STR_PAIR_Q_FMT]           = "Associare? %u s",

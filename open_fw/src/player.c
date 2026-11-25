@@ -860,6 +860,8 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
     int bt_route = aout_is_bt();                    /* the session can stop under us (BT off, fault) */
     int lowbatt_stop = 0;                           /* this loop stopped headphones mode at low battery */
     int abs_on = 0;                                 /* absolute volume in effect when the gain was last set */
+    /* output Both with no headset stream: the speaker plays alone; say so (user report 2026-11-25) */
+    int spk_only_toast = aout_get_mode() == AOUT_MODE_BOTH && aout_route() == AOUT_ROUTE_DAC;
     if (aout_is_bt()) {
         bt_hp_player_begin();                       /* keys / headset events from before this file do not apply */
         volume = bt_hp_vol31();
@@ -912,6 +914,13 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
     uint32_t last_tr_sig     = 0u;
     uint32_t last_vol_ms     = 0u;
     uint32_t toast_until     = 0u;
+#if PLAYER_BT
+    if (spk_only_toast) {
+        str_copy_cap(m->toast_msg, (int)sizeof(m->toast_msg), ui_tr_bt(UI_BT_STR_HP_SPK_ONLY));
+        m->toast_col = UI_COL_AMBER;
+        toast_until  = millis() + 2000u;
+    }
+#endif
     int      hp_cand         = hp_in;
     uint32_t hp_cand_since   = millis();
     int      ui_dirty        = 1;

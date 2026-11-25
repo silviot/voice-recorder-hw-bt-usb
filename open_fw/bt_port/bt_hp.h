@@ -38,6 +38,7 @@
 #define BT_HP_CONNECT_TO_MS   30000u   /* an A2DP connect that has not reported CONNECTED/DISCONNECTED by then */
 #define BT_HP_STALL_DISC_MS   8000u    /* design §4.6: no Disconnection Complete after the stall's 0406 -> restart
                                           (stop + bt_hp_start again: reconnects to the last headset) */
+#define BT_HP_NAME_REQ_TO_MS  10000u  /* a remote name request that never reports is given up then */
 #define BT_HP_SCAN_CANCEL_TO_MS 5000u  /* a discovery cancel not confirmed by "discovery stopped" is cleared after this */
 #define BT_HP_TICK_STOP_MS    100u     /* design §4.3: bound of the BTC-context tick stop at teardown */
 #define BT_HP_DEINIT_WAIT_MS  600u     /* design §5.5: ESP_A2D_DEINIT_SUCCESS wait inside the down job */
@@ -69,6 +70,7 @@ enum {
     BT_HP_MSG_CONNECTED, BT_HP_MSG_CONNECT_FAIL, BT_HP_MSG_DISCONNECTED, BT_HP_MSG_RECONNECTING, BT_HP_MSG_FORGOTTEN,
     BT_HP_MSG_PAIRING_UNAVAILABLE, BT_HP_MSG_STALLED, BT_HP_MSG_START_FAILED,
     BT_HP_MSG_UNSUPPORTED,           /* search / connect refused: this image's bt_ctrl refuses 0401/0402/0405/0408 */
+    BT_HP_MSG_PAIR_AGAIN,            /* the remembered headset has no key any more: reconnects stopped, pick it again */
 };
 
 typedef struct {

@@ -232,6 +232,26 @@ Settings > Headset button test) merged on top of the BT branch. The BT=0 image s
   - **Quality**: SEPs advertise max bitpool 53 (`HP_MAX_BITPOOL`; bench default 53), `HP_SPEECH_BP` 0 (16 kHz
     sources go out at the negotiated max instead of 24; bench default 0). At 53: 119-byte frames, 7 per packet with
     an 882-byte MTU, ~54 packets/s, ~357 kbit/s.
+- **User reports (same day, after merging integ/bt-all-local 4ecc022)**:
+  - *Names*: a headset whose name BTA's name pass missed stayed a MAC (search list, Forget row, `bt_hp_cfg.bin`).
+    The session now asks itself (`esp_bt_gap_read_remote_name`, one at a time, `rn_poll`): after a search, every
+    audio device without a name (only with no link and no search running: each is a page); after CONNECTED, the
+    connected headset over its link when its name is unknown. `READ_REMOTE_NAME_EVT` updates the list, the target and
+    the remembered headset (`bt_hp_cfg.bin` saved only on a change; log `name saved`). Host: S2 fails the headset's
+    first name request (`fake_peer.name_fail_n`) and wants the name in the list; S11 picks HP-Disp by address (no
+    search) and wants it remembered as "HP-Disp" (both fail without the change).
+  - *Forget / no key*: a reconnect to the remembered headset now first checks that a link key is stored
+    (`esp_bt_gap_get_bond_device_list`); without one (or after an authentication failure with no key) reconnects stop
+    and the screen says "Pair headset again" (`BT_HP_MSG_PAIR_AGAIN`, `UI_BT_STR_HP_PAIR_AGAIN`, English for now,
+    `TODO(i18n)`) until the user picks a headset. Forget also closes a connect to that headset still under way when
+    it reports (it was remembered again by CONNECTED). Host S13a removes the remembered headset's key behind the
+    session's back: PAIR_AGAIN, no page for 12 s (before: paged again at each backoff step); S13b re-pairs, Forgets:
+    no remembered headset in RAM or in the saved settings, bond gone, no reconnect.
+  - *Play with output Headphones and no headset*: the player's "Headset not connected" toast expired at once on the
+    list screen (main.c times toasts by `g_toast_until_ms`, which the player cannot set): `hp_player_toast_keep()`
+    (BT=1 only) gives it 2 s. Output Both with no headset now shows "No headset: speaker" (`UI_BT_STR_HP_SPK_ONLY`,
+    `TODO(i18n)`) while the speaker plays. `test_player_bt` checks both (the Both toast fails without the change; the
+    list-screen timing is main.c and not host-tested).
 
 ## Not tested / open
 

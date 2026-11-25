@@ -398,6 +398,20 @@ static void ui_show_toast(const char *msg, uint16_t col, uint32_t now_ms, uint32
     g_toast_until_ms = now_ms + dur_ms;
 }
 
+/* A toast the player left when it could not start (output Headphones with no headset stream: aout_start fails and
+ * the player returns at once): give it its time on the list screen, which expires toasts by g_toast_until_ms
+ * (user report 2026-11-25: Play did nothing visible). BT=1 only: the default image is unchanged. */
+#if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID
+static void hp_player_toast_keep(void)
+{
+    if (g_ui.toast_msg[0] != '\0' && (int32_t)(millis() - g_toast_until_ms) >= 0) {
+        g_toast_until_ms = millis() + 2000u;
+    }
+}
+#else
+#define hp_player_toast_keep() do { } while (0)
+#endif
+
 static int ui_poll_toast_expire(uint32_t now_ms)
 {
     if (g_ui.toast_msg[0] != '\0' && (int32_t)(now_ms - g_toast_until_ms) >= 0) {
@@ -1834,6 +1848,7 @@ static const char *hp_msg_text(uint8_t msg)
     case BT_HP_MSG_STALLED:             return ui_tr_bt(UI_BT_STR_LINK_STALLED_RECONN);
     case BT_HP_MSG_START_FAILED:        return ui_tr_bt(UI_BT_STR_HP_NOT_READY);
     case BT_HP_MSG_UNSUPPORTED:         return ui_tr_bt(UI_BT_STR_NOT_IN_BUILD);
+    case BT_HP_MSG_PAIR_AGAIN:          return ui_tr_bt(UI_BT_STR_HP_PAIR_AGAIN);
     default:                            return "";
     }
 }
@@ -2505,6 +2520,7 @@ static void play_file_at_index(int start_idx)
         g_ui.has_last  = 1;
         int rc = openfw_play_file_ui(&g_exfat_vol, g_file_dirs[idx], g_files[idx].filename, &g_ui);
         keys_ignore_held();
+        hp_player_toast_keep();
         apm_end_track(rc);
         backlight_note_activity(millis());
         g_files[idx].unplayed   = 0u;
@@ -2581,6 +2597,7 @@ static void play_named_file(const char *dir, ui_file_entry_t *entry)
     g_ui.play_autoplay = 0u;
     (void)openfw_play_file_ui(&g_exfat_vol, dir, entry->filename, &g_ui);
     keys_ignore_held();
+    hp_player_toast_keep();
     backlight_note_activity(millis());
     entry->resume_sec = g_ui.play_file.resume_sec;
     save_persisted_state();

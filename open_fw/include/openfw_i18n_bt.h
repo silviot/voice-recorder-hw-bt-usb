@@ -58,6 +58,8 @@ typedef enum {
     UI_BT_STR_HP_NOT_CONNECTED, /* Player toast: play with no headphones stream */
     UI_BT_STR_HP_PAUSED, /* Player toast: the headset paused the stream */
     UI_BT_STR_LOWBATT_BT_OFF, /* Toast: Bluetooth stopped / refused at low battery */
+    UI_BT_STR_HP_PAIR_AGAIN, /* Headphones message: the remembered headset lost its key, reconnects stopped */
+    UI_BT_STR_HP_SPK_ONLY, /* Player toast: output Both with no headset: the speaker plays alone */
     UI_BT_STR_COUNT
 } ui_bt_str_id_t;
 

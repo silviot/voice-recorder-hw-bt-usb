@@ -176,7 +176,13 @@ uint8_t bt_hp_vol31(void) { return bt_vol31; }
 void bt_hp_set_vol31(uint8_t v) { bt_vol31 = v; }
 int bt_hp_abs_vol(void) { return abs_vol; }
 int bt_lowbatt_poll(uint32_t now) { (void)now; return 0; }
-const char *ui_tr_bt(ui_bt_str_id_t id) { (void)id; return ""; }
+static char s_tr[UI_BT_STR_COUNT][8];
+const char *ui_tr_bt(ui_bt_str_id_t id)   /* "BT<id>": the toasts below are checked by id */
+{
+    snprintf(s_tr[id], sizeof(s_tr[id]), "BT%u", (unsigned)id);
+    return s_tr[id];
+}
+static int toast_spk_only;   /* a render showed the "speaker only" toast */
 
 /* ---- file, UI, keys, board ---- */
 int exfat_find_path(const exfat_vol_t *vol, const char *path, exfat_entry_t *ent)
@@ -207,6 +213,7 @@ void ui_render_screen(ui_screen_id_t screen, const ui_model_t *m)
     ended = m->play_state == 2;
     seen_route = aout_route();
     seen_gain = sink.gain_q15;
+    if (strcmp(m->toast_msg, ui_tr_bt(UI_BT_STR_HP_SPK_ONLY)) == 0) toast_spk_only = 1;
     advance(2);
     if (stall_on && now_ms - last_stall_ms >= 1000u) {
         last_stall_ms = now_ms;
@@ -320,10 +327,13 @@ int main(void)
         printf("[OK] Both, %s file, headset connected: speaker and headset each get every frame\n",
                ch == 1 ? "mono" : "stereo");
 
-        /* headset not connected: the file plays on the speaker alone, at the speaker volume */
+        /* headset not connected: the file plays on the speaker alone, at the speaker volume, and says so (user
+         * report 2026-11-25: no sign that the headset was not used) */
         bt_ready = 0;
+        toast_spk_only = 0;
         play(AOUT_MODE_BOTH, ch, 0);
         bt_ready = 1;
+        assert(toast_spk_only);
         assert(seen_route == AOUT_ROUTE_DAC);
         assert(dac_submitted == FRAMES && src_consumed == 0u);
         assert(dac_level == 10u);
@@ -352,5 +362,24 @@ int main(void)
     assert(mid_pads() == 0u);                /* without the DAC resync: 23 (the tap's backlog holds the ring) */
     assert(dac_submitted + dac_skipped == FRAMES && dac_skipped == st.dac_resync_frames);
     puts("[OK] Both, mono file, app task out 400 ms/s: the headset does not starve; the speaker drops its backlog");
+
+    /* output Headphones, no headset stream: nothing plays and the player returns at once with the toast set
+     * (main.c hp_player_toast_keep gives it its time on the list screen: before, it expired at once) */
+    {
+        static ui_model_t m;
+        exfat_vol_t vol = {0};
+        make_file(1);
+        memset(&m, 0, sizeof(m));
+        m.cfg.spk_vol = 10;
+        now_ms = 0;
+        time_limit_ms = 60000;
+        bt_ready = 0;
+        aout_bt_attach(&fake_tx, &sink, &k_link, 0);
+        aout_set_mode(AOUT_MODE_HEADPHONES);
+        assert(openfw_play_file_ui(&vol, "/record", "test.wav", &m) == 0);
+        bt_ready = 1;
+        assert(strcmp(m.toast_msg, ui_tr_bt(UI_BT_STR_HP_NOT_CONNECTED)) == 0);
+    }
+    puts("[OK] Headphones, no headset: no playback, \"headset not connected\" toast left for the list screen");
     return 0;
 }

@@ -43,6 +43,7 @@
 #define HP_RING_BYTES    16384u   /* PCM ring (design §3.3): 4096 stereo / 8192 mono frames */
 #define HP_CFG_MAGIC     0x31504842u  /* "BHP1" */
 #define HP_RC_STEPS      5u
+#define HP_BOND_LIST_MAX 8u       /* bonds read back to check the remembered headset still has a key */
 static const uint16_t k_rc_backoff_s[HP_RC_STEPS] = { 0u, 3u, 10u, 30u, 60u };   /* design §6.5; then every 60 s */
 
 /* BTC callbacks hand a 4-aligned copy (fine on Cortex-M4; x86-64 UBSan wants 8: see bt_xrec_bluedroid.c) */
@@ -96,6 +97,8 @@ typedef struct {
     uint8_t  keyq[HP_KEYQ];
     uint32_t kq_head, kq_tail;
     uint32_t player_ev;
+    uint8_t  rn_bda[6];                /* the last READ_REMOTE_NAME_EVT (its EV_NAME carries only bda and status) */
+    char     rn_name[BT_HP_NAME_MAX];
 
     /* ---- app task only ---- */
     uint8_t  state, link;
@@ -108,6 +111,16 @@ typedef struct {
     uint32_t scan_cancel_until;        /* a cancel whose "discovery stopped" never came is cleared then (STEP10 C16) */
     uint8_t  pick_pending, pick_pair;
     uint8_t  pick_bda[6];
+    /* name requests (user report 2026-11-25: a headset whose name the inquiry's name pass missed stayed a MAC for
+     * ever in the list, the Forget row and bt_hp_cfg.bin): one esp_bt_gap_read_remote_name at a time */
+    uint8_t  rn_busy;
+    uint32_t rn_t0;
+    uint8_t  rn_want;                  /* the connected headset's name is unknown: ask over its link */
+    uint8_t  rn_want_bda[6];
+    uint8_t  rn_tried[BT_HP_FOUND_MAX];   /* found[i] was asked once after the search (name pass) */
+    uint8_t  pair_again;               /* reconnects stopped until the user picks a headset (BT_HP_MSG_PAIR_AGAIN) */
+    uint8_t  forgot_valid;             /* Forget: a late CONNECTED of this device is closed, not remembered again */
+    uint8_t  forgot[6];
     uint32_t pick_since;
     uint8_t  target_valid;
     uint8_t  target[6];
@@ -512,6 +525,12 @@ static void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *p)
         e.type = EV_NAME;
         memcpy(e.bda, p->read_rmt_name.bda, 6u);
         e.a = (uint8_t)p->read_rmt_name.stat;
+        bt_xrec_plat_lock();
+        if (g != NULL && g->cb_open) {
+            memcpy(g->rn_bda, p->read_rmt_name.bda, 6u);
+            name_copy(g->rn_name, sizeof(g->rn_name), p->read_rmt_name.rmt_name, ESP_BT_GAP_MAX_BDNAME_LEN);
+        }
+        bt_xrec_plat_unlock();
         break;
     case ESP_BT_GAP_ACL_CONN_CMPL_STAT_EVT:
         e.type = EV_ACL_UP;
@@ -911,6 +930,89 @@ static void found_name(const uint8_t bda[6], char *out)
     bt_xrec_plat_unlock();
 }
 
+/* A name learned after the search (name pass, or asked over the headset's link): the list, the target and the
+ * remembered headset (saved only on a change). */
+static void name_learned(const uint8_t bda[6], const char *name)
+{
+    if (name[0] == '\0') {
+        return;
+    }
+    bt_xrec_plat_lock();
+    for (uint32_t i = 0u; i < g->n_found; i++) {
+        if (bda_eq(g->found[i].bda, bda)) {
+            memcpy(g->found[i].name, name, BT_HP_NAME_MAX);
+            g->found[i].named = 1u;
+        }
+    }
+    bt_xrec_plat_unlock();
+    if (g->target_valid && bda_eq(g->target, bda)) {
+        memcpy(g->target_name, name, BT_HP_NAME_MAX);
+    }
+    cfg_load();
+    if (s_cfg.last_valid && bda_eq(s_cfg.last, bda) && strncmp(s_cfg.last_name, name, BT_HP_NAME_MAX) != 0) {
+        memset(s_cfg.last_name, 0, sizeof(s_cfg.last_name));
+        memcpy(s_cfg.last_name, name, BT_HP_NAME_MAX - 1u);
+        cfg_save();
+        lbegin("name saved");
+        lka("peer", bda);
+        lks("name", s_cfg.last_name);
+        lend();
+    }
+}
+
+static bool rn_ask(const uint8_t bda[6], uint32_t now)
+{
+    if (esp_bt_gap_read_remote_name((uint8_t *)bda) != ESP_OK) {
+        return false;
+    }
+    g->rn_busy = 1u;
+    g->rn_t0 = now;
+    lbegin("name request");
+    lka("peer", bda);
+    lend();
+    return true;
+}
+
+/* One name request at a time: first the connected headset's (over its link), then, with no link and no search,
+ * the audio devices of the last search that have none (a page each: never while connecting or streaming). */
+static void rn_poll(uint32_t now)
+{
+    if (g->rn_busy) {
+        if (time_reached(now, g->rn_t0 + BT_HP_NAME_REQ_TO_MS)) {
+            g->rn_busy = 0u;               /* no READ_REMOTE_NAME_EVT: give up on this one */
+        }
+        return;
+    }
+    if (g->scanning || g->pick_pending || g->link == BT_HP_LINK_CONNECTING) {
+        return;
+    }
+    if (g->rn_want) {
+        if (g->link == BT_HP_LINK_NONE || !(g->target_valid && bda_eq(g->target, g->rn_want_bda))) {
+            g->rn_want = 0u;               /* that link is gone */
+        } else if (rn_ask(g->rn_want_bda, now)) {
+            g->rn_want = 0u;
+        }
+        return;
+    }
+    if (g->link != BT_HP_LINK_NONE) {
+        return;
+    }
+    uint8_t bda[6];
+    int idx = -1;
+    bt_xrec_plat_lock();
+    for (uint32_t i = 0u; i < g->n_found && idx < 0; i++) {
+        if (g->found[i].is_audio && !g->found[i].named && !g->rn_tried[i]) {
+            idx = (int)i;
+            memcpy(bda, g->found[i].bda, 6u);
+        }
+    }
+    bt_xrec_plat_unlock();
+    if (idx >= 0) {
+        g->rn_tried[idx] = 1u;
+        (void)rn_ask(bda, now);
+    }
+}
+
 /* ============================================ media control (design §4.5) ===================================== */
 static void start_failure(const char *why, bool final);
 
@@ -1081,10 +1183,44 @@ static void connect_now(const uint8_t bda[6])
     target_set(bda);
 }
 
+/* Is there a stored link key for bda (bt_hp_bonds.bin, loaded into Bluedroid's config)? */
+static bool bonded(const uint8_t bda[6])
+{
+    int n = esp_bt_gap_get_bond_device_num();
+    if (n <= 0) {
+        return false;
+    }
+    esp_bd_addr_t list[HP_BOND_LIST_MAX];
+    if (n > (int)HP_BOND_LIST_MAX) {
+        n = (int)HP_BOND_LIST_MAX;
+    }
+    if (esp_bt_gap_get_bond_device_list(&n, list) != ESP_OK) {
+        return true;                  /* unknown: keep the old behaviour (try) */
+    }
+    for (int i = 0; i < n; i++) {
+        if (bda_eq(list[i], bda)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The remembered headset needs pairing again (its key is gone here, or it refused ours): reconnects stop until the
+ * user picks a headset; the screen says "Pair again" (user report 2026-11-25: endless reconnects, auth st=9). */
+static void pair_again(const char *why)
+{
+    g->pair_again = 1u;
+    g->rc_active = 0u;
+    set_msg(BT_HP_MSG_PAIR_AGAIN);
+    lbegin("reconnect stopped: pair again");
+    lks("why", why);
+    lend();
+}
+
 static void rc_schedule(bool first)
 {
     cfg_load();
-    if (!s_cfg.last_valid || g->user_disc || !hp_rows_on()) {
+    if (!s_cfg.last_valid || g->user_disc || g->pair_again || !hp_rows_on()) {
         g->rc_active = 0u;
         return;
     }
@@ -1108,6 +1244,10 @@ static void rc_poll(uint32_t now)
         return;
     }
     if (!time_reached(now, g->rc_at)) {
+        return;
+    }
+    if (!bonded(s_cfg.last)) {
+        pair_again("no stored key");   /* a reconnect cannot pair (no window): it would only be refused, forever */
         return;
     }
     g->d.reconnect_tries++;
@@ -1174,6 +1314,15 @@ static void on_a2d_conn(const ev_t *e)
         (void)esp_a2d_source_disconnect_by_handle(e->h);
         return;
     }
+    if (e->a == ESP_A2D_CONNECTION_STATE_CONNECTED && g->forgot_valid && bda_eq(g->forgot, e->bda)) {
+        /* a connect that was under way when the user chose Forget: close it, do not remember the device again */
+        lbegin("forgotten headset connected: closed");
+        lka("peer", e->bda);
+        lend();
+        (void)esp_a2d_source_disconnect_by_handle(e->h);
+        g->link = BT_HP_LINK_NONE;
+        return;
+    }
     if (e->a == ESP_A2D_CONNECTION_STATE_CONNECTED) {
         g->link = BT_HP_LINK_OPEN;
         g->conn_hdl = e->h;
@@ -1191,7 +1340,11 @@ static void on_a2d_conn(const ev_t *e)
         }
         if (nm[0] != '\0') {
             memcpy(g->target_name, nm, sizeof(nm));
+        } else {
+            g->rn_want = 1u;          /* no name from the search: ask the headset over this link (rn_poll) */
+            memcpy(g->rn_want_bda, e->bda, 6u);
         }
+        g->pair_again = 0u;
         set_msg(BT_HP_MSG_CONNECTED);
         window_close("connected");
         /* linkinfo (design §10.2): role, packet types, slots from bt_ctrl's link view */
@@ -1382,6 +1535,14 @@ static void on_auth(const ev_t *e)
         if (accepted) {
             ssp_burn();
         }
+        cfg_load();
+        bool win = false;
+        bt_xrec_plat_lock();
+        win = g->win_open && bda_eq(g->win_bda, e->bda);
+        bt_xrec_plat_unlock();
+        if (!win && s_cfg.last_valid && bda_eq(s_cfg.last, e->bda) && !bonded(e->bda)) {
+            pair_again("authentication failed, no key");   /* a reconnect (no window) without a key cannot pair */
+        }
     }
 }
 
@@ -1491,12 +1652,23 @@ static void on_event(const ev_t *e)
         }
         break;
     }
-    case EV_NAME:
+    case EV_NAME: {
+        char nm[BT_HP_NAME_MAX];
+        bt_xrec_plat_lock();
+        bool same = bda_eq(g->rn_bda, e->bda);
+        memcpy(nm, g->rn_name, sizeof(nm));
+        bt_xrec_plat_unlock();
+        g->rn_busy = 0u;
         lbegin("name");
         lka("peer", e->bda);
         lku("st", e->a);
+        lks("name", same && e->a == ESP_BT_STATUS_SUCCESS ? nm : "");
         lend();
+        if (same && e->a == ESP_BT_STATUS_SUCCESS) {
+            name_learned(e->bda, nm);
+        }
         break;
+    }
     case EV_JW:
         if (e->a) {
             g->d.jw_allowed++;
@@ -2197,6 +2369,7 @@ static void ready_poll(uint32_t now)
         rc_schedule(false);
     }
     rc_poll(now);
+    rn_poll(now);
     /* START retry (design §4.5): once, BT_HP_START_RETRY_MS after the first failure (start_retries 2 = the retry is
      * out: its failure is final) */
     if (g->start_retries == 1u && g->mc_out == MC_NONE && g->link == BT_HP_LINK_OPEN && !g->start_failed &&
@@ -2385,6 +2558,7 @@ int bt_hp_scan(uint8_t secs)
     g->n_found = 0u;
     memset(g->found, 0, sizeof(g->found));
     bt_xrec_plat_unlock();
+    memset(g->rn_tried, 0, sizeof(g->rn_tried));
     g->rc_active = 0u;   /* a scheduled reconnect would page during the inquiry */
     esp_err_t r = esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, (uint8_t)len, 0u);
     lbegin("discovery");
@@ -2443,6 +2617,10 @@ int bt_hp_connect_addr(const uint8_t bda[6], int pair)
     g->pick_since = bt_xrec_plat_now_ms();
     g->user_disc = 0u;
     g->rc_active = 0u;
+    g->pair_again = 0u;               /* the user picked a headset: reconnects may run again after it connects */
+    if (g->forgot_valid && bda_eq(g->forgot, bda)) {
+        g->forgot_valid = 0u;
+    }
     found_name(bda, g->target_name);
     target_set(bda);
     bt_hp_scan_cancel();
@@ -2520,6 +2698,10 @@ int bt_hp_forget(void)
         return -1;                       /* entry kept: Forget can be chosen again */
     }
     set_msg(BT_HP_MSG_FORGOTTEN);
+    g->forgot_valid = 1u;             /* a connect still under way for it is closed when it reports */
+    memcpy(g->forgot, bda, 6u);
+    g->rn_want = 0u;
+    g->pair_again = 0u;
     s_cfg.last_valid = 0u;
     memset(s_cfg.last, 0, sizeof(s_cfg.last));
     memset(s_cfg.last_name, 0, sizeof(s_cfg.last_name));
