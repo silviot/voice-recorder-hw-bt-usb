@@ -21,7 +21,14 @@
 #include "ui_port.h"
 #include "eez/screens.h"
 
-/* Minimal host MMIO mock for LCDC (0x40095000) + ROM/GPIO stubs */
+/* Minimal host MMIO mock for LCDC (0x40095000) + ROM/GPIO stubs.
+ *
+ * Models the ST7735S GRAM in landscape (MADCTL MV=1): CASET addresses the 162
+ * gate lines (logical x = address - 1, addresses 0/161 hidden), RASET the
+ * source lines (logical y = address - 26). VSCSAD rotates the gate lines; with
+ * MY=1 gate order is reversed relative to CASET. g_fb is what the panel shows. */
+#define GRAM_LINES 162
+static uint16_t g_gram[80][GRAM_LINES];
 static uint16_t g_fb[80][160];
 static uint32_t g_written_pixels;
 static uint8_t  g_cmd = 0u;
@@ -34,6 +41,28 @@ static uint32_t g_data_len = 0u;
 static int      g_ramwr = 0;
 static uint8_t  g_pix_hi = 0u;
 static int      g_have_hi = 0;
+static uint8_t  g_madctl = 0u;
+static uint16_t g_ssa = 0u;
+static unsigned g_ssa_writes = 0u;
+static void   (*g_ssa_hook)(int before);
+
+/* CASET address shown at logical screen column x under the current SSA. */
+static int shown_addr(int x)
+{
+    int my = (g_madctl & 0x80u) != 0u;
+    int a = x + 1;
+    int gate = my ? GRAM_LINES - 1 - a : a;
+    int row = (gate + g_ssa) % GRAM_LINES;
+    return my ? GRAM_LINES - 1 - row : row;
+}
+
+static void mock_refresh_fb(void)
+{
+    for (int x = 0; x < 160; x++) {
+        int a = shown_addr(x);
+        for (int y = 0; y < 80; y++) g_fb[y][x] = g_gram[y][a];
+    }
+}
 
 static void mock_put_byte(uint8_t b)
 {
@@ -46,9 +75,12 @@ static void mock_put_byte(uint8_t b)
             g_have_hi = 0;
             int lx = (int)g_cx - 1;
             int ly = (int)g_cy - 26;
-            if (lx >= 0 && lx < 160 && ly >= 0 && ly < 80) {
-                g_written_pixels++;
-                g_fb[ly][lx] = rgb565_val;
+            if (g_cx < GRAM_LINES && ly >= 0 && ly < 80) {
+                if (lx >= 0 && lx < 160) g_written_pixels++;
+                g_gram[ly][g_cx] = rgb565_val;
+                for (int x = 0; x < 160; x++) {
+                    if (shown_addr(x) == g_cx) g_fb[ly][x] = rgb565_val;
+                }
             }
             g_cx++;
             if (g_cx > g_x1) {
@@ -70,6 +102,20 @@ static void mock_put_byte(uint8_t b)
     } else if (g_cmd == 0x2Bu && g_nparam == 4) {
         g_y0 = (uint16_t)((g_params[0] << 8) | g_params[1]);
         g_y1 = (uint16_t)((g_params[2] << 8) | g_params[3]);
+    } else if (g_cmd == 0x36u && g_nparam == 1) {
+        g_madctl = g_params[0];
+    } else if (g_cmd == 0x33u && g_nparam == 6) {
+        assert(g_params[0] == 0 && g_params[1] == 0);       /* TFA = 0 */
+        assert(g_params[2] == 0 && g_params[3] == 162);     /* VSA = 162 */
+        assert(g_params[4] == 0 && g_params[5] == 0);       /* BFA = 0 */
+    } else if (g_cmd == 0x37u && g_nparam == 2) {
+        uint16_t ssa = (uint16_t)((g_params[0] << 8) | g_params[1]);
+        assert(ssa < GRAM_LINES);
+        if (g_ssa_hook) g_ssa_hook(1);
+        g_ssa = ssa;
+        g_ssa_writes++;
+        mock_refresh_fb();
+        if (g_ssa_hook) g_ssa_hook(0);
     }
 }
 
@@ -139,6 +185,55 @@ static void sample_heap(const char *tag)
         g_peak_heap_used = used;
     }
     (void)tag;
+}
+
+static const uint16_t (*g_tr_old)[160];
+static const uint16_t (*g_tr_new)[160];
+static int g_tr_back, g_tr_d;
+
+/* Expected panel at push offset d: old page, 2 px seam (hidden GRAM lines,
+ * black), new page; mirrored for BACK. */
+static uint16_t tr_expected(int x, int y, int d)
+{
+    int xf = g_tr_back ? 159 - x : x;
+    if (xf < 160 - d) {
+        int src = xf + d;
+        return g_tr_old[y][g_tr_back ? 159 - src : src];
+    }
+    if (xf < 162 - d) return 0u;
+    int src = xf - 162 + d;
+    return g_tr_new[y][g_tr_back ? 159 - src : src];
+}
+
+static void tr_check_hook(int before)
+{
+    if (!before) g_tr_d += 2;
+    for (int y = 0; y < 80; y++) {
+        for (int x = 0; x < 160; x++) {
+            assert(g_fb[y][x] == tr_expected(x, y, g_tr_d));
+        }
+    }
+}
+
+/* Optional: TR_FRAMES_DIR=/path writes the panel every 16 ms (≈ one 60 Hz
+ * panel refresh) during the push test as 4x PPMs. */
+static void dump_tr_frame(int forward, int idx)
+{
+    const char *dir = getenv("TR_FRAMES_DIR");
+    if (!dir) return;
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s_%02d.ppm", dir, forward ? "fwd" : "back", idx);
+    FILE *fp = fopen(path, "wb");
+    if (!fp) return;
+    fprintf(fp, "P6\n%d %d\n255\n", 160 * 4, 80 * 4);
+    for (int y = 0; y < 80 * 4; y++) {
+        for (int x = 0; x < 160 * 4; x++) {
+            uint8_t rgb[3];
+            rgb565_to_rgb888(g_fb[y / 4][x / 4], &rgb[0], &rgb[1], &rgb[2]);
+            fwrite(rgb, 1, 3, fp);
+        }
+    }
+    fclose(fp);
 }
 
 static void capture_shot(int idx)
@@ -477,6 +572,58 @@ int main(int argc, char **argv)
     ui_render_screen(UI_SCR_PLAYER, &m);
     assert(g_written_pixels > player_pixels && g_written_pixels - player_pixels < 160u * 10u);
 
+    /* 5b: Player speed dial: speed pill, header state, and dial footer */
+    {
+        static const struct { int8_t speed; uint8_t state; const char *pill, *head, *foot; } dial[] = {
+            {   0, 0u, NULL,   "Playing", "\xE2\x97\x80 \xE2\x88\x92" "1\xC3\x97 \xC2\xB7 OK Pause \xC2\xB7 2\xC3\x97 \xE2\x96\xB6" },
+            {   0, 1u, NULL,   "Paused",  "\xE2\x97\x80 \xE2\x88\x92" "1\xC3\x97 \xC2\xB7 OK Play \xC2\xB7 2\xC3\x97 \xE2\x96\xB6" },
+            {   2, 0u, "2\xC3\x97", "Fast", "\xE2\x97\x80 1\xC3\x97 \xC2\xB7 OK 1\xC3\x97 \xC2\xB7 4\xC3\x97 \xE2\x96\xB6" },
+            {  -4, 0u, "\xE2\x88\x92" "4\xC3\x97", "Reverse",
+               "\xE2\x97\x80 \xE2\x88\x92" "8\xC3\x97 \xC2\xB7 OK 1\xC3\x97 \xC2\xB7 \xE2\x88\x92" "2\xC3\x97 \xE2\x96\xB6" },
+            {  16, 0u, "16\xC3\x97", "Seeking", "\xE2\x97\x80 8\xC3\x97 \xC2\xB7 OK 1\xC3\x97 \xC2\xB7 32\xC3\x97 \xE2\x96\xB6" },
+            {  32, 0u, "32\xC3\x97", "Seeking", "\xE2\x97\x80 16\xC3\x97 \xC2\xB7 OK 1\xC3\x97" },
+            { -32, 0u, "\xE2\x88\x92" "32\xC3\x97", "Seeking", "OK 1\xC3\x97 \xC2\xB7 \xE2\x88\x92" "16\xC3\x97 \xE2\x96\xB6" },
+        };
+        for (size_t i = 0; i < sizeof(dial) / sizeof(dial[0]); i++) {
+            m.play_scrub_speed = dial[i].speed;
+            m.play_state       = dial[i].state;
+            ui_render_screen(UI_SCR_PLAYER, &m);
+            assert(strcmp(lv_label_get_text(objects.play_bar_l), dial[i].head) == 0);
+            if (strcmp(lv_label_get_text(objects.player_footer), dial[i].foot) != 0) {
+                fprintf(stderr, "dial footer %d: \"%s\" != \"%s\"\n", dial[i].speed,
+                        lv_label_get_text(objects.player_footer), dial[i].foot);
+                assert(0);
+            }
+            if (dial[i].pill) assert(strcmp(lv_label_get_text(objects.player_vol_lbl), dial[i].pill) == 0);
+            else assert(strstr(lv_label_get_text(objects.player_vol_lbl), "\xC3\x97") == NULL); /* volume */
+            int32_t fw = lv_text_get_width(dial[i].foot, (uint32_t)strlen(dial[i].foot),
+                                           lv_obj_get_style_text_font(objects.player_footer, LV_PART_MAIN), 0);
+            assert(fw <= 156);
+        }
+        m.cfg.skip_mode = UI_SKIP_TRACK;
+        m.play_scrub_speed = 0;
+        ui_render_screen(UI_SCR_PLAYER, &m);
+        assert(strcmp(lv_label_get_text(objects.player_footer),
+                      "\xE2\x97\x80 Prev \xC2\xB7 OK Pause \xC2\xB7 \xE2\x96\xB6 Next") == 0);
+        m.cfg.skip_mode = UI_SKIP_SPEED;
+        /* Every language's dial header word fits where the longest play state does. */
+        const lv_font_t *hf = lv_obj_get_style_text_font(objects.play_bar_l, LV_PART_MAIN);
+        for (uint8_t lang = 0u; lang < (uint8_t)UI_LANG_COUNT; lang++) {
+            static const ui_str_id_t ids[] = { UI_STR_FAST, UI_STR_REVERSE, UI_STR_SEEKING };
+            for (size_t k = 0; k < 3; k++) {
+                const char *t = ui_tr_lang(lang, ids[k]);
+                int32_t w = lv_text_get_width(t, (uint32_t)strlen(t), hf, 0);
+                if (w > 60) {
+                    fprintf(stderr, "Player header too wide for lang=%u: \"%s\" %d px\n", (unsigned)lang, t, (int)w);
+                    assert(0);
+                }
+            }
+        }
+        m.play_scrub_speed = 0;
+        m.play_state       = 0;
+        ui_render_screen(UI_SCR_PLAYER, &m);
+    }
+
     /* 6: Player (Full-Height Smooth-Scrolling Transcript mode) */
     /* First verify cwx_measure_md_px matches ui_font_md glyph-for-glyph for all ASCII 0x20..0x7E */
     for (int cp = 0x20; cp <= 0x7E; cp++) {
@@ -656,6 +803,39 @@ int main(int argc, char **argv)
     ui_render_screen(UI_SCR_BT, &m);
     assert(g_written_pixels == before);
 
+    /* Headset button probe screen (About layout) incl. prompt + unknown plug, then About
+     * must render exactly as before (probe binder must not leak label state). */
+    {
+        ui_render_screen(UI_SCR_ABOUT, &m);
+        capture_shot(0);
+        static uint16_t about_ref[80][160];
+        memcpy(about_ref, g_fb, sizeof(about_ref));
+        m.hsp_secs_left = 27; m.hsp_phase = 1; m.hsp_prompt = 0; m.hsp_plug = 1;
+        ui_render_screen(UI_SCR_HSPROBE, &m);
+        capture_shot(0);
+        m.hsp_prompt = 2; m.hsp_phase = 2;
+        ui_render_screen(UI_SCR_HSPROBE, &m);
+        capture_shot(0);
+        {
+            int amber = 0;
+            for (int y = 14; y < 34; y++)
+                for (int x = 0; x < 160; x++)
+                    if (g_fb[y][x] == UI_COL_AMBER) amber++;
+            assert(amber > 20); /* "PRESS button now" highlighted */
+        }
+        m.hsp_prompt = 0; m.hsp_phase = 3; m.hsp_plug = -1;
+        ui_render_screen(UI_SCR_HSPROBE, &m);
+        sample_heap("hsprobe");
+        ui_render_screen(UI_SCR_ABOUT, &m);
+        capture_shot(0);
+        assert(memcmp(g_fb, about_ref, sizeof(about_ref)) == 0);
+        int saved_sel = m.set_sel, saved_scroll = m.set_scroll;
+        m.set_sel = UI_SET_HSPROBE; m.set_scroll = UI_SET_COUNT - 3;
+        ui_render_screen(UI_SCR_SETTINGS, &m);
+        sample_heap("settings_hsprobe");
+        m.set_sel = saved_sel; m.set_scroll = saved_scroll;
+    }
+
     /* Exercise extra sub-screens for heap measurement */
     ui_render_screen(UI_SCR_CHARGE, &m);
     sample_heap("charge");
@@ -716,31 +896,140 @@ int main(int argc, char **argv)
     ui_render_screen(UI_SCR_HOME, &m);
     capture_shot(0);
 
-    /* Drive the production reveal on a 125 Hz clock (LV_DEF_REFR_PERIOD=8) in both directions. */
+    /* Drive the production push transition in both directions. The SSA hook
+     * checks the panel before and after every scroll step: it must always show
+     * exactly old page | 2 px seam | new page at the current offset. Forward
+     * runs on a 1 ms tick (CPU1 cadence), back on 8 ms ticks (late-tick catch-up). */
     ui_render_screen(UI_SCR_HOME, &m);
+    s_now += 300u;
+    ui_port_task_handler();
     for (int forward = 1; forward >= 0; forward--) {
         int incoming = forward ? 4 : 0;
         int outgoing = forward ? 0 : 4;
+        assert(memcmp(g_fb, g_shots[outgoing], sizeof(g_fb)) == 0);
+        g_tr_old  = g_shots[outgoing];
+        g_tr_new  = g_shots[incoming];
+        g_tr_back = !forward;
+        g_tr_d    = 0;
+        g_ssa_hook = tr_check_hook;
+        unsigned ssa0 = g_ssa_writes;
         uint32_t start = g_written_pixels;
         ui_render_screen(forward ? UI_SCR_FILES : UI_SCR_HOME, &m);
         sample_heap(forward ? "home->files" : "files->home");
-        unsigned updates = 0;
-        for (int frame = 0; frame < 14; frame++) {
-            uint32_t prev_px = g_written_pixels;
-            s_now += 8u;
+        assert(ui_transition_busy() && ui_port_is_animating());
+        uint32_t t0 = s_now, tick = forward ? 1u : 8u;
+        int frame_no = 0;
+        dump_tr_frame(forward, frame_no++);
+        while (s_now - t0 < 200u) {
+            s_now += tick;
             ui_port_task_handler();
-            uint32_t written = g_written_pixels - start;
-            assert(written <= 160u * 80u && written % 80u == 0);
-            int cols = (int)(written / 80u);
-            for (int y = 0; y < 80; y++) {
-                for (int x = 0; x < 160; x++) {
-                    int shown = forward ? x >= 160 - cols : x < cols;
-                    assert(g_fb[y][x] == g_shots[shown ? incoming : outgoing][y][x]);
-                }
-            }
-            if (g_written_pixels > prev_px) updates++;
+            if (((s_now - t0) % 16u) == 0u) dump_tr_frame(forward, frame_no++);
+            if (s_now - t0 == 80u) assert(g_tr_d >= 120 && g_tr_d < 162);
         }
-        assert(g_written_pixels - start == 160u * 80u && updates >= 8);
+        g_ssa_hook = NULL;
+        assert(!ui_transition_busy() && !ui_port_is_animating());
+        assert(g_tr_d == 162 && g_ssa == 0u && g_ssa_writes - ssa0 == 81u);
+        assert(g_written_pixels - start == 160u * 80u);
+        assert(memcmp(g_fb, g_shots[incoming], sizeof(g_fb)) == 0);
+    }
+
+    /* Folder navigation inside Files: enter = FORWARD, leave = BACK, driven by
+     * ui_model_nav(); cursor moves, reloads and refreshes must not animate. */
+    {
+        static uint16_t root_shot[80][160], sub_shot[80][160];
+        static ui_file_entry_t sub_files[2];
+        memset(sub_files, 0, sizeof(sub_files));
+        strcpy(sub_files[0].filename, "Chapter 01.mp3");
+        sub_files[0].dt = m.now;
+        sub_files[0].duration_sec = 1834;
+        sub_files[0].channels = 2;
+        strcpy(sub_files[1].filename, "Chapter 02.mp3");
+        sub_files[1].dt = m.now;
+        sub_files[1].duration_sec = 2101;
+        sub_files[1].channels = 2;
+        ui_model_t root = m, sub = m;
+        sub.files = sub_files;
+        sub.file_count = 2;
+        sub.file_sel = 0;
+        sub.file_scroll = 0;
+        strcpy(sub.files_title, "Audiobook");
+
+        /* Reference frames, switched without navigation (no push). */
+        ui_render_screen(UI_SCR_FILES, &root);
+        s_now += 300u;
+        ui_port_task_handler();
+        unsigned ssa0 = g_ssa_writes;
+        memcpy(root_shot, g_fb, sizeof(g_fb));
+        ui_render_screen(UI_SCR_FILES, &sub);
+        s_now += 300u;
+        ui_port_task_handler();
+        memcpy(sub_shot, g_fb, sizeof(g_fb));
+        ui_render_screen(UI_SCR_FILES, &root);
+        s_now += 300u;
+        ui_port_task_handler();
+        assert(g_ssa_writes == ssa0 && !ui_transition_busy());
+        assert(memcmp(g_fb, root_shot, sizeof(g_fb)) == 0);
+        assert(memcmp(root_shot, sub_shot, sizeof(g_fb)) != 0);
+
+        for (int enter = 1; enter >= 0; enter--) {
+            ui_model_t *to = enter ? &sub : &root;
+            to->nav_seq = root.nav_seq;
+            ui_model_nav(to, enter ? UI_NAV_FORWARD : UI_NAV_BACK);
+            root.nav_seq = sub.nav_seq = to->nav_seq;
+            g_tr_old  = enter ? root_shot : sub_shot;
+            g_tr_new  = enter ? sub_shot : root_shot;
+            g_tr_back = !enter;
+            g_tr_d    = 0;
+            g_ssa_hook = tr_check_hook;
+            unsigned w0 = g_ssa_writes;
+            ui_render_screen(UI_SCR_FILES, to);
+            assert(ui_transition_busy());
+            /* A live refresh mid-push (same nav_seq) must not restart it. */
+            s_now += 30u;
+            ui_port_task_handler();
+            ui_render_screen(UI_SCR_FILES, to);
+            for (int i = 0; i < 200; i++) {
+                s_now += 1u;
+                ui_port_task_handler();
+            }
+            g_ssa_hook = NULL;
+            assert(!ui_transition_busy() && g_ssa == 0u && g_tr_d == 162);
+            assert(g_ssa_writes - w0 == 81u);
+            assert(memcmp(g_fb, enter ? sub_shot : root_shot, sizeof(g_fb)) == 0);
+        }
+
+        /* Cursor move and same-folder reload after navigation: no push. */
+        unsigned w1 = g_ssa_writes;
+        root.file_sel = 1;
+        ui_render_screen(UI_SCR_FILES, &root);
+        ui_render_screen(UI_SCR_FILES, &root);
+        s_now += 300u;
+        ui_port_task_handler();
+        root.file_sel = 0;
+        ui_render_screen(UI_SCR_FILES, &root);
+        s_now += 300u;
+        ui_port_task_handler();
+        assert(g_ssa_writes == w1 && !ui_transition_busy());
+        assert(memcmp(g_fb, root_shot, sizeof(g_fb)) == 0);
+        m.nav_seq = root.nav_seq;
+
+        /* Entering an empty folder (Files -> empty-Files page) also pushes. */
+        ui_model_t empty = root;
+        empty.files = NULL;
+        empty.file_count = 0;
+        ui_model_nav(&empty, UI_NAV_FORWARD);
+        w1 = g_ssa_writes;
+        ui_render_screen(UI_SCR_FILES, &empty);
+        assert(ui_transition_busy());
+        s_now += 300u;
+        ui_port_task_handler();
+        assert(!ui_transition_busy() && g_ssa_writes - w1 == 81u);
+        ui_model_nav(&root, UI_NAV_BACK);
+        ui_render_screen(UI_SCR_FILES, &root);
+        s_now += 300u;
+        ui_port_task_handler();
+        assert(memcmp(g_fb, root_shot, sizeof(g_fb)) == 0);
+        m.nav_seq = root.nav_seq;
     }
 
     /* Measure worst-case two-screen peak heap during HOME <-> REC transition */
@@ -750,11 +1039,22 @@ int main(int argc, char **argv)
     ui_render_screen(UI_SCR_HOME, &m);
     sample_heap("rec->home");
 
-    /* Interrupt an in-flight reveal with an instant screen. */
+    /* Interrupt an in-flight push with another push (fast-forwards the first),
+     * then with an instant screen: the panel must end unscrolled and exact. */
+    ui_render_screen(UI_SCR_FILES, &m);
+    s_now += 40u;
+    ui_port_task_handler();
+    assert(ui_transition_busy() && g_ssa != 0u);
+    ui_render_screen(UI_SCR_HOME, &m);
+    s_now += 300u;
+    ui_port_task_handler();
+    assert(!ui_transition_busy() && g_ssa == 0u);
+    assert(memcmp(g_fb, g_shots[0], sizeof(g_fb)) == 0);
     ui_render_screen(UI_SCR_FILES, &m);
     s_now += 80u;
     ui_port_task_handler();
     ui_render_screen(UI_SCR_POWER, &m);
+    assert(!ui_transition_busy() && g_ssa == 0u);
     assert(memcmp(g_fb, g_shots[13], sizeof(g_fb)) == 0);
     s_now += 200u;
     ui_port_task_handler();

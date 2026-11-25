@@ -26,6 +26,8 @@
 #include "openfw_exp.h"
 #include "openfw_wav.h"
 #include "openfw_player.h"
+#include "openfw_apmem.h"
+#include "openfw_hsprobe.h"
 #include "cassini_splash.h"
 #if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID && !(defined(OPENFW_HCI_PROBE) && OPENFW_HCI_PROBE)
 #include "../bt_port/bt_xrec_bluedroid.h" /* plan M2.3: pairing-window gate feedback (bt_xrec_get_debug) */
@@ -79,6 +81,7 @@ static uint32_t         g_vbus_poll_ms = 0u;
 static int              g_vbus_cache_valid = 0;
 
 static void save_persisted_state(void);
+static void apm_power_off(int screen);
 
 volatile uint32_t       g_ui_screen = UI_SCR_HOME;
 static ui_model_t       g_ui;
@@ -89,6 +92,21 @@ static wav_loc_t        g_scan_locs[MENU_MAX_FILES] OPENFW_SRAM_HI;
 static uint64_t         g_scan_cwx_hashes[MENU_MAX_CWX] OPENFW_SRAM_HI;
 static char             g_last_dir[MENU_DIR_CAP] = "/record";
 static char             g_browse_dir[MENU_DIR_CAP] = "";
+/* One-entry cache of "does this folder contain .autoplay" (-1 = unknown) */
+static char             g_autoplay_dir[MENU_DIR_CAP];
+static int8_t           g_autoplay_state = -1;
+/* Autoplay-folder memory (.autoplay.state): the track in the player and any
+ * position write deferred while a recording owns the card. */
+static struct {
+    char          dir[MENU_DIR_CAP];
+    char          name[32];
+    uint32_t      tag;      /* low 32 bits of the WAV size: detects a replaced file */
+    uint8_t       active;   /* the player's track lives in an autoplay folder */
+    uint8_t       failed;   /* a write failed (read-only/full card): quiet until reload */
+    uint8_t       pending;  /* pending_pos not written yet */
+    uint32_t      pending_pos;
+    apmem_sched_t sched;
+} g_apm;
 static int              g_root_file_sel = 0;
 static int              g_root_file_scroll = 0;
 static uint32_t         g_sd_free_mb   = 0u;
@@ -145,9 +163,26 @@ static void backlight_apply(uint8_t pct)
     }
 }
 
+/*
+ * Screen sleep/wake fades (ramp runs in the SysTick ISR, see lcd_st7735s.c).
+ * Sleep: fade to 0 over BL_FADE_OUT_MS while g_screen_off stays AWAKE, so the
+ * UI keeps drawing and keys act normally; backlight_service() then performs the
+ * real off-actions. Any wake during the fade cancels it at full brightness.
+ * Wake: CPU1 restarts and the (black) OFF frame is still on the panel, then the
+ * backlight ramps up over BL_FADE_IN_MS while the caller renders the new frame.
+ */
+#define BL_FADE_OUT_MS 200u
+#define BL_FADE_IN_MS  100u
+static enum screen_sleep_state g_fade_out_reason = SCREEN_AWAKE;
+
 static void backlight_wake(uint32_t now_ms)
 {
     g_last_activity_ms = now_ms;
+    if (g_fade_out_reason != SCREEN_AWAKE) {
+        g_fade_out_reason = SCREEN_AWAKE;
+        backlight_apply(user_bl_pct()); /* cancels the ramp */
+        return;
+    }
     int was_off        = (g_screen_off != SCREEN_AWAKE);
     g_screen_off       = SCREEN_AWAKE;
     if (was_off) {
@@ -155,15 +190,47 @@ static void backlight_wake(uint32_t now_ms)
         if (g_cpu1_booted && !cpu1_ui_is_active()) {
             (void)cpu1_ui_start();
         }
+        g_cur_bl_pct = user_bl_pct();
+        lcd_backlight_fade(0u, g_cur_bl_pct, BL_FADE_IN_MS);
+    } else {
+        backlight_apply(user_bl_pct());
     }
-    backlight_apply(user_bl_pct());
 }
 
 static void backlight_sleep_now(enum screen_sleep_state reason)
 {
-    g_screen_off = reason;
-    keys_ignore_held();
-    backlight_apply(0u);
+    if (g_screen_off != SCREEN_AWAKE) {
+        return;
+    }
+    if (g_fade_out_reason == SCREEN_AWAKE) {
+        keys_ignore_held(); /* suppress the press that requested sleep */
+        lcd_backlight_fade((g_cur_bl_pct > 100u) ? 100u : g_cur_bl_pct, 0u, BL_FADE_OUT_MS);
+        g_cur_bl_pct = 0u;
+    }
+    g_fade_out_reason = reason; /* a manual off may upgrade an idle fade */
+}
+
+/* The player runs no screen idle timer: restart it on return to the menus so
+ * they get a full timeout, without waking a screen the user switched off. */
+static void backlight_note_activity(uint32_t now_ms)
+{
+    g_last_activity_ms = now_ms;
+}
+
+static int screen_manually_off(void)
+{
+    return g_screen_off == SCREEN_MANUALLY_OFF || g_fade_out_reason == SCREEN_MANUALLY_OFF;
+}
+
+/* Task context, called from every UI loop: finish a completed fade-out. */
+static void backlight_service(void)
+{
+    if (g_fade_out_reason == SCREEN_AWAKE || lcd_backlight_fading()) {
+        return;
+    }
+    g_screen_off      = g_fade_out_reason;
+    g_fade_out_reason = SCREEN_AWAKE;
+    lcd_backlight_set(0u); /* disconnect the PWM from the pad */
     ui_render_screen(UI_SCR_OFF, &g_ui);
     cpu1_ui_sync(60u);
     /* When hardware IPC Mailbox WFE is active, CPU1 is already halted in
@@ -179,6 +246,7 @@ int ui_poll_power_button(ui_screen_id_t screen, ui_model_t *model, uint32_t now)
      * The PMU latches edges until acknowledged. */
     static uint32_t last_poll;
     static int      seen_press_after_boot;
+    backlight_service();
     if (now - last_poll >= 16u) {
         last_poll = now;
         uint8_t ev = key_onoff_poll();
@@ -191,7 +259,9 @@ int ui_poll_power_button(ui_screen_id_t screen, ui_model_t *model, uint32_t now)
         }
         uint8_t progress = 0;
         power_button_action_t action = power_button_update(ev, now,
-                                                           g_screen_off, &progress);
+                                                           g_screen_off != SCREEN_AWAKE ||
+                                                           g_fade_out_reason != SCREEN_AWAKE,
+                                                           &progress);
         switch (action) {
         case POWER_BUTTON_SLEEP:
             backlight_sleep_now(SCREEN_MANUALLY_OFF);
@@ -224,9 +294,11 @@ int ui_poll_power_button(ui_screen_id_t screen, ui_model_t *model, uint32_t now)
                 bt_xrec_stop();
             } else if (screen == UI_SCR_PLAYER) {
                 audio_dac_stop();
-                g_ui.last_file.resume_sec = g_ui.play_file.resume_sec;
+                /* last_file is the track being played (set before playback starts) */
+                g_ui.last_file.resume_sec = (g_ui.play_state == 2u) ? 0u : g_ui.play_pos_sec;
             }
             (void)recorder_stop();
+            apm_power_off((int)screen);
             if (screen == UI_SCR_SETTINGS || screen == UI_SCR_PLAYER) {
                 save_persisted_state();
             }
@@ -241,6 +313,10 @@ int ui_poll_power_button(ui_screen_id_t screen, ui_model_t *model, uint32_t now)
 
 static void backlight_update(void)
 {
+    backlight_service();
+    if (g_fade_out_reason != SCREEN_AWAKE) {
+        return;
+    }
     if (g_screen_off) {
         backlight_apply(0u);
         return;
@@ -254,16 +330,21 @@ static void backlight_update(void)
         backlight_apply(user_bl_pct());
         return;
     }
-    /* A queued key may have arrived after the main loop sampled its clock. */
-    uint32_t idle_ms = millis() - g_last_activity_ms;
-    if (idle_ms >= off_ms) {
+    /* Any debounced key edge is activity, including presses consumed by loops
+     * that never call backlight_wake()/backlight_update() (the player): without
+     * this, BACK out of a long playback left an idle time of the whole playback
+     * and the very first backlight_update() blacked the screen out. */
+    uint32_t last = g_last_activity_ms;
+    uint32_t key_ms;
+    if (keys_last_activity(&key_ms) && (int32_t)(key_ms - last) > 0) {
+        last = key_ms;
+    }
+    /* millis() (not the loop's sampled clock): a queued key may be newer. */
+    uint8_t pct = 0u;
+    if (screen_idle_level(millis(), last, off_ms, user_bl_pct(), &pct) == SCREEN_IDLE_SLEEP) {
         backlight_sleep_now(SCREEN_IDLE_TIMEOUT);
-    } else if (off_ms >= 20000u && idle_ms >= (off_ms / 2u)) {
-        uint8_t u = user_bl_pct();
-        uint8_t dim = (u < 15u) ? u : 15u;
-        backlight_apply(dim);
     } else {
-        backlight_apply(user_bl_pct());
+        backlight_apply(pct);
     }
 #endif
 }
@@ -635,7 +716,7 @@ static int count_dir_items_cb(const exfat_entry_t *entry, void *user)
         if (!is_ignored_dir_name(entry->name, 0)) {
             dc->sub_count++;
         }
-    } else if (name_ends_with_ci(entry->name, ".wav")) {
+    } else if (entry->name[0] != '.' && name_ends_with_ci(entry->name, ".wav")) {
         dc->wav_count++;
     }
     return 0;
@@ -688,7 +769,8 @@ static int menu_collect_cb(const exfat_entry_t *entry, void *user)
 {
     menu_list_ctx_t *ctx = (menu_list_ctx_t *)user;
     wdt_feed();
-    if (entry->is_dir) {
+    /* Hidden files (.autoplay marker, macOS ._* AppleDouble twins) are never tracks */
+    if (entry->is_dir || entry->name[0] == '.') {
         return 0;
     }
     if (name_ends_with_ci(entry->name, ".cwx")) {
@@ -756,6 +838,8 @@ static void reload_files_and_sd_stats(void)
     g_ui.files      = g_files;
     g_ui.file_count = 0;
     g_ui.files_title[0] = '\0';
+    g_autoplay_state = -1; /* USB/BT may have added or removed a .autoplay marker */
+    g_apm.failed     = 0u; /* card may have been swapped, freed or unlocked */
 
     if (!g_sd_mounted) {
         g_ui.sd_ok       = 0;
@@ -1218,7 +1302,7 @@ static int run_usb_msc_mode(int auto_mode)
             if (rxp > 0u || txp > 0u || now >= 3000u) {
                 clear_boot_strikes_once();
             }
-            if ((txp != prev_txp || rxp != prev_rxp) && g_screen_off != SCREEN_MANUALLY_OFF) {
+            if ((txp != prev_txp || rxp != prev_rxp) && !screen_manually_off()) {
                 backlight_wake(now);
             }
             if (txp != prev_txp) {
@@ -1317,7 +1401,7 @@ static void bt_prompt_ui_update(uint32_t now)
     }
     bt_xrec_ui_t bu;
     bt_xrec_get_ui(&bu);
-    if (bu.prompt && g_screen_off != SCREEN_MANUALLY_OFF) {
+    if (bu.prompt && !screen_manually_off()) {
         backlight_wake(now); /* the value must stay readable for the whole prompt */
     }
     g_ui.bt_prompt   = bu.prompt;
@@ -1467,7 +1551,7 @@ static void run_bt_xrec_mode(void)
                 prev_tx  = st.tx_acl_pkts;
                 prev_acl = st.acl_connected;
                 prev_spp = st.spp_open;
-                if (g_screen_off != SCREEN_MANUALLY_OFF) {
+                if (!screen_manually_off()) {
                     backlight_wake(now);
                 }
             }
@@ -1529,6 +1613,67 @@ static void run_bt_xrec_mode(void)
     g_ui.toast_msg[0] = '\0';
     backlight_wake(millis());
     reload_files_and_sd_stats();
+}
+
+/* Settings > Headset button test (diagnostic, see hsprobe.c). Modal. */
+static int hsprobe_poll_cb(uint32_t now_ms)
+{
+    BT_HP_POLL(); /* BT=1: a headphones session left running keeps being driven during the 30 s probe */
+    int show = ui_poll_power_button(UI_SCR_HSPROBE, &g_ui, now_ms);
+    /* Key scanning is paused during the probe, so keep the idle timer fresh
+     * (but never cancel a manual POWER sleep or its fade-out). */
+    if (g_screen_off == SCREEN_AWAKE && g_fade_out_reason == SCREEN_AWAKE) {
+        g_last_activity_ms = now_ms;
+    }
+    backlight_update();
+    return show;
+}
+
+static void hsprobe_render_cb(uint8_t secs_left, uint8_t phase, uint8_t prompt, int8_t plug)
+{
+    g_ui.hsp_secs_left = secs_left;
+    g_ui.hsp_phase     = phase;
+    g_ui.hsp_prompt    = prompt;
+    g_ui.hsp_plug      = plug;
+    if (!g_screen_off && g_ui_screen != UI_SCR_POWER) {
+        g_ui_screen = UI_SCR_HSPROBE;
+        ui_render_screen(UI_SCR_HSPROBE, &g_ui);
+    }
+}
+
+static void run_headset_probe(uint32_t now_ms)
+{
+    hsprobe_ctx_t ctx;
+    ctx.vol        = &g_exfat_vol;
+    ctx.sd_mounted = g_sd_mounted;
+    ctx.poll       = hsprobe_poll_cb;
+    ctx.render     = hsprobe_render_cb;
+
+    g_ui.toast_msg[0] = '\0';
+    backlight_wake(now_ms);
+    hsprobe_render_cb((uint8_t)(HSP_T_END / 1000u), 1u, 0u, (int8_t)keys_read_hp_detect());
+    int rc = hsprobe_run(&ctx);
+    if (rc == HSP_RC_SAVED) {
+        (void)sd_flush(&g_sd_card);
+    }
+    keys_ignore_held();
+    refresh_telemetry();
+    backlight_wake(millis());
+    /* TODO(i18n): probe toasts are English-only */
+    switch (rc) {
+    case HSP_RC_SAVED:
+        ui_show_toast(ui_tr(UI_STR_HSP_SAVED), UI_COL_GREEN, millis(), 3000u);
+        break;
+    case HSP_RC_NO_SD:
+        ui_show_toast(ui_tr(UI_STR_HSP_NO_SD), UI_COL_RED, millis(), 3000u);
+        break;
+    case HSP_RC_BUSY:
+        ui_show_toast(ui_tr(UI_STR_HSP_BUSY), UI_COL_AMBER, millis(), 2000u);
+        break;
+    default:
+        ui_show_toast(ui_tr(UI_STR_TOAST_SAVE_FAILED), UI_COL_RED, millis(), 3000u);
+        break;
+    }
 }
 
 #if OPENFW_BT_HP
@@ -1752,6 +1897,7 @@ static void run_bt_hp_screen(int bench)
 {
     (void)bench;                       /* release images: no bench run */
     g_ui_screen     = UI_SCR_LIST;
+    ui_model_nav(&g_ui, UI_NAV_FORWARD); /* Bluetooth choice -> Headphones: same layout, push the new page */
     g_ui.list_sel   = 0u;
     g_ui.list_scroll = 0u;
     g_ui.list_n     = 0u;
@@ -1859,6 +2005,8 @@ static void run_bt_hp_screen(int bench)
                     copy_cstr(g_ui.play_file.filename, (int)sizeof(g_ui.play_file.filename), name);
                     g_ui.play_has_prev = 0u;
                     g_ui.play_has_next = 0u;
+                    g_ui.play_autoplay = 0u;   /* no .autoplay advance / position memory on a bench run */
+                    g_ui.play_tick_cb  = 0;
                     int rc = openfw_play_file_ui(&g_exfat_vol, dir, name, &g_ui);
                     keys_ignore_held();
                     openfw_log_puts("BENCH hp play end rc ");
@@ -1886,7 +2034,7 @@ static void run_bt_hp_screen(int bench)
                 if (t[0] != '\0') {
                     ui_show_toast(t, (u.msg == BT_HP_MSG_CONNECTED || u.msg == BT_HP_MSG_PAIRED) ? UI_COL_GREEN
                                      : UI_COL_AMBER, now, 1500u);
-                    if (g_screen_off != SCREEN_MANUALLY_OFF) {
+                    if (!screen_manually_off()) {
                         backlight_wake(now);
                     }
                 }
@@ -2065,7 +2213,7 @@ static void adjust_setting(int idx, int delta, uint32_t now_ms)
         g_ui.cfg.screen_off_idx = (uint8_t)((g_ui.cfg.screen_off_idx + (delta > 0 ? 1u : 4u)) % 5u);
         break;
     case 7: /* Skip */
-        g_ui.cfg.skip_mode = (uint8_t)((g_ui.cfg.skip_mode + (delta > 0 ? 1u : 2u)) % 3u);
+        g_ui.cfg.skip_mode = (g_ui.cfg.skip_mode == UI_SKIP_TRACK) ? UI_SKIP_SPEED : UI_SKIP_TRACK;
         break;
     case 8: /* Language */
         g_ui.cfg.lang = (uint8_t)((g_ui.cfg.lang + (delta > 0 ? 1u : ((uint32_t)UI_LANG_COUNT - 1u))) % (uint32_t)UI_LANG_COUNT);
@@ -2083,6 +2231,142 @@ static void adjust_setting(int idx, int delta, uint32_t now_ms)
     }
 }
 
+static int dir_has_autoplay_cached(const char *dir)
+{
+    if (!g_sd_mounted || !dir || dir[0] == '\0') {
+        return 0;
+    }
+    if (g_autoplay_state < 0 || !str_eq_ci(g_autoplay_dir, dir)) {
+        copy_cstr(g_autoplay_dir, (int)sizeof(g_autoplay_dir), dir);
+        g_autoplay_state = (int8_t)player_dir_has_autoplay(&g_exfat_vol, dir);
+    }
+    return g_autoplay_state;
+}
+
+/* Write a deferred position (never while recording: the caller checks). */
+static void apm_flush(void)
+{
+    if (!g_apm.pending) {
+        return;
+    }
+    if (recorder_is_saving()) {
+        return; /* retried from the main loop once the recording is closed */
+    }
+    g_apm.pending = 0u;
+    if (g_apm.failed || !g_sd_mounted) {
+        return;
+    }
+    if (apmem_save_pos(&g_exfat_vol, g_apm.dir, g_apm.name, g_apm.tag, g_apm.pending_pos) != 0) {
+        g_apm.failed = 1u;
+    }
+}
+
+static void apm_player_tick(uint32_t now_ms)
+{
+    if (!g_apm.active || g_apm.failed || recorder_is_saving()) {
+        return;
+    }
+    if (g_ui.play_scrub_speed != 0) {
+        /* Speed dial away from 1x: the position is in flight. play_pos_sec is the
+         * heard position, but writing mid-seek is pointless; the first tick back
+         * at 1x (or a pause, or leaving the track) writes it instead. */
+        return;
+    }
+    if (apmem_sched_tick(&g_apm.sched, now_ms, g_ui.play_pos_sec, g_ui.play_state, g_ui.batt_mv)) {
+        uint32_t pos = apmem_store_pos(g_ui.play_pos_sec, g_ui.play_file.duration_sec, 0);
+        if (apmem_save_pos(&g_exfat_vol, g_apm.dir, g_apm.name, g_apm.tag, pos) != 0) {
+            g_apm.failed = 1u;
+        }
+        apmem_sched_saved(&g_apm.sched, now_ms, g_ui.play_pos_sec);
+    }
+}
+
+/* Before g_files[idx] starts: pick its remembered position and focus it. */
+static void apm_begin_track(int idx)
+{
+    g_apm.active = 0u;
+    g_ui.play_tick_cb = 0;
+    apm_flush();
+    if (!dir_has_autoplay_cached(g_file_dirs[idx])) {
+        return;
+    }
+    copy_cstr(g_apm.dir, (int)sizeof(g_apm.dir), g_file_dirs[idx]);
+    copy_cstr(g_apm.name, (int)sizeof(g_apm.name), g_files[idx].filename);
+    if (apmem_file_tag(&g_exfat_vol, g_apm.dir, g_apm.name, &g_apm.tag) != 0) {
+        return;
+    }
+    uint32_t saved = g_files[idx].resume_sec;
+    (void)apmem_load_pos(&g_exfat_vol, g_apm.dir, g_apm.name, g_apm.tag, &saved);
+    g_files[idx].resume_sec = apmem_resume_pos(saved, g_files[idx].duration_sec);
+    if (!g_apm.failed && !recorder_is_saving() &&
+        apmem_save_focus(&g_exfat_vol, g_apm.dir, g_apm.name) != 0) {
+        g_apm.failed = 1u;
+    }
+    g_apm.active = 1u;
+    apmem_sched_start(&g_apm.sched, millis(), g_files[idx].resume_sec);
+    g_ui.play_tick_cb = apm_player_tick;
+}
+
+/* After the player returned: remember where the track was left. */
+static void apm_end_track(int rc)
+{
+    g_ui.play_tick_cb = 0;
+    if (!g_apm.active) {
+        return;
+    }
+    g_apm.active      = 0u;
+    g_apm.pending_pos = apmem_store_pos(g_ui.play_file.resume_sec, g_ui.play_file.duration_sec,
+                                        rc == PLAYER_RC_AUTO_NEXT);
+    g_apm.pending     = 1u; /* an unchanged slot costs reads only, no write */
+    if (rc != 2) {
+        apm_flush(); /* REC slide (rc 2): deferred until the recording is over */
+    }
+}
+
+/* Files list inside an autoplay folder: remember the focused track. */
+static void apm_save_focus_sel(void)
+{
+    if (!g_sd_mounted || g_apm.failed || recorder_is_saving() || g_browse_dir[0] == '\0' ||
+        g_ui.file_sel < 0 || g_ui.file_sel >= g_ui.file_count || g_files[g_ui.file_sel].is_dir ||
+        !str_eq_ci(g_file_dirs[g_ui.file_sel], g_browse_dir) || !dir_has_autoplay_cached(g_browse_dir)) {
+        return;
+    }
+    if (apmem_save_focus(&g_exfat_vol, g_browse_dir, g_files[g_ui.file_sel].filename) != 0) {
+        g_apm.failed = 1u;
+    }
+}
+
+/* Just entered g_browse_dir: focus the folder's last focused track. */
+static void apm_focus_on_enter(void)
+{
+    char name[APMEM_FOCUS_CAP];
+    if (!g_sd_mounted || g_browse_dir[0] == '\0' || !dir_has_autoplay_cached(g_browse_dir) ||
+        apmem_load_focus(&g_exfat_vol, g_browse_dir, name, (uint32_t)sizeof(name)) != 0) {
+        return;
+    }
+    for (int i = 0; i < g_ui.file_count; i++) {
+        if (!g_files[i].is_dir && str_eq_ci(g_files[i].filename, name)) {
+            g_ui.file_sel    = i;
+            g_ui.file_scroll = (i > 0) ? i - 1 : 0;
+            if (g_ui.file_scroll > g_ui.file_count - 3) {
+                g_ui.file_scroll = (g_ui.file_count > 3) ? g_ui.file_count - 3 : 0;
+            }
+            return;
+        }
+    }
+}
+
+static void apm_power_off(int screen)
+{
+    if (screen == (int)UI_SCR_PLAYER && g_apm.active) {
+        g_ui.play_file.resume_sec = (g_ui.play_state == 2u) ? 0u : g_ui.play_pos_sec;
+        apm_end_track(0);
+    } else if (screen == (int)UI_SCR_FILES) {
+        apm_save_focus_sel();
+    }
+    apm_flush(); /* the recorder was stopped just before */
+}
+
 static void play_file_at_index(int start_idx)
 {
     int idx = start_idx;
@@ -2091,13 +2375,25 @@ static void play_file_at_index(int start_idx)
         while (prev_idx >= 0 && g_files[prev_idx].is_dir) prev_idx--;
         int next_idx = idx + 1;
         while (next_idx < g_ui.file_count && g_files[next_idx].is_dir) next_idx++;
+        int auto_idx = player_autoplay_next_index(g_files, &g_file_dirs[0][0], MENU_DIR_CAP,
+                                                  g_ui.file_count, idx);
 
         g_ui_screen = UI_SCR_PLAYER;
         g_ui.play_file     = g_files[idx];
         g_ui.play_has_prev = (prev_idx >= 0) ? 1u : 0u;
         g_ui.play_has_next = (next_idx < g_ui.file_count) ? 1u : 0u;
+        g_ui.play_autoplay = (auto_idx >= 0 && dir_has_autoplay_cached(g_file_dirs[idx])) ? 1u : 0u;
+        /* Record the track as "last played" before it starts so a power-off
+         * mid-track (also after an automatic advance) resumes this track. */
+        apm_begin_track(idx); /* autoplay folder: remembered position + focus */
+        g_ui.play_file = g_files[idx];
+        g_ui.last_file = g_files[idx];
+        copy_cstr(g_last_dir, (int)sizeof(g_last_dir), g_file_dirs[idx]);
+        g_ui.has_last  = 1;
         int rc = openfw_play_file_ui(&g_exfat_vol, g_file_dirs[idx], g_files[idx].filename, &g_ui);
         keys_ignore_held();
+        apm_end_track(rc);
+        backlight_note_activity(millis());
         g_files[idx].unplayed   = 0u;
         g_files[idx].resume_sec = g_ui.play_file.resume_sec;
         g_ui.last_file          = g_files[idx];
@@ -2110,7 +2406,11 @@ static void play_file_at_index(int start_idx)
             g_ui.file_scroll = g_ui.file_sel - 2;
         }
 
-        if (rc == 1 && next_idx < g_ui.file_count) {
+        if (rc == PLAYER_RC_AUTO_NEXT && auto_idx >= 0) {
+            /* Continuous listening: the next chapter resumes where it was left
+             * (apm_begin_track), or starts at 0:00 when it has no saved position */
+            idx = auto_idx;
+        } else if (rc == 1 && next_idx < g_ui.file_count) {
             idx = next_idx;
         } else if (rc == -1 && prev_idx >= 0) {
             idx = prev_idx;
@@ -2135,12 +2435,40 @@ static void play_named_file(const char *dir, ui_file_entry_t *entry)
             return;
         }
     }
+    /* Resuming a track of an autoplay folder that the Files list is not showing:
+     * open that folder in the list so playback can continue through it. */
+    if (!(dir[0] == '/' && dir[1] == '\0') && !str_eq_ci(g_browse_dir, dir) &&
+        dir_has_autoplay_cached(dir)) {
+        if (g_browse_dir[0] == '\0') {
+            g_root_file_sel    = g_ui.file_sel;
+            g_root_file_scroll = g_ui.file_scroll;
+        }
+        uint32_t resume = entry->resume_sec;
+        char name[sizeof(entry->filename)];
+        copy_cstr(name, (int)sizeof(name), entry->filename);
+        copy_cstr(g_browse_dir, (int)sizeof(g_browse_dir), dir);
+        g_ui.file_sel    = 0;
+        g_ui.file_scroll = 0;
+        reload_files_and_sd_stats();
+        for (int i = 0; i < g_ui.file_count; i++) {
+            if (!g_files[i].is_dir && str_eq_ci(g_file_dirs[i], dir) &&
+                str_eq_ci(g_files[i].filename, name)) {
+                g_files[i].resume_sec = resume;
+                g_files[i].unplayed   = 0u;
+                play_file_at_index(i);
+                entry->resume_sec = g_ui.last_file.resume_sec;
+                return;
+            }
+        }
+    }
     g_ui_screen        = UI_SCR_PLAYER;
     g_ui.play_file     = *entry;
     g_ui.play_has_prev = 0u;
     g_ui.play_has_next = 0u;
+    g_ui.play_autoplay = 0u;
     (void)openfw_play_file_ui(&g_exfat_vol, dir, entry->filename, &g_ui);
     keys_ignore_held();
+    backlight_note_activity(millis());
     entry->resume_sec = g_ui.play_file.resume_sec;
     save_persisted_state();
 }
@@ -2895,10 +3223,12 @@ int openfw_main(void)
                         if (key == KEY_BACK) {
                             if (g_browse_dir[0] != '\0') {
                                 /* Return from subfolder to parent / root Files list */
+                                apm_save_focus_sel();
                                 g_browse_dir[0]  = '\0';
                                 g_ui.file_sel    = g_root_file_sel;
                                 g_ui.file_scroll = g_root_file_scroll;
                                 reload_files_and_sd_stats();
+                                ui_model_nav(&g_ui, UI_NAV_BACK);
                             } else {
                                 scr         = UI_SCR_HOME;
                                 g_ui_screen = (uint32_t)scr;
@@ -2949,6 +3279,8 @@ int openfw_main(void)
                                 g_ui.file_sel    = 0;
                                 g_ui.file_scroll = 0;
                                 reload_files_and_sd_stats();
+                                apm_focus_on_enter();
+                                ui_model_nav(&g_ui, UI_NAV_FORWARD);
                                 dirty = 1;
                             } else {
                                 play_file_at_index(g_ui.file_sel);
@@ -3044,7 +3376,7 @@ int openfw_main(void)
                                     dirty = 1;
                                 }
                             } else if (key == KEY_RIGHT) {
-                                if (g_ui.set_sel < UI_SET_ROWS - 1) {
+                                if (g_ui.set_sel < UI_SET_COUNT - 1) {
                                     g_ui.set_sel++;
                                     if (g_ui.set_sel >= g_ui.set_scroll + 3) {
                                         g_ui.set_scroll = g_ui.set_sel - 2;
@@ -3080,6 +3412,11 @@ int openfw_main(void)
                                         dirty       = 1;
                                         modal_done  = 1;
                                     }
+                                } else if (g_ui.set_sel == UI_SET_HSPROBE) {
+                                    run_headset_probe(t);
+                                    g_ui_screen = (uint32_t)scr;
+                                    dirty       = 1;
+                                    modal_done  = 1;
                                 } else if (g_ui.set_sel == UI_SET_ROW_ABOUT) {
                                     enter_press_ms = 0u;
                                     about_armed    = 0;
@@ -3173,6 +3510,9 @@ int openfw_main(void)
         /* 7. Periodic 2 Hz telemetry & battery cutoff supervision */
         if ((uint32_t)(now_ms - last_slow_ms) >= 500u || last_slow_ms == 0u) {
             last_slow_ms = now_ms;
+            if (g_apm.pending && !rec_active) {
+                apm_flush(); /* position deferred by the REC slide */
+            }
             pmu_poll_charge_manage();
             uint8_t prev_min = g_ui.now.minute;
             uint8_t prev_bat = g_ui.batt_pct;

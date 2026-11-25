@@ -189,6 +189,7 @@ void SysTick_Handler(void)
         system_reboot();
     }
     keys_scan_tick(now);
+    lcd_backlight_fade_tick();   /* PWM3 duty only; task-side arming is ordered through s_fade_n (lcd_st7735s.c) */
 #if OPENFW_RTOS
     openfw_rtos_tick();
 #endif

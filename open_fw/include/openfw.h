@@ -154,6 +154,10 @@ typedef enum {
 
 power_button_action_t power_button_update(uint8_t events, uint32_t now, int screen_off,
                                           uint8_t *progress);
+/* Screen idle policy (pure): off_ms 0 = never; dims to 15% after off_ms/2 when off_ms >= 20 s. */
+typedef enum { SCREEN_IDLE_FULL, SCREEN_IDLE_DIM, SCREEN_IDLE_SLEEP } screen_idle_t;
+screen_idle_t   screen_idle_level(uint32_t now_ms, uint32_t last_activity_ms,
+                                  uint32_t off_ms, uint8_t user_pct, uint8_t *out_pct);
 void            pmu_soft_poweroff(void) __attribute__((noreturn));
 void            pmu_unattended_init(void);
 void            pmu_poll_charge_manage(void);
@@ -185,12 +189,14 @@ int         keys_read_hp_detect(void);
 key_id_t    keys_decode(uint16_t adc);
 const char *keys_name(key_id_t key);
 void        keys_scan_tick(uint32_t now_ms);
+void        keys_pause_scan(int pause); /* 1 = stop debounced scanning (diagnostics) */
 int         keys_peek_event(key_event_t *out);
 int         keys_pop_event(key_event_t *out);
 int         keys_event_pending(void);
 key_id_t    keys_flush_events(void); /* held key at the queue boundary */
 void        keys_ignore_held(void); /* start a screen transition, suppress the exiting press */
 key_id_t    keys_state(uint32_t *since_ms);
+int         keys_last_activity(uint32_t *t_ms); /* 1 + time of last debounced edge */
 
 /* ST7735S 80x160 / 160x80 8080 Parallel LCD + PWM3 Backlight (lcd_st7735s.c) */
 #define LCD_WIDTH   80u
@@ -201,7 +207,10 @@ static inline uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b)
     return (uint16_t)(((uint16_t)(r >> 3) << 11) | ((uint16_t)(g >> 2) << 5) | (uint16_t)(b >> 3));
 }
 
-void     lcd_backlight_set(uint8_t percent);
+void     lcd_backlight_set(uint8_t percent);   /* instant; cancels a fade */
+void     lcd_backlight_fade(uint8_t from_pct, uint8_t to_pct, uint32_t ms);
+int      lcd_backlight_fading(void);
+void     lcd_backlight_fade_tick(void);        /* 1 ms SysTick ISR */
 void     lcd_init(void);
 uint64_t lcd_init_begin(void);
 void     lcd_init_finish(uint64_t t_slpout_us);
@@ -222,6 +231,9 @@ void     lcd_draw_char_2x(uint16_t x, uint16_t y, char c, uint16_t fg, uint16_t 
 void     lcd_draw_str_2x(uint16_t x, uint16_t y, const char *s, uint16_t fg, uint16_t bg);
 void     lcd_draw_u32(uint16_t x, uint16_t y, uint32_t v, uint16_t fg, uint16_t bg);
 void     lcd_draw_hex(uint16_t x, uint16_t y, uint32_t v, uint8_t digits, uint16_t fg, uint16_t bg);
+/* Landscape hardware scroll ring: 160 visible columns + 2 hidden GRAM lines. */
+#define LCD_HSCROLL_LINES 162u
+void     lcd_hscroll_set(uint16_t offset);
 
 /* 1-Bit SDIO / microSD Block Driver (sdio.c) */
 typedef struct {

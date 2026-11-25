@@ -68,7 +68,7 @@ All interactions use physical buttons + 1 hardware slide switch (`1 kHz` IRQ SAR
 | **REC Slide Switch** | Side latch (`PB6`) | **Slide UP = Instant Record** (even from idle/playback); **Slide DOWN = Save & Stop** |
 | **OK / PLAY** | Front (`PD0` ladder) | Confirm / Play / Pause / Drop spectrogram marker while recording / Hold to delete in Files |
 | **BACK** | Front (`PD0` ladder) | Return one level / Stop sync / Hold to eject USB disk |
-| **PREV / NEXT** | Side/front (`PD0` ladder) | Navigate tiles & lists; during playback: tap to skip, double-tap for prev/next file, hold for audible pitch-preserving `2×–5×` scrub |
+| **PREV / NEXT** | Side/front (`PD0` ladder) | Navigate tiles & lists; during playback: press (repeats every 0.6 s while held) to step the speed dial `−32×…32×` (audible up to `4×`, silent from `8×`; OK = `1×`), or change file with *Skip: Track* |
 | **VOL+ / VOL-** | Side (`PD0` ladder) | Adjust headphone/speaker volume (32-step log dB curve); adjust values in Settings |
 | **POWER (ON/OFF)** | Side (`PMU 0x31`) | Short press: wake / blank screen; hold 2 s: power off (or charging standby while on USB) |
 

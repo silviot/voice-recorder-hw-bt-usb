@@ -113,29 +113,49 @@ typedef enum {
     UI_SCR_CHARGE,
     UI_SCR_POWER,
     UI_SCR_OFF,
+    UI_SCR_HSPROBE,     /* Headset button probe (diagnostic, reuses the About layout) */
 #if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID
     UI_SCR_LIST,            /* BT=1: generic list on the Settings layout (Bluetooth mode choice, headphones) */
 #endif
 } ui_screen_id_t;
 
-/* Settings rows: BT=1 adds "Audio output" before About (output routing for the headphones mode). */
+/* Settings rows 0..9 are fixed (mic gain .. USB disk); then BT=1 (not HCI_PROBE) adds "Audio output" (output
+ * routing for the headphones mode), then About, then the Headset button test diagnostic last. Row indices are
+ * UI-only: nothing persisted is indexed by them (settings.bin stores fields, bt_hp_cfg.bin the output mode). */
 #if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID && !(defined(OPENFW_HCI_PROBE) && OPENFW_HCI_PROBE)
 #define UI_SET_ROW_AOUT   10
 #define UI_SET_ROW_ABOUT  11
-#define UI_SET_ROWS       12
-#define UI_SET_ROWS_STR   "12"
+#define UI_SET_HSPROBE    12
+#define UI_SET_COUNT      13
 #else
 #define UI_SET_ROW_ABOUT  10
-#define UI_SET_ROWS       11
-#define UI_SET_ROWS_STR   "11"
+#define UI_SET_HSPROBE    11
+#define UI_SET_COUNT      12
 #endif
 #define UI_LIST_ROWS      12        /* UI_SCR_LIST rows (title + 3 visible, scrolled) */
 
 typedef enum {
-    UI_SKIP_5_10 = 0,
-    UI_SKIP_10_30,
-    UI_SKIP_TRACK,
+    UI_SKIP_SPEED = 0,       /* LEFT/RIGHT step the player speed dial */
+    UI_SKIP_LEGACY_10_30,    /* old 10/30 s skip setting, loaded as UI_SKIP_SPEED */
+    UI_SKIP_TRACK,           /* LEFT/RIGHT change file */
 } ui_skip_mode_t;
+
+/* Player speed dial: signed playback speed, no 0. |speed| <= 4 is audible,
+ * 8x and above seek silently. Returns the next speed toward dir (+1/-1),
+ * clamped at the ends. */
+#define UI_SPEED_SILENT 8
+static inline int ui_speed_step(int speed, int dir)
+{
+    static const int8_t ladder[] = { -32, -16, -8, -4, -2, -1, 1, 2, 4, 8, 16, 32 };
+    const int n = (int)(sizeof(ladder) / sizeof(ladder[0]));
+    int i = 0;
+    while (i < n - 1 && ladder[i] < speed) i++;
+    if (ladder[i] != speed && dir < 0 && i > 0) i--; /* off-ladder: nearest step that way */
+    else if (ladder[i] == speed) i += dir > 0 ? 1 : -1;
+    if (i < 0) i = 0;
+    if (i > n - 1) i = n - 1;
+    return ladder[i];
+}
 
 typedef enum {
     UI_SCR_OFF_15S = 0,
@@ -221,6 +241,10 @@ typedef struct {
     int            file_sel;
     int            file_scroll;
     char           files_title[24];
+    /* In-screen navigation (e.g. folder enter/leave): bump nav_seq via
+     * ui_model_nav() and the next render pushes the page in nav_dir. */
+    uint8_t        nav_seq;
+    uint8_t        nav_dir;         /* UI_NAV_FORWARD / UI_NAV_BACK */
 
     /* Player */
     ui_file_entry_t play_file;
@@ -228,13 +252,15 @@ typedef struct {
     uint32_t       play_pos_ms;      /* millisecond playback position for smooth progress */
     uint32_t       play_dur_ms;      /* millisecond duration for smooth progress */
     uint8_t        play_state;       /* 0=Playing, 1=Paused, 2=End */
-    int8_t         play_scrub_speed; /* 0=normal, +/-2..5 during audible scrub */
+    int8_t         play_scrub_speed; /* speed dial: 0=1x normal, else -32..-1, 2..32 */
     uint8_t        play_vol_hi;      /* 1 for 1.5s after VOL+/- */
     uint8_t        play_vu_l;
     uint8_t        play_vu_r;
     int            play_has_transcript;
     uint8_t        play_has_prev;    /* set by caller: a previous file exists */
     uint8_t        play_has_next;    /* set by caller: a next file exists */
+    uint8_t        play_autoplay;    /* set by caller: continue with the next file at end of track */
+    void         (*play_tick_cb)(uint32_t now_ms); /* optional, called by the player after each UI tick */
     cwx_tr_slot_t  tr_lines[CWX_TR_VIEW_LINES]; /* [0]=above, [1..4]=visible, [5]=below */
     int8_t         tr_active_slot;   /* 1..4 active row in tr_lines[], or -1 */
     int32_t        tr_top_line_id;   /* monotonic line_id of tr_lines[1] (drives scroll anim) */
@@ -250,7 +276,7 @@ typedef struct {
     uint8_t        del_holding;
 
     /* Settings */
-    int            set_sel;         /* 0..9 */
+    int            set_sel;         /* 0..UI_SET_COUNT-1 */
     int            set_scroll;
     uint8_t        set_edit_clock;  /* 0=no, 1=hour, 2=min */
     uint8_t        set_edit_h;
@@ -295,7 +321,24 @@ typedef struct {
     /* Active Toast overlay */
     char           toast_msg[40];
     uint16_t       toast_col;       /* UI_COL_AMBER / UI_COL_CYAN / UI_COL_GREEN */
+
+    /* Headset button probe (Settings > Headset button test) */
+    uint8_t        hsp_secs_left;
+    uint8_t        hsp_phase;       /* 1..3 */
+    uint8_t        hsp_prompt;      /* 0 or 1..5 while "press now" is shown */
+    int8_t         hsp_plug;        /* 1 plugged, 0 not, -1 unknown (PB11 analog) */
 } ui_model_t;
+
+/* Same values as ui_transition_t (src/ui/ui_port.h). */
+#define UI_NAV_FORWARD 1u
+#define UI_NAV_BACK    2u
+
+/* Request a push transition for the next render of the same screen. */
+static inline void ui_model_nav(ui_model_t *m, uint8_t dir)
+{
+    m->nav_dir = dir;
+    m->nav_seq++;
+}
 
 void ui_settings_defaults(ui_settings_t *cfg);
 int ui_poll_power_button(ui_screen_id_t screen, ui_model_t *model, uint32_t now);

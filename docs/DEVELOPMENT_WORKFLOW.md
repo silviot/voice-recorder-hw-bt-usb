@@ -19,7 +19,7 @@ make -C open_fw all test-host-san \
 What this catches in seconds on x86-64:
 - **Memory & UB bugs:** `-Wall -Wextra -Werror -fsanitize=undefined,address` across `test_core`, `test_drivers_mmio`, `test_ui_render`, `test_audio_dsp`, `test_player`, and `test_audio_bt_mmio`.
 - **exFAT corruption:** Creates real formatted images, runs multi-cluster WAV writes, checkpoints, atomic replaces, and validates with `fsck.exfat -n`.
-- **UI regressions & heap blowups:** `test_ui_render` drives the real firmware LVGL + EEZ code through all 14 screens, reveal/scroll animations, and overlays, asserting exact pixel dirty-budgets, toast pill bounds (catching LVGL `LV_DPI_DEF` default-size traps), and peak TLSF heap (`<= 18 KiB` on 64-bit host).
+- **UI regressions & heap blowups:** `test_ui_render` drives the real firmware LVGL + EEZ code through all 14 screens, the hardware-scroll screen push (checked before and after every scroll step), scroll animations, and overlays, asserting exact pixel dirty-budgets, toast pill bounds (catching LVGL `LV_DPI_DEF` default-size traps), and peak TLSF heap (`<= 18 KiB` on 64-bit host).
 - **Pixel-exact UI refactors:** When optimizing EEZ-generated screens or LVGL styles (e.g., deduplicating redundant default style calls in `open_fw/tools/gen_eez_project.py`), save a baseline contact sheet before editing and diff after:
   ```bash
   cp /tmp/sl6801_openfw_san/ui_all_screens.ppm /tmp/baseline_ui.ppm

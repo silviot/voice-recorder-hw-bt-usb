@@ -15,7 +15,7 @@ static uint16_t g_lcd_w     = LCD_WIDTH;
 static uint16_t g_lcd_h     = LCD_HEIGHT;
 static uint16_t g_lcd_x_off = 26u;
 static uint16_t g_lcd_y_off = 0u;
-static int      s_pwm_inited = 0;
+static volatile int s_pwm_inited = 0; /* read by lcd_backlight_fade_tick() */
 
 static inline void lcdc_wait_idle(void)
 {
@@ -104,23 +104,9 @@ static inline uint32_t pack_be16_pair(uint16_t p0, uint16_t p1)
     return rev16_u32((uint32_t)p0 | ((uint32_t)p1 << 16));
 }
 
-void lcd_backlight_set(uint8_t percent)
+/* Task context only: connects PWM3 to PB17 on first use (BUSY wait). */
+static void pwm3_set_duty(uint32_t duty)
 {
-    if (percent > 100u) {
-        percent = 100u;
-    }
-
-    if (percent == 0u) {
-        /* Preload the output latch before disconnecting PWM from the pad. */
-        gpio_write(GPIO_PORT_B, 17u, 0);
-        gpio_set_mux(GPIO_PORT_B, 17u, 1u);
-        if (s_pwm_inited && rom_rst_is_released(CRU_RST_PWM)) {
-            openfw_mmio_clr32(PWM3_CTRL_ADDR, 0x3Fu);
-        }
-        s_pwm_inited = 0;
-        return;
-    }
-
     int connect_pwm = !s_pwm_inited || !rom_rst_is_released(CRU_RST_PWM);
     if (connect_pwm) {
         if (!rom_rst_is_released(CRU_RST_PWM)) {
@@ -139,11 +125,103 @@ void lcd_backlight_set(uint8_t percent)
             break;
         }
     }
-    openfw_mmio_wr32(PWM3_PERIOD_DUTY_ADDR, (48000u << 16) | ((uint32_t)percent * 480u));
+    openfw_mmio_wr32(PWM3_PERIOD_DUTY_ADDR, (48000u << 16) | duty);
     if (connect_pwm) {
         gpio_set_mux(GPIO_PORT_B, 17u, 5u);
         s_pwm_inited = 1;
     }
+}
+
+/*
+ * Backlight fade. lcd_backlight_fade() (task context) connects the PWM at the
+ * start level and arms a ramp; lcd_backlight_fade_tick() runs from the 1 ms
+ * SysTick and only rewrites the PWM3 duty, one step per BL_FADE_STEP_MS.
+ * Perceptual curve: level L in 0..1000 moves linearly in time and
+ * duty = L^2 * 48000 / 1000^2 (gamma 2), so 100 % -> L 1000, 20 % -> L 447.
+ * Reversing a running ramp starts from its current level (no jump).
+ * Any lcd_backlight_set() cancels a running ramp; disconnecting the pad at
+ * 0 % is left to the caller once lcd_backlight_fading() reports done.
+ */
+#define BL_FADE_STEP_MS 10u
+static volatile uint8_t  s_fade_n;      /* total steps; 0 = idle */
+static volatile uint8_t  s_fade_step;
+static volatile uint8_t  s_fade_ms;
+static volatile int16_t  s_fade_l0, s_fade_l1, s_fade_l; /* s_fade_l: current */
+static volatile uint16_t s_fade_duty_end;
+
+static int16_t bl_pct_to_level(uint8_t pct) /* isqrt(pct * 10000) */
+{
+    uint32_t sq = (uint32_t)pct * 10000u, l = 0u;
+    while ((l + 1u) * (l + 1u) <= sq) {
+        l++;
+    }
+    return (int16_t)l;
+}
+
+void lcd_backlight_fade(uint8_t from_pct, uint8_t to_pct, uint32_t ms)
+{
+    int running = s_fade_n != 0u;
+    s_fade_n    = 0u;
+    from_pct    = (from_pct > 100u) ? 100u : from_pct;
+    to_pct      = (to_pct > 100u) ? 100u : to_pct;
+    uint32_t n  = ms / BL_FADE_STEP_MS;
+    uint32_t l0 = running ? (uint32_t)s_fade_l : (uint32_t)bl_pct_to_level(from_pct);
+    s_fade_l0 = s_fade_l = (int16_t)l0;
+    s_fade_l1       = bl_pct_to_level(to_pct);
+    s_fade_duty_end = (uint16_t)(to_pct * 480u);
+    s_fade_step     = 0u;
+    s_fade_ms       = 0u;
+    pwm3_set_duty(running ? (l0 * l0 * 48u) / 1000u : (uint32_t)from_pct * 480u);
+    s_fade_n = (uint8_t)((n == 0u) ? 1u : (n > 255u) ? 255u : n);
+}
+
+int lcd_backlight_fading(void)
+{
+    return s_fade_n != 0u;
+}
+
+/* SysTick context. No OPENFW_RAMFUNC needed: the linker script already copies
+ * all of lcd_st7735s.o's .text to SRAM before systick_init(). */
+void lcd_backlight_fade_tick(void)
+{
+    uint32_t n = s_fade_n;
+    if (n == 0u || !s_pwm_inited || ++s_fade_ms < BL_FADE_STEP_MS) {
+        return;
+    }
+    if ((openfw_mmio_rd32(PWM3_CTRL_ADDR) & (1u << 28)) != 0u) {
+        return; /* previous duty not latched yet: retry next ms */
+    }
+    s_fade_ms     = 0u;
+    uint32_t step = ++s_fade_step;
+    uint32_t duty = s_fade_duty_end;
+    if (step < n) {
+        int32_t l = s_fade_l0 + ((int32_t)s_fade_l1 - s_fade_l0) * (int32_t)step / (int32_t)n;
+        s_fade_l  = (int16_t)l;
+        duty      = ((uint32_t)l * (uint32_t)l * 48u) / 1000u;
+    } else {
+        s_fade_n = 0u;
+    }
+    openfw_mmio_wr32(PWM3_PERIOD_DUTY_ADDR, (48000u << 16) | duty);
+}
+
+void lcd_backlight_set(uint8_t percent)
+{
+    s_fade_n = 0u; /* cancel any ramp */
+    if (percent > 100u) {
+        percent = 100u;
+    }
+
+    if (percent == 0u) {
+        /* Preload the output latch before disconnecting PWM from the pad. */
+        gpio_write(GPIO_PORT_B, 17u, 0);
+        gpio_set_mux(GPIO_PORT_B, 17u, 1u);
+        if (s_pwm_inited && rom_rst_is_released(CRU_RST_PWM)) {
+            openfw_mmio_clr32(PWM3_CTRL_ADDR, 0x3Fu);
+        }
+        s_pwm_inited = 0;
+        return;
+    }
+    pwm3_set_duty((uint32_t)percent * 480u);
 }
 
 void lcd_shutdown(void)
@@ -159,7 +237,7 @@ void lcd_shutdown(void)
 
 uint64_t lcd_init_begin(void)
 {
-    /* Release LCDC reset & clock at 24 MHz HOSC (10.6 ms full-screen, ~1.1 ms per reveal slice) */
+    /* Release LCDC reset & clock at 24 MHz HOSC (10.6 ms full-screen, ~0.15 ms per 2-column push step) */
     if (!rom_rst_is_released(CRU_RST_LCDC)) {
         rom_rst_release(CRU_RST_LCDC);
     }
@@ -297,6 +375,41 @@ void lcd_set_rotation(int landscape)
         g_lcd_x_off = 26u;
         g_lcd_y_off = 1u; /* 162-row GRAM -> 1 px margin on top/bottom */
     }
+}
+
+/*
+ * Landscape horizontal hardware scroll (ST7735S VSCRDEF 33h / VSCSAD 37h).
+ *
+ * The ST7735S "vertical" scroll rotates the 162 gate lines of GRAM. With
+ * MADCTL MV=1 those gate lines are addressed by CASET, i.e. they run along the
+ * landscape X axis: column address a = x + 1 holds logical column x, and the
+ * two addresses 0 and 161 are hidden margin lines (cleared at init).
+ *
+ * lcd_hscroll_set(off) makes screen column x show address (x + 1 + off) % 162,
+ * so increasing off moves the picture left. MADCTL MY=1 reverses gate order
+ * relative to CASET, so the controller start address is 162 - off.
+ * Build with -DLCD_HSCROLL_SSA_INVERT=0 if a panel scrolls the other way.
+ */
+#ifndef LCD_HSCROLL_SSA_INVERT
+#define LCD_HSCROLL_SSA_INVERT 1
+#endif
+
+void lcd_hscroll_set(uint16_t offset)
+{
+    static uint8_t s_defined;
+    offset = (uint16_t)(offset % LCD_HSCROLL_LINES);
+    if (!s_defined) {
+        s_defined = 1u;
+        st7735s_write_cmd(0x33u); /* VSCRDEF: TFA=0, VSA=162, BFA=0 */
+        st7735s_write_data(pack_be16_pair(0u, LCD_HSCROLL_LINES), 4u);
+        st7735s_write_data(pack_be16_pair(0u, 0u) & 0xFFFFu, 2u);
+    }
+    uint16_t ssa = offset;
+    if (LCD_HSCROLL_SSA_INVERT && ssa != 0u) {
+        ssa = (uint16_t)(LCD_HSCROLL_LINES - ssa);
+    }
+    st7735s_write_cmd(0x37u); /* VSCSAD */
+    st7735s_write_data(pack_be16_pair(ssa, 0u) & 0xFFFFu, 2u);
 }
 
 uint16_t lcd_get_width(void)

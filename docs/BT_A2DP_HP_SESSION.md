@@ -101,11 +101,42 @@ Each host-testable one has a check that failed before the fix (scenario S unless
 | `pkt_type` in linkinfo is always 0 (040F REJ) | linkinfo also logs `req_pt` / `allow_rs` (our 0405) and the peer's `edr` / `slots35` (event 0x0B) | `hp_link_view_early_role` |
 | Recipe deleted the bond between stages; `hp_pick=first` could pick a phone/PC | recipe split (bond kept), `hp_pick=last` (stored headset); `bt_bench_hp_pick`: AV major class only, headset types first | `test-bt-port` (`test_bt_bench`) |
 
+## Integration with the local features (`integ/bt-all-local`: BT + `test/main-combo`)
+
+`test/main-combo` (backlight fade, `.autoplay` folders + position memory, speed dial, screen transitions, idle-key fix,
+Settings > Headset button test) merged on top of the BT branch. The BT=0 image stays byte-identical to
+`test/main-combo`'s (FIRM CRC-16 0xA3BB): every BT-side hook is a macro that folds to the old call for BT=0.
+
+- **Settings rows** (`include/openfw_ui.h`; row indices are UI-only, nothing persisted is indexed by them):
+  0..9 fixed (mic gain .. USB disk), then BT=1 release/bench: 10 Audio output, 11 About, 12 Headset button test
+  (`UI_SET_COUNT` 13); BT=0 and BT=1 `HCI_PROBE=1`: 10 About, 11 Headset button test (12). `UI_SET_ROWS` /
+  `UI_SET_ROWS_STR` are gone (`UI_SET_COUNT`, `UI_SET_ROW_ABOUT`, `UI_SET_HSPROBE`, optional `UI_SET_ROW_AOUT`).
+- **Player**: every speed-dial path writes, flushes, mutes and counts through `aout_*` and `PA_SET`, so Headphones
+  and Both work. The silent clock (|speed| >= 8) starts once `aout_queued_frames()` is 0; on the headset route that
+  includes the latency term, which drains within the delay estimate after the last real frame, so the clock starts
+  ~150-250 ms later than on the DAC. Nothing is written while silent: `hp_tx` sends silence, and after
+  `BT_HP_IDLE_SUSPEND_MS` (20 s) of it the session suspends; the next audible grain or 1x audio demands START again.
+  The speed dial is a lasting state now (not a hold), so link lost / stalled / remote suspend / START failed and
+  "headphones mode stopped" end it at the heard position before pausing, and starting the dial from pause on the
+  headset route is refused like PLAY when no stream is ready ("Headphones not connected").
+- **AVRCP keys**: FORWARD / BACKWARD = one fresh RIGHT / LEFT press (`keys.repeat` cleared): with the "Speed" skip
+  setting one speed-dial step (1x -> 2x, ...; at another speed toward it), with "Track" (or FORWARD at the end) the
+  next / previous file. PLAY/PAUSE toggle = OK (at another speed: back to 1x). STOP (`BT_HP_KEY_PAUSE`) during the
+  dial leaves it at the heard position and pauses.
+- **Headset button test on BT=1**: the 16 KiB log does not fit `.bss_hi` next to the BT bench / link-view buffers,
+  and the heap floor stays. BT=1 images keep the log in the experiment output buffer (`.exp_out`, 0x00858000, idle
+  outside a USB experiment run; a probe overwrites an undumped experiment output); BT=0 keeps its `.bss_hi` buffer.
+  The probe loop now waits with `OPENFW_TASK_WAIT()` and keeps polling a background headphones session.
+- **SysTick**: `lcd_backlight_fade_tick()` runs before `openfw_rtos_tick()`; it only rewrites the PWM3 duty and the
+  task side arms a ramp with `s_fade_n` cleared, so the RTOS tick ownership does not change it.
+- **Transitions**: `UI_SCR_LIST` maps to the Settings page (depth 1): Home -> Bluetooth pushes forward, Phone mode
+  (BT page) forward, back to Home backward; Bluetooth choice -> Headphones pushes forward through `ui_model_nav`.
+
 ## Not tested / open
 
 - Nothing on silicon. ROM behaviour of `0401`/`0405` as master, LM states, role switch / packet types / slots, real
   NOCP latency, CPU of SBC from XIP, heap under streaming: the recipe's stages answer these.
-- Not on the host: a 44.1 kHz-only sink (SEID 1 fallback), bitpool-limited peers, page-scan variants, the player and
+- Not on the host: the speed dial on the headset route (silent clock, link loss mid-dial), a 44.1 kHz-only sink (SEID 1 fallback), bitpool-limited peers, page-scan variants, the player and
   UI integration (no `test_player` BT=1 variant yet), wasm rendering of `UI_SCR_LIST`, TSan for scenario S, soak.
 - Design items still open: patches B/C, `bt_ctrl_rnr_pending()`, AVRCP scrub, Home PLAY, idle disconnect, mono
   pass-through, "BT" volume label, LRU of 2 headset bonds, REC → disconnect fallback (Exp 4h).

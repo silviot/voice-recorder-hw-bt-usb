@@ -199,6 +199,39 @@ power_button_action_t power_button_update(uint8_t events, uint32_t now, int scre
     return POWER_BUTTON_IDLE;
 }
 
+/*
+ * Screen idle policy, kept pure for host tests. last_activity_ms may be a key
+ * edge stamped by the SysTick after now_ms was sampled: a "negative" idle time
+ * is treated as fresh activity, never as a 4-billion-ms idle.
+ */
+screen_idle_t screen_idle_level(uint32_t now_ms, uint32_t last_activity_ms,
+                                uint32_t off_ms, uint8_t user_pct, uint8_t *out_pct)
+{
+    uint32_t idle_ms = (uint32_t)(now_ms - last_activity_ms);
+    if ((int32_t)idle_ms < 0) {
+        idle_ms = 0u;
+    }
+    if (out_pct) {
+        *out_pct = user_pct;
+    }
+    if (off_ms == 0u) {
+        return SCREEN_IDLE_FULL;
+    }
+    if (idle_ms >= off_ms) {
+        if (out_pct) {
+            *out_pct = 0u;
+        }
+        return SCREEN_IDLE_SLEEP;
+    }
+    if (off_ms >= 20000u && idle_ms >= (off_ms / 2u)) {
+        if (out_pct) {
+            *out_pct = (user_pct < 15u) ? user_pct : 15u;
+        }
+        return SCREEN_IDLE_DIM;
+    }
+    return SCREEN_IDLE_FULL;
+}
+
 /* Universal SL6801 PMU cold rail reset (SL6801_HW76_HARDWARE.md §5.2):
  * Drops and re-sequences all SoC rails cleanly (resets PLLs, CRU, USB PHY, XIP)
  * while preserving sticky PMU flags (PMU[0x23], PMU[0x00]). */

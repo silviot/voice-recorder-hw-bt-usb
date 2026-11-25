@@ -96,6 +96,9 @@ typedef enum {
     UI_STR_NEXT,
     UI_STR_PAUSE,
     UI_STR_PLAY,
+    UI_STR_FAST,               /* player speed dial: forward 2x/4x */
+    UI_STR_REVERSE,            /* reverse -1x..-4x */
+    UI_STR_SEEKING,            /* silent 8x and above, either way */
 
     /* Delete confirm */
     UI_STR_DELETE_Q,
@@ -119,6 +122,7 @@ typedef enum {
     UI_STR_SND_CLARITY,
     UI_STR_SND_BYPASS,
     UI_STR_SKIP_TRACK,
+    UI_STR_SKIP_SPEED,
     UI_STR_NEVER,
     UI_STR_ON,
     UI_STR_OFF,
@@ -169,6 +173,19 @@ typedef enum {
     UI_STR_TOAST_HP_PAUSED,
     UI_STR_TOAST_END_LIST,
     UI_STR_TOAST_START_LIST,
+
+    /* Headset button probe (diagnostic) — TODO(i18n): English only, other
+     * languages fall back to English via ui_tr_lang(). */
+    UI_STR_SET_HSPROBE,        /* "Headset button test" */
+    UI_STR_DESC_HSPROBE,
+    UI_STR_HSP_HINT,           /* "Plug headset, press its button 5x" */
+    UI_STR_HSP_PRESS_FMT,      /* "PRESS button now %u/5" */
+    UI_STR_HSP_WAIT_FMT,       /* "%u s left" */
+    UI_STR_HSP_PLUG_FMT,       /* "Plug %s · phase %u/3" */
+    UI_STR_HSP_FOOTER,
+    UI_STR_HSP_SAVED,          /* "Saved HSPROBE.LOG" */
+    UI_STR_HSP_NO_SD,
+    UI_STR_HSP_BUSY,
 
     UI_STR_COUNT
 } ui_str_id_t;

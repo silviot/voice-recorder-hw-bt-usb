@@ -135,6 +135,55 @@ static int make_cwx_path(char *out, int cap, const char *dir_path, const char *w
     return 0;
 }
 
+static int ascii_eq_ci(const char *a, const char *b)
+{
+    if (!a || !b) {
+        return 0;
+    }
+    while (*a != '\0' && *b != '\0') {
+        char ca = *a++, cb = *b++;
+        if (ca >= 'A' && ca <= 'Z') ca = (char)(ca + ('a' - 'A'));
+        if (cb >= 'A' && cb <= 'Z') cb = (char)(cb + ('a' - 'A'));
+        if (ca != cb) {
+            return 0;
+        }
+    }
+    return *a == '\0' && *b == '\0';
+}
+
+int player_dir_has_autoplay(exfat_vol_t *vol, const char *dir_path)
+{
+    if (!vol || !dir_path || dir_path[0] == '\0') {
+        return 0;
+    }
+    /* exFAT lookups compare names ASCII case-insensitively, so ".AUTOPLAY"
+     * or ".Autoplay" created on another OS match too. */
+    char path[EXFAT_MAX_NAME + 64];
+    build_path(path, (int)sizeof(path), dir_path, PLAYER_AUTOPLAY_MARKER);
+    exfat_entry_t ent;
+    return (exfat_find_path(vol, path, &ent) == 0 && !ent.is_dir) ? 1 : 0;
+}
+
+int player_autoplay_next_index(const ui_file_entry_t *files, const char *dirs,
+                               unsigned dir_stride, int count, int idx)
+{
+    if (!files || !dirs || idx < 0 || idx >= count) {
+        return -1;
+    }
+    int next = idx + 1;
+    while (next < count && files[next].is_dir) {
+        next++;
+    }
+    if (next >= count) {
+        return -1;
+    }
+    /* Only continue inside the same folder (the root Files view mixes folders) */
+    if (!ascii_eq_ci(dirs + (unsigned)idx * dir_stride, dirs + (unsigned)next * dir_stride)) {
+        return -1;
+    }
+    return next;
+}
+
 static uint32_t frames_to_ms(uint32_t frames, uint32_t sample_rate)
 {
     if (sample_rate == 0u || frames == 0u) {
@@ -199,15 +248,13 @@ static uint32_t populate_transcript_lines(ui_model_t *m, cwx_tr_pager_t *pager,
 
 void player_keys_init(player_keys_t *s, key_id_t initial, uint32_t now_ms)
 {
-    s->raw          = initial;
-    s->raw_since    = now_ms;
-    s->held         = initial;
-    s->held_since   = now_ms;
-    s->next_repeat  = now_ms;
-    s->hold_active  = 0u;
-    s->ignore       = (initial != KEY_NONE) ? 1u : 0u;
-    s->tap_key      = KEY_NONE;
-    s->tap_deadline = now_ms;
+    s->raw         = initial;
+    s->raw_since   = now_ms;
+    s->held        = initial;
+    s->held_since  = now_ms;
+    s->next_repeat = now_ms;
+    s->ignore      = (initial != KEY_NONE) ? 1u : 0u;
+    s->repeat      = 0u;
 }
 
 static int time_reached(uint32_t now_ms, uint32_t when_ms)
@@ -215,31 +262,25 @@ static int time_reached(uint32_t now_ms, uint32_t when_ms)
     return (int32_t)(now_ms - when_ms) >= 0;
 }
 
-static int is_seek_key(key_id_t k)
+static player_action_t seek_action(key_id_t k)
 {
-    return k == KEY_LEFT || k == KEY_RIGHT;
+    return (k == KEY_RIGHT) ? PLAYER_ACT_SEEK_FWD : PLAYER_ACT_SEEK_BACK;
 }
 
 player_action_t player_keys_tick(player_keys_t *s, uint32_t now_ms)
 {
-    /* A single tap whose double-tap window ran out becomes one seek step */
-    if (s->tap_key != KEY_NONE && time_reached(now_ms, s->tap_deadline)) {
-        key_id_t k = s->tap_key;
-        s->tap_key = KEY_NONE;
-        return (k == KEY_RIGHT) ? PLAYER_ACT_SEEK_FWD : PLAYER_ACT_SEEK_BACK;
-    }
-
-    if (s->held == KEY_NONE || s->ignore) {
+    if (s->held == KEY_NONE || s->ignore || !time_reached(now_ms, s->next_repeat)) {
         return PLAYER_ACT_NONE;
     }
-    if ((s->held == KEY_VOL_UP || s->held == KEY_VOL_DOWN) &&
-        time_reached(now_ms, s->next_repeat)) {
+    if (s->held == KEY_VOL_UP || s->held == KEY_VOL_DOWN) {
         s->next_repeat = now_ms + PLAYER_KEY_REPEAT_MS;
         return (s->held == KEY_VOL_UP) ? PLAYER_ACT_VOL_UP : PLAYER_ACT_VOL_DOWN;
     }
-    if (is_seek_key(s->held) && !s->hold_active && time_reached(now_ms, s->next_repeat)) {
-        s->hold_active = 1u;
-        return (s->held == KEY_RIGHT) ? PLAYER_ACT_SCRUB_FWD : PLAYER_ACT_SCRUB_BACK;
+    if (s->held == KEY_LEFT || s->held == KEY_RIGHT) {
+        s->next_repeat += PLAYER_KEY_STEP_MS;
+        if (time_reached(now_ms, s->next_repeat)) s->next_repeat = now_ms + PLAYER_KEY_STEP_MS;
+        s->repeat = 1u;
+        return seek_action(s->held);
     }
     return PLAYER_ACT_NONE;
 }
@@ -250,39 +291,9 @@ player_action_t player_keys_edge(player_keys_t *s, key_id_t key, uint32_t now_ms
         return PLAYER_ACT_NONE;
     }
 
-    /* Debounced change. A LEFT/RIGHT let go before its hold started is a tap. */
-    if (is_seek_key(s->held) && !s->hold_active && !s->ignore) {
-        s->tap_key      = s->held;
-        s->tap_deadline = now_ms + PLAYER_KEY_DOUBLE_TAP_MS;
-    }
-
-    s->held        = key;
-    s->held_since  = now_ms;
-    s->hold_active = 0u;
-    s->ignore      = 0u;
-
-    if (is_seek_key(key)) {
-        if (s->tap_key == key) {
-            /* Second tap of the same key inside the window */
-            s->tap_key = KEY_NONE;
-            s->ignore  = 1u;
-            return (key == KEY_RIGHT) ? PLAYER_ACT_NEXT_FILE : PLAYER_ACT_PREV_FILE;
-        }
-        s->next_repeat = now_ms + PLAYER_KEY_HOLD_MS;
-        if (s->tap_key != KEY_NONE) {
-            /* Pending tap of the other key: settle it now */
-            key_id_t k = s->tap_key;
-            s->tap_key = KEY_NONE;
-            return (k == KEY_RIGHT) ? PLAYER_ACT_SEEK_FWD : PLAYER_ACT_SEEK_BACK;
-        }
-        return PLAYER_ACT_NONE;
-    }
-
-    if (key != KEY_NONE && s->tap_key != KEY_NONE) {
-        /* Deliver the new control immediately. A different key rules out a
-         * double tap, so the next tick can settle the pending seek. */
-        s->tap_deadline = now_ms;
-    }
+    s->held       = key;
+    s->held_since = now_ms;
+    s->ignore     = 0u;
 
     switch (key) {
     case KEY_NONE:
@@ -295,6 +306,11 @@ player_action_t player_keys_edge(player_keys_t *s, key_id_t key, uint32_t now_ms
     case KEY_VOL_DOWN:
         s->next_repeat = now_ms + PLAYER_KEY_REPEAT_DELAY_MS;
         return (key == KEY_VOL_UP) ? PLAYER_ACT_VOL_UP : PLAYER_ACT_VOL_DOWN;
+    case KEY_LEFT:
+    case KEY_RIGHT:
+        s->next_repeat = now_ms + PLAYER_KEY_STEP_MS;
+        s->repeat      = 0u;
+        return seek_action(key);
     default:
         s->ignore = 1u;
         return PLAYER_ACT_NONE;
@@ -303,13 +319,6 @@ player_action_t player_keys_edge(player_keys_t *s, key_id_t key, uint32_t now_ms
 
 player_action_t player_keys_step(player_keys_t *s, key_id_t raw, uint32_t now_ms)
 {
-    /* A single tap whose double-tap window ran out becomes one seek step */
-    if (s->tap_key != KEY_NONE && time_reached(now_ms, s->tap_deadline)) {
-        key_id_t k = s->tap_key;
-        s->tap_key = KEY_NONE;
-        return (k == KEY_RIGHT) ? PLAYER_ACT_SEEK_FWD : PLAYER_ACT_SEEK_BACK;
-    }
-
     /* Debounce: the resistor ladder passes through other keys' voltage bands
      * while a button moves, so act only on a decode that stayed put. */
     if (raw != s->raw) {
@@ -356,34 +365,144 @@ static void player_seek_to_frame(const wav_stream_info_t *winfo, uint64_t target
     *data_off = (uint32_t)off64;
 }
 
-/* Both directions use the normal PCM/IMA staging buffers. Read a group of
- * complete codec blocks, decode forwards, then walk the PCM in either direction. */
+int64_t player_scrub_advance(int64_t pos, uint32_t total, int speed, uint32_t sample_rate,
+                             uint32_t elapsed_ms, uint32_t *rem_milli)
+{
+    uint32_t rate = (uint32_t)(speed < 0 ? -speed : speed);
+    uint64_t milli = (uint64_t)elapsed_ms * rate * sample_rate + *rem_milli;
+    int64_t frames = (int64_t)(milli / 1000u);
+    *rem_milli = (uint32_t)(milli % 1000u);
+    pos += speed < 0 ? -frames : frames;
+    if (pos > 0 && pos < (int64_t)total) return pos;
+    *rem_milli = 0;
+    return pos <= 0 ? 0 : (int64_t)total;
+}
+
+/*
+ * Speed-dial engine for every speed except 1x (which is normal playback).
+ * scrub_start() begins at a source position, scrub_set_speed() requests a new
+ * signed speed (applied at the next grain boundary), scrub_heard() is the
+ * position being heard now, and scrub_done() says the engine ran into the start
+ * or end of the file. |speed| < UI_SPEED_SILENT plays WSOLA grains; faster
+ * speeds read nothing and clock the position from millis().
+ *
+ * Both directions use the normal PCM/IMA staging buffers. Read a group of
+ * complete codec blocks, decode forwards, then walk the PCM in either direction.
+ */
+#define SCRUB_SEGS 8u
 typedef struct {
-    int speed;               /* signed source frames per output frame */
+    int speed;               /* signed source frames per output frame; 0 = engine off */
+    int target;              /* requested speed, applied at a grain boundary */
+    unsigned fade;           /* 1: the next grain fades out before silence, 2: it did */
+    int fade_in;             /* the next grain fades in after silence */
     uint32_t submitted;
-    uint32_t rate_start[PLAYER_SCRUB_MAX_RATE - 2u]; /* frames submitted before each increase */
+    struct { uint32_t start; int speed; } seg[SCRUB_SEGS]; /* speed of submitted frames */
+    uint32_t seg_n;          /* segments recorded; seg[(seg_n - 1) % SCRUB_SEGS] is current */
     int64_t next;            /* source boundary after the last submitted sample */
     uint32_t cache_start;
     uint32_t cache_frames;
     uint32_t pending_pos;
     uint32_t pending_count;
     uint32_t overlap;
+    uint32_t silent_ms;      /* silent clock: last time next was advanced */
+    uint32_t silent_rem;     /* sub-frame remainder of the silent clock */
+    int64_t cont;            /* source boundary right after the last grain's audio */
+    int cont_speed;          /* speed of the grain that set cont */
+    int prime;               /* seed the overlap with the 1x audio still queued */
     int finished;
 } scrub_t;
 
+static int scrub_silent(int speed)
+{
+    return speed >= UI_SPEED_SILENT || speed <= -UI_SPEED_SILENT;
+}
+
+/* Start at source boundary pos. queued_1x frames of normal playback are still in
+ * the DAC queue and end at pos: they keep playing, and the first grain crossfades
+ * from their continuation, so nothing clicks. With nothing queued (paused, at the
+ * end) the first grain fades in instead. */
+static void scrub_start(scrub_t *s, int speed, uint32_t pos, uint32_t queued_1x, uint32_t now_ms)
+{
+    *s = (scrub_t){ .speed = speed, .target = speed, .next = pos, .silent_ms = now_ms,
+                    .submitted = queued_1x, .seg_n = 1 };
+    s->seg[0].speed = speed;
+    if (queued_1x) {
+        s->seg[0].speed = 1;
+        s->seg[1].start = queued_1x;
+        s->seg[1].speed = speed;
+        s->seg_n = 2;
+        s->prime = 1;
+    } else {
+        s->fade_in = 1;
+    }
+}
+
+static void scrub_set_speed(scrub_t *s, int speed)
+{
+    s->target = speed;
+}
+
+/* At a grain boundary: switch to the requested speed. Going silent first plays
+ * one more grain at the old speed, faded to zero, so the DAC stops cleanly. */
+static void scrub_apply(scrub_t *s, uint32_t now_ms)
+{
+    if (s->target == s->speed) {
+        s->fade = 0;
+        return;
+    }
+    int was_silent = scrub_silent(s->speed), silent = scrub_silent(s->target);
+    if (!was_silent && silent && s->fade < 2u && !s->finished) {
+        s->fade = 1u;
+        return;
+    }
+    if (was_silent && !silent) s->fade_in = 1;
+    if (was_silent) s->overlap = 0; /* else crossfade from the old grain's continuation */
+    s->fade = 0;
+    s->finished = 0;
+    if (s->seg[(s->seg_n - 1u) % SCRUB_SEGS].start != s->submitted) s->seg_n++;
+    s->seg[(s->seg_n - 1u) % SCRUB_SEGS].start = s->submitted;
+    s->seg[(s->seg_n - 1u) % SCRUB_SEGS].speed = s->target;
+    s->speed = s->target;
+    s->silent_ms = now_ms;
+    s->silent_rem = 0;
+}
+
+/* Source position under the DAC: walk the queued frames back through the speeds
+ * they were generated at. */
 static uint32_t scrub_heard(const scrub_t *s, uint32_t total)
 {
-    uint32_t queued = aout_queued_frames();
-    uint32_t rate = (uint32_t)(s->speed > 0 ? s->speed : -s->speed);
-    int64_t distance = 2 * (int64_t)queued;
-    for (uint32_t step = 0; step < rate - 2u; step++) {
-        uint32_t frames = s->submitted - s->rate_start[step];
-        distance += frames < queued ? frames : queued;
+    uint32_t left = aout_queued_frames();
+    uint32_t end = s->submitted;
+    uint32_t n = s->seg_n < SCRUB_SEGS ? s->seg_n : SCRUB_SEGS;
+    int64_t distance = 0;
+    for (uint32_t i = 0; i < n && left; i++) {
+        uint32_t k = (s->seg_n - 1u - i) % SCRUB_SEGS;
+        uint32_t frames = end - s->seg[k].start;
+        if (frames > left || i + 1u == n) frames = left;
+        distance += (int64_t)s->seg[k].speed * frames;
+        left -= frames;
+        end = s->seg[k].start;
     }
-    int64_t pos = s->next + (s->speed > 0 ? -distance : distance);
+    int64_t pos = s->next - distance;
     if (pos < 0) return 0;
     if (pos > total) return total;
     return (uint32_t)pos;
+}
+
+/* Back at 1x: a whole 1x grain went out and only 1x grains are queued, so normal
+ * playback can take over at cont without a flush (sample-continuous). */
+static int scrub_at_1x(const scrub_t *s)
+{
+    return s->speed == 1 && s->target == 1 && s->cont_speed == 1 && !s->pending_count &&
+           !s->finished && s->submitted - s->seg[(s->seg_n - 1u) % SCRUB_SEGS].start >= aout_queued_frames();
+}
+
+/* The engine reached the file start (reverse) or end (forward) and the DAC is empty. */
+static int scrub_done(const scrub_t *s, uint32_t total)
+{
+    if (aout_queued_frames()) return 0;
+    if (scrub_silent(s->speed)) return s->speed > 0 ? s->next >= (int64_t)total : s->next <= 0;
+    return s->finished;
 }
 
 static uint32_t decode_blocks(const wav_stream_info_t *w, uint32_t bytes)
@@ -495,6 +614,8 @@ static int scrub_grain(scrub_t *s, exfat_vol_t *vol, const exfat_entry_t *file,
         shift = scrub_match(search, blend);
     }
     frame += direction * (int32_t)shift;
+    s->cont = frame + direction * (int32_t)hop; /* used for forward 1x hand-over */
+    s->cont_speed = s->speed;
     if (!scrub_copy(s, vol, file, w, pcm, frame, direction, g_mono_tx, hop)) return 0;
     for (uint32_t i = 0; i < blend; i++) {
         for (unsigned ch = 0; ch < 2; ch++) {
@@ -514,23 +635,57 @@ static int scrub_grain(scrub_t *s, exfat_vol_t *vol, const exfat_entry_t *file,
     return 1;
 }
 
+static void scrub_ramp(uint32_t count, int up)
+{
+    for (uint32_t i = 0; i < count; i++) {
+        int32_t gain = (int32_t)(up ? i + 1u : count - 1u - i);
+        for (unsigned ch = 0; ch < 2u; ch++) {
+            int16_t *v = &g_mono_tx[2u * i + ch];
+            *v = (int16_t)((int32_t)*v * gain / (int32_t)count);
+        }
+    }
+}
+
 static void scrub_queue(scrub_t *s, exfat_vol_t *vol, const exfat_entry_t *file,
-                        const wav_stream_info_t *w, const int16_t *pcm, uint32_t held_ms)
+                        const wav_stream_info_t *w, const int16_t *pcm, uint32_t now_ms)
 {
     for (unsigned slot = 0; slot < AUDIO_DAC_QUEUE_SLOTS; slot++) {
-        if (!s->pending_count) {
-            int direction = s->speed > 0 ? 1 : -1;
-            unsigned rate = (unsigned)(direction * s->speed);
-            while (rate < PLAYER_SCRUB_MAX_RATE &&
-                   held_ms >= PLAYER_KEY_HOLD_MS + (rate - 1u) * PLAYER_SCRUB_STEP_MS) {
-                s->rate_start[rate - 2u] = s->submitted;
-                rate++;
+        if (!s->pending_count) scrub_apply(s, now_ms);
+        if (!s->pending_count && scrub_at_1x(s)) return; /* hand over to normal playback */
+        if (scrub_silent(s->speed)) {
+            /* Nothing is read or submitted. Hold the clock while the faded grain
+             * drains (scrub_heard walks through it), then advance in real time. */
+            if (!aout_queued_frames()) {
+                s->next = player_scrub_advance(s->next, w->total_samples, s->speed, w->sample_rate,
+                                               now_ms - s->silent_ms, &s->silent_rem);
             }
-            s->speed = direction * (int)rate;
+            s->silent_ms = now_ms;
+            return;
         }
-        if (!s->pending_count && (s->finished || !scrub_grain(s, vol, file, w, pcm))) {
-            s->finished = 1; /* End of this directional pass, or SD read error. */
-            break;
+        if (!s->pending_count) {
+            if (s->prime) {
+                /* Seed the WSOLA overlap with the audio normal playback would play next. */
+                s->prime = 0;
+                uint32_t tail = w->sample_rate / 160u;
+                if (tail > SCRUB_OVERLAP_MAX) tail = SCRUB_OVERLAP_MAX;
+                if (s->next + tail <= (int64_t)w->total_samples &&
+                    scrub_copy(s, vol, file, w, pcm, s->next, 1, g_scrub_tail, tail)) {
+                    s->overlap = tail;
+                } else {
+                    s->fade_in = 1;
+                }
+            }
+            if (s->finished || !scrub_grain(s, vol, file, w, pcm)) {
+                s->finished = 1; /* End of this directional pass, or SD read error. */
+                break;
+            }
+            if (s->fade == 1u) {
+                scrub_ramp(s->pending_count, 0);
+                s->fade = 2u;
+            } else if (s->fade_in) {
+                scrub_ramp(s->pending_count, 1);
+            }
+            s->fade_in = 0;
         }
         int sent = aout_write(g_mono_tx + 2 * s->pending_pos, s->pending_count, 2);
         if (sent <= 0) break;
@@ -539,6 +694,19 @@ static void scrub_queue(scrub_t *s, exfat_vol_t *vol, const exfat_entry_t *file,
         s->submitted += (uint32_t)sent;
         s->next += (int64_t)sent * s->speed;
     }
+}
+
+/* Leave the speed dial for 1x at the heard position (queued grains count). */
+static void scrub_stop(scrub_t *s, const wav_stream_info_t *w, uint32_t *data_off,
+                       uint32_t *played_frames, uint32_t *skip_frames,
+                       uint32_t *buf_pos, uint32_t *buf_frames)
+{
+    uint32_t heard = scrub_heard(s, w->total_samples);
+    aout_flush();
+    s->speed = 0;
+    player_seek_to_frame(w, heard, data_off, played_frames);
+    *skip_frames = heard - *played_frames;
+    *buf_pos = *buf_frames = 0u;
 }
 
 static void player_pause_rewind(const wav_stream_info_t *winfo,
@@ -697,6 +865,9 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
     m->play_vol_hi              = 0u;
     m->play_vu_l                = 0u;
     m->play_vu_r                = 0u;
+    /* Live position for a power-off mid-track (refreshed on every UI tick) */
+    m->play_pos_sec             = m->play_file.resume_sec;
+    m->play_state               = 0u;
 
     uint32_t data_off      = 0u;
     uint32_t played_frames = 0u;
@@ -794,16 +965,29 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
             /* AVRCP keys (design §6.6): past the screen-off gate (a headset button in a pocket still works) */
             switch (bt_hp_take_key()) {
             case BT_HP_KEY_PLAY:     act = (paused || eof_reached) ? PLAYER_ACT_PLAY_PAUSE : PLAYER_ACT_NONE; break;
-            case BT_HP_KEY_PAUSE:    act = (!paused && !eof_reached) ? PLAYER_ACT_PLAY_PAUSE : PLAYER_ACT_NONE; break;
-            case BT_HP_KEY_TOGGLE:   act = PLAYER_ACT_PLAY_PAUSE; break;
-            case BT_HP_KEY_NEXT:     act = PLAYER_ACT_SEEK_FWD; break;   /* next file or +seek per skip mode */
-            case BT_HP_KEY_PREV:     act = PLAYER_ACT_SEEK_BACK; break;
+            case BT_HP_KEY_PAUSE:
+                if (scrub.speed) {
+                    /* STOP during the speed dial: leave it at the heard position, then pause as at 1x (OK on the
+                     * device would only return to 1x) */
+                    scrub_stop(&scrub, &winfo, &data_off, &played_frames, &skip_frames, &buf_pos, &buf_frames);
+                }
+                act = (!paused && !eof_reached) ? PLAYER_ACT_PLAY_PAUSE : PLAYER_ACT_NONE;
+                break;
+            case BT_HP_KEY_TOGGLE:   act = PLAYER_ACT_PLAY_PAUSE; break;   /* = OK: at another speed, back to 1x */
+            /* FORWARD / BACKWARD = one fresh RIGHT / LEFT press (never a hold repeat): per the skip setting a speed
+             * dial step ("Speed") or the next / previous file ("Track", or RIGHT at the end) */
+            case BT_HP_KEY_NEXT:     act = PLAYER_ACT_SEEK_FWD; keys.repeat = 0u; break;
+            case BT_HP_KEY_PREV:     act = PLAYER_ACT_SEEK_BACK; keys.repeat = 0u; break;
             case BT_HP_KEY_VOL_UP:   act = PLAYER_ACT_VOL_UP; break;
             case BT_HP_KEY_VOL_DOWN: act = PLAYER_ACT_VOL_DOWN; break;
             default: break;
             }
         }
-        if (act == PLAYER_ACT_PLAY_PAUSE && paused && aout_is_bt() && !bt_hp_stream_ready()) {
+        if (((act == PLAYER_ACT_PLAY_PAUSE && paused) ||
+             /* the speed dial unpauses too (audible speeds write to the ring) */
+             ((act == PLAYER_ACT_SEEK_FWD || act == PLAYER_ACT_SEEK_BACK) && !scrub.speed && (paused || eof_reached) &&
+              !(!has_cwx && m->cfg.skip_mode == UI_SKIP_TRACK) && !(eof_reached && act == PLAYER_ACT_SEEK_FWD))) &&
+            aout_is_bt() && !bt_hp_stream_ready()) {
             act = PLAYER_ACT_NONE;                   /* nothing would drain the ring: stay paused */
             str_copy_cap(m->toast_msg, (int)sizeof(m->toast_msg), "Headphones not connected"); /* TODO(i18n) */
             m->toast_col = UI_COL_AMBER;
@@ -812,6 +996,9 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
         }
         if (bt_route && !aout_is_bt() && !paused && !eof_reached) {
             bt_route = 0;                            /* headphones mode stopped under the file: hold it */
+            if (scrub.speed) {
+                scrub_stop(&scrub, &winfo, &data_off, &played_frames, &skip_frames, &buf_pos, &buf_frames);
+            }
             paused = 1;
             str_copy_cap(m->toast_msg, (int)sizeof(m->toast_msg), "Headphones disconnected"); /* TODO(i18n) */
             m->toast_col = UI_COL_AMBER;
@@ -820,9 +1007,14 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
         }
         {
             uint32_t pev = bt_hp_take_player_events();
-            if (pev != 0u && aout_is_bt() && !paused && !eof_reached && !scrub.speed) {
+            if (pev != 0u && aout_is_bt() && !paused && !eof_reached) {
                 /* link lost / stalled / remote suspend / START failed (design §6.7): pause, rewind to the last
-                 * heard frame (the transmit path's snapshot), like a headphone unplug */
+                 * heard frame (the transmit path's snapshot), like a headphone unplug. The speed dial is a lasting
+                 * state (not a hold), so it ends here too, at its heard position (a frozen snapshot would also stop
+                 * its silent clock, which waits for an empty queue). */
+                if (scrub.speed) {
+                    scrub_stop(&scrub, &winfo, &data_off, &played_frames, &skip_frames, &buf_pos, &buf_frames);
+                }
                 paused = 1;
                 aout_set_mute(1);
                 player_pause_rewind(&winfo, &data_off, &played_frames, &buf_pos, &buf_frames, &skip_frames);
@@ -837,18 +1029,9 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
         }
 #endif
         int unplug = hp_in && !cur_hp;
-        if (scrub.speed && (!keys.hold_active || unplug ||
-                            (!keys_event_pending() && keys_state(NULL) != keys.held))) {
-            uint32_t heard = scrub_heard(&scrub, winfo.total_samples);
-            aout_flush();
-            scrub.speed = 0;
-            player_seek_to_frame(&winfo, heard, &data_off, &played_frames);
-            skip_frames = heard - played_frames;
-            buf_pos = buf_frames = 0;
-            eof_reached = heard == winfo.total_samples;
-            if (eof_reached) played_frames = heard;
-            aout_set_mute(paused || eof_reached);
-            PA_SET(!paused && !eof_reached && !hp_in && !unplug);
+        if (scrub.speed && unplug) {
+            /* Back to 1x; the headphone code below then pauses at this position. */
+            scrub_stop(&scrub, &winfo, &data_off, &played_frames, &skip_frames, &buf_pos, &buf_frames);
             ui_dirty = 1;
         }
         if (cur_hp != hp_in) {
@@ -876,7 +1059,16 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
         if (act == PLAYER_ACT_BACK) {
             ret_code = 0;
             break;
+        } else if (act == PLAYER_ACT_PLAY_PAUSE && scrub.speed && scrub.target != 1) {
+            /* Any speed other than 1x: OK returns to 1x. The queued grains play
+             * out and 1x grains hand over to normal playback without a flush. */
+            scrub_set_speed(&scrub, 1);
+            ui_dirty = 1;
         } else if (act == PLAYER_ACT_PLAY_PAUSE) {
+            if (scrub.speed) {
+                /* Still handing over to 1x: finish now, then pause as at 1x. */
+                scrub_stop(&scrub, &winfo, &data_off, &played_frames, &skip_frames, &buf_pos, &buf_frames);
+            }
             if (eof_reached) {
                 data_off      = 0u;
                 played_frames = 0u;
@@ -917,42 +1109,35 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
             aout_set_volume(PLAYER_VOL_GAIN(volume), 0x1FFu);
             last_vol_ms = now ? now : 1u;
             ui_dirty    = 1;
-        } else if (act == PLAYER_ACT_PREV_FILE || act == PLAYER_ACT_NEXT_FILE) {
-            file_dir = (act == PLAYER_ACT_NEXT_FILE) ? 1 : -1;
-        } else if ((act == PLAYER_ACT_SCRUB_BACK || act == PLAYER_ACT_SCRUB_FWD) && !unplug) {
-            uint32_t heard = eof_reached ? played_frames : player_heard_frames(played_frames, skip_frames);
-            aout_flush();
-            scrub = (scrub_t){ .speed = act == PLAYER_ACT_SCRUB_FWD ? 2 : -2, .next = heard };
-            aout_set_mute(0);
-            PA_SET(!hp_in);
-            ui_dirty = 1;
         } else if (act == PLAYER_ACT_SEEK_BACK || act == PLAYER_ACT_SEEK_FWD) {
             int fwd = act == PLAYER_ACT_SEEK_FWD;
-            /* A tap keeps the old meaning in "Track" skip mode and at the end of
-             * the file; a hold always seeks. */
-            if ((eof_reached && fwd) || (!has_cwx && m->cfg.skip_mode == UI_SKIP_TRACK)) {
-                file_dir = fwd ? 1 : -1;
-            } else {
-                int32_t step_s;
-                if (m->cfg.skip_mode == UI_SKIP_5_10) {
-                    step_s = fwd ? 10 : -5;
+            int cur = scrub.speed ? scrub.target : 1;
+            /* "Track" mode (without a transcript) changes file; so does a fresh RIGHT
+             * press at the end. A held RIGHT that reached the end stays there. */
+            if ((!has_cwx && m->cfg.skip_mode == UI_SKIP_TRACK) || (eof_reached && fwd && cur == 1)) {
+                if (!keys.repeat) file_dir = fwd ? 1 : -1;
+            } else if (!unplug && !(keys.repeat && cur == 1 && (paused || eof_reached))) {
+                /* (A held key that ran into 0:00 or the end stays stopped there.) */
+                int want = ui_speed_step(cur, fwd ? 1 : -1);
+                if (!scrub.speed) {
+                    /* From 1x, playing or paused: start the dial after the audio
+                     * already queued (paused or at the end nothing is queued). */
+                    uint32_t queued = (paused || eof_reached) ? 0u : aout_queued_frames();
+                    uint32_t pos = eof_reached ? played_frames : played_frames + skip_frames;
+                    if (!queued) {
+                        aout_flush();
+                        pos = eof_reached ? played_frames : player_heard_frames(played_frames, skip_frames);
+                    }
+                    buf_pos = buf_frames = 0u;
+                    scrub_start(&scrub, want, pos, queued, now);
+                    paused = 0;
+                    eof_reached = 0;
+                    aout_set_mute(0);
+                    PA_SET(!hp_in);
                 } else {
-                    step_s = fwd ? 30 : -10;
+                    scrub_set_speed(&scrub, want);
                 }
-                uint32_t heard = player_heard_frames(played_frames, skip_frames);
-                int64_t delta  = (int64_t)winfo.sample_rate * (int64_t)step_s;
-                int64_t target = (int64_t)heard + delta;
-                if (target < 0) {
-                    target = 0;
-                }
-                player_seek_to_frame(&winfo, (uint64_t)target, &data_off, &played_frames);
-                buf_pos     = 0u;
-                buf_frames  = 0u;
-                skip_frames = 0u;
-                eof_reached = 0;
-                aout_flush();
-                PA_SET((!hp_in && !paused) ? 1 : 0);
-                ui_dirty    = 1;
+                ui_dirty = 1;
             }
         }
         if (file_dir != 0) {
@@ -968,8 +1153,25 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
         }
 
         /* Refill PCM decode staging buffer & fill the DAC queue before doing display work */
+        int eof_before_refill = eof_reached;
         if (scrub.speed) {
-            scrub_queue(&scrub, vol, &wav_ent, &winfo, pcm_buf, millis() - keys.held_since);
+            scrub_queue(&scrub, vol, &wav_ent, &winfo, pcm_buf, millis());
+            if (scrub_at_1x(&scrub)) {
+                /* Normal playback continues sample-exactly after the last 1x grain. */
+                player_seek_to_frame(&winfo, (uint64_t)scrub.cont, &data_off, &played_frames);
+                skip_frames = (uint32_t)scrub.cont - played_frames;
+                buf_pos = buf_frames = 0u;
+                scrub.speed = 0;
+                ui_dirty = 1;
+            } else if (scrub_done(&scrub, winfo.total_samples)) {
+                /* Forward: 1x at the end, so the normal end-of-file path runs next.
+                 * Reverse: 1x paused at 0:00. */
+                paused = scrub.speed < 0;
+                scrub_stop(&scrub, &winfo, &data_off, &played_frames, &skip_frames, &buf_pos, &buf_frames);
+                aout_set_mute(paused);
+                PA_SET(!paused && !hp_in);
+                ui_dirty = 1;
+            }
         } else if (!paused && !eof_reached) {
             for (unsigned iter = 0; iter < AUDIO_DAC_QUEUE_SLOTS; iter++) {
                 if (buf_pos >= buf_frames) {
@@ -1100,6 +1302,14 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
             }
         }
 
+        /* Folder marked with .autoplay: the end of the track (fully drained; also
+         * when the speed dial ran into it, since the dial hands the end over to
+         * the normal path above) moves straight on to the next track. */
+        if (!eof_before_refill && eof_reached && m->play_autoplay && m->play_has_next) {
+            ret_code = PLAYER_RC_AUTO_NEXT;
+            break;
+        }
+
         /* Drive smooth LVGL animations on single-core / WASM / QEMU (no-op on dual-core CPU1) */
         if (show_player && ui_dispatch_is_animating() && (uint32_t)(now - last_anim_ms) >= 8u) {
             last_anim_ms = now;
@@ -1154,10 +1364,10 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
             m->play_pos_ms      = pos_ms;
             m->play_dur_ms      = dur_ms;
             m->play_state       = scrub.speed ? 0u : eof_reached ? 2u : (paused ? 1u : 0u);
-            m->play_scrub_speed = (int8_t)scrub.speed;
+            m->play_scrub_speed = (int8_t)(scrub.speed && scrub.target != 1 ? scrub.target : 0);
             m->play_vol_hi      = (last_vol_ms != 0u && (uint32_t)(now - last_vol_ms) < 1500u) ? 1u : 0u;
-            m->play_vu_l        = (paused || eof_reached) ? 0u : peak_l_pct;
-            m->play_vu_r        = (paused || eof_reached) ? 0u : peak_r_pct;
+            m->play_vu_l        = (paused || eof_reached || scrub.speed) ? 0u : peak_l_pct;
+            m->play_vu_r        = (paused || eof_reached || scrub.speed) ? 0u : peak_r_pct;
 
             if (has_cwx && !tr_populated) {
                 last_tr_sig     = populate_transcript_lines(m, &g_tr_pager, pos_ms, paused && !scrub.speed);
@@ -1165,6 +1375,9 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
             }
             if (show_player) {
                 ui_render_screen(UI_SCR_PLAYER, m);
+            }
+            if (m->play_tick_cb) {
+                m->play_tick_cb(now); /* e.g. autoplay-folder position memory */
             }
         }
 

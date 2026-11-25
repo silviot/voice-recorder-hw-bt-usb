@@ -22,8 +22,20 @@ lv_display_t *ui_port_get_display(void);
 /* Run LVGL timers/animations/refresh (call periodically from main loop). */
 void ui_port_task_handler(void);
 
-/* Reveal the newly loaded navigation screen from the specified edge. */
-void ui_port_set_reveal(bool enabled, bool from_right);
+/* Screen-change transition (horizontal push on the LCD hardware scroll).
+ * Call right before loading a different screen: FORWARD pushes the new screen
+ * in from the right, BACK from the left, NONE shows it instantly. Same-screen
+ * refreshes must not call it. Any push still running is completed first. */
+typedef enum {
+    UI_TRANSITION_NONE = 0,
+    UI_TRANSITION_FORWARD,
+    UI_TRANSITION_BACK,
+} ui_transition_t;
+
+void ui_transition(ui_transition_t dir);
+
+/* True from ui_transition() until the push has finished. */
+bool ui_transition_busy(void);
 
 /* Returns non-zero while an LVGL animation is actively running. */
 int ui_port_is_animating(void);

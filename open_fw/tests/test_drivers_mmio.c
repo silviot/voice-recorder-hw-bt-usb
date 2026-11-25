@@ -1224,6 +1224,61 @@ static void test_keys_driver(void)
     printf("[OK] keys SARADC + PB6/PB11 + 1kHz scanner/debounce/SPSC MMIO\n");
 }
 
+/* Screen idle policy + key activity stamp (main.c backlight_update()). */
+static void test_screen_idle_policy(void)
+{
+    uint8_t pct = 0u;
+    /* 30 s timeout: full, dim to 15% from 15 s, sleep at 30 s. */
+    assert(screen_idle_level(1000u, 1000u, 30000u, 80u, &pct) == SCREEN_IDLE_FULL && pct == 80u);
+    assert(screen_idle_level(15999u, 1000u, 30000u, 80u, &pct) == SCREEN_IDLE_FULL && pct == 80u);
+    assert(screen_idle_level(16000u, 1000u, 30000u, 80u, &pct) == SCREEN_IDLE_DIM && pct == 15u);
+    assert(screen_idle_level(16000u, 1000u, 30000u, 10u, &pct) == SCREEN_IDLE_DIM && pct == 10u);
+    assert(screen_idle_level(31000u, 1000u, 30000u, 80u, &pct) == SCREEN_IDLE_SLEEP && pct == 0u);
+    /* 15 s timeout never dims; "never" never sleeps. */
+    assert(screen_idle_level(15999u, 1000u, 15000u, 60u, &pct) == SCREEN_IDLE_FULL && pct == 60u);
+    assert(screen_idle_level(16000u, 1000u, 15000u, 60u, &pct) == SCREEN_IDLE_SLEEP);
+    assert(screen_idle_level(UINT32_MAX, 0u, 0u, 60u, &pct) == SCREEN_IDLE_FULL && pct == 60u);
+    /* Activity stamped after the caller sampled its clock is fresh, not 49 days old. */
+    assert(screen_idle_level(5000u, 5003u, 30000u, 80u, &pct) == SCREEN_IDLE_FULL && pct == 80u);
+    /* Wrap-safe. */
+    assert(screen_idle_level(100u, UINT32_MAX - 100u, 30000u, 80u, &pct) == SCREEN_IDLE_FULL);
+
+    /* Regression: an hour of playback (player loop never touches the idle timer),
+     * then BACK. The last backlight_wake() was entering the player at t=1000. */
+    soc_reset();
+    g_soc.saradc_ch1_data = 4095u;
+    keys_init();
+    uint32_t k = 0u;
+    assert(keys_last_activity(&k) == 0);
+    uint32_t wake_ms = 1000u, t = wake_ms + 3600000u;
+    g_soc.saradc_ch1_data = 2550u; /* KEY_BACK */
+    for (int i = 0; i < 8; i++) keys_scan_tick(t++);
+    uint32_t press_ms = t - 1u;
+    g_soc.saradc_ch1_data = 4095u;
+    for (int i = 0; i < 8; i++) keys_scan_tick(t++);
+    uint32_t release_ms = t - 1u;
+    keys_flush_events(); /* consumed by the player */
+    uint32_t now = t + 20u;
+    /* Old backlight_update(): idle measured from wake_ms -> immediate sleep. */
+    assert(screen_idle_level(now, wake_ms, 30000u, 80u, &pct) == SCREEN_IDLE_SLEEP);
+    /* Fixed: the last key edge counts as activity -> full brightness. */
+    assert(keys_last_activity(&k) == 1 && k == release_ms && k > press_ms);
+    uint32_t last = ((int32_t)(k - wake_ms) > 0) ? k : wake_ms;
+    assert(screen_idle_level(now, last, 30000u, 80u, &pct) == SCREEN_IDLE_FULL && pct == 80u);
+    assert(screen_idle_level(release_ms + 15000u, last, 30000u, 80u, &pct) == SCREEN_IDLE_DIM);
+    assert(screen_idle_level(release_ms + 30000u, last, 30000u, 80u, &pct) == SCREEN_IDLE_SLEEP);
+    /* An edge on a resync-ignored (held across a transition) key still counts. */
+    g_soc.saradc_ch1_data = 2850u;
+    for (int i = 0; i < 8; i++) keys_scan_tick(t++);
+    keys_ignore_held();
+    g_soc.saradc_ch1_data = 4095u;
+    for (int i = 0; i < 8; i++) keys_scan_tick(t++);
+    assert(keys_last_activity(&k) == 1 && k == t - 1u);
+    assert(!keys_event_pending());
+
+    printf("[OK] screen idle policy + key activity stamp (player exit regression)\n");
+}
+
 static int exp_test_blk_read(void *ctx, uint32_t lba, uint32_t count, void *buf)
 {
     uint8_t *img = (uint8_t *)ctx;
@@ -1296,6 +1351,69 @@ static void test_exp_runner_guards(const char *exfat_img_path)
     printf("[OK] exp_runner guards + wrapped log dump MMIO\n");
 }
 
+/* Run the 1 ms fade tick until the ramp ends; check monotonic duty steps. */
+static uint32_t run_fade(int dir, uint32_t *ticks)
+{
+    uint32_t prev = g_soc.pwm3_period_duty & 0xFFFFu, steps = 0u;
+    *ticks = 0u;
+    while (lcd_backlight_fading() && *ticks < 1000u) {
+        lcd_backlight_fade_tick();
+        (*ticks)++;
+        uint32_t d = g_soc.pwm3_period_duty & 0xFFFFu;
+        assert((g_soc.pwm3_period_duty >> 16) == 48000u);
+        if (d != prev) {
+            assert(dir > 0 ? d > prev : d < prev);
+            assert((*ticks % 10u) == 0u);
+            steps++;
+        }
+        prev = d;
+    }
+    return steps;
+}
+
+static void test_backlight_fade(void)
+{
+    uint32_t ticks;
+    /* Fade-out 80% -> 0 over 200 ms: 20 steps, gamma-2 first step is small */
+    lcd_backlight_set(80u);
+    lcd_backlight_fade(80u, 0u, 200u);
+    assert(lcd_backlight_fading());
+    assert((g_soc.pwm3_period_duty & 0xFFFFu) == 80u * 480u);
+    for (int i = 0; i < 10; i++) lcd_backlight_fade_tick();
+    uint32_t d1 = g_soc.pwm3_period_duty & 0xFFFFu; /* L 894 -> 849: 34600 */
+    assert(d1 < 80u * 480u && d1 > 34000u);
+    assert(run_fade(-1, &ticks) == 19u && ticks == 190u);
+    assert((g_soc.pwm3_period_duty & 0xFFFFu) == 0u && !lcd_backlight_fading());
+    lcd_backlight_set(0u);
+    assert(((g_soc.gpio_mux[GPIO_PORT_B][2] >> 4) & 0xFu) == 1u);
+
+    /* Fade-in 0 -> 20% over 100 ms from a disconnected pad: PWM connects */
+    lcd_backlight_fade(0u, 20u, 100u);
+    assert(((g_soc.gpio_mux[GPIO_PORT_B][2] >> 4) & 0xFu) == 5u);
+    assert((g_soc.pwm3_period_duty & 0xFFFFu) == 0u);
+    assert(run_fade(+1, &ticks) == 10u && ticks == 100u);
+    assert(g_soc.pwm3_period_duty == ((48000u << 16) | (20u * 480u)));
+
+    /* Reversal mid-ramp continues from the current level (no jump) */
+    lcd_backlight_set(0u);
+    lcd_backlight_fade(0u, 100u, 100u);
+    for (int i = 0; i < 50; i++) lcd_backlight_fade_tick();
+    uint32_t mid = g_soc.pwm3_period_duty & 0xFFFFu;   /* L 500 -> 12000 */
+    assert(mid == 12000u);
+    lcd_backlight_fade(100u, 0u, 200u);
+    assert((g_soc.pwm3_period_duty & 0xFFFFu) == mid);
+    assert(run_fade(-1, &ticks) == 20u);
+
+    /* lcd_backlight_set() cancels a running ramp */
+    lcd_backlight_fade(0u, 60u, 100u);
+    lcd_backlight_fade_tick();
+    lcd_backlight_set(35u);
+    assert(!lcd_backlight_fading());
+    for (int i = 0; i < 50; i++) lcd_backlight_fade_tick();
+    assert(g_soc.pwm3_period_duty == ((48000u << 16) | (35u * 480u)));
+    printf("[OK] backlight fade ramp\n");
+}
+
 static void test_lcd_driver(void)
 {
     soc_reset();
@@ -1312,6 +1430,7 @@ static void test_lcd_driver(void)
     assert(((g_soc.gpio_mux[GPIO_PORT_B][2] >> 4) & 0xFu) == 5u);
     assert((g_soc.pwm3_ctrl & 0x3Fu) == 0x3Fu);
     assert(g_soc.pwm3_period_duty == ((48000u << 16) | (35u * 480u)));
+    test_backlight_fade();
 
     lcd_init();
     assert((g_soc.gpio_lcd_pad_en & 0x0000FFD0u) == 0x0000FFD0u);
@@ -1763,6 +1882,7 @@ int main(int argc, char **argv)
     test_rtc_driver();
     test_pmu_driver();
     test_keys_driver();
+    test_screen_idle_policy();
     test_exp_runner_guards(argv[1]);
     test_lcd_driver();
     test_sdio_exfat_and_usb_msc(argv[1]);

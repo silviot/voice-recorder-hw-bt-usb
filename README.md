@@ -17,8 +17,8 @@ The core recorder firmware is **working and verified on physical `HW_76` silicon
 | Subsystem | Status | Notes |
 | :--- | :---: | :--- |
 | **Dual-Mic Audio Recording & DSP** | Working | Instant `PB6` slide-switch capture to exFAT WAV, `AMIC1 + AMIC2` stereo/mono, clean-room `Voice Clarity` / `ASR Raw` / `Bypass` DSP, optional VOR (200 ms pre-roll + 500 ms hangover), live 128-pt FFT Mel spectrogram + markers |
-| **Audio Playback & Transcripts** | Working | On-device WAV (PCM & IMA-ADPCM) playback with 32-step log-dB volume, automatic speaker (`PB30` PA) / 3.5 mm headphone (`PB11`) switching, audible pitch-preserving `2×–5×` hold-scrubbing, and synced `.cwx` word-level captions |
-| **Dual-Core LVGL v9.2.2 UI** | Working | Dedicated **CPU1 (96 MHz)** UI worker with IPC Mailbox `WFE` sleep, 4-bit anti-aliased Noto Sans fonts, EEZ Studio screens, smooth strip reveals, and `289 ms` cold boot |
+| **Audio Playback & Transcripts** | Working | On-device WAV (PCM & IMA-ADPCM) playback with 32-step log-dB volume, automatic speaker (`PB30` PA) / 3.5 mm headphone (`PB11`) switching, a speed dial (`−32×…32×`: pitch-preserving audio up to `4×` forward and reverse, silent seeking from `8×`), and synced `.cwx` word-level captions |
+| **Dual-Core LVGL v9.2.2 UI** | Working | Dedicated **CPU1 (96 MHz)** UI worker with IPC Mailbox `WFE` sleep, 4-bit anti-aliased Noto Sans fonts, EEZ Studio screens, hardware-scroll screen push transitions, and `289 ms` cold boot |
 | **Crash-Safe exFAT Storage** | Working | 1-bit SDIO (`CMD18`/`CMD25` bursts + fallback), periodic WAV checkpointing, atomic staged file replace, `fsck.exfat`-clean |
 | **USB-C Drive Mode & Telemetry** | Working | Clean-room Mentor MUSB USB Mass Storage (`1209:0001`, `~810 KB/s` via EP2 `2 KiB` FIFO, no Linux disconnect loop) + vendor SCSI `0xE0` live log, RTC sync & SRAM experiment runner |
 | **Bluetooth Connectivity (`+XREC v5`)** | **Next Milestone** | Clean-room RF/VCO/BPF calibration, `RW-BT` HCI controller glue, SPP framing, and `+XREC v5` protocol are written and unit-tested; end-to-end on-device BT pairing & sync soak is the next active work item |
@@ -50,7 +50,7 @@ Every screen below is rendered directly by the real compiled `open_fw` C firmwar
 | **Record Slide Switch** | `PB6` (active-low) | **Slide UP:** instant stereo/mono WAV recording from any screen. **Slide DOWN:** stop, finalize WAV, and show Saved screen. |
 | **OK / Play** | `PD0` KADC ladder | Open/confirm, play/pause, drop a cyan spectrogram marker while recording, or hold in Files to delete. |
 | **Back** | `PD0` KADC ladder | Navigate back, exit sync, or hold in USB mode to safely eject. |
-| **Prev / Next** | `PD0` KADC ladder | Navigate tiles/lists; during playback: tap to skip (`5/10s`, `10/30s`, or track), double-tap for prev/next file, hold for audible `2×–5×` scrub. |
+| **Prev / Next** | `PD0` KADC ladder | Navigate tiles/lists; during playback: each press (repeating every 0.6 s while held) steps the speed dial `−32× … −1×, 1× … 32×` (OK returns to `1×`); with the *Skip: Track* setting a press changes file instead. |
 | **VOL+ / VOL−** | `PD0` KADC ladder | Adjust speaker/headphone volume (`32`-step log dB) or Settings values. |
 | **Power (ON/OFF)** | `PMU reg 0x31` | Short press: wake/blank display; hold `2 s`: clean power-off (or charging standby on USB). Hold `8 s`: hardware PMU rescue reset. |
 
