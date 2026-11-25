@@ -200,6 +200,8 @@ typedef struct {
     uint8_t  state, admission_open, dlv_open, rom_running, parked, c2h_fc, rom_cmd_credits, fwd_pending;
     uint32_t session, tx_free, evt_used, evt_resv, evt_deferred, acl_used, held_acl;
     uint32_t h2c_inflight, c2h_outstanding, c2h_credits, c2h_len, nocp_pending;
+    uint32_t acl_markers;           /* bit i: inbound ACL marker for handle 0x80+i still live (DISC/CONN_CMP delivered,
+                                       held ACL older than it not yet purged) */
 } bt_ctrl_debug_t;
 
 /* One-time binding. Returns the number of opcode/event table validation errors (0 required; >0 also faults). */
