@@ -178,6 +178,12 @@ test-bt-hp:
 		-DAOUT_HOST_TEST -Iinclude tests/test_audio_out.c src/audio_out.c bt_port/hp_tx.c bt_port/hp_sink.c \
 		bt_port/hp_sbc.c $(BT_HP_TEST_DIR)/sbc/sbc_*.o -lm -o $(BT_HP_TEST_DIR)/test_audio_out
 	$(BT_HP_TEST_DIR)/test_audio_out
+	@# the player on the headset route (BT=1 player.c + audio_out.c + hp_sink.c): mono pass-through, no starved
+	@# packet while the app task is descheduled (silicon 2026-11-25, docs/BT_A2DP_HP_SESSION.md)
+	$(BT_HP_CC) $(BT_CTRL_TEST_CFLAGS) $(BT_CTRL_BD_DEFS) $(BT_CTRL_BD_INCS) -DOPENFW_HOST_MMIO -DOPENFW_BT_BLUEDROID=1 \
+		-DAOUT_HOST_TEST -Iinclude -Isrc/ui tests/test_player_bt.c src/player.c src/audio_out.c bt_port/hp_sink.c \
+		src/ui/ui_i18n.c src/wav.c src/cwx.c -lm -o $(BT_HP_TEST_DIR)/test_player_bt
+	$(BT_HP_TEST_DIR)/test_player_bt
 	@# the RTOS self-test (T_HPCORE, test-qemu-bt) checks the ARM output against the same golden
 	python3 -c "import re,sys; a=re.search(r'HP_SELFTEST_GOLDEN (0x[0-9A-Fa-f]+)u', open('bt_port/hp_selftest.h').read()).group(1); \
 		b=re.search(r'ST_HP_GOLDEN (0x[0-9A-Fa-f]+)u', open('src/rtos/rtos_selftest.c').read()).group(1); \

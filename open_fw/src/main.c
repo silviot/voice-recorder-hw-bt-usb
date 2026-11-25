@@ -1444,7 +1444,8 @@ static uint8_t s_bench_back_sent;
 static void bench_hp_play_tick(uint32_t now_ms)
 {
     char p[4];
-    int a = bt_bench_hp_tick(now_ms, p, (uint32_t)sizeof(p));
+    (void)now_ms;   /* the player's loop-top time can be hundreds of ms old here: stats intervals use the clock */
+    int a = bt_bench_hp_tick(millis(), p, (uint32_t)sizeof(p));
     if ((a & BT_BENCH_HP_ACT_EXIT) && !s_bench_back_sent) {
         s_bench_back_sent = 1u;
         openfw_log_puts("BENCH hp play: time limit, BACK\n");

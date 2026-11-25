@@ -58,6 +58,12 @@ SECTIONS
             *lv_font_fmt_txt.o
             *lv_style.o
             *lv_tlsf.o
+            *libbt_port.a:hp_sink.o
+            *libbluedroid.a:sbc_analysis.o
+            *libbluedroid.a:sbc_dct.o
+            *libbluedroid.a:sbc_enc_bit_alloc_ste.o
+            *libbluedroid.a:sbc_encoder.o
+            *libbluedroid.a:sbc_packing.o
         ) .text .text.*)
         *(.rodata .rodata.*)
         . = ALIGN(4);
@@ -148,6 +154,24 @@ SECTIONS
         . = ALIGN(4);
         _ebt_bss = .;
     } > RTOS_HEAP
+
+    /* BT=1 headphones (empty otherwise): the BTC tick's per-sample code (ring + resampler, SBC analysis / bit
+     * allocation / packing) runs from zero-wait SRAM instead of XIP, where it shares the flash path with CPU1's UI and
+     * every other task (silicon 2026-11-25: BTC took ~46 % of the CPU for 375 SBC frames/s from XIP). Placed at the
+     * start of RTOS_HEAP_LO (the high region keeps its 32 KiB floor), copied by startup.c bt_static_init(). */
+    .bt_fast : ALIGN(8) {
+        _sbt_fast = .;
+        *libbt_port.a:hp_sink.o(.text .text.*)
+        *libbluedroid.a:sbc_analysis.o(.text .text.*)
+        *libbluedroid.a:sbc_dct.o(.text .text.*)
+        *libbluedroid.a:sbc_enc_bit_alloc_ste.o(.text .text.*)
+        *libbluedroid.a:sbc_encoder.o(.text .text.*)
+        *libbluedroid.a:sbc_packing.o(.text .text.*)
+        . = ALIGN(8);
+        _ebt_fast = .;
+    } > RTOS_HEAP_LO AT > XIP
+
+    _sibt_fast = LOADADDR(.bt_fast);
 
     .rtos_heap_lo (NOLOAD) : ALIGN(8) {
         _srtos_heap_lo = .;

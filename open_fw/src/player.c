@@ -830,6 +830,12 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
     if (volume > 31u) {
         volume = 18u;
     }
+#if PLAYER_BT
+    /* The headset ring keeps the source channel count (docs/BT_A2DP_DESIGN.md §3.1 "Mono"): a mono file fills a mono
+     * ring (8192 frames = 512 ms at 16 kHz instead of 256 ms stereo) and the BTC tick resamples one channel, not two.
+     * Silicon 2026-11-25: with the stereo ring a 16 kHz mono file starved the headset (pads 5-17 per second). */
+    aout_set_src_channels((uint8_t)winfo.channels);
+#endif
     if (aout_start(winfo.sample_rate, volume) != 0) {
 #if PLAYER_BT
         if (aout_get_mode() == AOUT_MODE_HEADPHONES) {
@@ -1308,6 +1314,10 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
                     int sent;
                     if (winfo.channels == 2u) {
                         sent = aout_write(&pcm_buf[buf_pos * 2u], buf_frames - buf_pos, 2);
+#if PLAYER_BT
+                    } else if (aout_is_bt()) {
+                        sent = aout_write(&pcm_buf[buf_pos], buf_frames - buf_pos, 1);   /* mono ring: no expansion */
+#endif
                     } else {
                         uint32_t n = buf_frames - buf_pos;
                         if (n > PLAYER_DAC_CHUNK_FRAMES) {
