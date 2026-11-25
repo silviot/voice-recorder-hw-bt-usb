@@ -304,14 +304,15 @@ typedef struct {
     uint8_t        bt_bonded;       /* the shown peer holds a MITM bond */
     uint16_t       bt_window_s;     /* pairing window seconds left (0 = closed) */
     char           bt_digits[8];
-    /* BT=1 generic list screen (UI_SCR_LIST): Bluetooth mode choice, headphones screen. English, TODO(i18n). */
+    /* BT=1 generic list screen (UI_SCR_LIST): Bluetooth mode choice, headphones screen. Text from openfw_i18n_bt.h;
+     * the buffers hold the longest translation (UTF-8: Cyrillic is 2 bytes a letter), tests/test_ui_render.c. */
     char           list_title[20];
     char           list_sub[12];
     uint8_t        list_n, list_sel, list_scroll;
-    char           list_lbl[UI_LIST_ROWS][26];
+    char           list_lbl[UI_LIST_ROWS][34];
     char           list_val[UI_LIST_ROWS][14];
     uint8_t        list_val_col[UI_LIST_ROWS];   /* 0 dim, 1 cyan, 2 green, 3 amber */
-    char           list_foot[44];
+    char           list_foot[64];
     uint8_t        bt_out_mode;     /* Settings "Audio output": 0 Speaker, 1 Headphones, 2 Both */
 #endif
 

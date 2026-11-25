@@ -69,6 +69,11 @@ void bt_xrec_test_set_inflight_max(uint32_t n);   /* bt_xrec_bluedroid.c test ho
  * from the firmware's "BT mem" log lines (bt_xrec_fw.c, BT_HW_RESULTS recipe), not from here. */
 #define PHONE_HEAP_CEILING (224u * 1024u)
 
+/* Bluedroid task supervisor (bt_port/bt_task_sup.h) in the scenario: firmware 1 s / 8 s / 20 s, here shorter. */
+#define SUP_PERIOD_MS 200u
+#define SUP_STALL_MS  1500u
+#define SUP_HOLD_MS   4000u
+
 static int p_fail, p_checks;
 #define PCHECK(cond, ...)                                                                                             \
     do {                                                                                                              \
@@ -1346,6 +1351,33 @@ static bool plant_bond(const char *bdstr, int key_type, const uint8_t wire_key[1
            exfat_close_file(&w) == 0;
 }
 
+/* The supervisor over a quiet stretch: every thread answered, no fault, no WDT hold (plan M4 "Watchdog" tests). */
+static void sup_quiet(const char *what, uint32_t ms)
+{
+    bt_task_sup_stats_t a, b;
+    bthx_sup_stats(&a);
+    uint32_t f0 = bthx_sup_faults();
+    int held = 0;
+    for (uint32_t t = 0u; t < ms; t += 10u) {
+        for (int k = 0; k < 10; k++) {
+            peer_poll();
+            vTaskDelay(1);
+        }
+        held |= bthx_sup_hold();
+    }
+    bthx_sup_stats(&b);
+    PCHECK(b.armed && bthx_sup_faults() == f0 && b.stalls == a.stalls && !held,
+           "%s: supervisor armed %u faults %u stalls %u hold %d", what, b.armed, bthx_sup_faults() - f0,
+           b.stalls - a.stalls, held);
+    for (unsigned i = 0u; i < BT_TASK_SUP_N; i++) {
+        uint32_t n = b.answers[i] - a.answers[i];
+        PCHECK(n >= ms / SUP_PERIOD_MS / 2u, "%s: %s answered %u pings in %u ms", what, bt_task_sup_name(i), n, ms);
+    }
+    bth_log("    %s: %u ms, pings hciT %u BTU %u BTC %u, max latency %u/%u/%u ms\n", what, ms,
+            b.answers[0] - a.answers[0], b.answers[1] - a.answers[1], b.answers[2] - a.answers[2], b.max_ms[0],
+            b.max_ms[1], b.max_ms[2]);
+}
+
 int bth_phone_scenario(const char *img_path)
 {
     bth_log("[P] phone mode end to end: XREC backend + Bluedroid + bt_ctrl + fake ROM peer\n");
@@ -1353,6 +1385,7 @@ int bth_phone_scenario(const char *img_path)
         return 1;
     }
     PCHECK(bthx_init(&s_card) == 0, "bthx_init");
+    bthx_sup_limits(SUP_PERIOD_MS, SUP_STALL_MS, SUP_HOLD_MS);
     vTaskDelay(pdMS_TO_TICKS(20));
     /* Warm-up session (start, READY, stop, no peer). The first esp_spp_init() creates btc_spp.c's resident mutex and
      * TX event group, which upstream keeps for the life of the process on purpose (btc_spp.c "s_spp_resident": a VFS
@@ -1506,6 +1539,11 @@ int bth_phone_scenario(const char *img_path)
     PCHECK(xrec_auth_chal(xkey), "CHAL/AUTH");
     PCHECK(gets_verify("REC0001.WAV", 1u, 1000u, 5000u, 640u, -1, NULL), "GETS after reconnect");
 
+    /* ---- 7b ---- */
+    bth_log("[P7b] WDT supervisor: idle bonded phone (authorized link, no traffic) for 3 stall windows\n");
+    sup_quiet("idle bonded phone", 3u * SUP_STALL_MS);
+    PCHECK(S().d.state == BT_XREC_ST_READY && S().d.conn_open, "idle link lost (state %u)", S().d.state);
+
     /* ---- 8 ---- */
     /* The laptop's app stops reading (RFCOMM credits withheld: data backs up in RFCOMM, BTC and the session) while
      * its stack stays responsive (baseband acks, RFCOMM DISC/UA, L2CAP, detach): the user leaves BT mode mid-sync. */
@@ -1521,6 +1559,9 @@ int bth_phone_scenario(const char *img_path)
     s = S();
     bth_log("    outstanding at stop: inflight %u, tx_used %u, cong %u\n", (unsigned)s.d.inflight,
             (unsigned)s.d.tx_used, s.d.cong);
+    /* plan M4 "intentionally stalled transfer": the peer, not a task, is stuck; the threads stay healthy */
+    sup_quiet("transfer stalled by the peer", 2u * SUP_STALL_MS);
+    PCHECK(S().d.state == BT_XREC_ST_READY, "stalled transfer: state %u", S().d.state);
     stop_session(&base, "stop with traffic outstanding");
     PCHECK(!fake_peer.connected && fake_peer.stop_kills == 0u, "link still up when the controller stopped (no detach)");
     PCHECK(P.dlc_disc_rx == 1u || P.mux_disc_rx == 1u || P.rfc.closed, "RFCOMM/L2CAP not closed by the device "
@@ -2174,6 +2215,40 @@ int bth_phone_scenario(const char *img_path)
         PCHECK(x_send("+XREC:PING\r") && x_line(line, sizeof(line), 3000u), "PING after the recovery");
         peer_drop(0x13u);
         PCHECK(WAIT(!S().d.conn_open && S().d.acl_links == 0u, 3000), "D link not down");
+    }
+    if (p_fail) {
+        goto out;
+    }
+
+    /* ---- 22 ---- */
+    bth_log("[P22] WDT supervisor: BTC stuck in a work item -> platform fault 4 -> graceful recovery; restart\n");
+    {
+        uint32_t f0 = bthx_sup_faults();
+        uint32_t h0 = bthx_hard_path_reason();
+        PCHECK(bthx_block_thread(BT_TASK_SUP_BTC, 1) == 0, "blocker not posted");
+        PCHECK(WAIT(bthx_block_running(BT_TASK_SUP_BTC), 1000), "blocker never ran");
+        uint64_t t0 = us_timer_now();
+        bool seen = WAIT(bthx_sup_faults() != f0, SUP_STALL_MS + SUP_PERIOD_MS + 1000u);
+        uint32_t ms = (uint32_t)((us_timer_now() - t0) / 1000u);
+        bthx_block_thread(BT_TASK_SUP_BTC, 0);     /* the stuck work ends: the teardown can run through BTC */
+        PCHECK(seen, "stuck BTC not reported");
+        PCHECK(ms >= SUP_STALL_MS - SUP_PERIOD_MS && ms <= SUP_STALL_MS + SUP_PERIOD_MS + 200u,
+               "reported after %u ms (stall %u, period %u)", ms, SUP_STALL_MS, SUP_PERIOD_MS);
+        PCHECK(WAIT(S().d.state == BT_XREC_ST_FAULTED, 4000), "not FAULTED after the stall (state %u)", S().d.state);
+        bthx_snap_t s2 = S();
+        PCHECK(s2.d.last_fault == BT_XREC_FAULT_PLATFORM && bthx_hard_path_reason() == h0,
+               "fault %u, hard path %u (want PLATFORM, graceful)", s2.d.last_fault, bthx_hard_path_reason());
+        bt_task_sup_stats_t st;
+        bthx_sup_stats(&st);
+        PCHECK(!st.armed && !bthx_sup_hold(), "supervisor still armed / holding after the teardown");
+        bth_log("    BTC stall reported after %u ms; graceful recovery (FAULTED)\n", ms);
+        /* not wait_ready(): its READY-or-FAULTED wait would end on the snapshot of this fault */
+        PCHECK(bthx_call(BTHX_START, 0u, 3000u) == 0, "bt_xrec_start after the fault");
+        if (!WAIT(S().d.state == BT_XREC_ST_READY, 15000)) {
+            PCHECK(0, "not READY after the fault (state %u)", S().d.state);
+            goto out;
+        }
+        sup_quiet("after the restart", 2u * SUP_STALL_MS);
     }
     if (p_fail) {
         goto out;

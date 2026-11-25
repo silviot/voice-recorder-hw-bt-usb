@@ -14,6 +14,8 @@
 /* BT=1 headphones hooks (docs/BT_A2DP_DESIGN.md §3.1 R-14, §6.6, §6.7): PA off and jack edges ignored while the
  * headset plays, AVRCP keys, headset events pause with the snapshot rewind, bt_vol for the headset route. */
 #include "../bt_port/bt_hp.h"
+#include "openfw_i18n_bt.h"
+int bt_lowbatt_poll(uint32_t now);   /* src/main.c (bt_port/bt_lowbatt.h): 1 = battery low, BT must stop */
 #define PLAYER_BT 1
 #define PA_SET(on) audio_pa_set((on) && aout_route() != AOUT_ROUTE_BT)
 /* With absolute volume the headset sets its own level: its PCM gain stays at unity (31), the DAC (output mode BOTH:
@@ -831,7 +833,7 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
     if (aout_start(winfo.sample_rate, volume) != 0) {
 #if PLAYER_BT
         if (aout_get_mode() == AOUT_MODE_HEADPHONES) {
-            str_copy_cap(m->toast_msg, (int)sizeof(m->toast_msg), "Headphones not connected"); /* TODO(i18n) */
+            str_copy_cap(m->toast_msg, (int)sizeof(m->toast_msg), ui_tr_bt(UI_BT_STR_HP_NOT_CONNECTED));
             m->toast_col = UI_COL_AMBER;
         }
 #endif
@@ -850,6 +852,7 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
 #if PLAYER_BT
     int bt_only = aout_route() == AOUT_ROUTE_BT;   /* the headset alone: jack edges change nothing (R-14) */
     int bt_route = aout_is_bt();                    /* the session can stop under us (BT off, fault) */
+    int lowbatt_stop = 0;                           /* this loop stopped headphones mode at low battery */
     if (aout_is_bt()) {
         bt_hp_player_begin();                       /* keys / headset events from before this file do not apply */
         volume = bt_hp_vol31();
@@ -960,6 +963,10 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
             cur_hp = hp_in;
         }
         bt_hp_poll();
+        if (bt_hp_active() && bt_lowbatt_poll(now)) {
+            (void)bt_hp_stop();                  /* plan step 8: low battery stops headphones mode (bt_lowbatt.h) */
+            lowbatt_stop = 1;
+        }
         if (aout_is_bt() && bt_hp_vol31() != volume) {
             /* the headset changed its volume (absolute volume CHANGED / SetAbsoluteVolume): follow it, so the next
              * VOL key steps from the headset's value instead of jumping back */
@@ -995,7 +1002,7 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
               !(!has_cwx && m->cfg.skip_mode == UI_SKIP_TRACK) && !(eof_reached && act == PLAYER_ACT_SEEK_FWD))) &&
             aout_is_bt() && !bt_hp_stream_ready()) {
             act = PLAYER_ACT_NONE;                   /* nothing would drain the ring: stay paused */
-            str_copy_cap(m->toast_msg, (int)sizeof(m->toast_msg), "Headphones not connected"); /* TODO(i18n) */
+            str_copy_cap(m->toast_msg, (int)sizeof(m->toast_msg), ui_tr_bt(UI_BT_STR_HP_NOT_CONNECTED));
             m->toast_col = UI_COL_AMBER;
             toast_until  = now + 1500u;
             ui_dirty     = 1;
@@ -1007,7 +1014,8 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
                 scrub_stop(&scrub, &winfo, &data_off, &played_frames, &skip_frames, &buf_pos, &buf_frames);
             }
             paused = 1;
-            str_copy_cap(m->toast_msg, (int)sizeof(m->toast_msg), "Headphones disconnected"); /* TODO(i18n) */
+            str_copy_cap(m->toast_msg, (int)sizeof(m->toast_msg),
+                         ui_tr_bt(lowbatt_stop ? UI_BT_STR_LOWBATT_BT_OFF : UI_BT_STR_HP_DISCONNECTED));
             m->toast_col = UI_COL_AMBER;
             toast_until  = now + 2000u;
             ui_dirty     = 1;
@@ -1027,9 +1035,9 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
                 aout_set_mute(1);
                 player_pause_rewind(&winfo, &data_off, &played_frames, &buf_pos, &buf_frames, &skip_frames);
                 str_copy_cap(m->toast_msg, (int)sizeof(m->toast_msg),
-                             (pev & BT_HP_PEV_REMOTE_SUSPEND) ? "Headphones paused" :      /* TODO(i18n) */
-                             (pev & BT_HP_PEV_START_FAILED) ? "Headphones not ready" :     /* TODO(i18n) */
-                                                              "Headphones disconnected");  /* TODO(i18n) */
+                             ui_tr_bt((pev & BT_HP_PEV_REMOTE_SUSPEND) ? UI_BT_STR_HP_PAUSED :
+                                      (pev & BT_HP_PEV_START_FAILED) ? UI_BT_STR_HP_NOT_READY :
+                                                                       UI_BT_STR_HP_DISCONNECTED));
                 m->toast_col = UI_COL_AMBER;
                 toast_until  = now + 2000u;
                 ui_dirty     = 1;

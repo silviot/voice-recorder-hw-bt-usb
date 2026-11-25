@@ -15,6 +15,9 @@
 #include "ui_port.h"
 #include "ui_theme.h"
 #include "eez/ui.h"
+#if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID
+#include "openfw_i18n_bt.h"
+#endif
 
 static lv_image_dsc_t          s_spec_dsc;
 static enum ScreensEnum        s_active_eez_scr = (enum ScreensEnum)0;
@@ -1222,8 +1225,9 @@ static void format_setting_val(const ui_model_t *m, int idx, char *val, int vcap
     case 8: lv_snprintf(val, (size_t)vcap, "%s", ui_lang_native_name(m->cfg.lang)); break;
     case 9: lv_snprintf(val, (size_t)vcap, "%s", ui_tr(m->vbus_present ? UI_STR_CONNECT : UI_STR_UNPLUGGED)); *adj = 0; break;
 #ifdef UI_SET_ROW_AOUT
-    case UI_SET_ROW_AOUT: /* TODO(i18n) */
-        lv_snprintf(val, (size_t)vcap, "%s", m->bt_out_mode == 1u ? "Headphones" : m->bt_out_mode == 2u ? "Both" : "Speaker");
+    case UI_SET_ROW_AOUT:
+        lv_snprintf(val, (size_t)vcap, "%s", ui_tr_bt(m->bt_out_mode == 1u ? UI_BT_STR_OUT_BT
+                                                      : m->bt_out_mode == 2u ? UI_BT_STR_OUT_BOTH : UI_BT_STR_OUT_SPEAKER));
         break;
 #endif
     case UI_SET_HSPROBE: lv_snprintf(val, (size_t)vcap, "%s", "OK"); *adj = 0; break; /* TODO(i18n) */
@@ -1233,7 +1237,7 @@ static void format_setting_val(const ui_model_t *m, int idx, char *val, int vcap
 
 static void bind_settings(const ui_model_t *m)
 {
-    /* i18n labels of every row but "Audio output" (BT=1 inserts that one at UI_SET_ROW_AOUT, English) */
+    /* i18n labels of every row but "Audio output" (BT=1 inserts that one at UI_SET_ROW_AOUT, openfw_i18n_bt.h) */
     static const ui_str_id_t label_ids[] = {
         UI_STR_SET_MIC_GAIN, UI_STR_SET_SOUND, UI_STR_SET_MICS, UI_STR_SET_VOR,
         UI_STR_SET_BRIGHTNESS, UI_STR_SET_SCREEN_OFF, UI_STR_SET_CLOCK,
@@ -1274,7 +1278,7 @@ static void bind_settings(const ui_model_t *m)
         }
 #ifdef UI_SET_ROW_AOUT
         if (idx == UI_SET_ROW_AOUT) {
-            set_changed_text(lbls[r], "Audio output"); /* TODO(i18n) */
+            set_changed_text(lbls[r], ui_tr_bt(UI_BT_STR_AUDIO_OUTPUT));
         } else {
             set_changed_text(lbls[r], ui_tr(label_ids[idx > UI_SET_ROW_AOUT ? idx - 1 : idx]));
         }
@@ -1343,7 +1347,7 @@ static void bind_settings(const ui_model_t *m)
         case 8: desc = ui_tr(UI_STR_DESC_LANGUAGE); break;
         case 9: desc = ui_tr(m->vbus_present ? UI_STR_DESC_USB_MOUNT : UI_STR_DESC_USB_PLUG); break;
 #ifdef UI_SET_ROW_AOUT
-        case UI_SET_ROW_AOUT: desc = "Play to the speaker, BT headphones, or both"; break; /* TODO(i18n) */
+        case UI_SET_ROW_AOUT: desc = ui_tr_bt(UI_BT_STR_DESC_AUDIO_OUTPUT); break;
 #endif
         case UI_SET_HSPROBE: desc = ui_tr(UI_STR_DESC_HSPROBE); break;
         default: break;
@@ -1354,7 +1358,7 @@ static void bind_settings(const ui_model_t *m)
 
 #if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID
 /* BT=1 generic list (UI_SCR_LIST) on the Settings layout: title, 3 visible rows of label + value, footer text. The
- * strings come from main.c (English, TODO(i18n) there). */
+ * strings come from main.c (openfw_i18n_bt.h). */
 static void bind_list(const ui_model_t *m)
 {
     bind_status_bar(objects.set_bar, objects.set_bar_ic, objects.set_bar_l, objects.set_bar_sub,
@@ -1489,23 +1493,23 @@ static void bind_bt(const ui_model_t *m)
     const char *l2 = ui_tr(UI_STR_BT_OPEN_APP);
     uint32_t l2_col = UI_HEX_MUTE;
     if (m->bt_prompt) {
-        lv_snprintf(l2s, sizeof(l2s), "Pair? %u s", (unsigned)m->bt_prompt_s); /* TODO(i18n) */
+        lv_snprintf(l2s, sizeof(l2s), ui_tr_bt(UI_BT_STR_PAIR_Q_FMT), (unsigned)m->bt_prompt_s);
         set_changed_text(objects.bt_name_lbl, m->bt_digits);
         set_changed_text(objects.bt_l1_lbl, m->bt_peer);
         set_changed_text_color(objects.bt_l1_lbl, lv_color_hex(UI_HEX_TEXT));
         set_changed_text(objects.bt_l2_lbl, l2s);
         set_changed_text_color(objects.bt_l2_lbl, lv_color_hex(UI_HEX_AMBER));
-        set_changed_text(objects.bt_footer, "ENTER Yes \xC2\xB7 BACK No"); /* TODO(i18n) */
+        set_changed_text(objects.bt_footer, ui_tr_bt(UI_BT_STR_PAIR_KEYS));
         set_hidden(objects.bt_l2_lbl, false);
         set_hidden(objects.bt_prog, true);
         return;
     }
     if (m->bt_state == 0u && m->bt_window_s > 0u) {
-        lv_snprintf(l2s, sizeof(l2s), "Pairing open %u s", (unsigned)m->bt_window_s); /* TODO(i18n) */
+        lv_snprintf(l2s, sizeof(l2s), ui_tr_bt(UI_BT_STR_PAIR_OPEN_FMT), (unsigned)m->bt_window_s);
         l2 = l2s;
         l2_col = UI_HEX_CYAN;
     } else if (m->bt_state == 1u && m->bt_bonded) {
-        l2 = "Bonded"; /* TODO(i18n) */
+        l2 = ui_tr_bt(UI_BT_STR_BONDED);
         l2_col = UI_HEX_GREEN;
     }
     set_changed_text(objects.bt_name_lbl, m->bt_name[0] ? m->bt_name : "HW_76");

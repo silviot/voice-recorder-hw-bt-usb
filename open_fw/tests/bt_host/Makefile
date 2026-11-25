@@ -31,7 +31,8 @@ include $(ROOT)/bt/bluedroid_srcs.mk
 BD_SRCS   := $(addprefix $(ROOT)/,$(BLUEDROID_SRCS)) $(ROOT)/bt_port/bt_xrec_spp_mtu.c \
              $(ROOT)/bt_port/bt_xrec_bond.c $(ROOT)/bt_port/hp_sbc.c $(ROOT)/bt_port/hp_tx_bd.c
 PORT_SRCS := $(addprefix $(ROOT)/bt_port/,bt_alarm.c bt_esp_timer.c bt_entropy.c bt_drbg.c bt_store.c bt_ctrl.c \
-             bt_ctrl_cmds.c bt_ctrl_evt.c bt_xrec_bluedroid.c bt_hp_bluedroid.c hp_sink.c hp_tx.c)
+             bt_ctrl_cmds.c bt_ctrl_evt.c bt_xrec_bluedroid.c bt_hp_bluedroid.c hp_sink.c hp_tx.c \
+             bt_task_sup.c)
 HOST_SRCS := $(HT)/host_heap.c $(HT)/host_glue.c $(HT)/host_ctrl.c $(HT)/test_bt_host.c $(HT)/host_link_stubs.c \
              $(HT)/host_xrec.c $(HT)/test_phone.c $(HT)/test_hp_link.c $(HT)/test_headphones.c \
              $(ROOT)/tests/fake_rom.c

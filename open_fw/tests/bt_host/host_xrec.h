@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include "openfw.h"
 #include "bt_xrec_bluedroid.h"
+#include "bt_task_sup.h"
 
 /* SSP_ANSWER(arg 1 = ENTER, 0 = BACK); START_PAIR(arg ms) = bt_xrec_start + bt_xrec_open_pairing in one app-task step
  * (the SD bench run's pair=1 at t=0, before READY); BENCH_AUTOCONFIRM(arg 0/1) = bt_xrec_set_bench_autoconfirm;
@@ -59,5 +60,16 @@ uint32_t bthx_profile_down_rc(void);     /* the last down job's profile teardown
 exfat_vol_t *bthx_card(void);
 /* bt_xrec_plat_pairing_block() calls made inside bt_xrec_plat_lock() (must stay 0: a critical section on target). */
 uint32_t bthx_gate_in_lock(void);
+
+/* Bluedroid task supervisor (bt_port/bt_task_sup.h) as the firmware runs it: shorter limits for the scenario (0 keeps),
+ * its counters, the WDT-feed hold, platform faults it raised. */
+void bthx_sup_limits(uint32_t period_ms, uint32_t stall_ms, uint32_t hold_ms);
+void bthx_sup_stats(bt_task_sup_stats_t *out);
+int  bthx_sup_hold(void);
+uint32_t bthx_sup_faults(void);
+/* TEST knob: on = post a work item to that Bluedroid thread (BT_TASK_SUP_*) that keeps it busy until off (the stuck
+ * task the supervisor exists for). Returns -1 if the post failed. bthx_block_running: the item is executing. */
+int  bthx_block_thread(unsigned idx, int on);
+int  bthx_block_running(unsigned idx);
 
 #endif /* BT_HOST_XREC_H */

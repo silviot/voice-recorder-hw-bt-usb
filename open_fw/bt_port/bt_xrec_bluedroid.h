@@ -58,7 +58,7 @@ enum {
     BT_XREC_FAULT_CONFIG = 3,         /* a GAP/SPP configuration call or event failed */
     BT_XREC_FAULT_CONFIG_TIMEOUT = 4,
     BT_XREC_FAULT_EVQ_OVERFLOW = 5,   /* a control event could not be queued: the session state is no longer known */
-    BT_XREC_FAULT_PLATFORM = 6,       /* bt_ctrl fault / hang, HCI command timeout (bt_xrec_plat_poll) */
+    BT_XREC_FAULT_PLATFORM = 6,       /* bt_ctrl fault / hang, HCI command timeout, stalled BT task (plat_poll) */
     BT_XREC_FAULT_DOWN_DEADLINE = 7,  /* graceful teardown did not finish within BT_XREC_SHUTDOWN_DEADLINE_MS */
     BT_XREC_FAULT_DOWN_FAIL = 8,      /* graceful teardown reported an error */
     BT_XREC_FAULT_DOWN_LATCHED = 9,   /* teardown finished, but the deadline had already latched bt_stop */
@@ -201,7 +201,9 @@ int      bt_xrec_plat_deadline_disarm(void);
 void     bt_xrec_plat_hard_path(uint32_t reason);
 void     bt_xrec_plat_service(void);         /* keep the recorder serviced while waiting (recorder_poll) */
 void     bt_xrec_plat_wait(void);            /* sleep about one tick */
-uint32_t bt_xrec_plat_poll(void);            /* bond-store flush when requested; returns a fault reason (0 = none) */
+/* Bond-store flush when requested; returns a platform fault (0 = none): 1 bt_ctrl hung / over its CPU share, 2 bt_ctrl
+ * fault, 3 HCI command timeout, 4 a Bluedroid task stalled (bt_task_sup.h: ping unanswered for 8 s). */
+uint32_t bt_xrec_plat_poll(void);
 void     bt_xrec_plat_session_end(void);     /* final bond-store flush; release the volume */
 void     bt_xrec_plat_reboot(uint8_t mode);  /* 1 reboot, 2 SD OTA, 3 USB DFU (legacy F:2138-2147) */
 uint32_t bt_xrec_plat_irq_count(void);

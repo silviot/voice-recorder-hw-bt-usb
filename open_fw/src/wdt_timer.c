@@ -68,9 +68,25 @@ void wdt_start_reset(uint32_t timeout_sec, uint8_t pmu_reg20_cur)
     }
 }
 
+#if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID
+/* BT=1: the Bluedroid task supervisor's backstop (bt_port/bt_task_sup.h, strong definition in bt_xrec_fw.c; the probe
+ * image keeps this one). 1 = a BT task has had a ping outstanding for 20 s: the hardware WDT is no longer written and
+ * resets the device about 32 s later. The experiment deadline below is a separate timer and still extends. */
+__attribute__((weak)) int bt_task_sup_feed_hold_now(void)
+{
+    return 0;
+}
+#endif
+
 void wdt_feed(void)
 {
+#if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID
+    if (!bt_task_sup_feed_hold_now()) {
+        openfw_mmio_wr32(WDT_FEED_ADDR, WDT_FEED_KEY);
+    }
+#else
     openfw_mmio_wr32(WDT_FEED_ADDR, WDT_FEED_KEY);
+#endif
     if (g_exp_running != 0u) {
         g_exp_deadline_ms = g_systick_ms + OPENFW_EXP_TIMEOUT_MS;
     }
