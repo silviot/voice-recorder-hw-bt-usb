@@ -715,7 +715,7 @@ Verified via BootROM/stock disassembly (`dumps/bootrom_384K.bin`, `dumps/firmwar
   * `/dev/exti` (`open=0x00D3AC55`, `read=0x00D3AC3D`) samples GPIO ID `0x15800` (`PB11`) and feeds `earphoone_exist` inside `writer.pcm` (`0x00D3DE40` / `0x00D3DEE6`). Audio codec init/control (`0x00D4D78C`, `0x00D4DB0C`) also configures `PB10` (`0x15000`), `PB11` (`0x15800`), `PB14` (`0x17000`), `PB15` (`0x17800`), `PB19` (`0x19800`), and `PB20` (`0x1A000`).
 
 ### 25.3 OpenFW Layer 5e Additions (Core Features, MMIO Tests, Tooling & CI)
-* **Two-Way Wireless BT `+XREC v5` Remote Control & OTA ([xrec_proto.c](../open_fw/src/xrec_proto.c), [bt_hci.c](../open_fw/src/bt_hci.c), [openfw_xrec.h](../open_fw/include/openfw_xrec.h)):**
+* **Two-Way Wireless BT `+XREC v5` Remote Control & OTA ([xrec_proto.c](../open_fw/src/xrec_proto.c), `src/bt_hci.c` at 7c76b77 (removed in plan step 9; now [bt_xrec_bluedroid.c](../open_fw/bt_port/bt_xrec_bluedroid.c)), [openfw_xrec.h](../open_fw/include/openfw_xrec.h)):**
   * Wired `+XREC:RECSTART` / `+XREC:RECSTOP` to `recorder_start()` / `recorder_stop()` and added binary `+XREC:PUT,<off>,<len>,<crc>,OTA:<bytes>` streaming to `0:/update.up` (with CRC-16 verification + idempotent retry handling) plus `+XREC:OTA` triggering `pmu_reboot_to_sd_ota()` after ACL TX drains (`250 ms`), keeping OpenFW two-way compatible with [tools/bt_sync.py](../tools/bt_sync.py) `--ota`.
   * Persists Classic BT link keys across reboots in 96-byte `"BLK1"` `0:/bt_keys.bin` alongside `0:/cassini.key`.
 * **Power Management, Recording Safety & On-Device UI ([main.c](../open_fw/src/main.c), [recorder.c](../open_fw/src/recorder.c)):**

@@ -1949,13 +1949,14 @@ out:
     return s_fail ? 1 : 0;
 }
 
-/* G (test_bt_host: bt_ctrl refuses 0401/0402/0405/0408, as in a release BT=1 image): headphones mode starts, but
+/* G (test_bt_host: bt_ctrl refuses 0401/0402/0405/0408: the rows-refused (pre-Exp-4 / gate-off) configuration;
+ * every shipped BT=1 image forwards them since Exp 4): headphones mode starts, but
  * search and connect fail at once with BT_HP_MSG_UNSUPPORTED instead of a 0-device search / endless CONNECT_FAIL. */
 static int fn_pair_hp_nopair(uint32_t a) { (void)a; return bt_hp_connect_addr(s_hp_bda, 0); }
 
 int bth_headphones_gated(const char *img_path)
 {
-    bth_log("[G] headphones mode with the initiator rows refused (release image) (heap seq %u)\n",
+    bth_log("[G] headphones mode with the initiator rows refused (pre-Exp-4 / gate-off configuration) (heap seq %u)\n",
             (unsigned)bth_heap_seq());
     FILE *fimg = fopen(img_path, "rb");
     if (fimg == NULL || fread(s_disk, 1u, sizeof(s_disk), fimg) != sizeof(s_disk) || exfat_mount(&s_card, &s_dev) != 0) {

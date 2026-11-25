@@ -43,10 +43,16 @@ jobs:
       - name: Run OpenFW host tests under ASan + UBSan
         run: make -C open_fw test-host-san
 
+      # The default image's Bluetooth layer (BT=1) on the host: entropy/DRBG/store/probe-trigger shims, the
+      # controller shim against the fake ROM, and the phone-mode XREC session over mocked Bluedroid SPP. Host
+      # compiler + vendored Bluedroid headers only (no picolibc). test-bt-host (full Bluedroid harness) stays local.
+      - name: Run OpenFW Bluetooth host tests (BT=1 port, controller shim, XREC session)
+        run: make -C open_fw test-bt-port test-bt-ctrl test-bt-xrec
+
       # BT=0 (no Bluetooth): the default BT=1 image needs picolibc (tools/build_picolibc.sh: meson + ninja), which
-      # this runner does not install. The BT=1 build and its host tests run in the local gates.
+      # this runner does not install. The BT=1 ARM build runs in the local gates.
       - name: Build Cassini OpenFW ARM firmware (BT=0)
-        run: make -C open_fw BT=0
+        run: make -C open_fw BT=0 all
 
       - name: Run Python host tool self-tests and safety regressions
         run: |

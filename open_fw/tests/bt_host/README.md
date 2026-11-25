@@ -128,7 +128,8 @@ H. **Headphones-path smoke** (`test_bt_host_hp hp`, docs/BT_A2DP_DESIGN.md miles
    - H5 teardown back to the heap / task / esp_timer baseline (taken after a warm-up cycle: btc_spp keeps resident
      objects after its first init); no unknown opcode, ROM id without packer, deadline, BT fault or HCI timeout.
 
-**Allocation-failure sweeps** (`run_sweep.py --mode M`, `test_bt_host sweep-count|sweep-one N M`): one per lifecycle
+**Allocation-failure sweeps** (`run_sweep.py --mode M`, `test_bt_host_hp sweep-count|sweep-one N M`: the binary with
+the shipping bt_ctrl gate list; the phone scenario P also runs on both binaries): one per lifecycle
 call `esp_bluedroid_<M>()`, M = init, enable, disable, deinit. The stack is brought to the state before the call, the
 call's allocation attempts (all tasks) are counted, and each is failed in turn in its own process. A point passes when
 the call returned `ESP_OK` or an error with the API state unchanged (CLEAN_FAIL), teardown from there works (a failed

@@ -5,8 +5,8 @@
  * verified, before anything touches the controller, so a probe that hangs or resets the device cannot run again on the
  * next boot unless the user creates the file again (a 32 s WDT reset is a PMU cold reset that clears AON_BACKUP, so an
  * AON marker alone cannot stop a reset loop). Its content picks the stage: empty or "A" = stage A, "B" = stage A then
- * stage B; anything else is consumed and refused ("HCIP OFF trig=bad_content"). Without the file the image behaves like
- * BT=1 and logs "HCIP OFF".
+ * stage B; anything else is consumed and refused ("HCIP OFF trig=bad_content"). Without the file the image logs "HCIP OFF"
+ * and runs without Bluetooth (diagnostic image: no phone or headphones mode).
  * The probe runs in its own low-priority task (same priority as the app, which keeps feeding the WDT; the probe also
  * feeds it while it waits): stage A ~6 s on silicon, stage B ~33 s more; then BT stays off. While it runs, main.c refuses
  * recording and defers USB MSC (each Reset busy-waits ~0.3-0.5 s in RF calibration at bt_ctrl priority). The probe image

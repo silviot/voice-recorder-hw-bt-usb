@@ -1,13 +1,17 @@
 # Build system for Cassini OpenFW (standalone clean-room SL6801 firmware)
 #
 # Usage:
-#   make -C open_fw            # Compile & pack standalone open_fw FIRM partition (BT=1: Bluedroid, needs picolibc)
+#   make -C open_fw            # Compile & pack standalone open_fw FIRM partition (= `all`; BT=1: Bluedroid, needs picolibc)
 #   make -C open_fw BT=0       # The same without Bluetooth (no picolibc / meson / ninja needed)
 #   make -C open_fw test-host  # Compile & run host unit tests (crypto, wav, exfat, LVGL UI)
 #   make -C open_fw update-up  # Also build 2 MB flash image + 0:\update.up (requires ../dumps/firmware_2M.bin)
 #   make -C open_fw clean      # Remove build artifacts
 #
 # SPDX-License-Identifier: MIT
+
+# `all` must be the default goal: the picolibc rule (bt/firmware.mk) and $(CONFIG_STAMP) appear before it, and make
+# would otherwise pick whichever comes first (a goal-less `make` then only wrote .config or checked libc.a).
+.DEFAULT_GOAL := all
 
 CLANG    ?= clang
 HOST_CC  ?= cc

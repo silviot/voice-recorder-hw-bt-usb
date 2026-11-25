@@ -105,10 +105,15 @@ The recorder uses a single exFAT partition on the microSD card with the followin
 │   ├── settings.bin            # Persisted UI/audio settings + last played file & resume offset
 │   └── <subfolder>/            # Optional nested audio folders (also surfaced in Files root)
 ├── cassini.key                 # +XREC v5 paired host key ("CSK5" + 32 B)
-├── bt_keys.bin                 # Classic BT link-key cache ("BLK1", 4 slots)
+├── bt_bonds.bin                # BT=1: phone-mode Bluedroid bonds (bt_port/bt_xrec_fw.c)
+├── bt_hp_bonds.bin             # BT=1: headphones-mode bonds (headsets)
+├── bt_hp_cfg.bin               # BT=1: headphones settings (output mode, volume, last headset)
 ├── update.up                   # Optional SD OTA firmware update package (Stage-1 HLKJ)
 └── <Custom_Folder>/            # Any other non-empty root folder (excluding dotfiles, System Volume Information, $RECYCLE.BIN)
 ```
+
+A `bt_keys.bin` left by the legacy Bluetooth host (removed in plan step 9) is ignored: bonds are not migrated
+(docs/BLUETOOTH_BLUEDROID_PLAN.md D8), so phones and headsets pair again once.
 
 ### File Browser Rules (`src/main.c`, `src/ui/ui_screens.c`)
 - **Root `Files` view:** Shows all non-empty subfolders discovered under `/audiobooks/`, `/cassini/`, `/record/`, and `/` (sorted A–Z with an amber dot and `<N> ▶` chapter count), followed by loose `.wav` files from `/record/`, `/cassini/`, and `/` sorted **newest-first** (up to `96` entries per view).

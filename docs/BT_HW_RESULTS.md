@@ -391,7 +391,7 @@ The file's content picks the stage:
 | anything else | nothing: the file is consumed and the boot logs `HCIP OFF trig=bad_content` |
 
 Case, surrounding spaces/line ends and a UTF-8 BOM are ignored (`echo B >` and files saved by Windows Notepad both work). Without the file
-the image behaves like a plain `BT=1` image and logs `HCIP OFF trig=absent`. A probe that hangs or resets the device
+the image logs `HCIP OFF trig=absent` and runs without Bluetooth (diagnostic image: no phone or headphones mode). A probe that hangs or resets the device
 therefore cannot run again on the next boot unless you create the file again.
 
 **Stage A** (BT stays off afterwards unless stage B follows; the app keeps feeding the WDT):
