@@ -20,6 +20,7 @@
 #include "openfw.h"
 #include "audio_dsp.h"
 #include "openfw_wav.h"
+#include "openfw_bench_meas.h"   /* F0 counters: bench images only (OPENFW_BENCH_MEAS), compiled out otherwise */
 
 /* Checkpoint every ~160 KiB (~5s mono / ~2.5s stereo) and after first 4 KiB */
 #define REC_CKPT_INTERVAL_BYTES 163840u
@@ -278,15 +279,28 @@ static void rec_vor_emit_cb(void *user, const int16_t *pcm, size_t num_frames)
         }
     }
 
+#if OPENFW_BENCH_MEAS
+    uint32_t bm_t0 = (uint32_t)us_timer_now();
+#endif
     if (exfat_write(&g_writer, pcm, nbytes) != 0) {
         rec_log_err("write", g_pcm_bytes);
         g_rec_error = 1;
         /* Best-effort commit of whatever was already flushed */
         (void)finalize_current_wav_file();
         g_rec_saving = 0;
+#if OPENFW_BENCH_MEAS
+        bench_meas_write(&g_bench_meas, 0u, (uint32_t)us_timer_now() - bm_t0, 0u);
+#endif
     } else {
         g_pcm_bytes += nbytes;
+#if OPENFW_BENCH_MEAS
+        uint32_t bm_t1 = (uint32_t)us_timer_now();
         recorder_checkpoint_if_due();
+        uint32_t bm_t2 = (uint32_t)us_timer_now();
+        bench_meas_write(&g_bench_meas, (uint32_t)num_frames, bm_t1 - bm_t0, bm_t2 - bm_t1);
+#else
+        recorder_checkpoint_if_due();
+#endif
     }
 }
 
@@ -385,6 +399,10 @@ int recorder_start(exfat_vol_t *vol, int sd_mounted)
 
     g_last_overruns = audio_get_overruns();
     g_rec_active    = 1;
+#if OPENFW_BENCH_MEAS
+    bench_meas_rec_start(&g_bench_meas, g_filename, g_active_channels, g_mic_gain, (uint8_t)g_dsp_profile,
+                         (uint8_t)g_vor_enabled, (uint32_t)us_timer_now());
+#endif
     return 0;
 }
 
@@ -393,6 +411,10 @@ void recorder_poll(void)
     if (!g_rec_active) {
         return;
     }
+#if OPENFW_BENCH_MEAS
+    uint32_t bm_enter = (uint32_t)us_timer_now();
+    bench_meas_poll_enter(&g_bench_meas, bm_enter);
+#endif
 
     /* Compensate any DMA ring overruns with silence (only when not paused by VOR gate,
      * and capped per poll so an SD hiccup cannot trigger a cascading zero-write storm). */
@@ -400,6 +422,9 @@ void recorder_poll(void)
     if (ov != g_last_overruns) {
         uint32_t dropped = ov - g_last_overruns;
         g_last_overruns  = ov;
+#if OPENFW_BENCH_MEAS
+        uint32_t bm_dropped = dropped, bm_comp = 0u;
+#endif
         if (g_rec_saving && (!g_vor.enabled || g_vor.gate_open)) {
             if (dropped > 2u) {
                 dropped = 2u;
@@ -410,8 +435,14 @@ void recorder_poll(void)
             }
             for (uint32_t d = 0u; d < dropped && g_rec_saving; d++) {
                 rec_vor_emit_cb(0, g_proc_buf, 2048u);
+#if OPENFW_BENCH_MEAS
+                bm_comp++;
+#endif
             }
         }
+#if OPENFW_BENCH_MEAS
+        bench_meas_overrun(&g_bench_meas, bm_dropped, bm_comp);
+#endif
     }
 
     uint32_t nbytes = 0u;
@@ -423,6 +454,9 @@ void recorder_poll(void)
             audio_vor_feed(&g_vor, g_proc_buf, num_frames, rec_vor_emit_cb, 0);
         }
     }
+#if OPENFW_BENCH_MEAS
+    bench_meas_poll_exit(&g_bench_meas, bm_enter, (uint32_t)us_timer_now(), audio_get_frames());
+#endif
 }
 
 int recorder_stop(void)
@@ -432,10 +466,24 @@ int recorder_stop(void)
     }
 
     audio_capture_stop();
+#if OPENFW_BENCH_MEAS
+    bench_meas_capture_end(&g_bench_meas, (uint32_t)us_timer_now());   /* the clock side of the sample accounting */
+#endif
     recorder_poll();
 
     int fin_rc = finalize_current_wav_file();
     g_rec_active = 0;
+#if OPENFW_BENCH_MEAS
+    bench_meas_rec_stop(&g_bench_meas, audio_get_frames(), audio_get_overruns());
+    {
+        /* "BENCH rec ..." (docs/BT_HW_RESULTS.md, M2/M3 recipe): read with dev_cycle.py log or +XREC:LOG */
+        static char bm_line[BENCH_MEAS_LINE_MAX];
+        (void)bench_meas_format_rec(&g_bench_meas.cur, ' ', bm_line, (uint32_t)sizeof(bm_line));
+        openfw_log_puts("BENCH rec ");
+        openfw_log_puts(bm_line);
+        openfw_log_putc('\n');
+    }
+#endif
 
     if (fin_rc != 0 || g_rec_error != 0) {
         g_rec_error = 1;

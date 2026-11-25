@@ -5,6 +5,7 @@ Offline regression tests for host safety tools:
   - tools/usb_sync.py: content-hashed collision handling & deduplication
   - tools/fix_exfat_boundary.py: tail-cluster allocation bitmap check,
     MBR/VBR geometry validation, shrink, and idempotency on re-run
+  - tools/rf_audio_check.py: its synthetic self-test (clean vs spur / dropout / phase step / AM / noise; needs numpy)
 
 SPDX-License-Identifier: MIT
 """
@@ -251,12 +252,25 @@ def test_fix_exfat_boundary() -> None:
     print("[PASS] fix_exfat_boundary.py allocated-tail refusal, shrink, and idempotency")
 
 
+def test_rf_audio_check() -> None:
+    try:
+        import numpy  # noqa: F401
+    except ImportError:
+        print("[SKIP] rf_audio_check.py self-test (numpy not installed)")
+        return
+    import rf_audio_check  # noqa: E402
+
+    assert rf_audio_check.self_test() == 0, "rf_audio_check self-test failed"
+    print("[PASS] rf_audio_check.py synthetic self-test")
+
+
 def main() -> int:
     test_bt_sync_path_traversal()
     test_bt_sync_transport_detection()
     test_bt_sync_split_error_and_keyfile_perms()
     test_usb_sync_collisions()
     test_fix_exfat_boundary()
+    test_rf_audio_check()
     print("ALL HOST TOOL SAFETY TESTS PASSED")
     return 0
 

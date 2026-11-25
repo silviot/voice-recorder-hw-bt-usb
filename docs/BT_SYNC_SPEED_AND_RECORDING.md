@@ -1,6 +1,8 @@
 # BT sync: speed, and syncing while recording
 
-Status: **design, awaiting approval.** Nothing here is implemented yet.
+Status: **design approved (decisions in section 5).** S2 tooling implemented on `feat/bt-sync-measure`: F0 counters
+(bench images), `+XREC:DBG`, `tools/bt_sync.py --bench-load`, `tools/rf_audio_check.py`; the M2/M3 run recipe is in
+`docs/BT_HW_RESULTS.md` ("Sync during recording: M2/M3 measurement recipe"). No silicon data yet.
 Based on three read-only research passes (throughput, firmware concurrency, app), firmware `feat/bt-step9` @ b3fa6c6, app `feat/recorder-sync`.
 
 User requirement: *sync is extremely slow; when a phone is paired, sync should happen during recording, but must never, ever affect recording quality.*

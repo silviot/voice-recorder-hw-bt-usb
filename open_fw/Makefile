@@ -150,6 +150,9 @@ ifeq ($(BT),1)
 SRCS      += src/audio_out.c   # output dispatch DAC / headset / both (include/audio_out.h; BT=0 aliases the DAC)
 SRCS      += src/ui/ui_i18n_bt.c   # BT UI strings, 18 languages (include/openfw_i18n_bt.h; not in the BT=0 image)
 endif
+ifeq ($(BENCH),1)
+SRCS      += src/bench_meas.c      # F0 measurement counters (include/openfw_bench_meas.h): bench images only
+endif
 OBJS      := $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(SRCS))
 $(BUILD_DIR)/audio_out.o: CFLAGS += -Ibt_port
 
@@ -248,7 +251,7 @@ $(BUILD_DIR)/xip.bin: $(BUILD_DIR)/open_fw.elf
 $(BUILD_DIR)/open_fw_firm.bin: $(BUILD_DIR)/ram_boot.bin $(BUILD_DIR)/xip.bin tools/pack_firm.py
 	python3 tools/pack_firm.py --ram-boot $(BUILD_DIR)/ram_boot.bin --xip $(BUILD_DIR)/xip.bin --out-firm $@
 
-test-host: $(LVGL_DIR)/lvgl.h $(BUILD_DIR)/liblvgl_host.a tests/test_core.c tests/test_xrec_rec.c src/crypto.c src/wav.c src/cwx.c src/exfat.c src/persist.c src/apmem.c src/usb_scsi.c src/xrec_proto.c | $(BUILD_DIR)
+test-host: $(LVGL_DIR)/lvgl.h $(BUILD_DIR)/liblvgl_host.a tests/test_core.c tests/test_xrec_rec.c src/bench_meas.c src/crypto.c src/wav.c src/cwx.c src/exfat.c src/persist.c src/apmem.c src/usb_scsi.c src/xrec_proto.c | $(BUILD_DIR)
 	$(HOST_CC) $(HOST_CFLAGS) tests/test_core.c src/crypto.c src/wav.c src/cwx.c src/exfat.c src/persist.c src/apmem.c src/usb_scsi.c src/xrec_proto.c -o $(BUILD_DIR)/test_core
 	$(BUILD_DIR)/test_core
 	dd if=/dev/zero of=$(BUILD_DIR)/test_exfat.img bs=512 count=4096 status=none
@@ -261,8 +264,20 @@ test-host: $(LVGL_DIR)/lvgl.h $(BUILD_DIR)/liblvgl_host.a tests/test_core.c test
 	/usr/sbin/mkfs.exfat -q -b 4096 -c 4096 $(BUILD_DIR)/test_xrec_rec.img
 	$(BUILD_DIR)/test_xrec_rec $(BUILD_DIR)/test_xrec_rec.img
 	/usr/sbin/fsck.exfat -n $(BUILD_DIR)/test_xrec_rec.img
+	@# the same with the bench-only +XREC:DBG and GETS byte count (OPENFW_BT_BENCH_IMAGE, src/bench_meas.c)
+	$(HOST_CC) $(HOST_CFLAGS) -DOPENFW_BT_BENCH_IMAGE=1 tests/test_xrec_rec.c src/xrec_proto.c src/crypto.c src/exfat.c \
+		src/bench_meas.c -o $(BUILD_DIR)/test_xrec_rec_bench
+	dd if=/dev/zero of=$(BUILD_DIR)/test_xrec_rec.img bs=512 count=4096 status=none
+	/usr/sbin/mkfs.exfat -q -b 4096 -c 4096 $(BUILD_DIR)/test_xrec_rec.img
+	$(BUILD_DIR)/test_xrec_rec_bench $(BUILD_DIR)/test_xrec_rec.img
+	/usr/sbin/fsck.exfat -n $(BUILD_DIR)/test_xrec_rec.img
 	python3 -I ../tools/test_bt_sync_xrec.py > $(BUILD_DIR)/test_bt_sync_xrec.log
 	@tail -n 1 $(BUILD_DIR)/test_bt_sync_xrec.log
+	@# M2 analysis tool (docs/BT_SYNC_SPEED_AND_RECORDING.md): synthetic self-test; skipped without numpy
+	@if python3 -I -c 'import numpy' 2>/dev/null; then \
+		python3 -I ../tools/rf_audio_check.py --self-test > $(BUILD_DIR)/test_rf_audio_check.log || \
+		{ cat $(BUILD_DIR)/test_rf_audio_check.log; exit 1; }; tail -n 1 $(BUILD_DIR)/test_rf_audio_check.log; \
+	else echo "rf_audio_check self-test: SKIPPED (numpy not installed)"; fi
 	$(HOST_CC) $(HOST_CFLAGS) -DOPENFW_HOST_MMIO -DOPENFW_ENABLE_USB_EXP=1 -DOPENFW_UNATTENDED_DEV=1 tests/test_drivers_mmio.c \
 		src/wdt_timer.c src/uart.c src/rtc.c src/pmu.c src/keys.c \
 		src/sdio.c src/lcd_st7735s.c src/usb_musb.c src/usb_scsi.c src/exfat.c \

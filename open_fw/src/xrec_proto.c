@@ -5,6 +5,7 @@
  */
 #include "openfw_xrec.h"
 #include "openfw_crypto.h"
+#include "openfw_bench_meas.h"   /* +XREC:DBG and the GETS byte count: bench images only (OPENFW_BENCH_MEAS) */
 
 typedef uint32_t __attribute__((may_alias)) xrec_u32_t;
 
@@ -1258,6 +1259,49 @@ static void handle_log_cmd(xrec_ctx_t *ctx, const char *args)
     }
 }
 
+#if OPENFW_BENCH_MEAS
+/* +XREC:DBG (bench images only; docs/XREC_PROTOCOL.md): the F0 measurement counters (include/openfw_bench_meas.h).
+ *   +XREC:DBG        -> +XREC:DBG,LIVE,<rec fields>,<cpu fields>   the running (else the last) recording
+ *   +XREC:DBG,REC,i  -> +XREC:DBG,REC,i,<rec fields>               i-th latest finished recording (0 = latest)
+ *                       +XREC:ERR,NOENT when there is none (BENCH_MEAS_HIST are kept) */
+static void handle_dbg(xrec_ctx_t *ctx, const char *args)
+{
+    char line[24u + BENCH_MEAS_LINE_MAX];
+    int pos = 0;
+    const bench_meas_rec_t *r = &g_bench_meas.cur;
+    if (*args == '\0') {
+        append_str(line, &pos, (int)sizeof(line), "+XREC:DBG,LIVE,");
+    } else if (str_starts_with(args, ",REC,")) {
+        const char *p = args + 5;
+        uint32_t i = 0u;
+        if (parse_u32_step(&p, &i) != 0 || *p != '\0') {
+            send_err(ctx, "ARGS");
+            return;
+        }
+        r = bench_meas_hist(&g_bench_meas, i);
+        if (r == 0) {
+            send_err(ctx, "NOENT");
+            return;
+        }
+        append_str(line, &pos, (int)sizeof(line), "+XREC:DBG,REC,");
+        append_u32(line, &pos, (int)sizeof(line), i);
+        append_str(line, &pos, (int)sizeof(line), ",");
+    } else {
+        send_err(ctx, "ARGS");
+        return;
+    }
+    /* room for ",<cpu fields>\r\n" is kept by BENCH_MEAS_LINE_MAX (rec ~330 B + cpu ~70 B worst case) */
+    pos += (int)bench_meas_format_rec(r, ',', &line[pos], (uint32_t)((int)sizeof(line) - pos - 2));
+    if (*args == '\0') {
+        append_str(line, &pos, (int)sizeof(line) - 2, ",");
+        pos += (int)bench_meas_format_cpu(&g_bench_meas, ',', &line[pos], (uint32_t)((int)sizeof(line) - pos - 2));
+    }
+    line[pos++] = '\r';
+    line[pos++] = '\n';
+    send_text(ctx, line, pos);
+}
+#endif
+
 /* A refused PUT header whose length is known: reply the error now and eat exactly that many payload bytes without
  * parsing them, so binary payload never reaches the line parser (where a "\r+XREC:..." piece would run as a
  * command and long pieces would raise unsolicited ERR,LINE replies). */
@@ -1415,6 +1459,10 @@ static void process_line(xrec_ctx_t *ctx, const char *line)
         handle_audio_cfg_cmd(ctx, "CH", cmd + 2, 2u, 1u, 2u);
     } else if (str_starts_with(cmd, "VOR") && (cmd[3] == '\0' || cmd[3] == '=' || cmd[3] == ',')) {
         handle_audio_cfg_cmd(ctx, "VOR", cmd + 3, 3u, 0u, 1u);
+#if OPENFW_BENCH_MEAS
+    } else if (str_starts_with(cmd, "DBG") && (cmd[3] == '\0' || cmd[3] == ',')) {
+        handle_dbg(ctx, cmd + 3);
+#endif
     } else {
         send_err(ctx, "CMD");
     }
@@ -1636,6 +1684,9 @@ void xrec_poll(xrec_ctx_t *ctx)
         ctx->gets_staged  = 0u;
         ctx->gets_offset += sent;
         ctx->gets_rem    -= sent;
+#if OPENFW_BENCH_MEAS
+        bench_meas_gets(&g_bench_meas, sent);
+#endif
         if (sent > 0u) {   /* an empty EOF frame (GETS at/past the end) began no view: leave the shown one alone */
             xfer_progress(ctx, 0u, ctx->gets_offset);
         }

@@ -34,7 +34,7 @@ DEFAULT_NAME_PREFIXES = ("Cassini_", "HW_")
 DEFAULT_KEY_FILE = Path.home() / ".config" / "hw76-sync" / "keys.json"
 CHUNK_SIZE = 640  # 12 B header + 640 B = 652 B <= 660 B RFCOMM MTU (with bt-rfcomm-turbo; use 480 on stock MTU)
 PUT_CHUNK_SIZE = 600  # +XREC:PUT payload (<= 640); header + payload stays one ~650 B write, one chunk in flight
-DEFAULT_BURST_SIZE = 3840  # 6 x 640 B frames per +XREC:GETS burst (~92-96 KB/s, safe within K=7 credits)
+DEFAULT_BURST_SIZE = 3840  # 6 x 640 B frames per +XREC:GETS burst (stock firmware's window; open_fw takes any size)
 
 
 def load_device_key(key_file: Path, mac: str) -> Optional[bytes]:
@@ -444,6 +444,93 @@ class XRecRFCOMMClient:
         keys = ("battery_pct", "voltage_mv", "charge_status", "vbus", "media_status", "rec_sec", "free_mb", "total_mb")
         return dict(zip(keys, parts))
 
+    def dbg(self, rec: Optional[int] = None) -> Dict[str, str]:
+        """+XREC:DBG (bench images only, after AUTH): the recorder's measurement counters as a dict, "_line" = the raw
+        reply. rec=None: the running (else the last) recording plus CPU / GETS totals; rec=i: the i-th latest
+        finished recording. Field list: open_fw/include/openfw_bench_meas.h."""
+        self._send_cmd("+XREC:DBG" if rec is None else f"+XREC:DBG,REC,{int(rec)}")
+        line = self._read_line()
+        if not line.startswith("+XREC:DBG,"):
+            raise RuntimeError(f"DBG failed: {line} (bench image only: make -C open_fw BT=1 BENCH=1)")
+        kv = dict(t.split("=", 1) for t in line.split(",") if "=" in t)
+        kv["_line"] = line
+        return kv
+
+    def bench_load(
+        self,
+        seconds: float,
+        load_file: Optional[str] = None,
+        load_size: int = 0,
+        burst_size: int = DEFAULT_BURST_SIZE,
+        chunk_size: int = CHUNK_SIZE,
+        kbps: float = 0.0,
+        dbg_every: float = 5.0,
+        rec: bool = False,
+        log=print,
+        storm_every: float = 0.0,
+    ) -> Dict[str, float]:
+        """Measurement session (docs/BT_HW_RESULTS.md, "Sync during recording"): hold this link for `seconds`,
+        optionally RECSTART first / RECSTOP last, pull GETS bursts of load_file in a loop (from 0 again at its end;
+        kbps > 0 caps the average rate in KiB/s, 0 = as fast as the link goes) and log a +XREC:DBG line every
+        dbg_every s (0 = only at the end). storm_every > 0: every storm_every s also STAT, LS and a DEL of a name that
+        does not exist (ERR,DEL: the directory scan without deleting anything), design M3. Returns the bytes / seconds /
+        KiB/s actually moved."""
+        t0 = time.monotonic()
+        nstorm = t0 + storm_every if storm_every > 0 else float("inf")
+        storms = 0
+        if rec:
+            log(f"{0.0:8.1f} RECSTART {self.rec_start()}")
+        nxt = t0 + dbg_every if dbg_every > 0 else float("inf")
+        off = moved = errors = 0
+        while True:
+            now = time.monotonic()
+            if now - t0 >= seconds:
+                break
+            if now >= nxt:
+                log(f"{now - t0:8.1f} {self.dbg()['_line']}")
+                nxt += dbg_every
+                continue
+            if now >= nstorm:
+                self.get_stat()
+                self.list_files()
+                try:
+                    self.delete_file("STORM_NO_SUCH_FILE.WAV")
+                except RuntimeError:
+                    pass
+                storms += 1
+                nstorm += storm_every
+                continue
+            if not load_file or load_size <= 0:
+                time.sleep(min(0.05, max(0.0, nxt - now)))
+                continue
+            if kbps > 0 and moved > kbps * 1024.0 * (now - t0):
+                time.sleep(0.005)
+                continue
+            req = min(burst_size, load_size - off)
+            try:
+                data = self.get_burst(load_file, off, req, chunk_size)
+            except (RuntimeError, TimeoutError, OSError) as exc:
+                errors += 1
+                log(f"{now - t0:8.1f} GETS error at {off}: {exc}")
+                self.rx_buf.clear()
+                time.sleep(0.2)
+                continue
+            moved += len(data)
+            off += len(data)
+            if not data or off >= load_size:
+                off = 0
+        el = time.monotonic() - t0
+        if rec:
+            self.rec_stop()
+            log(f"{el:8.1f} RECSTOP")
+            log(f"{el:8.1f} {self.dbg(0)['_line']}")
+        else:
+            log(f"{el:8.1f} {self.dbg()['_line']}")
+        res = {"bytes": float(moved), "seconds": el, "kib_s": moved / 1024.0 / max(el, 1e-6), "errors": float(errors),
+               "storms": float(storms)}
+        log(f"{el:8.1f} LOAD bytes={moved} kib_s={res['kib_s']:.1f} errors={errors} storms={storms}")
+        return res
+
     def _read_xrec_frame(self, expected_offset: int, filename: str) -> bytes:
         # Wait for either 12-byte binary header "XREC" or text error "+XREC:ERR," (even if split across recv chunks)
         while True:
@@ -623,6 +710,22 @@ def main() -> None:
         metavar="REC_NAME",
         help="Recording the --upload-cwx sidecar belongs to (e.g. REC_0001.wav -> REC_0001.cwx); checked against LS",
     )
+    parser.add_argument("--dbg", action="store_true", help="Bench images: print +XREC:DBG (recording / CPU counters)")
+    parser.add_argument("--dbg-rec", type=int, metavar="I", help="Bench images: +XREC:DBG,REC,I (I-th latest recording)")
+    parser.add_argument(
+        "--bench-load",
+        type=float,
+        metavar="SECONDS",
+        help="Bench images: hold the link SECONDS, polling +XREC:DBG every --dbg-every s; with --load-file pull GETS "
+        "bursts of that file in a loop (--load-kbps cap), with --load-rec RECSTART first and RECSTOP last",
+    )
+    parser.add_argument("--load-file", metavar="NAME", help="--bench-load: file in 0:\\record to pull repeatedly")
+    parser.add_argument("--load-kbps", type=float, default=0.0, help="--bench-load: average GETS cap in KiB/s (0 = full)")
+    parser.add_argument("--load-rec", action="store_true", help="--bench-load: RECSTART at the start, RECSTOP at the end")
+    parser.add_argument("--load-storm", type=float, default=0.0,
+                        help="--bench-load: every N s also STAT + LS + DEL of a missing name (0 = off)")
+    parser.add_argument("--dbg-every", type=float, default=5.0, help="--bench-load: DBG poll period in s (0 = end only)")
+    parser.add_argument("--dbg-log", type=Path, help="--bench-load / --dbg: also append the lines to this file")
     parser.add_argument("--pair", metavar="PIN", help="Bind to recorder using the 6-digit PIN shown on its Bluetooth menu LCD (v5)")
     parser.add_argument(
         "--key-file",
@@ -682,6 +785,26 @@ def main() -> None:
             client.authenticate(key)
             print("Authenticated (HMAC-SHA256 challenge-response OK).")
 
+        def out(line: str) -> None:
+            print(line, flush=True)
+            if args.dbg_log:
+                with open(args.dbg_log, "a", encoding="ascii", errors="replace") as fh:
+                    fh.write(line + "\n")
+
+        if args.dbg or args.dbg_rec is not None:
+            out(client.dbg(args.dbg_rec)["_line"])
+            return
+        if args.bench_load is not None:
+            size = 0
+            if args.load_file:
+                size = dict(client.list_files()).get(args.load_file, 0)
+                if size <= 0:
+                    print(f"{args.load_file} is not in 0:\\record (LS); no GETS load.")
+                    sys.exit(1)
+            client.bench_load(args.bench_load, args.load_file, size, burst_size=max(args.burst_size, args.chunk_size),
+                              chunk_size=args.chunk_size, kbps=args.load_kbps, dbg_every=args.dbg_every,
+                              rec=args.load_rec, log=out, storm_every=args.load_storm)
+            return
         if args.rtc_read:
             print(f"Device RTC: {client.read_rtc()}")
             return

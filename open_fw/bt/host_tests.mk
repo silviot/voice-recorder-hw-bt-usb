@@ -40,6 +40,8 @@ test-bt-port:
 	$(HOST_CC) $(BT_PORT_TEST_CFLAGS) tests/test_bt_bench.c bt_port/bt_bench.c src/exfat.c \
 		-o $(BT_PORT_TEST_DIR)/test_bt_bench
 	$(BT_PORT_TEST_DIR)/test_bt_bench $(BT_PORT_TEST_DIR)/hcip_exfat.img
+	$(HOST_CC) $(BT_PORT_TEST_CFLAGS) tests/test_bench_meas.c src/bench_meas.c -o $(BT_PORT_TEST_DIR)/test_bench_meas
+	$(BT_PORT_TEST_DIR)/test_bench_meas
 
 # ---- test-bt-ctrl: controller shim against the fake ROM (plan M1, step 3). Host build, sanitizers on. ----
 # Bluedroid's hci_packet_parser.c is compiled in (unmodified) so the mandatory-success replies are proven against the
@@ -132,7 +134,7 @@ test-bt-xrec:
 	@mkdir -p $(BT_XREC_TEST_DIR)
 	$(HOST_CC) $(BT_CTRL_TEST_CFLAGS) $(BT_CTRL_BD_DEFS) $(BT_CTRL_BD_INCS) -DBT_XREC_TEST_HOOKS=1 \
 		-DOPENFW_BT_BENCH_IMAGE=1 \
-		tests/test_bt_xrec.c bt_port/bt_xrec_bluedroid.c src/xrec_proto.c src/crypto.c src/exfat.c \
+		tests/test_bt_xrec.c bt_port/bt_xrec_bluedroid.c src/xrec_proto.c src/crypto.c src/exfat.c src/bench_meas.c \
 		-o $(BT_XREC_TEST_DIR)/test_bt_xrec
 	$(BT_XREC_TEST_DIR)/test_bt_xrec
 	@# A release BT=1 session (no BENCH=1) must not contain the SD bench overrides (autoconfirm, fixed XREC PIN).

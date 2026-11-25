@@ -15,6 +15,7 @@ Python host utilities for building, flashing, debugging, syncing, and testing th
 | **[`cassini_to_device.py`](cassini_to_device.py)** | Convert Cassini portable-meeting Ogg Opus files into device-ready IMA-ADPCM/PCM `.wav` + `.cwx` synced transcript files | `python3 tools/cassini_to_device.py --self-test` |
 | **[`inspect_fw.py`](inspect_fw.py)** | Validate `HLKJ` bootloader header, partition directory, and CRC-16/CCITT-FALSE checksums on 2 MiB SL6801 images | `python3 tools/inspect_fw.py dumps/firmware_2M_openfw.bin` |
 | **[`bt_probe_report.py`](bt_probe_report.py)** | Markdown/JSON report of the Bluetooth Exp 1 stage A HCI probe (`HCIP` lines from `dev_cycle.py log`; image `make -C open_fw BT=1 HCI_PROBE=1`, see `docs/BT_HW_RESULTS.md`) | `python3 tools/bt_probe_report.py --self-test` |
+| **[`rf_audio_check.py`](rf_audio_check.py)** | "Does the radio change the recording?": WAV captures vs a radio-off baseline (noise floor, 1 Hz Welch spurs at the BT rhythms, envelope modulation, tone SNR / THD+N, continuity, device counters from `BENCH rec` / `+XREC:DBG`), Markdown + JSON pass/fail (`docs/BT_HW_RESULTS.md` "Sync during recording: M2/M3 measurement recipe"; numpy) | `python3 tools/rf_audio_check.py --self-test` |
 | **[`test_tools.py`](test_tools.py)** | Offline regression tests for `usb_sync.py`, `bt_sync.py` path-traversal guards, and `fix_exfat_boundary.py` | `python3 tools/test_tools.py` |
 
 ## Bluetooth Sync Tools

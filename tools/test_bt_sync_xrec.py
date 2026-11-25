@@ -47,6 +47,10 @@ class FakeDevice:
         self.fail_put_at = {}                   # offset -> error sent instead of OK (once)
         self.corrupt_put_at = set()             # offsets whose payload arrives corrupted once
         self.gets_frames = None                 # override: list of payload sizes the next GETS answers with
+        self.dbg_calls = 0                      # +XREC:DBG (bench images)
+        self.recording = self.rec_done = False
+        self.gets_bytes = 0
+        self.dels = 0
 
     # --- socket API ---
     def settimeout(self, t):
@@ -163,6 +167,25 @@ class FakeDevice:
                 if k.startswith("/record/"):
                     self._reply(f"+XREC:F,{len(v)},{k[len('/record/'):]}")
             self._reply("+XREC:END")
+        elif line == "+XREC:DBG" or line.startswith("+XREC:DBG,"):
+            self.dbg_calls += 1
+            if line == "+XREC:DBG":
+                self._reply(f"+XREC:DBG,LIVE,seq=1,file=REC_0001.wav,rec={int(self.recording)},ov=0,gets_tot={self.gets_bytes}")
+            elif line == "+XREC:DBG,REC,0" and self.rec_done:
+                self._reply("+XREC:DBG,REC,0,seq=1,file=REC_0001.wav,rec=0,ov=0,acct=0")
+            else:
+                self._reply("+XREC:ERR,NOENT")
+        elif line == "+XREC:STAT":
+            self._reply("+XREC:STAT,80,3900,0,0,1,12,1000,30000")
+        elif line.startswith("+XREC:DEL,"):
+            self.dels += 1
+            self._reply("+XREC:ERR,DEL")
+        elif line == "+XREC:RECSTART":
+            self.recording = True
+            self._reply("+XREC:OK,RECSTART,REC_0001.wav")
+        elif line == "+XREC:RECSTOP":
+            self.recording, self.rec_done = False, True
+            self._reply("+XREC:OK,RECSTOP")
         elif line.startswith("+XREC:GETS,"):
             off, tot, chunk, name = line[len("+XREC:GETS,") :].split(",", 3)
             self._gets(int(off), int(tot), int(chunk), name)
@@ -188,6 +211,7 @@ class FakeDevice:
         while rem > 0:
             want = min(rem, chunk)
             got = data[off : off + want]
+            self.gets_bytes += len(got)
             self._frame(off, got)
             off += len(got)
             rem -= len(got)
@@ -322,12 +346,35 @@ def test_get_burst_eof(td: Path) -> None:
     print("[PASS] bt_sync get_burst: EOF inside a burst, short EOF first frame, MTU-clamped frames, shrunk file")
 
 
+def test_bench_dbg_and_load() -> None:
+    dev = FakeDevice({"/record/OLD.wav": bytes(range(256)) * 20})
+    c = client_for(dev)
+    d = c.dbg()
+    assert d["rec"] == "0" and d["file"] == "REC_0001.wav" and d["_line"].startswith("+XREC:DBG,LIVE,")
+    expect_raises(lambda: c.dbg(0), "DBG failed", "NOENT")
+    lines = []
+    res = c.bench_load(0.4, "OLD.wav", 5120, burst_size=3840, chunk_size=640, kbps=0, dbg_every=0.1, rec=True,
+                       log=lines.append)
+    assert res["bytes"] > 5120 and res["errors"] == 0, res                 # wrapped around the file at least once
+    assert dev.dbg_calls >= 4 and dev.rec_done, dev.dbg_calls               # polls + the final REC,0
+    assert "RECSTART REC_0001.wav" in lines[0] and any("RECSTOP" in ln for ln in lines)
+    assert any("+XREC:DBG,REC,0," in ln for ln in lines) and "LOAD bytes=" in lines[-1]
+    # capped: about kbps * seconds (one burst of slack)
+    dev = FakeDevice({"/record/OLD.wav": bytes(10000)})
+    res = client_for(dev).bench_load(0.5, "OLD.wav", 10000, burst_size=1024, chunk_size=512, kbps=8, dbg_every=0,
+                                     log=lambda s: None, storm_every=0.1)
+    assert res["bytes"] <= 8 * 1024 * 0.5 + 1024 + 1, res
+    assert res["storms"] >= 3 and dev.dels == res["storms"] and dev.files, res   # DEL of a missing name only
+    print("[PASS] bt_sync +XREC:DBG and --bench-load (RECSTART, GETS loop with wrap and cap, DBG polls, STAT/LS/DEL storm, RECSTOP)")
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory(prefix="test_bt_sync_xrec_") as t:
         td = Path(t)
         test_put_happy_and_late_replies(td)
         test_put_errors(td)
         test_get_burst_eof(td)
+    test_bench_dbg_and_load()
     print("bt_sync +XREC transfer tests: OK")
     return 0
 

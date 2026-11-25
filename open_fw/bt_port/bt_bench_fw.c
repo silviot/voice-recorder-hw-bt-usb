@@ -12,6 +12,7 @@
 #include "bt_ctrl.h"
 #include "bt_xrec_bluedroid.h"
 #include "bt_hp.h"
+#include "openfw_bench_meas.h"
 #include <string.h>
 
 /* SRAM_HI (.bss_hi, zeroed at boot) like hci_probe.c's log copy: .bt_bss would come out of the RTOS heap region. */
@@ -23,7 +24,7 @@ static exfat_writer_t s_writer BENCH_HI;
 static bt_bench_cap_t s_cap BENCH_HI;
 static bt_bench_run_t s_run BENCH_HI;
 static bt_bench_cfg_t s_cfg BENCH_HI;
-static char s_line[160] BENCH_HI;
+static char s_line[512] BENCH_HI;        /* "BENCH meas" carries ~360 B of fields */
 static uint32_t s_cap_ui[(sizeof(bt_hp_ui_t) + 3u) / 4u] BENCH_HI;   /* bt_hp_get_ui() scratch (off the stack) */
 static uint32_t s_ll;
 static uint8_t s_armed;          /* request taken this boot, run not ended yet */
@@ -130,6 +131,153 @@ static void drain(void)
     bt_bench_cap_drain(&s_cap, g_openfw_log.buf, OPENFW_LOG_SIZE, g_openfw_log.write_idx);
 }
 
+/* ---- per-task CPU over a window (run-time stats clock: us_timer, FreeRTOSConfig.h) ----
+ * FreeRTOS charges an ISR to the task it interrupted. A window's first take only sets the baseline (dt = 0). */
+#define BENCH_TASKS_MAX 16u
+typedef struct {
+    struct {
+        uint32_t num, rt;
+    } prev[BENCH_TASKS_MAX];
+    uint32_t n;
+    uint32_t prev_us;
+} cpu_win_t;
+
+static TaskStatus_t s_ts[BENCH_TASKS_MAX] BENCH_HI;   /* app task only (both runs), off the stack */
+static uint32_t s_td[BENCH_TASKS_MAX] BENCH_HI;
+
+typedef struct {
+    UBaseType_t n;          /* tasks in s_ts / s_td */
+    uint32_t dt;            /* window length, us (0 = baseline only) */
+    uint32_t sum;           /* run time charged to the tasks in the window */
+    uint32_t idle, btc, app;
+} cpu_take_t;
+
+static void cpu_win_take(cpu_win_t *w, cpu_take_t *o)
+{
+    o->n = uxTaskGetSystemState(s_ts, BENCH_TASKS_MAX, NULL);
+    uint32_t now = (uint32_t)us_timer_now();
+    o->dt = w->prev_us != 0u ? now - w->prev_us : 0u;
+    o->sum = o->idle = o->btc = o->app = 0u;
+    for (UBaseType_t i = 0; i < o->n; i++) {
+        uint32_t rt = (uint32_t)s_ts[i].ulRunTimeCounter, prev = rt;
+        for (uint32_t j = 0u; j < w->n; j++) {
+            if (w->prev[j].num == (uint32_t)s_ts[i].xTaskNumber) {
+                prev = w->prev[j].rt;
+                break;
+            }
+        }
+        s_td[i] = rt - prev;
+        o->sum += s_td[i];
+        if (s_ts[i].xHandle == xTaskGetIdleTaskHandle()) {
+            o->idle = s_td[i];
+        } else if (strcmp(s_ts[i].pcTaskName, "BTC_TASK") == 0) {
+            o->btc = s_td[i];
+        } else if (strcmp(s_ts[i].pcTaskName, "app") == 0) {
+            o->app = s_td[i];
+        }
+    }
+    w->n = 0u;
+    for (UBaseType_t i = 0; i < o->n && i < BENCH_TASKS_MAX; i++) {
+        w->prev[i].num = (uint32_t)s_ts[i].xTaskNumber;
+        w->prev[i].rt = (uint32_t)s_ts[i].ulRunTimeCounter;
+        w->n++;
+    }
+    w->prev_us = now != 0u ? now : 1u;
+}
+
+static uint32_t pm_of(uint32_t v, uint32_t dt)
+{
+    return dt != 0u ? (uint32_t)((uint64_t)v * 1000u / dt) : 0u;
+}
+
+static void lk_task(const char *name, uint32_t v)
+{
+    char k[9];
+    uint32_t i = 0u;
+    for (; i < 8u && name[i] != '\0'; i++) {
+        char c = name[i];
+        k[i] = (c == ' ' || c == '=') ? '_' : c;
+    }
+    k[i] = '\0';
+    lku(k, v);
+}
+
+/* "BENCH <tag> name=pm ... other=pm" (continued as "BENCH <tag>+") for the window just taken. */
+static void log_tasks(const char *tag, const cpu_take_t *c)
+{
+    lbegin(tag);
+    for (UBaseType_t i = 0; i < c->n; i++) {
+        if (s_ll > 120u) {
+            lemit();
+            lbegin(tag);
+            lc('+');
+        }
+        lk_task(s_ts[i].pcTaskName, pm_of(s_td[i], c->dt));
+    }
+    uint32_t sum_pm = pm_of(c->sum, c->dt);
+    lku("other", sum_pm < 1000u ? 1000u - sum_pm : 0u);
+    lemit();
+}
+
+/* ---- phone-mode measurement (docs/BT_SYNC_SPEED_AND_RECORDING.md F0) ----
+ * Every second: a 1 s CPU window into g_bench_meas (the +XREC:DBG idle/app/btc values and the recording's lowest
+ * idle). With every status line (30 s): "BENCH cpu" + "BENCH tasks" over the 30 s and "BENCH meas" (the recording
+ * counters, live). */
+#define BENCH_CPU1_MS 1000u
+static cpu_win_t s_win1 BENCH_HI, s_win30 BENCH_HI;
+static uint32_t s_cpu1_next BENCH_HI;
+
+/* Append the F0 fields to the line being built (formatted in place: no second buffer in the tight .bss_hi). */
+static void lmeas_rec(const bench_meas_rec_t *r)
+{
+    s_ll += bench_meas_format_rec(r, ' ', &s_line[s_ll], (uint32_t)(sizeof(s_line) - 2u - s_ll));
+}
+
+static void lmeas_cpu(void)
+{
+    s_ll += bench_meas_format_cpu(&g_bench_meas, ' ', &s_line[s_ll], (uint32_t)(sizeof(s_line) - 2u - s_ll));
+}
+
+static void meas_cpu1(uint32_t now)
+{
+    if ((int32_t)(now - s_cpu1_next) < 0) {
+        return;
+    }
+    s_cpu1_next = now + BENCH_CPU1_MS;
+    cpu_take_t c;
+    cpu_win_take(&s_win1, &c);
+    if (c.dt != 0u) {
+        bench_meas_cpu(&g_bench_meas, pm_of(c.idle, c.dt), pm_of(c.app, c.dt), pm_of(c.btc, c.dt), c.dt / 1000u);
+    }
+}
+
+static void log_meas(void)
+{
+    lbegin("meas ");
+    lmeas_rec(&g_bench_meas.cur);
+    lemit();
+    lbegin("meas+ ");
+    lmeas_cpu();
+    lemit();
+}
+
+static void log_cpu30(void)
+{
+    cpu_take_t c;
+    cpu_win_take(&s_win30, &c);
+    if (c.dt == 0u) {
+        return;
+    }
+    lbegin("cpu");
+    lku("ms", c.dt / 1000u);
+    lku("idle_pm", pm_of(c.idle, c.dt));
+    lku("app_pm", pm_of(c.app, c.dt));
+    lku("btc_pm", pm_of(c.btc, c.dt));
+    lku("rec", g_bench_meas.cur.active);
+    lemit();
+    log_tasks("tasks", &c);
+}
+
 static void log_status(uint32_t el_ms)
 {
     bt_status_t st;
@@ -153,6 +301,8 @@ static void log_status(uint32_t el_ms)
     (void)bt_ctrl_stats_format(cl, (uint16_t)sizeof(cl));
     lbegin(cl);                              /* "BENCH BT ctrl stats unk=.. short=.. ...": bt_ctrl's silent drops */
     lemit();
+    log_cpu30();
+    log_meas();
 }
 
 static void act(uint32_t a, uint32_t now)
@@ -283,6 +433,7 @@ void bt_bench_hp_begin(void)
     }
     s_in = 1u;
     memset(&s_hp, 0, sizeof(s_hp));
+    s_win30.prev_us = 0u;                    /* the first CPU window of the run is a baseline */
     uint32_t now = millis();
     bt_bench_run_begin(&s_run, &s_cfg, now);
     s_run.next_pair = UINT32_MAX;
@@ -319,56 +470,19 @@ static void hp_found_log(void)
  * busy ISRs here are SysTick and the IRQ 26 top half, which is in RAM and short), then other = 1000 - sum (time not
  * charged to any task: counter wrap or a task created/deleted in the interval).
  * Silicon 2026-11-25: the player stage ran BTC at ~46 % with ~45 % of the CPU outside BTC and the app. */
-#define HPB_TASKS_MAX 16u
-static struct {
-    uint32_t num, rt;
-} s_task_prev[HPB_TASKS_MAX] BENCH_HI;
-static uint32_t s_task_prev_n BENCH_HI;
-
-static void lk_task(const char *name, uint32_t v)
-{
-    char k[9];
-    uint32_t i = 0u;
-    for (; i < 8u && name[i] != '\0'; i++) {
-        char c = name[i];
-        k[i] = (c == ' ' || c == '=') ? '_' : c;
-    }
-    k[i] = '\0';
-    lku(k, v);
-}
 
 static void hp_cpu_stats(const hp_tx_t *t)
 {
-    TaskStatus_t ts[HPB_TASKS_MAX];
-    UBaseType_t n = uxTaskGetSystemState(ts, HPB_TASKS_MAX, NULL);
-    uint32_t now = (uint32_t)us_timer_now();
-    uint32_t dt = now - s_hp.prev_us;
-    uint32_t idle = 0u, btc = 0u, app = 0u, sum = 0u;
-    uint32_t d[HPB_TASKS_MAX];
-    for (UBaseType_t i = 0; i < n; i++) {
-        uint32_t rt = (uint32_t)ts[i].ulRunTimeCounter, prev = rt;
-        for (uint32_t j = 0u; j < s_task_prev_n; j++) {
-            if (s_task_prev[j].num == (uint32_t)ts[i].xTaskNumber) {
-                prev = s_task_prev[j].rt;
-                break;
-            }
-        }
-        d[i] = rt - prev;
-        sum += d[i];
-        if (ts[i].xHandle == xTaskGetIdleTaskHandle()) {
-            idle = d[i];
-        } else if (strcmp(ts[i].pcTaskName, "BTC_TASK") == 0) {
-            btc = d[i];
-        } else if (strcmp(ts[i].pcTaskName, "app") == 0) {
-            app = d[i];
-        }
-    }
+    cpu_take_t c;
+    cpu_win_take(&s_win30, &c);              /* a headphones run never runs the phone-mode windows: shared */
+    UBaseType_t n = c.n;
+    uint32_t dt = c.dt, idle = c.idle, btc = c.btc, app = c.app;   /* dt = 0: first window of the run */
     bt_rom_real_diag_t rd;
     bt_rom_real_diag(&rd);
     bt_ctrl_rtos_stats_t cs;
     bt_ctrl_rtos_stats(&cs);
     uint32_t sbc = t->st.frames_sbc - s_hp.prev_sbc, ui_fr = g_ui_frames;
-    if (s_hp.prev_us != 0u && dt != 0u) {
+    if (dt != 0u) {
         lbegin("hp cpu");
         lku("ms", dt / 1000u);
         lku("idle_pm", (uint32_t)((uint64_t)idle * 1000u / dt));
@@ -382,17 +496,7 @@ static void hp_cpu_stats(const hp_tx_t *t)
         lku("ui_us", g_ui_last_render_us);
         lku("xip", g_openfw_xip_mode);
         lemit();
-        lbegin("hp tasks");
-        for (UBaseType_t i = 0; i < n; i++) {
-            if (s_ll > 120u) {
-                lemit();
-                lbegin("hp tasks+");
-            }
-            lk_task(ts[i].pcTaskName, (uint32_t)((uint64_t)d[i] * 1000u / dt));
-        }
-        uint32_t sum_pm = (uint32_t)((uint64_t)sum * 1000u / dt);
-        lku("other", sum_pm < 1000u ? 1000u - sum_pm : 0u);
-        lemit();
+        log_tasks("hp tasks", &c);
         /* bt_ctrl split: its task time = ROM ISR work (irq_service) + ROM kernel dispatches (incl. TASK_HCI upcalls)
          * + our glue (the rest: bottom half, rings, ACL/event paths, FreeRTOS calls). us per interval, per run. */
         uint32_t runs = cs.ctrl_runs - s_hp.prev_runs, run_us = cs.ctrl_run_total_us - s_hp.prev_run_us;
@@ -417,18 +521,11 @@ static void hp_cpu_stats(const hp_tx_t *t)
                     lemit();
                     lbegin("hp stack+");
                 }
-                lku(ts[i].pcTaskName, (uint32_t)ts[i].usStackHighWaterMark);
+                lku(s_ts[i].pcTaskName, (uint32_t)s_ts[i].usStackHighWaterMark);
             }
             lemit();
         }
     }
-    s_task_prev_n = 0u;
-    for (UBaseType_t i = 0; i < n && i < HPB_TASKS_MAX; i++) {
-        s_task_prev[i].num = (uint32_t)ts[i].xTaskNumber;
-        s_task_prev[i].rt = (uint32_t)ts[i].ulRunTimeCounter;
-        s_task_prev_n++;
-    }
-    s_hp.prev_us = now;
     s_hp.prev_late = t->st.tick_late;
     s_hp.prev_ticks = t->st.ticks;
     s_hp.prev_sbc = t->st.frames_sbc;
@@ -786,6 +883,12 @@ void bt_bench_begin(void)
     }
     uint32_t now = millis();
     bt_bench_run_begin(&s_run, &s_cfg, now);
+    s_win1.prev_us = 0u;                     /* CPU windows start with this run (baselines) */
+    s_win30.prev_us = 0u;
+    s_cpu1_next = now;
+    meas_cpu1(now);
+    cpu_take_t c;
+    cpu_win_take(&s_win30, &c);
     act(bt_bench_run_tick(&s_run, now), now);
     drain();
 }
@@ -795,6 +898,7 @@ int bt_bench_tick(uint32_t now_ms)
     if (!s_in) {
         return 0;
     }
+    meas_cpu1(now_ms);
     uint32_t a = bt_bench_run_tick(&s_run, now_ms);
     if (a & BT_BENCH_ACT_EXIT) {
         if (!s_why_time) {
@@ -811,6 +915,19 @@ int bt_bench_tick(uint32_t now_ms)
     act(a, now_ms);
     drain();
     return 0;
+}
+
+#define BENCH_TAIL_RECS 2u                   /* finished recordings in the BTBENCH.LOG trailer */
+static char s_tail[1408] BENCH_HI;           /* LOGCAP + final + live + 2 recordings (<= ~390 B each) */
+
+/* Append the line builder's content (one whole line) to s_tail at tl; a line that does not fit is dropped. */
+static uint32_t tail_add(uint32_t tl)
+{
+    if (tl + s_ll <= sizeof(s_tail)) {
+        memcpy(&s_tail[tl], s_line, s_ll);
+        tl += s_ll;
+    }
+    return tl;
 }
 
 int bt_bench_end(exfat_vol_t *vol, int sd_mounted)
@@ -835,7 +952,9 @@ int bt_bench_end(exfat_vol_t *vol, int sd_mounted)
     s_armed = 0u;
     s_in = 0u;
 
-    char tail[80];
+    /* The file's trailer: the capture counters, then the F0 measurement summary (the capture keeps the head of a long
+     * run, so these always survive): "BENCH final" (GETS, last CPU window), the running recording (if any) and the
+     * latest finished ones, newest first ("BENCH final rec i=<n|live> <fields>"). */
     uint32_t tl = 0u;
     s_ll = 0u;                               /* reuse the line builder for the file's trailer */
     ls("BENCH LOGCAP");
@@ -843,10 +962,36 @@ int bt_bench_end(exfat_vol_t *vol, int sd_mounted)
     lku("lost", s_cap.lost);
     lku("resets", s_cap.resets);
     lc('\n');
-    for (; tl < s_ll && tl < sizeof(tail); tl++) {
-        tail[tl] = s_line[tl];
+    tl = tail_add(tl);
+    s_ll = 0u;
+    ls("BENCH final ");
+    lmeas_cpu();
+    lku("recs", g_bench_meas.hist_n);
+    lc('\n');
+    tl = tail_add(tl);
+    for (uint32_t i = 0u; i <= BENCH_TAIL_RECS; i++) {
+        const bench_meas_rec_t *rec;
+        s_ll = 0u;
+        ls("BENCH final rec i=");
+        if (i == 0u) {
+            if (!g_bench_meas.cur.active) {
+                continue;
+            }
+            rec = &g_bench_meas.cur;
+            ls("live ");
+        } else {
+            rec = bench_meas_hist(&g_bench_meas, i - 1u);
+            if (rec == NULL) {
+                break;
+            }
+            lu(i - 1u);
+            lc(' ');
+        }
+        lmeas_rec(rec);
+        lc('\n');
+        tl = tail_add(tl);
     }
-    int r = bt_bench_log_save(vol, sd_mounted, s_cap.buf, s_cap.len, tail, tl, &s_writer);
+    int r = bt_bench_log_save(vol, sd_mounted, s_cap.buf, s_cap.len, s_tail, tl, &s_writer);
     lbegin("LOGFILE");
     lks("file", BT_BENCH_LOG_FILE);
     lks("st", r == 0 ? "OK" : "FAIL");

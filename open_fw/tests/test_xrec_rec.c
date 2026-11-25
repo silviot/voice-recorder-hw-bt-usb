@@ -7,6 +7,9 @@
  * payload is discarded unparsed; only for an existing <stem>.wav (NOENT), DEL of a recording takes its sidecar;
  * CRC mismatch, idempotent PUTEND, SDIO failure mid-upload, power loss mid-upload (checkpointed temp is freed).
  *
+ * Built a second time with -DOPENFW_BT_BENCH_IMAGE=1 (+ src/bench_meas.c): section 10 checks the bench-only +XREC:DBG
+ * reply and the GETS byte count (docs/BT_SYNC_SPEED_AND_RECORDING.md F0).
+ *
  * Usage: test_xrec_rec <exfat image>
  * SPDX-License-Identifier: MIT
  */
@@ -18,6 +21,7 @@
 #include "openfw_crypto.h"
 #include "openfw_fs.h"
 #include "openfw_xrec.h"
+#include "openfw_bench_meas.h"
 
 static char     g_out[16384];
 static uint32_t g_out_len;
@@ -554,6 +558,41 @@ int main(int argc, char **argv)
         authenticate();
         printf("xrec transfer status (BT screen) tests: OK\n");
     }
+
+#if OPENFW_BENCH_MEAS
+    /* 10. Bench images: +XREC:DBG (authenticated) and the GETS payload count. */
+    {
+        bench_meas_reset(&g_bench_meas);
+        static uint8_t gb[1500];
+        fill(gb, sizeof(gb), 0x77u);
+        make_wav("DBG_GETS.wav", gb, sizeof(gb));
+        bench_meas_rec_start(&g_bench_meas, "REC_0042.wav", 1u, 20u, 3u, 0u, 1000u);
+        cmd("+XREC:GETS,0,1500,640,DBG_GETS.wav");          /* 640 + 640 + 220 */
+        assert(g_bench_meas.gets_b_total == 1500u && g_bench_meas.gets_frames_total == 3u &&
+               g_bench_meas.cur.gets_b == 1500u);
+        const char *r = cmd("+XREC:DBG");
+        assert(strncmp(r, "+XREC:DBG,LIVE,seq=1,file=REC_0042.wav,rec=1,ch=1,gain=20,dsp=3,vor=0,", 70) == 0);
+        assert(strstr(r, ",gets_b=1500,") != NULL && strstr(r, ",gets_tot=1500,gets_fr=3,idle_pm=-,") != NULL);
+        assert(strstr(r, ",acct=0,") != NULL && strstr(r, ",idle_min_pm=-,") != NULL);
+        size_t n = strlen(r);
+        assert(n <= XREC_REPLY_MAX && strcmp(&r[n - 2], "\r\n") == 0 && strchr(r, '\n') == &r[n - 1]);
+        assert(strcmp(cmd("+XREC:DBG,REC,0"), "+XREC:ERR,NOENT\r\n") == 0);   /* nothing finished yet */
+        bench_meas_capture_end(&g_bench_meas, 2000u);
+        bench_meas_rec_stop(&g_bench_meas, 0u, 0u);
+        r = cmd("+XREC:DBG,REC,0");
+        assert(strncmp(r, "+XREC:DBG,REC,0,seq=1,file=REC_0042.wav,rec=0,", 46) == 0);
+        assert(strstr(r, "gets_tot") == NULL && strstr(r, ",t_ms=1,") != NULL);
+        assert(strcmp(cmd("+XREC:DBG,REC,1"), "+XREC:ERR,NOENT\r\n") == 0);
+        assert(strcmp(cmd("+XREC:DBG,REC,x"), "+XREC:ERR,ARGS\r\n") == 0);
+        assert(strcmp(cmd("+XREC:DBG,REC,0,1"), "+XREC:ERR,ARGS\r\n") == 0);
+        assert(strcmp(cmd("+XREC:DBG,FOO"), "+XREC:ERR,ARGS\r\n") == 0);
+        assert(strcmp(cmd("+XREC:DBGX"), "+XREC:ERR,CMD\r\n") == 0);
+        xrec_on_disconnect(&g_x);                            /* a new link: DBG needs AUTH like every data command */
+        assert(strcmp(cmd("+XREC:DBG"), "+XREC:ERR,LOCKED\r\n") == 0);
+        authenticate();
+        printf("xrec bench DBG / GETS count tests: OK\n");
+    }
+#endif
 
     /* final LS: recordings + sidecars, no temps */
     {
