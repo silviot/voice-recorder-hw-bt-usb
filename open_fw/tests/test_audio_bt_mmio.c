@@ -20,6 +20,64 @@
 #include "audio_dsp.h"
 #include "openfw_fs.h"
 #include "openfw_wav.h"
+#include "openfw_bench_meas.h"
+
+#if OPENFW_BENCH_MEAS
+openfw_log_t g_openfw_log;
+static uint32_t g_irq_save_depth;
+static uint32_t g_rtos_crit_depth;
+static uint32_t g_rtos_crit_enters;
+static uint32_t g_irq_save_in_log;
+static uint32_t g_rtos_crit_in_log;
+
+uint32_t openfw_host_irq_save(void)
+{
+    return g_irq_save_depth++;
+}
+
+void openfw_host_irq_restore(uint32_t pm)
+{
+    (void)pm;
+    assert(g_irq_save_depth > 0u);
+    g_irq_save_depth--;
+}
+
+void openfw_host_rtos_crit_enter(void)
+{
+    g_rtos_crit_depth++;
+    g_rtos_crit_enters++;
+}
+
+void openfw_host_rtos_crit_exit(void)
+{
+    assert(g_rtos_crit_depth > 0u);
+    g_rtos_crit_depth--;
+}
+
+void openfw_log_putc(char c)
+{
+    if (g_irq_save_depth > 0u) {
+        g_irq_save_in_log++;
+    }
+    if (g_rtos_crit_depth > 0u) {
+        g_rtos_crit_in_log++;
+    }
+    if (g_openfw_log.magic != OPENFW_LOG_MAGIC || g_openfw_log.size != OPENFW_LOG_SIZE) {
+        g_openfw_log.magic     = OPENFW_LOG_MAGIC;
+        g_openfw_log.size      = OPENFW_LOG_SIZE;
+        g_openfw_log.write_idx = 0u;
+    }
+    g_openfw_log.buf[g_openfw_log.write_idx & (OPENFW_LOG_SIZE - 1u)] = c;
+    g_openfw_log.write_idx++;
+}
+
+void openfw_log_puts(const char *s)
+{
+    while (s && *s != '\0') {
+        openfw_log_putc(*s++);
+    }
+}
+#endif
 
 extern void DMAC_CH1_IRQHandler(void);
 
@@ -809,6 +867,50 @@ static void test_recorder(const char *exfat_img_path)
     /* Restore clean snapshot for fsck.exfat validation */
     memcpy(g_soc.sd_buf, sd_clean, (size_t)sz);
     free(sd_clean);
+
+#if OPENFW_BENCH_MEAS
+    /* Bench measurement hooks + AGENTS.md critical-section invariant:
+     * bm_log_rec() MUST use FreeRTOS BASEPRI (taskENTER_CRITICAL) rather than
+     * OPENFW_IRQ_SAVE (PRIMASK), so priority-0 audio DMAC IRQs are never masked
+     * across ~450-byte log-ring pushes. */
+    assert(exfat_mount(&vol, &dev) == 0);
+    bench_meas_reset(&g_bench_meas);
+    memset(&g_openfw_log, 0, sizeof(g_openfw_log));
+    g_openfw_log.magic = OPENFW_LOG_MAGIC;
+    g_openfw_log.size  = OPENFW_LOG_SIZE;
+    /* Simulate another task mid-line in g_openfw_log */
+    g_openfw_log.buf[0] = 'X';
+    g_openfw_log.write_idx = 1u;
+    g_irq_save_depth   = 0u;
+    g_rtos_crit_depth  = 0u;
+    g_rtos_crit_enters = 0u;
+    g_irq_save_in_log  = 0u;
+    g_rtos_crit_in_log = 0u;
+
+    recorder_set_gain(20u);
+    recorder_set_dsp_profile(AUDIO_DSP_BYPASS);
+    recorder_set_channels(1u);
+    recorder_set_vor(0);
+    g_soc.us_time = 1000000ull;
+    assert(recorder_start(&vol, 1) == 0);
+    for (uint32_t f = 0u; f < 4u; f++) {
+        g_soc.us_time = 1000000ull + (uint64_t)(f + 1u) * 128000ull;
+        sim_dma_deliver_frame(100, 4000, NULL);
+        g_soc.us_time += 500ull;
+        recorder_poll();
+    }
+    g_soc.us_time += 20000ull;
+    assert(recorder_stop() == 0);
+    assert(g_irq_save_depth == 0u && g_rtos_crit_depth == 0u);
+    assert(g_irq_save_in_log == 0u);   /* PRIMASK never held during bm_log_rec() */
+    assert(g_rtos_crit_enters == 1u && g_rtos_crit_in_log > 200u);
+    const bench_meas_rec_t *bmr = bench_meas_hist(&g_bench_meas, 0u);
+    assert(bmr != NULL && bmr->wav_frames == 4u * 2048u && bench_meas_acct(bmr) == 0);
+    assert(bmr->b_valid && bench_meas_bdrift(bmr) == 0);
+    assert(g_openfw_log.buf[0] == 'X' && g_openfw_log.buf[1] == '\n');
+    g_openfw_log.buf[g_openfw_log.write_idx] = '\0';
+    assert(strncmp(&g_openfw_log.buf[2], "BENCH rec seq=1 file=REC_0005.wav rec=0 ", 40) == 0);
+#endif
 
     /* Restore default recorder config */
     recorder_set_gain(20u);

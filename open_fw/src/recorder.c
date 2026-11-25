@@ -22,7 +22,21 @@
 #include "openfw_wav.h"
 #include "openfw_bench_meas.h"   /* F0 counters: bench images only (OPENFW_BENCH_MEAS), compiled out otherwise */
 #if OPENFW_BENCH_MEAS
-#include "sl6801_regs.h"         /* OPENFW_IRQ_SAVE for the whole "BENCH rec" line */
+#if defined(OPENFW_RTOS) && OPENFW_RTOS
+#ifdef OPENFW_HOST_MMIO
+#define REC_LOG_CRIT_ENTER() openfw_host_rtos_crit_enter()
+#define REC_LOG_CRIT_EXIT()  openfw_host_rtos_crit_exit()
+#else
+#include "FreeRTOS.h"            /* BASEPRI critical section (AGENTS.md: never mask priority-0 audio DMAC IRQs) */
+#include "task.h"
+#define REC_LOG_CRIT_ENTER() taskENTER_CRITICAL()
+#define REC_LOG_CRIT_EXIT()  taskEXIT_CRITICAL()
+#endif
+#else
+#include "sl6801_regs.h"
+#define REC_LOG_CRIT_ENTER() uint32_t pm; OPENFW_IRQ_SAVE(pm)
+#define REC_LOG_CRIT_EXIT()  OPENFW_IRQ_RESTORE(pm)
+#endif
 #endif
 
 /* Checkpoint every ~160 KiB (~5s mono / ~2.5s stereo) and after first 4 KiB */
@@ -478,7 +492,7 @@ void recorder_poll(void)
 
 #if OPENFW_BENCH_MEAS
 /* "BENCH rec ..." at every REC stop (docs/BT_HW_RESULTS.md, M2/M3 recipe; read with dev_cycle.py log or +XREC:LOG).
- * Pushed whole with interrupts off (no task switch: BT tasks log into the same ring), at a line start. */
+ * Pushed whole under FreeRTOS BASEPRI (no task switch or BT IRQ, priority-0 audio DMAC IRQs stay unmasked). */
 static void bm_log_rec(void)
 {
     static char bm_line[16u + BENCH_MEAS_LINE_MAX];
@@ -491,14 +505,13 @@ static void bm_log_rec(void)
     n += bench_meas_format_rec(&g_bench_meas.cur, ' ', &bm_line[n], (uint32_t)sizeof(bm_line) - n - 1u);
     bm_line[n++] = '\n';
     bm_line[n] = '\0';
-    uint32_t pm;
-    OPENFW_IRQ_SAVE(pm);
+    REC_LOG_CRIT_ENTER();
     uint32_t w = g_openfw_log.write_idx;
     if (w != 0u && g_openfw_log.buf[(w - 1u) & (OPENFW_LOG_SIZE - 1u)] != '\n') {
         openfw_log_putc('\n');   /* another task was mid-line */
     }
     openfw_log_puts(bm_line);
-    OPENFW_IRQ_RESTORE(pm);
+    REC_LOG_CRIT_EXIT();
 }
 #endif
 
