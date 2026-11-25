@@ -266,6 +266,28 @@ Seen in the trace, expected: `080D`, `0C37` (CC `0x01`) and `040F` (CS `0x01`) a
 (REJ rows); `ev=0x1B` Max Slots Change right after the Connection Complete. The first trace images also traced
 successful set-up CCs (`0C03`...`0C14`); the committed trace skips successful CCs outside link control.
 
+## Session 8 (2026-11-25): headphones audio captured on the laptop
+
+Image: bench `BT=1 BENCH=1 HP_GATES=1` from `integ/bt-all-local` `64d820e` (FIRM CRC `0xD52F`); laptop as sink
+(PipeWire 1.6.2, BlueZ 5.85). Capture: PipeWire creates `bluez_input.<addr>.N` only while the transport is
+`active` (after AVDTP START); `pw-record --target <node> -P '{ node.dont-reconnect = true }'` records it (without
+`dont-reconnect`, pw-record moves to the default source when the node goes away and records laptop audio).
+WirePlumber auto-links the node to the default sink; `pw-link -d` on those links keeps it off the speakers.
+
+| Run | Result |
+|---|---|
+| first boot of the new image (`player`, `hp_pick=last`) | **bond lost**: the stored key was not used (no `0411` before the SSP attempt, `ev=0x36 st=0x05`), `Just Works pairing refused` (no window: correct), retries 3/10/30 s; `bt_hp_bonds.bin` went from 152 to 43 B (empty store written). Previous boot ran the older image `0edcb61`. Cause not found (ring tail only); same-image reboots afterwards kept the bond (next rows). Open item |
+| `connect hp_addr hp_pair=1` (laptop bond removed first) | SSP Just Works accepted inside the window, `auth st=0 key=4`, `bt_hp_bonds.bin` 152 B |
+| `player hp_pick=last secs=70` | reconnect **with the stored key** (no pairing), link 171 ms, `connected` 3.4 s, plays `/cassini/cassini-final-moments.wav` (IMA ADPCM 16 kHz mono); BlueZ `fd(30) ready`; the run ends at `secs` (time-limit BACK works). Capture: audio present but **~42 dB below the source** and **`pads=5..17` per second** (packets with no real PCM) |
+| `tone hp_pick=last secs=40` | capture: continuous **1000 Hz** (zero-crossing count 992-1000 Hz), constant RMS for 31 s, no gaps; device `pkts` 47-55/s, `acked` 368-440, pads 0 |
+
+Findings:
+- **Level**: AVRCP `abs_vol=1` arrived ~1.3 s after the player set the PCM gain, so the gain stayed at `bt_vol` 64
+  (vol31 16, -24 dB) while the sink applied absolute volume 64 as well. Fixed in `ecc8b33` (the player re-applies
+  the gain when `bt_hp_abs_vol()` changes).
+- **Player starvation**: the tone path (same ring, resampler, SBC) has pads 0; the player stage has ~20 % padding
+  packets, i.e. audible gaps. Under investigation on `fix/hp-player-starve`.
+
 ## Exp 1 stages A and B: how to run
 
 Probe image for plan M5 Exp 1 stage A and stage B (step 4): `bt_ctrl` (plan M1) drives the real RW-BT ROM through
