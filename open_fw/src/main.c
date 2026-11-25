@@ -2256,6 +2256,142 @@ static void run_bt_choice(void)
         }
     }
 }
+
+/*
+ * When "BT" (AOUT_MODE_HEADPHONES) is selected as output and no headset stream
+ * is ready yet, automatically start headphones mode (if off) and connect to
+ * the remembered headset before entering the player.
+ * Returns 1 if playback should proceed, 0 if cancelled / failed / timed out /
+ * interrupted by the REC switch.
+ */
+static int hp_auto_connect_for_play(void)
+{
+    if (aout_get_mode() != AOUT_MODE_HEADPHONES || bt_hp_stream_ready()) {
+        return 1;
+    }
+
+    int started_here = !bt_hp_active();
+    uint32_t t0 = millis();
+    if (started_here) {
+        if (hp_start_session() != 0) {
+            if (g_ui.toast_msg[0] == '\0') {
+                ui_show_toast(ui_tr_bt(UI_BT_STR_HP_NOT_CONNECTED), UI_COL_AMBER, millis(), 2000u);
+            }
+            return 0;
+        }
+    }
+
+    bt_hp_ui_t u;
+    bt_hp_get_ui(&u);
+    uint32_t seen_seq = u.msg_seq;
+    int tried_connect = 0;
+    uint32_t last_ui = 0u;
+    uint8_t shown_phase = 0u; /* 1=Starting, 2=Connecting */
+
+    keys_ignore_held();
+    for (;;) {
+        wdt_feed();
+        bt_hp_poll();
+        recorder_poll();
+        if (keys_read_rec_switch()) {
+            g_ui.toast_msg[0] = '\0';
+            backlight_wake(millis());
+            return 0;
+        }
+
+        uint32_t now = millis();
+        if (bt_lowbatt_service(now)) {
+            return 0;
+        }
+
+        int show = ui_poll_power_button(g_ui_screen, &g_ui, now);
+        key_event_t kev;
+        while (keys_pop_event(&kev)) {
+            if (!show || !kev.pressed) {
+                continue;
+            }
+            backlight_wake(kev.t_ms);
+            if (kev.key == KEY_BACK) {
+                g_ui.toast_msg[0] = '\0';
+                keys_ignore_held();
+                if (started_here && !bt_hp_stream_ready()) {
+                    (void)bt_hp_stop();
+                }
+                return 0;
+            }
+        }
+
+        if (bt_hp_stream_ready()) {
+            bt_hp_get_ui(&u);
+            g_hp_msg_seen = u.msg_seq;
+            g_ui.toast_msg[0] = '\0';
+            keys_ignore_held();
+            return 1;
+        }
+
+        bt_hp_get_ui(&u);
+        if (u.state == BT_HP_ST_OFF || u.state == BT_HP_ST_FAULTED || u.state == BT_HP_ST_DEAD) {
+            ui_show_toast(ui_tr_bt(UI_BT_STR_HP_NOT_CONNECTED), UI_COL_AMBER, now, 2000u);
+            return 0;
+        }
+
+        if (u.state == BT_HP_ST_READY) {
+            if (!u.has_last && u.link == BT_HP_LINK_NONE) {
+                if (started_here) {
+                    (void)bt_hp_stop();
+                }
+                ui_show_toast(ui_tr_bt(UI_BT_STR_HP_NOT_CONNECTED), UI_COL_AMBER, now, 2000u);
+                return 0;
+            }
+            if (u.has_last && u.link == BT_HP_LINK_NONE && !tried_connect) {
+                tried_connect = 1;
+                if (bt_hp_connect_addr(u.last, 0) != 0) {
+                    ui_show_toast(ui_tr_bt(UI_BT_STR_CONNECT_FAILED), UI_COL_AMBER, now, 2000u);
+                    return 0;
+                }
+            }
+        }
+
+        if (u.msg_seq != seen_seq) {
+            seen_seq = u.msg_seq;
+            g_hp_msg_seen = seen_seq;
+            if (u.msg == BT_HP_MSG_CONNECT_FAIL || u.msg == BT_HP_MSG_PAIR_AGAIN ||
+                u.msg == BT_HP_MSG_UNSUPPORTED) {
+                const char *t = hp_msg_text(u.msg);
+                ui_show_toast(t[0] ? t : ui_tr_bt(UI_BT_STR_HP_NOT_CONNECTED), UI_COL_AMBER, now, 2000u);
+                return 0;
+            }
+        }
+
+        if ((uint32_t)(now - t0) >= BT_HP_CONNECT_TO_MS) {
+            ui_show_toast(ui_tr_bt(UI_BT_STR_CONNECT_FAILED), UI_COL_AMBER, now, 2000u);
+            return 0;
+        }
+
+        uint8_t phase = (u.state == BT_HP_ST_READY) ? 2u : 1u;
+        if (phase != shown_phase) {
+            shown_phase = phase;
+            ui_show_toast(ui_tr_bt(phase == 2u ? UI_BT_STR_CONNECTING : UI_BT_STR_STARTING),
+                          UI_COL_CYAN, now, BT_HP_CONNECT_TO_MS + 1000u);
+            last_ui = 0u;
+        }
+
+        if ((uint32_t)(now - last_ui) >= 200u || last_ui == 0u) {
+            last_ui = now;
+            pmu_poll_charge_manage();
+            backlight_update();
+            refresh_telemetry();
+            if (show && !g_screen_off) {
+                ui_render_screen(g_ui_screen, &g_ui);
+            }
+        }
+        if (!keys_event_pending() && !recorder_is_saving()) {
+            OPENFW_TASK_WAIT();
+        }
+    }
+}
+#else
+#define hp_auto_connect_for_play() 1
 #endif
 
 static void play_boot_animation(void)
@@ -2497,6 +2633,9 @@ static void apm_power_off(int screen)
 
 static void play_file_at_index(int start_idx)
 {
+    if (!hp_auto_connect_for_play()) {
+        return;
+    }
     int idx = start_idx;
     while (idx >= 0 && idx < g_ui.file_count && !g_files[idx].is_dir) {
         int prev_idx = idx - 1;
@@ -2589,6 +2728,9 @@ static void play_named_file(const char *dir, ui_file_entry_t *entry)
                 return;
             }
         }
+    }
+    if (!hp_auto_connect_for_play()) {
+        return;
     }
     g_ui_screen        = UI_SCR_PLAYER;
     g_ui.play_file     = *entry;
