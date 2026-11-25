@@ -387,6 +387,16 @@ toolchain** until step 9.
 7. **A2DP source + AVRCP**: sink abstraction; Exp 4.
 8. **UI/settings/i18n, WDT supervisor, power transitions**; Exp 5.
 9. **Parity + switch default**; legacy host code deleted in a separate commit.
+   **Parity (2026-11-25, DONE):** the Bluedroid image does everything the legacy host did and more, on silicon
+   (`docs/BT_HW_RESULTS.md`): phone mode (SSP numeric comparison with a session P-192 key; XREC PAIR / AUTH / LS /
+   byte-exact GETS from a laptop with `tools/bt_sync.py`, reconnect with stored keys, exit with a link up, sessions
+   4-5; confirm prompt accepted / rejected / timed out by a person at the device, session 6; an Android phone (Pixel 8)
+   pairing with the mismatched-public-key control and SSP auto-accept, session 9) and headphones mode (A2DP source to a
+   laptop sink, audio captured, sessions 7-8; a user headset at bitpool 53 in real time and the BT UI checks,
+   session 9). `BT ?= 1` is now the
+   default (`open_fw/Makefile`); `BT=0` stays a supported image without Bluetooth (CI builds it: no picolibc there);
+   `wasm` is pinned to the no-BT configuration; `test-qemu-rtos` is the RTOS-without-BT gate (`BT=0`). The legacy
+   host (`src/bt_hci.c`, `src/bt_spp.c`) is deleted in the following commit (log below).
 10. **Joint final review** (Codex + agy).
 
 ## 7. Verification strategy

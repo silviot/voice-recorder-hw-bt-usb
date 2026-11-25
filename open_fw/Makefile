@@ -1,7 +1,8 @@
 # Build system for Cassini OpenFW (standalone clean-room SL6801 firmware)
 #
 # Usage:
-#   make -C open_fw            # Compile & pack standalone open_fw FIRM partition
+#   make -C open_fw            # Compile & pack standalone open_fw FIRM partition (BT=1: Bluedroid, needs picolibc)
+#   make -C open_fw BT=0       # The same without Bluetooth (no picolibc / meson / ninja needed)
 #   make -C open_fw test-host  # Compile & run host unit tests (crypto, wav, exfat, LVGL UI)
 #   make -C open_fw update-up  # Also build 2 MB flash image + 0:\update.up (requires ../dumps/firmware_2M.bin)
 #   make -C open_fw clean      # Remove build artifacts
@@ -24,12 +25,13 @@ else
 BUILD_DIR ?= /tmp/sl6801_openfw
 endif
 
-# BT=1: Bluedroid host stack (docs/BLUETOOTH_BLUEDROID_PLAN.md); implies RTOS=1. Default 0 until parity.
-BT ?= 0
+# BT=1 (default since plan step 9, parity reached): Bluedroid host stack (docs/BLUETOOTH_BLUEDROID_PLAN.md); implies
+# RTOS=1 and builds picolibc once (tools/build_picolibc.sh: meson + ninja). BT=0: the supported image without Bluetooth.
+BT ?= 1
 ifeq ($(BT),1)
 override RTOS := 1
 endif
-# RTOS=1: run the app as a FreeRTOS task (prerequisite for Bluedroid). Default 0 until validated.
+# RTOS=1: run the app as a FreeRTOS task (prerequisite for Bluedroid; forced by BT=1). BT=0 images default to 0.
 RTOS ?= 0
 RTOS_SELFTEST ?= 0
 FREERTOS_DIR := third_party/freertos
@@ -137,7 +139,8 @@ LVGL_HOST_OBJS := $(patsubst $(LVGL_DIR)/%.c,$(BUILD_DIR)/lvgl_host/%.o,$(LVGL_S
 
 EEZ_SRCS  := src/ui/eez/ui.c src/ui/eez/screens.c src/ui/eez/styles.c src/ui/eez/images.c
 
-SRCS      := src/startup.c src/wdt_timer.c src/rtc.c src/uart.c src/pmu.c \
+# CORE_SRCS: every image (and, minus startup.c / bt_hci.c, the WASM build, which is pinned to the no-BT configuration).
+CORE_SRCS := src/startup.c src/wdt_timer.c src/rtc.c src/uart.c src/pmu.c \
              src/keys.c src/lcd_st7735s.c src/cpu1_ui.c src/ui_spectrogram.c \
              src/ui/ui_port.c src/ui/ui_theme.c src/ui/ui_fonts.c src/ui/ui_i18n.c src/ui/ui_screens.c \
              $(EEZ_SRCS) \
@@ -146,6 +149,7 @@ SRCS      := src/startup.c src/wdt_timer.c src/rtc.c src/uart.c src/pmu.c \
              src/xrec_proto.c src/bt_hci.c src/recorder.c src/player.c \
              src/exp_runner.c src/crypto.c src/wav.c src/cwx.c src/exfat.c \
              src/persist.c src/apmem.c src/hsprobe_log.c src/hsprobe.c src/main.c
+SRCS      := $(CORE_SRCS)
 ifeq ($(BT),1)
 SRCS      += src/audio_out.c   # output dispatch DAC / headset / both (include/audio_out.h; BT=0 aliases the DAC)
 SRCS      += src/ui/ui_i18n_bt.c   # BT UI strings, 18 languages (include/openfw_i18n_bt.h; not in the BT=0 image)
@@ -323,15 +327,16 @@ test-qemu: all update-up $(BUILD_DIR)/qemu_boot_stub.bin
 
 -include bt/host_tests.mk
 
-# FreeRTOS scheduler/primitives self-test + normal boot checks on the SL6801 QEMU model.
+# FreeRTOS scheduler/primitives self-test + normal boot checks on the SL6801 QEMU model, RTOS without Bluetooth (BT=0;
+# the BT=1 image has its own gate, test-qemu-bt).
 # Usage: make -C open_fw test-qemu-rtos   (needs tools/setup_qemu.sh + ../dumps/*)
 RTOS_QEMU_DIR ?= /tmp/sl6801_openfw_rtos_selftest
 test-qemu-rtos:
-	$(MAKE) update-up qemu-stub RTOS=1 RTOS_SELFTEST=1 BUILD_DIR=$(RTOS_QEMU_DIR)
+	$(MAKE) update-up qemu-stub BT=0 RTOS=1 RTOS_SELFTEST=1 BUILD_DIR=$(RTOS_QEMU_DIR)
 	python3 tools/run_qemu.py --elf $(RTOS_QEMU_DIR)/open_fw.elf --stub $(RTOS_QEMU_DIR)/qemu_boot_stub.bin \
 		--flash $(OUT_BIN) --skip-keys --png-out $(RTOS_QEMU_DIR)/qemu_lcd.png
 
-# Same gate for the BT=1 image (Bluedroid linked, not started yet: plan step 1).
+# Same gate for the BT=1 image (Bluedroid linked; BT is not started at boot).
 BT_QEMU_DIR ?= /tmp/sl6801_openfw_bt_selftest
 test-qemu-bt:
 	$(MAKE) update-up qemu-stub BT=1 RTOS_SELFTEST=1 BUILD_DIR=$(BT_QEMU_DIR)
@@ -377,7 +382,8 @@ WASM_CFLAGS    := --target=wasm32 -Os -Wall -Wextra -ffreestanding -fno-builtin 
                   -Iinclude -Isrc/ui -Isrc/ui/eez $(LVGL_INC) -I$(BUILD_DIR)
 WASM_LVGL_CFLAGS := --target=wasm32 -O2 -ffreestanding -fno-builtin -fno-stack-protector \
                     -DOPENFW_WASM=1 -Wno-unused-parameter -Wno-sign-compare -Iinclude $(LVGL_INC)
-WASM_SRCS      := $(filter-out src/startup.c src/bt_hci.c,$(SRCS)) wasm/wasm_platform.c
+# No-BT configuration whatever BT is (audio_out.c / ui_i18n_bt.c are BT=1 only; WASM_CFLAGS has no OPENFW_BT_BLUEDROID).
+WASM_SRCS      := $(filter-out src/startup.c src/bt_hci.c,$(CORE_SRCS)) wasm/wasm_platform.c
 WASM_OBJS      := $(patsubst %.c,$(WASM_BUILD_DIR)/%.o,$(WASM_SRCS))
 WASM_LVGL_OBJS := $(patsubst $(LVGL_DIR)/%.c,$(WASM_BUILD_DIR)/lvgl/%.o,$(LVGL_SRCS))
 

@@ -43,8 +43,10 @@ jobs:
       - name: Run OpenFW host tests under ASan + UBSan
         run: make -C open_fw test-host-san
 
-      - name: Build Cassini OpenFW ARM firmware
-        run: make -C open_fw
+      # BT=0 (no Bluetooth): the default BT=1 image needs picolibc (tools/build_picolibc.sh: meson + ninja), which
+      # this runner does not install. The BT=1 build and its host tests run in the local gates.
+      - name: Build Cassini OpenFW ARM firmware (BT=0)
+        run: make -C open_fw BT=0
 
       - name: Run Python host tool self-tests and safety regressions
         run: |

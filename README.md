@@ -113,11 +113,14 @@ flowchart LR
 
 ### 1. Build & Run the Automated Test Suite (No Hardware Needed)
 
-Requires `clang`, `lld`, `llvm` (`llvm-objcopy`), `cc`, `exfatprogs`, `python3`, and `python3-pil`. LVGL v9.2.2 is fetched automatically into `open_fw/third_party/lvgl/` on the first build:
+Requires `clang`, `lld`, `llvm` (`llvm-objcopy`), `cc`, `exfatprogs`, `python3`, and `python3-pil`. LVGL v9.2.2 is fetched automatically into `open_fw/third_party/lvgl/` on the first build. The default image includes Bluetooth (`BT=1`: Bluedroid phone and headphones modes) and also needs `meson` and `ninja`, which build picolibc once (`open_fw/tools/build_picolibc.sh`); `BT=0` builds the image without Bluetooth and without picolibc:
 
 ```bash
-# Build the ARM Cortex-M4F firmware and run all 6 host unit/MMIO/UI test suites
+# Build the ARM Cortex-M4F firmware (BT=1) and run all 6 host unit/MMIO/UI test suites
 make -C open_fw all test-host
+
+# The same image without Bluetooth (no meson / ninja / picolibc needed; what CI builds)
+make -C open_fw BT=0 all
 
 # Run with AddressSanitizer + UndefinedBehaviorSanitizer
 make -C open_fw test-host-san

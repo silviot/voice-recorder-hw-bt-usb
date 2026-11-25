@@ -38,9 +38,22 @@ open_fw/
 
 ## Build & Test Commands
 
+`BT=1` (the default since plan step 9) links the Bluedroid host stack (`bt_port/`, `third_party/bluedroid/`) and
+picolibc, built once by `tools/build_picolibc.sh` (needs `meson` + `ninja`); it forces `RTOS=1`. `BT=0` is the
+supported image without Bluetooth (no picolibc). The WebAssembly build always uses the no-BT configuration.
+
 ```bash
-# Build ARM Cortex-M4F FIRM binary (/tmp/sl6801_openfw/open_fw_firm.bin)
+# Build ARM Cortex-M4F FIRM binary (/tmp/sl6801_openfw/open_fw_firm.bin), Bluetooth included
 make -C open_fw all
+
+# The same without Bluetooth
+make -C open_fw BT=0 all
+
+# Bluetooth host tests (bt/host_tests.mk): port shims, XREC session, Bluedroid host harness
+make -C open_fw test-bt-port test-bt-xrec test-bt-host
+
+# Boot checks + RTOS self-test in QEMU: without BT (RTOS=1) and with BT
+make -C open_fw test-qemu-rtos test-qemu-bt
 
 # Run all 6 host unit, MMIO driver, UI render, DSP, and fsck.exfat tests
 make -C open_fw test-host
