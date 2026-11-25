@@ -76,7 +76,8 @@ typedef struct {
     uint8_t  win_open;                 /* pairing window (read by the Just Works hook) */
     uint8_t  win_bda[6];
     uint32_t win_deadline;
-    uint8_t  gate_ok;                  /* the M2.3 gate held at the last poll (the hook cannot call the platform) */
+    uint8_t  gate_ok;                  /* the M2.3 gate held at the last poll (the hook cannot call the platform; it
+                                          reads the gate's RNG latch live, bt_xrec_plat_rng_starved) */
     uint8_t  jw_accepted;              /* a Just Works pairing was accepted for win_bda */
     uint8_t  acl_valid;
     uint8_t  acl_bda[6];
@@ -555,7 +556,9 @@ int openfw_just_works_allowed(const uint8_t bda[6])
     bt_xrec_plat_lock();
     if (g != NULL && g->cb_open) {
         hp = true;
-        allow = (g->win_open && bda_eq(g->win_bda, bda) && g->gate_ok &&
+        /* gate_ok is the last poll's gate; the RNG latch is read live: the ROM may have drawn this pairing's nonce
+         * from a dry pool since that poll (STEP10 C3) */
+        allow = (g->win_open && bda_eq(g->win_bda, bda) && g->gate_ok && !bt_xrec_plat_rng_starved() &&
                  !time_reached(bt_xrec_plat_now_ms(), g->win_deadline)) ? 1 : 0;
         if (allow) {
             g->jw_accepted = 1u;
@@ -1509,8 +1512,8 @@ static void on_event(const ev_t *e)
     case EV_CFM_REQ: {
         /* a headset with a display (numeric comparison): accepted for the picked device inside the window only */
         bt_xrec_plat_lock();
-        bool ok = g->win_open && bda_eq(g->win_bda, e->bda) && g->gate_ok &&
-                  !time_reached(bt_xrec_plat_now_ms(), g->win_deadline);   /* as the Just Works hook (STEP10 A8) */
+        bool ok = g->win_open && bda_eq(g->win_bda, e->bda) && g->gate_ok && !bt_xrec_plat_rng_starved() &&
+                  !time_reached(bt_xrec_plat_now_ms(), g->win_deadline);   /* as the Just Works hook (STEP10 A8, C3) */
         if (ok) {
             g->jw_accepted = 1u;
         }
@@ -1532,7 +1535,7 @@ static void on_event(const ev_t *e)
             /* bench only (hp_pin=1): the ROM pairs as initiator with legacy PIN (silicon 2026-11-25); answer "0000"
              * for the picked device inside its window, with the same gate as the Just Works hook */
             bt_xrec_plat_lock();
-            bool ok = g->win_open && bda_eq(g->win_bda, e->bda) && g->gate_ok;
+            bool ok = g->win_open && bda_eq(g->win_bda, e->bda) && g->gate_ok && !bt_xrec_plat_rng_starved();
             if (ok) {
                 g->jw_accepted = 1u;
             }
