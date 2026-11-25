@@ -1261,10 +1261,16 @@ void xrec_on_disconnect(xrec_ctx_t *ctx)
     ctx->put_written        = 0u;
 }
 
-void xrec_on_rx(xrec_ctx_t *ctx, const uint8_t *data, uint16_t len)
+/* Flow control (review STEP10 A5): room for the worst-case reply before running anything that replies. */
+static int tx_room(const xrec_ctx_t *ctx)
+{
+    return !ctx->ops.tx_free || ctx->ops.tx_free(ctx->user) >= XREC_REPLY_MAX;
+}
+
+uint16_t xrec_on_rx(xrec_ctx_t *ctx, const uint8_t *data, uint16_t len)
 {
     if (!ctx || !data) {
-        return;
+        return len;
     }
     uint16_t i = 0u;
     while (i < len) {
@@ -1272,6 +1278,12 @@ void xrec_on_rx(xrec_ctx_t *ctx, const uint8_t *data, uint16_t len)
             uint16_t need  = (uint16_t)(ctx->put_len - ctx->put_got);
             uint16_t avail = (uint16_t)(len - i);
             uint16_t take  = (avail < need) ? avail : need;
+            if (take == need && !tx_room(ctx)) {
+                take = (uint16_t)(need - 1u);   /* hold the byte that completes the chunk (it sends the PUT reply) */
+                if (take == 0u) {
+                    return i;
+                }
+            }
             mem_copy(&ctx->xfer.put_buf[ctx->put_got], &data[i], take);
             ctx->put_got = (uint16_t)(ctx->put_got + take);
             i            = (uint16_t)(i + take);
@@ -1281,7 +1293,13 @@ void xrec_on_rx(xrec_ctx_t *ctx, const uint8_t *data, uint16_t len)
             }
             continue;
         }
-        char c = (char)data[i++];
+        char c = (char)data[i];
+        if (((c == '\r' && (ctx->rx_len > 0u || ctx->rx_overflow)) ||
+             (c == ':' && !ctx->rx_overflow && ctx->rx_len >= 14u && str_starts_with(ctx->rx_line, "+XREC:PUT,"))) &&
+            !tx_room(ctx)) {
+            return i;                           /* not consumed: offered again once the TX side drained */
+        }
+        i++;
         if (c == '\n') {
             continue;
         }
@@ -1312,6 +1330,7 @@ void xrec_on_rx(xrec_ctx_t *ctx, const uint8_t *data, uint16_t len)
             ctx->rx_overflow = 1u;
         }
     }
+    return i;
 }
 
 void xrec_poll(xrec_ctx_t *ctx)

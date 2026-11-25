@@ -464,6 +464,26 @@ static int mem_write_sectors(void *ctx, uint32_t lba, uint32_t count, const void
     return 0;
 }
 
+/* Review STEP10 C1 residual: cluster-heap reads (directory sectors; LBA >= 22 past the FAT at 16..19 and the bitmap
+ * at 21) fail once the first write went through (the entry-set clear in exfat_delete_file), so the following "does
+ * another entry share these clusters" scan hits an I/O error while FAT / bitmap I/O still works. */
+static int g_rd_fail_after_write, g_rd_fail_armed;
+static int armed_read_sectors(void *ctx, uint32_t lba, uint32_t count, void *buf)
+{
+    if (g_rd_fail_armed && lba >= 22u) {
+        return -1;
+    }
+    return mem_read_sectors(ctx, lba, count, buf);
+}
+static int armed_write_sectors(void *ctx, uint32_t lba, uint32_t count, const void *buf)
+{
+    int r = mem_write_sectors(ctx, lba, count, buf);
+    if (g_rd_fail_after_write) {
+        g_rd_fail_armed = 1;
+    }
+    return r;
+}
+
 static void write_exfat_entry_set(uint8_t *slot_base, const char *name,
                                   uint16_t attr, uint8_t no_fat_chain,
                                   uint32_t first_cluster, uint64_t size)
@@ -678,6 +698,30 @@ static void test_exfat_write(void)
     assert(exfat_create_file(&vol, "/record", "REC_REUSE.wav", &w) == 0);
     assert(exfat_write(&w, "OK", 2u) == 0);
     assert(exfat_close_file(&w) == 0);
+
+    /* C1 residual: the cluster-share scan fails with an I/O error -> the clusters stay allocated (leaked, not freed
+     * under a possibly live entry) and the delete reports the error. */
+    {
+        assert(exfat_create_file(&vol, "/record", "REC_IOE.wav", &w) == 0);
+        assert(exfat_write(&w, pcm, 1024u) == 0);
+        assert(exfat_close_file(&w) == 0);
+        exfat_entry_t ioe;
+        assert(exfat_find_path(&vol, "/record/REC_IOE.wav", &ioe) == 0 && ioe.first_cluster >= 2u);
+        uint32_t bit = ioe.first_cluster - 2u;
+        const uint8_t *bmp = &g_disk[21u * 512u];
+        assert((bmp[bit >> 3] >> (bit & 7u)) & 1u);
+        blkdev_t dev_ioe = { armed_read_sectors, armed_write_sectors, MEM_DISK_SECTORS, NULL };
+        exfat_vol_t vol_ioe = vol;
+        vol_ioe.dev = &dev_ioe;
+        g_rd_fail_after_write = 1;
+        int rc = exfat_delete_file(&vol_ioe, "/record", "REC_IOE.wav");
+        g_rd_fail_after_write = 0;
+        g_rd_fail_armed = 0;
+        assert(rc != 0);
+        assert((bmp[bit >> 3] >> (bit & 7u)) & 1u);   /* still allocated */
+        assert(exfat_find_path(&vol, "/record/REC_IOE.wav", &ioe) != 0);
+        printf("  [PASS] exfat_delete_file keeps clusters when the share scan fails (STEP10 C1)\n");
+    }
 
     exfat_vol_t vol2;
     assert(exfat_mount(&vol2, &dev) == 0);
@@ -2591,6 +2635,74 @@ static int xrec_count_write_sectors(void *ctx, uint32_t lba, uint32_t count, con
     return mem_write_sectors(NULL, lba, count, buf);
 }
 
+/* Review STEP10 A5: with ops.tx_free, xrec_on_rx() holds back any byte that would produce a reply (line end, PUT header
+ * ':', last PUT payload byte) while less than XREC_REPLY_MAX is free, and reports how much it consumed. */
+static uint32_t g_fc_room;
+static char     g_fc_out[256];
+static uint32_t g_fc_len;
+static int      g_fc_sends;
+static int fc_send(void *user, const uint8_t *data, uint16_t len)
+{
+    (void)user;
+    if (len > g_fc_room || g_fc_len + len > sizeof(g_fc_out)) {
+        return -1;
+    }
+    memcpy(&g_fc_out[g_fc_len], data, len);
+    g_fc_len += len;
+    g_fc_sends++;
+    return 0;
+}
+static uint32_t fc_tx_free(void *user)
+{
+    (void)user;
+    return g_fc_room;
+}
+static void test_xrec_flow_control(void)
+{
+    xrec_ops_t ops;
+    memset(&ops, 0, sizeof(ops));
+    ops.send    = fc_send;
+    ops.tx_free = fc_tx_free;
+    static xrec_ctx_t x;
+    xrec_init(&x, NULL, &ops, NULL);
+
+    /* two pipelined PINGs, TX full: the parser stops at the first '\r' and nothing is lost */
+    const char *two = "+XREC:PING\r\n+XREC:PING\r\n";
+    uint16_t n2 = (uint16_t)strlen(two);
+    g_fc_room = XREC_REPLY_MAX - 1u;
+    uint16_t used = xrec_on_rx(&x, (const uint8_t *)two, n2);
+    assert(used == 10u && g_fc_sends == 0);
+    assert(xrec_on_rx(&x, (const uint8_t *)two + used, (uint16_t)(n2 - used)) == 0u);
+    g_fc_room = 4096u;
+    used = (uint16_t)(used + xrec_on_rx(&x, (const uint8_t *)two + used, (uint16_t)(n2 - used)));
+    assert(used == n2 && g_fc_sends == 2);
+    assert(strstr(g_fc_out, "+XREC:PONG") != NULL && strstr(strstr(g_fc_out, "+XREC:PONG") + 1, "+XREC:PONG") != NULL);
+
+    /* PUT: held at the header ':' and at the byte that completes the chunk (both send a reply) */
+    g_fc_len = 0u;
+    g_fc_sends = 0;
+    const char *put = "+XREC:PUT,0,4,0,EXP:abcd";
+    uint16_t np = (uint16_t)strlen(put);
+    g_fc_room = 0u;
+    used = xrec_on_rx(&x, (const uint8_t *)put, np);
+    assert(used == np - 5u && put[used] == ':' && g_fc_sends == 0);
+    g_fc_room = 4096u;
+    used = (uint16_t)(used + xrec_on_rx(&x, (const uint8_t *)put + used, 4u));   /* ':' + "abc" */
+    assert(used == np - 1u && g_fc_sends == 0);
+    g_fc_room = 10u;
+    assert(xrec_on_rx(&x, (const uint8_t *)put + used, 1u) == 0u && g_fc_sends == 0);
+    g_fc_room = 4096u;
+    assert(xrec_on_rx(&x, (const uint8_t *)put + used, 1u) == 1u && g_fc_sends == 1);
+    assert(strncmp(g_fc_out, "+XREC:ERR,", 10) == 0);   /* unauthenticated PUT: LOCKED, but it was answered */
+
+    /* no tx_free op: everything is consumed as before */
+    ops.tx_free = NULL;
+    xrec_init(&x, NULL, &ops, NULL);
+    g_fc_room = 4096u;
+    assert(xrec_on_rx(&x, (const uint8_t *)two, n2) == n2);
+    printf("xrec flow control (A5): OK\n");
+}
+
 static void test_bt_spp_and_xrec(void)
 {
     /* Prepare clean exFAT volume in g_disk with /record/REC_0001.wav + EXACT960.wav + 8 extra files */
@@ -2687,7 +2799,7 @@ static void test_bt_spp_and_xrec(void)
         NULL, NULL, mock_xrec_on_ota,
         mock_xrec_exp_write, mock_xrec_exp_run, mock_xrec_read_log,
         mock_xrec_reset_log, mock_xrec_on_dfu, mock_xrec_audio_cfg,
-        mock_xrec_get_mtu, mock_xrec_file_busy,
+        mock_xrec_get_mtu, mock_xrec_file_busy, NULL,
     };
     xrec_init(&xrec, &vol, &ops, &sp);
     bt_spp_init(&spp, mock_spp_data_cb, &xrec);
@@ -3282,6 +3394,7 @@ int main(int argc, char **argv)
     test_usb_msc();
     test_usb_msc_async_pingpong();
     test_usb_msc_vendor_e0();
+    test_xrec_flow_control();
     test_bt_spp_and_xrec();
     printf("All open_fw host unit tests PASSED!\n");
     return 0;

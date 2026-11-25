@@ -14,6 +14,10 @@
 
 #define XREC_RX_LINE_MAX  192u
 #define XREC_MAX_CHUNK    640u
+/* Largest single reply one command line (or one completed PUT chunk) can produce: the LOG frame (header <= 64 B +
+ * 512 B payload). LS / GETS stream from xrec_poll() and retry on their own. Flow control (review STEP10 A5): with
+ * ops.tx_free set, xrec_on_rx() stops before any byte that would produce a reply while less than this is free. */
+#define XREC_REPLY_MAX    (64u + 512u)
 
 typedef struct {
     uint16_t voltage_mv;
@@ -62,6 +66,9 @@ typedef struct {
     uint16_t (*get_mtu)(void *user);
     /* DEL: non-zero when /record/<name> is the file being recorded (+XREC:ERR,BUSY; review STEP10 A1). Optional. */
     int      (*file_busy)(void *user, const char *name);
+    /* Bytes the transport accepts right now (send is all-or-nothing). Optional: NULL = no RX backpressure (a reply
+     * that does not fit is dropped). Review STEP10 A5. */
+    uint32_t (*tx_free)(void *user);
 } xrec_ops_t;
 
 typedef enum {
@@ -137,7 +144,10 @@ void xrec_set_bound_key(xrec_ctx_t *ctx, const uint8_t key[32]);
 void xrec_open_pairing(xrec_ctx_t *ctx, const char pin_6digits[6]);
 void xrec_close_pairing(xrec_ctx_t *ctx);
 void xrec_on_disconnect(xrec_ctx_t *ctx);
-void xrec_on_rx(xrec_ctx_t *ctx, const uint8_t *data, uint16_t len);
+/* Returns the bytes consumed. Fewer than len only when ops.tx_free reports less than XREC_REPLY_MAX free before a byte
+ * that completes a command (line end, PUT header ':' or the last PUT payload byte): the caller keeps the rest and
+ * hands it in again after the transport drained (xrec_poll() first). */
+uint16_t xrec_on_rx(xrec_ctx_t *ctx, const uint8_t *data, uint16_t len);
 void xrec_poll(xrec_ctx_t *ctx);
 
 #endif /* OPENFW_XREC_H */

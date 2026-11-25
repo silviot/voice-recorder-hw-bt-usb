@@ -1084,6 +1084,48 @@ static void t_congestion_partial(void)
     stop_ok();
 }
 
+/* Review STEP10 A5: commands pipelined in one SPP write while BTC is congested. The replies outgrow the 2 KiB TX ring;
+ * xrec_proto holds the next command back (xo_tx_free) instead of dropping its reply, and the WRITE / CONG events
+ * queued behind the held DATA still run, so the session drains and every reply arrives in order. */
+static void t_tx_flow_control(void)
+{
+    printf("[6b] XREC RX flow control: pipelined replies larger than the TX ring are not dropped (A5)\n");
+    mocks_reset();
+    bring_up();
+    pair_and_auth();
+    m_btc_cap = 1000u;                            /* >= BT_XREC_WRITE_MAX: every write fits once drained */
+    char burst[512];
+    int bl = 0;
+    for (int k = 0; k < 8; k++) {
+        bl += snprintf(&burst[bl], sizeof(burst) - (size_t)bl, "+XREC:LOG,%u,512\r\n", (unsigned)(k * 512));
+    }
+    rx(H1, burst);                                /* 8 x ~545 B of replies > 1000 B BTC + 2048 B TX ring */
+    bt_xrec_poll();
+    CHECK(dbg().tx_busy == 0u, "no reply refused by a full TX ring (tx_busy %u)", dbg().tx_busy);
+    CHECK(dbg().rx_held > 0u && dbg().rx_used > 0u, "commands held in the RX ring (held %u, rx_used %u)",
+          dbg().rx_held, dbg().rx_used);
+    for (int i = 0; i < 20 && (dbg().rx_used > 0u || dbg().tx_used > 0u || m_btc_used > 0u); i++) {
+        btc_drain(H1, m_btc_used, 100u);
+        bt_xrec_poll();
+    }
+    CHECK(dbg().tx_busy == 0u && dbg().rx_used == 0u && dbg().conn_open && !dbg().conn_closing,
+          "drained, link kept (tx_busy %u rx_used %u)", dbg().tx_busy, dbg().rx_used);
+    CHECK(check_log_frames(0u, 8) == 0, "all 8 LOG replies on the wire, in order, intact (%d)",
+          check_log_frames(0u, 8));
+    wire_clear();
+
+    /* a link that closes while commands are held: the held bytes are dropped, never parsed later */
+    rx(H1, burst);
+    bt_xrec_poll();
+    CHECK(dbg().rx_used > 0u, "held again (rx_used %u)", dbg().rx_used);
+    uint32_t dropped = dbg().rx_dropped;
+    spp_close(H1);
+    bt_xrec_poll();
+    CHECK(dbg().rx_used == 0u && dbg().rx_dropped > dropped && !dbg().conn_open,
+          "held bytes dropped on close (rx_used %u)", dbg().rx_used);
+    stop_ok();
+}
+
 static void t_write_error(void)
 {
     printf("[7] esp_spp_write error closes the link and clears XREC authorization\n");
@@ -2089,6 +2131,7 @@ int main(int argc, char **argv)
     t_bonded_reconnect();
     t_rx_overflow();
     t_congestion_partial();
+    t_tx_flow_control();
     t_write_error();
     t_disconnect_mid_transfer();
     t_stop_during_transfer();
