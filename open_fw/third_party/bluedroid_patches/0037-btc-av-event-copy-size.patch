@@ -1,0 +1,66 @@
+diff --git a/open_fw/third_party/bluedroid/host/bluedroid/btc/profile/std/a2dp/btc_av.c b/open_fw/third_party/bluedroid/host/bluedroid/btc/profile/std/a2dp/btc_av.c
+index 4c3e237..409096a 100644
+--- a/open_fw/third_party/bluedroid/host/bluedroid/btc/profile/std/a2dp/btc_av.c
++++ b/open_fw/third_party/bluedroid/host/bluedroid/btc/profile/std/a2dp/btc_av.c
+@@ -2344,11 +2344,61 @@ void btc_dispatch_sm_event(btc_av_sm_event_t event, void *p_data, int len)
+     btc_transfer_context(&msg, p_data, len, NULL, NULL);
+ }
+ 
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++/* open_fw patch 0037: BTA AV hands most events as a pointer to the event's own (smaller) struct cast to tBTA_AV *
++ * (bta_av_api_enable passes a 2-byte tBTA_AV_ENABLE on its stack); copying sizeof(tBTA_AV) from it is a stack
++ * over-read on every A2DP event (ASan, test_bt_host_hp hps). The size of the event's member is copied instead, into a
++ * zeroed full union, so later reads of the union stay defined. Same class as patch 0024 (SPP). */
++static size_t btc_av_evt_len(tBTA_AV_EVT event)
++{
++    switch (event) {
++    case BTA_AV_ENABLE_EVT:         return sizeof(((tBTA_AV *)0)->enable);
++    case BTA_AV_REGISTER_EVT:       return sizeof(((tBTA_AV *)0)->registr);
++    case BTA_AV_OPEN_EVT:           return sizeof(((tBTA_AV *)0)->open);
++    case BTA_AV_CLOSE_EVT:          return sizeof(((tBTA_AV *)0)->close);
++    case BTA_AV_START_EVT:          return sizeof(((tBTA_AV *)0)->start);
++    case BTA_AV_STOP_EVT:           return sizeof(((tBTA_AV *)0)->suspend);
++    case BTA_AV_PROTECT_REQ_EVT:    return sizeof(((tBTA_AV *)0)->protect_req);
++    case BTA_AV_PROTECT_RSP_EVT:    return sizeof(((tBTA_AV *)0)->protect_rsp);
++    case BTA_AV_RC_OPEN_EVT:        return sizeof(((tBTA_AV *)0)->rc_open);
++    case BTA_AV_RC_CLOSE_EVT:       return sizeof(((tBTA_AV *)0)->rc_close);
++    case BTA_AV_REMOTE_CMD_EVT:     return sizeof(((tBTA_AV *)0)->remote_cmd);
++    case BTA_AV_REMOTE_RSP_EVT:     return sizeof(((tBTA_AV *)0)->remote_rsp);
++    case BTA_AV_VENDOR_CMD_EVT:     return sizeof(((tBTA_AV *)0)->vendor_cmd);
++    case BTA_AV_VENDOR_RSP_EVT:     return sizeof(((tBTA_AV *)0)->vendor_rsp);
++    case BTA_AV_RECONFIG_EVT:       return sizeof(((tBTA_AV *)0)->reconfig);
++    case BTA_AV_SUSPEND_EVT:        return sizeof(((tBTA_AV *)0)->suspend);
++    case BTA_AV_PENDING_EVT:        return sizeof(((tBTA_AV *)0)->pend);
++    case BTA_AV_META_MSG_EVT:       return sizeof(((tBTA_AV *)0)->meta_msg);
++    case BTA_AV_REJECT_EVT:         return sizeof(((tBTA_AV *)0)->reject);
++    case BTA_AV_RC_FEAT_EVT:        return sizeof(((tBTA_AV *)0)->rc_feat);
++    case BTA_AV_SET_DELAY_VALUE_EVT:
++    case BTA_AV_GET_DELAY_VALUE_EVT: return sizeof(((tBTA_AV *)0)->delay);
++    case BTA_AV_SNK_PSC_CFG_EVT:    return sizeof(((tBTA_AV *)0)->psc);
++    case BTA_AV_SEP_REG_EVT:        return sizeof(((tBTA_AV *)0)->sep_reg);
++#if BTA_AV_CA_INCLUDED
++    case BTA_AV_CA_STATUS_EVT:      return sizeof(((tBTA_AV *)0)->ca_status);
++    case BTA_AV_CA_DATA_EVT:        return sizeof(((tBTA_AV *)0)->ca_data);
++#endif
++    case BTA_AV_INCOMING_CFG_EVT:   return sizeof(((tBTA_AV *)0)->incoming);
++    default:                        return sizeof(tBTA_AV);
++    }
++}
++#endif
++
+ static void bte_av_callback(tBTA_AV_EVT event, tBTA_AV *p_data)
+ {
+     bt_status_t stat;
+     btc_msg_t msg;
+     int arg_len = (int)sizeof(tBTA_AV);
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++    tBTA_AV ev;
++    if (p_data != NULL && event != BTA_AV_DISABLE_EVT) {
++        memset(&ev, 0, sizeof(ev));
++        memcpy(&ev, p_data, btc_av_evt_len(event));
++        p_data = &ev;
++    }
++#endif
+ 
+     /* DISABLE has no payload. btc_transfer_context accepts NULL only with length 0. */
+     if (event == BTA_AV_DISABLE_EVT) {
