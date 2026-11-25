@@ -273,6 +273,30 @@ int bt_xrec_plat_job_done(int *result)
 }
 int bt_xrec_plat_deadline_disarm(void) { return m_dl_latched; }
 void bt_xrec_plat_hard_path(uint32_t reason) { m_hard_reason = (int)reason; }
+/* F8 (fault while recording): the recorder state and the platform park */
+static int m_recording, m_park_calls, m_park_polls;
+static uint32_t m_park_reason;
+int bt_xrec_plat_rec_active(void) { return m_recording; }
+void bt_xrec_plat_park(uint32_t reason)
+{
+    m_park_calls++;
+    if (m_park_reason == 0u) {
+        m_park_reason = reason;
+    }
+}
+int bt_xrec_plat_park_poll(void)
+{
+    if (m_park_reason == 0u) {
+        return 0;
+    }
+    m_park_polls++;
+    if (m_recording) {
+        return 1;
+    }
+    m_hard_reason = (int)m_park_reason;   /* the deferred hard path (target: fault record + reboot) */
+    m_park_reason = 0u;
+    return 0;
+}
 void bt_xrec_plat_service(void) { m_service++; }
 void bt_xrec_plat_wait(void) { m_now += 1u; }
 uint32_t bt_xrec_plat_poll(void) { return (uint32_t)m_poll_fault; }
@@ -639,6 +663,8 @@ static void mocks_reset(void)
     m_up_calls = m_down_calls = m_hold_up = m_hold_down = m_up_result = m_down_result = m_job_kind = 0;
     m_job_pending = m_deinit_needed_at_down = 0;
     m_dl_latched = m_hard_reason = m_service = m_session_end = m_reboot_mode = m_saved_key = m_poll_fault = m_save_fail = 0;
+    m_recording = m_park_calls = m_park_polls = 0;
+    m_park_reason = 0u;
     m_peer_mtu = 660u;
     m_gap_cb = NULL;
     m_spp_cb = NULL;
@@ -1420,6 +1446,96 @@ static void t_hard_paths(void)
     CHECK(m_hard_reason == BT_XREC_FAULT_DOWN_FAIL, "teardown error -> hard path (%d)", m_hard_reason);
 }
 
+/* F8 (docs/BT_SYNC_SPEED_AND_RECORDING.md 2.5): a BT fault while a recording runs neither ends the recording (hard path
+ * = reboot) nor runs the recovery ladder (graceful teardown); BT is parked and the hard path waits for REC to stop. */
+static void t_fault_while_recording(void)
+{
+    printf("[13b] F8: faults while recording park BT; hard path deferred until REC stops\n");
+    static const struct {
+        int poll_fault;
+        uint32_t want;
+    } cases[] = {
+        { 2, BT_XREC_FAULT_PLATFORM },   /* bt_ctrl fault */
+        { 4, BT_XREC_FAULT_PLATFORM },   /* a Bluedroid task stalled (bt_task_sup) */
+        { 5, BT_XREC_FAULT_ASSERT },     /* assert() in a BT task: the platform already parked */
+    };
+    for (unsigned c = 0u; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        mocks_reset();
+        bring_up();
+        pair_and_auth();
+        m_recording = 1;
+        m_poll_fault = cases[c].poll_fault;
+        int allocs = m_allocs, frees = m_frees, down = m_down_calls, sess_end = m_session_end;
+        bt_xrec_poll();
+        m_poll_fault = 0;
+        CHECK(dbg().state == BT_XREC_ST_DEAD && dbg().parked && dbg().last_fault == cases[c].want,
+              "case %u: parked (state %u parked %u fault %u)", c, dbg().state, dbg().parked, dbg().last_fault);
+        CHECK(m_park_calls >= 1 && m_park_reason == cases[c].want, "case %u: platform parked (reason %u)", c,
+              m_park_reason);
+        CHECK(m_down_calls == down && m_service == 0 && m_session_end == sess_end,
+              "case %u: no graceful teardown, no recovery ladder (down %d)", c, m_down_calls - down);
+        CHECK(m_hard_reason == 0, "case %u: no hard path while recording (%d)", c, m_hard_reason);
+        CHECK(m_allocs == allocs && m_frees == frees, "case %u: session memory kept (BT tasks not torn down)", c);
+        bt_status_t st = status();
+        CHECK(!st.active && !st.spp_open && !st.xrec_auth && !st.pair_active, "case %u: shown as off", c);
+        /* the session stays silent: no more SPP traffic, no Bluedroid calls, no restart */
+        int writes = (int)dbg().tx_writes, disc = m_disc_calls, scans = m_scan_calls;
+        rx(H1, "+XREC:PING\r\n");
+        for (int i = 0; i < 50; i++) {
+            m_now += 100u;
+            bt_xrec_poll();
+        }
+        CHECK((int)dbg().tx_writes == writes && m_disc_calls == disc && m_scan_calls == scans,
+              "case %u: silent while parked", c);
+        CHECK(m_hard_reason == 0 && m_park_polls > 0, "case %u: still deferred while recording", c);
+        CHECK(bt_xrec_start(NULL, 0) == -1, "case %u: no restart while parked", c);
+        /* REC stops: the next poll takes the deferred hard path (target: fault record 0xB1 + reboot) */
+        m_recording = 0;
+        bt_xrec_poll();
+        CHECK(m_hard_reason == (int)cases[c].want && !dbg().parked, "case %u: hard path after REC (%d)", c,
+              m_hard_reason);
+        bt_xrec_test_reset();
+    }
+
+    printf("    BT-mode exit while parked: the stop after REC takes the deferred hard path\n");
+    mocks_reset();
+    bring_up();
+    pair_and_auth();
+    m_recording = 1;
+    m_poll_fault = 3;                      /* HCI command timeout */
+    bt_xrec_poll();
+    m_poll_fault = 0;
+    CHECK(dbg().parked && m_down_calls == 0, "parked");
+    bt_xrec_stop();                        /* still recording: nothing happens */
+    CHECK(m_hard_reason == 0 && dbg().parked, "stop while recording: still deferred");
+    m_recording = 0;
+    bt_xrec_stop();                        /* main.c stops the recording, then BT */
+    CHECK(m_hard_reason == BT_XREC_FAULT_PLATFORM, "stop after REC: hard path (%d)", m_hard_reason);
+    bt_xrec_test_reset();
+
+    printf("    a fault in the teardown wait while a recording runs parks instead of the hard path\n");
+    mocks_reset();
+    bring_up();
+    m_hold_down = 1;
+    m_recording = 1;                       /* (not reachable in BT mode today: RECSTART needs a live link) */
+    (void)bt_shutdown();
+    CHECK(m_hard_reason == 0 && m_park_reason == BT_XREC_FAULT_DOWN_DEADLINE && dbg().parked,
+          "teardown deadline while recording: parked (hard %d park %u)", m_hard_reason, m_park_reason);
+    m_recording = 0;
+    bt_xrec_poll();
+    CHECK(m_hard_reason == BT_XREC_FAULT_DOWN_DEADLINE, "hard path after REC");
+    bt_xrec_test_reset();
+
+    printf("    not recording: unchanged (graceful recovery)\n");
+    mocks_reset();
+    bring_up();
+    m_poll_fault = 2;
+    bt_xrec_poll();
+    m_poll_fault = 0;
+    CHECK(dbg().state == BT_XREC_ST_FAULTED && !dbg().parked && m_park_calls == 0 && m_down_calls == 1,
+          "graceful as before");
+}
+
 static void t_ssp_prompt(void)
 {
     printf("[14] local numeric-comparison prompt: accept, reject, timeout, window closing, peer gone, second request\n");
@@ -2175,6 +2291,7 @@ int main(int argc, char **argv)
     t_entropy_fail_closed();
     t_evq_overflow_and_faults();
     t_hard_paths();
+    t_fault_while_recording();
     t_ssp_prompt();
     t_bench_autoconfirm();
     t_pairing_gate();

@@ -146,9 +146,9 @@ void bt_xrec_plat_log_u32(const char *msg, uint32_t v)
 
 void *bt_xrec_plat_alloc(size_t n) { return pvPortMalloc(n); }
 void bt_xrec_plat_free(void *p) { vPortFree(p); }
-static void assert_check(void);
-void bt_xrec_plat_service(void) { assert_check(); recorder_poll(); }
-void bt_xrec_plat_wait(void) { assert_check(); vTaskDelay(1); }
+static int assert_check(void);
+void bt_xrec_plat_service(void) { (void)assert_check(); recorder_poll(); }
+void bt_xrec_plat_wait(void) { (void)assert_check(); vTaskDelay(1); }
 uint32_t bt_xrec_plat_irq_count(void) { return s_irq_cache; }
 
 /* "BT ROM links lc=.. ld=.. rep=..", two hex digits per link 0..6 (bt_rom_real_links): tells a link the ROM still
@@ -222,9 +222,12 @@ int bt_xrec_plat_ctrl_name(uint8_t bda[6], char *name, uint16_t cap)
     return bt_ctrl_peer_name(bda, name, cap);
 }
 
+static volatile uint32_t s_park_reason;   /* F8 (below): nonzero = parked; the deferred hard path's reason */
+
 int bt_xrec_plat_start_allowed(void)
 {
-    return g_prev_fault_code != (OPENFW_FAULT_MAGIC_BASE | BT_FAULT_RECORD_CODE);
+    /* parked (F8): a stopped controller and BT tasks in an unknown state until the deferred reboot */
+    return g_prev_fault_code != (OPENFW_FAULT_MAGIC_BASE | BT_FAULT_RECORD_CODE) && s_park_reason == 0u;
 }
 
 /* Stable per-device identity (plan M1): eFuse BD_ADDR (02:CA:55:00:01:1D on the bench unit, BT_HW_RESULTS session 1)
@@ -1123,6 +1126,58 @@ void bt_xrec_plat_hard_path(uint32_t reason)
     hard_path_rec(reason, 0u);
 }
 
+/* ============================================ F8: fault while recording ========================================= */
+/* docs/BT_SYNC_SPEED_AND_RECORDING.md 2.5 "BT fault during REC": the hard path would finalise the recording and
+ * reboot, i.e. end it. While a recording runs the sessions park instead (bt_xrec_bluedroid.h): RW-BT is silenced the
+ * way the hard path does it (no ROM call, no RF work, no wait), the supervisors that could still reset the device are
+ * disarmed, and the hard path itself (fault record 0xB1 + reboot, BT off on the next boot) waits for the end of the
+ * recording. Outside a recording nothing changes. */
+
+int bt_xrec_plat_rec_active(void) { return recorder_is_saving(); }
+
+void bt_xrec_plat_park(uint32_t reason)
+{
+    if (reason == 0u) {
+        reason = BT_XREC_FAULT_PLATFORM;
+    }
+    taskENTER_CRITICAL();
+    int first = s_park_reason == 0u;
+    if (first) {
+        s_park_reason = reason;
+    }
+    taskEXIT_CRITICAL();
+    bt_ctrl_rtos_hard_stop();                            /* bt_stop + IRQ 26 masked (no ROM call) */
+    if (bt_rom_real_busy()) {
+        (void)bt_rom_real_silence();                     /* RWBTEN off + soft reset without the ROM */
+    }
+    bt_task_sup_disarm(&s_sup);                          /* no stall fault and no WDT feed hold from here on */
+    if (s_guard_timer != NULL) {
+        (void)xTimerStop(s_guard_timer, 0);              /* bt_ctrl hang guard: the controller is stopped */
+    }
+    if (s_dl_timer != NULL) {
+        (void)bt_xrec_plat_deadline_disarm();            /* a teardown deadline in flight: already silenced */
+    }
+    if (first) {
+        openfw_log_puts("BT parked (fault while recording), reason ");
+        openfw_log_u32(reason);
+        openfw_log_puts(": RW-BT silenced, recording continues, hard path after REC\n");
+    }
+}
+
+int bt_xrec_plat_park_poll(void)
+{
+    uint32_t reason = s_park_reason;
+    if (reason == 0u) {
+        return 0;
+    }
+    recorder_poll();
+    if (recorder_is_saving()) {
+        return 1;
+    }
+    openfw_log_puts("BT parked: recording ended, deferred hard path\n");
+    hard_path_rec(reason, 0u);                           /* no recording left to finalise: fault record + reboot */
+}
+
 /* ============================================ assert() (review STEP10 A9) ====================================== */
 /* BT images build Bluedroid with its assert()s live (no NDEBUG): picolibc's __assert_func printed and called abort()
  * -> _exit() -> reboot, without finalising a recording in progress. A failed assert in a task is now handed to the
@@ -1164,20 +1219,38 @@ static void assert_fail(const char *file, int line)
         hard_path_rec(BT_XREC_FAULT_ASSERT, (uint32_t)line);
     }
     for (uint32_t t = 0u; t < BT_ASSERT_BACKSTOP_MS; t += 10u) {
+        if (s_park_reason != 0u) {
+            break;
+        }
         vTaskDelay(pdMS_TO_TICKS(10u));
+    }
+    /* F8: the app parked BT for a recording: this task never runs again (it may hold Bluedroid locks; nothing calls
+     * Bluedroid any more), the deferred hard path reboots after REC. */
+    while (s_park_reason != 0u) {
+        vTaskSuspend(NULL);
     }
     openfw_rtos_fatal(0xF0u, (uint32_t)line, (uint32_t)(uintptr_t)file);
 }
 
-/* App task: take the hard path for an assert another task reported. */
-static void assert_check(void)
+/* App task: take the hard path for an assert another task reported. While recording (F8): park instead (BT silenced,
+ * the asserting task stays blocked for good, the session parks at its next poll: bt_xrec_plat_poll() returns 5). */
+static int assert_check(void)
 {
     if (s_assert_pending && s_app != NULL && xTaskGetCurrentTaskHandle() == s_app) {
+        if (s_park_reason != 0u) {
+            return 1;                                    /* already parked: covered by the deferred hard path */
+        }
         openfw_log_puts("BT assert in a BT task, line ");
         openfw_log_u32(s_assert_line);
+        if (recorder_is_saving()) {
+            openfw_log_puts(": recording, BT parked\n");
+            bt_xrec_plat_park(BT_XREC_FAULT_ASSERT);
+            return 1;
+        }
         openfw_log_puts(": hard path\n");
         hard_path_rec(BT_XREC_FAULT_ASSERT, s_assert_line);
     }
+    return 0;
 }
 
 /* picolibc's assert() targets (libc.a members of their own: these definitions replace them in BT images). */
@@ -1197,7 +1270,9 @@ void __assert_no_args(void)
 
 uint32_t bt_xrec_plat_poll(void)
 {
-    assert_check();
+    if (assert_check() || s_park_reason != 0u) {
+        return 5u;                                       /* F8: parked (assert while recording) */
+    }
     uint32_t now = millis();
     session_entropy_poll(now);
     if (recorder_is_saving()) {
