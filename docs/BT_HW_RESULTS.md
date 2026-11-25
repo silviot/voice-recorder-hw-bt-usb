@@ -339,6 +339,15 @@ Normal UI on the same image (no RUN file), user report "All worked flawlessly":
 | output `Both`, headset on | plays on the speaker and the headset together |
 | output `BT`, headset off, PLAY | shows the not-connected toast instead of a silent stall |
 
+Review C5 / A11 run: image `029f2a8` (bench lines `hp ctrl ... more streak_max streak_us`, `hp stack` = FreeRTOS
+`usStackHighWaterMark`, free words, lowest since task creation), `player hp_addr=<Jabra> secs=20`, stored key
+(no pairing): connected 1.3 s after start, 371-420 SBC frames/s, `pads=0`, idle 9-18 %.
+
+| Item | Result |
+|---|---|
+| C5 (`bt_ctrl` zero-wait loop) | `more=0` in every window and **`streak_max=0 streak_us=0`** since boot (ROM start, page, auth, AVDTP setup, streaming): `bt_ctrl_run()` never returned "more work" on silicon, ~1700-1900 runs/s at 49-58 us each. The zero-wait path is not exercised; no yield bound needed. |
+| A11 (stack headroom, words free) | BTC_TASK **543** (2172 B), BTU_TASK 869, bt_ctrl 721, hciT 425, bt_dlv 313, bt_recover 695, bt_alarm 191, Tmr Svc 356, IDLE 103, app 2065. All far above the 512 B threshold. Caveat: SSP pairing was not in this run (stored key); the session-9 pairing run predates the `hp stack` line. |
+
 ## Exp 1 stages A and B: how to run
 
 Probe image for plan M5 Exp 1 stage A and stage B (step 4): `bt_ctrl` (plan M1) drives the real RW-BT ROM through
