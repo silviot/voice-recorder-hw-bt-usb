@@ -220,6 +220,90 @@ static int is_safe_filename(const char *s)
     return 1;
 }
 
+static char lower_ascii(char c)
+{
+    return (c >= 'A' && c <= 'Z') ? (char)(c + ('a' - 'A')) : c;
+}
+
+static int str_eq_ci(const char *a, const char *b)
+{
+    while (*a != '\0' && *b != '\0') {
+        if (lower_ascii(*a) != lower_ascii(*b)) {
+            return 0;
+        }
+        a++;
+        b++;
+    }
+    return *a == *b;
+}
+
+/* PUT REC,<name>: only a transcript sidecar can be written into /record, never a recording or a hidden file.
+ * is_safe_filename, printable ASCII, <= 30 chars (exfat_replace_file limit), not a dot-file, ends in ".cwx". */
+static int is_rec_sidecar_name(const char *s)
+{
+    if (!is_safe_filename(s) || s[0] == '.') {
+        return 0;
+    }
+    uint32_t n = 0u;
+    while (s[n] != '\0') {
+        uint8_t ch = (uint8_t)s[n];
+        if (ch < 0x20u || ch > 0x7Eu || n >= 30u) {
+            return 0;
+        }
+        n++;
+    }
+    return n > 4u && str_eq_ci(&s[n - 4u], ".cwx");
+}
+
+/* Staging location of a streamed PUT target: the temp is a dot-file (hidden from LS and the file list) in the
+ * destination folder, committed by an atomic exfat_replace_file (PUTEND / OTA). */
+#define XREC_REC_TMP ".xrec_rec.tmp"
+static void put_stage_loc(uint8_t mode, const char **dir, const char **tmp)
+{
+    if (mode == XREC_PUT_CAS) {
+        *dir = "/cassini";
+        *tmp = ".xrec_cas.tmp";
+    } else if (mode == XREC_PUT_REC) {
+        *dir = "/record";
+        *tmp = XREC_REC_TMP;
+    } else {
+        *dir = "/";
+        *tmp = ".xrec_ota.tmp";
+    }
+}
+
+static int put_is_named(uint8_t mode)
+{
+    return mode == XREC_PUT_CAS || mode == XREC_PUT_REC;
+}
+
+/* <name> with its 3-letter extension (".wav" / ".cwx", any case) swapped for new_ext; 0 when name has no such
+ * extension or does not fit. */
+static int swap_ext3(char *out, uint32_t cap, const char *name, const char *old_ext, const char *new_ext)
+{
+    uint32_t n = 0u;
+    while (name[n] != '\0') {
+        n++;
+    }
+    if (n <= 4u || n + 1u > cap || !str_eq_ci(&name[n - 4u], old_ext)) {
+        return 0;
+    }
+    mem_copy(out, name, n - 4u);
+    copy_cstr(&out[n - 4u], cap - (n - 4u), new_ext);
+    return 1;
+}
+
+/* PUT REC only for an existing recording: a sidecar for a missing <stem>.wav would be shown on the next recording
+ * that reuses the number. */
+static int rec_wav_exists(const xrec_ctx_t *ctx, const char *cwx_name)
+{
+    char path[48];
+    copy_cstr(path, (uint32_t)sizeof(path), "/record/");
+    exfat_entry_t e;
+    return swap_ext3(&path[8], (uint32_t)sizeof(path) - 8u, cwx_name, ".cwx", ".wav") &&
+           exfat_find_path(ctx->vol, path, &e) == 0 && !e.is_dir;
+}
+
 typedef struct {
     xrec_ctx_t *ctx;
     char        buf[512];
@@ -639,14 +723,22 @@ static void handle_del(xrec_ctx_t *ctx, const char *filename)
         send_err(ctx, "NAME");
         return;
     }
-    /* the file being recorded: deleting it frees clusters the writer still fills (review STEP10 A1) */
-    if (ctx->ops.file_busy && ctx->ops.file_busy(ctx->user, filename) != 0) {
+    /* the file being recorded: deleting it frees clusters the writer still fills (review STEP10 A1); likewise the
+     * staging temp of a PUT REC upload in progress (its writer is open) */
+    if ((ctx->ops.file_busy && ctx->ops.file_busy(ctx->user, filename) != 0) ||
+        (ctx->put_stream_mode == XREC_PUT_REC && str_eq_ci(filename, XREC_REC_TMP))) {
         send_err(ctx, "BUSY");
         return;
     }
     if (exfat_delete_file(ctx->vol, "/record", filename) != 0) {
         send_err(ctx, "DEL");
         return;
+    }
+    /* a deleted recording takes its transcript sidecar with it (as the on-device delete does): its number is reused
+     * by the next recording, which must not inherit the old transcript */
+    char cwx_name[80];
+    if (swap_ext3(cwx_name, (uint32_t)sizeof(cwx_name), filename, ".wav", ".cwx")) {
+        (void)exfat_delete_file(ctx->vol, "/record", cwx_name);
     }
     static const char ok[] = "+XREC:OK,DEL\r\n";
     send_text(ctx, ok, (int)(sizeof(ok) - 1u));
@@ -710,12 +802,10 @@ static void abort_staged_put(xrec_ctx_t *ctx)
     }
     uint8_t mode = ctx->put_stream_mode;
     (void)exfat_close_file(&ctx->put_writer);
-    if (ctx->vol) {
-        if (mode == XREC_PUT_CAS) {
-            (void)exfat_delete_file(ctx->vol, "/cassini", ".xrec_cas.tmp");
-        } else if (mode == XREC_PUT_OTA) {
-            (void)exfat_delete_file(ctx->vol, "/", ".xrec_ota.tmp");
-        }
+    if (ctx->vol && (mode == XREC_PUT_CAS || mode == XREC_PUT_REC || mode == XREC_PUT_OTA)) {
+        const char *dir, *tmp;
+        put_stage_loc(mode, &dir, &tmp);
+        (void)exfat_delete_file(ctx->vol, dir, tmp);
     }
     ctx->put_stream_mode    = XREC_PUT_NONE;
     ctx->put_has_last       = 0u;
@@ -759,7 +849,7 @@ static void handle_put_complete(xrec_ctx_t *ctx)
         ctx->put_offset == ctx->put_last_off &&
         ctx->put_len == ctx->put_last_len &&
         ctx->put_crc == ctx->put_last_crc &&
-        (ctx->put_target != XREC_PUT_CAS || str_eq(ctx->put_cas_name, ctx->put_stream_name))) {
+        (!put_is_named(ctx->put_target) || str_eq(ctx->put_name, ctx->put_stream_name))) {
         send_put_ok(ctx, ctx->put_offset, ctx->put_len);
         return;
     }
@@ -768,19 +858,19 @@ static void handle_put_complete(xrec_ctx_t *ctx)
         if (ctx->put_stream_mode != XREC_PUT_NONE) {
             abort_staged_put(ctx);
         }
+        if (ctx->put_target == XREC_PUT_REC && !rec_wav_exists(ctx, ctx->put_name)) {
+            send_err(ctx, "NOENT");
+            return;
+        }
 
-        const char *dir      = "/";
-        const char *fname    = "update.up";
-        const char *tmp_name = ".xrec_ota.tmp";
+        const char *dir;
+        const char *tmp_name;
+        const char *fname = put_is_named(ctx->put_target) ? ctx->put_name : "update.up";
+        put_stage_loc(ctx->put_target, &dir, &tmp_name);
 
-        if (ctx->put_target == XREC_PUT_CAS) {
-            if (exfat_mkdir(ctx->vol, "cassini") != 0) {
-                send_err(ctx, "SDIO");
-                return;
-            }
-            dir      = "/cassini";
-            fname    = ctx->put_cas_name;
-            tmp_name = ".xrec_cas.tmp";
+        if (put_is_named(ctx->put_target) && exfat_mkdir(ctx->vol, dir) != 0) {
+            send_err(ctx, "SDIO");
+            return;
         }
 
         /* Stage under temporary name so interrupted uploads never clobber existing files */
@@ -795,7 +885,7 @@ static void handle_put_complete(xrec_ctx_t *ctx)
         ctx->put_has_last = 0u;
     } else if (ctx->put_stream_mode != ctx->put_target ||
                ctx->put_offset != ctx->put_written ||
-               (ctx->put_target == XREC_PUT_CAS && !str_eq(ctx->put_cas_name, ctx->put_stream_name))) {
+               (put_is_named(ctx->put_target) && !str_eq(ctx->put_name, ctx->put_stream_name))) {
         send_err(ctx, "OFF");
         return;
     }
@@ -806,7 +896,11 @@ static void handle_put_complete(xrec_ctx_t *ctx)
         return;
     }
 
-    if (exfat_write(&ctx->put_writer, ctx->xfer.put_buf, ctx->put_len) != 0) {
+    /* REC / CAS: publish the temp's cluster chain after every chunk, so a temp left by a power loss or reset is a
+     * normal file whose clusters the next upload's delete frees (else they stay marked used until fsck). OTA images
+     * are large and skip it. */
+    if (exfat_write(&ctx->put_writer, ctx->xfer.put_buf, ctx->put_len) != 0 ||
+        (put_is_named(ctx->put_target) && exfat_checkpoint_file(&ctx->put_writer, 0, 0u) != 0)) {
         abort_staged_put(ctx);
         send_err(ctx, "SDIO");
         return;
@@ -821,17 +915,35 @@ static void handle_put_complete(xrec_ctx_t *ctx)
     send_put_ok(ctx, ctx->put_offset, ctx->put_len);
 }
 
+static void send_putend_ok(xrec_ctx_t *ctx, uint32_t total)
+{
+    char resp[64];
+    int pos = 0;
+    append_str(resp, &pos, (int)sizeof(resp), "+XREC:OK,PUTEND,");
+    append_u32(resp, &pos, (int)sizeof(resp), total);
+    append_str(resp, &pos, (int)sizeof(resp), "\r\n");
+    send_text(ctx, resp, pos);
+}
+
 static void handle_putend(xrec_ctx_t *ctx)
 {
     if (!ctx->vol) {
         send_err(ctx, "NOSD");
         return;
     }
-    if (ctx->put_stream_mode != XREC_PUT_CAS) {
+    if (!put_is_named(ctx->put_stream_mode)) {
+        if (ctx->put_done_valid) {
+            /* repeated PUTEND after a lost reply: the commit already happened, answer it again */
+            send_putend_ok(ctx, ctx->put_done_total);
+            return;
+        }
         send_err(ctx, "NOPUT");
         return;
     }
 
+    const char *dir, *tmp;
+    uint8_t mode = ctx->put_stream_mode;
+    put_stage_loc(mode, &dir, &tmp);
     uint32_t total = ctx->put_written;
     char final_name[32];
     copy_cstr(final_name, (uint32_t)sizeof(final_name), ctx->put_stream_name);
@@ -840,18 +952,20 @@ static void handle_putend(xrec_ctx_t *ctx)
     ctx->put_has_last       = 0u;
     ctx->put_written        = 0u;
     ctx->put_stream_name[0] = '\0';
-    if (rc != 0 || exfat_replace_file(ctx->vol, "/cassini", ".xrec_cas.tmp", final_name) != 0) {
-        (void)exfat_delete_file(ctx->vol, "/cassini", ".xrec_cas.tmp");
+    if (rc == 0 && mode == XREC_PUT_REC && !rec_wav_exists(ctx, final_name)) {
+        /* the recording was deleted during the upload: never leave an orphan sidecar */
+        (void)exfat_delete_file(ctx->vol, dir, tmp);
+        send_err(ctx, "NOENT");
+        return;
+    }
+    if (rc != 0 || exfat_replace_file(ctx->vol, dir, tmp, final_name) != 0) {
+        (void)exfat_delete_file(ctx->vol, dir, tmp);
         send_err(ctx, "SDIO");
         return;
     }
-
-    char resp[64];
-    int pos = 0;
-    append_str(resp, &pos, (int)sizeof(resp), "+XREC:OK,PUTEND,");
-    append_u32(resp, &pos, (int)sizeof(resp), total);
-    append_str(resp, &pos, (int)sizeof(resp), "\r\n");
-    send_text(ctx, resp, pos);
+    ctx->put_done_valid = 1u;
+    ctx->put_done_total = total;
+    send_putend_ok(ctx, total);
 }
 
 static void handle_ota(xrec_ctx_t *ctx)
@@ -1049,6 +1163,19 @@ static void handle_log_cmd(xrec_ctx_t *ctx, const char *args)
     }
 }
 
+/* A refused PUT header whose length is known: reply the error now and eat exactly that many payload bytes without
+ * parsing them, so binary payload never reaches the line parser (where a "\r+XREC:..." piece would run as a
+ * command and long pieces would raise unsolicited ERR,LINE replies). */
+static void put_refuse(xrec_ctx_t *ctx, uint32_t chunk_len, const char *err)
+{
+    send_err(ctx, err);
+    ctx->put_active     = 1u;
+    ctx->put_discard    = 1u;
+    ctx->put_done_valid = 0u;
+    ctx->put_len     = (uint16_t)chunk_len;
+    ctx->put_got     = 0u;
+}
+
 static void try_start_put_header(xrec_ctx_t *ctx)
 {
     ctx->rx_line[ctx->rx_len] = '\0';
@@ -1056,25 +1183,26 @@ static void try_start_put_header(xrec_ctx_t *ctx)
 
     const char *p = ctx->rx_line + 10; /* after "+XREC:PUT," */
     uint32_t off = 0u, chunk_len = 0u, crc = 0u;
+    /* offset and length first: once the payload length is known every later refusal discards the payload */
     if (parse_u32_step(&p, &off) != 0 || *p != ',') {
         send_err(ctx, "ARG");
         return;
     }
     p++;
-    if (parse_u32_step(&p, &chunk_len) != 0 || *p != ',') {
+    if (parse_u32_step(&p, &chunk_len) != 0 || *p != ',' || chunk_len == 0u || chunk_len > XREC_MAX_CHUNK) {
         send_err(ctx, "ARG");
         return;
     }
     p++;
-    if (parse_u32_step(&p, &crc) != 0 || *p != ',') {
-        send_err(ctx, "ARG");
+    if (parse_u32_step(&p, &crc) != 0 || *p != ',' || crc > 0xFFFFu) {
+        put_refuse(ctx, chunk_len, "ARG");
         return;
     }
     p++;
 
     uint8_t target = XREC_PUT_NONE;
-    char cas_name[32];
-    cas_name[0] = '\0';
+    char tgt_name[32];
+    tgt_name[0] = '\0';
     if (str_eq(p, "OTA")) {
         target = XREC_PUT_OTA;
     } else if (str_eq(p, "EXP")) {
@@ -1086,28 +1214,33 @@ static void try_start_put_header(xrec_ctx_t *ctx)
             flen++;
         }
         if (!is_safe_filename(fname) || flen > 30u) {
-            send_err(ctx, "NAME");
+            put_refuse(ctx, chunk_len, "NAME");
             return;
         }
         target = XREC_PUT_CAS;
-        copy_cstr(cas_name, (uint32_t)sizeof(cas_name), fname);
+        copy_cstr(tgt_name, (uint32_t)sizeof(tgt_name), fname);
+    } else if (str_starts_with(p, "REC,")) {
+        /* transcript sidecar next to its recording: only <stem>.cwx, so a recording can never be overwritten */
+        if (!is_rec_sidecar_name(p + 4)) {
+            put_refuse(ctx, chunk_len, "NAME");
+            return;
+        }
+        target = XREC_PUT_REC;
+        copy_cstr(tgt_name, (uint32_t)sizeof(tgt_name), p + 4);
     } else {
-        send_err(ctx, "ARG");
-        return;
-    }
-
-    if (chunk_len == 0u || chunk_len > XREC_MAX_CHUNK || crc > 0xFFFFu) {
-        send_err(ctx, "ARG");
+        put_refuse(ctx, chunk_len, "ARG");
         return;
     }
 
     /* PUT binary buffer shares union storage with GETS staged frame */
-    ctx->gets_active = 0u;
-    ctx->gets_staged = 0u;
-    ctx->put_active  = 1u;
-    ctx->put_auth_ok = ctx->auth;
-    ctx->put_target  = target;
-    copy_cstr(ctx->put_cas_name, (uint32_t)sizeof(ctx->put_cas_name), cas_name);
+    ctx->gets_active    = 0u;
+    ctx->gets_staged    = 0u;
+    ctx->put_active     = 1u;
+    ctx->put_discard    = 0u;
+    ctx->put_done_valid = 0u;
+    ctx->put_auth_ok    = ctx->auth;
+    ctx->put_target     = target;
+    copy_cstr(ctx->put_name, (uint32_t)sizeof(ctx->put_name), tgt_name);
     ctx->put_offset  = off;
     ctx->put_len     = (uint16_t)chunk_len;
     ctx->put_crc     = (uint16_t)crc;
@@ -1251,8 +1384,10 @@ void xrec_on_disconnect(xrec_ctx_t *ctx)
     ctx->ls_has_dir         = 0u;
     ctx->ls_sent_cnt        = 0u;
     ctx->put_active         = 0u;
+    ctx->put_discard        = 0u;
+    ctx->put_done_valid     = 0u;
     ctx->put_target         = XREC_PUT_NONE;
-    ctx->put_cas_name[0]    = '\0';
+    ctx->put_name[0]        = '\0';
     ctx->put_got            = 0u;
     ctx->put_stream_mode    = XREC_PUT_NONE;
     ctx->put_has_last       = 0u;
@@ -1274,6 +1409,18 @@ uint16_t xrec_on_rx(xrec_ctx_t *ctx, const uint8_t *data, uint16_t len)
     }
     uint16_t i = 0u;
     while (i < len) {
+        if (ctx->put_active && ctx->put_discard) {
+            uint16_t need  = (uint16_t)(ctx->put_len - ctx->put_got);
+            uint16_t avail = (uint16_t)(len - i);
+            uint16_t take  = (avail < need) ? avail : need;
+            ctx->put_got = (uint16_t)(ctx->put_got + take);
+            i            = (uint16_t)(i + take);
+            if (ctx->put_got >= ctx->put_len) {
+                ctx->put_active  = 0u;
+                ctx->put_discard = 0u;
+            }
+            continue;
+        }
         if (ctx->put_active) {
             uint16_t need  = (uint16_t)(ctx->put_len - ctx->put_got);
             uint16_t avail = (uint16_t)(len - i);

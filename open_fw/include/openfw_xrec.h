@@ -75,7 +75,8 @@ typedef enum {
     XREC_PUT_NONE = 0,
     XREC_PUT_OTA  = 1,
     XREC_PUT_EXP  = 2,
-    XREC_PUT_CAS  = 3,
+    XREC_PUT_CAS  = 3,   /* CAS,<name>: /cassini/<name> */
+    XREC_PUT_REC  = 4,   /* REC,<stem>.cwx: transcript sidecar /record/<stem>.cwx (only .cwx names) */
 } xrec_put_target_t;
 
 typedef struct {
@@ -113,11 +114,12 @@ typedef struct {
     exfat_entry_t  ls_dir;
     uint32_t       ls_sent_cnt;
 
-    /* Streaming +XREC:PUT -> OTA / EXP / CAS upload state */
+    /* Streaming +XREC:PUT -> OTA / EXP / CAS / REC upload state */
     uint8_t        put_active;
+    uint8_t        put_discard;        /* refused header: eat put_len payload bytes unparsed, no reply */
     uint8_t        put_auth_ok;
     uint8_t        put_target;
-    char           put_cas_name[32];
+    char           put_name[32];       /* CAS / REC file name of the chunk being received */
     uint32_t       put_offset;
     uint16_t       put_len;
     uint16_t       put_got;
@@ -137,6 +139,9 @@ typedef struct {
     uint32_t       put_last_off;
     uint16_t       put_last_len;
     uint16_t       put_last_crc;
+    /* last PUTEND commit, so a repeated PUTEND (lost reply) answers the same OK until the next PUT header */
+    uint8_t        put_done_valid;
+    uint32_t       put_done_total;
 } xrec_ctx_t;
 
 void xrec_init(xrec_ctx_t *ctx, exfat_vol_t *vol, const xrec_ops_t *ops, void *user);

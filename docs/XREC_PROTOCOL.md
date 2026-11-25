@@ -1,160 +1,245 @@
-# `+XREC` v5 Bluetooth RFCOMM Protocol Specification (`HW_76` / Smartlink SL6801)
+# `+XREC` v5 Bluetooth protocol (open_fw `Cassini_XX`, Smartlink SL6801)
 
-This document specifies the `+XREC v5` wire protocol over Classic Bluetooth BR/EDR RFCOMM Channel 1, designed for mobile (`cassini-android`) and desktop (`tools/bt_sync.py`) clients.
+This document specifies the `+XREC v5` wire protocol over Classic Bluetooth BR/EDR SPP (RFCOMM channel 1), used by
+the mobile app (`cassini-android`) and the desktop client (`tools/bt_sync.py`).
 
-> **Implementation status:**
-> - **Standalone `open_fw`** (`open_fw/src/xrec_proto.c` protocol state machine; transport: the Bluedroid SPP server in `open_fw/bt_port/bt_xrec_bluedroid.c`, default `BT=1` image; RF calibration `open_fw/src/bt_rf.c`): verified on silicon with `tools/bt_sync.py` (SSP pairing, `PAIR`/`AUTH`/`LS`/byte-exact `GETS`; `docs/BT_HW_RESULTS.md`). The earlier clean-room host (`src/bt_hci.c` + `src/bt_spp.c`) was deleted in plan step 9 (`docs/BLUETOOTH_BLUEDROID_PLAN.md`). `open_fw` also extends the command set with `+XREC:DSP`, `+XREC:GAIN`, `+XREC:LOG`, `+XREC:DFU`, and staged `PUT`/`PUTEND` uploads (see `open_fw/src/xrec_proto.c`).
-> - **Legacy stock-firmware patch** (`fw_mod/bt_filesync.c`, `v5+`): Runs on top of the stock `pen133_2.0.65` Bluetooth stack (requires the HFP `SLC_OPEN` handshake below).
+**Primary implementation: open_fw, BT=1 (Bluedroid) phone mode.** Protocol state machine `open_fw/src/xrec_proto.c`
+(`include/openfw_xrec.h`), SPP session `open_fw/bt_port/bt_xrec_bluedroid.c`, device glue `open_fw/bt_port/bt_xrec_fw.c`.
+Host tests: `make -C open_fw test-host` (`tests/test_core.c`, `tests/test_xrec_rec.c`), `test-bt-xrec`, `test-bt-host`.
+Everything below describes open_fw unless a paragraph says otherwise. The legacy stock-firmware patch (`fw_mod`)
+differs in several places: see [section 8](#8-legacy-stock-firmware-patch-fw_mod-differences).
+The earlier clean-room host (`src/bt_hci.c` + `src/bt_spp.c`) was deleted in plan step 9
+(`docs/BLUETOOTH_BLUEDROID_PLAN.md`).
 
 ---
 
-## 1. Transport & Connection Setup
+## 1. Transport
 
-* **Bluetooth Type:** Classic Bluetooth BR/EDR only (SL6801 `RW-BT` silicon has no BLE hardware).
-* **Device Name:** `HW_XX` (e.g., `HW_76`, derived from the last byte of the BT MAC).
-* **RFCOMM Channel:** `1`
-* **Recommended Android Socket API:**
-  * With `--patch bt-spp-uuid` installed (recommended for dedicated Android recorders):
-    ```kotlin
-    val sppUuid = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
-    val socket = device.createRfcommSocketToServiceRecord(sppUuid)
-    socket.connect()
-    ```
-    Advertising SPP (`0x1101`) prevents Android's `HeadsetService` from routing phone calls to `HW_76` or contending for RFCOMM Channel 1.
-  * Without `bt-spp-uuid`: `HW_76` advertises HFP (`0000111E-0000-1000-8000-00805F9B34FB`); users should toggle **Phone calls** OFF in Android Bluetooth device settings.
+* Classic BR/EDR only (the SL6801 RW-BT silicon has no BLE).
+* **Device name `Cassini_XX`**: `XX` = 2 uppercase hex digits of `bd_addr[0]`. Class of Device `0x200404` (Android may
+  show a headset icon). IO capability DisplayYesNo.
+* **SPP server**: RFCOMM server channel 1, SDP UUID `0x1101` (`00001101-0000-1000-8000-00805F9B34FB`), service name
+  `"Cassini"`, security AUTHENTICATE | ENCRYPT | MITM. On Android use the secure
+  `createRfcommSocketToServiceRecord(SPP_UUID)`, not the insecure variant.
+* **An SPP open requires a MITM-authenticated bond** (SSP numeric comparison). Without one the device closes the link
+  at once. On Android call `createBond()` during the device's pairing window first (section 2).
+* One SPP session at a time (a second open is dropped). At most 4 bonds are kept on the device.
+* **No HFP / AT handshake**: after RFCOMM opens the device sends nothing; the client starts with `+XREC:` lines.
+* Device RX ring 2048 B: **never pipeline uploads**. Keep one PUT chunk (<= 652 B on the wire) in flight
+  (stop-and-wait). An RX overflow closes the link.
+* No idle disconnect and **no authentication expiry**. Authentication is cleared on disconnect, which also aborts a
+  staged (not yet committed) PUT upload.
 
-### Mandatory HFP `SLC_OPEN` Handshake (On Every RFCOMM Connect)
-Immediately after RFCOMM Channel 1 opens, the SL6801 HFP state machine initiates an AT handshake. The client **must** complete this before sending any `+XREC:` command.
+## 2. Device states, pairing window, binding
 
-**Critical framing rule:** Send each response line in a **separate `write()` + `flush()` with ~50 ms spacing**, because the SL6801 AT parser processes one line per RFCOMM frame during handshake.
+* The radio is on only while the user is in BT phone mode on the recorder (Home -> BT tile -> ENTER; in
+  headphones-capable builds a choice screen follows: "Phone"). The recorder is not connectable on Home, while playing,
+  on USB, or while recording from the REC switch. Clients must tolerate connect failures quietly and retry.
+* Inside BT mode the device is connectable after bring-up (up to ~12 s). **ENTER opens a 60 s pairing window**: the
+  device becomes discoverable and shows the toast `PIN xxxxxx` (the 6-digit XREC PIN, from the DRBG). ENTER again
+  with more than 10 s left extends the window and keeps the PIN.
+* SSP numeric comparison is auto-accepted by the device inside the window (release default); the phone still shows
+  its own pairing dialog. After the first MITM bond the device stops being discoverable. If an accepted SSP pairing
+  fails, no more SSP until the user re-enters BT mode.
+* Recording while in BT mode only via `+XREC:RECSTART`; leaving BT mode stops it.
+* First-time binding (within 60 s of ENTER; ENTER again extends):
+  1. User presses ENTER on the recorder's BT screen (window opens, PIN shown).
+  2. Client finds `Cassini_XX` and bonds (`createBond()`); the user confirms on the phone.
+  3. Client opens the SPP socket, sends `+XREC:PING`, expects `pair=1`.
+  4. User types the PIN shown on the recorder; client generates a random 32-byte key and sends
+     `+XREC:PAIR,<pin>,<64 lowercase hex>` -> `+XREC:OK,PAIR` (session authenticated). Store the key securely per
+     device address.
+  5. Later sessions: device in BT mode, client connects, `CHAL` / `AUTH`.
+* The device stores the key in **`SD:/cassini.key`**. A new `PAIR` replaces it: other clients' keys become invalid
+  (`ERR,AUTH`).
 
-| Recorder Sends (`\r`-terminated) | Client Replies (each wrapped in `\r\n...\r\n`, 50 ms apart) |
+## 3. Framing
+
+* Commands: ASCII lines starting with `+XREC:` and ending in `\r` (`\n` is ignored). Lines not starting with `+XREC:`
+  are ignored. Max line 191 characters, else `+XREC:ERR,LINE`.
+* Replies end in `\r\n`. Errors: `+XREC:ERR,<REASON>`. Unknown command: `+XREC:ERR,CMD`.
+* Binary data appears only in GET/GETS frames (device -> client) and PUT payloads (client -> device).
+
+## 4. Unauthenticated commands
+
+| Command | Reply |
 | :--- | :--- |
-| `AT+BRSF=<n>` | `+BRSF: 1007` then `OK` |
-| `AT+BAC=...` | `OK` |
-| `AT+CIND=?` | `+CIND: ("service",(0,1)),("call",(0,1)),("callsetup",(0,3)),("callheld",(0,2)),("signal",(0,5)),("roam",(0,1)),("battchg",(0,5))` then `OK` |
-| `AT+CIND?` | `+CIND: 1,0,0,0,5,0,5` then `OK` |
-| `AT+CMER=...` | `OK` → wait ~150 ms → **`SLC_OPEN` established!** |
-| Any other `AT...` | `OK` |
+| `+XREC:PING` | `+XREC:PONG,openfw_v5,v5,bound=<0\|1>,auth=<0\|1>,pair=<0\|1>` (`pair` = XREC PIN window open) |
+| `+XREC:PAIR,<6 digits>,<64 hex>` | `+XREC:OK,PAIR`, or `ERR,PAIRCLOSED`, `ERR,PIN` (5 failures close the window), `ERR,BADKEY`, `ERR,SAVE` (key not written to the card; old binding kept) |
+| `+XREC:CHAL` | `+XREC:CHAL,<32 lowercase hex nonce>` (16 bytes). If the entropy pool is not ready: no reply and the link is closed |
+| `+XREC:AUTH,<64 hex>` | HMAC-SHA256(key, nonce bytes): `+XREC:OK,AUTH`, or `ERR,UNBOUND`, `ERR,NOCHAL` (one AUTH per CHAL), `ERR,AUTH` |
 
----
+## 5. Authenticated commands (else `+XREC:ERR,LOCKED`)
 
-## 2. Casual-User Pairing & Authentication State Machine (`v5`)
+### 5.1 STAT, RTC
+* `+XREC:STAT` -> `+XREC:STAT,<bat_pct>,<mV>,<chg 0/1/2>,<vbus 0/1>,<media>,<rec_sec>,<free_mb>,<total_mb>`.
+  `chg`: 0 discharging, 1 charging, 2 full. `media`: **33 (0x21) while recording**, else 16 (0x10).
+* `+XREC:RTC` -> `+XREC:RTC,YYYY-MM-DD HH:MM:SS,<wd 0=Mon..6=Sun>`.
+* `+XREC:RTC,y,m,d,h,mi,s,wd` -> `+XREC:OK,RTC` | `ERR,ARGS` | `ERR,RTCRNG` | `ERR,RTC`.
 
-All `+XREC:` commands are terminated with `\r` (CR). Text replies end with `\r\n` (CRLF).
+### 5.2 LS
+`+XREC:LS` -> zero or more `+XREC:F,<size dec>,<name>` lines, then `+XREC:END`.
+* Only `/record`, non-recursive, directory order. Dot-files (staging temps such as `.xrec_rec.tmp`, `.autoplay`) and
+  subfolders are skipped. Every other file is listed, including `.cwx` transcript sidecars.
+* Names may contain commas: split an `F,` line with limit 2 (size, then the rest of the line is the name).
 
-### 2.1 Discovery & Status (`+XREC:PING`, unauthenticated)
-* **Request:** `+XREC:PING\r`
-* **Response:**
-  ```text
-  +XREC:PONG,pen133_2.0.65,v5,bound=<0|1>,auth=<0|1>,pair=<0|1>\r\n
-  ```
-  * `bound`: `1` if a 256-bit secret is persisted in `PSMP` (`"xrec_key"`), else `0`.
-  * `auth`: `1` if this RFCOMM session is currently authenticated, else `0`.
-  * `pair`: `1` if the 60-second physical-presence pairing window (opened via the recorder's Bluetooth menu) is active, else `0`.
+### 5.3 GETS / GET (download)
+`+XREC:GETS,<off>,<total>,<chunk 1..640>,<name>` -> binary frames until `total` bytes were sent or EOF:
 
-### 2.2 First-Time Physical-Presence Binding (`+XREC:PAIR`)
-1. User opens the **Bluetooth** menu on the recorder:
-   * Recorder enables BT discoverability (`Inquiry Scan = ON`) for **60 seconds**.
-   * Recorder renders a yellow **`PIN: XXXXXX`** (6 decimal digits) banner at the bottom of the LCD.
-2. App generates a cryptographically random 32-byte key (`SecureRandom`, stored in Android Keystore) and sends:
-   ```text
-   +XREC:PAIR,<6-digit-PIN>,<64-lowercase-hex-key>\r
-   ```
-3. **Responses:**
-   * `+XREC:OK,PAIR\r\n` — Key persisted in `PSMP` (`"xrec_key"`), pairing window closed, discoverability disabled, current session immediately authenticated.
-   * `+XREC:ERR,PAIRCLOSED\r\n` — User has not opened the Bluetooth menu (or 60s expired).
-   * `+XREC:ERR,PIN\r\n` — Wrong PIN (window auto-closes after 5 failed attempts).
+| Bytes | Type | Meaning |
+| :---: | :--- | :--- |
+| 0..3 | ASCII | `"XREC"` |
+| 4..7 | u32 LE | file offset of this frame |
+| 8..9 | u16 LE | payload length N |
+| 10..11 | u16 LE | CRC-16/CCITT-FALSE of the payload |
+| 12.. | N bytes | file data |
 
-### 2.3 Per-Connection Challenge-Response (`+XREC:CHAL` → `+XREC:AUTH`)
-Required on every new connection before calling any privileged command:
-1. Client sends `+XREC:CHAL\r` → Recorder replies `+XREC:CHAL,<32-hex-nonce>\r\n` (16-byte one-time random nonce).
-2. Client computes `mac = HMAC-SHA256(key = stored_32B_key, msg = nonce_16B)` (lowercase 64-char hex) and sends:
-   ```text
-   +XREC:AUTH,<64-hex-hmac>\r
-   ```
-3. **Responses:**
-   * `+XREC:OK,AUTH\r\n` — Session unlocked (bound to current `hf` handle + peer `BD_ADDR`, auto-expires after 10 minutes idle or on disconnect/reboot).
-   * `+XREC:ERR,AUTH\r\n` — Wrong key (nonce is consumed; call `+XREC:CHAL` again to retry).
-   * `+XREC:ERR,UNBOUND\r\n` — Recorder has no bound key yet; prompt user to pair.
+* The device may lower the chunk to `RFCOMM MTU - 12`: **a short first frame is NOT EOF**. Track EOF with the size
+  from `LS`, and ask for at most `size - off` bytes. Every frame of a burst has the same size except the last one.
+* A burst that starts at or after EOF returns one frame with N = 0. A burst that reaches EOF part-way (the file is
+  shorter than requested, e.g. it was replaced after `LS`) ends with one short frame and **no** N = 0 frame: treat a
+  frame shorter than the burst's first frame as its end, and a silence after a short first frame as EOF (then ask
+  again from the new offset; that burst gets the N = 0 frame).
+* Errors come as text instead of a frame: `+XREC:ERR,<NOENT|NOSD|NAME|ARGS|SDIO>`.
+* Do not send another command while a GETS streams (LS, PUT and GETS cancel it).
+* Recommended: `total = 3840`, `chunk = 640`; verify offset and CRC of every frame; on any error retry from the last
+  good offset (downloads are resumable).
+* `+XREC:GET,<off>,<len <= 640>,<name>` -> one frame.
 
----
+### 5.4 DEL, RECSTART / RECSTOP, other
+* `+XREC:DEL,<name>` -> `+XREC:OK,DEL` | `ERR,NOSD` | `ERR,NAME` | `ERR,BUSY` (the file being recorded, or the
+  staging temp of a REC upload in progress) | `ERR,DEL` (missing). Only in `/record`. Deleting a recording
+  `<stem>.wav` also deletes its transcript sidecar `<stem>.cwx` (as the on-device delete does): the recorder reuses
+  the number of a deleted newest recording, and the new recording must not inherit the old transcript.
+* `+XREC:RECSTART` -> `+XREC:OK,RECSTART,<name>`; `+XREC:RECSTOP` -> `+XREC:OK,RECSTOP` | `ERR,NOTREC`.
+* `REBOOT`, `DFU`, `OTA`, `LOG`, `RUN`, `DSP` / `GAIN` / `CH` / `VOR`: maintenance and development commands, not
+  needed by a sync client (see `xrec_proto.c`).
 
-## 3. Privileged Commands (Require `auth=1`, Else `+XREC:ERR,LOCKED\r\n`)
+## 6. PUT uploads
 
-### 3.1 Telemetry & Recording State (`+XREC:STAT`)
-* **Request:** `+XREC:STAT\r`
-* **Response:**
-  ```text
-  +XREC:STAT,<bat_pct>,<voltage_mv>,<charge_status>,<vbus>,<media_status>,<rec_sec>,<free_mb>,<total_mb>\r\n
-  ```
-  * `charge_status`: `0` = discharging, `1` = charging, `2` = full.
-  * `media_status`: `0x00` = idle, `0x10` = `BTREADY`, **`0x21` = `RECORDPLAY`**, **`0x22` = `RECORDPAUSE`**.
+```
++XREC:PUT,<offset>,<len 1..640>,<crc16 decimal>,<target>:<exactly len raw bytes, no CR>
+```
+Reply per chunk: `+XREC:OK,PUT,<offset>,<len>`. Errors: `ERR,LOCKED`, `ERR,CRC`, `ERR,OFF`, `ERR,NAME`, `ERR,ARG`,
+`ERR,SDIO`, `ERR,NOSD`, `ERR,UNSUP`, `ERR,NOENT` (REC: no `/record/<stem>.wav`).
 
-### 3.2 Hardware RTC Read & Sync (`+XREC:RTC`)
-* **Read:** `+XREC:RTC\r` → `+XREC:RTC,YYYY-MM-DD HH:MM:SS,W\r\n` (`W`: `0`=Mon..`6`=Sun).
-* **Set:** `+XREC:RTC,<YYYY>,<MM>,<DD>,<hh>,<mm>,<ss>,<wd>\r` → `+XREC:OK,RTC\r\n`.
+Client retry policy: resend the same chunk only after a timeout or `ERR,CRC`. `SDIO`, `NOSD`, `LOCKED`, `NOENT` and
+`OFF` are final (after `SDIO` the device has already dropped the staged upload). A late `OK,PUT` for an earlier
+offset (the first reply to a chunk that was resent after a timeout) must be dropped, not taken as the reply to the
+next chunk or to `PUTEND`.
 
-### 3.3 Directory Listing (`+XREC:LS`)
-* **Request:** `+XREC:LS\r`
-* **Response:** Zero or more file lines followed by `+XREC:END\r\n`:
-  ```text
-  +XREC:F,<size_bytes_dec>,<filename>\r\n
-  ...
-  +XREC:END\r\n
-  ```
-  Lists files in `0:\record`.
+| Target | Destination | Commit |
+| :--- | :--- | :--- |
+| `REC,<stem>.cwx` | `/record/<stem>.cwx`: the transcript sidecar of the existing recording `/record/<stem>.wav` (else `ERR,NOENT` at offset 0, and at `PUTEND` if the recording was deleted meanwhile). Staged as `/record/.xrec_rec.tmp` | `+XREC:PUTEND` |
+| `CAS,<name>` | `/cassini/<name>` (`/cassini` is created if missing). Staged as `/cassini/.xrec_cas.tmp` | `+XREC:PUTEND` |
+| `OTA` | `/update.up`. Staged as `/.xrec_ota.tmp` | `+XREC:OTA` (needs >= 64 B; reboots into the SD updater) |
 
-### 3.4 Binary Burst Download (`+XREC:GETS` & `+XREC:GET`)
-* **Request:**
-  ```text
-  +XREC:GETS,<offset_dec>,<total_len_dec>,<chunk_len_dec>,<filename>\r
-  ```
-  * With `bt-rfcomm-turbo` (`v5.1+`): use **`chunk_len = 640`**, **`total_len = 3840`** (6 × 640 B frames per burst → **~92–96 KB/s**).
-  * Without `bt-rfcomm-turbo`: use `chunk_len = 480`, `total_len = 1920` (4 × 480 B frames → ~59 KB/s).
-  * Arbitrary `offset_dec` is supported for **resumable downloads** after Bluetooth dropouts.
-* **Binary Response Frame (repeated until `total_len` bytes or EOF):**
-  | Byte Offset | Size | Type | Description |
-  | :---: | :---: | :--- | :--- |
-  | `0..3` | 4 | ASCII | Magic `"XREC"` (`0x58 0x52 0x45 0x43`) |
-  | `4..7` | 4 | `uint32_le` | Byte offset of this chunk in the file |
-  | `8..9` | 2 | `uint16_le` | Payload length `N` (`0..640`; `< chunk_len` indicates EOF) |
-  | `10..11` | 2 | `uint16_le` | `CRC-16/CCITT-FALSE` over the `N` payload bytes |
-  | `12..12+N-1` | `N` | raw bytes | Raw file bytes |
-  * On error, recorder replies with text `+XREC:ERR,<reason>[,<code>]\r\n` instead of `"XREC"`.
+**Transcripts must use `REC`.** The player and the Files list look for `<stem>.cwx` in the same folder as the
+recording; a file in `/cassini` is never shown next to a recording.
 
-### 3.5 Delete, Remote Record & Wireless OTA
-* **Delete:** `+XREC:DEL,<filename>\r` → `+XREC:OK,DEL\r\n`
-* **Start local WAV recording:** `+XREC:RECSTART[,<filename>]\r` → `+XREC:OK,RECSTART,<filename>\r\n`
-* **Stop local WAV recording:** `+XREC:RECSTOP\r` → `+XREC:OK,RECSTOP\r\n`
-* **OTA chunk write (`0:\update.up`):** `+XREC:PUT,<offset>,<len>,<crc16_dec>,OTA:<raw_bytes>` → `+XREC:OK,PUT,<offset>,<len>\r\n` (max `len = 600` B with `bt-rfcomm-turbo`).
-* **Trigger OTA flash & reboot:** `+XREC:OTA\r` → `+XREC:OK,OTA\r\n` (reboots into Stage-1, flashes `0:\update.up`, auto-boots new `FIRM`).
-* **Reboot:** `+XREC:REBOOT\r` → `+XREC:OK,REBOOT\r\n` (device may drop RFCOMM immediately).
+Staging rules (all targets):
+* Offset 0 starts a new upload and aborts any staged one, of any target (its temp is deleted).
+* Later chunks strictly in order: `offset` must equal the bytes written so far, with the same target and name, else
+  `ERR,OFF`.
+* Resending the last chunk with identical offset / len / crc / target returns OK without writing it twice (safe
+  retry after a lost reply).
+* `+XREC:PUTEND` -> `+XREC:OK,PUTEND,<total>` commits a staged REC or CAS upload by an atomic replace (an existing
+  file of that name is replaced; the name never disappears on power loss). `ERR,NOPUT` when no REC/CAS upload is
+  staged (PUTEND never commits an OTA image, and `+XREC:OTA` never commits a REC/CAS upload: `ERR,NOOTA`).
+* `PUTEND` is idempotent: until the next PUT header, a repeated `PUTEND` (its reply was lost) answers the same
+  `OK,PUTEND,<total>`. Firmware before this change answers `ERR,NOPUT` instead; a client that gets `NOPUT` on a
+  repeated `PUTEND` confirms the commit with `LS` (name and size).
+* A disconnect before the commit discards the staged upload (temp deleted).
+* After a power loss or reset during an upload the temp stays on the card (a REC temp is visible as
+  `/record/.xrec_rec.tmp` over USB). REC and CAS temps are checkpointed after every chunk, so the leftover is a normal
+  file that owns its clusters; the next upload of that target deletes it at offset 0 (or delete it over USB). An OTA
+  temp is not checkpointed: its clusters stay marked used until `fsck`.
+* If the header is rejected after its `<len>` was parsed (`NAME`, an unknown target, a bad crc field: `ERR,NAME` /
+  `ERR,ARG`), the error is sent at once and exactly `<len>` payload bytes are discarded unparsed. An unparsable or
+  out-of-range offset or length gives `ERR,ARG` and the payload goes to the line parser. **Firmware before this
+  change** fed the payload of every refused header to the line parser: `\r`-terminated pieces were parsed as lines,
+  pieces of 192+ bytes gave extra `ERR,LINE` replies. So after any refused header send `\r+XREC:PING\r` and drain
+  replies up to the `+XREC:PONG`.
+* A device that predates the REC target answers `ERR,ARG` to a `REC,` header: report "recorder firmware too old for
+  transcript upload" and do not retry.
 
----
+Example (transcript for `REC_0007.wav`, 1500 bytes, chunks of 600):
+```
+> +XREC:PUT,0,600,<crc>,REC,REC_0007.cwx:<600 bytes>      < +XREC:OK,PUT,0,600
+> +XREC:PUT,600,600,<crc>,REC,REC_0007.cwx:<600 bytes>    < +XREC:OK,PUT,600,600
+> +XREC:PUT,1200,300,<crc>,REC,REC_0007.cwx:<300 bytes>   < +XREC:OK,PUT,1200,300
+> +XREC:PUTEND                                            < +XREC:OK,PUTEND,1500
+```
+`tools/bt_sync.py --upload-cwx REC_0007.cwx --for-recording REC_0007.wav` does exactly this.
 
-## 4. Recommended `cassini-android` Polling & Sync Algorithm
+### 6.1 File name rules
+* All names (`GET`/`GETS`/`DEL`/`PUT`): not empty, not `.` / `..`, shorter than 63 bytes, no control characters and
+  none of `/ \ : * ? " < > |`, must not end in `.` or space. Names are case-insensitive on the card (exFAT).
+* `CAS` names: additionally at most 30 characters, ASCII.
+* `REC` names: additionally at most 30 characters, printable ASCII, must not start with `.`, and **must end in `.cwx`**
+  (any case). Anything else (`REC_0001.wav`, `../x.cwx`, hidden or longer names) is `ERR,NAME`, so a recording can
+  never be overwritten. A recording is a `.wav`, so a REC upload never touches the file being recorded.
 
-1. **Background Poll Cycle (e.g., WorkManager / Foreground Service while paired device is nearby):**
-   * Connect RFCOMM → complete HFP `SLC_OPEN` handshake → `+XREC:PING` → `+XREC:CHAL` / `+XREC:AUTH`.
-   * *(Note: `v5.2+` firmware does **not** wake the recorder's LCD screen or reset `idleshut` on `PING`/`CHAL`/`AUTH`/`STAT`/`LS`, so background polling won't light up the screen in the user's pocket!)*
-2. **Check `+XREC:STAT` First:**
-   * If `media_status` is **`0x21` (`RECORDPLAY`)** or **`0x22` (`RECORDPAUSE`)**: **do NOT download yet** — the user is actively recording and the `.wav` file is still open/unflushed. Disconnect cleanly and check again on the next poll.
-3. **Auto-Sync Hardware Clock:**
-   * Read `+XREC:RTC`; if drift from phone wall clock > 5 seconds, send `+XREC:RTC,<now>`.
-4. **Diff & Resumable Download:**
-   * Call `+XREC:LS` and ignore any file with `size <= 44` bytes (empty WAV header).
-   * Compare `(filename, size)` against Cassini's imported recordings table.
-   * For each new recording, download into `<filename>.part` starting at `offset = partFile.length()` using `+XREC:GETS,<offset>,3840,640,<filename>`, verifying `offset` and `CRC-16/CCITT-FALSE` on every frame (up to 3 retries per burst).
-   * Atomically rename `.part` → `.wav` once `offset == size`, enqueue into Cassini's transcription pipeline, and optionally call `+XREC:DEL,<filename>` if auto-delete is enabled.
+### 6.2 After the session
+The recorder re-scans the file list when the user leaves BT mode, so a new or replaced `<stem>.cwx` shows the
+transcript mark in the Files list right away; the player opens the sidecar from the card when playback starts.
 
----
+## 7. Recordings and the CWX1 transcript sidecar
 
-## 5. Cryptographic & Checksum Test Vectors (For Unit Tests)
+### 7.1 Recordings
+`/record/REC_NNNN.wav`, RIFF WAV PCM 16-bit, 16 kHz, mono or stereo (files written by tools may be IMA-ADPCM).
+Ignore files of 44 bytes or less. A file being recorded grows: call `STAT` first and skip downloads while
+`media == 33`. Key sync state on (device address, name, size), optionally plus a hash of the first 4 KiB, because
+numbering restarts after the card is wiped.
 
-### CRC-16/CCITT-FALSE (`poly = 0x1021`, `init = 0xFFFF`, no reflect, `xorout = 0x0000`)
-* Input ASCII `"123456789"` → **`0x29B1`**
-* Input empty `""` → **`0xFFFF`**
+### 7.2 CWX1 format (summary)
+Reader: `open_fw/src/cwx.c`, `open_fw/include/openfw_cwx.h`. Reference encoder: `tools/cassini_to_device.py`
+(`build_cwx_bytes`). Sample: `web_emu/samples/cassini-final-moments.cwx`. All little-endian.
+
+* **Header (64 B)**: 0 `"CWX1"`; 4 u16 version = 1; 6 u16 speaker_count (<= 16); 8 u32 duration_ms; 12 u32
+  word_count; 16 u32 speakers_off (>= 64); 20 u32 seek_off; 24 u32 seek_count; 28 u32 words_off; 32 char[32] title
+  (NUL-padded, <= 31 bytes). Section order: speakers, seek, words.
+* **Speakers**: speaker_count x 24 B: u16 RGB565 colour, u8 flags (0), u8 reserved (0), char[20] label (<= 19 B,
+  NUL-padded).
+* **Seek table**: seek_count = duration_ms / 1000 + 1 entries of 8 B: u32 byte offset of a word relative to
+  words_off, u32 word index; entry k points at the first word whose end_ms >= k * 1000.
+* **Words**: u32 start_ms, u32 end_ms, u8 speaker_idx, u8 flags (0x01 TURN_START, 0x02 LOW_CONF), u8 text_len, then
+  text_len bytes of UTF-8 (the reader keeps up to 47 bytes). Words in turn order (not sorted by start). The encoder
+  maps typographic quotes, dashes and ellipsis to ASCII and strips control characters; the device font covers
+  Latin-1, Latin Extended-A, Greek and Cyrillic.
+
+## 8. Legacy stock-firmware patch (`fw_mod`) differences
+
+`fw_mod/bt_filesync.c` (v5+) runs on top of the stock `pen133_2.0.65` Bluetooth stack. It is not maintained for new
+features (no `REC` / `CAS` targets, no `PUTEND`). Differences from open_fw:
+
+* Device name `HW_XX` (last byte of the BT MAC); without the `bt-spp-uuid` patch it advertises HFP
+  (`0000111E-...`) instead of SPP, and Android's HeadsetService may contend for channel 1 (turn "Phone calls" off).
+* **Mandatory HFP `SLC_OPEN` handshake** on every RFCOMM connect before any `+XREC:` command. The recorder sends AT
+  commands; answer each line in a separate write about 50 ms apart:
+
+  | Recorder sends | Client replies |
+  | :--- | :--- |
+  | `AT+BRSF=<n>` | `+BRSF: 1007`, `OK` |
+  | `AT+BAC=...` | `OK` |
+  | `AT+CIND=?` | `+CIND: ("service",(0,1)),("call",(0,1)),("callsetup",(0,3)),("callheld",(0,2)),("signal",(0,5)),("roam",(0,1)),("battchg",(0,5))`, `OK` |
+  | `AT+CIND?` | `+CIND: 1,0,0,0,5,0,5`, `OK` |
+  | `AT+CMER=...` | `OK`, wait ~150 ms: SLC open |
+  | other `AT...` | `OK` |
+
+  `tools/bt_sync.py --transport auto` detects this (open_fw stays silent after connect).
+* PONG firmware field `pen133_2.0.65` instead of `openfw_v5`; the key is stored in PSMP (`"xrec_key"`), not on the
+  card.
+* Authentication expires after 10 minutes idle (open_fw: never, only on disconnect).
+* STAT `media`: `0x00` idle, `0x10` BTREADY, `0x21` RECORDPLAY, `0x22` RECORDPAUSE.
+* Only the `OTA` PUT target (max 600 B per chunk with `bt-rfcomm-turbo`). Without `bt-rfcomm-turbo` use GETS chunk
+  480 and total 1920.
+
+## 9. Test vectors
+
+### CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF, no reflection, xorout 0x0000)
+* ASCII `"123456789"` -> **`0x29B1`**
+* empty input -> **`0xFFFF`**
 
 ### HMAC-SHA256 (`+XREC:AUTH`)
 * Key (32 B hex): `000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f`
