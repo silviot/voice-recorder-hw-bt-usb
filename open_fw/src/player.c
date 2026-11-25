@@ -677,6 +677,7 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
     int bt_only = aout_route() == AOUT_ROUTE_BT;   /* the headset alone: jack edges change nothing (R-14) */
     int bt_route = aout_is_bt();                    /* the session can stop under us (BT off, fault) */
     if (aout_is_bt()) {
+        bt_hp_player_begin();                       /* keys / headset events from before this file do not apply */
         volume = bt_hp_vol31();
         aout_set_volume(PLAYER_VOL_GAIN(volume), 0x1FFu);
     }
@@ -782,6 +783,13 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
             cur_hp = hp_in;
         }
         bt_hp_poll();
+        if (aout_is_bt() && bt_hp_vol31() != volume) {
+            /* the headset changed its volume (absolute volume CHANGED / SetAbsoluteVolume): follow it, so the next
+             * VOL key steps from the headset's value instead of jumping back */
+            volume = bt_hp_vol31();
+            aout_set_volume(PLAYER_VOL_GAIN(volume), 0x1FFu);
+            ui_dirty = 1;
+        }
         if (act == PLAYER_ACT_NONE && aout_is_bt()) {
             /* AVRCP keys (design §6.6): past the screen-off gate (a headset button in a pocket still works) */
             switch (bt_hp_take_key()) {

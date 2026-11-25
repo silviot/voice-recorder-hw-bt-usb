@@ -20,6 +20,16 @@
  *       reconnect
  *   S9  headset forgets the key: a reconnect needs pairing, the window is closed -> Just Works refused (0036)
  *   S10 teardown while STARTED with a frozen headset: < 2 s, no hard path; a second full start/READY/stop works
+ * Review fixes (each check fails without its fix):
+ *   S1  a headphones stop never writes phone mode's bt_bonds.bin; the M2.3 gate is never evaluated inside the
+ *       session lock (a critical section on target)
+ *   S5b a local SUSPEND (REC switch, idle) is not counted or reported as a remote suspend
+ *   S5c START rejected twice: the retry waits BT_HP_START_RETRY_MS, START_FAILED; a later play press starts again
+ *   S6  single-button headsets: PLAY and PAUSE presses are toggles, STOP pauses; VOL passthrough is one player key
+ *       (bt_vol changes only through the player); S6b keys and player events from before a file are dropped by
+ *       bt_hp_player_begin()
+ *   S8b credit stall without a Disconnection Complete: the escalation restarts headphones mode, which reconnects
+ *   G   (test_bt_host, rows refused) scan and connect fail at once with BT_HP_MSG_UNSUPPORTED, no reconnect
  * Not covered here (listed in docs/BT_A2DP_HP_SESSION.md): 44.1 kHz-only peers (SEID 1 fallback), page-scan / LM
  * state variants, AVRCP FF/REW scrub, the player integration (test_player BT=1 variant), soak runs.
  * SPDX-License-Identifier: MIT */
@@ -46,6 +56,7 @@
 #include "oi_codec_sbc.h"
 
 int bth_headphones_scenario(const char *img_path);
+int bth_headphones_gated(const char *img_path);
 
 static int s_fail, s_checks;
 #define SCHECK(cond, ...)                                                                                             \
@@ -137,17 +148,20 @@ static volatile int s_feed;            /* the "player" writes a 1 kHz tone, 16 k
 static volatile uint32_t s_fed, s_keys[8], s_pev;
 static uint32_t s_phase;
 static volatile uint32_t s_vol31_req = 0xFFu;
+static volatile int s_hold;            /* the "player" is not running: keys and events stay queued (S6b) */
 
 static void app_hook(void)
 {
     bt_hp_poll();
     int k;
-    while ((k = bt_hp_take_key()) != BT_HP_KEY_NONE) {
+    while (!s_hold && (k = bt_hp_take_key()) != BT_HP_KEY_NONE) {
         if (k >= 0 && k < 8) {
             s_keys[k]++;
         }
     }
-    s_pev |= bt_hp_take_player_events();
+    if (!s_hold) {
+        s_pev |= bt_hp_take_player_events();
+    }
     if (s_vol31_req != 0xFFu) {
         bt_hp_set_vol31((uint8_t)s_vol31_req);
         s_vol31_req = 0xFFu;
@@ -180,6 +194,8 @@ static int fn_start(uint32_t a) { (void)a; return bt_hp_start(bthx_card(), 1); }
 static int fn_stop(uint32_t a) { (void)a; return bt_hp_stop(); }
 static int fn_scan(uint32_t a) { return bt_hp_scan((uint8_t)a); }
 static int fn_pair_hp(uint32_t a) { return bt_hp_connect_addr(s_hp_bda, (int)a); }
+static int fn_suspend(uint32_t a) { (void)a; bt_hp_suspend(); return 0; }
+static int fn_player_begin(uint32_t a) { (void)a; bt_hp_player_begin(); return 0; }
 static int fn_fmt(uint32_t a)
 {
     hp_sink_t *sk = (hp_sink_t *)s_att_sink;
@@ -228,6 +244,9 @@ static struct {
     uint8_t  streaming;
     uint8_t  tl;
     uint32_t avdt_rejects;
+    uint8_t  reject_start;         /* START commands to reject (BAD_STATE) before accepting again (S5c) */
+    uint32_t n_start;
+    uint32_t start_ms[4];          /* when the first STARTs arrived */
     /* media */
     uint32_t pkts, frames, bytes, bad, seq_err, ts_err, fpp_err, len_err, hdr_err;
     uint16_t last_seq;
@@ -622,6 +641,17 @@ static void avdt_in(const uint8_t *p, uint16_t n)
         }
         break;
     case 0x07:                                               /* START */
+        if (H.n_start < 4u) {
+            H.start_ms[H.n_start] = bt_xrec_plat_now_ms();
+        }
+        H.n_start++;
+        if (H.reject_start != 0u) {
+            H.reject_start--;
+            r[0] = n >= 3u ? p[2] : (uint8_t)(SEID_SNK << 2);  /* first failing SEID, BAD_STATE */
+            r[1] = 0x31u;
+            avdt_send(tl, 3u, sig, r, 2u);
+            return;
+        }
         H.streaming = 1u;
         H.have_last = 0u;
         break;
@@ -959,6 +989,14 @@ static uint32_t rom_count(uint16_t id)
     return n;
 }
 
+static uint32_t rom_stops(void)
+{
+    bth_rom_lock();
+    uint32_t n = fake_rom.stops;
+    bth_rom_unlock();
+    return n;
+}
+
 static void rom_log_clear(void)
 {
     bth_rom_lock();
@@ -1097,6 +1135,13 @@ int bth_headphones_scenario(const char *img_path)
     SCHECK(bt_ctrl_scan_enable() == 0u, "scan enable 0x%02X (want off)", bt_ctrl_scan_enable());
     stop_session("S1 stop");
     SCHECK(s_att_tx == NULL, "sink still attached after stop");
+    {
+        static uint8_t img[BT_STORE_IMAGE_MAX];
+        SCHECK(bthx_read_root_file("bt_bonds.bin", img, sizeof(img)) < 0,
+               "a headphones stop wrote phone mode's bt_bonds.bin");
+        SCHECK(bthx_gate_in_lock() == 0u, "pairing gate evaluated inside the session lock %u times",
+               bthx_gate_in_lock());
+    }
     controller_clean("S1");
     sbase_t w;
     (void)ssettle(&base0, &w);
@@ -1207,6 +1252,41 @@ int bth_headphones_scenario(const char *img_path)
         SCHECK(d.remote_suspends == 1u && d.starts >= 2u, "remote suspends %u starts %u", d.remote_suspends,
                d.starts);
     }
+    /* S5b: our own SUSPEND (REC switch; the idle suspend takes the same path) */
+    {
+        bt_hp_debug_t a, b;
+        s_feed = 0;
+        (void)WAIT(0, 100);
+        s_pev = 0u;
+        bt_hp_get_debug(&a);
+        SCHECK(bthx_call_fn(fn_suspend, 0u, 2000u) == 0, "bt_hp_suspend");
+        SCHECK(WAIT(UI().link == BT_HP_LINK_OPEN, 3000), "local suspend not done (link %u)", UI().link);
+        (void)WAIT(0, 300);
+        bt_hp_get_debug(&b);
+        SCHECK(b.suspends == a.suspends + 1u && b.remote_suspends == a.remote_suspends,
+               "S5b: suspends %u -> %u, remote suspends %u -> %u (a local suspend counted as remote)", a.suspends,
+               b.suspends, a.remote_suspends, b.remote_suspends);
+        SCHECK((s_pev & BT_HP_PEV_REMOTE_SUSPEND) == 0u, "S5b: local suspend raised REMOTE_SUSPEND (0x%x)", s_pev);
+    }
+    /* S5c: the headset refuses START twice (busy with another source), later accepts */
+    {
+        s_pev = 0u;
+        H.n_start = 0u;
+        H.reject_start = 2u;
+        s_feed = 1;
+        SCHECK(WAIT(s_pev & BT_HP_PEV_START_FAILED, 4000), "S5c: no START_FAILED (0x%x, STARTs %u)", s_pev, H.n_start);
+        s_feed = 0;                                          /* the player pauses */
+        SCHECK(H.n_start == 2u && H.start_ms[1] - H.start_ms[0] >= BT_HP_START_RETRY_MS - 50u,
+               "S5c: %u STARTs, retry after %u ms (want 2, >= %u)", H.n_start, H.start_ms[1] - H.start_ms[0],
+               BT_HP_START_RETRY_MS);
+        H.reject_start = 0u;
+        (void)WAIT(0, 300);
+        s_feed = 1;                                          /* play pressed again */
+        SCHECK(wait_link(BT_HP_LINK_STARTED, 8000), "S5c: no START after START_FAILED (link %u)", UI().link);
+        bt_hp_debug_t d;
+        bt_hp_get_debug(&d);
+        SCHECK(d.start_fail == 2u, "S5c: start_fail %u", d.start_fail);
+    }
 
     /* ---- S6 ---- */
     bth_log("[S6] AVRCP keys and absolute volume (heap seq %u)\n", (unsigned)bth_heap_seq());
@@ -1218,9 +1298,12 @@ int bth_headphones_scenario(const char *img_path)
     memset((void *)s_keys, 0, sizeof(s_keys));
     avrc_key(0x44u);                                         /* PLAY */
     avrc_key(0x46u);                                         /* PAUSE */
+    avrc_key(0x45u);                                         /* STOP */
     avrc_key(0x4Bu);                                         /* FORWARD */
-    SCHECK(WAIT(s_keys[BT_HP_KEY_PLAY] == 1u && s_keys[BT_HP_KEY_PAUSE] == 1u && s_keys[BT_HP_KEY_NEXT] == 1u, 2000),
-           "keys PLAY %u PAUSE %u NEXT %u", s_keys[BT_HP_KEY_PLAY], s_keys[BT_HP_KEY_PAUSE], s_keys[BT_HP_KEY_NEXT]);
+    SCHECK(WAIT(s_keys[BT_HP_KEY_TOGGLE] == 2u && s_keys[BT_HP_KEY_PAUSE] == 1u && s_keys[BT_HP_KEY_NEXT] == 1u, 2000),
+           "keys TOGGLE %u (PLAY/PAUSE presses) PLAY %u PAUSE %u (STOP) NEXT %u", s_keys[BT_HP_KEY_TOGGLE],
+           s_keys[BT_HP_KEY_PLAY], s_keys[BT_HP_KEY_PAUSE], s_keys[BT_HP_KEY_NEXT]);
+    SCHECK(s_keys[BT_HP_KEY_PLAY] == 0u, "PLAY press delivered as PLAY (dropped by a playing player)");
     SCHECK(H.psth_acks == 0u || 1, "passthrough");
     SCHECK(WAIT(H.getcaps >= 1u && H.regs >= 1u, 3000), "absolute volume: GetCapabilities %u, registrations %u",
            H.getcaps, H.regs);
@@ -1232,6 +1315,31 @@ int bth_headphones_scenario(const char *img_path)
     s_vol31_req = 10u;
     SCHECK(WAIT(H.setvol > sv && H.setvol_last == (10u * 127u + 15u) / 31u, 2000), "SetAbsoluteVolume %u (last %u)",
            H.setvol, H.setvol_last);
+    {
+        /* VOL+ passthrough: one player key; bt_vol moves only through the player's bt_hp_set_vol31 */
+        (void)WAIT(0, 100);
+        uint8_t v0 = UI().bt_vol;
+        avrc_key(0x41u);                                     /* VOLUME UP */
+        SCHECK(WAIT(s_keys[BT_HP_KEY_VOL_UP] == 1u, 2000), "VOL_UP key %u", s_keys[BT_HP_KEY_VOL_UP]);
+        SCHECK(UI().bt_vol == v0, "VOL_UP passthrough changed bt_vol %u -> %u besides the player key", v0,
+               UI().bt_vol);
+    }
+    /* S6b: keys and events queued while no file plays are dropped when the next file starts */
+    {
+        s_hold = 1;
+        memset((void *)s_keys, 0, sizeof(s_keys));
+        s_pev = 0u;
+        avrc_key(0x4Bu);                                     /* FORWARD on the menu */
+        s_feed = 0;                                          /* no file plays: no demand START after the suspend */
+        avdt_cmd(0x09u);                                     /* the headset suspends (taken off) */
+        SCHECK(WAIT(UI().link == BT_HP_LINK_OPEN, 3000), "S6b: remote suspend not seen (link %u)", UI().link);
+        (void)WAIT(0, 200);
+        SCHECK(bthx_call_fn(fn_player_begin, 0u, 2000u) == 0, "bt_hp_player_begin");
+        s_hold = 0;
+        (void)WAIT(0, 300);
+        SCHECK(s_keys[BT_HP_KEY_NEXT] == 0u && (s_pev & BT_HP_PEV_REMOTE_SUSPEND) == 0u,
+               "S6b: stale NEXT %u / player events 0x%x reached the new file", s_keys[BT_HP_KEY_NEXT], s_pev);
+    }
 
     /* ---- S7 ---- */
     bth_log("[S7] headset drops the link, reconnect with the stored key (heap seq %u)\n", (unsigned)bth_heap_seq());
@@ -1275,6 +1383,34 @@ int bth_headphones_scenario(const char *img_path)
         SCHECK(rom_count(0xE400u) >= 1u, "no 0406 reached the controller");
     }
     bth_step_done();
+
+    /* ---- S8b ---- */
+    bth_log("[S8b] credit stall, no Disconnection Complete: escalation restarts headphones mode (heap seq %u)\n",
+            (unsigned)bth_heap_seq());
+    {
+        s_feed = 1;
+        SCHECK(wait_link(BT_HP_LINK_STARTED, 5000) && WAIT(H.pkts > 20u, 3000), "S8b: not streaming before the stall");
+        s_pev = 0u;
+        bth_rom_lock();
+        uint32_t stops = fake_rom.stops;
+        fake_rom.auto_ack_acl = false;                       /* NOCP stops ... */
+        fake_peer.defer_detach = true;                       /* ... and the 0406 never completes (ghost link) */
+        bth_rom_unlock();
+        bth_step("S8b stall", 40000u);
+        SCHECK(WAIT(s_pev & BT_HP_PEV_STALLED, 4000), "S8b: no STALLED event (0x%x)", s_pev);
+        s_feed = 0;
+        bool esc = WAIT(rom_stops() != stops, BT_HP_STALL_DISC_MS + 6000u);
+        SCHECK(esc, "S8b: no escalation (controller not stopped)");
+        peer_link_reset();
+        bth_rom_lock();
+        fake_peer.defer_detach = false;
+        fake_rom.auto_ack_acl = true;
+        bth_rom_unlock();
+        SCHECK(WAIT(UI().state == BT_HP_ST_READY && UI().link == BT_HP_LINK_OPEN, 30000),
+               "S8b: headphones mode not back and reconnected (state %u link %u)", UI().state, UI().link);
+        bth_step_done();
+        controller_clean("S8b");
+    }
 
     /* ---- S9 ---- */
     bth_log("[S9] headset lost its key, window closed: Just Works refused (heap seq %u)\n", (unsigned)bth_heap_seq());
@@ -1340,7 +1476,8 @@ int bth_headphones_scenario(const char *img_path)
         known_leak_bytes = after_frozen.bytes > base.bytes ? after_frozen.bytes - base.bytes : 0u;
         bth_log("    S10: frozen teardown left %zu blocks / %zu B (AVDTP ccb/scb queues of the dead link + btc's resident "
                 "connect queue)\n", known_leak_blocks, known_leak_bytes);
-        SCHECK(known_leak_blocks <= 16u && known_leak_bytes <= 4096u, "frozen teardown left %zu blocks / %zu B",
+        /* two frozen-peer teardowns in this run (S8b's stall escalation, S10), up to 16 blocks / 4 KiB each */
+        SCHECK(known_leak_blocks <= 32u && known_leak_bytes <= 8192u, "frozen teardowns left %zu blocks / %zu B",
                known_leak_blocks, known_leak_bytes);
     }
 
@@ -1364,5 +1501,48 @@ out:
         bth_heap_dump_since(base.seq);
     }
     bth_log("test_bt_host headphones: %d checks, %d failures\n", s_checks, s_fail);
+    return s_fail ? 1 : 0;
+}
+
+/* G (test_bt_host: bt_ctrl refuses 0401/0402/0405/0408, as in a release BT=1 image): headphones mode starts, but
+ * search and connect fail at once with BT_HP_MSG_UNSUPPORTED instead of a 0-device search / endless CONNECT_FAIL. */
+static int fn_pair_hp_nopair(uint32_t a) { (void)a; return bt_hp_connect_addr(s_hp_bda, 0); }
+
+int bth_headphones_gated(const char *img_path)
+{
+    bth_log("[G] headphones mode with the initiator rows refused (release image) (heap seq %u)\n",
+            (unsigned)bth_heap_seq());
+    FILE *fimg = fopen(img_path, "rb");
+    if (fimg == NULL || fread(s_disk, 1u, sizeof(s_disk), fimg) != sizeof(s_disk) || exfat_mount(&s_card, &s_dev) != 0) {
+        bth_log("G: %s is not a %u-sector exFAT image\n", img_path, CARD_SECTORS);
+        if (fimg) fclose(fimg);
+        return 1;
+    }
+    fclose(fimg);
+    peer_link_reset();
+    world();
+    SCHECK(bthx_init(&s_card) == 0, "bthx_init");
+    bthx_set_app_hook(app_hook);
+    vTaskDelay(pdMS_TO_TICKS(20));
+    if (start_ready("G start")) {
+        rom_log_clear();
+        uint32_t seq = UI().msg_seq;
+        SCHECK(bthx_call_fn(fn_scan, 4u, 2000u) != 0, "G: bt_hp_scan accepted with 0401 refused");
+        SCHECK(UI().msg == BT_HP_MSG_UNSUPPORTED && UI().msg_seq != seq, "G: scan msg %u (want UNSUPPORTED)", UI().msg);
+        SCHECK(UI().scanning == 0u, "G: scanning");
+        seq = UI().msg_seq;
+        SCHECK(bthx_call_fn(fn_pair_hp, 1u, 2000u) != 0 && bthx_call_fn(fn_pair_hp_nopair, 0u, 2000u) != 0,
+               "G: bt_hp_connect_addr accepted with 0405 refused");
+        SCHECK(UI().msg == BT_HP_MSG_UNSUPPORTED && UI().msg_seq != seq, "G: connect msg %u (want UNSUPPORTED)",
+               UI().msg);
+        (void)WAIT(0, 1500);
+        SCHECK(UI().link == BT_HP_LINK_NONE && !UI().reconnecting, "G: link %u reconnecting %u", UI().link,
+               UI().reconnecting);
+        SCHECK(rom_count(0xE000u) == 0u && rom_count(0xE004u) == 0u, "G: inquiry / page reached the ROM");
+        stop_session("G stop");
+    }
+    controller_clean("G");
+    bthx_set_app_hook(NULL);
+    bth_log("test_bt_host headphones (gated): %d checks, %d failures\n", s_checks, s_fail);
     return s_fail ? 1 : 0;
 }

@@ -1586,6 +1586,7 @@ static const char *hp_msg_text(uint8_t msg)
     case BT_HP_MSG_PAIRING_UNAVAILABLE: return "Pairing unavailable";
     case BT_HP_MSG_STALLED:             return "Link stalled, reconnecting";
     case BT_HP_MSG_START_FAILED:        return "Headphones not ready";
+    case BT_HP_MSG_UNSUPPORTED:         return "Not in this build"; /* TODO(i18n) */
     default:                            return "";
     }
 }

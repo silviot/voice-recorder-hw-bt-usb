@@ -405,8 +405,11 @@ void bt_xrec_plat_set_mode(uint8_t mode, int (*profile_down)(void))
     s_profile_down = profile_down;
 }
 
-static const char *bond_file(void) { return s_mode == BT_XREC_MODE_HP ? HP_BOND_FILE : BOND_FILE; }
-static const char *bond_tmp(void) { return s_mode == BT_XREC_MODE_HP ? HP_BOND_TMP : BOND_TMP; }
+/* The file of a mode's bonds. Loads use the mode of the session starting; writes use the mode whose bonds the RAM
+ * store holds (s_store_mode), so a flush after a mode switch can never land in the other mode's file (review finding:
+ * the headphones stop switched to phone mode before its final flush and overwrote bt_bonds.bin). */
+static const char *bond_file(uint8_t mode) { return mode == BT_XREC_MODE_HP ? HP_BOND_FILE : BOND_FILE; }
+static const char *bond_tmp(uint8_t mode) { return mode == BT_XREC_MODE_HP ? HP_BOND_TMP : BOND_TMP; }
 
 /* Bond store (plan M2 "Store"): loaded before esp_bluedroid_init(); written by the app when bt_store asks. */
 static void bonds_load(void)
@@ -422,7 +425,7 @@ static void bonds_load(void)
     }
     char path[24];
     path[0] = '/';
-    memcpy(&path[1], bond_file(), strlen(bond_file()) + 1u);
+    memcpy(&path[1], bond_file(s_mode), strlen(bond_file(s_mode)) + 1u);
     exfat_entry_t ent;
     if (exfat_find_path(s_vol, path, &ent) != 0 || ent.is_dir || ent.size == 0u ||
         ent.size > BT_STORE_IMAGE_MAX) {
@@ -446,7 +449,7 @@ static void bonds_load(void)
 
 static void bonds_write(void)
 {
-    if (!bt_store_dirty() || !s_sd || s_vol == NULL) {
+    if (!bt_store_dirty() || !s_sd || s_vol == NULL || s_store_mode == 0xFFu) {
         return;
     }
     uint8_t *img = (uint8_t *)pvPortMalloc(BT_STORE_IMAGE_MAX);
@@ -455,7 +458,7 @@ static void bonds_write(void)
         return;
     }
     size_t n = bt_store_serialize(img, BT_STORE_IMAGE_MAX);
-    if (n != 0u && save_root_file_atomic(bond_tmp(), bond_file(), img, (uint32_t)n) == 0) {
+    if (n != 0u && save_root_file_atomic(bond_tmp(s_store_mode), bond_file(s_store_mode), img, (uint32_t)n) == 0) {
         bt_store_mark_saved();       /* only now: a failed write keeps the store dirty (review finding) */
         s_bond_fails = 0u;
     } else {

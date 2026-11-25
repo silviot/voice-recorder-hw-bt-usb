@@ -10,7 +10,7 @@ work: fold it into the design's live log section** (the design file lives in the
 
 | Part | Files | Notes |
 |---|---|---|
-| Session | `bt_port/bt_hp.h`, `bt_port/bt_hp_bluedroid.c` | Design §6: states OFF/UP/CONFIG/READY/FAULTED, link NONE/CONNECTING/OPEN/STARTED/STALLED. Config per §5.4 (GAP, AVRC CT+TG with the passthrough filter, A2DP source init, SEPs after PROF_STATE). Discovery with the CoD audio filter and names; pick → pairing window (120 s, that address only) → connect; Just Works through patch 0036; AUTH check; A2DP connect; transmit path wired in BTC context; media control one-at-a-time with one START retry; demand start; idle suspend 20 s; remote SUSPEND / unasked START; reconnect backoff 0/3/10/30/60 s then every 60 s; credit stall → 0406 → reconnect, escalation after 8 s; AVRCP keys and absolute volume (capabilities, register, re-register after CHANGED, SetAbsoluteVolume); teardown. |
+| Session | `bt_port/bt_hp.h`, `bt_port/bt_hp_bluedroid.c` | Design §6: states OFF/UP/CONFIG/READY/FAULTED, link NONE/CONNECTING/OPEN/STARTED/STALLED. Config per §5.4 (GAP, AVRC CT+TG with the passthrough filter, A2DP source init, SEPs after PROF_STATE). Discovery with the CoD audio filter and names; pick → pairing window (120 s, that address only) → connect; Just Works through patch 0036; AUTH check; A2DP connect; transmit path wired in BTC context; media control one-at-a-time with one START retry; demand start; idle suspend 20 s; remote SUSPEND / unasked START; reconnect backoff 0/3/10/30/60 s then every 60 s; credit stall → 0406 → reconnect, escalation after 8 s (stop + restart of headphones mode, which reconnects); AVRCP keys and absolute volume (capabilities, register, re-register after CHANGED, SetAbsoluteVolume); teardown. |
 | Shared platform | `bt_port/bt_xrec_bluedroid.h` (`bt_xrec_plat_set_mode`), `bt_xrec_fw.c`, `bt_store.c` (`bt_store_reset`) | Both modes use phone mode's platform seam: bring-up/teardown jobs, the 2 s hard-stop deadline, hard path, entropy + ROM key staging, controller notes, bond store. The mode picks `bt_bonds.bin` or `bt_hp_bonds.bin`, resets the RAM store on a mode change (§6.4), and adds the profile teardown (AVRC + A2DP deinit, ≤ 600 ms) to the down job. `bt_shutdown()` stops either mode; each mode refuses to start while the other runs. |
 | Settings file | `bt_xrec_fw.c` (`bt_hp_plat_cfg_*`) | `SD:/bt_hp_cfg.bin` (64 B): output mode, `bt_vol`, last headset address + name. |
 | Bluedroid patches | 0036-0039 (`third_party/bluedroid_patches/README.md`) | 0036 Just Works hook (design patch D); 0037/0038 event/message copy sizes (ASan over-reads found by scenario S); 0039 local AV close on deregister (design patch E). |
@@ -20,7 +20,11 @@ work: fold it into the design's live log section** (the design file lives in the
 | Bench | `bt_port/bt_bench.c/.h`, `bt_bench_fw.c`, `src/main.c` | `mode=hp`: stages scan / connect / tone / player with per-second stats; `hp_tone_hz=0` alternates 440/880 Hz; player stage defaults to the first recording. |
 | Host scenario S | `tests/bt_host/test_headphones.c` (`test_bt_host_hp hps`, in `make test-bt-host`) | Fake headset: L2CAP acceptor, SDP server (A2DP sink, AVRCP CT and TG records), AVDTP acceptor (SBC sink, delay report), media receiver (RTP/SBC checks, vendored SBC decoder, pacing), minimal AVCTP/AVRCP. |
 
-## Host results (`test_bt_host_hp hps`, ASan/UBSan, 90 checks, 0 failures)
+## Host results (`test_bt_host_hp hps`, ASan/UBSan, 117 checks, 0 failures; scenario G 20 checks)
+
+After the second review round (table below) S also runs S5b, S5c, S6b and S8b; the two frozen-peer teardowns of the
+run (S8b's escalation, S10) leave 31 blocks / 3392 B together (known leak 13, bound 32 blocks / 8 KiB).
+
 
 - S1 start → READY → stop: 213 ms teardown, heap/tasks/timers back to the baseline.
 - S2 discovery: 3 devices, 2 audio-class, the headset named.
@@ -64,7 +68,9 @@ work: fold it into the design's live log section** (the design file lives in the
    no prompt.
 9. **AVRCP subset:** FAST_FORWARD/REWIND (scrub) are not mapped; FORWARD/BACKWARD map to the player's seek actions (next
    file in Track skip mode, ±seek otherwise, as the arrow taps); keys outside the player are ignored (design: PLAY on
-   Home resumes the last file). PLAY/PAUSE are state-aware.
+   Home resumes the last file) and dropped when the next file starts (`bt_hp_player_begin`). PLAY and PAUSE presses
+   are both toggles and STOP pauses: we register no PLAYBACK_STATUS notification and a paused player keeps the
+   stream STARTED until the idle suspend, so one-button headsets guess which of PLAY/PAUSE to send.
 10. **Idle:** suspend after 20 s without real audio; the 10 min idle disconnect is not implemented.
 11. **Player:** writes stereo (mono pass-through not used yet); the volume overlay keeps its HP/SPK label.
 12. **Headphones mode starts when the Headphones screen opens** (and reconnects then), not at boot.
@@ -73,6 +79,27 @@ work: fold it into the design's live log section** (the design file lives in the
     responsive headset does not leak.
 14. **Bench:** the tone goes through `aout` (Audio output forced to Headphones for the run), -9.5 dBFS; stats every
     second for 15 s, then every 15 s (the 8 KiB log capture); the player stage plays one file once.
+
+## Review fixes (second review round)
+
+Each host-testable one has a check that failed before the fix (scenario S unless noted; `make test-bt-host`).
+
+| Finding | Fix | Test |
+|---|---|---|
+| Release `BT=1` images (rows `0401/0402/0405/0408` refused) showed a 0-device search and an endless `CONNECT_FAIL` | `bt_hp_scan` / `bt_hp_connect_addr` fail at once with `BT_HP_MSG_UNSUPPORTED` ("Not in this build"), no reconnect schedule, `ready ... hp_rows=0/1`. Headphones tests need `BT=1 BENCH=1 HP_GATES=1` | scenario G (`test_bt_host hpgated`, rows refused) |
+| The headphones stop switched to phone mode before its final bond flush: `bt_hp_bonds.bin` content was written to `bt_bonds.bin` (Bluedroid's disable always dirties the store) | flush first, then switch; `bonds_write` writes the file of the mode whose bonds the RAM store holds (`s_store_mode`), firmware and host platform | S1: no `bt_bonds.bin` after a headphones stop |
+| `config_finish` evaluated the M2.3 gate (entropy mutex) inside `bt_xrec_plat_lock()` (a critical section on target) | gate computed outside the lock | S1: the host lock counts gate calls made inside it |
+| Our SUSPEND (REC switch, idle) counted and reported as a remote suspend (the ext-codec source acks SUSPEND before it reports the audio state, so `mc_out` was already clear) | `suspend_pending` set under the lock in `mc_issue`, consumed in `a2d_cb` (`audio SUSPEND ... ours=1`) | S5b |
+| START failed for good was sticky until the link dropped (play pressed later: silence, frozen position); demand START bypassed the 500 ms retry delay | retry only from `ready_poll` at `start_retry_at`; a failed send or an unacknowledged START counts as an attempt; after `BT_HP_START_COOLDOWN_MS` (2 s) new demand (play press) or a still-waiting unmuted player starts again; STARTED without an armed tick is a final failure (SUSPEND + `START_FAILED`) | S5c (headset rejects START twice) |
+| Keys / player events queued while no file played (menu presses, LINK_LOST, suspends) acted on the next file | `bt_hp_player_begin()` drops them; the player calls it when a file starts on the headset route | S6b |
+| `BT_HP_KEY_TOGGLE` never produced; PLAY dropped while playing, PAUSE while paused | PLAY/PAUSE → TOGGLE, STOP → PAUSE; the key decision is logged | S6 |
+| VOL passthrough changed `bt_vol` by 4 and pushed a player key (double); the player's volume went stale after headset-side changes | passthrough is only a player key; the player follows `bt_hp_vol31()` every loop on the headset route | S6 (the player part has no host test: no BT `test_player` variant) |
+| Stall escalation turned headphones mode off (design §4.6/Q7: restart and reconnect) | stop + `bt_hp_start()` again in the same poll (reconnect from backoff step 0), at most once per 5 min (`BT_HP_AUTO_RESTART_MIN_MS`); an explicit stop cancels it | S8b (0406 never completes) |
+| Connect timeout / disconnect could not cancel a first connect (no handle yet) | cancel by address (`esp_a2d_source_disconnect`, deprecated upstream, the only form without a handle); until the abandoned connect reports (or 30 s) no new connect starts; a late `CONNECTED` for another target (or after a user disconnect) is closed; `connect_now` never pages while a link exists | not host-tested (needs a page/pairing that stalls > 30 s, which the fake ROM cannot model) |
+| AVRCP CT commands used the A2DP handle (invalid before A2DP `CONNECTED` on headsets that open AVCTP first) | the CT connection's own handle (`ct_hdl`) | not host-tested (the fake headset opens AVCTP after AVDTP) |
+| Role Change before Connection Complete was lost (linkinfo `role=M` while slave) | kept for the paged/accepted address and applied at Connection Complete | `test-bt-ctrl` `hp_link_view_early_role` |
+| `pkt_type` in linkinfo is always 0 (040F REJ) | linkinfo also logs `req_pt` / `allow_rs` (our 0405) and the peer's `edr` / `slots35` (event 0x0B) | `hp_link_view_early_role` |
+| Recipe deleted the bond between stages; `hp_pick=first` could pick a phone/PC | recipe split (bond kept), `hp_pick=last` (stored headset); `bt_bench_hp_pick`: AV major class only, headset types first | `test-bt-port` (`test_bt_bench`) |
 
 ## Not tested / open
 

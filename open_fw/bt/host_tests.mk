@@ -91,6 +91,9 @@ test-bt-host:
 	dd if=/dev/zero of=$(BT_HOST_TEST_DIR)/hp_exfat.img bs=512 count=4096 status=none
 	/usr/sbin/mkfs.exfat -q -b 4096 -c 4096 $(BT_HOST_TEST_DIR)/hp_exfat.img
 	$(BT_HOST_TEST_DIR)/asan/test_bt_host_hp hps $(BT_HOST_TEST_DIR)/hp_exfat.img
+	@# scenario G: a release image (rows refused) fails search / connect at once with a clear message
+	/usr/sbin/mkfs.exfat -q -b 4096 -c 4096 $(BT_HOST_TEST_DIR)/hp_exfat.img
+	$(BT_HOST_TEST_DIR)/asan/test_bt_host hpgated $(BT_HOST_TEST_DIR)/hp_exfat.img
 	set -e; for m in init enable disable deinit; do \
 		python3 tests/bt_host/run_sweep.py $(BT_HOST_TEST_DIR)/asan/test_bt_host --mode $$m --jobs $(BT_HOST_JOBS) \
 			--timeout 120 --waivers tests/bt_host/sweep_waivers.txt; done

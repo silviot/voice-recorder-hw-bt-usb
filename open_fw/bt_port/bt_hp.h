@@ -31,8 +31,11 @@
 #define BT_HP_SCAN_SECS_DEF   10u      /* discovery length (0401 Inquiry_Length = ceil(secs / 1.28)) */
 #define BT_HP_IDLE_SUSPEND_MS 20000u   /* design §6.5: STARTED with no real audio for this long -> SUSPEND */
 #define BT_HP_START_RETRY_MS  500u     /* design §4.5: a failed START is retried once after this */
+#define BT_HP_START_COOLDOWN_MS 2000u  /* after START failed twice: new demand (play pressed) starts again after this */
+#define BT_HP_AUTO_RESTART_MIN_MS 300000u  /* stall escalation: at most one automatic restart per 5 minutes */
 #define BT_HP_CONNECT_TO_MS   30000u   /* an A2DP connect that has not reported CONNECTED/DISCONNECTED by then */
-#define BT_HP_STALL_DISC_MS   8000u    /* design §4.6: no Disconnection Complete after the stall's 0406 -> restart */
+#define BT_HP_STALL_DISC_MS   8000u    /* design §4.6: no Disconnection Complete after the stall's 0406 -> restart
+                                          (stop + bt_hp_start again: reconnects to the last headset) */
 #define BT_HP_TICK_STOP_MS    100u     /* design §4.3: bound of the BTC-context tick stop at teardown */
 #define BT_HP_DEINIT_WAIT_MS  600u     /* design §5.5: ESP_A2D_DEINIT_SUCCESS wait inside the down job */
 #define BT_HP_VOL_DEF         64u      /* bt_vol default (0..127, AVRCP scale) */
@@ -62,6 +65,7 @@ enum {
     BT_HP_MSG_SCAN_DONE, BT_HP_MSG_SCAN_FAIL, BT_HP_MSG_PAIRED, BT_HP_MSG_PAIR_FAIL, BT_HP_MSG_PAIR_REFUSED,
     BT_HP_MSG_CONNECTED, BT_HP_MSG_CONNECT_FAIL, BT_HP_MSG_DISCONNECTED, BT_HP_MSG_RECONNECTING, BT_HP_MSG_FORGOTTEN,
     BT_HP_MSG_PAIRING_UNAVAILABLE, BT_HP_MSG_STALLED, BT_HP_MSG_START_FAILED,
+    BT_HP_MSG_UNSUPPORTED,           /* search / connect refused: this image's bt_ctrl refuses 0401/0402/0405/0408 */
 };
 
 typedef struct {
@@ -131,13 +135,13 @@ int  bt_hp_streaming(void);
 
 /* ---- player integration (src/player.c, BT=1) ---- */
 #define BT_HP_KEY_NONE      0
-#define BT_HP_KEY_PLAY      1         /* AVRCP PLAY press: resume if paused */
-#define BT_HP_KEY_PAUSE     2         /* AVRCP PAUSE / STOP press: pause if playing */
+#define BT_HP_KEY_PLAY      1         /* resume if paused (not produced by AVRCP: PLAY presses are toggles) */
+#define BT_HP_KEY_PAUSE     2         /* AVRCP STOP press: pause if playing */
 #define BT_HP_KEY_NEXT      3         /* AVRCP FORWARD press */
 #define BT_HP_KEY_PREV      4         /* AVRCP BACKWARD press */
 #define BT_HP_KEY_VOL_UP    5         /* passthrough volume without absolute volume */
 #define BT_HP_KEY_VOL_DOWN  6
-#define BT_HP_KEY_TOGGLE    7         /* AVRCP PLAY while playing on headsets with one button: treated as toggle */
+#define BT_HP_KEY_TOGGLE    7         /* AVRCP PLAY or PAUSE press: one-button headsets guess which to send */
 int  bt_hp_take_key(void);            /* next AVRCP key (BT_HP_KEY_*), BT_HP_KEY_NONE when none */
 /* Events that pause the player (design §6.7): link lost, credit stall, remote suspend, START failed for good.
  * Returns the bits seen since the last call (BT_HP_PEV_*). */
@@ -146,6 +150,9 @@ int  bt_hp_take_key(void);            /* next AVRCP key (BT_HP_KEY_*), BT_HP_KEY
 #define BT_HP_PEV_REMOTE_SUSPEND 0x4u
 #define BT_HP_PEV_START_FAILED   0x8u
 uint32_t bt_hp_take_player_events(void);
+/* A file starts on the headset route: drop the keys and player events queued before it (pressed on the menu, a link
+ * lost or a suspend while no file played) so they do not act on the new file. */
+void     bt_hp_player_begin(void);
 /* Player volume 0..31 <-> bt_vol 0..127 (design §6.6). */
 uint8_t bt_hp_vol31(void);
 void    bt_hp_set_vol31(uint8_t v31);     /* sends SetAbsoluteVolume when the headset supports it */

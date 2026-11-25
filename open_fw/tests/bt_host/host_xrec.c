@@ -36,8 +36,9 @@
 #include "host_xrec.h"
 
 #define BTHX_RECOVER_PRIO 2u
-#define BOND_FILE (s_mode == BT_XREC_MODE_HP ? "bt_hp_bonds.bin" : "bt_bonds.bin")
-#define BOND_TMP (s_mode == BT_XREC_MODE_HP ? ".bt_hp_bonds.tmp" : ".bt_bonds.tmp")
+/* as bt_xrec_fw.c: loads by the starting session's mode, writes by the mode whose bonds the RAM store holds */
+#define BOND_FILE(m) ((m) == BT_XREC_MODE_HP ? "bt_hp_bonds.bin" : "bt_bonds.bin")
+#define BOND_TMP(m) ((m) == BT_XREC_MODE_HP ? ".bt_hp_bonds.tmp" : ".bt_bonds.tmp")
 static uint8_t s_mode;
 static uint8_t s_store_mode = 0xFFu;
 static int (*s_profile_down)(void);
@@ -84,8 +85,21 @@ static uint32_t s_bond_retry_at;
 
 /* ============================================ small helpers ===================================================== */
 uint32_t bt_xrec_plat_now_ms(void) { return (uint32_t)(us_timer_now() / 1000u); }
-void bt_xrec_plat_lock(void) { taskENTER_CRITICAL(); }
-void bt_xrec_plat_unlock(void) { taskEXIT_CRITICAL(); }
+/* The lock is a critical section, as on target (taskENTER_CRITICAL with interrupts masked): nothing that can block
+ * (the entropy mutex behind the M2.3 gate) may run inside it. s_lock_depth lets the gate check that (review finding:
+ * config_finish evaluated the gate under the lock). */
+static volatile uint32_t s_lock_depth, s_gate_in_lock;
+void bt_xrec_plat_lock(void)
+{
+    taskENTER_CRITICAL();
+    s_lock_depth++;
+}
+void bt_xrec_plat_unlock(void)
+{
+    s_lock_depth--;
+    taskEXIT_CRITICAL();
+}
+uint32_t bthx_gate_in_lock(void) { return s_gate_in_lock; }
 
 void bt_xrec_plat_notify_app(void)
 {
@@ -149,6 +163,9 @@ int bt_xrec_plat_entropy(void *out, size_t n)
  * next start, exactly as on target. The RNG-pool reason (starved) has no host model (test_bt_rom_rng covers it). */
 const char *bt_xrec_plat_pairing_block(void)
 {
+    if (s_lock_depth != 0u) {
+        s_gate_in_lock++;            /* on target: xSemaphoreTake(entropy mutex) inside a critical section */
+    }
     bt_ent_stats_t es;
     bt_entropy_get_stats(&es);
     if (es.health_failures != 0u) {
@@ -244,7 +261,7 @@ static void bonds_load(void)
         bt_xrec_plat_log("BT bonds not loaded: no memory");
         return;
     }
-    int n = read_root_file(s_vol, BOND_FILE, img, BT_STORE_IMAGE_MAX);
+    int n = read_root_file(s_vol, BOND_FILE(s_mode), img, BT_STORE_IMAGE_MAX);
     if (n > 0) {
         esp_err_t r = bt_store_load(img, (size_t)n);
         if (r != ESP_OK) {
@@ -257,7 +274,7 @@ static void bonds_load(void)
 
 static void bonds_write(void)
 {
-    if (!bt_store_dirty() || !s_sd || s_vol == NULL) {
+    if (!bt_store_dirty() || !s_sd || s_vol == NULL || s_store_mode == 0xFFu) {
         return;
     }
     uint8_t *img = (uint8_t *)pvPortMalloc(BT_STORE_IMAGE_MAX);
@@ -265,7 +282,7 @@ static void bonds_write(void)
         return;                      /* retried on the next flush request / session end */
     }
     size_t n = bt_store_serialize(img, BT_STORE_IMAGE_MAX);
-    if (n != 0u && !s_fail_bond_writes && save_root_file_atomic(BOND_TMP, BOND_FILE, img, (uint32_t)n) == 0) {
+    if (n != 0u && !s_fail_bond_writes && save_root_file_atomic(BOND_TMP(s_store_mode), BOND_FILE(s_store_mode), img, (uint32_t)n) == 0) {
         bt_store_mark_saved();       /* as bt_xrec_fw.c: only after the write succeeded */
         s_bond_fails = 0u;
         s_bond_writes++;

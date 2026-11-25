@@ -774,8 +774,11 @@ keys for the UI part). Exp numbers refer to design §11.
 
 **Build the bench image with the headphones rows forwarded**: `make -C open_fw BT=1 BENCH=1 HP_GATES=1`. Release
 `BT=1` images still **refuse** `0401`/`0402`/`0405`/`0408` (inquiry, cancel, create connection, cancel connection),
-so in them headphones mode starts but can neither search nor connect (`BT HCI inquiry st=0x..` local refusal); each
-row flips to forwarded only after its silicon experiment passed (design §7). The bench image runs the UI normally as
+so in them headphones mode starts but can neither search nor connect: `Search` and picking a device fail at once with
+the footer `Not in this build` and `BT hp discovery refused=this build's bt_ctrl refuses inquiry/page ...` (no
+reconnect attempts either; `BT hp ready ... hp_rows=0`). **Tomorrow's / any headphones test image must be built with
+`BT=1 BENCH=1 HP_GATES=1`** (`BT hp ready ... hp_rows=1`). Each row flips to forwarded only after its silicon
+experiment passed (design §7). The bench image runs the UI normally as
 well: the `SD:/BTBENCH.RUN` trigger is optional.
 
 What the image does:
@@ -794,9 +797,12 @@ What the image does:
   delayed by the headset latency estimate). Stored in `SD:/bt_hp_cfg.bin` with `bt_vol` and the last headset, not in
   `settings.bin` (design §6.6).
 - **Player** with Headphones/Both: speaker amp off, jack plugging ignored, volume = headset volume (AVRCP absolute
-  volume when the headset supports it, else PCM gain); headset buttons PLAY/PAUSE/STOP toggle, NEXT/PREV skip or seek
-  like the device's arrow taps, VOL+/- change `bt_vol`; a link loss, credit stall, START failure or the headset
-  pausing itself (in-ear detection) pauses the player at the last heard sample.
+  volume when the headset supports it, else PCM gain; a volume change on the headset is followed by the device's VOL
+  keys); headset buttons PLAY and PAUSE toggle (one-button headsets guess which one to send), STOP pauses, NEXT/PREV
+  skip or seek like the device's arrow taps, VOL+/- step the volume once (`BT hp avrcp key code=.. rel=0 key=N` logs
+  each decision); a link loss, credit stall, START failure or the headset pausing itself (in-ear detection) pauses
+  the player at the last heard sample. Buttons pressed and headset events while no file plays are dropped when the
+  next file starts.
 - **Exit paths**: power-off, USB disk mode and phone mode stop headphones mode first; the REC switch suspends the stream
   (link kept).
 
@@ -809,7 +815,7 @@ writes `SD:/BTBENCH.LOG` (8 KiB head of the log; keep runs short: `secs=60..180`
 | `hp_stage` | Does | Exp |
 |---|---|---|
 | `scan` | `hp_secs` s inquiry + name pass; logs every device (`BENCH hp dev i=.. addr=..:..:.. cod=.. audio=.. name=..`) | 4a |
-| `connect` | picks `hp_addr` (or `hp_pick=first`: the first audio-class device of a scan), opens its window if `hp_pair=1`, connects, holds the link; stats every second for 15 s, then every 15 s | 4b |
+| `connect` | picks `hp_addr`, or `hp_pick=first` (a scan, then the first device of major class Audio/Video, headset/headphones/speaker types first; phones and PCs that only set the Audio service bit are never picked), or `hp_pick=last` (the headset stored by an earlier stage: no scan, no pairing); opens its window if `hp_pair=1`, connects, holds the link; stats every second for 15 s, then every 15 s | 4b |
 | `tone` | as `connect`, then streams a 16 kHz mono tone through the full output path (`aout` -> ring -> x3 resampler -> SBC): `hp_tone_hz=1000` (default) or `hp_tone_hz=0` (440/880 Hz alternating each second) | 4c |
 | `player` | as `connect`, then plays `hp_file` (or the first recording of the file list) once in the player, Audio output forced to Headphones for that file | 4d |
 
@@ -819,7 +825,7 @@ mode=hp hp_stage=scan hp_secs=10 secs=40
 mode=hp hp_stage=connect hp_pick=first hp_pair=1 hp_secs=10 secs=90
 mode=hp hp_stage=tone hp_pick=first hp_pair=1 secs=120
 mode=hp hp_stage=tone hp_addr=AA:BB:CC:DD:EE:FF secs=120 hp_tone_hz=0
-mode=hp hp_stage=player hp_addr=AA:BB:CC:DD:EE:FF secs=180
+mode=hp hp_stage=player hp_pick=last secs=180
 mode=hp hp_stage=tone hp_addr=AA:BB:CC:DD:EE:FF secs=120 hp_rate=44100 hp_bitpool=28
 ```
 `hp_pair=1` is needed once per headset (first pairing, or after `Forget`); afterwards the stored key in
@@ -833,9 +839,11 @@ B=/tmp/sl6801_openfw_bt_hp_bench
 # 1. Build + flash (update-up writes dumps/firmware_2M_openfw.bin: build right before flashing)
 make -C open_fw BT=1 BENCH=1 HP_GATES=1 BUILD_DIR=$B update-up        # 0 warnings, "Packed hybrid FIRM ..."
 sudo env OPENFW_FIRM_BIN=$B/open_fw_firm.bin python3 tools/dev_cycle.py flash
-# 2. Card (device in USB disk mode): clean headphones state, one request
+# 2a. ONCE, before the first stage only: clean headphones state (device in USB disk mode)
 udisksctl mount -b /dev/sda1; M=/media/$USER/<label>
-rm -f $M/BTBENCH.LOG $M/bt_hp_bonds.bin $M/bt_hp_cfg.bin
+rm -f $M/bt_hp_bonds.bin $M/bt_hp_cfg.bin
+# 2b. Every stage: one request (keep bt_hp_bonds.bin / bt_hp_cfg.bin: later stages reconnect with the stored key)
+rm -f $M/BTBENCH.LOG
 printf 'mode=hp hp_stage=scan hp_secs=10 secs=40\n' > $M/BTBENCH.RUN
 sync && udisksctl unmount -b /dev/sda1
 # 3. The user puts the headphones in PAIRING mode (usually: hold the power button until the LED flashes
@@ -844,9 +852,12 @@ sudo python3 tools/dev_cycle.py dfu
 sudo python3 tools/dev_cycle.py boot --timeout $((40 + 60)) > /tmp/hp_boot.txt 2>&1
 # 4. Read SD:/BTBENCH.LOG (USB disk mode again) and the ring log (dev_cycle.py log) and report.
 ```
-Then repeat 2-4 with the next stage: `connect` (`hp_pick=first hp_pair=1`, headphones still in pairing mode), `tone`
-(the user listens: a steady 1 kHz tone, then the alternating one), `player`. If `scan` does not list the headset, the
-rest cannot run: report the scan log.
+Then repeat 2b-4 (never 2a: deleting `bt_hp_bonds.bin` between stages loses the pairing, and the next stage's
+reconnect is then refused as `Just Works pairing refused`) with the next stage: `connect` (`hp_pick=first hp_pair=1`,
+headphones still in pairing mode), `tone` (`hp_pick=last`, the user listens: a steady 1 kHz tone, then the alternating
+one with `hp_tone_hz=0`), `player` (`hp_pick=last`). Logs print only the last 3 address bytes, so stages after
+`connect` use `hp_pick=last` rather than `hp_addr`. If `scan` does not list the headset, the rest cannot run: report
+the scan log.
 
 **Manual UI check (no request file, user at the device):** Bluetooth tile → `Headphones` → `Search for headphones`
 (headphones in pairing mode) → ENTER on the headset row → `Pairing...` → `Headphones connected` → BACK → Settings →
@@ -868,8 +879,13 @@ opened again (headphones mode is not started at boot).
   `BT HCI create connection st=0x00 rom` (`0405` accepted), `BT HCI connection complete h=0x0080 st=0x00`,
   `BT hp acl up`, `BT hp Just Works pairing accepted ...`, `BT hp auth ... st=0 key=4|5|7|8`, `BT hp codec cfg
   cie=0x........ ok=1 rate=48000 mode=3 blocks=16 sb=8 bp=2-35`, `BT hp a2dp conn state=2 ... mtu=NNN cfg_ok=1`,
-  `BT hp linkinfo role=M pkt_type=0x.... max_slots=N ...`, `BT hp avrcp ct conn=1`, `BT hp avrcp rn caps ...
-  abs_vol=0|1`, `BENCH hp connected t_ms=... rate=48000 bp=35`.
+  `BT hp linkinfo role=M|S pkt_type=0x0000 req_pt=0x.... allow_rs=0|1 max_slots=N role_chg=N out=1 acl=0x0080
+  edr=0..3 slots35=0..3`, `BT hp avrcp ct conn=1 hdl=N caps_err=0`, `BT hp avrcp rn caps ... abs_vol=0|1`,
+  `BENCH hp connected t_ms=... rate=48000 bp=35`. `pkt_type` stays 0 (only a `040F`, which stays REJ, makes the
+  controller report packet types); what was asked for is `req_pt` (our `0405` Packet_Type) and what the headset can
+  do is `edr` (page-0 bits: 1 = 2 Mb/s, 2 = 3 Mb/s, 3 = both) and `slots35` (1 = 3-slot, 2 = 5-slot, 3 = both).
+  `role=S` with `role_chg>=1` = the headset took the master role (also when it switched before the Connection
+  Complete, as TWS earbuds do).
 - Tone: `BT hp media START err=0`, `BT hp media ack cmd=2 st=0`, `BT hp audio STARTED ours=1 tick=1`,
   `BT hp stream rate=48000 bp=35 bp_min=.. fpp=N mtu=NNN tick_ms=20`, then per second
   `BENCH hp t=N link=3 rate=48000 bp=35 fpp=N pkts=~37 sbc=~375 acked=~375 pads=0 lost=0 drop=0 allocf=0 cs_no=0
@@ -882,8 +898,12 @@ opened again (headphones mode is not started at boot).
 **Failure signatures to report verbatim:** `BT HCI inquiry st=0x..` other than 0x00 (ROM refused `0401`; LM state),
 `BT HCI create connection st=0x0C` (`0405` refused: inquiry/page state), `connection complete st=0x04` (page timeout:
 headset not connectable / out of range), `BT hp Just Works pairing refused` (window/gate), `BT hp auth ... st=` non-0
-(pairing failed: also `BT hp SSP key spent`), `BT hp connect failed`, `BT hp codec cfg ... ok=0`, `BT hp media ack
-cmd=2 st=1|2`, `BT hp START failed twice`, `BT hp credit stall` (link stopped acknowledging), `linkinfo ...
+(pairing failed: also `BT hp SSP key spent`), `BT hp connect failed`, `BT hp connect timed out` (and any
+`late a2dp connect closed`), `BT hp codec cfg ... ok=0`, `BT hp media ack cmd=2 st=1|2`, `BT hp START failed, retry`
+/ `BT hp START failed twice` (a play press 2 s later tries again: `START: new demand ...`), `BT hp credit stall` (link
+stopped acknowledging), `BT hp stall: no Disconnection Complete after the 0406 then=restarting headphones mode` (the
+ROM kept the dead link: headphones mode stops and starts again by itself, `restart after the stall escalation`, then
+reconnects to the headset; at most once per 5 minutes, else `then=headphones mode off`), `linkinfo ...
 max_slots=1` (1-slot packets: throughput too low, design §7 role-switch risk), `pads` > 0 or `nocp_max_ms` > 200
 (throughput), any `BT hp fault reason=N`, `BT bt_ctrl fault`, `BT platform fault`, a reboot (`PREV_FAULT`).
 

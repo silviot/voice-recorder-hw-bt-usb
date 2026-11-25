@@ -19,6 +19,7 @@
 #include "esp_a2dp_api.h"
 #include "esp_avrc_api.h"
 #include "bt_ctrl.h"
+#include "bt_ctrl_cmds.h"
 #include "bt_hp.h"
 #include "bt_xrec_bluedroid.h"
 #include "hp_sink.h"
@@ -81,6 +82,9 @@ typedef struct {
     uint8_t  acl_bda[6];
     uint16_t acl_handle;
     uint8_t  start_pending;            /* we asked for START: the next STARTED is ours (design §4.5) */
+    uint8_t  suspend_pending;          /* we asked for SUSPEND: the next SUSPEND is ours, not the headset's. Kept here,
+                                          not in mc_out: the ext-codec source acks a SUSPEND (MEDIA_CTRL_ACK) before
+                                          it reports the audio state, so on_a2d_ack has cleared mc_out by then */
     uint8_t  unasked_started;          /* a remote START: the SUSPEND that follows is not a remote suspend */
     uint8_t  cfg_valid;
     uint8_t  cfg_cie[4];               /* AUDIO_CFG arrives before CONNECTED (no MTU yet): applied again there */
@@ -114,8 +118,14 @@ typedef struct {
     uint8_t  start_retries;
     uint32_t start_retry_at;
     uint8_t  start_failed;
+    uint32_t start_failed_at;
+    uint8_t  start_demand;             /* demand arrived while start_failed: START again after the cooldown */
     uint32_t last_real_pcm, last_real_t;
     uint8_t  ct_conn, abs_vol, ct_tl;
+    uint16_t ct_hdl;                   /* the AVRCP CT connection's handle (AVCTP may open before A2DP CONNECTED) */
+    uint8_t  orphan;                   /* a connect we gave up on (timeout) may still complete in Bluedroid */
+    uint8_t  orphan_bda[6];
+    uint32_t orphan_until;
     uint8_t  ssp_burned;
     uint8_t  stall_disc;
     uint32_t stall_t;
@@ -151,6 +161,11 @@ static volatile uint32_t s_down_ms HP_HI;
 static bt_hp_bench_tun_t s_tun HP_HI;
 static uint8_t s_tun_set HP_HI;
 #endif
+static exfat_vol_t *s_start_vol HP_HI;   /* bt_hp_start() arguments, for the stall escalation's restart */
+static int s_start_sd HP_HI;
+static uint8_t s_auto_restart HP_HI;     /* restart once the session is FAULTED (stall escalation, design §4.6) */
+static uint32_t s_auto_restart_t HP_HI;
+static uint8_t s_auto_restart_done HP_HI;
 static char s_line[128] HP_HI;
 static uint32_t s_ll HP_HI;
 
@@ -571,6 +586,7 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *p)
             bt_xrec_plat_lock();
             if (g != NULL) {
                 g->start_pending = 0u;
+                g->suspend_pending = 0u;
                 g->unasked_started = 0u;
                 g->cfg_valid = 0u;
             }
@@ -580,7 +596,7 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *p)
     case ESP_A2D_AUDIO_STATE_EVT: {
         e.type = EV_A2D_AUDIO;
         e.a = (uint8_t)p->audio_stat.state;
-        bool ours = false, unasked_susp = false;
+        bool ours = false, unasked_susp = false, local_susp = false;
         bt_xrec_plat_lock();
         if (g != NULL) {
             if (p->audio_stat.state == ESP_A2D_AUDIO_STATE_STARTED) {
@@ -590,6 +606,8 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *p)
             } else {
                 unasked_susp = g->unasked_started != 0u;
                 g->unasked_started = 0u;
+                local_susp = g->suspend_pending != 0u;
+                g->suspend_pending = 0u;
             }
         }
         bt_xrec_plat_unlock();
@@ -600,6 +618,7 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *p)
             }
         } else {
             e.b = unasked_susp ? 1u : 0u;
+            e.c = local_susp ? 1u : 0u;                    /* our SUSPEND (REC switch, idle), not the headset's */
             hp_tx_bd_stopped(HP_STOP_SUSPEND);
         }
         break;
@@ -628,11 +647,14 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *p)
         e.type = EV_A2D_ACK;
         e.a = (uint8_t)p->media_ctrl_stat.cmd;
         e.b = (uint8_t)p->media_ctrl_stat.status;
-        if (p->media_ctrl_stat.cmd == ESP_A2D_MEDIA_CTRL_START &&
-            p->media_ctrl_stat.status != ESP_A2D_MEDIA_CTRL_ACK_SUCCESS) {
+        if (p->media_ctrl_stat.status != ESP_A2D_MEDIA_CTRL_ACK_SUCCESS) {
             bt_xrec_plat_lock();
             if (g != NULL) {
-                g->start_pending = 0u;
+                if (p->media_ctrl_stat.cmd == ESP_A2D_MEDIA_CTRL_START) {
+                    g->start_pending = 0u;
+                } else if (p->media_ctrl_stat.cmd == ESP_A2D_MEDIA_CTRL_SUSPEND) {
+                    g->suspend_pending = 0u;   /* refused: no SUSPEND audio state follows */
+                }
             }
             bt_xrec_plat_unlock();
         }
@@ -842,23 +864,29 @@ static void found_name(const uint8_t bda[6], char *out)
 }
 
 /* ============================================ media control (design §4.5) ===================================== */
+static void start_failure(const char *why, bool final);
+
 static void mc_issue(uint8_t cmd)
 {
     esp_a2d_media_ctrl_t c = cmd == MC_START ? ESP_A2D_MEDIA_CTRL_START : ESP_A2D_MEDIA_CTRL_SUSPEND;
+    bt_xrec_plat_lock();
     if (cmd == MC_START) {
-        bt_xrec_plat_lock();
         g->start_pending = 1u;
-        bt_xrec_plat_unlock();
+    } else {
+        g->suspend_pending = 1u;
     }
+    bt_xrec_plat_unlock();
     esp_err_t r = esp_a2d_media_ctrl_by_handle(g->conn_hdl, c);
     lbegin(cmd == MC_START ? "media START" : "media SUSPEND");
     lku("err", (uint32_t)r);
     lend();
     if (r != ESP_OK) {
+        bt_xrec_plat_lock();
+        g->start_pending = 0u;
+        g->suspend_pending = 0u;
+        bt_xrec_plat_unlock();
         if (cmd == MC_START) {
-            bt_xrec_plat_lock();
-            g->start_pending = 0u;
-            bt_xrec_plat_unlock();
+            start_failure("send", false);    /* counts as an attempt: the retry waits, no START (and log line) per poll */
         }
         return;
     }
@@ -892,11 +920,22 @@ static void link_request_start(void)
     if (g == NULL || g->state != BT_HP_ST_READY) {
         return;
     }
-    if (g->link == BT_HP_LINK_OPEN && g->mc_out != MC_START && !g->start_failed) {
-        g->mc_want = MC_START;
+    uint32_t now = bt_xrec_plat_now_ms();
+    if (g->start_failed) {
+        if (!time_reached(now, g->start_failed_at + BT_HP_START_COOLDOWN_MS)) {
+            g->start_demand = 1u;     /* ready_poll starts again after the cooldown if the player still wants it */
+            return;
+        }
+        g->start_failed = 0u;         /* new demand after the cooldown (the user pressed play): two more attempts */
+        g->start_retries = 0u;
+        g->start_demand = 0u;
+        log1("START: new demand after START failed, trying again");
+    }
+    if (g->link == BT_HP_LINK_OPEN && g->mc_out != MC_START && g->start_retries == 0u) {
+        g->mc_want = MC_START;        /* (start_retries 1: ready_poll sends the one retry at start_retry_at) */
         mc_pump();
     }
-    g->last_real_t = bt_xrec_plat_now_ms();   /* demand restarts the idle clock */
+    g->last_real_t = now;             /* demand restarts the idle clock */
 }
 
 static int link_stream_ready(void)
@@ -912,10 +951,64 @@ static const struct {
 } k_link = { link_stream_ready, link_request_start };
 
 /* ============================================ connect / reconnect ============================================= */
+/* bt_ctrl forwards the initiator rows (BT_CTRL_HP_GATE_LIST): a release BT=1 image refuses them until their silicon
+ * experiments passed (bt_ctrl_cmds.h), so search and connect cannot work there; say so at once. */
+static bool hp_rows_on(void)
+{
+    static const uint16_t k_rows[] = { 0x0401u, 0x0402u, 0x0405u, 0x0408u };
+    for (size_t i = 0u; i < sizeof(k_rows) / sizeof(k_rows[0]); i++) {
+        const bt_ctrl_cmd_row_t *r = bt_ctrl_cmds_lookup(k_rows[i]);
+        if (r == NULL || bt_ctrl_cmds_eff(r) != BTC_FWD) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool hp_rows_refused(const char *what)
+{
+    if (hp_rows_on()) {
+        return false;
+    }
+    lbegin(what);
+    lks("refused", "this build's bt_ctrl refuses inquiry/page (0401/0402/0405/0408): build BT=1 BENCH=1 HP_GATES=1");
+    lend();
+    set_msg(BT_HP_MSG_UNSUPPORTED);
+    return true;
+}
+
+/* Cancel a connect that has no handle yet (a first connect gets its handle with CONNECTED): the address form, which
+ * the BTC task resolves (btc_av_disconnect_evt). Deprecated upstream in favour of the handle form, which cannot do
+ * this. */
+static esp_err_t a2d_cancel_by_addr(const uint8_t bda[6])
+{
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+    esp_err_t r = esp_a2d_source_disconnect((uint8_t *)bda);
+#pragma GCC diagnostic pop
+    return r;
+}
+
+static bool orphan_active(uint32_t now)
+{
+    if (g->orphan && time_reached(now, g->orphan_until)) {
+        g->orphan = 0u;
+        log1("timed-out connect: no late result, connecting again is allowed");
+    }
+    return g->orphan != 0u;
+}
+
 static void connect_now(const uint8_t bda[6])
 {
     if (g->scanning) {
         return;          /* the pick waits for DISC_STATE stopped (design §6.2) */
+    }
+    if (g->link != BT_HP_LINK_NONE) {
+        lbegin("a2dp connect skipped");   /* one link at a time: never a second ACL next to an open one */
+        lka("peer", bda);
+        lku("link", g->link);
+        lend();
+        return;
     }
     esp_err_t r = esp_a2d_source_connect((uint8_t *)bda);
     lbegin("a2dp connect");
@@ -939,7 +1032,7 @@ static void connect_now(const uint8_t bda[6])
 static void rc_schedule(bool first)
 {
     cfg_load();
-    if (!s_cfg.last_valid || g->user_disc) {
+    if (!s_cfg.last_valid || g->user_disc || !hp_rows_on()) {
         g->rc_active = 0u;
         return;
     }
@@ -959,7 +1052,7 @@ static void rc_schedule(bool first)
 
 static void rc_poll(uint32_t now)
 {
-    if (!g->rc_active || g->link != BT_HP_LINK_NONE || g->scanning || g->pick_pending) {
+    if (!g->rc_active || g->link != BT_HP_LINK_NONE || g->scanning || g->pick_pending || orphan_active(now)) {
         return;
     }
     if (!time_reached(now, g->rc_at)) {
@@ -981,8 +1074,11 @@ static void on_link_down(const char *why, uint32_t pev)
     g->link = BT_HP_LINK_NONE;
     g->mc_out = g->mc_want = MC_NONE;
     g->start_failed = 0u;
+    g->start_retries = 0u;
+    g->start_demand = 0u;
     g->ct_conn = 0u;
     g->abs_vol = 0u;
+    g->ct_hdl = ESP_A2D_INVALID_CONN_HDL;
     g->stall_disc = 0u;
     if (was == BT_HP_LINK_OPEN || was == BT_HP_LINK_STARTED || was == BT_HP_LINK_STALLED) {
         g->d.disconnects++;
@@ -1010,6 +1106,21 @@ static void on_a2d_conn(const ev_t *e)
         lku("cfg_ok", e->c);
     }
     lend();
+    bool orphan = g->orphan && bda_eq(g->orphan_bda, e->bda);
+    if (orphan && (e->a == ESP_A2D_CONNECTION_STATE_CONNECTED || e->a == ESP_A2D_CONNECTION_STATE_DISCONNECTED)) {
+        g->orphan = 0u;               /* the timed-out connect reported after all */
+    }
+    if (e->a == ESP_A2D_CONNECTION_STATE_CONNECTED &&
+        (g->link == BT_HP_LINK_OPEN || g->link == BT_HP_LINK_STARTED || g->link == BT_HP_LINK_STALLED ||
+         !g->target_valid || !bda_eq(g->target, e->bda) || (g->link == BT_HP_LINK_NONE && g->user_disc))) {
+        /* a late result of a connect we gave up on (timeout), for a device that is no longer the target: close it */
+        lbegin("late a2dp connect closed");
+        lka("peer", e->bda);
+        lku("link", g->link);
+        lend();
+        (void)esp_a2d_source_disconnect_by_handle(e->h);
+        return;
+    }
     if (e->a == ESP_A2D_CONNECTION_STATE_CONNECTED) {
         g->link = BT_HP_LINK_OPEN;
         g->conn_hdl = e->h;
@@ -1040,18 +1151,28 @@ static void on_a2d_conn(const ev_t *e)
         if (h != 0xFFFFu && bt_ctrl_link_info(h, &li)) {
             lbegin("linkinfo");
             lks("role", li.role == BT_CTRL_ROLE_MASTER ? "M" : li.role == BT_CTRL_ROLE_SLAVE ? "S" : "?");
-            lkx("pkt_type", li.pkt_type, 4);
+            lkx("pkt_type", li.pkt_type, 4);          /* 0x0000 while 040F stays REJ (no 0x1D event) */
+            lkx("req_pt", li.req_pkt_type, 4);        /* what our 0405 asked for */
+            lku("allow_rs", li.req_allow_rs);
             lku("max_slots", li.max_slots);
-            lku("role_changes", li.role_changes);
+            lku("role_chg", li.role_changes);
             lku("out", li.outgoing);
+            if (li.rmt_feat_seen) {                   /* the peer's LMP page 0: EDR 2M/3M, 3-/5-slot */
+                lku("edr", (li.rmt_feat3 >> 1) & 3u);   /* bit 0: 2 Mb/s, bit 1: 3 Mb/s */
+                lku("slots35", li.rmt_feat0 & 3u);      /* bit 0: 3-slot, bit 1: 5-slot */
+            } else {
+                lks("edr", "?");
+            }
             lkx("acl", h, 4);
-            lku("mtu", e->v);
             lend();
         }
         /* the device the user connected to is the one to reconnect to (bonded or not: a headset that pairs again
          * each time still reconnects) */
         save_last(e->bda, g->target_name);
     } else if (e->a == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
+        if (g->target_valid && !bda_eq(g->target, e->bda)) {
+            return;                   /* the timed-out connect to an earlier pick closed: not this link */
+        }
         if (g->link == BT_HP_LINK_CONNECTING) {
             g->d.connect_fail++;
             set_msg(BT_HP_MSG_CONNECT_FAIL);
@@ -1071,6 +1192,14 @@ static void on_a2d_audio(const ev_t *e)
         lku("ours", e->b);
         lku("tick", e->c);
         lend();
+        if (e->b && !e->c) {
+            /* our START, but the transmit path did not arm (no valid codec config, fpp 0, alarm): nothing would be
+             * sent. Suspend again and pause the player rather than show "playing" with no audio. */
+            g->link = BT_HP_LINK_STARTED;
+            g->mc_want = MC_SUSPEND;
+            start_failure("tick", true);
+            return;
+        }
         if (e->b) {
             g->link = BT_HP_LINK_STARTED;
             g->start_retries = 0u;
@@ -1090,12 +1219,13 @@ static void on_a2d_audio(const ev_t *e)
     } else {
         lbegin("audio SUSPEND");
         lku("after_remote_start", e->b);
+        lku("ours", e->c);
         lend();
         bool was_started = g->link == BT_HP_LINK_STARTED;
         if (g->link == BT_HP_LINK_STARTED) {
             g->link = BT_HP_LINK_OPEN;
         }
-        if (was_started && !e->b && g->mc_out != MC_SUSPEND) {
+        if (was_started && !e->b && !e->c) {
             g->d.remote_suspends++;
             player_event(BT_HP_PEV_REMOTE_SUSPEND);
         }
@@ -1117,18 +1247,40 @@ static void on_a2d_ack(const ev_t *e)
         g->d.media_busy++;
     }
     if (e->a == ESP_A2D_MEDIA_CTRL_START && e->b != ESP_A2D_MEDIA_CTRL_ACK_SUCCESS && out == MC_START) {
-        g->d.start_fail++;
-        if (g->start_retries < 1u) {
-            g->start_retries++;
-            g->start_retry_at = bt_xrec_plat_now_ms() + BT_HP_START_RETRY_MS;
-        } else {
-            g->start_failed = 1u;     /* for good: the player pauses (design §4.5) */
-            set_msg(BT_HP_MSG_START_FAILED);
-            player_event(BT_HP_PEV_START_FAILED);
-            log1("START failed twice: headphones not ready");
-        }
+        start_failure("ack", false);
     }
     mc_pump();
+}
+
+/* A START attempt failed (refused, not sent, or started without a transmit tick). The first failure schedules the one
+ * retry at BT_HP_START_RETRY_MS (ready_poll; demand does not bypass it); the second is final: the player pauses
+ * (design §4.5). start_failed is not sticky: new demand after BT_HP_START_COOLDOWN_MS (the user presses play) tries
+ * again (link_request_start), so a headset that was busy with another source is usable without a power cycle. */
+static void start_failure(const char *why, bool final)
+{
+    g->d.start_fail++;
+    uint32_t now = bt_xrec_plat_now_ms();
+    if (g->start_retries == 0u && !final) {
+        g->start_retries = 1u;
+        g->start_retry_at = now + BT_HP_START_RETRY_MS;
+        lbegin("START failed, retry");
+        lks("why", why);
+        lku("in_ms", BT_HP_START_RETRY_MS);
+        lend();
+        return;
+    }
+    if (g->start_failed) {
+        return;
+    }
+    g->start_failed = 1u;
+    g->start_failed_at = now;
+    g->start_retries = 0u;
+    g->start_demand = 0u;
+    set_msg(BT_HP_MSG_START_FAILED);
+    player_event(BT_HP_PEV_START_FAILED);
+    lbegin("START failed twice: headphones not ready");
+    lks("why", why);
+    lend();
 }
 
 static void on_auth(const ev_t *e)
@@ -1165,40 +1317,41 @@ static void on_auth(const ev_t *e)
     }
 }
 
+/* Passthrough presses -> player keys (design §6.6). We register no PLAYBACK_STATUS notification and a player pause
+ * keeps the stream STARTED (silence) until the idle suspend, so a one-button headset guesses PLAY or PAUSE from its
+ * own view: both are toggles (BT_HP_KEY_TOGGLE). STOP always pauses. VOL+/- passthrough (headsets without absolute
+ * volume) is one player key; the player changes bt_vol through bt_hp_set_vol31(), once. */
 static void on_tg_key(const ev_t *e)
 {
+    uint8_t k = BT_HP_KEY_NONE;
+    if (e->b == 0u) {                 /* press edges only */
+        switch (e->a) {
+        case ESP_AVRC_PT_CMD_PLAY:
+        case ESP_AVRC_PT_CMD_PAUSE:    k = BT_HP_KEY_TOGGLE; break;
+        case ESP_AVRC_PT_CMD_STOP:     k = BT_HP_KEY_PAUSE; break;
+        case ESP_AVRC_PT_CMD_FORWARD:  k = BT_HP_KEY_NEXT; break;
+        case ESP_AVRC_PT_CMD_BACKWARD: k = BT_HP_KEY_PREV; break;
+        case ESP_AVRC_PT_CMD_VOL_UP:   k = BT_HP_KEY_VOL_UP; break;
+        case ESP_AVRC_PT_CMD_VOL_DOWN: k = BT_HP_KEY_VOL_DOWN; break;
+        default: break;
+        }
+    }
     lbegin("avrcp key");
     lkx("code", e->a, 2);
     lku("rel", e->b);
+    lku("key", k);
     lend();
-    if (e->b != 0u) {
-        return;                       /* press edges only (design §6.6) */
+    if (k != BT_HP_KEY_NONE) {
+        g->d.avrc_keys++;
+        keyq_push(k);
     }
-    g->d.avrc_keys++;
-    switch (e->a) {
-    case ESP_AVRC_PT_CMD_PLAY:
-        keyq_push(BT_HP_KEY_PLAY);
-        break;
-    case ESP_AVRC_PT_CMD_PAUSE:
-    case ESP_AVRC_PT_CMD_STOP:
-        keyq_push(BT_HP_KEY_PAUSE);
-        break;
-    case ESP_AVRC_PT_CMD_FORWARD:
-        keyq_push(BT_HP_KEY_NEXT);
-        break;
-    case ESP_AVRC_PT_CMD_BACKWARD:
-        keyq_push(BT_HP_KEY_PREV);
-        break;
-    case ESP_AVRC_PT_CMD_VOL_UP:
-    case ESP_AVRC_PT_CMD_VOL_DOWN: {
-        int v = (int)s_cfg.bt_vol + (e->a == ESP_AVRC_PT_CMD_VOL_UP ? 4 : -4);
-        s_cfg.bt_vol = (uint8_t)(v < 0 ? 0 : v > 127 ? 127 : v);
-        keyq_push(e->a == ESP_AVRC_PT_CMD_VOL_UP ? BT_HP_KEY_VOL_UP : BT_HP_KEY_VOL_DOWN);
-        break;
-    }
-    default:
-        break;
-    }
+}
+
+/* AVRCP CT commands go to the AVRCP connection's handle (valid before A2DP CONNECTED on headsets that open AVCTP
+ * first; on a first connect g->conn_hdl is still invalid then). */
+static uint16_t ct_handle(void)
+{
+    return g->ct_hdl != ESP_A2D_INVALID_CONN_HDL ? g->ct_hdl : g->conn_hdl;
 }
 
 static void abs_vol_send(void)
@@ -1207,7 +1360,7 @@ static void abs_vol_send(void)
         return;
     }
     g->ct_tl = (uint8_t)((g->ct_tl + 1u) & 0x0Fu);
-    esp_err_t r = esp_avrc_ct_send_set_absolute_volume_cmd_by_handle(g->conn_hdl, g->ct_tl, s_cfg.bt_vol);
+    esp_err_t r = esp_avrc_ct_send_set_absolute_volume_cmd_by_handle(ct_handle(), g->ct_tl, s_cfg.bt_vol);
     if (r != ESP_OK) {
         lbegin("set_absolute_volume failed");
         lku("err", (uint32_t)r);
@@ -1218,7 +1371,7 @@ static void abs_vol_send(void)
 static void vol_register(void)
 {
     g->ct_tl = (uint8_t)((g->ct_tl + 1u) & 0x0Fu);
-    esp_err_t r = esp_avrc_ct_send_register_notification_cmd_by_handle(g->conn_hdl, g->ct_tl,
+    esp_err_t r = esp_avrc_ct_send_register_notification_cmd_by_handle(ct_handle(), g->ct_tl,
                                                                        ESP_AVRC_RN_VOLUME_CHANGE, 0u);
     if (r != ESP_OK) {
         lbegin("register volume notification failed");
@@ -1407,15 +1560,17 @@ static void on_event(const ev_t *e)
         lend();
         break;
     case EV_CT_CONN:
-        lbegin("avrcp ct");
-        lku("conn", e->a);
-        lend();
         g->ct_conn = e->a;
         g->abs_vol = 0u;
+        g->ct_hdl = e->a ? e->h : ESP_A2D_INVALID_CONN_HDL;
+        lbegin("avrcp ct");
+        lku("conn", e->a);
+        lku("hdl", e->h);
         if (e->a) {
             g->ct_tl = (uint8_t)((g->ct_tl + 1u) & 0x0Fu);
-            (void)esp_avrc_ct_send_get_rn_capabilities_cmd_by_handle(g->conn_hdl, g->ct_tl);
+            lku("caps_err", (uint32_t)esp_avrc_ct_send_get_rn_capabilities_cmd_by_handle(ct_handle(), g->ct_tl));
         }
+        lend();
         break;
     case EV_CT_FEAT:
         lbegin("avrcp remote features");
@@ -1653,13 +1808,16 @@ static void config_finish(void)
     }
     bt_hp_plat_attach_sink(hp_tx_bd(), &g->sink, &k_link, g->ring_is_dac);
     set_state(BT_HP_ST_READY);
+    /* the gate takes the entropy mutex: evaluated outside bt_xrec_plat_lock() (a critical section on target) */
+    const char *why = gate_block();
     bt_xrec_plat_lock();
-    g->gate_ok = gate_block() == NULL ? 1u : 0u;
+    g->gate_ok = why == NULL ? 1u : 0u;
     bt_xrec_plat_unlock();
     lbegin("ready");
     lks("name", g->dev_name);
     lku("last", s_cfg.last_valid);
-    lks("gate", gate_block() == NULL ? "ok" : gate_block());
+    lks("gate", why == NULL ? "ok" : why);
+    lku("hp_rows", hp_rows_on() ? 1u : 0u);   /* 0: release image, search/connect refused (BT=1 BENCH=1 HP_GATES=1) */
     lend();
     rc_schedule(true);
 }
@@ -1766,15 +1924,16 @@ static int shutdown_now(void)
     if (r == 5) {
         log1("A2DP deinit did not confirm in time (hp_av_deinit_timeout): restart the recorder before the next use");
     }
-    bt_xrec_plat_set_mode(BT_XREC_MODE_PHONE, NULL);
     free_session();
     if (reason != BT_XREC_FAULT_NONE) {
+        bt_xrec_plat_set_mode(BT_XREC_MODE_PHONE, NULL);
         s_last_fault = reason;
         set_state(BT_HP_ST_DEAD);
         bt_xrec_plat_hard_path(reason);
         return (int)reason;
     }
-    bt_xrec_plat_session_end();
+    bt_xrec_plat_session_end();        /* final bond flush to bt_hp_bonds.bin: still in headphones mode */
+    bt_xrec_plat_set_mode(BT_XREC_MODE_PHONE, NULL);
     set_state(BT_HP_ST_OFF);
     cfg_save();
     log1("stopped");
@@ -1836,6 +1995,9 @@ int bt_hp_start(exfat_vol_t *vol, int sd_mounted)
     b->dev_name[10] = '\0';
     b->cb_open = 1u;
     b->conn_hdl = ESP_A2D_INVALID_CONN_HDL;
+    b->ct_hdl = ESP_A2D_INVALID_CONN_HDL;
+    s_start_vol = vol;
+    s_start_sd = sd_mounted;
     bt_xrec_plat_lock();
     g = b;
     bt_xrec_plat_unlock();
@@ -1880,7 +2042,7 @@ static void ready_poll(uint32_t now)
         (void)esp_bt_gap_cancel_discovery();
     }
     /* a pick waits for the discovery to stop (design §6.2), then for bt_ctrl's inquiry flag, at most 1 s more */
-    if (g->pick_pending && !g->scanning) {
+    if (g->pick_pending && !g->scanning && !orphan_active(now)) {
         if (!bt_ctrl_inquiry_active() || time_reached(now, g->pick_since + 1000u)) {
             g->pick_pending = 0u;
             if (g->pick_pair) {
@@ -1891,20 +2053,43 @@ static void ready_poll(uint32_t now)
     }
     /* connect timeout (a page or pairing that never reported) */
     if (g->link == BT_HP_LINK_CONNECTING && time_reached(now, g->connect_t0)) {
-        log1("connect timed out");
-        (void)esp_a2d_source_disconnect_by_handle(g->conn_hdl);
+        /* cancel by address: on a first connect there is no handle yet (it comes with CONNECTED), and the handle
+         * call would return INVALID_ARG while Bluedroid keeps paging / pairing. Until that connect reports (or
+         * another BT_HP_CONNECT_TO_MS passed) no new connect starts, and a late CONNECTED for another device is
+         * closed (on_a2d_conn). */
+        esp_err_t r = g->conn_hdl != ESP_A2D_INVALID_CONN_HDL ? esp_a2d_source_disconnect_by_handle(g->conn_hdl)
+                                                              : a2d_cancel_by_addr(g->target);
+        lbegin("connect timed out");
+        lka("peer", g->target);
+        lku("cancel_err", (uint32_t)r);
+        lend();
+        g->orphan = 1u;
+        memcpy(g->orphan_bda, g->target, 6u);
+        g->orphan_until = now + BT_HP_CONNECT_TO_MS;
         g->link = BT_HP_LINK_NONE;
         g->d.connect_fail++;
         set_msg(BT_HP_MSG_CONNECT_FAIL);
         rc_schedule(false);
     }
     rc_poll(now);
-    /* START retry (design §4.5) */
+    /* START retry (design §4.5): once, BT_HP_START_RETRY_MS after the first failure (start_retries 2 = the retry is
+     * out: its failure is final) */
     if (g->start_retries == 1u && g->mc_out == MC_NONE && g->link == BT_HP_LINK_OPEN && !g->start_failed &&
         time_reached(now, g->start_retry_at)) {
         g->start_retries = 2u;
+        g->mc_want = MC_NONE;
         mc_issue(MC_START);
-        g->start_retries = 1u;
+    }
+    /* START failed for good: after the cooldown, start again if the player still wants audio (unmuted, ring filled
+     * while it waited); a paused player (muted) waits for its next play press (link_request_start) */
+    if (g->start_failed && time_reached(now, g->start_failed_at + BT_HP_START_COOLDOWN_MS)) {
+        g->start_failed = 0u;
+        g->start_retries = 0u;
+        if (g->start_demand && !g->sink.mute && hp_sink_queued(&g->sink) > 0u) {
+            log1("START: the player still waits after the cooldown, trying again");
+            link_request_start();
+        }
+        g->start_demand = 0u;
     }
     /* idle suspend (design §6.5): STARTED, no real audio taken from the ring for BT_HP_IDLE_SUSPEND_MS */
     if (g->link == BT_HP_LINK_STARTED) {
@@ -1922,23 +2107,51 @@ static void ready_poll(uint32_t now)
     /* a media command that was never acknowledged */
     if (g->mc_out != MC_NONE && time_reached(now, g->mc_t + 5000u)) {
         log1("media command not acknowledged in 5 s");
+        uint8_t out = g->mc_out;
         g->mc_out = MC_NONE;
         bt_xrec_plat_lock();
         g->start_pending = 0u;
+        g->suspend_pending = 0u;
         bt_xrec_plat_unlock();
+        if (out == MC_START) {
+            start_failure("no ack", false);
+        }
     }
     mc_pump();
-    /* stall escalation (design §4.6): no Disconnection Complete within BT_HP_STALL_DISC_MS -> controller restart */
+    /* stall escalation (design §4.6, Q7): no Disconnection Complete within BT_HP_STALL_DISC_MS (the ROM keeps a dead
+     * link for its supervision timeout, ~20-40 s on silicon) -> stop the controller and start headphones mode again,
+     * which reconnects to the last headset (backoff from step 0). Bounded: one automatic restart per
+     * BT_HP_AUTO_RESTART_MIN_MS; a second escalation inside that leaves the session FAULTED. */
     if (g->stall_disc && time_reached(now, g->stall_t + BT_HP_STALL_DISC_MS)) {
         g->stall_disc = 0u;
-        log1("stall: no Disconnection Complete after the 0406; restarting BT (fault ladder)");
+        bool may = !s_auto_restart_done || time_reached(now, s_auto_restart_t + BT_HP_AUTO_RESTART_MIN_MS);
+        lbegin("stall: no Disconnection Complete after the 0406");
+        lks("then", may ? "restarting headphones mode" : "headphones mode off (restarted recently)");
+        lend();
+        s_auto_restart = may ? 1u : 0u;
         fault(BT_XREC_FAULT_PLATFORM);
+    }
+}
+
+/* The stall escalation's restart (ready_poll): once the fault's teardown left the session FAULTED. */
+static void auto_restart_poll(void)
+{
+    if (!s_auto_restart || g != NULL || s_state != BT_HP_ST_FAULTED) {
+        return;
+    }
+    s_auto_restart = 0u;
+    s_auto_restart_done = 1u;
+    s_auto_restart_t = bt_xrec_plat_now_ms();
+    log1("restart after the stall escalation");
+    if (bt_hp_start(s_start_vol, s_start_sd) != 0) {
+        log1("restart refused: headphones mode stays off");
     }
 }
 
 void bt_hp_poll(void)
 {
     if (g == NULL) {
+        auto_restart_poll();
         return;
     }
     uint32_t now = bt_xrec_plat_now_ms();
@@ -1988,6 +2201,7 @@ void bt_hp_poll(void)
     }
     ready_poll(now);
     if (g == NULL || s_state != BT_HP_ST_READY) {
+        auto_restart_poll();          /* in the same poll: the UI and the bench never see the FAULTED gap */
         return;
     }
     ctrl_notes_drain();
@@ -2002,6 +2216,7 @@ void bt_hp_poll(void)
 
 int bt_hp_stop(void)
 {
+    s_auto_restart = 0u;              /* an explicit stop (BACK + off, phone mode, USB disk, power) wins */
     if (g == NULL) {
         return s_state == BT_HP_ST_DEAD ? (int)s_last_fault : 0;
     }
@@ -2020,6 +2235,9 @@ int bt_hp_scan(uint8_t secs)
     }
     if (g->link == BT_HP_LINK_STARTED || g->link == BT_HP_LINK_CONNECTING) {
         return -1;   /* design §11: no discovery while streaming; one page at a time */
+    }
+    if (hp_rows_refused("discovery")) {
+        return -1;
     }
     if (secs < 2u || secs > 61u) {
         secs = BT_HP_SCAN_SECS_DEF;
@@ -2070,6 +2288,9 @@ int bt_hp_connect_addr(const uint8_t bda[6], int pair)
     }
     if (g->link != BT_HP_LINK_NONE) {
         return 0;
+    }
+    if (hp_rows_refused("connect")) {
+        return -1;
     }
     if (pair) {
         const char *why = gate_block();
@@ -2123,7 +2344,16 @@ int bt_hp_disconnect(void)
     if (g->link == BT_HP_LINK_NONE) {
         return 0;
     }
-    esp_err_t r = esp_a2d_source_disconnect_by_handle(g->conn_hdl);
+    /* while CONNECTING on a first connect there is no handle yet: cancel by address */
+    esp_err_t r = g->conn_hdl != ESP_A2D_INVALID_CONN_HDL || !g->target_valid
+                      ? esp_a2d_source_disconnect_by_handle(g->conn_hdl)
+                      : a2d_cancel_by_addr(g->target);
+    if (g->link == BT_HP_LINK_CONNECTING && g->target_valid) {
+        g->orphan = 1u;               /* a late CONNECTED is closed (user_disc), no new connect until it reports */
+        memcpy(g->orphan_bda, g->target, 6u);
+        g->orphan_until = bt_xrec_plat_now_ms() + BT_HP_CONNECT_TO_MS;
+        g->link = BT_HP_LINK_NONE;
+    }
     lbegin("disconnect");
     lku("err", (uint32_t)r);
     lend();
@@ -2259,6 +2489,16 @@ uint32_t bt_hp_take_player_events(void)
     }
     bt_xrec_plat_unlock();
     return v;
+}
+
+void bt_hp_player_begin(void)
+{
+    bt_xrec_plat_lock();
+    if (g != NULL) {
+        g->player_ev = 0u;
+        g->kq_tail = g->kq_head;
+    }
+    bt_xrec_plat_unlock();
 }
 
 void bt_hp_set_vol31(uint8_t v31)
