@@ -354,6 +354,11 @@ const char *bt_xrec_plat_pairing_block(void)
     return NULL;
 }
 
+int bt_xrec_plat_rng_starved(void)
+{
+    return bt_rom_rng_starved() != 0u ? 1 : 0;
+}
+
 /* ============================================ files (app task) ================================================== */
 static void wipe_mem(void *p, size_t n)
 {

@@ -45,6 +45,9 @@ uint32_t bthx_reboot_mode(void);
 /* TEST knob: the session's entropy as after a BT-mode entry whose mic collection credited nothing (XREC PIN / CHAL fail
  * closed, M2.3 gate refuses). Read at stack_up_begin for the ROM key model, and live for everything else. */
 void bthx_withhold_entropy(int on);
+/* TEST knob: the ROM RNG hook served a security site from the legacy generator (bt_rom_rng `starved`++): latched until
+ * the next start; the M2.3 gate and bt_xrec_plat_rng_starved() see it at once (STEP10 C3). */
+void bthx_rng_starve(void);
 /* TEST knob: the next up job waits while on (the worker outranks the app task, and the fake ROM answers at once, so
  * without it the bring-up always finishes before the app task runs again; on target the ROM bring-up does not). */
 void bthx_hold_bringup(int on);

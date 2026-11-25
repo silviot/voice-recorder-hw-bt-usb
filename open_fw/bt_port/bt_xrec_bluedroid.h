@@ -176,6 +176,11 @@ int      bt_xrec_plat_entropy(void *out, size_t n);   /* 0 = OK; anything else f
  * RNG pool never ran dry this session), else a short reason for the log. Checked when the window opens and on every
  * poll while its SSP part is open. */
 const char *bt_xrec_plat_pairing_block(void);
+/* The gate's RNG part alone, lock-free and callable from any task or inside bt_xrec_plat_lock(): nonzero once the ROM
+ * RNG pool ran dry at a security call site this session (latched until the next session). Pairing decisions taken
+ * between two polls (the patch 0036 Just Works hook in BTC, the confirmation replies) read it next to the polled gate
+ * (STEP10 C3). */
+int      bt_xrec_plat_rng_starved(void);
 const xrec_ops_t *bt_xrec_plat_device_ops(void);       /* stat, rtc, recorder, log, audio cfg, exp (legacy F:1733-1966) */
 void     bt_xrec_plat_load_bound_key(xrec_ctx_t *ctx);  /* SD:/cassini.key (legacy F:1968, same CSK5 format) */
 int      bt_xrec_plat_save_bound_key(const uint8_t key[32]);  /* 0 saved (or no card: RAM-only binding), -1 write failed */

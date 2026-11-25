@@ -184,6 +184,10 @@ void bt_xrec_plat_reboot(uint8_t mode) { s_reboot_mode = mode; }
  * collection credited nothing: the XREC PIN and the CHAL nonce fail closed and the M2.3 gate refuses. */
 static volatile uint8_t s_withhold;
 static volatile uint8_t s_key_staged, s_key_installed;   /* bt_rom_real_stage_p192 / start() install, modelled */
+static volatile uint32_t s_rng_starved;                   /* bt_rom_rng `starved`, modelled (bthx_rng_starve) */
+
+void bthx_rng_starve(void) { __atomic_add_fetch(&s_rng_starved, 1u, __ATOMIC_SEQ_CST); }
+int bt_xrec_plat_rng_starved(void) { return __atomic_load_n(&s_rng_starved, __ATOMIC_SEQ_CST) != 0u ? 1 : 0; }
 
 static bool session_entropy_ready(void) { return !s_withhold && bt_entropy_ready(); }
 
@@ -199,7 +203,8 @@ int bt_xrec_plat_entropy(void *out, size_t n)
  * on the firmware's sequence: the key is staged at stack_up_begin only with credited entropy (session_entropy_begin)
  * and "installed" when esp_bluedroid_enable() returned (bt_rom_real start() runs inside its HCI Reset); stop wipes it.
  * A credit arriving later in the session (deferred mic collection) does not install it: SSP stays refused until the
- * next start, exactly as on target. The RNG-pool reason (starved) has no host model (test_bt_rom_rng covers it). */
+ * next start, exactly as on target. The RNG-pool reason is the `starved` latch (bthx_rng_starve), reset at the next
+ * stack_up_begin as bt_rom_rng_reset() does in session_entropy_begin. */
 const char *bt_xrec_plat_pairing_block(void)
 {
     if (s_lock_depth != 0u) {
@@ -215,6 +220,9 @@ const char *bt_xrec_plat_pairing_block(void)
     }
     if (!s_key_installed) {
         return "ROM P-192 key not replaced (re-enter BT mode)";
+    }
+    if (bt_xrec_plat_rng_starved()) {
+        return "ROM RNG pool ran dry this session";
     }
     return NULL;
 }
@@ -555,6 +563,7 @@ int bt_xrec_plat_stack_up_begin(exfat_vol_t *vol, int sd_mounted, const uint8_t 
     bonds_load();                    /* before esp_bluedroid_init() (plan M2) */
     s_key_installed = 0u;            /* bt_xrec_fw.c session_entropy_begin: key staged only with credited entropy */
     s_key_staged = (uint8_t)session_entropy_ready();
+    __atomic_store_n(&s_rng_starved, 0u, __ATOMIC_SEQ_CST);   /* bt_rom_rng_reset() in session_entropy_begin */
     s_faults_base = bth_ctrl_faults();
     s_hci_to_base = bth_hci_cmd_timeouts();
     s_flush_seen = bth_store_flush_requests();

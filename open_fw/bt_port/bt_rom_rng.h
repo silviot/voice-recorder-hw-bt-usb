@@ -78,4 +78,9 @@ uint32_t bt_rom_rng_hook(uint32_t ret_addr, volatile uint8_t *nonce_block, uint3
 
 void bt_rom_rng_stats(bt_rom_rng_stats_t *out);
 
+/* The `starved` count alone, lock-free from any task (one aligned 32-bit load; the hook is its only writer). Nonzero
+ * latches until bt_rom_rng_reset() (the next session): the pairing decisions that run between two app-task polls (the
+ * patch 0036 Just Works hook in BTC, the numeric-comparison and PIN replies) refuse while it is set (STEP10 C3). */
+uint32_t bt_rom_rng_starved(void);
+
 #endif /* BT_ROM_RNG_H */

@@ -20,6 +20,10 @@
  *       reconnect
  *   S9  headset forgets the key: a reconnect needs pairing, the window is closed -> Just Works refused (0036)
  *   S10 teardown while STARTED with a frozen headset: < 2 s, no hard path; a second full start/READY/stop works
+ *   S11 (STEP10 C3) the Just Works hook reads the RNG latch live (pool ran dry since the last poll: refused);
+ *       (A3, patch 0042) a headset bonded with numeric comparison (MITM key) is re-paired by a keyless NoIO peer with its
+ *       address inside an open window: Just Works refused before a key exists, the failed pairing keeps the stored
+ *       bond, and the real headset reconnects with its MITM key after a restart
  * Review fixes (each check fails without its fix):
  *   S1  a headphones stop never writes phone mode's bt_bonds.bin; the M2.3 gate is never evaluated inside the
  *       session lock (a critical section on target)
@@ -94,7 +98,8 @@ static uint32_t rdbe32(const uint8_t *p) { return ((uint32_t)p[0] << 24) | ((uin
 static const uint8_t k_hp_wire[6] = { 0xC1, 0xC2, 0xC3, 0x1B, 0x00, 0x88 };     /* 88:00:1B:C3:C2:C1 */
 static const uint8_t k_ph_wire[6] = { 0x61, 0x62, 0x63, 0x64, 0x65, 0x66 };
 static const uint8_t k_sp_wire[6] = { 0x71, 0x72, 0x73, 0x74, 0x75, 0x76 };
-static uint8_t s_hp_bda[6];
+static const uint8_t k_hp2_wire[6] = { 0xD1, 0xD2, 0xD3, 0x1B, 0x00, 0x88 };    /* S11: a headset with a display */
+static uint8_t s_hp_bda[6], s_hp2_bda[6];
 
 /* ============================================ platform seam for bt_hp (host) ================================== */
 #define CFG_FILE "bt_hp_cfg.bin"
@@ -196,6 +201,16 @@ static int fn_scan(uint32_t a) { return bt_hp_scan((uint8_t)a); }
 static int fn_pair_hp(uint32_t a) { return bt_hp_connect_addr(s_hp_bda, (int)a); }
 static int fn_suspend(uint32_t a) { (void)a; bt_hp_suspend(); return 0; }
 static int fn_forget(uint32_t a) { (void)a; return bt_hp_forget(); }
+static int fn_pair_hp2(uint32_t a) { return bt_hp_connect_addr(s_hp2_bda, (int)a); }
+static int fn_disconnect(uint32_t a) { (void)a; return bt_hp_disconnect(); }
+/* STEP10 C3: in one app-task step (no poll in between), the ROM RNG pool runs dry (a nonce drawn from the legacy
+ * generator) and then the Just Works hook decides, still with the gate_ok of the poll before */
+static int fn_jw_after_starve(uint32_t a)
+{
+    (void)a;
+    bthx_rng_starve();
+    return openfw_just_works_allowed(s_hp2_bda);
+}
 static int fn_player_begin(uint32_t a) { (void)a; bt_hp_player_begin(); return 0; }
 static int fn_fmt(uint32_t a)
 {
@@ -1005,11 +1020,11 @@ static void rom_log_clear(void)
     bth_rom_unlock();
 }
 
-static void world(void)
+static void hp_peer_cfg(fake_peer_cfg_t *cp, const uint8_t wire[6])
 {
     fake_peer_cfg_t c;
     memset(&c, 0, sizeof(c));
-    memcpy(c.addr, k_hp_wire, 6);
+    memcpy(c.addr, wire, 6);
     c.cod[0] = 0x18; c.cod[1] = 0x04; c.cod[2] = 0x24;         /* 0x240418 headphones */
     c.io_cap = 0x03;                                           /* NoInputNoOutput: Just Works */
     c.auth_req = 0x04;
@@ -1032,6 +1047,13 @@ static void world(void)
     c.rssi = -48;
     c.discoverable = true;
     memcpy(c.name, "HP-Fake", 7);
+    *cp = c;
+}
+
+static void world(void)
+{
+    fake_peer_cfg_t c;
+    hp_peer_cfg(&c, k_hp_wire);
     fake_dev_t d;
     bth_rom_lock();
     fake_peer_init(&c);
@@ -1052,6 +1074,7 @@ static void world(void)
     bth_rom_unlock();
     for (int i = 0; i < 6; i++) {
         s_hp_bda[i] = k_hp_wire[5 - i];
+        s_hp2_bda[i] = k_hp2_wire[5 - i];
     }
 }
 
@@ -1509,6 +1532,114 @@ int bth_headphones_scenario(const char *img_path)
                UI().has_last);
         /* C4 / A3: no headphones session -> the patch 0036 hook refuses Just Works (phone mode never keeps it) */
         SCHECK(openfw_just_works_allowed(s_hp_bda) == 0, "S10c: Just Works allowed with no headphones session");
+    }
+    if (s_fail) {
+        goto out;
+    }
+
+    /* ---- S11 ---- (review STEP10 C3, A3) */
+    bth_log("[S11] C3: RNG latch read by the Just Works hook between polls; A3: a MITM bond survives a Just Works "
+            "re-pair and its failure (patch 0042) (heap seq %u)\n", (unsigned)bth_heap_seq());
+    {
+        fake_peer_cfg_t c2;
+        hp_peer_cfg(&c2, k_hp2_wire);
+        memcpy(c2.name, "HP-Disp", 7);
+        c2.ignores_pages = true;                             /* C3: the window stays open, nothing pairs */
+        bth_rom_lock();
+        fake_peer_init(&c2);
+        bth_rom_unlock();
+        bt_hp_debug_t d0, d1;
+        if (!start_ready("S11 start")) {
+            goto out;
+        }
+        /* the start reconnects to S3's headset, which is not the scripted peer now: that page times out */
+        SCHECK(WAIT((bt_hp_get_debug(&d0), d0.connect_fail >= 1u && UI().link == BT_HP_LINK_NONE), 15000),
+               "S11: reconnect to the old headset did not fail (link %u)", UI().link);
+        bt_hp_get_debug(&d0);
+        SCHECK(bthx_call_fn(fn_pair_hp2, 1u, 2000u) == 0, "S11: pick HP-Disp (pair)");
+        SCHECK(WAIT((bt_hp_get_debug(&d1), d1.connect_fail > d0.connect_fail && UI().link == BT_HP_LINK_NONE), 15000),
+               "S11: page to HP-Disp did not time out (link %u)", UI().link);
+        /* the window is open for HP-Disp and the last poll found the gate holding; the pool runs dry now */
+        SCHECK(bthx_call_fn(fn_jw_after_starve, 0u, 2000u) == 0,
+               "S11 C3: Just Works allowed after the ROM RNG pool ran dry since the last poll");
+        stop_session("S11 stop (C3)");
+
+        /* A3: HP-Disp pairs with numeric comparison: an authenticated (MITM) key, bonded */
+        c2.ignores_pages = false;
+        c2.io_cap = 0x01;                                    /* DisplayYesNo */
+        c2.auth_req = 0x05;                                  /* general bonding, MITM */
+        c2.key_type = 0x05;                                  /* authenticated combination P-192 */
+        c2.numeric = 314159u;
+        bth_rom_lock();
+        fake_peer_init(&c2);
+        bth_rom_unlock();
+        if (!start_ready("S11 start (A3)")) {
+            goto out;
+        }
+        SCHECK(WAIT((bt_hp_get_debug(&d0), d0.connect_fail >= 1u && UI().link == BT_HP_LINK_NONE), 15000),
+               "S11: reconnect to the old headset did not fail (link %u)", UI().link);
+        peer_link_reset();
+        SCHECK(bthx_call_fn(fn_pair_hp2, 1u, 2000u) == 0, "S11: pick HP-Disp (pair, numeric comparison)");
+        bth_step("S11 MITM pairing", 30000u);
+        bool open = wait_link(BT_HP_LINK_OPEN, 20000);
+        bth_step_done();
+        SCHECK(open && fake_peer.pairings == 1u && fake_peer.host_confirms == 1u,
+               "S11: numeric comparison pairing (open %d pairings %u confirms %u)", open, fake_peer.pairings,
+               fake_peer.host_confirms);
+        uint8_t k2[16];
+        memcpy(k2, fake_peer.key, 16u);
+        SCHECK(bthx_call_fn(fn_disconnect, 0u, 2000u) == 0, "S11: disconnect HP-Disp");
+        SCHECK(WAIT(UI().link == BT_HP_LINK_NONE && !fake_peer.connected, 10000), "S11: HP-Disp link not down");
+        if (s_fail) {
+            goto out;
+        }
+        /* the same address now pairs as NoInputNoOutput without the key (a spoofer, or the headset reset): our
+         * authentication gets Key Missing, BTM retries with SSP, Just Works comes inside the picked device's open
+         * window. 0042 refuses it before a key exists; the failed pairing (0x05) leaves the stored bond alone. */
+        fake_peer_cfg_t cj = c2;
+        cj.io_cap = 0x03;
+        cj.auth_req = 0x04;
+        cj.key_type = 0x04;
+        cj.numeric = 271828u;                                /* the fake LM derives the key from it: a different key */
+        /* the reconnect does not read page 1 again, so the modelled ROM slot would pick legacy PIN (rejected anyway);
+         * the case here is the SSP Just Works one */
+        cj.rom_auth_decision = false;
+        bth_rom_lock();
+        fake_peer_init(&cj);
+        bth_rom_unlock();
+        peer_link_reset();
+        bt_hp_get_debug(&d0);
+        SCHECK(bthx_call_fn(fn_pair_hp2, 1u, 2000u) == 0, "S11: pick HP-Disp again (pair)");
+        bth_step("S11 Just Works over a MITM bond", 30000u);
+        SCHECK(WAIT(fake_peer.host_rejects >= 1u || fake_peer.pairings > 0u, 15000),
+               "S11 A3: no confirmation reply (rejects %u pairings %u)", fake_peer.host_rejects, fake_peer.pairings);
+        SCHECK(fake_peer.host_key_replies >= 1u && fake_peer.io_cap_requests >= 1u && fake_peer.pin_requests == 0u,
+               "S11 A3: want stored key tried, then SSP (key replies %u io cap %u pin %u)", fake_peer.host_key_replies,
+               fake_peer.io_cap_requests, fake_peer.pin_requests);
+        SCHECK(fake_peer.pairings == 0u && fake_peer.host_confirms == 0u,
+               "S11 A3: Just Works key made over the stored MITM key (pairings %u confirms %u)", fake_peer.pairings,
+               fake_peer.host_confirms);
+        SCHECK(!wait_link(BT_HP_LINK_OPEN, 2000), "S11 A3: opened after a refused Just Works");
+        bth_step_done();
+        SCHECK(bthx_call_fn(fn_disconnect, 0u, 2000u) == 0, "S11: disconnect after the refusal");
+        SCHECK(WAIT(UI().link == BT_HP_LINK_NONE && !fake_peer.connected, 10000), "S11: link not down after refusal");
+        stop_session("S11 stop (A3)");
+
+        /* the real headset (its MITM key) comes back after a restart: the stored bond reconnects it, no pairing */
+        bth_rom_lock();
+        fake_peer_init(&c2);
+        fake_peer_set_key(k2);
+        bth_rom_unlock();
+        peer_link_reset();
+        if (!start_ready("S11 restart (A3)")) {
+            goto out;
+        }
+        bth_step("S11 reconnect with the MITM key", 30000u);
+        open = wait_link(BT_HP_LINK_OPEN, 20000);
+        bth_step_done();
+        SCHECK(open && fake_peer.pairings == 0u && memcmp(fake_peer.host_key, k2, 16u) == 0,
+               "S11 A3: stored MITM bond lost or replaced (open %d pairings %u key %s)", open, fake_peer.pairings,
+               memcmp(fake_peer.host_key, k2, 16u) == 0 ? "same" : "different");
     }
 
 out:

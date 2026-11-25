@@ -328,6 +328,27 @@ Acceptance budget per mode: minimum free heap under traffic ≥ 8 KB and largest
 - UI strings through i18n for all 18 languages (one batch). Shared-file diffs (`main.c`, `Makefile`, `startup.c`) stay
   hook-sized; `k_exp_api`, `test-host` and `wasm` targets keep compiling under both flag values.
 
+### Threat model: keys on the SD card (STEP10 C6)
+What is stored, in plaintext, in the card's root: `/bt_bonds.bin` (phone mode) and `/bt_hp_bonds.bin` (headphones
+mode), `bt_store` images ("BTS1", SHA-256 prefix as an integrity check only) holding Bluedroid's bond config: peer
+address, 128-bit BR/EDR link key, key type; and `/cassini.key` ("CSK5" + the 32-byte XREC HMAC key, the stock
+firmware's format, kept so a card moves between stock and open firmware). No device-unique secret exists to encrypt
+them with (the NOR UID follow-up of C18 is the same prerequisite); nothing else on the card is secret.
+
+- **In scope, mitigated**: a radio-only attacker. Phone mode bonds need numeric comparison confirmed on the device
+  inside a user-opened window; Just Works is refused in phone mode, and never replaces a stored MITM key in either mode;
+  a failed authentication or "key missing" from a peer using a bonded address does not remove the bond (patch 0042);
+  pairing is refused while the entropy gate is not met (M2.3, C3 latch). XREC commands need `CHAL`/`AUTH` with the
+  key; `PAIR` needs the device's own window.
+- **Out of scope (accepted)**: anyone who reads the card (seconds with the device in hand, or the card in a reader).
+  With a bond file they can impersonate the bonded phone or headset to the device, and with the peer's address and link
+  key decrypt recorded BR/EDR traffic of that pair or impersonate the device to the phone. With `cassini.key` they pass
+  XREC `AUTH` and can list, download and delete recordings over BT, which the card in hand gives them anyway. Someone
+  who can write the card can plant a bond or replace the XREC key (the same as pairing with physical access).
+- **Recovery**: on a lost or copied card, remove the device from the phone's Bluetooth list, delete the three files
+  (or Forget in headphones mode) and pair again; a new `PAIR` replaces `cassini.key`. Link keys are never logged
+  (`bt_store.h`), and the bench log carries no key material.
+
 ### M5 — Hardware experiments (user runs; tools provided)
 - **Exp 0 (SRAM, separate probe image, scheduler off)**: candidate ranges excluded from all allocation in this image;
   pattern-fill `0x86B000..0x880000` and `0x805C00..0x81A37F`; exercise legacy BT bring-up, UI, recording, USB; verify
@@ -831,6 +852,21 @@ secret of ~33 predictable bits: bench-only waiver, see the review-round entry be
   DEL and PAIR checks fail without their fixes. Gates (0 warnings): FIRM CRC def 0xECB8, bt 0xA199, hp 0x663A,
   hpb 0xD52F, bench 0x4FED. Open: A5 XREC TX flow control, C3, A3 key downgrade, A6/A9/C7/C11 OOM paths, C13; hardware:
   C5, headset IO capability (C2/A8), C18 address, A10, A11, Exp 5.
+- 2026-11-25 (`fix/s10-sec-policy` from `ab27527`): STEP10 **C3**, **A3 second part**, **C6**. C3: `bt_rom_rng_starved()`
+  (lock-free read of the hook's `starved` count, latched until the next session's `bt_rom_rng_reset()`) behind the new
+  platform seam `bt_xrec_plat_rng_starved()`; the headphones Just Works hook (BTC), numeric comparison and bench PIN
+  replies read it next to the polled `gate_ok`, so a nonce drawn from a dry pool after the last poll no longer lets
+  that pairing through (phone mode re-runs the whole gate at the request and at the answer already). A3: Bluedroid
+  patch **0042** (`btc_dm.c`): Just Works is refused before a key exists when the stored bond for that address has an
+  authenticated key (read from the bond config, not BTM's record, which BTM clears on its Key Missing retry); an
+  unauthenticated key reported anyway (legacy PIN) is not stored over it and the pairing is reported failed; stored
+  bonds are no longer removed on `HCI_ERR_AUTH_FAILURE` / `HCI_ERR_KEY_MISSING`. Within the session BTA still drops
+  BTM's RAM record after such a failure; the bond file reloads it at the next BT-mode entry. A headset bonded with
+  numeric comparison that lost its key must be Forgotten before a Just Works re-pair. C6: threat model above (§5).
+  Tests: `test_bt_rom_rng` (latch), headphones **S11** (`test_bt_host_hp hps`): C3 probe fails without the hook's latch
+  read; the Just Works over a MITM bond fails without 0042's confirmation check; the final reconnect with the MITM key
+  fails without the AUTH_FAILURE keep, and without both 0042 checks (the storage check alone keeps the key). Gates
+  (0 warnings, all rc=0): FIRM CRC def 0xECB8 (unchanged), bt 0x4F01, hp 0x3D1D, hpb 0x343F, bench 0x6FC3.
 
 ## 11. Round-1 traceability
 
