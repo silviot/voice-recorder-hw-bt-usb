@@ -248,13 +248,19 @@ $(BUILD_DIR)/xip.bin: $(BUILD_DIR)/open_fw.elf
 $(BUILD_DIR)/open_fw_firm.bin: $(BUILD_DIR)/ram_boot.bin $(BUILD_DIR)/xip.bin tools/pack_firm.py
 	python3 tools/pack_firm.py --ram-boot $(BUILD_DIR)/ram_boot.bin --xip $(BUILD_DIR)/xip.bin --out-firm $@
 
-test-host: $(LVGL_DIR)/lvgl.h $(BUILD_DIR)/liblvgl_host.a tests/test_core.c src/crypto.c src/wav.c src/cwx.c src/exfat.c src/persist.c src/apmem.c src/usb_scsi.c src/bt_spp.c src/xrec_proto.c | $(BUILD_DIR)
+test-host: $(LVGL_DIR)/lvgl.h $(BUILD_DIR)/liblvgl_host.a tests/test_core.c tests/test_xrec_rec.c src/crypto.c src/wav.c src/cwx.c src/exfat.c src/persist.c src/apmem.c src/usb_scsi.c src/bt_spp.c src/xrec_proto.c | $(BUILD_DIR)
 	$(HOST_CC) $(HOST_CFLAGS) tests/test_core.c src/crypto.c src/wav.c src/cwx.c src/exfat.c src/persist.c src/apmem.c src/usb_scsi.c src/bt_spp.c src/xrec_proto.c -o $(BUILD_DIR)/test_core
 	$(BUILD_DIR)/test_core
 	dd if=/dev/zero of=$(BUILD_DIR)/test_exfat.img bs=512 count=4096 status=none
 	/usr/sbin/mkfs.exfat -q -b 4096 -c 4096 $(BUILD_DIR)/test_exfat.img
 	$(BUILD_DIR)/test_core --exfat-img $(BUILD_DIR)/test_exfat.img
 	/usr/sbin/fsck.exfat -n $(BUILD_DIR)/test_exfat.img
+	@# +XREC PUT REC,<stem>.cwx (transcript sidecar into /record) on its own fresh image
+	$(HOST_CC) $(HOST_CFLAGS) tests/test_xrec_rec.c src/xrec_proto.c src/crypto.c src/exfat.c -o $(BUILD_DIR)/test_xrec_rec
+	dd if=/dev/zero of=$(BUILD_DIR)/test_xrec_rec.img bs=512 count=4096 status=none
+	/usr/sbin/mkfs.exfat -q -b 4096 -c 4096 $(BUILD_DIR)/test_xrec_rec.img
+	$(BUILD_DIR)/test_xrec_rec $(BUILD_DIR)/test_xrec_rec.img
+	/usr/sbin/fsck.exfat -n $(BUILD_DIR)/test_xrec_rec.img
 	$(HOST_CC) $(HOST_CFLAGS) -DOPENFW_HOST_MMIO -DOPENFW_ENABLE_USB_EXP=1 -DOPENFW_UNATTENDED_DEV=1 tests/test_drivers_mmio.c \
 		src/wdt_timer.c src/uart.c src/rtc.c src/pmu.c src/keys.c \
 		src/sdio.c src/lcd_st7735s.c src/usb_musb.c src/usb_scsi.c src/exfat.c \

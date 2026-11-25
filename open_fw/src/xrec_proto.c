@@ -220,6 +220,63 @@ static int is_safe_filename(const char *s)
     return 1;
 }
 
+static char lower_ascii(char c)
+{
+    return (c >= 'A' && c <= 'Z') ? (char)(c + ('a' - 'A')) : c;
+}
+
+static int str_eq_ci(const char *a, const char *b)
+{
+    while (*a != '\0' && *b != '\0') {
+        if (lower_ascii(*a) != lower_ascii(*b)) {
+            return 0;
+        }
+        a++;
+        b++;
+    }
+    return *a == *b;
+}
+
+/* PUT REC,<name>: only a transcript sidecar can be written into /record, never a recording or a hidden file.
+ * is_safe_filename, printable ASCII, <= 30 chars (exfat_replace_file limit), not a dot-file, ends in ".cwx". */
+static int is_rec_sidecar_name(const char *s)
+{
+    if (!is_safe_filename(s) || s[0] == '.') {
+        return 0;
+    }
+    uint32_t n = 0u;
+    while (s[n] != '\0') {
+        uint8_t ch = (uint8_t)s[n];
+        if (ch < 0x20u || ch > 0x7Eu || n >= 30u) {
+            return 0;
+        }
+        n++;
+    }
+    return n > 4u && str_eq_ci(&s[n - 4u], ".cwx");
+}
+
+/* Staging location of a streamed PUT target: the temp is a dot-file (hidden from LS and the file list) in the
+ * destination folder, committed by an atomic exfat_replace_file (PUTEND / OTA). */
+#define XREC_REC_TMP ".xrec_rec.tmp"
+static void put_stage_loc(uint8_t mode, const char **dir, const char **tmp)
+{
+    if (mode == XREC_PUT_CAS) {
+        *dir = "/cassini";
+        *tmp = ".xrec_cas.tmp";
+    } else if (mode == XREC_PUT_REC) {
+        *dir = "/record";
+        *tmp = XREC_REC_TMP;
+    } else {
+        *dir = "/";
+        *tmp = ".xrec_ota.tmp";
+    }
+}
+
+static int put_is_named(uint8_t mode)
+{
+    return mode == XREC_PUT_CAS || mode == XREC_PUT_REC;
+}
+
 typedef struct {
     xrec_ctx_t *ctx;
     char        buf[512];
@@ -639,8 +696,10 @@ static void handle_del(xrec_ctx_t *ctx, const char *filename)
         send_err(ctx, "NAME");
         return;
     }
-    /* the file being recorded: deleting it frees clusters the writer still fills (review STEP10 A1) */
-    if (ctx->ops.file_busy && ctx->ops.file_busy(ctx->user, filename) != 0) {
+    /* the file being recorded: deleting it frees clusters the writer still fills (review STEP10 A1); likewise the
+     * staging temp of a PUT REC upload in progress (its writer is open) */
+    if ((ctx->ops.file_busy && ctx->ops.file_busy(ctx->user, filename) != 0) ||
+        (ctx->put_stream_mode == XREC_PUT_REC && str_eq_ci(filename, XREC_REC_TMP))) {
         send_err(ctx, "BUSY");
         return;
     }
@@ -710,12 +769,10 @@ static void abort_staged_put(xrec_ctx_t *ctx)
     }
     uint8_t mode = ctx->put_stream_mode;
     (void)exfat_close_file(&ctx->put_writer);
-    if (ctx->vol) {
-        if (mode == XREC_PUT_CAS) {
-            (void)exfat_delete_file(ctx->vol, "/cassini", ".xrec_cas.tmp");
-        } else if (mode == XREC_PUT_OTA) {
-            (void)exfat_delete_file(ctx->vol, "/", ".xrec_ota.tmp");
-        }
+    if (ctx->vol && (mode == XREC_PUT_CAS || mode == XREC_PUT_REC || mode == XREC_PUT_OTA)) {
+        const char *dir, *tmp;
+        put_stage_loc(mode, &dir, &tmp);
+        (void)exfat_delete_file(ctx->vol, dir, tmp);
     }
     ctx->put_stream_mode    = XREC_PUT_NONE;
     ctx->put_has_last       = 0u;
@@ -759,7 +816,7 @@ static void handle_put_complete(xrec_ctx_t *ctx)
         ctx->put_offset == ctx->put_last_off &&
         ctx->put_len == ctx->put_last_len &&
         ctx->put_crc == ctx->put_last_crc &&
-        (ctx->put_target != XREC_PUT_CAS || str_eq(ctx->put_cas_name, ctx->put_stream_name))) {
+        (!put_is_named(ctx->put_target) || str_eq(ctx->put_name, ctx->put_stream_name))) {
         send_put_ok(ctx, ctx->put_offset, ctx->put_len);
         return;
     }
@@ -769,18 +826,14 @@ static void handle_put_complete(xrec_ctx_t *ctx)
             abort_staged_put(ctx);
         }
 
-        const char *dir      = "/";
-        const char *fname    = "update.up";
-        const char *tmp_name = ".xrec_ota.tmp";
+        const char *dir;
+        const char *tmp_name;
+        const char *fname = put_is_named(ctx->put_target) ? ctx->put_name : "update.up";
+        put_stage_loc(ctx->put_target, &dir, &tmp_name);
 
-        if (ctx->put_target == XREC_PUT_CAS) {
-            if (exfat_mkdir(ctx->vol, "cassini") != 0) {
-                send_err(ctx, "SDIO");
-                return;
-            }
-            dir      = "/cassini";
-            fname    = ctx->put_cas_name;
-            tmp_name = ".xrec_cas.tmp";
+        if (put_is_named(ctx->put_target) && exfat_mkdir(ctx->vol, dir) != 0) {
+            send_err(ctx, "SDIO");
+            return;
         }
 
         /* Stage under temporary name so interrupted uploads never clobber existing files */
@@ -795,7 +848,7 @@ static void handle_put_complete(xrec_ctx_t *ctx)
         ctx->put_has_last = 0u;
     } else if (ctx->put_stream_mode != ctx->put_target ||
                ctx->put_offset != ctx->put_written ||
-               (ctx->put_target == XREC_PUT_CAS && !str_eq(ctx->put_cas_name, ctx->put_stream_name))) {
+               (put_is_named(ctx->put_target) && !str_eq(ctx->put_name, ctx->put_stream_name))) {
         send_err(ctx, "OFF");
         return;
     }
@@ -827,11 +880,13 @@ static void handle_putend(xrec_ctx_t *ctx)
         send_err(ctx, "NOSD");
         return;
     }
-    if (ctx->put_stream_mode != XREC_PUT_CAS) {
+    if (!put_is_named(ctx->put_stream_mode)) {
         send_err(ctx, "NOPUT");
         return;
     }
 
+    const char *dir, *tmp;
+    put_stage_loc(ctx->put_stream_mode, &dir, &tmp);
     uint32_t total = ctx->put_written;
     char final_name[32];
     copy_cstr(final_name, (uint32_t)sizeof(final_name), ctx->put_stream_name);
@@ -840,8 +895,8 @@ static void handle_putend(xrec_ctx_t *ctx)
     ctx->put_has_last       = 0u;
     ctx->put_written        = 0u;
     ctx->put_stream_name[0] = '\0';
-    if (rc != 0 || exfat_replace_file(ctx->vol, "/cassini", ".xrec_cas.tmp", final_name) != 0) {
-        (void)exfat_delete_file(ctx->vol, "/cassini", ".xrec_cas.tmp");
+    if (rc != 0 || exfat_replace_file(ctx->vol, dir, tmp, final_name) != 0) {
+        (void)exfat_delete_file(ctx->vol, dir, tmp);
         send_err(ctx, "SDIO");
         return;
     }
@@ -1073,8 +1128,8 @@ static void try_start_put_header(xrec_ctx_t *ctx)
     p++;
 
     uint8_t target = XREC_PUT_NONE;
-    char cas_name[32];
-    cas_name[0] = '\0';
+    char tgt_name[32];
+    tgt_name[0] = '\0';
     if (str_eq(p, "OTA")) {
         target = XREC_PUT_OTA;
     } else if (str_eq(p, "EXP")) {
@@ -1090,7 +1145,15 @@ static void try_start_put_header(xrec_ctx_t *ctx)
             return;
         }
         target = XREC_PUT_CAS;
-        copy_cstr(cas_name, (uint32_t)sizeof(cas_name), fname);
+        copy_cstr(tgt_name, (uint32_t)sizeof(tgt_name), fname);
+    } else if (str_starts_with(p, "REC,")) {
+        /* transcript sidecar next to its recording: only <stem>.cwx, so a recording can never be overwritten */
+        if (!is_rec_sidecar_name(p + 4)) {
+            send_err(ctx, "NAME");
+            return;
+        }
+        target = XREC_PUT_REC;
+        copy_cstr(tgt_name, (uint32_t)sizeof(tgt_name), p + 4);
     } else {
         send_err(ctx, "ARG");
         return;
@@ -1107,7 +1170,7 @@ static void try_start_put_header(xrec_ctx_t *ctx)
     ctx->put_active  = 1u;
     ctx->put_auth_ok = ctx->auth;
     ctx->put_target  = target;
-    copy_cstr(ctx->put_cas_name, (uint32_t)sizeof(ctx->put_cas_name), cas_name);
+    copy_cstr(ctx->put_name, (uint32_t)sizeof(ctx->put_name), tgt_name);
     ctx->put_offset  = off;
     ctx->put_len     = (uint16_t)chunk_len;
     ctx->put_crc     = (uint16_t)crc;
@@ -1252,7 +1315,7 @@ void xrec_on_disconnect(xrec_ctx_t *ctx)
     ctx->ls_sent_cnt        = 0u;
     ctx->put_active         = 0u;
     ctx->put_target         = XREC_PUT_NONE;
-    ctx->put_cas_name[0]    = '\0';
+    ctx->put_name[0]        = '\0';
     ctx->put_got            = 0u;
     ctx->put_stream_mode    = XREC_PUT_NONE;
     ctx->put_has_last       = 0u;
