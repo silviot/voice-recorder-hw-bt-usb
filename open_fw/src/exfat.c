@@ -279,6 +279,7 @@ int exfat_mount(exfat_vol_t *vol, const blkdev_t *dev)
     if (!vol || !dev || !dev->read_sectors) {
         return -1;
     }
+    vol->free_valid = 0u;   /* a failed remount must not leave a stale free count behind (mem_zero below on success) */
 
     uint8_t sec[512];
     if (dev->read_sectors(dev->ctx, 0u, 1u, sec) != 0) {
@@ -827,6 +828,27 @@ static int fat_set_entry(const exfat_vol_t *cvol, uint32_t cluster, uint32_t val
     return 0;
 }
 
+/* Free-cluster cache bookkeeping (F4): only bits that really changed state move the count; an I/O error drops it. */
+static void free_cache_add(exfat_vol_t *vol, int32_t delta)
+{
+    if (!vol->free_valid) {
+        return;
+    }
+    int64_t n = (int64_t)vol->free_clusters + delta;
+    if (n < 0 || n > (int64_t)vol->cluster_count) {
+        vol->free_valid = 0u;   /* inconsistent: recount at the next stat */
+        return;
+    }
+    vol->free_clusters = (uint32_t)n;
+}
+
+void exfat_invalidate_free_cache(exfat_vol_t *vol)
+{
+    if (vol) {
+        vol->free_valid = 0u;
+    }
+}
+
 static int scan_bitmap_range(exfat_vol_t *vol, uint32_t start_byte, uint32_t end_byte,
                              uint32_t prev_cluster, uint32_t *out_cluster)
 {
@@ -886,6 +908,7 @@ static int scan_bitmap_range(exfat_vol_t *vol, uint32_t start_byte, uint32_t end
                         uint32_t new_c = idx + 2u;
                         sec[b] |= (uint8_t)(1u << bit);
                         if (vol->dev->write_sectors(vol->dev->ctx, base_lba + s, 1u, sec) != 0) {
+                            vol->free_valid = 0u;   /* the bit may or may not be on the card */
                             return -1;
                         }
                         int fat_rc = 0;
@@ -917,9 +940,12 @@ static int scan_bitmap_range(exfat_vol_t *vol, uint32_t start_byte, uint32_t end
                         }
                         if (fat_rc != 0) {
                             sec[b] &= (uint8_t)~(1u << bit);
-                            (void)vol->dev->write_sectors(vol->dev->ctx, base_lba + s, 1u, sec);
+                            if (vol->dev->write_sectors(vol->dev->ctx, base_lba + s, 1u, sec) != 0) {
+                                vol->free_valid = 0u;   /* the rollback did not reach the card */
+                            }
                             return -1;
                         }
+                        free_cache_add(vol, -1);
                         vol->alloc_hint = idx + 1u;
                         *out_cluster    = new_c;
                         return 0;
@@ -999,9 +1025,14 @@ static int free_cluster_bit(exfat_vol_t *vol, uint32_t cluster)
     if (vol->dev->read_sectors(vol->dev->ctx, lba, 1u, sec) != 0) {
         return -1;
     }
+    int was_set = (sec[in_sec] & (1u << bit)) != 0u;
     sec[in_sec] &= (uint8_t)~(1u << bit);
     if (vol->dev->write_sectors(vol->dev->ctx, lba, 1u, sec) != 0) {
+        vol->free_valid = 0u;
         return -1;
+    }
+    if (was_set) {
+        free_cache_add(vol, 1);
     }
 
     if (idx < vol->alloc_hint) {
@@ -1754,7 +1785,7 @@ int exfat_close_file(exfat_writer_t *w)
     return tail_err;
 }
 
-int exfat_stat_fs(const exfat_vol_t *vol, uint32_t *free_mb, uint32_t *total_mb)
+int exfat_stat_fs(exfat_vol_t *vol, uint32_t *free_mb, uint32_t *total_mb)
 {
     if (!vol || !vol->dev || !vol->dev->read_sectors) {
         return -1;
@@ -1767,8 +1798,39 @@ int exfat_stat_fs(const exfat_vol_t *vol, uint32_t *free_mb, uint32_t *total_mb)
     if (!free_mb) {
         return 0;
     }
-    if (vol->bitmap_cluster < 2u || vol->bitmap_bytes == 0u) {
+    uint32_t free_cls = 0u;
+    if (exfat_free_clusters(vol, &free_cls) != 0) {
         *free_mb = 0u;
+        return -1;
+    }
+    *free_mb = ((free_cls >> 11) * spc) + (((free_cls & 0x7FFu) * spc) >> 11);
+    return 0;
+}
+
+int exfat_free_clusters(exfat_vol_t *vol, uint32_t *out_free)
+{
+    if (!vol || !out_free) {
+        return -1;
+    }
+    if (!vol->free_valid) {
+        uint32_t n = 0u;
+        if (exfat_count_free_scan(vol, &n) != 0) {
+            return -1;
+        }
+        vol->free_clusters = n;
+        vol->free_valid    = 1u;
+    }
+    *out_free = vol->free_clusters;
+    return 0;
+}
+
+int exfat_count_free_scan(const exfat_vol_t *vol, uint32_t *out_free)
+{
+    if (!vol || !out_free || !vol->dev || !vol->dev->read_sectors) {
+        return -1;
+    }
+    uint32_t spc = vol->sectors_per_cluster;
+    if (vol->bitmap_cluster < 2u || vol->bitmap_bytes == 0u) {
         return -1;
     }
 
@@ -1826,7 +1888,7 @@ int exfat_stat_fs(const exfat_vol_t *vol, uint32_t *free_mb, uint32_t *total_mb)
         }
     }
 
-    *free_mb = ((free_cls >> 11) * spc) + (((free_cls & 0x7FFu) * spc) >> 11);
+    *out_free = free_cls;
     return 0;
 }
 
@@ -1963,6 +2025,17 @@ static int sec_wb_load(const exfat_vol_t *vol, sec_wb_cache_t *c, uint32_t lba)
     return 0;
 }
 
+/* After a free_file_clusters() pass: the cleared bits are free now, unless a bitmap write failed (then some of them
+ * may still be set on the card: recount). */
+static void free_file_clusters_account(exfat_vol_t *vol, int rc, uint32_t freed)
+{
+    if (rc != 0) {
+        vol->free_valid = 0u;
+    } else {
+        free_cache_add(vol, (int32_t)freed);
+    }
+}
+
 static int free_file_clusters(exfat_vol_t *vol, uint32_t first_cluster, uint64_t size, uint8_t no_fat_chain)
 {
     if (first_cluster < 2u || size == 0u) {
@@ -1983,6 +2056,7 @@ static int free_file_clusters(exfat_vol_t *vol, uint32_t first_cluster, uint64_t
     uint32_t cached_bmp_cidx = 0u;
     uint32_t cached_bmp_cls  = vol->bitmap_cluster;
     int      rc              = 0;
+    uint32_t freed           = 0u;   /* bitmap bits this call cleared (F4 free-cluster cache) */
 
     if (no_fat_chain) {
         uint64_t n_cls64 = (size + ((uint64_t)vol->cluster_size - 1u)) >> cls_shift;
@@ -2022,6 +2096,9 @@ static int free_file_clusters(exfat_vol_t *vol, uint32_t first_cluster, uint64_t
                 rc = -1;
                 break;
             }
+            if (bmp_c.buf[byte_off & 511u] & (1u << bit)) {
+                freed++;
+            }
             bmp_c.buf[byte_off & 511u] &= (uint8_t)~(1u << bit);
             bmp_c.dirty = 1u;
             if (idx < vol->alloc_hint) {
@@ -2031,6 +2108,7 @@ static int free_file_clusters(exfat_vol_t *vol, uint32_t first_cluster, uint64_t
         if (sec_wb_flush(vol, &bmp_c) != 0) {
             rc = -1;
         }
+        free_file_clusters_account(vol, rc, freed);
         return rc;
     }
 
@@ -2079,6 +2157,9 @@ static int free_file_clusters(exfat_vol_t *vol, uint32_t first_cluster, uint64_t
             rc = -1;
             break;
         }
+        if (bmp_c.buf[byte_off & 511u] & (1u << bit)) {
+            freed++;
+        }
         bmp_c.buf[byte_off & 511u] &= (uint8_t)~(1u << bit);
         bmp_c.dirty = 1u;
         if (idx < vol->alloc_hint) {
@@ -2099,6 +2180,7 @@ static int free_file_clusters(exfat_vol_t *vol, uint32_t first_cluster, uint64_t
     if (sec_wb_flush(vol, &bmp_c) != 0) {
         rc = -1;
     }
+    free_file_clusters_account(vol, rc, freed);
     if (sec_wb_flush(vol, &fat_c) != 0) {
         rc = -1;
     }

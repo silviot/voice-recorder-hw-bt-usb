@@ -38,6 +38,12 @@ typedef struct {
     uint32_t bitmap_cluster;
     uint32_t bitmap_bytes;
     uint32_t alloc_hint;
+    /* Free-cluster count cache (docs/BT_SYNC_SPEED_AND_RECORDING.md F4): computed by the first exfat_stat_fs() after
+     * exfat_mount() (which clears it), then kept by every bitmap change made through this volume (allocate / free).
+     * Any bitmap I/O error drops it (recomputed by the next exfat_stat_fs). Writers that bypass this volume (USB MSC)
+     * are followed by a remount (AGENTS.md MSC boundary), or by exfat_invalidate_free_cache(). */
+    uint32_t free_clusters;
+    uint8_t  free_valid;
     uint32_t default_timestamp;
     exfat_rd_cache_t rd_cache[4];
     uint8_t  rd_cache_rr;
@@ -89,7 +95,13 @@ int exfat_read_file(const exfat_vol_t *vol, const exfat_entry_t *file,
 
 /* Write & maintenance operations (requires dev->write_sectors != NULL and 0x81 Allocation Bitmap) */
 void exfat_set_timestamp(exfat_vol_t *vol, uint32_t dos_timestamp);
-int  exfat_stat_fs(const exfat_vol_t *vol, uint32_t *free_mb, uint32_t *total_mb);
+/* free_mb from the volume's free-cluster cache (one bitmap scan after a mount, then none); total_mb from the VBR. */
+int  exfat_stat_fs(exfat_vol_t *vol, uint32_t *free_mb, uint32_t *total_mb);
+/* The cached free-cluster count (scans the bitmap when the cache is not valid). */
+int  exfat_free_clusters(exfat_vol_t *vol, uint32_t *out_free);
+/* Uncached: counts the clear bits of the allocation bitmap (the reference the cache is tested against). */
+int  exfat_count_free_scan(const exfat_vol_t *vol, uint32_t *out_free);
+void exfat_invalidate_free_cache(exfat_vol_t *vol);
 int  exfat_mkdir(exfat_vol_t *vol, const char *name);
 int  exfat_create_file(exfat_vol_t *vol, const char *dir_path, const char *filename, exfat_writer_t *out);
 int  exfat_write(exfat_writer_t *w, const void *data, uint32_t len);
