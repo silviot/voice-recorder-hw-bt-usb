@@ -953,3 +953,101 @@ max_slots=1` (1-slot packets: throughput too low, design §7 role-switch risk), 
 tone / crackles / dropouts, delay of play/pause), whether the headset announced "connected"/"paired", and for the UI
 run which steps worked. Afterwards leave the latest BT-branch build on the device (per the hardware-access rule;
 the bench image is fine for continued headphones tests, a release `BT=1` image cannot connect yet).
+
+## Exp 5 (plan step 8): power, USB, card and REC transitions with BT active — how to test
+
+Plan §5 M5 "Exp 5": every way the device can leave or lose Bluetooth while phone or headphones mode runs must end in
+the **coordinated teardown** (`bt_shutdown()`: graceful within 2 s, else the M1 hard path with the recording
+finalised and fault record `0xB1`), never in a hang, a WDT reset or a damaged card. What each transition does in the
+code (2026-11-25, branch `feat/bt-step8`; host-tested where the harness reaches, nothing of it on silicon yet):
+
+| Transition | Phone mode (BT screen) | Headphones mode (runs in the background) |
+|---|---|---|
+| Power off (hold the power key) | `ui_poll_power_button`: `bt_shutdown()` then power-off | same; on the player screen `aout_stop()` first |
+| USB cable plugged | stays in BT mode (charges, no USB disk); USB disk mode starts after BACK | home/browser: auto USB disk mode, which runs `bt_shutdown()` first (no `bt_hp_bonds.bin` write while the host owns the card); player / BT screens: after leaving them |
+| Settings → USB disk | not reachable from BT mode | `bt_shutdown()` first, as above |
+| microSD removed | no detection (plan §6.7 dropped "card removal"); XREC file commands fail on the card, the session keeps running; BACK leaves normally | bond flushes fail: `BT bonds not saved (SD write failed, retrying)`, retried up to 8 times, then at the next change / stop |
+| REC switch on | leaves BT mode (`bt_xrec_stop()`), recording starts | stream suspended, link kept (design §6.9), recording starts |
+| Low battery (new) | below 3450 mV in 3 samples 0.5 s apart, no VBUS: leaves BT mode, toast `Low battery: BT off` | stopped (`bt_hp_stop()`), same toast; on the player the file pauses with that toast |
+| Starting BT at low battery (new) | refused with that toast (one sample < 3450 mV, or still latched below 3550 mV) | refused, same |
+| XREC REBOOT / OTA / DFU | deferred reboot: `bt_shutdown()` first, then reboot / SD OTA / USB DFU (recording finalised) | n/a |
+| A Bluedroid task stuck (new) | WDT supervisor: hciT/BTU/BTC ping unanswered 8 s → `BT task stalled: <task>`, platform fault 4 → graceful recovery or hard path; ping unanswered 20 s → the WDT is no longer fed (reset ~32 s later) | same (`BT hp fault`) |
+
+**Image:** a bench image, because headphones mode needs the forwarded rows (`HP_GATES=1`); no `SD:/BTBENCH.RUN` on
+the card, so it boots into the normal UI and everything below is done by a person at the device.
+```bash
+B=/tmp/sl6801_openfw_bt_exp5
+make -C open_fw BT=1 BENCH=1 HP_GATES=1 BUILD_DIR=$B update-up      # 0 warnings, "Packed hybrid FIRM ..."
+sudo env OPENFW_FIRM_BIN=$B/open_fw_firm.bin python3 tools/dev_cycle.py flash
+MAC=02:CA:55:00:01:1D
+```
+Before starting: the laptop is paired with the device in phone mode (phone-mode recipe steps 4-5, or the UI: BT tile →
+Phone → ENTER → accept the prompt), a headset is paired in headphones mode (headphones recipe, UI check), and the card
+holds a few recordings including one of several MB. After **every** item: `sudo python3 tools/dev_cycle.py log >
+/tmp/exp5_<item>.txt` (ring log; USB disk mode) and note what the screen showed. Items that power the device off read
+the log after the next boot. In every log check: no `BT shutdown: hard path`, no `PREV_FAULT=` line at the next boot
+(a WDT or fault reset), teardown lines under 2 s.
+
+**E1 Power off in phone mode.** (a) BT screen idle, laptop not connected; (b) laptop connected and authorised
+(`bt_sync.py --mac $MAC --ping`, then within 10 s); (c) during a long transfer: `python3 tools/bt_sync.py --mac $MAC`
+(syncs all recordings) and hold the power key while it runs; (d) while a pairing prompt is up (laptop: `bluetoothctl
+remove $MAC`, then pair again and hold the power key on the prompt). Expect each time: `BT SSP prompt withdrawn: BT
+stopping` (d only), `BT mem stop ...`, `BT sup stop stalls 0 ...`, `BT stopped`, the device switches off. Power on:
+BT tile → Phone works, the laptop reconnects with its bond (a, b, c) and the transfer can be repeated; after (c)
+`fsck.exfat -n` on the card (USB disk mode) reports no error.
+
+**E2 Power off in headphones mode.** (a) headphones on, home screen, headset connected, nothing playing; (b) a
+recording playing on the headset; (c) headphones screen while `Searching...`. Expect `BT hp teardown ... reason=0`
+(ms < 2000), `BT hp stopped`, off. Power on → BT tile → Headphones: reconnects to the headset.
+
+**E3 USB cable.** (a) phone mode on the BT screen, laptop connected: plug the cable. Expect: BT mode stays (the
+charge icon), no USB disk; transfers still work; BACK → USB disk mode comes up by itself within ~2 s, with `BT stopped`
+logged before it. (b) Headphones on, home screen, headset connected: plug the cable. Expect `BT hp stopped` logged
+**before** the USB disk mode starts; on the laptop the card mounts and `fsck.exfat -n` is clean; unplug → home; BT tile
+→ Headphones reconnects. (c) Playing on the headset, plug the cable: playback goes on; leave the player → USB disk
+mode as in (b). (d) Settings → USB disk with headphones on: as (b).
+
+**E4 microSD removal.** (a) Phone mode, laptop connected and authorised: pull the card, then `bt_sync.py --mac $MAC
+--list` and `--stat`. Expect error answers (or an empty list), no reboot, the BT screen responsive; BACK leaves BT
+mode (`BT stopped`); insert the card and report whether the home screen sees it again (the home loop re-probes only
+a card whose init failed; otherwise a power cycle is needed); then BT tile → Phone: the laptop reconnects. (b) Headphones on and connected: pull the card, then
+use the headphones screen `Forget` on the headset (forces a bond-file write). Expect `BT bonds not saved (SD write
+failed, retrying)`, at most 8 retries, no reboot, headphones mode keeps running. Re-insert the card, BACK, power off
+and on: the old headset bond is either still there or gone (whichever write last reached the card), never a damaged
+`bt_hp_bonds.bin` (`fsck.exfat -n` clean, headphones mode starts). (c) Card out, enter phone mode, card in, leave:
+no crash; report what the screen showed.
+
+**E5 REC switch.** (a) Phone mode during a `bt_sync.py` transfer: slide REC on. Expect `BT stopped` within 2 s,
+recording starts at once, the laptop sees the link drop; REC off: the recording is saved and plays back without a gap
+at its start. (b) Headphones streaming: REC on. Expect `BT hp media SUSPEND` (or `SUSPEND refused retry=N`), the
+headset falls silent, recording runs; REC off, back to the player, PLAY: the stream resumes. Report any hum or noise
+in that recording (Exp 4h).
+
+**E6 Low battery.** Needs VBAT near 3.45 V: either let the battery run down with BT active (the `BT vbat mV last N min
+M vbus 0` line every 30 s while BT runs shows the level and the sag under RF load), or, if the bench has one, a lab
+supply in place of the battery at 3.40-3.60 V. Unplug USB (VBUS cancels the rule). (a) Phone mode below 3450 mV:
+expect `BT low battery mV N` after ~1.5 s, `BT phone mode left: low battery`, `BT stopped`, toast `Low battery: BT
+off` on the home screen. (b) BT tile → Phone again: refused at once (`BT start refused, low battery mV N`, same toast).
+(c) Headphones playing, below 3450 mV: `BT headphones stopped: low battery`, the player pauses with the toast. (d)
+Raise to >= 3550 mV (or charge): BT starts again. Report the `min` values seen while BT was busy (pairing, transfer,
+streaming) against the idle `last`: if the radio alone pulls a healthy battery under 3450 mV, the threshold or the
+sample count needs changing (`open_fw/bt_port/bt_lowbatt.h`).
+
+**E7 WDT supervisor on silicon.** Read the `BT sup stop stalls 0 hciT n=.. max=.. ref=.. out=..` line written at every
+BT stop of E1-E6: `stalls` must be 0, `max` (ms, the slowest ping answer) far below 8000 and `ref` (refused posts)
+0. (a) Idle bonded phone: phone mode with the laptop connected and nothing sent for 10 min: no `BT task stalled`, no
+fault. (b) Stalled transfer: start `python3 tools/bt_sync.py --mac $MAC` on a large recording, then freeze the client
+for 60 s (`kill -STOP <pid>`, later `kill -CONT <pid>`): no `BT task stalled`, the transfer continues or the client
+times out; BACK leaves cleanly. Report `max` for both: it sets how much margin the 8 s stall limit has
+(`open_fw/bt_port/bt_task_sup.h`).
+
+**E8 Recovery images.** (a) Phone mode, laptop connected and authorised: `python3 tools/bt_sync.py --mac $MAC
+--reboot`. Expect `BT XREC deferred reboot, mode 1`, `BT stopped`, then a normal boot. (b) The same with `--ota
+dumps/update_openfw.up` (written by the `update-up` above; the bench image itself is fine): `BT XREC deferred reboot, mode 2`,
+`BT stopped`, the SD OTA updater runs and the device comes back with the image. (c) Start a recording over BT
+(`--rec-start`) and then `--reboot`: the recording is finalised before the reboot (plays back, correct length). (d)
+After all of the above `sudo python3 tools/dev_cycle.py dfu` and a re-flash still work (the USB DFU recovery path).
+
+**What to report:** per item the ring log (and `SD:/BTBENCH.LOG` if one was written), what the screen and the headset
+did, `fsck.exfat -n` results, any reboot or `PREV_FAULT`, and the `BT vbat` / `BT sup` lines. Afterwards leave the
+latest BT-branch build on the device.

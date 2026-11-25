@@ -765,6 +765,37 @@ secret of ~33 predictable bits: bench-only waiver, see the review-round entry be
   - accept `8b9dc77` -> `360c188` tools: split `+XREC:ERR` framing, atomic 0600 key file, probe-log token guards
     (self-test's always-true assert replaced by a real check).
   Silicon checks owed: disconnect during bulk inbound transfer then reconnect (R1-11); OTA during a recording.
+- 2026-11-25 (step 8, host and QEMU only; branch `feat/bt-step8` from `c15f6b2`; silicon recipe: `docs/BT_HW_RESULTS.md`
+  "Exp 5"). Gap audit of step 8 against `c15f6b2`, then everything that needs no hardware:
+  (1) **UI/i18n:** all BT=1 strings (phone prompt `Pair? N s` / `ENTER Yes · BACK No` / `Pairing open N s` / bonded,
+  "Pairing unavailable", Bluetooth choice, headphones screen and messages, Settings "Audio output" row and values,
+  player headset toasts, the new low-battery toast) moved to a separate table `include/openfw_i18n_bt.h` +
+  `src/ui/ui_i18n_bt.c`, 43 strings x 18 languages, compiled only with `BT=1` (the BT=0 image keeps CRC `0xA3BB`:
+  `openfw_i18n.h`'s enum and table untouched). Flash only (.rodata in XIP). `test_ui_render` (BT=1 build) checks
+  every string: non-empty, every glyph in ui_font_sm/md, its UTF-8 bytes against the buffer it is copied into
+  (`list_lbl` 26 -> 34, `list_foot` 44 -> 64 bytes: Cyrillic takes 2 bytes a letter) and its pixel width against the
+  label that shows it (toast 136 px, footers 154, list rows by their value column, the Settings row with "- X +").
+  The English texts that did not fit their label were shortened (the old headphones hint was cut by `list_foot`).
+  Settings "Audio output" values are now Speaker / BT / Both. Left English: the headset-button probe (diagnostic,
+  shared with BT=0).
+  (2) **WDT supervisor** (M4 "Watchdog"): `bt_port/bt_task_sup.c`. The app task (lowest priority) feeds the WDT, so
+  a feed already proves no task above it hogs the CPU; the supervisor adds liveness: while the stack is enabled the
+  app posts a ping work item to hciT, BTU and BTC (osi queue 0, no wait) once a second. Idle threads answer at once
+  (idle bonded phone, peer-stalled transfer: healthy); a ping unanswered 8 s = platform fault 4 (`BT task stalled:
+  <task>`, graceful recovery or the hard path); unanswered 20 s = `wdt_feed()` stops writing the WDT (BT=1 only,
+  weak hook in `wdt_timer.c`; the experiment deadline still extends: the separation the plan asks for). Armed at the
+  first platform poll, disarmed when the teardown starts (the 2 s window and the bring-up keep their own deadlines).
+  bt_ctrl keeps its hang / CPU-share guards; bt_dlv blocks only on the hciT/BTU queues. Tests: `test_bt_task_sup`
+  (unit, `test-bt-port`) and the real Bluedroid threads in `test-bt-host` phone P7b (idle bonded phone), P8 (stalled
+  transfer, 2 stall windows) and P22 (BTC blocked -> fault 4 -> FAULTED, no hard path -> restart). State in
+  SRAM_HI; `.bt_bss` +8 B (heap_5 region 0: 33,776 B, floor 32 KiB).
+  (3) **Power transitions:** audit of power-off, USB, card, REC switch and XREC reboot paths: all already went through
+  `bt_shutdown()` (table in BT_HW_RESULTS Exp 5). New: **low battery** (`bt_port/bt_lowbatt.h`, the recorder's
+  3450/3550 mV thresholds, 3 samples 0.5 s apart, VBUS cancels): phone mode leaves BT mode, headphones mode stops
+  (home loop, Bluetooth screens, player), a start is refused; toast "Low battery: BT off"; `BT vbat mV last/min` logged
+  every 30 s while BT runs (Exp 5 measures the sag under RF load). Unit test `test_bt_lowbatt`. Not changed: a USB
+  cable plugged in phone mode keeps BT mode (as legacy; USB disk mode after BACK), no card-removal detection (§6.7 of
+  the A2DP design). Needs hardware: Exp 5 E1-E8, the supervisor's real ping latencies (E7), VBAT under load (E6).
 
 ## 11. Round-1 traceability
 
