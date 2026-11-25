@@ -92,8 +92,12 @@ differs in several places: see [section 8](#8-legacy-stock-firmware-patch-fw_mod
 | 10..11 | u16 LE | CRC-16/CCITT-FALSE of the payload |
 | 12.. | N bytes | file data |
 
-* The device may lower the chunk to `RFCOMM MTU - 12`: **a short frame is NOT EOF**. Track EOF with the size from
-  `LS`, and ask for at most `size - off` bytes. A read at or after EOF returns one frame with N = 0.
+* The device may lower the chunk to `RFCOMM MTU - 12`: **a short first frame is NOT EOF**. Track EOF with the size
+  from `LS`, and ask for at most `size - off` bytes. Every frame of a burst has the same size except the last one.
+* A burst that starts at or after EOF returns one frame with N = 0. A burst that reaches EOF part-way (the file is
+  shorter than requested, e.g. it was replaced after `LS`) ends with one short frame and **no** N = 0 frame: treat a
+  frame shorter than the burst's first frame as its end, and a silence after a short first frame as EOF (then ask
+  again from the new offset; that burst gets the N = 0 frame).
 * Errors come as text instead of a frame: `+XREC:ERR,<NOENT|NOSD|NAME|ARGS|SDIO>`.
 * Do not send another command while a GETS streams (LS, PUT and GETS cancel it).
 * Recommended: `total = 3840`, `chunk = 640`; verify offset and CRC of every frame; on any error retry from the last
@@ -102,7 +106,9 @@ differs in several places: see [section 8](#8-legacy-stock-firmware-patch-fw_mod
 
 ### 5.4 DEL, RECSTART / RECSTOP, other
 * `+XREC:DEL,<name>` -> `+XREC:OK,DEL` | `ERR,NOSD` | `ERR,NAME` | `ERR,BUSY` (the file being recorded, or the
-  staging temp of a REC upload in progress) | `ERR,DEL` (missing). Only in `/record`.
+  staging temp of a REC upload in progress) | `ERR,DEL` (missing). Only in `/record`. Deleting a recording
+  `<stem>.wav` also deletes its transcript sidecar `<stem>.cwx` (as the on-device delete does): the recorder reuses
+  the number of a deleted newest recording, and the new recording must not inherit the old transcript.
 * `+XREC:RECSTART` -> `+XREC:OK,RECSTART,<name>`; `+XREC:RECSTOP` -> `+XREC:OK,RECSTOP` | `ERR,NOTREC`.
 * `REBOOT`, `DFU`, `OTA`, `LOG`, `RUN`, `DSP` / `GAIN` / `CH` / `VOR`: maintenance and development commands, not
   needed by a sync client (see `xrec_proto.c`).
@@ -113,11 +119,16 @@ differs in several places: see [section 8](#8-legacy-stock-firmware-patch-fw_mod
 +XREC:PUT,<offset>,<len 1..640>,<crc16 decimal>,<target>:<exactly len raw bytes, no CR>
 ```
 Reply per chunk: `+XREC:OK,PUT,<offset>,<len>`. Errors: `ERR,LOCKED`, `ERR,CRC`, `ERR,OFF`, `ERR,NAME`, `ERR,ARG`,
-`ERR,SDIO`, `ERR,NOSD`, `ERR,UNSUP`.
+`ERR,SDIO`, `ERR,NOSD`, `ERR,UNSUP`, `ERR,NOENT` (REC: no `/record/<stem>.wav`).
+
+Client retry policy: resend the same chunk only after a timeout or `ERR,CRC`. `SDIO`, `NOSD`, `LOCKED`, `NOENT` and
+`OFF` are final (after `SDIO` the device has already dropped the staged upload). A late `OK,PUT` for an earlier
+offset (the first reply to a chunk that was resent after a timeout) must be dropped, not taken as the reply to the
+next chunk or to `PUTEND`.
 
 | Target | Destination | Commit |
 | :--- | :--- | :--- |
-| `REC,<stem>.cwx` | `/record/<stem>.cwx`: the transcript sidecar next to `/record/<stem>.wav` (`/record` is created if missing). Staged as `/record/.xrec_rec.tmp` | `+XREC:PUTEND` |
+| `REC,<stem>.cwx` | `/record/<stem>.cwx`: the transcript sidecar of the existing recording `/record/<stem>.wav` (else `ERR,NOENT` at offset 0, and at `PUTEND` if the recording was deleted meanwhile). Staged as `/record/.xrec_rec.tmp` | `+XREC:PUTEND` |
 | `CAS,<name>` | `/cassini/<name>` (`/cassini` is created if missing). Staged as `/cassini/.xrec_cas.tmp` | `+XREC:PUTEND` |
 | `OTA` | `/update.up`. Staged as `/.xrec_ota.tmp` | `+XREC:OTA` (needs >= 64 B; reboots into the SD updater) |
 
@@ -133,9 +144,20 @@ Staging rules (all targets):
 * `+XREC:PUTEND` -> `+XREC:OK,PUTEND,<total>` commits a staged REC or CAS upload by an atomic replace (an existing
   file of that name is replaced; the name never disappears on power loss). `ERR,NOPUT` when no REC/CAS upload is
   staged (PUTEND never commits an OTA image, and `+XREC:OTA` never commits a REC/CAS upload: `ERR,NOOTA`).
+* `PUTEND` is idempotent: until the next PUT header, a repeated `PUTEND` (its reply was lost) answers the same
+  `OK,PUTEND,<total>`. Firmware before this change answers `ERR,NOPUT` instead; a client that gets `NOPUT` on a
+  repeated `PUTEND` confirms the commit with `LS` (name and size).
 * A disconnect before the commit discards the staged upload (temp deleted).
-* If the header is rejected (`ARG`, `NAME`, ...), the payload bytes are fed to the line parser and silently dropped:
-  after such an error send a bare `\r` and re-sync on replies.
+* After a power loss or reset during an upload the temp stays on the card (a REC temp is visible as
+  `/record/.xrec_rec.tmp` over USB). REC and CAS temps are checkpointed after every chunk, so the leftover is a normal
+  file that owns its clusters; the next upload of that target deletes it at offset 0 (or delete it over USB). An OTA
+  temp is not checkpointed: its clusters stay marked used until `fsck`.
+* If the header is rejected after its `<len>` was parsed (`NAME`, an unknown target, a bad crc field: `ERR,NAME` /
+  `ERR,ARG`), the error is sent at once and exactly `<len>` payload bytes are discarded unparsed. An unparsable or
+  out-of-range offset or length gives `ERR,ARG` and the payload goes to the line parser. **Firmware before this
+  change** fed the payload of every refused header to the line parser: `\r`-terminated pieces were parsed as lines,
+  pieces of 192+ bytes gave extra `ERR,LINE` replies. So after any refused header send `\r+XREC:PING\r` and drain
+  replies up to the `+XREC:PONG`.
 * A device that predates the REC target answers `ERR,ARG` to a `REC,` header: report "recorder firmware too old for
   transcript upload" and do not retry.
 

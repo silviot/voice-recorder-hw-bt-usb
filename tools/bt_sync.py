@@ -333,6 +333,36 @@ class XRecRFCOMMClient:
             raise RuntimeError(f"OTA trigger failed: {resp}")
         print("Device acknowledged +XREC:OTA — rebooting to flash 0:\\update.up and auto-boot new firmware!")
 
+    _PUT_OK_RE = re.compile(r"\+XREC:OK,PUT,(\d+),(\d+)")
+
+    def _read_put_reply(self, offset: int) -> str:
+        """Next reply line for the PUT chunk at `offset` (or for PUTEND when offset is the total). A late
+        +XREC:OK,PUT for an earlier chunk (its first reply arrived after we timed out and resent it; the device
+        answers the identical resend again) is dropped, so the client never falls one reply behind."""
+        while True:
+            line = self._read_line()
+            m = self._PUT_OK_RE.fullmatch(line)
+            if m and int(m.group(1)) < offset:
+                continue
+            return line
+
+    def _resync_after_refused_header(self) -> None:
+        """After a refused PUT header. Current firmware discards the payload of a refused header whose length it
+        parsed; older firmware fed it to the line parser, which may answer with extra ERR,LINE (or other) lines.
+        A bare CR ends any partial line; then drain every reply up to our own PONG."""
+        assert self.sock is not None
+        self.sock.sendall(b"\r+XREC:PING\r")
+        try:
+            for _ in range(64):
+                if self._read_line().startswith("+XREC:PONG"):
+                    return
+        except (TimeoutError, socket.timeout):
+            self.rx_buf.clear()
+
+    # PUT chunk errors worth a resend of the same chunk; every other error is final
+    _PUT_RETRY_ERRS = ("+XREC:ERR,CRC",)
+    _PUT_HEADER_ERRS = ("+XREC:ERR,ARG", "+XREC:ERR,UNSUP", "+XREC:ERR,NAME")
+
     def put_file(self, target: str, data: bytes, chunk_size: int = PUT_CHUNK_SIZE) -> int:
         """Staged upload: stop-and-wait +XREC:PUT chunks (one in flight: the device RX ring is 2 KiB) then
         +XREC:PUTEND, which commits atomically. target is "REC,<stem>.cwx" (sidecar next to /record/<stem>.wav) or
@@ -352,19 +382,23 @@ class XRecRFCOMMClient:
             for attempt in range(3):
                 try:
                     self.sock.sendall(header + chunk)
-                    resp = self._read_line()
+                    resp = self._read_put_reply(offset)
                     if resp == want:
                         break
                     err_msg = resp
-                    if resp in ("+XREC:ERR,ARG", "+XREC:ERR,UNSUP", "+XREC:ERR,NAME"):
-                        # header refused: its payload went to the device's line parser; a bare CR re-syncs it
-                        self.sock.sendall(b"\r")
+                    if resp in self._PUT_HEADER_ERRS:
+                        self._resync_after_refused_header()
                         if offset == 0 and resp != "+XREC:ERR,NAME" and target.startswith("REC,"):
                             raise RuntimeError(f"recorder firmware too old for transcript upload ({resp})")
                         raise RuntimeError(f"PUT {target} refused: {resp}")
+                    if resp == "+XREC:ERR,NOENT" and target.startswith("REC,"):
+                        raise RuntimeError(f"PUT {target} refused: no matching .wav recording in 0:\\record")
+                    if resp not in self._PUT_RETRY_ERRS:
+                        # SDIO / NOSD / LOCKED / OFF ...: the device dropped the staged upload, a resend cannot help
+                        raise RuntimeError(f"PUT {target} failed at offset {offset}: {resp}")
                 except (TimeoutError, socket.timeout) as exc:
-                    err_msg = str(exc)
-                    self.rx_buf.clear()
+                    # keep rx_buf: a partial late reply completes later and is then matched or dropped as stale
+                    err_msg = f"timeout ({exc})" if str(exc) else "timeout"
                 if attempt == 2:
                     raise RuntimeError(f"PUT {target} failed at offset {offset}: {err_msg}")
                 # resending the same chunk (same offset/len/crc/name) is acknowledged without a second write
@@ -372,11 +406,24 @@ class XRecRFCOMMClient:
             offset += len(chunk)
             print(f"\r  PUT {target}: {offset:,}/{total:,} B", end="", flush=True)
         print()
-        self._send_cmd("+XREC:PUTEND")
-        resp = self._read_line()
-        if resp != f"+XREC:OK,PUTEND,{total}":
-            raise RuntimeError(f"PUTEND failed for {target}: {resp}")
-        return total
+        want_end = f"+XREC:OK,PUTEND,{total}"
+        resp = ""
+        for attempt in range(3):
+            self._send_cmd("+XREC:PUTEND")
+            try:
+                resp = self._read_put_reply(total)
+            except (TimeoutError, socket.timeout):
+                resp = "timeout"
+                continue   # PUTEND is idempotent on current firmware: a repeat answers the same OK
+            if resp == want_end:
+                return total
+            if resp == "+XREC:ERR,NOPUT" and attempt > 0 and target.startswith("REC,"):
+                # older firmware after a lost PUTEND reply: the commit happened iff LS shows the name with this size
+                name = target[len("REC,") :]
+                if any(n.lower() == name.lower() and sz == total for n, sz in self.list_files()):
+                    return total
+            break
+        raise RuntimeError(f"PUTEND failed for {target}: {resp}")
 
     def upload_cwx(self, cwx_path: Path, remote_name: str, chunk_size: int = PUT_CHUNK_SIZE) -> int:
         """Upload a CWX1 transcript sidecar as /record/<remote_name> (must end in .cwx) via the REC target."""
@@ -445,18 +492,31 @@ class XRecRFCOMMClient:
         return self._read_xrec_frame(offset, filename)
 
     def get_burst(self, filename: str, offset: int, total_len: int, chunk_size: int = CHUNK_SIZE) -> bytes:
-        """One +XREC:GETS burst. total_len must not run past the file's LS size: the device may lower the frame size
-        to its RFCOMM MTU - 12, so a SHORT FRAME IS NOT EOF. The burst ends when total_len bytes arrived or on an
-        empty frame (read at/after EOF)."""
+        """One +XREC:GETS burst. total_len must not run past the file's LS size. The device may lower the frame size
+        to its RFCOMM MTU - 12, so a short FIRST frame is not EOF; but every frame of a burst except the last has
+        the same size, so a frame shorter than the first one ends the burst (EOF inside the burst: the device sends
+        no N=0 frame after it). The burst also ends when total_len bytes arrived, on an empty frame (read at/after
+        EOF), or on a timeout after at least one frame (a short first frame that was EOF)."""
         self._send_cmd(f"+XREC:GETS,{offset},{total_len},{chunk_size},{filename}")
         out = bytearray()
         cur = offset
+        first_len = 0
         while len(out) < total_len:
-            frame = self._read_xrec_frame(cur, filename)
+            try:
+                frame = self._read_xrec_frame(cur, filename)
+            except (TimeoutError, socket.timeout):
+                if not out:
+                    raise
+                self.rx_buf.clear()   # the device is done; drop any partial bytes
+                break
             if not frame:
                 break  # N=0: at/after EOF (the file is shorter than its LS size)
             out.extend(frame)
             cur += len(frame)
+            if not first_len:
+                first_len = len(frame)
+            elif len(frame) < first_len:
+                break  # EOF inside the burst
         return bytes(out)
 
     def download_file(
@@ -661,8 +721,8 @@ def main() -> None:
             return
         if args.upload_cwx:
             if args.for_recording:
-                names = {n for n, _ in client.list_files()}
-                if args.for_recording not in names:
+                names = {n.lower() for n, _ in client.list_files()}
+                if args.for_recording.lower() not in names:
                     print(f"{args.for_recording} is not in 0:\\record (LS); not uploading.")
                     sys.exit(1)
                 remote = Path(args.for_recording).stem + ".cwx"
