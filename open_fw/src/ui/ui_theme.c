@@ -318,6 +318,12 @@ void ui_toast_update(const char *msg, uint16_t rgb565_col)
 
     if (!s_toast_visible || msg_len >= sizeof(s_toast_last_msg) ||
         lv_strcmp(s_toast_last_msg, msg) != 0) {
+        /* LONG_DOT on a LV_SIZE_CONTENT label dots the text against its pre-layout width (0 px), so every toast
+         * became a "..." pill. Give the label its text width, at most 136 px, and one line, so only a really long
+         * message is dotted. */
+        lv_point_t tsz;
+        lv_text_get_size(&tsz, msg, &ui_font_sm, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+        lv_obj_set_size(s_toast_lbl, tsz.x < 136 ? tsz.x : 136, lv_font_get_line_height(&ui_font_sm));
         lv_label_set_text(s_toast_lbl, msg);
         if (msg_len < sizeof(s_toast_last_msg)) {
             lv_memcpy(s_toast_last_msg, msg, msg_len + 1u);

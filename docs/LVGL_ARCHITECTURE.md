@@ -38,6 +38,7 @@ open_fw/
 - **LVGL SRAM:** Full-screen direct RGB565 draw buffer (`160 × 80 × 2 B = 25.6 KiB`, enabling the hardware-scroll screen push and dirty-rect partial LCD flushes) + built-in TLSF heap (`LV_OBJ_STYLE_CACHE` enabled, ~`7.6 KiB` live on silicon / `~13.4 KiB` peak on 64-bit host).
 - **Cached Nav Screens (`src/ui/eez/ui.c`):** High-frequency navigation screens (`HOME`, `FILES`, `SETTINGS`) stay cached in LVGL RAM for instant switching, with a contiguous-heap guard (`10 KiB`) that evicts inactive cached screens cleanly before loading modal/heavy screens.
 - **`lv_layer_top()` Sizing Rule:** Because `LV_DPI_DEF = 160` in `lv_conf.h`, any manually created LVGL widget (`ui_box_create` / `lv_obj_create`) defaults to `160 × 160` px unless sized explicitly (`lv_obj_set_size(..., LV_SIZE_CONTENT, LV_SIZE_CONTENT)`). Always set explicit size on overlays such as `s_toast_pill`.
+- **`LV_LABEL_LONG_DOT` needs a fixed label width:** a `LONG_DOT` label left at `LV_SIZE_CONTENT` is dotted against its pre-layout width (0 px), so the whole text becomes `...` (every toast used to show a `...` pill). `ui_toast_update()` sets the toast label to its measured text width (`lv_text_get_size`, capped at 136 px) and one line height before `lv_label_set_text()`; `test_ui_render` checks the toast label text and pill width for every image.
 
 ---
 
