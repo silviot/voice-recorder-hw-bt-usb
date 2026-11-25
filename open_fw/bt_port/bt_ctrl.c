@@ -1567,13 +1567,27 @@ static bool held_is_stale(const held_acl_t *h)
 
 /* Drop held ACL_RX whose Disconnection Complete or a newer Connection Complete has already crossed to the host, even
  * while C2H credits are exhausted (so a dead link neither pins EM RX buffers nor injects stale frames onto a reused
- * handle once credits return). Returns false if parked. */
+ * handle once credits return). Returns false if parked.
+ *
+ * Marker expiry: a marker is the event's RX sequence number, and every ACL_RX gets its number in bt_ctrl context from
+ * the same counter (rx_seq), so any ACL_RX held after this pass is numbered after every marker bt_dlv can have set so
+ * far. Once a full pass has removed every held entry older than a marker, that marker can never match again: it is
+ * cleared here. Left set, it would turn "stale" for every new frame on that handle once rx_seq had advanced 2^31
+ * past it (seq_before() is a wrapping comparison). The pass works on one snapshot of the markers, and a marker is
+ * cleared only if bt_dlv has not replaced it meanwhile (a newer one needs its own pass). */
 static bool purge_stale_held(bool *progress)
 {
+    uint8_t valid;
+    uint32_t min_seq[BT_CTRL_MAX_LINKS];
+    g.p.enter();
+    valid = g.acl_min_valid;
+    memcpy(min_seq, g.acl_min_seq, sizeof(min_seq));
+    g.p.exit();
     for (uint32_t i = 0u; i < g.held_n; ) {
         uint32_t idx = (g.held_head + i) % BT_CTRL_HELD_ACL;
         held_acl_t *h = &g.held[idx];
-        if (!held_is_stale(h)) {
+        uint8_t bit = handle_bit(h->handle);
+        if (bit != 0u && ((valid & bit) == 0u || !seq_before(h->seq, min_seq[h->handle - 0x80u]))) {
             i++;
             continue;
         }
@@ -1595,6 +1609,16 @@ static bool purge_stale_held(bool *progress)
         g.held_n--;
         g.st.acl_rx_dropped_disc++;
         *progress = true;
+    }
+    if (valid != 0u) {
+        g.p.enter();
+        for (uint32_t i = 0u; i < BT_CTRL_MAX_LINKS; i++) {
+            uint8_t bit = (uint8_t)(1u << i);
+            if ((valid & bit) != 0u && g.acl_min_seq[i] == min_seq[i]) {
+                g.acl_min_valid &= (uint8_t)~bit;
+            }
+        }
+        g.p.exit();
     }
     return true;
 }
@@ -2202,6 +2226,14 @@ void bt_ctrl_get_stats(bt_ctrl_stats_t *out)
     g.p.exit();
 }
 
+#if defined(BT_CTRL_TEST_HOOKS) && BT_CTRL_TEST_HOOKS
+/* Host tests only: jump the RX sequence counter (bt_ctrl context), standing in for 2^31 upcalls. */
+void bt_ctrl_test_advance_rx_seq(uint32_t n)
+{
+    g.rx_seq += n;
+}
+#endif
+
 void bt_ctrl_get_debug(bt_ctrl_debug_t *out)
 {
     memset(out, 0, sizeof(*out));
@@ -2221,6 +2253,7 @@ void bt_ctrl_get_debug(bt_ctrl_debug_t *out)
     out->evt_deferred = g.def_n;
     out->acl_used = g.acl_head - g.acl_tail;
     out->held_acl = g.held_n;
+    out->acl_markers = g.acl_min_valid;
     out->h2c_inflight = g.inflight_total;
     out->c2h_outstanding = g.c2h_out_total;
     out->c2h_credits = g.c2h_credits;

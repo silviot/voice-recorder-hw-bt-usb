@@ -48,7 +48,7 @@ BT_CTRL_BD_INCS = $(addprefix -I,$(sort $(shell find $(BT_CTRL_BD)/host/bluedroi
                   -Ithird_party/freertos/include -Itests/bt_host -Isrc/rtos -Ibt_port -Itests
 BT_CTRL_BD_DEFS := -DESP_PLATFORM=1 -D__ESP_ATTR_H__ -DOPENFW_BLUEDROID=1 -DBT_LOGS=0 \
                    -include bt_port/bt_port_prefix.h
-BT_CTRL_TEST_CFLAGS := $(BT_PORT_TEST_CFLAGS) -std=gnu11
+BT_CTRL_TEST_CFLAGS := $(BT_PORT_TEST_CFLAGS) -std=gnu11 -DBT_CTRL_TEST_HOOKS=1
 test-bt-ctrl:
 	@mkdir -p $(BT_CTRL_TEST_DIR)
 	$(HOST_CC) $(BT_CTRL_TEST_CFLAGS) $(BT_CTRL_BD_DEFS) $(BT_CTRL_BD_INCS) -c $(BT_CTRL_BD)/host/bluedroid/hci/hci_packet_parser.c \

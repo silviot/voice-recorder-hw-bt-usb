@@ -765,6 +765,23 @@ secret of ~33 predictable bits: bench-only waiver, see the review-round entry be
   - accept `8b9dc77` -> `360c188` tools: split `+XREC:ERR` framing, atomic 0600 key file, probe-log token guards
     (self-test's always-true assert replaced by a real check).
   Silicon checks owed: disconnect during bulk inbound transfer then reconnect (R1-11); OTA during a recording.
+- 2026-11-25: **Review r1 verifier lows** (three follow-ups on applied r1 fixes; each test fails without its fix).
+  - `390ce27` (R1-11): the DISC / CONN_CMP inbound-ACL marker (`acl_min_seq`) never expired, so 2^31 RX sequence
+    numbers after it `seq_before()` wrapped and every new ACL on that handle was purged as stale. A full
+    `purge_stale_held()` pass now clears each marker it served (taken as one snapshot; cleared only if bt_dlv has not
+    replaced it meanwhile): every later ACL_RX is numbered after it. `bt_ctrl_debug_t.acl_markers` shows live
+    markers. Test `acl_marker_expiry` (test hook `bt_ctrl_test_advance_rx_seq`, `-DBT_CTRL_TEST_HOOKS=1` in
+    test-bt-ctrl): 2^31 + 16 numbers after a reconnect ACL is still delivered; the R1-11 purge still works across
+    the counter wrap.
+  - `f847255` (R1-15): on a leaked ROM lock `bt_ctrl_task` unwound only `bt_rom_real` and then forced `more = 1`, so
+    with any other ROM (the fake ROM) it re-ran at once forever, posting a fault per pass. The decision is now
+    `bt_ctrl_leak_check()` (`bt_port/bt_ctrl_leak.h`): unwound -> re-run once to finish the stop; still held -> no
+    immediate re-run (the task blocks; only reachable without PRIMASK) and one fault per leak. Test
+    `lock_leak_recovery` drives it as the task loop does (1000 passes: 0 re-runs, 1 fault).
+  - `d7baca0` (R1-18): the test covered only the `bt_xrec_spp_deinit_needed()` flag. Phone scenario step P0
+    (test-bt-host) now holds BTC_TASK suspended after the up job so the SPP INIT stays queued, stops in CONFIG and
+    checks the down job calls `esp_spp_deinit()`, SPP UNINIT arrives, and the next session reaches READY (without the
+    fix: deinit skipped, next session FAULTED with CONFIG, SPP INIT -> `ESP_SPP_NEED_DEINIT`).
 
 ## 11. Round-1 traceability
 

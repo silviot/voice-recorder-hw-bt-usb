@@ -59,6 +59,7 @@
 #include "fake_rom.h"
 #include "host_env.h"
 #include "host_xrec.h"
+#include "esp_spp_api.h"
 
 int bth_phone_scenario(const char *img_path);
 void bt_xrec_test_set_inflight_max(uint32_t n);   /* bt_xrec_bluedroid.c test hook (0 = default) */
@@ -1383,6 +1384,40 @@ int bth_phone_scenario(const char *img_path)
                                       9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24 };
     uint8_t lkey[16];
     char line[200];
+
+    /* ---- 0 ---- */
+    /* R1-18 (d7baca0): a stop while BTC_TASK has not yet run the session's SPP INIT (state CONFIG, spp_inited still
+     * false) must still esp_spp_deinit(); skipped, BTC_TASK later initialises SPP into the stack-down and the next
+     * session's INIT fails with ESP_SPP_NEED_DEINIT (CONFIG fault). BTC_TASK is held suspended to open that window. */
+    bth_log("[P0] stop in CONFIG with the SPP INIT posted but not yet run\n");
+    {
+        bthx_hold_btc(1);
+        PCHECK(bthx_call(BTHX_START, 0u, 3000u) == 0, "P0 bt_xrec_start");
+        bool win = WAIT(bthx_btc_held() && S().d.state == BT_XREC_ST_CONFIG && bt_xrec_spp_deinit_needed(), 5000);
+        esp_spp_profile_status_t ps;
+        memset(&ps, 0, sizeof(ps));
+        PCHECK(win && esp_spp_get_profile_status(&ps) == ESP_OK && !ps.spp_inited,
+               "P0 window not reached (held %d state %u posted %d inited %d)", bthx_btc_held(), S().d.state,
+               bt_xrec_spp_deinit_needed(), (int)ps.spp_inited);
+        uint32_t chk0 = bthx_down_spp_checked(), dn0 = bthx_down_spp_deinit();
+        uint32_t seq = bthx_post(BTHX_STOP, 0u);
+        PCHECK(WAIT(bthx_down_spp_checked() != chk0, 3000), "P0 down job never reached the SPP deinit decision");
+        PCHECK(bthx_down_spp_deinit() == dn0 + 1u, "P0 down job skipped esp_spp_deinit() for the posted SPP INIT");
+        vTaskDelay(pdMS_TO_TICKS(20));
+        PCHECK(bthx_hold_btc(0) == 1, "P0 BTC_TASK was not held");
+        int r = -1000;
+        PCHECK(WAIT(bthx_done(seq, &r), 8000) && r == 0, "P0 stop (%d)", r);
+        PCHECK(S().d.state == BT_XREC_ST_OFF && bt_xrec_spp_uninit_seen(), "P0 state %u, SPP UNINIT seen %d",
+               S().d.state, bt_xrec_spp_uninit_seen());
+        controller_clean("P0 stop");
+        pbase_t now;
+        PCHECK(psettle(&base, &now), "P0: heap %zu B / %zu blocks (base %zu / %zu): SPP state left allocated",
+               now.bytes, now.blocks, base.bytes, base.blocks);
+        if (!wait_ready()) {                      /* the next session's SPP INIT must succeed */
+            goto out;
+        }
+        stop_session(&base, "P0 restart stop");
+    }
 
     /* ---- 1 ---- */
     bth_log("[P1] bt_xrec_start, pairing window\n");

@@ -46,6 +46,12 @@ void bthx_withhold_entropy(int on);
 /* TEST knob: the next up job waits while on (the worker outranks the app task, and the fake ROM answers at once, so
  * without it the bring-up always finishes before the app task runs again; on target the ROM bring-up does not). */
 void bthx_hold_bringup(int on);
+/* TEST knob: while on, the next up job ends with BTC_TASK suspended, so the session's esp_spp_enhanced_init() stays
+ * queued (ST_CONFIG, SPP INIT posted, spp_inited still false). Off resumes BTC_TASK; returns 1 if it was suspended. */
+int  bthx_hold_btc(int on);
+int  bthx_btc_held(void);
+uint32_t bthx_down_spp_checked(void);    /* down jobs that have made the SPP-deinit decision */
+uint32_t bthx_down_spp_deinit(void);     /* ... of which decided to call esp_spp_deinit() */
 uint32_t bthx_ssp_value_logged(void);    /* value of the last "numeric comparison accepted" log line */
 /* Read a root file of the RAM SD card (test task, only while the session is OFF or idle). Returns bytes or -1. */
 int  bthx_read_root_file(const char *name, uint8_t *buf, uint32_t cap);

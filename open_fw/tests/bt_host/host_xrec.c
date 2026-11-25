@@ -335,6 +335,9 @@ const xrec_ops_t *bt_xrec_plat_device_ops(void) { return &k_dev_ops; }
 
 /* ============================================ worker ============================================================ */
 static volatile uint8_t s_hold_up;    /* test knob: the up job waits (the app task keeps running, state UP) */
+static volatile uint8_t s_hold_btc;   /* test knob: the up job ends with BTC_TASK suspended (bthx_hold_btc) */
+static TaskHandle_t volatile s_btc_held;
+static volatile uint32_t s_down_spp_checked, s_down_spp_deinit;   /* down jobs past the SPP check / that deinit */
 
 static int job_up(void)
 {
@@ -351,6 +354,12 @@ static int job_up(void)
         return 4;
     }
     s_key_installed = s_key_staged;  /* firmware: bt_rom_real start() installed the staged P-192 pair (HCI Reset) */
+    if (s_hold_btc) {                /* test knob: BTC_TASK queues, but does not run, what the session posts next */
+        s_btc_held = xTaskGetHandle("BTC_TASK");
+        if (s_btc_held != NULL) {
+            vTaskSuspend(s_btc_held);
+        }
+    }
     return 0;
 }
 
@@ -371,7 +380,10 @@ static int job_down(void)
     if (esp_bluedroid_get_status() == ESP_BLUEDROID_STATUS_ENABLED) {
         esp_spp_profile_status_t ps;
         memset(&ps, 0, sizeof(ps));
-        if ((esp_spp_get_profile_status(&ps) == ESP_OK && ps.spp_inited) || bt_xrec_spp_deinit_needed()) {
+        int need = (esp_spp_get_profile_status(&ps) == ESP_OK && ps.spp_inited) || bt_xrec_spp_deinit_needed();
+        s_down_spp_deinit += need ? 1u : 0u;
+        s_down_spp_checked++;
+        if (need) {
             if (esp_spp_deinit() == ESP_OK) {
                 while (!bt_xrec_spp_uninit_seen()) {
                     vTaskDelay(1);
@@ -692,3 +704,17 @@ uint32_t bthx_key_writes(void) { return s_key_writes; }
 uint32_t bthx_reboot_mode(void) { return s_reboot_mode; }
 void bthx_withhold_entropy(int on) { s_withhold = on ? 1u : 0u; }
 void bthx_hold_bringup(int on) { s_hold_up = on ? 1u : 0u; }
+int bthx_hold_btc(int on)
+{
+    s_hold_btc = on ? 1u : 0u;
+    if (!on && s_btc_held != NULL) {
+        TaskHandle_t h = s_btc_held;
+        s_btc_held = NULL;
+        vTaskResume(h);
+        return 1;
+    }
+    return 0;
+}
+int bthx_btc_held(void) { return s_btc_held != NULL; }
+uint32_t bthx_down_spp_checked(void) { return s_down_spp_checked; }
+uint32_t bthx_down_spp_deinit(void) { return s_down_spp_deinit; }

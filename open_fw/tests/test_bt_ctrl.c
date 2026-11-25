@@ -14,6 +14,7 @@
 #include "bt_ctrl_evt.h"
 #include "bt_ctrl_parser_shim.h"
 #include "fake_rom.h"
+#include "bt_ctrl_leak.h"
 
 static int g_fail, g_checks;
 static int t_quiet;
@@ -1680,6 +1681,135 @@ static void test_parked_shutdown_completes(void)
     CHECK(bt_ctrl_shutdown_status() == BT_CTRL_STOP_PARKED && dbg().state == 0u && fake_rom.calls == c0,
           "do_stop completed as STOP_PARKED with 0 ROM calls (status %d, state %u)",
           bt_ctrl_shutdown_status(), dbg().state);
+}
+
+void bt_ctrl_test_advance_rx_seq(uint32_t n);   /* bt_ctrl.c, BT_CTRL_TEST_HOOKS */
+
+/* Verifier finding on 390ce27 (R1-11 port): the DISC / CONN_CMP marker (acl_min_seq) never expired, so once the RX
+ * sequence counter had moved 2^31 past it, seq_before() wrapped and every new inbound ACL on that handle was purged
+ * as "stale". The marker must clear once no held ACL older than it remains, and the purge must stay correct when the
+ * counter wraps through 0. */
+static void test_acl_marker_expiry(void)
+{
+    uint8_t d_a[64], d_b[64];
+    memset(d_a, 0xAA, sizeof(d_a));
+    memset(d_b, 0xBB, sizeof(d_b));
+    const pkt_t *p;
+
+    /* (a) reconnect on 0x80 with nothing held: both markers expire; 2^31 + 16 RX numbers later ACL still flows */
+    setup();
+    bring_up();
+    link_up(0);
+    fake_rom_link(0, false);
+    inject_disc(0x80, 0x13);
+    pump();
+    fake_rom_link(0, true);
+    inject_conn_cmp(0x80);
+    pump();
+    t_rx_rd = t_rx_n;
+    CHECK(dbg().acl_markers == 0u, "(a) DISC/CONN_CMP markers expired once nothing older is held (0x%x)",
+          dbg().acl_markers);
+    uint32_t drop0 = stats().acl_rx_dropped_disc;
+    bt_ctrl_test_advance_rx_seq(0x80000000u + 16u);
+    CHECK(fake_rom_inject_acl(0x80, 2, d_b, 32) == 0, "(a) inject after 2^31 RX numbers");
+    pump();
+    p = next_pkt();
+    CHECK(p != NULL && p->d[0] == BT_H4_ACL && (p->d[1] | ((p->d[2] & 0x0Fu) << 8)) == 0x80u && p->d[5] == 0xBBu,
+          "(a) live ACL on 0x80 delivered 2^31 RX numbers after the marker (dropped_disc %u -> %u)", drop0,
+          stats().acl_rx_dropped_disc);
+    CHECK(stats().acl_rx_dropped_disc == drop0 && dbg().held_acl == 0u, "(a) nothing purged as stale");
+    host_nocp(0x80, 1);
+    pump();
+    shutdown_and_check();
+
+    /* (b) the R1-11 purge itself across the counter wrap: credit-blocked frames numbered just below 2^32, the
+     *     Disconnection Complete just above 0; stale frames still dropped, the new link's frames still delivered */
+    setup();
+    bring_up();
+    link_up(0);
+    bt_ctrl_test_advance_rx_seq(0xFFFFFFFCu);    /* rx_seq was small after bring-up: now a few numbers below 2^32 */
+    for (int i = 0; i < 6; i++) CHECK(fake_rom_inject_acl(0x80, 2, d_a, 32) == 0, "(b) inject A %d", i);
+    pump();
+    t_rx_rd = t_rx_n;
+    CHECK(dbg().c2h_outstanding == 4u && dbg().held_acl == 2u, "(b) 4 delivered, 2 held");
+    fake_rom_link(0, false);
+    inject_disc(0x80, 0x13);
+    pump();
+    p = next_pkt();
+    CHECK(is_evt(p, BT_HCI_EVT_DISC) && dbg().held_acl == 0u && fake_rom_em_rx_in_use() == 0u,
+          "(b) held frames purged across the wrap (held %u)", dbg().held_acl);
+    CHECK(dbg().acl_markers == 0u, "(b) marker expired after the purge (0x%x)", dbg().acl_markers);
+    fake_rom_link(0, true);
+    inject_conn_cmp(0x80);
+    host_nocp(0x80, 4);
+    pump();
+    uint32_t stale = 0u;
+    while ((p = next_pkt()) != NULL) stale += p->d[0] == BT_H4_ACL;
+    CHECK(stale == 0u, "(b) no stale ACL after reconnect (%u)", stale);
+    CHECK(fake_rom_inject_acl(0x80, 2, d_b, 32) == 0, "(b) inject on the new link");
+    pump();
+    p = next_pkt();
+    CHECK(p != NULL && p->d[0] == BT_H4_ACL && p->d[5] == 0xBBu && dbg().acl_markers == 0u,
+          "(b) new link's ACL delivered, markers clear");
+    host_nocp(0x80, 1);
+    pump();
+    shutdown_and_check();
+}
+
+/* Verifier finding on f847255 (R1-15 accept): bt_ctrl_task unwound a leaked ROM lock only for bt_rom_real and then
+ * forced `more = 1` whatever happened, so with any other ROM (the fake ROM) a leaked lock made the task re-run at once
+ * forever without blocking, posting a fault on every pass. bt_ctrl_leak_check() is the task's decision, driven here as
+ * the task loop drives it. */
+static uint32_t lk_stops, lk_unwinds, lk_faults, lk_fault_code;
+static void lk_stop(void) { lk_stops++; }
+static void lk_unwind(void) { lk_unwinds++; fake_rom.lock_depth = 0; }
+static void lk_fault(uint32_t code) { lk_faults++; lk_fault_code = code; }
+
+/* One bt_ctrl task pass after bt_ctrl_run() returned run_more; returns the task's "run again at once". */
+static uint32_t lk_task_pass(bt_ctrl_leak_t *st, uint32_t run_more, void (*unwind)(void))
+{
+    int r = bt_ctrl_leak_check(st, &fake_rom_if, lk_stop, unwind, lk_fault);
+    return r == BT_CTRL_LEAK_NONE ? run_more : (r == BT_CTRL_LEAK_UNWOUND ? 1u : 0u);
+}
+
+static void test_lock_leak_recovery(void)
+{
+    bt_ctrl_leak_t st;
+    setup();
+    /* (a) no leak: the task's own result passes through, nothing posted */
+    memset(&st, 0, sizeof(st));
+    lk_stops = lk_unwinds = lk_faults = lk_fault_code = 0u;
+    fake_rom.lock_depth = 0;
+    CHECK(lk_task_pass(&st, 0u, lk_unwind) == 0u && lk_task_pass(&st, 1u, lk_unwind) == 1u &&
+          lk_stops == 0u && lk_faults == 0u, "(a) no leak: no stop, no fault, run result kept");
+
+    /* (b) a ROM with an unwind (bt_rom_real): stopped, unwound, one fault, one immediate re-run to finish the stop */
+    fake_rom.lock_depth = 1;
+    CHECK(lk_task_pass(&st, 0u, lk_unwind) == 1u, "(b) unwound leak re-runs bt_ctrl at once");
+    CHECK(fake_rom.lock_depth == 0u && lk_stops == 1u && lk_unwinds == 1u && lk_faults == 1u &&
+          lk_fault_code == BT_CTRL_FAULT_INVARIANT, "(b) stop + unwind + INVARIANT once (stops %u faults %u)",
+          lk_stops, lk_faults);
+    CHECK(lk_task_pass(&st, 0u, lk_unwind) == 0u && lk_faults == 1u, "(b) lock free again: task blocks");
+
+    /* (c) a ROM without an unwind (the fake ROM in bt_ctrl_rtos): the task must not spin. Before the fix every pass
+     *     returned "run again" and posted a fault; 1000 passes of the task loop here model the spin. */
+    memset(&st, 0, sizeof(st));
+    lk_stops = lk_unwinds = lk_faults = 0u;
+    fake_rom.lock_depth = 1;
+    uint32_t reruns = 0u;
+    for (int i = 0; i < 1000; i++) {
+        reruns += lk_task_pass(&st, 1u, NULL);
+    }
+    CHECK(reruns == 0u, "(c) stuck leak: task never re-runs at once (%u of 1000 passes did)", reruns);
+    CHECK(lk_faults == 1u && st.reported == 1u && st.leaks == 1000u && lk_stops == 1000u,
+          "(c) one fault for one stuck leak (faults %u leaks %u)", lk_faults, st.leaks);
+    /* the leak clears (bt_ctrl's stop path released it): normal again; a later, separate leak is reported anew */
+    fake_rom.lock_depth = 0;
+    CHECK(lk_task_pass(&st, 0u, NULL) == 0u && st.stuck == 0u, "(c) lock free: back to normal");
+    fake_rom.lock_depth = 2;
+    (void)lk_task_pass(&st, 0u, NULL);
+    CHECK(lk_faults == 2u, "(c) a new leak posts its own fault (%u)", lk_faults);
+    fake_rom.lock_depth = 0;
 }
 
 /* Finding 10: send-available only on a full -> not-full transition. */
@@ -3824,6 +3954,8 @@ int main(void)
         { "fwd_orphan", test_fwd_orphan },
         { "stale_tx_acl_flush", test_stale_tx_acl_flush },
         { "stale_rx_acl_flush", test_stale_rx_acl_flush },
+        { "acl_marker_expiry", test_acl_marker_expiry },
+        { "lock_leak_recovery", test_lock_leak_recovery },
         { "unsolicited_reply_dropped", test_unsolicited_reply_dropped },
         { "0c13_rom_nul_guard", test_0c13_rom_nul_guard },
         { "parked_shutdown_completes", test_parked_shutdown_completes },
