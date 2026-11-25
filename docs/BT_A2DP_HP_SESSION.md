@@ -124,10 +124,11 @@ Each host-testable one has a check that failed before the fix (scenario S unless
   the end of the recording; headsets rarely refuse SUSPEND (design Exp 4h).
 - Unasked STARTED after the 5 s START no-ack timeout (audit 5b): needs the stack to send STARTED > 5 s late; fix
   when seen on silicon (SUSPEND it after ~500 ms).
-- Just Works hook allows when the session is gone (audit 6): harmless while headphones mode is never connectable;
-  tightening it touches phone mode's pairing path.
-- Patch E backstop (`btc_av` state reset at deinit, new patch 0040) and refusing `bt_hp_start` after `job_rc=5`
-  (audit 7): only a headset frozen during a stop reaches it, and 0039 covers the stream stuck closing.
+- Just Works hook allows when the session is gone (audit 6): **done in step 10** (review STEP10 C4/A3): the hook
+  refuses unless a headphones session is open; phone mode never kept a Just Works key anyway.
+- Patch E backstop (`btc_av` state reset at deinit, new patch 0040): still deferred (only a headset frozen during a
+  stop reaches it, and 0039 covers the stream stuck closing). Refusing `bt_hp_start` after `job_rc=5` (audit 7):
+  **done in step 10** (review STEP10 C14: `s_restart_required`, cleared only by a reboot).
 - `mc_issue` clearing both pending flags on a send error: harmless (one command outstanding at a time).
 
 ## Integration with the local features (`integ/bt-all-local`: BT + `test/main-combo`)

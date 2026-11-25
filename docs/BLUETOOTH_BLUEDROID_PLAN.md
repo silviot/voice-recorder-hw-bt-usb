@@ -814,6 +814,23 @@ secret of ~33 predictable bits: bench-only waiver, see the review-round entry be
   every 30 s while BT runs (Exp 5 measures the sag under RF load). Unit test `test_bt_lowbatt`. Not changed: a USB
   cable plugged in phone mode keeps BT mode (as legacy; USB disk mode after BACK), no card-removal detection (§6.7 of
   the A2DP design). Needs hardware: Exp 5 E1-E8, the supervisor's real ping latencies (E7), VBAT under load (E6).
+- 2026-11-25 (step 10, `integ/bt-all-local`): merged `fix/bt-verifier-lows` (41735ee), `fix/toast-text-all`
+  (b389642) and `feat/bt-step8` (e44dcea). Conflicts: `test_ui_render.c` (the toast checks now run for every image; the
+  BT=1 string checks sit in the BT=1 block before `check_bt_ui`) and this log (both entries kept). The step 8 entry's
+  "BT=0 keeps 0xA3BB" held for its branch only: the toast fix (0x7EC9) and the review fixes below change the default
+  image. Then the **joint review** of `c15f6b2` (Codex 18 + agy 11 findings), triaged in
+  `docs/reviews/STEP10_JOINT_REVIEW.md` (raw: `STEP10_CODEX.md`, `STEP10_AGY.md`). Fixed: XREC DEL of the file being
+  recorded (`+XREC:ERR,BUSY`), PAIR acknowledged only after `cassini.key` is written (`+XREC:ERR,SAVE`; also legacy
+  `bt_hci.c`), bond store kept over an older file after a failed write and never written over an unreadable file
+  (`s_bonds_hold`), Just Works hook refuses outside a headphones session (phone P11/P13 now expect the refusal),
+  headphones numeric comparison bounded by the window deadline, teardown hard path before freeing the session and a
+  stuck tick escalated, start refused after an unconfirmed A2DP deinit, `conn_hdl` invalidated on link down, Forget
+  only while READY, discovery-cancel deadline, Play blocked on route NONE, About reboot stops BT, bench PIN 0000 cleared
+  after the run. New tests: `test_core` (DEL busy, PAIR save failure), `test_bt_xrec` (PAIR save failure), phone P15b
+  (unsaved bonds kept; unreadable file kept), headphones S10c (Forget off, Just Works with no session); the P15b, S10c,
+  DEL and PAIR checks fail without their fixes. Gates (0 warnings): FIRM CRC def 0xECB8, bt 0xA199, hp 0x663A,
+  hpb 0xD52F, bench 0x4FED. Open: A5 XREC TX flow control, C3, A3 key downgrade, A6/A9/C7/C11 OOM paths, C13; hardware:
+  C5, headset IO capability (C2/A8), C18 address, A10, A11, Exp 5.
 
 ## 11. Round-1 traceability
 
