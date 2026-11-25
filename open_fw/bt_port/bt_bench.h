@@ -35,8 +35,10 @@
  *                       phone-mode keys and are refused with mode=hp (pair_secs is the hp_pair window length)
  *   hp_stage=scan|connect|tone|player   default scan (Exp 4a / 4b / 4c / 4d)
  *   hp_addr=XX:XX:XX:XX:XX:XX   the headset (as printed by a phone or bluetoothctl, most significant byte first);
- *                       required from hp_stage=connect on unless hp_pick=first; not with hp_pick=first
- *   hp_pick=addr|first  default addr; first = the first audio-class device the scan finds
+ *                       required from hp_stage=connect on unless hp_pick=first|last; not with hp_pick=first|last
+ *   hp_pick=addr|first|last  default addr; first = a scan, then the first AV-class device found (headset types
+ *                       first, bt_bench_hp_pick); last = the headset stored by an earlier stage (no scan; not with
+ *                       hp_addr or hp_pair)
  *   hp_pair=0|1         default 0: open the pairing window (pair_secs) for the picked headset; not with hp_stage=scan
  *   hp_pscan=0|1        default 0: leave page scan on during 0401/0405 (Exp 4a/4b variant, design §6.2)
  *   hp_secs=N           2..61, default 10: discovery length in s (0401 Inquiry_Length = ceil(N / 1.28 s))
@@ -106,6 +108,7 @@ typedef struct {
     uint8_t  hp_addr_set;   /* hp_addr given */
     uint8_t  hp_addr[6];    /* esp_bd_addr_t order: most significant byte first, as written */
     uint8_t  hp_pick_first; /* hp_pick=first */
+    uint8_t  hp_pick_last;  /* hp_pick=last: the stored last headset (SD:/bt_hp_cfg.bin), no scan, no pairing */
     uint8_t  hp_pair, hp_pscan, hp_mono;
     uint8_t  hp_secs;       /* discovery length (s) */
     uint16_t hp_rate;       /* 0 = auto, 44100, 48000 */
@@ -148,6 +151,10 @@ bt_bench_trig_t bt_bench_take(exfat_vol_t *vol, int mounted, bt_bench_cfg_t *cfg
 /* 0401 Inquiry_Length (units of 1.28 s, 1..0x30) for hp_secs: ceil(secs / 1.28). */
 uint8_t bt_bench_hp_inq_len(uint8_t secs);
 const char *bt_bench_hp_stage_name(uint8_t stage);   /* scan, connect, tone, player */
+/* hp_pick=first over a scan's devices (their CoD, discovery order): the first AV-major device with a headset-type minor
+ * (wearable headset, hands-free, loudspeaker, headphones, portable audio), else the first AV-major device; -1 if none.
+ * Devices that only set the Audio/Rendering service bits (phones, laptops) are never picked. */
+int bt_bench_hp_pick(const uint32_t *cod, uint32_t n);
 
 /* Short words for the log. */
 const char *bt_bench_trig_name(bt_bench_trig_t t);   /* taken, absent, no_sd, not_file, stuck, bad_content */

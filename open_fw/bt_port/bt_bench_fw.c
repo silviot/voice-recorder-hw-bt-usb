@@ -226,6 +226,7 @@ static void hp_boot_log(void)
     lku("secs", s_cfg.secs);
     lku("hp_secs", s_cfg.hp_secs);
     lku("pick_first", s_cfg.hp_pick_first);
+    lku("pick_last", s_cfg.hp_pick_last);
     lku("addr_set", s_cfg.hp_addr_set);
     if (s_cfg.hp_addr_set) {
         lka("addr", s_cfg.hp_addr);
@@ -342,7 +343,9 @@ static void hp_stats(uint32_t el_ms)
         lbegin("hp linkinfo");
         lks("role", li.role == BT_CTRL_ROLE_MASTER ? "M" : li.role == BT_CTRL_ROLE_SLAVE ? "S" : "?");
         lkx("pkt_type", li.pkt_type);
+        lkx("req_pt", li.req_pkt_type);
         lku("max_slots", li.max_slots);
+        lku("edr", li.rmt_feat_seen ? (uint32_t)((li.rmt_feat3 >> 1) & 3u) : 9u);   /* 9 = features not seen */
         lku("mode", li.mode);
         lku("acl_sent", li.acl_sent);
         lku("acl_done", li.acl_completed);
@@ -425,6 +428,21 @@ int bt_bench_hp_tick(uint32_t now, char *path, uint32_t cap)
                     lemit();
                     s_hp.st = HPB_DONE;
                 }
+            } else if (s_cfg.hp_pick_last) {
+                if (!u->has_last) {
+                    lbegin("hp");
+                    lks("err", "hp_pick=last: no stored headset (run a connect stage with hp_pair=1 first)");
+                    lemit();
+                    s_hp.st = HPB_DONE;
+                    break;
+                }
+                lbegin("hp pick");
+                lks("from", "last");
+                lka("addr", u->last);
+                lks("name", u->last_name[0] != '\0' ? u->last_name : "?");
+                lemit();
+                (void)bt_hp_connect_addr(u->last, 0);   /* usually already reconnecting (READY starts it) */
+                s_hp.st = HPB_CONNECTING;
             } else {
                 if (s_cfg.hp_pair) {
                     lbegin("hp pair window");
@@ -443,15 +461,14 @@ int bt_bench_hp_tick(uint32_t now, char *path, uint32_t cap)
                 s_hp.st = HPB_DONE;
                 break;
             }
-            int pick = -1;
-            for (uint32_t i = 0u; i < u->n_found && pick < 0; i++) {
-                if (u->found[i].is_audio) {
-                    pick = (int)i;
-                }
+            uint32_t cods[BT_HP_FOUND_MAX];
+            for (uint32_t i = 0u; i < u->n_found; i++) {
+                cods[i] = u->found[i].cod;
             }
+            int pick = bt_bench_hp_pick(cods, u->n_found);   /* AV major class, headset types first */
             if (pick < 0) {
                 lbegin("hp");
-                lks("err", "no audio-class device found (put the headphones in pairing mode)");
+                lks("err", "no AV-class device found (put the headphones in pairing mode; phones/PCs are never picked)");
                 lemit();
                 s_hp.st = HPB_DONE;
                 break;

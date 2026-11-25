@@ -264,7 +264,9 @@ static void test_parse_hp(void)
         { "mode=hp hp_addr=00:1B:66:AA:BB:CG", BT_BENCH_E_VALUE },
         { "mode=hp hp_addr=00:00:00:00:00:00", BT_BENCH_E_VALUE },
         { "mode=hp hp_addr=FF:FF:FF:FF:FF:FF", BT_BENCH_E_VALUE },
-        { "mode=hp hp_pick=last", BT_BENCH_E_VALUE },
+        { "mode=hp hp_pick=lastx", BT_BENCH_E_VALUE },
+        { "mode=hp hp_stage=player hp_pick=last hp_addr=00:1B:66:AA:BB:CC", BT_BENCH_E_CONFLICT },
+        { "mode=hp hp_stage=player hp_pick=last hp_pair=1", BT_BENCH_E_CONFLICT },   /* a stored headset: no pairing */
         { "mode=hp hp_pair=2", BT_BENCH_E_VALUE },
         { "mode=hp hp_pscan=yes", BT_BENCH_E_VALUE },
         { "mode=hp hp_secs=1", BT_BENCH_E_VALUE },
@@ -318,6 +320,28 @@ static void test_parse_hp(void)
           bt_bench_hp_inq_len(13) == 11u, "inquiry length");
     CHECK(strcmp(bt_bench_hp_stage_name(BT_BENCH_HP_TONE), "tone") == 0 && strcmp(bt_bench_hp_stage_name(9), "?") == 0,
           "stage names");
+    /* hp_pick=last: the headset stored by an earlier stage (the bond file is kept between stages) */
+    bt_bench_cfg_default(&c);
+    CHECK(parse("mode=hp hp_stage=player hp_pick=last secs=180", &c, NULL) == BT_BENCH_OK && c.hp_pick_last &&
+          !c.hp_pick_first && !c.hp_addr_set, "hp_pick=last");
+    bt_bench_cfg_default(&c);
+    CHECK(parse("mode=hp hp_stage=tone hp_pick=LAST", &c, NULL) == BT_BENCH_OK && c.hp_pick_last, "hp_pick=LAST");
+    /* hp_pick=first: AV major class first (headset-type minors before other AV), never a service-bit-only match (a
+     * phone or laptop advertising Audio/Rendering) */
+    {
+        static const uint32_t iphone = 0x7A020Cu, laptop = 0x5A010Cu, car = 0x240420u, hdph = 0x240418u,
+                              wearable = 0x240404u, speaker = 0x240414u;
+        const uint32_t a[] = { iphone, laptop, car, hdph };
+        CHECK(bt_bench_hp_pick(a, 4u) == 3, "phone, laptop, car audio, headphones -> headphones (%d)",
+              bt_bench_hp_pick(a, 4u));
+        const uint32_t b[] = { iphone, laptop };
+        CHECK(bt_bench_hp_pick(b, 2u) == -1, "service-bit-only devices are never picked (%d)", bt_bench_hp_pick(b, 2u));
+        const uint32_t d[] = { iphone, car };
+        CHECK(bt_bench_hp_pick(d, 2u) == 1, "any AV major class when no headset-type minor (%d)", bt_bench_hp_pick(d, 2u));
+        const uint32_t e[] = { 0u, speaker, wearable };
+        CHECK(bt_bench_hp_pick(e, 3u) == 1, "first headset-type device in discovery order (%d)", bt_bench_hp_pick(e, 3u));
+        CHECK(bt_bench_hp_pick(e, 0u) == -1, "empty list");
+    }
 }
 
 /* ---------------------------------------------------------------------------------------------------------------- */

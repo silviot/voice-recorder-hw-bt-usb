@@ -61,6 +61,7 @@ void bt_bench_cfg_default(bt_bench_cfg_t *cfg)
         cfg->hp_addr[i] = 0u;
     }
     cfg->hp_pick_first = 0u;
+    cfg->hp_pick_last = 0u;
     cfg->hp_pair = 0u;
     cfg->hp_pscan = 0u;
     cfg->hp_mono = 0u;
@@ -251,11 +252,14 @@ static int hp_rules(uint32_t seen, bt_bench_cfg_t *c)
     if (SEEN(K_PAIR) || SEEN(K_PAIR_EVERY) || SEEN(K_AUTOCONFIRM) || SEEN(K_XREC_PIN)) {
         return -1;                                       /* phone-session overrides */
     }
-    if (c->hp_stage >= BT_BENCH_HP_CONNECT && !c->hp_addr_set && !c->hp_pick_first) {
+    if (c->hp_stage >= BT_BENCH_HP_CONNECT && !c->hp_addr_set && !c->hp_pick_first && !c->hp_pick_last) {
         return -1;
     }
-    if (c->hp_addr_set && c->hp_pick_first) {
+    if (c->hp_addr_set && (c->hp_pick_first || c->hp_pick_last)) {
         return -1;
+    }
+    if (c->hp_pick_last && c->hp_pair) {
+        return -1;                                       /* the stored headset is bonded: no pairing window */
     }
     if (c->hp_pair && c->hp_stage == BT_BENCH_HP_SCAN) {
         return -1;
@@ -374,9 +378,13 @@ bt_bench_err_t bt_bench_parse(const uint8_t *buf, uint32_t len, bt_bench_cfg_t *
             break;
         case K_HP_PICK:
             if (word_is(v, vn, "addr")) {
-                c.hp_pick_first = 0u;
+                c.hp_pick_first = c.hp_pick_last = 0u;
             } else if (word_is(v, vn, "first")) {
                 c.hp_pick_first = 1u;
+                c.hp_pick_last = 0u;
+            } else if (word_is(v, vn, "last")) {
+                c.hp_pick_last = 1u;
+                c.hp_pick_first = 0u;
             } else {
                 return BT_BENCH_E_VALUE;
             }
@@ -641,4 +649,23 @@ int bt_bench_log_save(exfat_vol_t *vol, int mounted, const char *data, uint32_t 
         return -1;
     }
     return exfat_close_file(w);
+}
+
+int bt_bench_hp_pick(const uint32_t *cod, uint32_t n)
+{
+    int any_av = -1;
+    for (uint32_t i = 0u; i < n; i++) {
+        uint32_t major = (cod[i] >> 8) & 0x1Fu, minor = (cod[i] >> 2) & 0x3Fu;
+        if (major != 0x04u) {
+            continue;                                    /* not Audio/Video: service bits alone do not count */
+        }
+        /* wearable headset 1, hands-free 2, loudspeaker 5, headphones 6, portable audio 7 */
+        if (minor == 1u || minor == 2u || minor == 5u || minor == 6u || minor == 7u) {
+            return (int)i;
+        }
+        if (any_av < 0) {
+            any_av = (int)i;
+        }
+    }
+    return any_av;
 }
