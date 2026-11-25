@@ -247,9 +247,7 @@ static void capture_shot(int idx)
 }
 
 
-#if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID
-/* BT=1 phone-mode UI checks (review findings): the toast label shows its text (not "..."), a long peer name on the BT
- * status line ends in "..." on one line instead of wrapping out of the 12 px label. */
+/* The visible toast's label (the pill on lv_layer_top() is the only visible child with a child). */
 static lv_obj_t *toast_label(void)
 {
     lv_obj_t *top = lv_layer_top();
@@ -261,6 +259,60 @@ static lv_obj_t *toast_label(void)
     }
     return NULL;
 }
+
+/* Toasts show their text, not a "..." pill (LONG_DOT on a content-sized label used to dot against a 0 px width):
+ * short messages are shown whole on one line and the rendered pill is as wide as the text; only a message wider
+ * than 136 px is dotted. Runs for every image (default and BT=1). */
+static void check_toast_text(ui_model_t *m)
+{
+    ui_model_t b = *m;
+    static const char *const msgs[] = { "Saved", "Start of list", "PIN 246810" };
+    const lv_font_t *font = NULL;
+    for (unsigned k = 0; k < sizeof(msgs) / sizeof(msgs[0]); k++) {
+        strcpy(b.toast_msg, msgs[k]);
+        b.toast_col = UI_COL_AMBER;
+        ui_render_screen(UI_SCR_HOME, &b);
+        for (int frame = 0; frame < 14; frame++) { s_now += 16u; ui_port_task_handler(); }
+        lv_obj_t *tl = toast_label();
+        assert(tl != NULL);
+        lv_obj_update_layout(tl);
+        font = lv_obj_get_style_text_font(tl, 0);
+        lv_point_t tsz;
+        lv_text_get_size(&tsz, msgs[k], font, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+        int min_x = 160, max_x = -1;
+        for (int y = 56; y < 80; y++) {
+            for (int x = 0; x < 160; x++) {
+                if (g_fb[y][x] == UI_COL_AMBER) {
+                    if (x < min_x) min_x = x;
+                    if (x > max_x) max_x = x;
+                }
+            }
+        }
+        printf("toast: [%s] label w=%d (text %d) pill px %d..%d\n", lv_label_get_text(tl),
+               (int)lv_obj_get_width(tl), (int)tsz.x, min_x, max_x);
+        assert(strcmp(lv_label_get_text(tl), msgs[k]) == 0);
+        assert(tsz.x < 136 && lv_obj_get_width(tl) == tsz.x);
+        assert(lv_obj_get_height(tl) == lv_font_get_line_height(font));
+        assert(max_x >= 0 && max_x - min_x + 1 >= tsz.x + 16);   /* text width + 2 x 8 px padding */
+    }
+    strcpy(b.toast_msg, "Long warning toast clipped cleanly!!!");
+    ui_render_screen(UI_SCR_HOME, &b);
+    for (int frame = 0; frame < 14; frame++) { s_now += 16u; ui_port_task_handler(); }
+    lv_obj_t *tl = toast_label();
+    assert(tl != NULL);
+    lv_obj_update_layout(tl);
+    printf("long toast: [%s] w=%d h=%d\n", lv_label_get_text(tl), (int)lv_obj_get_width(tl),
+           (int)lv_obj_get_height(tl));
+    assert(strstr(lv_label_get_text(tl), "Long warning") != NULL && strstr(lv_label_get_text(tl), "...") != NULL &&
+           lv_obj_get_width(tl) == 136 && lv_obj_get_height(tl) == lv_font_get_line_height(font));
+    b.toast_msg[0] = '\0';
+    ui_render_screen(UI_SCR_HOME, &b);
+    for (int frame = 0; frame < 14; frame++) { s_now += 16u; ui_port_task_handler(); }
+}
+
+#if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID
+/* BT=1 phone-mode UI checks (review findings): the toast label shows its text (not "...") on the BT screen, a long
+ * peer name on the BT status line ends in "..." on one line instead of wrapping out of the 12 px label. */
 
 static void check_bt_ui(ui_model_t *m)
 {
@@ -856,6 +908,7 @@ int main(int argc, char **argv)
 #if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID
     check_bt_ui(&m);
 #endif
+    check_toast_text(&m);
     /* Verify visible toast (including long truncated toast) is a compact bottom pill
      * (never a full-screen 160x160 default-sized circle) and produces 0 redraw pixels when unchanged */
     strcpy(m.toast_msg, "Long warning toast clipped cleanly!!!");
