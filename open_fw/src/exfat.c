@@ -398,10 +398,16 @@ typedef struct {
 
 typedef int (*exfat_dir_loc_cb_t)(const exfat_entry_t *entry, const exfat_dir_loc_t *loc, void *user);
 
-static int list_dir_with_loc(const exfat_vol_t *vol, uint32_t dir_cluster, uint8_t no_fat_chain,
-                             uint64_t dir_size, exfat_dir_cb_t cb, exfat_dir_loc_cb_t loc_cb, void *user)
+/* The directory walker behind every listing and lookup. Starts at *pos when pos names a cluster (else at the start),
+ * hands each complete entry set to cb / loc_cb / pos_cb (pos_cb also gets the position right after the set), and asks
+ * yield before each card read except the first one of the call and never inside an entry set (so every call makes
+ * progress and no set is cut). Returns 0 at the end of the directory, 1 when a callback stopped the walk, 2 when yield
+ * did (*pos = where to resume: every entry before it went to the callback), -1 on a read error. */
+static int dir_walk(const exfat_vol_t *vol, uint32_t dir_cluster, uint8_t no_fat_chain, uint64_t dir_size,
+                    exfat_dir_cb_t cb, exfat_dir_loc_cb_t loc_cb, exfat_dir_pos_cb_t pos_cb,
+                    exfat_dir_yield_t yield, void *user, exfat_dir_pos_t *pos)
 {
-    if (!vol || (!cb && !loc_cb) || dir_cluster < 2u) {
+    if (!vol || (!cb && !loc_cb && !pos_cb) || dir_cluster < 2u) {
         return -1;
     }
 
@@ -414,6 +420,7 @@ static int list_dir_with_loc(const exfat_vol_t *vol, uint32_t dir_cluster, uint8
     uint8_t name_pos     = 0u;
     exfat_dir_loc_t prim_loc;
     mem_zero(&prim_loc, sizeof(prim_loc));
+    mem_zero(&cur_ent, sizeof(cur_ent));
 
     uint32_t cls_shift = 9u + (uint32_t)vol->spc_shift;
     uint32_t max_cls   = 0u;
@@ -426,8 +433,33 @@ static int list_dir_with_loc(const exfat_vol_t *vol, uint32_t dir_cluster, uint8
         }
     }
 
-    uint32_t cls     = dir_cluster;
-    uint32_t cls_idx = 0u;
+    uint32_t cls       = dir_cluster;
+    uint32_t cls_idx   = 0u;
+    uint32_t s_start   = 0u;
+    uint32_t slot0     = 0u;
+    if (pos && pos->cls >= 2u) {
+        cls     = pos->cls;
+        cls_idx = pos->cls_idx;
+        s_start = pos->sec;
+        slot0   = pos->slot;
+        if (slot0 >= 16u) {                      /* "after the last slot of a sector" */
+            s_start++;
+            slot0 = 0u;
+        }
+        if (s_start >= vol->sectors_per_cluster) {   /* "after the last sector of a cluster" */
+            s_start = 0u;
+            cls_idx++;
+            if (no_fat_chain && cls_idx >= max_cls) {
+                return 0;
+            }
+            uint32_t nxt = 0u;
+            if (next_cluster(vol, cls, no_fat_chain, &nxt) != 0) {
+                return -1;
+            }
+            cls = nxt;
+        }
+    }
+    uint8_t did_read = 0u;
     uint8_t buf[4u * 512u];
 
     while (cls >= 2u && (cls - 2u) < vol->cluster_count) {
@@ -435,19 +467,29 @@ static int list_dir_with_loc(const exfat_vol_t *vol, uint32_t dir_cluster, uint8
             return -1; /* Corrupted FAT cycle */
         }
         uint32_t base_lba = cluster_to_lba(vol, cls);
-        for (uint32_t s_base = 0u; s_base < vol->sectors_per_cluster; ) {
+        for (uint32_t s_base = s_start; s_base < vol->sectors_per_cluster; ) {
             uint32_t chunk = vol->sectors_per_cluster - s_base;
             if (chunk > 4u) {
                 chunk = 4u;
             }
+            if (yield && did_read && !in_set && yield(user) != 0) {
+                if (pos) {
+                    pos->cls     = cls;
+                    pos->cls_idx = cls_idx;
+                    pos->sec     = s_base;
+                    pos->slot    = 0u;
+                }
+                return 2;
+            }
             if (vol->dev->read_sectors(vol->dev->ctx, base_lba + s_base, chunk, buf) != 0) {
                 return -1;
             }
+            did_read = 1u;
             for (uint32_t cs = 0u; cs < chunk; cs++) {
                 uint32_t s   = s_base + cs;
                 uint32_t lba = base_lba + s;
                 const uint8_t *sec = &buf[cs * 512u];
-                for (uint32_t idx = 0u; idx < 16u; idx++) {
+                for (uint32_t idx = slot0; idx < 16u; idx++) {
                 const uint8_t *d = &sec[idx * 32u];
                 uint8_t etype = d[0];
                 if (etype == 0x00u) {
@@ -507,17 +549,28 @@ static int list_dir_with_loc(const exfat_vol_t *vol, uint32_t dir_cluster, uint8
                 if (sec_seen >= sec_expected) {
                     in_set = 0u;
                     if (have_stream && cur_ent.name[0] != '\0') {
-                        int stop = loc_cb ? loc_cb(&cur_ent, &prim_loc, user)
-                                          : cb(&cur_ent, user);
+                        int stop;
+                        if (pos_cb) {
+                            exfat_dir_pos_t next;
+                            next.cls     = cls;
+                            next.cls_idx = cls_idx;
+                            next.sec     = s;
+                            next.slot    = idx + 1u;
+                            stop = pos_cb(&cur_ent, &next, user);
+                        } else {
+                            stop = loc_cb ? loc_cb(&cur_ent, &prim_loc, user) : cb(&cur_ent, user);
+                        }
                         if (stop != 0) {
-                            return 0;
+                            return 1;
                         }
                     }
                 }
-            }
+                }
+                slot0 = 0u;
             }
             s_base += chunk;
         }
+        s_start = 0u;
         cls_idx++;
         if (no_fat_chain && cls_idx >= max_cls) {
             break;
@@ -530,6 +583,13 @@ static int list_dir_with_loc(const exfat_vol_t *vol, uint32_t dir_cluster, uint8
     }
 
     return 0;
+}
+
+static int list_dir_with_loc(const exfat_vol_t *vol, uint32_t dir_cluster, uint8_t no_fat_chain,
+                             uint64_t dir_size, exfat_dir_cb_t cb, exfat_dir_loc_cb_t loc_cb, void *user)
+{
+    int rc = dir_walk(vol, dir_cluster, no_fat_chain, dir_size, cb, loc_cb, 0, 0, user, 0);
+    return (rc < 0) ? -1 : 0;
 }
 
 int exfat_list_dir(const exfat_vol_t *vol, uint32_t dir_cluster, uint8_t no_fat_chain,
@@ -545,6 +605,66 @@ int exfat_list_dir_entry(const exfat_vol_t *vol, const exfat_entry_t *dir,
         return -1;
     }
     return list_dir_with_loc(vol, dir->first_cluster, dir->no_fat_chain, dir->size, cb, 0, user);
+}
+
+int exfat_list_dir_resume(const exfat_vol_t *vol, const exfat_entry_t *dir, exfat_dir_pos_t *pos,
+                          exfat_dir_pos_cb_t cb, exfat_dir_yield_t yield, void *user)
+{
+    if (!dir || !dir->is_dir || !pos || !cb) {
+        return -1;
+    }
+    return dir_walk(vol, dir->first_cluster, dir->no_fat_chain, dir->size, 0, 0, cb, yield, user, pos);
+}
+
+typedef struct {
+    const char       *name;
+    uint32_t          name_len;
+    exfat_entry_t    *out;
+    exfat_dir_yield_t yield;
+    void             *yield_user;
+} find_resume_ctx_t;
+
+static int find_resume_cb(const exfat_entry_t *entry, const exfat_dir_pos_t *next, void *user)
+{
+    (void)next;
+    find_resume_ctx_t *fc = (find_resume_ctx_t *)user;
+    if (str_eq_ci_n(entry->name, fc->name, fc->name_len)) {
+        *fc->out = *entry;
+        return 1;
+    }
+    return 0;
+}
+
+static int find_resume_yield(void *user)
+{
+    find_resume_ctx_t *fc = (find_resume_ctx_t *)user;
+    return fc->yield(fc->yield_user);
+}
+
+int exfat_find_in_dir_resume(const exfat_vol_t *vol, const exfat_entry_t *dir, const char *name,
+                             exfat_dir_pos_t *pos, exfat_dir_yield_t yield, void *user, exfat_entry_t *out)
+{
+    if (!dir || !dir->is_dir || !name || !pos || !out) {
+        return -1;
+    }
+    find_resume_ctx_t fc;
+    fc.name     = name;
+    fc.name_len = 0u;
+    while (name[fc.name_len] != '\0') {
+        fc.name_len++;
+    }
+    fc.out        = out;
+    fc.yield      = yield;
+    fc.yield_user = user;
+    int rc = dir_walk(vol, dir->first_cluster, dir->no_fat_chain, dir->size, 0, 0, find_resume_cb,
+                      yield ? find_resume_yield : 0, &fc, pos);
+    if (rc == 1) {
+        return 0;                                /* found */
+    }
+    if (rc == 0) {
+        return 1;                                /* not in the directory */
+    }
+    return rc;                                   /* 2: yielded (*pos), -1: read error */
 }
 
 typedef struct {

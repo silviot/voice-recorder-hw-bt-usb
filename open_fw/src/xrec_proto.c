@@ -232,8 +232,24 @@ static void send_later(xrec_ctx_t *ctx)
     send_err(ctx, reason);
 }
 
-/* STAT field 10: 0 = not recording; mono: the time one XREC_PACE_WINDOW takes at the cap (the client's pause between
- * windows); stereo: XREC_LATER_MS (no transfers until REC stops). */
+/* send_later() that reports whether the line was queued (0) or the transport refused it (-1, nothing counted). */
+static int send_later_try(xrec_ctx_t *ctx)
+{
+    char buf[48];
+    int pos = 0;
+    append_str(buf, &pos, (int)sizeof(buf), "+XREC:ERR,LATER,");
+    append_u32(buf, &pos, (int)sizeof(buf), XREC_LATER_MS);
+    append_str(buf, &pos, (int)sizeof(buf), "\r\n");
+    if (!ctx->ops.send || ctx->ops.send(ctx->user, (const uint8_t *)buf, (uint16_t)pos) != 0) {
+        return -1;
+    }
+    ctx->pace.later++;
+    return 0;
+}
+
+/* STAT field 10: 0 = not recording; mono: the time one XREC_PACE_WINDOW takes at the cap (the shortest interval
+ * between window starts; the device paces, a client adds no pause after a window); stereo: XREC_LATER_MS (no
+ * transfers until REC stops). */
 static uint32_t pace_ms(const xrec_ctx_t *ctx)
 {
     uint8_t ch = rec_channels(ctx);
@@ -380,13 +396,15 @@ static int rec_wav_exists(const xrec_ctx_t *ctx, const char *cwx_name)
 }
 
 typedef struct {
-    xrec_ctx_t *ctx;
-    char        buf[512];
-    int         buf_cap;
-    int         pos;
-    uint32_t    seen_files;
-    uint32_t    batch_files;
-    int         busy;
+    xrec_ctx_t     *ctx;
+    char            buf[512];
+    int             buf_cap;
+    int             pos;
+    exfat_dir_pos_t batch_end;   /* right after the last entry in buf: ctx->ls_pos once buf was sent */
+    uint8_t         has_end;
+    uint8_t         budgeted;    /* recording: the walk yields to the recorder and the pass budget */
+    uint32_t        t0;
+    int             busy;
 } ls_ctx_t;
 
 static int ls_flush(ls_ctx_t *lc)
@@ -399,13 +417,15 @@ static int ls_flush(ls_ctx_t *lc)
         lc->busy = 1;
         return -1;
     }
-    lc->ctx->ls_sent_cnt += lc->batch_files;
-    lc->batch_files       = 0u;
-    lc->pos               = 0;
+    if (lc->has_end) {
+        lc->ctx->ls_pos = lc->batch_end;
+        lc->has_end     = 0u;
+    }
+    lc->pos = 0;
     return 0;
 }
 
-static int ls_append(ls_ctx_t *lc, const char *line, int len, int is_file_entry)
+static int ls_append(ls_ctx_t *lc, const char *line, int len)
 {
     if (lc->pos > 0 && (lc->pos + len) > lc->buf_cap) {
         if (ls_flush(lc) != 0) {
@@ -415,34 +435,33 @@ static int ls_append(ls_ctx_t *lc, const char *line, int len, int is_file_entry)
     for (int i = 0; i < len && lc->pos < (int)sizeof(lc->buf); i++) {
         lc->buf[lc->pos++] = line[i];
     }
-    if (is_file_entry) {
-        lc->batch_files++;
-    }
     return 0;
 }
 
-static int ls_dir_cb(const exfat_entry_t *entry, void *user)
+/* The listing resumes at ctx->ls_pos, the first slot after the last entry that was sent (or skipped with nothing
+ * unsent before it): a pass reads only the directory part not listed yet. */
+static int ls_dir_cb(const exfat_entry_t *entry, const exfat_dir_pos_t *next, void *user)
 {
     ls_ctx_t *lc = (ls_ctx_t *)user;
     /* Hidden files (e.g. a .autoplay folder marker) are not recordings */
-    if (entry->is_dir || entry->name[0] == '.') {
-        return 0;
+    if (!entry->is_dir && entry->name[0] != '.') {
+        char line[128];
+        int pos = 0;
+        uint32_t sz = (entry->size > 0xFFFFFFFFu) ? 0xFFFFFFFFu : (uint32_t)entry->size;
+        append_str(line, &pos, (int)sizeof(line), "+XREC:F,");
+        append_u32(line, &pos, (int)sizeof(line), sz);
+        append_str(line, &pos, (int)sizeof(line), ",");
+        append_str(line, &pos, (int)sizeof(line), entry->name);
+        append_str(line, &pos, (int)sizeof(line), "\r\n");
+        if (ls_append(lc, line, pos) != 0) {
+            return 1;
+        }
     }
-    if (lc->seen_files < lc->ctx->ls_sent_cnt) {
-        lc->seen_files++;
-        return 0;
-    }
-    lc->seen_files++;
-    char line[128];
-    int pos = 0;
-    uint32_t sz = (entry->size > 0xFFFFFFFFu) ? 0xFFFFFFFFu : (uint32_t)entry->size;
-    append_str(line, &pos, (int)sizeof(line), "+XREC:F,");
-    append_u32(line, &pos, (int)sizeof(line), sz);
-    append_str(line, &pos, (int)sizeof(line), ",");
-    append_str(line, &pos, (int)sizeof(line), entry->name);
-    append_str(line, &pos, (int)sizeof(line), "\r\n");
-    if (ls_append(lc, line, pos, 1) != 0) {
-        return 1;
+    if (lc->pos == 0) {
+        lc->ctx->ls_pos = *next;                 /* nothing unsent before this point */
+    } else {
+        lc->batch_end = *next;
+        lc->has_end   = 1u;
     }
     return 0;
 }
@@ -773,6 +792,35 @@ static void handle_rtc(xrec_ctx_t *ctx, const char *args)
     send_text(ctx, ok, (int)(sizeof(ok) - 1u));
 }
 
+/* While recording: a directory walk stops before its next card read once the recorder has audio waiting or the pass
+ * used its budget (F1); the next pass resumes there. */
+static int rec_walk_yield(xrec_ctx_t *ctx, uint32_t t0)
+{
+    if (rec_channels(ctx) == 0u) {
+        return 0;
+    }
+    if (rec_ring_busy(ctx)) {
+        return 1;
+    }
+    if ((uint32_t)(pace_now_us(ctx) - t0) >= ctx->pace.budget_us) {
+        ctx->pace.budget_stops++;
+        return 1;
+    }
+    return 0;
+}
+
+static int lookup_yield(void *user)
+{
+    xrec_ctx_t *ctx = (xrec_ctx_t *)user;
+    return rec_walk_yield(ctx, ctx->walk_t0);
+}
+
+static int ls_yield(void *user)
+{
+    ls_ctx_t *lc = (ls_ctx_t *)user;
+    return lc->budgeted ? rec_walk_yield(lc->ctx, lc->t0) : 0;
+}
+
 static void xrec_poll_ls(xrec_ctx_t *ctx)
 {
     if (!ctx || !ctx->ls_active || !ctx->ops.send) {
@@ -790,15 +838,24 @@ static void xrec_poll_ls(xrec_ctx_t *ctx)
             lc.buf_cap = (int)mtu;
         }
     }
-    lc.pos         = 0;
-    lc.seen_files  = 0u;
-    lc.batch_files = 0u;
-    lc.busy        = 0;
+    lc.pos      = 0;
+    lc.has_end  = 0u;
+    lc.busy     = 0;
+    lc.budgeted = (uint8_t)(rec_channels(ctx) != 0u);
+    lc.t0       = lc.budgeted ? pace_now_us(ctx) : 0u;
 
     if (ctx->ls_has_dir) {
-        int rc = exfat_list_dir_entry(ctx->vol, &ctx->ls_dir, ls_dir_cb, &lc);
+        exfat_dir_pos_t at = ctx->ls_pos;
+        int rc = exfat_list_dir_resume(ctx->vol, &ctx->ls_dir, &at, ls_dir_cb, ls_yield, &lc);
         if (lc.busy) {
             return; /* Retry on next xrec_poll() once RFCOMM credits/queue free up */
+        }
+        if (rc == 2) {
+            /* budget / recorder: send what was read, the next pass reads on from where this one stopped */
+            if (ls_flush(&lc) == 0) {
+                ctx->ls_pos = at;
+            }
+            return;
         }
         if (rc != 0) {
             ctx->ls_active = 0u;
@@ -808,7 +865,7 @@ static void xrec_poll_ls(xrec_ctx_t *ctx)
     }
 
     static const char end[] = "+XREC:END\r\n";
-    if (ls_append(&lc, end, (int)(sizeof(end) - 1u), 0) != 0 || ls_flush(&lc) != 0) {
+    if (ls_append(&lc, end, (int)(sizeof(end) - 1u)) != 0 || ls_flush(&lc) != 0) {
         return; /* Retry sending +XREC:END on next poll */
     }
     ctx->ls_active = 0u;
@@ -823,8 +880,9 @@ static void handle_ls(xrec_ctx_t *ctx)
     /* Stop any active GETS stream so binary frames never interleave with LS text */
     ctx->gets_active = 0u;
     ctx->gets_staged = 0u;
+    ctx->gets_lookup = 0u;
     ctx->ls_active   = 1u;
-    ctx->ls_sent_cnt = 0u;
+    mem_zero(&ctx->ls_pos, sizeof(ctx->ls_pos));
     ctx->ls_has_dir  = 0u;
 
     exfat_entry_t rec_dir;
@@ -833,6 +891,19 @@ static void handle_ls(xrec_ctx_t *ctx)
         ctx->ls_has_dir = 1u;
     }
     xrec_poll_ls(ctx);
+}
+
+/* ctx->gets_file found: the stream starts at the next pass (gets_offset / gets_rem / gets_chunk_max already set). */
+static void gets_begin(xrec_ctx_t *ctx)
+{
+    uint32_t off = ctx->gets_offset;
+    if ((uint64_t)off < ctx->gets_file.size) {   /* at/past EOF (a resume probe) no byte moves: no transfer view */
+        xfer_begin(ctx, 0u, ctx->gets_file.name, ctx->gets_file.first_cluster, off,
+                   (ctx->gets_file.size > 0xFFFFFFFFull) ? 0xFFFFFFFFu : (uint32_t)ctx->gets_file.size);
+    }
+    ctx->gets_lookup = 0u;
+    ctx->gets_staged = 0u;
+    ctx->gets_active = 1u;
 }
 
 static void handle_get_common(xrec_ctx_t *ctx, const char *args, int is_stream)
@@ -889,28 +960,48 @@ static void handle_get_common(xrec_ctx_t *ctx, const char *args, int is_stream)
         return;
     }
 
+    if (rec_channels(ctx) != 0u) {
+        /* While recording the lookup in /record (one read per 4 directory sectors) runs over the next polls within
+         * the pass budget, as a GETS chunk read does (F1): a large /record never delays the recorder. The request
+         * replaces any running stream / LS at once (as a found file does when idle). */
+        exfat_entry_t rec_dir;
+        if (exfat_find_path(ctx->vol, "/record", &rec_dir) != 0 || !rec_dir.is_dir) {
+            send_err(ctx, "NOENT");
+            return;
+        }
+        ctx->ls_active      = 0u;
+        ctx->gets_active    = 0u;
+        ctx->gets_staged    = 0u;
+        ctx->gets_dir       = rec_dir;
+        ctx->gets_offset    = off;
+        ctx->gets_rem       = tot;
+        ctx->gets_chunk_max = (uint16_t)chunk;
+        copy_cstr(ctx->gets_name, (uint32_t)sizeof(ctx->gets_name), p);
+        mem_zero(&ctx->gets_find_pos, sizeof(ctx->gets_find_pos));
+        ctx->gets_lookup = 1u;
+        xrec_poll(ctx);
+        return;
+    }
+
     char path[96];
     int pos = 0;
     append_str(path, &pos, (int)sizeof(path), "/record/");
     append_str(path, &pos, (int)sizeof(path), p);
     path[pos] = '\0';
 
-    if (exfat_find_path(ctx->vol, path, &ctx->gets_file) != 0 || ctx->gets_file.is_dir) {
+    exfat_entry_t found;
+    if (exfat_find_path(ctx->vol, path, &found) != 0 || found.is_dir) {
         send_err(ctx, "NOENT");
         return;
     }
 
     /* Stop any active LS stream so text lines never interleave with binary GETS frames */
     ctx->ls_active      = 0u;
-    if ((uint64_t)off < ctx->gets_file.size) {   /* at/past EOF (a resume probe) no byte moves: no transfer view */
-        xfer_begin(ctx, 0u, ctx->gets_file.name, ctx->gets_file.first_cluster, off,
-                   (ctx->gets_file.size > 0xFFFFFFFFull) ? 0xFFFFFFFFu : (uint32_t)ctx->gets_file.size);
-    }
+    ctx->gets_file      = found;
     ctx->gets_offset    = off;
     ctx->gets_rem       = tot;
     ctx->gets_chunk_max = (uint16_t)chunk;
-    ctx->gets_staged    = 0u;
-    ctx->gets_active    = 1u;
+    gets_begin(ctx);
     xrec_poll(ctx);
 }
 
@@ -1000,18 +1091,35 @@ static void send_put_ok(xrec_ctx_t *ctx, uint32_t offset, uint16_t chunk_len)
     send_text(ctx, buf, pos);
 }
 
-static void abort_staged_put(xrec_ctx_t *ctx)
+/* Closes put_writer and deletes the staging temp of mode (card writes). */
+static void drop_staged_file(xrec_ctx_t *ctx, uint8_t mode)
 {
-    if (!ctx || ctx->put_stream_mode == XREC_PUT_NONE) {
-        return;
-    }
-    uint8_t mode = ctx->put_stream_mode;
     (void)exfat_close_file(&ctx->put_writer);
     if (ctx->vol && (mode == XREC_PUT_CAS || mode == XREC_PUT_REC || mode == XREC_PUT_OTA)) {
         const char *dir, *tmp;
         put_stage_loc(mode, &dir, &tmp);
         (void)exfat_delete_file(ctx->vol, dir, tmp);
     }
+}
+
+/* A staged upload of a link that went during a recording (xrec_on_disconnect): dropped here, before put_writer is
+ * used again, once no recording runs (or when forced at session end). */
+static void orphan_put_flush(xrec_ctx_t *ctx, int force)
+{
+    if (ctx->put_orphan == XREC_PUT_NONE || (!force && rec_channels(ctx) != 0u)) {
+        return;
+    }
+    uint8_t mode = ctx->put_orphan;
+    ctx->put_orphan = XREC_PUT_NONE;
+    drop_staged_file(ctx, mode);
+}
+
+static void abort_staged_put(xrec_ctx_t *ctx)
+{
+    if (!ctx || ctx->put_stream_mode == XREC_PUT_NONE) {
+        return;
+    }
+    drop_staged_file(ctx, ctx->put_stream_mode);
     ctx->put_stream_mode    = XREC_PUT_NONE;
     ctx->put_has_last       = 0u;
     ctx->put_written        = 0u;
@@ -1052,6 +1160,7 @@ static void handle_put_complete(xrec_ctx_t *ctx)
         send_later(ctx);                         /* F6 (recording began after the header): the staged upload stays */
         return;
     }
+    orphan_put_flush(ctx, 0);                   /* before put_writer is staged again (RECSTOP + PUT in one batch) */
 
     if (ctx->put_stream_mode == ctx->put_target && ctx->put_has_last &&
         ctx->put_last_mode == ctx->put_target &&
@@ -1552,6 +1661,7 @@ static void try_start_put_header(xrec_ctx_t *ctx)
     /* PUT binary buffer shares union storage with GETS staged frame */
     ctx->gets_active    = 0u;
     ctx->gets_staged    = 0u;
+    ctx->gets_lookup    = 0u;
     ctx->put_active     = 1u;
     ctx->put_discard    = 0u;
     ctx->put_done_valid = 0u;
@@ -1716,7 +1826,13 @@ void xrec_on_disconnect(xrec_ctx_t *ctx)
         return;
     }
     if (ctx->put_stream_mode != XREC_PUT_NONE) {
-        abort_staged_put(ctx);
+        if (rec_channels(ctx) != 0u && ctx->put_orphan == XREC_PUT_NONE) {
+            /* F6: no card write while recording. The writer stays open and the temp stays until the recording
+             * stopped (xrec_deferred_poll) or the session ends (xrec_deferred_flush); a new link never sees it. */
+            ctx->put_orphan = ctx->put_stream_mode;
+        } else {
+            abort_staged_put(ctx);
+        }
     }
     ctx->auth               = 0u;
     ctx->chal_active        = 0u;
@@ -1726,7 +1842,8 @@ void xrec_on_disconnect(xrec_ctx_t *ctx)
     ctx->gets_staged        = 0u;
     ctx->ls_active          = 0u;
     ctx->ls_has_dir         = 0u;
-    ctx->ls_sent_cnt        = 0u;
+    mem_zero(&ctx->ls_pos, sizeof(ctx->ls_pos));
+    ctx->gets_lookup        = 0u;
     ctx->put_active         = 0u;
     ctx->put_discard        = 0u;
     ctx->put_done_valid     = 0u;
@@ -1739,6 +1856,20 @@ void xrec_on_disconnect(xrec_ctx_t *ctx)
     ctx->put_stream_name[0] = '\0';
     ctx->put_written        = 0u;
     ctx->xfer_valid         = 0u;
+}
+
+void xrec_deferred_poll(xrec_ctx_t *ctx)
+{
+    if (ctx) {
+        orphan_put_flush(ctx, 0);
+    }
+}
+
+void xrec_deferred_flush(xrec_ctx_t *ctx)
+{
+    if (ctx) {
+        orphan_put_flush(ctx, 1);
+    }
 }
 
 /* Flow control (review STEP10 A5): room for the worst-case reply before running anything that replies. Recorder
@@ -1757,6 +1888,7 @@ uint16_t xrec_on_rx(xrec_ctx_t *ctx, const uint8_t *data, uint16_t len)
     if (!ctx || !data) {
         return len;
     }
+    orphan_put_flush(ctx, 0);
     uint16_t i = 0u;
     while (i < len) {
         if (ctx->put_active && ctx->put_discard) {
@@ -1832,7 +1964,11 @@ uint16_t xrec_on_rx(xrec_ctx_t *ctx, const uint8_t *data, uint16_t len)
 
 void xrec_poll(xrec_ctx_t *ctx)
 {
-    if (!ctx || !ctx->ops.send) {
+    if (!ctx) {
+        return;
+    }
+    orphan_put_flush(ctx, 0);
+    if (!ctx->ops.send) {
         return;
     }
     if (ctx->ls_active) {
@@ -1843,15 +1979,37 @@ void xrec_poll(xrec_ctx_t *ctx)
     if (rec_ch == 0u) {
         ctx->pace_live = 0u;                     /* the next recording starts with a full bucket */
     }
-    if (!ctx->gets_active || ctx->put_active) {
+    if ((!ctx->gets_active && !ctx->gets_lookup) || ctx->put_active) {
         return;
     }
     if (rec_ch > 1u) {
-        /* a stereo recording began during a stream: it ends here (decision 5), the client asks again later */
-        ctx->gets_active = 0u;
+        /* a stereo recording began during a stream (or its lookup): it ends here (decision 5), the client asks again
+         * later. The stream ends only once the LATER line is queued: a full TX ring (the stream filled it) retries it
+         * at the next poll, so the client never waits for a timeout. */
         ctx->gets_staged = 0u;
-        send_later(ctx);
+        if (send_later_try(ctx) == 0) {
+            ctx->gets_active = 0u;
+            ctx->gets_lookup = 0u;
+        }
         return;
+    }
+    if (ctx->gets_lookup) {
+        if (rec_ring_busy(ctx)) {
+            return;
+        }
+        ctx->walk_t0 = pace_now_us(ctx);
+        int rc = exfat_find_in_dir_resume(ctx->vol, &ctx->gets_dir, ctx->gets_name, &ctx->gets_find_pos,
+                                          lookup_yield, ctx, &ctx->gets_file);
+        if (rc == 2) {
+            return;                              /* budget / recorder: the lookup goes on at the next pass */
+        }
+        ctx->gets_lookup = 0u;
+        if (rc != 0 || ctx->gets_file.is_dir) {
+            send_err(ctx, "NOENT");
+            return;
+        }
+        gets_begin(ctx);
+        return;                                  /* the stream starts at the next pass, with a budget of its own */
     }
     uint32_t pass_t0 = 0u;
     if (rec_ch != 0u) {

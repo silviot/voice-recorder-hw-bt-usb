@@ -1592,6 +1592,7 @@ static void run_bt_xrec_mode(void)
 
     uint32_t iter_rx     = 0u;
     uint32_t iter_tx     = 0u;
+    uint8_t  cfg_save_deferred = 0u;   /* g_ui.cfg changed by XREC during a recording: saved after it */
 #if OPENFW_BT_HP
     int      lowbatt_exit = 0;
 #endif
@@ -1614,6 +1615,12 @@ static void run_bt_xrec_mode(void)
             g_ui.cfg.sound_mode = (uint8_t)recorder_get_dsp_profile();
             g_ui.cfg.channels = recorder_get_channels();
             g_ui.cfg.vor_enabled = (uint8_t)recorder_get_vor();
+            cfg_save_deferred = 1u;
+        }
+        /* F6 (docs/BT_SYNC_SPEED_AND_RECORDING.md): an XREC GAIN / DSP / VOR / CH during a recording applies live, but
+         * the settings file is rewritten only once the recording stopped (the REC-stop path saves it too). */
+        if (cfg_save_deferred && !recorder_is_saving()) {
+            cfg_save_deferred = 0u;
             save_persisted_state();
         }
 
@@ -1757,6 +1764,9 @@ static void run_bt_xrec_mode(void)
     keys_ignore_held();
     if (recorder_is_saving()) {
         (void)recorder_stop();
+    }
+    if (cfg_save_deferred) {
+        save_persisted_state();                 /* settings an XREC command changed during the recording */
     }
     bt_xrec_stop();
     g_ui.toast_msg[0] = '\0';

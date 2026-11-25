@@ -627,6 +627,8 @@ static void test_audio_dma(void)
 /* ============================================================================
  * Suite 2: Real-Time WAV Recorder + exFAT Flush Tests
  * ============================================================================ */
+void recorder_test_set_split_bytes(uint32_t n);   /* src/recorder.c, OPENFW_HOST_MMIO only */
+
 static void test_recorder(const char *exfat_img_path)
 {
     soc_reset();
@@ -844,6 +846,51 @@ static void test_recorder(const char *exfat_img_path)
     assert(exfat_find_path(&vol, "/record/REC_0005.wav", &ent7) == 0);
     assert(ent7.size == 44u); /* 0 PCM bytes emitted while VOR gate stayed closed */
     recorder_set_vor(0);
+
+    /* STAT rec_idx (F7): the pure REC_NNNN.wav parser */
+    assert(recorder_rec_index_of("REC_0001.wav") == 1u);
+    assert(recorder_rec_index_of("REC_9999.wav") == 9999u);
+    assert(recorder_rec_index_of("rec_0042.WAV") == 42u);
+    assert(recorder_rec_index_of("REC_0000.wav") == 0u);
+    assert(recorder_rec_index_of("REC_12a4.wav") == 0u);
+    assert(recorder_rec_index_of("REC_0001.wa") == 0u);
+    assert(recorder_rec_index_of("REC_0001.wavx") == 0u);
+    assert(recorder_rec_index_of("REC_001.wav") == 0u);
+    assert(recorder_rec_index_of("XEC_0001.wav") == 0u);
+    assert(recorder_rec_index_of("REC-0001.wav") == 0u);
+    assert(recorder_rec_index_of("REC_0001.cwx") == 0u);
+    assert(recorder_rec_index_of("") == 0u && recorder_rec_index_of(NULL) == 0u);
+    assert(recorder_get_rec_index() == 0u);           /* not recording */
+
+    /* Recording #8: a 2 GiB split (threshold 8 KiB here) moves rec_idx to the next file; the finished one is no
+     * longer the active file (GETS of it is allowed again, the new one answers BUSY) */
+    recorder_test_set_split_bytes(8192u);
+    recorder_set_channels(1u);
+    assert(recorder_start(&vol, 1) == 0);
+    char split_a[16];
+    snprintf(split_a, sizeof(split_a), "%s", recorder_get_filename());
+    uint32_t idx_a = recorder_get_rec_index();
+    assert(idx_a != 0u && idx_a == recorder_rec_index_of(split_a));
+    assert(recorder_is_recording_file(split_a) == 1);
+    for (int f = 0; f < 2; f++) {                     /* 2 x 4096 B: exactly at the threshold, no split yet */
+        sim_dma_deliver_frame(500, 0, NULL);
+        recorder_poll();
+    }
+    assert(recorder_get_rec_index() == idx_a);
+    sim_dma_deliver_frame(500, 0, NULL);              /* the third frame does not fit: split */
+    recorder_poll();
+    assert(recorder_is_saving() == 1);
+    uint32_t idx_b = recorder_get_rec_index();
+    assert(idx_b == idx_a + 1u);
+    assert(recorder_is_recording_file(split_a) == 0);
+    assert(recorder_is_recording_file(recorder_get_filename()) == 1);
+    assert(recorder_rec_index_of(recorder_get_filename()) == idx_b);
+    assert(recorder_stop() == 0);
+    assert(recorder_get_rec_index() == 0u && recorder_is_recording_file(split_a) == 0);
+    exfat_entry_t ent8a, ent8b;
+    assert(exfat_find_path(&vol, "/record/REC_0006.wav", &ent8a) == 0 && ent8a.size == 44u + 8192u);
+    assert(exfat_find_path(&vol, "/record/REC_0007.wav", &ent8b) == 0 && ent8b.size == 44u + 4096u);
+    recorder_test_set_split_bytes(0u);
 
     /* Restore clean snapshot for fsck.exfat validation */
     memcpy(g_soc.sd_buf, sd_clean, (size_t)sz);

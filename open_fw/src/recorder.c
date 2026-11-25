@@ -29,6 +29,18 @@
 #define REC_CKPT_INTERVAL_BYTES 163840u
 /* Split WAV files safely below signed 32-bit / 4 GiB RIFF limit (~2 GiB) */
 #define REC_MAX_PCM_BYTES       0x7FFF0000u
+#if defined(OPENFW_HOST_MMIO)
+/* Host tests force a 2 GiB split with a small threshold (recorder_test_set_split_bytes). */
+static uint32_t g_rec_split_bytes = REC_MAX_PCM_BYTES;
+void recorder_test_set_split_bytes(uint32_t n);
+void recorder_test_set_split_bytes(uint32_t n)
+{
+    g_rec_split_bytes = (n != 0u) ? n : REC_MAX_PCM_BYTES;
+}
+#define REC_SPLIT_BYTES g_rec_split_bytes
+#else
+#define REC_SPLIT_BYTES REC_MAX_PCM_BYTES
+#endif
 
 static int                 g_rec_active      = 0;
 static int                 g_rec_saving      = 0;
@@ -272,7 +284,7 @@ static void rec_vor_emit_cb(void *user, const int16_t *pcm, size_t num_frames)
     uint32_t nbytes = (uint32_t)(num_frames * (size_t)g_active_channels * sizeof(int16_t));
 
     /* Split seamlessly before 32-bit RIFF/WAV limit */
-    if (g_pcm_bytes > REC_MAX_PCM_BYTES - nbytes) {
+    if (g_pcm_bytes > REC_SPLIT_BYTES - nbytes) {
         uint32_t bps = 32000u * (uint32_t)(g_active_channels ? g_active_channels : 1u);
         g_prev_split_sec += g_pcm_bytes / bps;
         if (finalize_current_wav_file() != 0 || open_next_wav_file(g_rec_vol) != 0) {
@@ -568,6 +580,45 @@ uint32_t recorder_get_created_timestamp(void)
 const char *recorder_get_filename(void)
 {
     return g_filename;
+}
+
+/* NNNN of "REC_NNNN.wav" (1..9999, any case), 0 for any other name. Pure (host-tested). */
+uint32_t recorder_rec_index_of(const char *name)
+{
+    static const char pfx[] = "rec_";
+    static const char ext[] = ".wav";
+    if (name == NULL) {
+        return 0u;
+    }
+    uint32_t idx = 0u;
+    for (uint32_t i = 0u; i < 12u; i++) {
+        char c = name[i];
+        if (c == '\0') {
+            return 0u;
+        }
+        if (c >= 'A' && c <= 'Z') {
+            c = (char)(c - 'A' + 'a');
+        }
+        if (i < 4u) {
+            if (c != pfx[i]) {
+                return 0u;
+            }
+        } else if (i < 8u) {
+            if (c < '0' || c > '9') {
+                return 0u;
+            }
+            idx = idx * 10u + (uint32_t)(c - '0');
+        } else if (c != ext[i - 8u]) {
+            return 0u;
+        }
+    }
+    return (name[12] == '\0') ? idx : 0u;
+}
+
+/* STAT rec_idx (F7): the index of the file being written, 0 when none (also after a split: the new file's). */
+uint32_t recorder_get_rec_index(void)
+{
+    return g_rec_saving ? recorder_rec_index_of(g_filename) : 0u;
 }
 
 /* XREC DEL guard (review STEP10 A1): non-zero while /record/<name> (case-insensitive, as exFAT) is being written. */

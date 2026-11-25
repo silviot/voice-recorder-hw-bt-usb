@@ -580,15 +580,7 @@ static void dev_get_stat(void *user, xrec_stat_t *out)       /* F:1733-1752 */
     if (s_sd && s_vol != NULL) {
         (void)exfat_stat_fs(s_vol, &out->free_mb, &out->total_mb);   /* cached free count (F4): no bitmap scan */
     }
-    out->rec_idx = 0u;                                                 /* STAT field 9 (F7) */
-    if (recorder_is_saving()) {
-        const char *f = recorder_get_filename();                       /* "REC_NNNN.wav" */
-        uint32_t idx = 0u;
-        for (uint32_t i = 4u; i < 8u && f[i] >= '0' && f[i] <= '9'; i++) {
-            idx = idx * 10u + (uint32_t)(f[i] - '0');
-        }
-        out->rec_idx = (f[0] == 'R' && f[3] == '_' && f[8] == '.') ? idx : 0u;
-    }
+    out->rec_idx = recorder_get_rec_index();                           /* STAT field 9 (F7) */
 }
 
 /* Sync while recording (openfw_xrec.h, docs/BT_SYNC_SPEED_AND_RECORDING.md F1/F6/F7). */

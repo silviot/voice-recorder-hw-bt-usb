@@ -313,6 +313,8 @@ uint32_t            recorder_get_committed_bytes(void);
 uint32_t            recorder_get_created_timestamp(void);
 const char         *recorder_get_filename(void);
 int                 recorder_is_recording_file(const char *name); /* /record/<name> is open for recording */
+uint32_t            recorder_rec_index_of(const char *name);      /* NNNN of REC_NNNN.wav, else 0 (pure) */
+uint32_t            recorder_get_rec_index(void);                 /* STAT rec_idx: the file being written, 0 none */
 
 /* USB Mass Storage Full-Speed MUSB & PHY Plug Detect (usb_musb.c) */
 typedef int (*usb_audio_cfg_cb_t)(int set, uint8_t cfg[4], int16_t *rms_x10, uint16_t *clips);

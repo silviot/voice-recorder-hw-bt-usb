@@ -1567,6 +1567,7 @@ static void free_session(void)
     memset(s.nm, 0, sizeof(s.nm));
     bt_xrec_plat_unlock();
     if (b != NULL) {
+        xrec_deferred_flush(&b->xrec);          /* a staged upload kept for a recording: the context goes now */
         wipe_free(b);
     }
 }
@@ -1920,6 +1921,9 @@ void bt_xrec_poll(void)
     }
     tx_kick();
     xrec_reset_flush();
+    if (s.b != NULL) {
+        xrec_deferred_poll(&s.b->xrec);         /* F6: card work a disconnect deferred, once REC stopped */
+    }
 
     if (s.reboot_mode != 0u && time_reached(now, s.reboot_at) &&
         ((s.tx_head == s.tx_tail && s.inflight == 0u) || now - s.reboot_at >= BT_XREC_REBOOT_DRAIN_MAX_MS)) {

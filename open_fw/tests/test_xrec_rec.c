@@ -26,10 +26,19 @@
 
 static char     g_out[16384];
 static uint32_t g_out_len;
+static int      g_send_fail;        /* the next g_send_fail sends fail (a full TX ring) */
+static uint32_t g_reads;            /* read_sectors calls */
+static uint32_t g_writes;           /* write_sectors calls */
+static uint32_t g_read_cost_us;     /* fake time one read_sectors call takes */
+static uint32_t g_now_us = 5000000u;
 
 static int cap_send(void *user, const uint8_t *data, uint16_t len)
 {
     (void)user;
+    if (g_send_fail > 0) {
+        g_send_fail--;
+        return -1;
+    }
     assert(g_out_len + len < sizeof(g_out));
     memcpy(&g_out[g_out_len], data, len);
     g_out_len += len;
@@ -40,6 +49,8 @@ static int cap_send(void *user, const uint8_t *data, uint16_t len)
 static int file_read_sectors(void *ctx, uint32_t lba, uint32_t count, void *buf)
 {
     FILE *fp = (FILE *)ctx;
+    g_reads++;
+    g_now_us += g_read_cost_us;
     if (fseek(fp, (long)lba * 512L, SEEK_SET) != 0) {
         return -1;
     }
@@ -51,6 +62,7 @@ static int g_fail_writes;   /* fault injection: every sector write fails while s
 static int file_write_sectors(void *ctx, uint32_t lba, uint32_t count, const void *buf)
 {
     FILE *fp = (FILE *)ctx;
+    g_writes++;
     if (g_fail_writes) {
         return -1;
     }
@@ -191,7 +203,6 @@ static void fill(uint8_t *b, uint32_t n, uint8_t seed)
 /* ---- 11. Sync while recording (docs/BT_SYNC_SPEED_AND_RECORDING.md F1, F1b, F6, F7): fake recorder state ---- */
 static uint8_t  g_rec_ch;           /* 0 idle, 1 mono, 2 stereo */
 static uint32_t g_rec_pending;      /* audio blocks the recorder has not taken */
-static uint32_t g_now_us = 5000000u;
 static uint32_t g_us_step;          /* added to g_now_us at every now_us() read: card reads that take time */
 static int      g_rtc_sets;
 
@@ -413,6 +424,280 @@ static void test_sync_while_recording(void)
     assert(exfat_delete_file(&g_vol, "/record", "REC_0007.wav") == 0);
     assert(exfat_delete_file(&g_vol, "/record", "REC_0007.cwx") == 0);
     printf("xrec sync while recording (recorder first, cap, budget, LATER, BUSY, STAT 9/10): OK\n");
+}
+
+/* ---- 12. Review fixes for sync while recording: bounded LS / GETS lookups on a large /record, no card write for a
+ * link lost during a recording, the stereo LATER line never lost ---- */
+static uint16_t g_mtu = 100u;
+static uint16_t fake_mtu(void *u) { (void)u; return g_mtu; }
+
+#define BIG_DIR_FILES 300u
+
+/* Runs xrec_poll until LS ends; checks each name appears once and every pass reads at most max_reads_per_pass. */
+static uint32_t ls_drain(uint32_t max_reads_per_pass, uint32_t *passes_out)
+{
+    static char all[65536];
+    uint32_t all_len = 0u, passes = 0u;
+    memcpy(all, g_out, g_out_len);
+    all_len = g_out_len;
+    while (g_x.ls_active) {
+        uint32_t r0 = g_reads;
+        clear_out();
+        xrec_poll(&g_x);
+        assert(g_reads - r0 <= max_reads_per_pass);
+        assert(all_len + g_out_len < sizeof(all));
+        memcpy(&all[all_len], g_out, g_out_len);
+        all_len += g_out_len;
+        g_now_us += 1000u;
+        assert(++passes < 100000u);
+    }
+    all[all_len] = '\0';
+    assert(all_len >= 11u && strcmp(&all[all_len - 11u], "+XREC:END\r\n") == 0);
+    for (uint32_t i = 0u; i < BIG_DIR_FILES; i++) {
+        char want[64];
+        snprintf(want, sizeof(want), ",LS_%04u.wav\r\n", (unsigned)i);
+        const char *a = strstr(all, want);
+        assert(a != NULL && strstr(a + 1, want) == NULL);       /* listed exactly once */
+    }
+    uint32_t lines = 0u;
+    for (const char *q = all; (q = strstr(q, "+XREC:F,")) != NULL; q++) {
+        lines++;
+    }
+    if (passes_out) {
+        *passes_out = passes;
+    }
+    return lines;
+}
+
+static void test_rec_hardening(void)
+{
+    xrec_ops_t ops;
+    memset(&ops, 0, sizeof(ops));
+    ops.send = cap_send;
+    ops.now_ms = fake_now;
+    ops.get_stat = fake_get_stat;
+    ops.set_rtc = fake_set_rtc;
+    ops.file_busy = fake_file_busy;
+    ops.rec_channels = fake_rec_channels;
+    ops.rec_pending = fake_rec_pending;
+    ops.now_us = fake_now_us;
+    ops.get_mtu = fake_mtu;
+    xrec_init(&g_x, &g_vol, &ops, NULL);
+    xrec_set_bound_key(&g_x, g_key);
+    authenticate();
+    g_rec_ch = 0u;
+    g_rec_pending = 0u;
+    g_us_step = 0u;
+
+    /* a large /record: BIG_DIR_FILES files, 3 directory entries each */
+    static uint8_t data[640];
+    fill(data, sizeof(data), 0x77u);
+    for (uint32_t i = 0u; i < BIG_DIR_FILES; i++) {
+        char n[32];
+        snprintf(n, sizeof(n), "LS_%04u.wav", (unsigned)i);
+        make_wav(n, data, (i == BIG_DIR_FILES - 1u) ? 600u : 0u);
+    }
+    uint32_t base_lines = 0u;
+    {
+        /* idle: unbudgeted, the whole listing in one command (the transport takes it all) */
+        uint32_t r0 = g_reads;
+        cmd("+XREC:LS");
+        assert(!g_x.ls_active);
+        base_lines = ls_drain(0u, NULL);
+        assert(base_lines >= BIG_DIR_FILES);
+        uint32_t idle_reads = g_reads - r0;
+        /* recording mono, 1 ms per card read, 5 ms budget: each pass reads at most 5 times (the read that
+         * reaches the budget is the last one); the listing still completes, each name once, and the whole walk
+         * reads about once per directory chunk instead of once per entry (no O(N^2) re-walk) */
+        g_rec_ch = 1u;
+        g_read_cost_us = 1000u;
+        xrec_pace_stats_t ps0, ps1;
+        xrec_get_pace_stats(&g_x, &ps0);
+        r0 = g_reads;
+        clear_out();
+        rx_str("+XREC:LS\r");
+        assert(g_x.ls_active);
+        uint32_t passes = 0u;
+        assert(ls_drain(5u, &passes) == base_lines);
+        uint32_t rec_reads = g_reads - r0;
+        xrec_get_pace_stats(&g_x, &ps1);
+        assert(ps1.budget_stops > ps0.budget_stops);
+        assert(rec_reads <= 2u * idle_reads + 2u * passes);   /* a resume re-reads at most its first chunk */
+        /* a full TX ring in the middle: the listing resumes after the last line that was sent */
+        r0 = g_reads;
+        clear_out();
+        rx_str("+XREC:LS\r");
+        for (int k = 0; k < 40 && g_x.ls_active; k++) {
+            uint32_t keep = g_out_len;
+            g_send_fail = 1;
+            xrec_poll(&g_x);
+            assert(g_out_len == keep);                         /* nothing sent, nothing lost */
+            g_now_us += 1000u;
+            xrec_poll(&g_x);
+        }
+        assert(ls_drain(5u, NULL) == base_lines);
+        /* the recorder has blocks: no directory read at all */
+        clear_out();
+        rx_str("+XREC:LS\r");
+        g_rec_pending = 1u;
+        r0 = g_reads;
+        for (int k = 0; k < 10; k++) {
+            xrec_poll(&g_x);
+        }
+        assert(g_reads == r0 && g_x.ls_active);
+        g_rec_pending = 0u;
+        assert(ls_drain(5u, NULL) == base_lines);
+    }
+
+    /* GETS / GET while recording: the lookup in the large /record runs within the budget over several passes */
+    {
+        clear_out();
+        uint32_t r0 = g_reads;
+        rx_str("+XREC:GETS,0,600,256,LS_0299.wav\r");
+        assert(g_reads - r0 <= 2u * 6u);                     /* /record lookup in / + one budgeted pass, twice */
+        uint32_t next = 0u, got = 0u;
+        static uint8_t back[600];
+        for (int k = 0; k < 2000 && (g_x.gets_lookup || g_x.gets_active); k++) {
+            uint32_t r1 = g_reads;
+            uint32_t o0 = g_out_len;
+            xrec_poll(&g_x);
+            assert(g_reads - r1 <= 6u);
+            (void)o0;
+            g_now_us += 20000u;                              /* tokens for the cap */
+        }
+        assert(!g_x.gets_lookup && !g_x.gets_active);
+        /* the frames, in order */
+        uint32_t i = 0u;
+        while (i + 12u <= g_out_len) {
+            const uint8_t *f = (const uint8_t *)&g_out[i];
+            assert(memcmp(f, "XREC", 4) == 0);
+            uint32_t off = (uint32_t)f[4] | ((uint32_t)f[5] << 8);
+            uint32_t n = (uint32_t)f[8] | ((uint32_t)f[9] << 8);
+            assert(off == next && off + n <= sizeof(back));
+            memcpy(&back[off], f + 12, n);
+            next += n;
+            got += n;
+            i += 12u + n;
+        }
+        assert(i == g_out_len && got == 600u && memcmp(back, data, 600u) == 0);
+        /* a name not in /record: NOENT after the bounded walk */
+        clear_out();
+        rx_str("+XREC:GET,0,64,NOPE_0001.wav\r");
+        for (int k = 0; k < 2000 && g_x.gets_lookup; k++) {
+            uint32_t r1 = g_reads;
+            xrec_poll(&g_x);
+            assert(g_reads - r1 <= 6u);
+        }
+        assert(strcmp(g_out, "+XREC:ERR,NOENT\r\n") == 0);
+        /* LS cancels a lookup in progress */
+        clear_out();
+        rx_str("+XREC:GET,0,64,LS_0299.wav\r");
+        assert(g_x.gets_lookup);
+        rx_str("+XREC:LS\r");
+        assert(!g_x.gets_lookup);
+        (void)ls_drain(5u, NULL);
+        /* a stereo recording during a lookup ends it with LATER */
+        clear_out();
+        rx_str("+XREC:GET,0,64,LS_0299.wav\r");
+        assert(g_x.gets_lookup);
+        g_rec_ch = 2u;
+        clear_out();
+        xrec_poll(&g_x);
+        assert(strcmp(g_out, "+XREC:ERR,LATER,30000\r\n") == 0 && !g_x.gets_lookup);
+        g_rec_ch = 1u;
+    }
+    g_read_cost_us = 0u;
+
+    /* The stereo LATER that ends a running stream is retried while the TX ring is full: never lost */
+    {
+        static uint8_t big4k[4096];
+        fill(big4k, sizeof(big4k), 0x21u);
+        make_wav("BIGL_0001.wav", big4k, sizeof(big4k));   /* more than the 2 KiB bucket: the stream stays open */
+        g_rec_ch = 0u;
+        clear_out();
+        rx_str("+XREC:GETS,0,4096,64,BIGL_0001.wav");
+        g_rec_ch = 1u;
+        xrec_set_rec_pace(&g_x, 48000u, 0u);
+        rx_str("\r");
+        for (int k = 0; k < 50 && !g_x.gets_active; k++) {
+            xrec_poll(&g_x);                                 /* lookup passes */
+        }
+        assert(g_x.gets_active);
+        g_rec_ch = 2u;
+        g_send_fail = 2;
+        clear_out();
+        xrec_poll(&g_x);
+        assert(g_out_len == 0u && g_x.gets_active);           /* not queued: the stream is not ended silently */
+        xrec_poll(&g_x);
+        assert(g_out_len == 0u && g_x.gets_active);
+        xrec_poll(&g_x);
+        assert(strcmp(g_out, "+XREC:ERR,LATER,30000\r\n") == 0 && !g_x.gets_active);
+        clear_out();
+        xrec_poll(&g_x);
+        assert(g_out_len == 0u);                              /* once */
+        g_rec_ch = 0u;
+        assert(exfat_delete_file(&g_vol, "/record", "BIGL_0001.wav") == 0);
+    }
+
+    /* F6: a link lost during a recording writes nothing to the card; its staged upload goes after the recording */
+    {
+        make_wav("REC_0042.wav", data, 100u);
+        g_rec_ch = 0u;
+        expect_put_ok(0u, "REC,REC_0042.cwx", data, 64u);
+        assert(exists("/record/.xrec_rec.tmp"));
+        g_rec_ch = 1u;
+        uint32_t w0 = g_writes;
+        xrec_on_disconnect(&g_x);
+        assert(g_writes == w0 && g_x.put_stream_mode == XREC_PUT_NONE && g_x.put_orphan == XREC_PUT_REC);
+        xrec_deferred_poll(&g_x);
+        xrec_poll(&g_x);
+        assert(g_writes == w0);
+        /* the next link sees no staged upload */
+        authenticate();
+        assert(strcmp(cmd("+XREC:PUTEND"), "+XREC:ERR,NOPUT\r\n") == 0);
+        assert(strcmp(put(64u, "REC,REC_0042.cwx", data, 16u), "+XREC:ERR,LATER,30000\r\n") == 0);
+        assert(g_writes == w0 && exists("/record/.xrec_rec.tmp"));
+        /* REC stops: the first session poll drops it */
+        g_rec_ch = 0u;
+        xrec_deferred_poll(&g_x);
+        assert(g_x.put_orphan == XREC_PUT_NONE && !exists("/record/.xrec_rec.tmp") && !exists("/record/REC_0042.cwx"));
+        assert(strcmp(put(64u, "REC,REC_0042.cwx", data, 16u), "+XREC:ERR,OFF\r\n") == 0);
+        /* a new upload after it works */
+        expect_put_ok(0u, "REC,REC_0042.cwx", data, 32u);
+        assert(strcmp(cmd("+XREC:PUTEND"), "+XREC:OK,PUTEND,32\r\n") == 0);
+        expect_file("/record/REC_0042.cwx", data, 32u);
+        /* orphan + RX after REC stopped: dropped before the next command runs */
+        expect_put_ok(0u, "CAS,NOTE.TXT", data, 32u);
+        g_rec_ch = 1u;
+        xrec_on_disconnect(&g_x);
+        assert(g_x.put_orphan == XREC_PUT_CAS && exists("/cassini/.xrec_cas.tmp"));
+        g_rec_ch = 0u;
+        authenticate();
+        assert(g_x.put_orphan == XREC_PUT_NONE && !exists("/cassini/.xrec_cas.tmp"));
+        /* session end during a recording: forced */
+        expect_put_ok(0u, "CAS,NOTE.TXT", data, 32u);
+        g_rec_ch = 1u;
+        xrec_on_disconnect(&g_x);
+        assert(exists("/cassini/.xrec_cas.tmp"));
+        xrec_deferred_flush(&g_x);
+        assert(g_x.put_orphan == XREC_PUT_NONE && !exists("/cassini/.xrec_cas.tmp"));
+        /* idle disconnect: dropped at once, as before */
+        g_rec_ch = 0u;
+        authenticate();
+        expect_put_ok(0u, "CAS,NOTE.TXT", data, 32u);
+        xrec_on_disconnect(&g_x);
+        assert(g_x.put_orphan == XREC_PUT_NONE && !exists("/cassini/.xrec_cas.tmp"));
+        assert(exfat_delete_file(&g_vol, "/record", "REC_0042.wav") == 0);
+        assert(exfat_delete_file(&g_vol, "/record", "REC_0042.cwx") == 0);
+    }
+
+    for (uint32_t i = 0u; i < BIG_DIR_FILES; i++) {
+        char n[32];
+        snprintf(n, sizeof(n), "LS_%04u.wav", (unsigned)i);
+        assert(exfat_delete_file(&g_vol, "/record", n) == 0);
+    }
+    g_rec_ch = 0u;
+    printf("xrec sync while recording, review fixes (bounded LS / lookup, deferred abort, LATER retry): OK\n");
 }
 
 int main(int argc, char **argv)
@@ -832,6 +1117,7 @@ int main(int argc, char **argv)
 
     /* 11. Sync while recording (own ops; the context is set up again afterwards) */
     test_sync_while_recording();
+    test_rec_hardening();
     xrec_init(&g_x, &g_vol, &ops, NULL);
     xrec_set_bound_key(&g_x, g_key);
     authenticate();
