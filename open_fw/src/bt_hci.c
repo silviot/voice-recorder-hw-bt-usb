@@ -1438,11 +1438,11 @@ static const bt_link_key_slot_t *find_link_key(const uint8_t bd[6])
     return 0;
 }
 
-static void save_root_file_atomic(const char *tmp_name, const char *final_name,
-                                  const void *data, uint32_t len)
+static int save_root_file_atomic(const char *tmp_name, const char *final_name,
+                                 const void *data, uint32_t len)
 {
     if (!g_sd_mounted || !g_vol) {
-        return;
+        return 0;                    /* no card: nothing to keep (RAM-only state, as before) */
     }
     rtc_datetime_t dt;
     rtc_get(&dt);
@@ -1455,10 +1455,11 @@ static void save_root_file_atomic(const char *tmp_name, const char *final_name,
         int crc = exfat_close_file(&w);
         if (wrc == 0 && crc == 0 &&
             exfat_replace_file(g_vol, "/", tmp_name, final_name) == 0) {
-            return;
+            return 0;
         }
         (void)exfat_delete_file(g_vol, "/", tmp_name);
     }
+    return -1;
 }
 
 static void save_link_keys_to_sd(void)
@@ -1477,7 +1478,7 @@ static void save_link_keys_to_sd(void)
         bt_memcpy(&blob[off + 1u], g_key_cache[i].bd, 6u);
         bt_memcpy(&blob[off + 7u], g_key_cache[i].key, 16u);
     }
-    save_root_file_atomic(".bt_keys.tmp", "bt_keys.bin", blob, (uint32_t)sizeof(blob));
+    (void)save_root_file_atomic(".bt_keys.tmp", "bt_keys.bin", blob, (uint32_t)sizeof(blob));
 }
 
 static void load_link_keys_from_sd(void)
@@ -1798,9 +1799,22 @@ static void xrec_cb_entropy(void *user, uint8_t out[16])
     bt_memcpy(out, digest, 16u);
 }
 
-static void xrec_cb_on_bound_key(void *user, const uint8_t key[32])
+static int xrec_cb_on_bound_key(void *user, const uint8_t key[32])
 {
     (void)user;
+    uint8_t blob[36];
+    blob[0] = 'C';
+    blob[1] = 'S';
+    blob[2] = 'K';
+    blob[3] = '5';
+    bt_memcpy(&blob[4], key, 32u);
+    /* saved before the key is installed and acknowledged (+XREC:ERR,SAVE otherwise; review STEP10 C9) */
+    int rc = save_root_file_atomic(".cassini.tmp", "cassini.key", blob, (uint32_t)sizeof(blob));
+    bt_memzero(blob, sizeof(blob));
+    if (rc != 0) {
+        openfw_log_puts("BT XREC key not saved (SD write failed): PAIR refused\n");
+        return -1;
+    }
     openfw_log_puts("BT XREC PAIRED\n");
     g_pair_deadline_set = 0u;
     g_pair_deadline_ms  = 0u;
@@ -1808,16 +1822,7 @@ static void xrec_cb_on_bound_key(void *user, const uint8_t key[32])
         g_scan_discoverable = 0u;
         hci_send_scan_enable(0x02u); /* Disable Inquiry Scan once paired */
     }
-    if (!g_sd_mounted || !g_vol) {
-        return;
-    }
-    uint8_t blob[36];
-    blob[0] = 'C';
-    blob[1] = 'S';
-    blob[2] = 'K';
-    blob[3] = '5';
-    bt_memcpy(&blob[4], key, 32u);
-    save_root_file_atomic(".cassini.tmp", "cassini.key", blob, (uint32_t)sizeof(blob));
+    return 0;
 }
 
 static void xrec_cb_on_reboot(void *user)
@@ -2012,6 +2017,12 @@ static void derive_local_bd_addr_and_name(void)
     g_dev_name[10] = '\0';
 }
 
+static int xrec_cb_file_busy(void *user, const char *name)
+{
+    (void)user;
+    return recorder_is_recording_file(name);
+}
+
 int bt_xrec_start(exfat_vol_t *vol, int sd_mounted)
 {
     static const xrec_ops_t ops = {
@@ -2037,6 +2048,7 @@ int bt_xrec_start(exfat_vol_t *vol, int sd_mounted)
         xrec_cb_on_dfu,
         xrec_cb_audio_cfg,
         xrec_cb_get_mtu,
+        xrec_cb_file_busy,
     };
 
     g_vol                 = vol;

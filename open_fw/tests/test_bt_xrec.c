@@ -229,7 +229,16 @@ void bt_xrec_plat_load_bound_key(xrec_ctx_t *ctx)
         xrec_set_bound_key(ctx, m_key);
     }
 }
-void bt_xrec_plat_save_bound_key(const uint8_t key[32]) { (void)key; m_saved_key++; }
+static int m_save_fail;          /* the card refuses the cassini.key write */
+int bt_xrec_plat_save_bound_key(const uint8_t key[32])
+{
+    (void)key;
+    if (m_save_fail) {
+        return -1;
+    }
+    m_saved_key++;
+    return 0;
+}
 
 int bt_xrec_plat_stack_up_begin(exfat_vol_t *vol, int sd_mounted, const uint8_t bd[6])
 {
@@ -629,7 +638,7 @@ static void mocks_reset(void)
     m_pair_block_calls = 0;
     m_up_calls = m_down_calls = m_hold_up = m_hold_down = m_up_result = m_down_result = m_job_kind = 0;
     m_job_pending = m_deinit_needed_at_down = 0;
-    m_dl_latched = m_hard_reason = m_service = m_session_end = m_reboot_mode = m_saved_key = m_poll_fault = 0;
+    m_dl_latched = m_hard_reason = m_service = m_session_end = m_reboot_mode = m_saved_key = m_poll_fault = m_save_fail = 0;
     m_peer_mtu = 660u;
     m_gap_cb = NULL;
     m_spp_cb = NULL;
@@ -711,6 +720,14 @@ static void pair_and_auth(void)
     char cmd[128];
     snprintf(cmd, sizeof(cmd), "+XREC:PAIR,%s,%s\r\n", st.pair_pin,
              "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+    /* STEP10 C9: a key the card did not take is neither installed nor acknowledged; the window stays for a retry */
+    m_save_fail = 1;
+    rx(H1, cmd);
+    m_save_fail = 0;
+    CHECK(wire_has("+XREC:ERR,SAVE") && !wire_has("+XREC:OK,PAIR"), "PAIR with a failed key write answered ERR,SAVE");
+    CHECK(status().xrec_auth == 0u && status().pair_active, "failed PAIR: not authenticated, window still open "
+          "(auth %u pair %u)", status().xrec_auth, status().pair_active);
+    wire_clear();
     rx(H1, cmd);
     CHECK(wire_has("+XREC:OK,PAIR"), "PAIR accepted");
     CHECK(status().xrec_auth == 1u, "XREC authenticated");

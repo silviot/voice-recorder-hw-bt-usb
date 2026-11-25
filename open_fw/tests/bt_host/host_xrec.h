@@ -39,6 +39,7 @@ uint32_t bthx_deadline_fired(void);
 uint32_t bthx_bond_writes(void);         /* /bt_bonds.bin replaced */
 void bthx_fail_bond_writes(int on);       /* every /bt_bonds.bin write fails while on (full / removed card) */
 uint32_t bthx_bond_write_fails(void);
+void bthx_fail_bond_reads(int on);        /* reading the mode's bond file at a start fails (SD error / no memory) */
 uint32_t bthx_key_writes(void);          /* /cassini.key replaced */
 uint32_t bthx_reboot_mode(void);
 /* TEST knob: the session's entropy as after a BT-mode entry whose mic collection credited nothing (XREC PIN / CHAL fail

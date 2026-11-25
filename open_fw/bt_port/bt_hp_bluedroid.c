@@ -102,6 +102,7 @@ typedef struct {
     uint8_t  a2d_inited, avrc_inited, seps_ok, seps_pending, prof_init;
     uint8_t  scanning, scan_cancel;
     uint32_t scan_until;
+    uint32_t scan_cancel_until;        /* a cancel whose "discovery stopped" never came is cleared then (STEP10 C16) */
     uint8_t  pick_pending, pick_pair;
     uint8_t  pick_bda[6];
     uint32_t pick_since;
@@ -156,6 +157,7 @@ static hp_cfg_t s_cfg HP_HI;
 static uint8_t s_cfg_loaded HP_HI;
 static uint8_t s_state HP_HI;          /* session state, readable without g (OFF / FAULTED / DEAD) */
 static uint32_t s_last_fault HP_HI;
+static uint8_t s_restart_required HP_HI; /* A2DP deinit never confirmed: no new session this boot (STEP10 C14) */
 static volatile uint8_t s_a2d_deinit_seen HP_HI;
 static volatile uint8_t s_a2d_down HP_HI, s_avrc_down HP_HI;   /* what the down job must deinit */
 static volatile uint32_t s_down_ms HP_HI;
@@ -515,7 +517,9 @@ static void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *p)
 /* Patch 0036 (btc_dm.c, BTC task): Just Works only for the picked device inside its window, with the gate holding. */
 int openfw_just_works_allowed(const uint8_t bda[6])
 {
-    int allow = 1;
+    /* 0 unless a headphones session is open: phone mode never keeps a Just Works key (it removes it at AUTH_CMPL, by
+     * which time it has replaced the phone's MITM key) and a stopping session pairs nothing (STEP10 C4 / A3) */
+    int allow = 0;
     bool hp = false;
     bt_xrec_plat_lock();
     if (g != NULL && g->cb_open) {
@@ -1025,6 +1029,7 @@ static void connect_now(const uint8_t bda[6])
         return;
     }
     g->d.connects++;
+    g->conn_hdl = ESP_A2D_INVALID_CONN_HDL;      /* never the previous link's handle (STEP10 C12) */
     g->link = BT_HP_LINK_CONNECTING;
     g->connect_t0 = bt_xrec_plat_now_ms() + BT_HP_CONNECT_TO_MS;   /* deadline */
     g->target_valid = 1u;
@@ -1081,6 +1086,7 @@ static void on_link_down(const char *why, uint32_t pev)
     g->ct_conn = 0u;
     g->abs_vol = 0u;
     g->ct_hdl = ESP_A2D_INVALID_CONN_HDL;
+    g->conn_hdl = ESP_A2D_INVALID_CONN_HDL;   /* a later connect's timeout / cancel goes by address (STEP10 C12) */
     g->stall_disc = 0u;
     if (was == BT_HP_LINK_OPEN || was == BT_HP_LINK_STARTED || was == BT_HP_LINK_STALLED) {
         g->d.disconnects++;
@@ -1462,7 +1468,8 @@ static void on_event(const ev_t *e)
     case EV_CFM_REQ: {
         /* a headset with a display (numeric comparison): accepted for the picked device inside the window only */
         bt_xrec_plat_lock();
-        bool ok = g->win_open && bda_eq(g->win_bda, e->bda) && g->gate_ok;
+        bool ok = g->win_open && bda_eq(g->win_bda, e->bda) && g->gate_ok &&
+                  !time_reached(bt_xrec_plat_now_ms(), g->win_deadline);   /* as the Just Works hook (STEP10 A8) */
         if (ok) {
             g->jw_accepted = 1u;
         }
@@ -1480,7 +1487,7 @@ static void on_event(const ev_t *e)
         esp_bt_pin_code_t pin;
         memset(pin, 0, sizeof(pin));
 #if BENCH_IMAGE
-        if (s_tun.pin0000) {
+        if (s_tun_set && s_tun.pin0000) {   /* only during the bench run that asked for it (STEP10 C17) */
             /* bench only (hp_pin=1): the ROM pairs as initiator with legacy PIN (silicon 2026-11-25); answer "0000"
              * for the picked device inside its window, with the same gate as the Just Works hook */
             bt_xrec_plat_lock();
@@ -1923,7 +1930,8 @@ static int shutdown_now(void)
     }
     uint32_t t0 = bt_xrec_plat_now_ms();
     /* 1. stop the tick in BTC context, bounded (design §4.3, §5.5 step 1); detach the audio output */
-    if (hp_tx_bd_stop_wait(BT_HP_TICK_STOP_MS, sleep_1ms) != 0) {
+    bool tick_stuck = hp_tx_bd_stop_wait(BT_HP_TICK_STOP_MS, sleep_1ms) != 0;
+    if (tick_stuck) {
         log1("tick did not stop in BTC context within the bound (teardown continues)");
     }
     bt_hp_plat_attach_sink(NULL, NULL, NULL, 0);
@@ -1959,17 +1967,26 @@ static int shutdown_now(void)
     lku("job_rc", (uint32_t)r);
     lku("reason", reason);
     lend();
-    if (r == 5) {
-        log1("A2DP deinit did not confirm in time (hp_av_deinit_timeout): restart the recorder before the next use");
+    if (reason == BT_XREC_FAULT_NONE && tick_stuck && r != 0) {
+        /* the tick never confirmed its stop and BTC did not finish the profile teardown either: the tick may still
+         * run on BTC over the sink and ring free_session() returns (STEP10 A4) */
+        reason = BT_XREC_FAULT_DOWN_FAIL;
     }
-    free_session();
+    if (r == 5 && reason == BT_XREC_FAULT_NONE) {
+        log1("A2DP deinit did not confirm in time (hp_av_deinit_timeout): headphones mode off until the next boot");
+        s_restart_required = 1u;
+    }
     if (reason != BT_XREC_FAULT_NONE) {
+        /* the hard path first (it reboots on target): BTC may still use the sink / ring, so they are not freed under
+         * it (STEP10 A4); the host harness's hard path returns, then the session is freed */
         bt_xrec_plat_set_mode(BT_XREC_MODE_PHONE, NULL);
         s_last_fault = reason;
         set_state(BT_HP_ST_DEAD);
         bt_xrec_plat_hard_path(reason);
+        free_session();
         return (int)reason;
     }
+    free_session();
     bt_xrec_plat_session_end();        /* final bond flush to bt_hp_bonds.bin: still in headphones mode */
     bt_xrec_plat_set_mode(BT_XREC_MODE_PHONE, NULL);
     set_state(BT_HP_ST_OFF);
@@ -1999,6 +2016,8 @@ void bt_hp_set_bench_tun(const bt_hp_bench_tun_t *t)
     s_tun_set = t != NULL ? 1u : 0u;
     if (t != NULL) {
         s_tun = *t;
+    } else {
+        memset(&s_tun, 0, sizeof(s_tun));   /* the run ended: no bench tuning (PIN 0000) for manual use */
     }
 }
 #endif
@@ -2010,6 +2029,10 @@ int bt_hp_start(exfat_vol_t *vol, int sd_mounted)
     }
     if (s_state == BT_HP_ST_DEAD || !bt_xrec_plat_start_allowed()) {
         log1("start refused: BT fault recorded this boot");
+        return -1;
+    }
+    if (s_restart_required) {
+        log1("start refused: the last A2DP teardown did not confirm (restart the recorder)");
         return -1;
     }
     bt_status_t ps;
@@ -2077,7 +2100,17 @@ static void ready_poll(uint32_t now)
     /* discovery length (the stack stops itself; this is the bound if it does not) */
     if (g->scanning && !g->scan_cancel && time_reached(now, g->scan_until)) {
         g->scan_cancel = 1u;
+        g->scan_cancel_until = now + BT_HP_SCAN_CANCEL_TO_MS;
         (void)esp_bt_gap_cancel_discovery();
+    } else if (g->scanning && g->scan_cancel && time_reached(now, g->scan_cancel_until)) {
+        /* "discovery stopped" never came (event lost, cancel not posted): leave "Searching" so a pick and a new
+         * search can run; bt_ctrl's inquiry flag still holds a pick back (below) */
+        lbegin("discovery stop not reported: search cleared");
+        lku("inq", (uint32_t)bt_ctrl_inquiry_active());
+        lend();
+        g->scanning = 0u;
+        g->scan_cancel = 0u;
+        set_msg(BT_HP_MSG_SCAN_DONE);
     }
     /* a pick waits for the discovery to stop (design §6.2), then for bt_ctrl's inquiry flag, at most 1 s more */
     if (g->pick_pending && !g->scanning && !orphan_active(now)) {
@@ -2319,6 +2352,7 @@ void bt_hp_scan_cancel(void)
 {
     if (g != NULL && g->scanning && !g->scan_cancel) {
         g->scan_cancel = 1u;
+        g->scan_cancel_until = bt_xrec_plat_now_ms() + BT_HP_SCAN_CANCEL_TO_MS;
         esp_err_t r = esp_bt_gap_cancel_discovery();
         lbegin("discovery cancel");
         lku("err", (uint32_t)r);
@@ -2416,16 +2450,23 @@ int bt_hp_forget(void)
     }
     uint8_t bda[6];
     memcpy(bda, s_cfg.last, 6u);
-    if (g != NULL && s_state == BT_HP_ST_READY) {
-        g->user_disc = 1u;
-        g->rc_active = 0u;
-        esp_err_t r = esp_bt_gap_remove_bond_device(bda);   /* also takes the link down (bta_dm_remove_device) */
-        lbegin("forget");
-        lka("peer", bda);
-        lku("err", (uint32_t)r);
-        lend();
-        set_msg(BT_HP_MSG_FORGOTTEN);
+    /* only with the stack up and the removal posted: otherwise the link key stayed in bt_hp_bonds.bin while the menu
+     * entry to remove it went away (STEP10 C8); the UI offers Forget only in READY */
+    if (g == NULL || s_state != BT_HP_ST_READY) {
+        log1("forget refused: headphones mode not ready");
+        return -1;
     }
+    g->user_disc = 1u;
+    g->rc_active = 0u;
+    esp_err_t r = esp_bt_gap_remove_bond_device(bda);   /* also takes the link down (bta_dm_remove_device) */
+    lbegin("forget");
+    lka("peer", bda);
+    lku("err", (uint32_t)r);
+    lend();
+    if (r != ESP_OK) {
+        return -1;                       /* entry kept: Forget can be chosen again */
+    }
+    set_msg(BT_HP_MSG_FORGOTTEN);
     s_cfg.last_valid = 0u;
     memset(s_cfg.last, 0, sizeof(s_cfg.last));
     memset(s_cfg.last_name, 0, sizeof(s_cfg.last_name));

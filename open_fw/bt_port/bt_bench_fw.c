@@ -580,6 +580,7 @@ void bt_bench_hp_finish(uint8_t out_mode)
     }
     aout_set_src_channels(2u);
     aout_set_mode((aout_mode_t)out_mode);
+    bt_hp_set_bench_tun(NULL);           /* the run's tuning (PIN 0000) ends with it (STEP10 C17) */
 }
 
 int bt_bench_boot(exfat_vol_t *vol, int sd_mounted)

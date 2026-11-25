@@ -178,7 +178,7 @@ int      bt_xrec_plat_entropy(void *out, size_t n);   /* 0 = OK; anything else f
 const char *bt_xrec_plat_pairing_block(void);
 const xrec_ops_t *bt_xrec_plat_device_ops(void);       /* stat, rtc, recorder, log, audio cfg, exp (legacy F:1733-1966) */
 void     bt_xrec_plat_load_bound_key(xrec_ctx_t *ctx);  /* SD:/cassini.key (legacy F:1968, same CSK5 format) */
-void     bt_xrec_plat_save_bound_key(const uint8_t key[32]);
+int      bt_xrec_plat_save_bound_key(const uint8_t key[32]);  /* 0 saved (or no card: RAM-only binding), -1 write failed */
 /* Bring-up, app part (bt_port_init, bond store loaded from SD before esp_bluedroid_init), then posts the "up" job to
  * the worker (bt_ctrl open + HCI driver attach + esp_bluedroid_init + enable). 0 = job posted. */
 int      bt_xrec_plat_stack_up_begin(exfat_vol_t *vol, int sd_mounted, const uint8_t bd_addr[6]);

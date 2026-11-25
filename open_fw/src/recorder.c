@@ -485,3 +485,28 @@ const char *recorder_get_filename(void)
 {
     return g_filename;
 }
+
+/* XREC DEL guard (review STEP10 A1): non-zero while /record/<name> (case-insensitive, as exFAT) is being written. */
+int recorder_is_recording_file(const char *name)
+{
+    if (!g_rec_saving || name == NULL) {
+        return 0;
+    }
+    for (uint32_t i = 0u; i < sizeof(g_filename); i++) {
+        char a = g_filename[i];
+        char b = name[i];
+        if (a >= 'A' && a <= 'Z') {
+            a = (char)(a - 'A' + 'a');
+        }
+        if (b >= 'A' && b <= 'Z') {
+            b = (char)(b - 'A' + 'a');
+        }
+        if (a != b) {
+            return 0;
+        }
+        if (a == '\0') {
+            return 1;
+        }
+    }
+    return 0;
+}

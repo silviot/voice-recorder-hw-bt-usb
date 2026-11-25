@@ -1897,7 +1897,7 @@ static void hp_build(const bt_hp_ui_t *u)
         }
         HP_ROW(HPR_SEARCH, 0, ui_tr_bt(u->scanning ? UI_BT_STR_SEARCHING : UI_BT_STR_SEARCH), val, 1);
     }
-    if (u->has_last) {
+    if (u->has_last && u->state == BT_HP_ST_READY) {   /* the bond is removed by the running stack (STEP10 C8) */
         p = 0;
         lbl[0] = '\0';
         append_str(lbl, &p, (int)sizeof(lbl), ui_tr_bt(UI_BT_STR_FORGET_PREFIX));
@@ -3563,6 +3563,9 @@ int openfw_main(void)
                             enter_press_ms = t ? t : 1u;
                         } else if ((int32_t)(t - enter_press_ms) >= 600) {
                             (void)recorder_stop();
+#if OPENFW_BT_HP
+                            (void)bt_shutdown();    /* headphones mode may run in the background (STEP10 A7) */
+#endif
                             save_persisted_state();
                             (void)sd_flush(&g_sd_card);
                             ui_show_toast(ui_tr(UI_STR_TOAST_UPDATE_MODE), UI_COL_CYAN, t, 1000u);

@@ -1000,8 +1000,10 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
              /* the speed dial unpauses too (audible speeds write to the ring) */
              ((act == PLAYER_ACT_SEEK_FWD || act == PLAYER_ACT_SEEK_BACK) && !scrub.speed && (paused || eof_reached) &&
               !(!has_cwx && m->cfg.skip_mode == UI_SKIP_TRACK) && !(eof_reached && act == PLAYER_ACT_SEEK_FWD))) &&
-            aout_is_bt() && !bt_hp_stream_ready()) {
-            act = PLAYER_ACT_NONE;                   /* nothing would drain the ring: stay paused */
+            ((aout_is_bt() && !bt_hp_stream_ready()) || aout_route() == AOUT_ROUTE_NONE)) {
+            /* nothing would drain the ring: stay paused (NONE: the session detached under a headphones-only file,
+             * STEP10 C15; reopening the file picks a route again) */
+            act = PLAYER_ACT_NONE;
             str_copy_cap(m->toast_msg, (int)sizeof(m->toast_msg), ui_tr_bt(UI_BT_STR_HP_NOT_CONNECTED));
             m->toast_col = UI_COL_AMBER;
             toast_until  = now + 1500u;

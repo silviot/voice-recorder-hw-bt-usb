@@ -339,14 +339,20 @@ static void handle_pair(xrec_ctx_t *ctx, const char *args)
         send_err(ctx, "BADKEY");
         return;
     }
+    /* Saved first: a key that only lived in RAM worked for this session, then the old key came back from the card at the
+     * next start while the phone had been told OK (review STEP10 C9). Not saved: ERR, the old binding stays and the
+     * window stays open for a retry. */
+    if (ctx->ops.on_bound_key && ctx->ops.on_bound_key(ctx->user, new_key) != 0) {
+        mem_zero(new_key, sizeof(new_key));
+        send_err(ctx, "SAVE");
+        return;
+    }
     mem_copy(ctx->key, new_key, 32u);
+    mem_zero(new_key, sizeof(new_key));
     ctx->bound      = 1u;
     ctx->auth       = 1u;
     ctx->pair_fails = 0u;
     xrec_close_pairing(ctx);
-    if (ctx->ops.on_bound_key) {
-        ctx->ops.on_bound_key(ctx->user, ctx->key);
-    }
     static const char ok[] = "+XREC:OK,PAIR\r\n";
     send_text(ctx, ok, (int)(sizeof(ok) - 1u));
 }
@@ -631,6 +637,11 @@ static void handle_del(xrec_ctx_t *ctx, const char *filename)
     }
     if (!is_safe_filename(filename)) {
         send_err(ctx, "NAME");
+        return;
+    }
+    /* the file being recorded: deleting it frees clusters the writer still fills (review STEP10 A1) */
+    if (ctx->ops.file_busy && ctx->ops.file_busy(ctx->user, filename) != 0) {
+        send_err(ctx, "BUSY");
         return;
     }
     if (exfat_delete_file(ctx->vol, "/record", filename) != 0) {

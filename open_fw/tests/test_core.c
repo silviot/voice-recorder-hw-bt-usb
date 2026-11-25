@@ -2336,6 +2336,8 @@ typedef struct {
     xrec_rtc_t  rtc;
     uint8_t     bound_key[32];
     int         bound_called;
+    int         bound_fail;      /* on_bound_key reports the key write failed */
+    const char *busy_name;       /* file_busy: the file being recorded */
     int         ota_called;
     int         dfu_called;
     uint8_t     exp_buf[1024];
@@ -2429,11 +2431,21 @@ static void mock_xrec_entropy(void *user, uint8_t out[16])
     }
 }
 
-static void mock_xrec_bound(void *user, const uint8_t key[32])
+static int mock_xrec_bound(void *user, const uint8_t key[32])
 {
     sim_phone_t *sp = (sim_phone_t *)user;
+    if (sp->bound_fail) {
+        return -1;
+    }
     memcpy(sp->bound_key, key, 32u);
     sp->bound_called = 1;
+    return 0;
+}
+
+static int mock_xrec_file_busy(void *user, const char *name)
+{
+    sim_phone_t *sp = (sim_phone_t *)user;
+    return sp->busy_name != NULL && strcmp(sp->busy_name, name) == 0;
 }
 
 static void mock_xrec_on_ota(void *user)
@@ -2675,7 +2687,7 @@ static void test_bt_spp_and_xrec(void)
         NULL, NULL, mock_xrec_on_ota,
         mock_xrec_exp_write, mock_xrec_exp_run, mock_xrec_read_log,
         mock_xrec_reset_log, mock_xrec_on_dfu, mock_xrec_audio_cfg,
-        mock_xrec_get_mtu,
+        mock_xrec_get_mtu, mock_xrec_file_busy,
     };
     xrec_init(&xrec, &vol, &ops, &sp);
     bt_spp_init(&spp, mock_spp_data_cb, &xrec);
@@ -2753,6 +2765,16 @@ static void test_bt_spp_and_xrec(void)
     sp.rx_len = 0u;
     xrec_open_pairing(&xrec, "482910");
     const char *c_pair = "+XREC:PAIR,482910,000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\r";
+    /* STEP10 C9: the key write fails -> ERR,SAVE, nothing installed, the window stays open for a retry */
+    sp.bound_fail = 1;
+    send_rfcomm_client_uih(&spp, 0x0041u, 2u, (const uint8_t *)c_pair, (uint16_t)strlen(c_pair));
+    drain_acl_to_phone(&spp, &sp);
+    sp.rx_stream[sp.rx_len] = '\0';
+    assert(strstr((const char *)sp.rx_stream, "+XREC:ERR,SAVE") != NULL);
+    assert(strstr((const char *)sp.rx_stream, "+XREC:OK,PAIR") == NULL);
+    assert(sp.bound_called == 0 && xrec.bound == 0u && xrec.auth == 0u);
+    sp.bound_fail = 0;
+    sp.rx_len = 0u;
     send_rfcomm_client_uih(&spp, 0x0041u, 2u, (const uint8_t *)c_pair, (uint16_t)strlen(c_pair));
     drain_acl_to_phone(&spp, &sp);
     sp.rx_stream[sp.rx_len] = '\0';
@@ -2821,6 +2843,22 @@ static void test_bt_spp_and_xrec(void)
     assert(strstr((const char *)sp.rx_stream, "+XREC:F,64,REC_0009.wav") != NULL);
     assert(strstr((const char *)sp.rx_stream, ".autoplay") == NULL);
     assert(strstr((const char *)sp.rx_stream, "+XREC:END") != NULL);
+
+    /* STEP10 A1: DEL of the file being recorded is refused and the file stays */
+    sp.rx_len = 0u;
+    sp.busy_name = "REC_0009.wav";
+    const char *c_del_busy = "+XREC:DEL,REC_0009.wav\r";
+    send_rfcomm_client_uih(&spp, 0x0041u, 2u, (const uint8_t *)c_del_busy, (uint16_t)strlen(c_del_busy));
+    drain_acl_to_phone(&spp, &sp);
+    sp.rx_stream[sp.rx_len] = '\0';
+    assert(strstr((const char *)sp.rx_stream, "+XREC:ERR,BUSY") != NULL);
+    assert(strstr((const char *)sp.rx_stream, "+XREC:OK,DEL") == NULL);
+    {
+        exfat_entry_t busy_ent;
+        assert(exfat_find_path(&vol, "/record/REC_0009.wav", &busy_ent) == 0 && busy_ent.size == 64u);
+    }
+    sp.busy_name = NULL;
+    send_rfcomm_client_credits(&spp, 0x0041u, 2u, 2u);
 
     sp.rx_len = 0u;
     const char *c_del_trav = "+XREC:DEL,../evil.wav\r+XREC:GETS,0,16,16,../evil.wav\r+XREC:DEL,REC_0009.wav\r+XREC:LS\r";

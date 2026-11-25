@@ -655,12 +655,15 @@ static void window_close(void)
     }
 }
 
-static void xo_bound_key(void *user, const uint8_t key[32])
+static int xo_bound_key(void *user, const uint8_t key[32])
 {
     (void)user;
+    if (bt_xrec_plat_save_bound_key(key) != 0) {
+        return -1;               /* +XREC:ERR,SAVE: old binding kept, window left open for a retry (STEP10 C9) */
+    }
     bt_xrec_plat_log("BT XREC PAIRED");
     window_close();              /* legacy F:1805-1810: window and discoverability closed */
-    bt_xrec_plat_save_bound_key(key);
+    return 0;
 }
 
 static void defer_reboot(uint8_t mode)

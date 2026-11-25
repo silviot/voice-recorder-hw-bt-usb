@@ -42,7 +42,9 @@ typedef struct {
     void (*get_rtc)(void *user, xrec_rtc_t *out);
     int  (*set_rtc)(void *user, const xrec_rtc_t *dt);
     void (*get_entropy)(void *user, uint8_t out[16]);
-    void (*on_bound_key)(void *user, const uint8_t key[32]);
+    /* PAIR: persist the new key BEFORE it is installed and acknowledged. Non-zero = not saved: the session replies
+     * +XREC:ERR,SAVE and keeps the previous binding (review STEP10 C9). */
+    int  (*on_bound_key)(void *user, const uint8_t key[32]);
     void (*on_reboot)(void *user);
     int  (*rec_start)(void *user, const char *opt_name, char *out_name, uint32_t out_max);
     int  (*rec_stop)(void *user);
@@ -58,6 +60,8 @@ typedef struct {
     int      (*audio_cfg)(void *user, int set, uint8_t *dsp_profile,
                           uint8_t *gain, uint8_t *channels, uint8_t *vor);
     uint16_t (*get_mtu)(void *user);
+    /* DEL: non-zero when /record/<name> is the file being recorded (+XREC:ERR,BUSY; review STEP10 A1). Optional. */
+    int      (*file_busy)(void *user, const char *name);
 } xrec_ops_t;
 
 typedef enum {

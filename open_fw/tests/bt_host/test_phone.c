@@ -1316,6 +1316,13 @@ static void expect_never_authorized(const char *who)
 
 /* Write a bond for bda (Bluedroid's "xx:xx:xx:xx:xx:xx") with the given link key type into /bt_bonds.bin, next to
  * what the file holds (session OFF): the state a power loss, a failed SD write or a lost AUTH_CMPL leaves behind. */
+static int fn_store_reset(uint32_t a)
+{
+    (void)a;
+    bt_store_reset();    /* a fresh boot's empty RAM store (P15b) */
+    return 0;
+}
+
 static bool plant_bond(const char *bdstr, int key_type, const uint8_t wire_key[16])
 {
     int n = bthx_read_root_file("bt_bonds.bin", s_img, sizeof(s_img));
@@ -1655,7 +1662,9 @@ int bth_phone_scenario(const char *img_path)
     }
 
     /* ---- 11 ---- */
-    bth_log("[P11] window open, laptop C (NoInputNoOutput): Just Works bond removed, link dropped\n");
+    /* Review STEP10 C4 / A3: the patch 0036 hook refuses Just Works outside a headphones session, so phone mode no longer
+     * lets Bluedroid create (and replace a stored MITM key with) a Just Works key it then has to remove. */
+    bth_log("[P11] window open, laptop C (NoInputNoOutput): Just Works refused at the confirmation, no key\n");
     {
         bthx_call(BTHX_OPEN_PAIRING, 60000u, 2000u);
         PCHECK(WAIT(S().d.scan_disc == 1u, 2000), "window not reopened");
@@ -1667,12 +1676,13 @@ int bth_phone_scenario(const char *img_path)
             goto out;
         }
         peer_authenticate();
-        PCHECK(WAIT(S().d.bonds_removed == rm0 + 1u, 3000), "Just Works bond not removed (removed %u)",
-               S().d.bonds_removed);
+        PCHECK(WAIT(fake_peer.host_rejects >= 1u || fake_peer.auth_fail > 0u, 3000),
+               "Just Works confirmation not refused (rejects %u)", fake_peer.host_rejects);
         PCHECK(WAIT(!fake_peer.connected, 3000), "Just Works link not dropped");
         PCHECK(WAIT(S().bonds == 1, 2000), "bonds %d after C (want only A)", S().bonds);
-        PCHECK(fake_peer.pairings == 1u && fake_peer.host_confirms == 1u, "C: Bluedroid auto-confirmed (%u, %u)",
-               fake_peer.pairings, fake_peer.host_confirms);
+        PCHECK(fake_peer.pairings == 0u && fake_peer.host_confirms == 0u && S().d.bonds_removed == rm0,
+               "C: Just Works key made (pairings %u, confirms %u, removed %u)", fake_peer.pairings,
+               fake_peer.host_confirms, S().d.bonds_removed - rm0);
         PCHECK(S().d.ssp_accepted == 0u, "Just Works reached the numeric-comparison policy");
         /* the session's own view of the link (ACL_DISCONN_CMPL through BTC) can trail the peer's: the next page
          * counts links from here */
@@ -1712,7 +1722,7 @@ int bth_phone_scenario(const char *img_path)
     /* ---- 13 ---- */
     /* Review finding: a Just Works key is stored (and a flush requested) before the app sees AUTH_CMPL; BTA DM removes
      * it only once the ACL is down, which never happens if BT stops first. It must still never reach the card. */
-    bth_log("[P13] window open, laptop C pairs Just Works; its link is still up when bt_xrec_stop runs\n");
+    bth_log("[P13] window open, laptop C tries Just Works (refused); its link is still up when bt_xrec_stop runs\n");
     uint8_t ckey[16];
     rom_cmds_clear();
     if (!wait_ready()) {
@@ -1732,11 +1742,15 @@ int bth_phone_scenario(const char *img_path)
         fake_peer.defer_detach = true;               /* the rejection's disconnect does not complete before the stop */
         bth_rom_unlock();
         peer_authenticate();
-        PCHECK(WAIT(S().d.bonds_removed == rm0 + 1u, 3000), "Just Works bond not removed (removed %u)",
-               S().d.bonds_removed);
-        memcpy(ckey, fake_peer.key, 16u);
-        PCHECK(fake_peer.pairings == 1u && fake_peer.connected, "C: pairing %u, link up %u", fake_peer.pairings,
-               fake_peer.connected);
+        /* since STEP10 C4 the confirmation is refused (P11): no key exists to leak; C's key for P14 / P15 is one from
+         * a Just Works pairing it made elsewhere */
+        PCHECK(WAIT(fake_peer.host_rejects >= 1u || fake_peer.auth_fail > 0u, 3000),
+               "Just Works confirmation not refused (rejects %u)", fake_peer.host_rejects);
+        PCHECK(fake_peer.pairings == 0u && S().d.bonds_removed == rm0, "C: pairing %u, removed %u", fake_peer.pairings,
+               S().d.bonds_removed - rm0);
+        for (unsigned i = 0u; i < 16u; i++) {
+            ckey[i] = (uint8_t)(0x5Au ^ (i * 17u));
+        }
         stop_session(&base, "stop right after the Just Works rejection");
         int n = bthx_read_root_file("bt_bonds.bin", s_img, sizeof(s_img));
         PCHECK(n > 0 && !mem_has(s_img, (uint32_t)n, "00:5b:1a:51:7e:c3", 17u),
@@ -1800,6 +1814,81 @@ int bth_phone_scenario(const char *img_path)
             goto out;
         }
         expect_never_authorized("C (stale Just Works bond on the card)");
+    }
+
+    /* ---- 15b ---- */
+    /* Review STEP10 C10: a restart reloaded the card's bond file over RAM bonds whose write had failed (the older file
+     * won: a removed bond came back, a new one was lost). A2: a file that exists but could not be read left an empty
+     * store, which the start's config save then wrote over the file (every bond erased). */
+    bth_log("[P15b] unsaved bond changes survive a restart; an unreadable bond file is never written over\n");
+    stop_session(&base, "stop before P15b");
+    if (p_fail) {
+        goto out;
+    }
+    {
+        PCHECK(plant_bond("00:5b:1a:51:7e:c3", 4, ckey), "could not write C's stale bond into /bt_bonds.bin");
+        uint32_t wf0 = bthx_bond_write_fails();
+        bthx_fail_bond_writes(1);
+        rom_cmds_clear();
+        if (!wait_ready()) {
+            bthx_fail_bond_writes(0);
+            goto out;
+        }
+        PCHECK(WAIT(S().d.bonds_removed == 1u, 2000), "stale bond not removed at start (removed %u)",
+               S().d.bonds_removed);
+        PCHECK(WAIT(bthx_bond_write_fails() > wf0, 2000), "the removal never tried to write /bt_bonds.bin");
+        stop_session(&base, "P15b stop, card refusing writes");
+        if (p_fail) {
+            bthx_fail_bond_writes(0);
+            goto out;
+        }
+        /* RAM: A only (unsaved); card: A + C. The restart must keep the newer RAM store. */
+        rom_cmds_clear();
+        if (!wait_ready()) {
+            bthx_fail_bond_writes(0);
+            goto out;
+        }
+        (void)WAIT(0, 300);
+        PCHECK(S().d.bonds_removed == 0u && S().bonds == 1, "restart reloaded the older bond file over unsaved RAM "
+               "bonds (C removed again %u, bonds %d)", S().d.bonds_removed, S().bonds);
+        bthx_fail_bond_writes(0);
+        int n = -1;
+        bool clean = WAIT((n = bthx_read_root_file("bt_bonds.bin", s_img, sizeof(s_img))) > 0 &&
+                          !mem_has(s_img, (uint32_t)n, "00:5b:1a:51:7e:c3", 17u) &&
+                          mem_has(s_img, (uint32_t)n, "00:5b:1a:51:7e:a1", 17u), 3000);
+        PCHECK(clean, "after the card recovered /bt_bonds.bin is not A only");
+        stop_session(&base, "P15b stop");
+        if (p_fail) {
+            goto out;
+        }
+    }
+    {
+        /* a fresh boot (empty RAM store) whose bond file read fails */
+        PCHECK(bthx_call_fn(fn_store_reset, 0u, 2000u) == 0, "bt_store_reset");
+        bthx_fail_bond_reads(1);
+        rom_cmds_clear();
+        if (!wait_ready()) {
+            bthx_fail_bond_reads(0);
+            goto out;
+        }
+        PCHECK(S().bonds == 0, "bonds %d with the bond file unreadable", S().bonds);
+        uint32_t wr0 = bthx_bond_writes();
+        (void)WAIT(0, 1500);         /* the start's config save asks for a flush */
+        int n = bthx_read_root_file("bt_bonds.bin", s_img, sizeof(s_img));
+        PCHECK(n > 0 && mem_has(s_img, (uint32_t)n, "00:5b:1a:51:7e:a1", 17u) && bthx_bond_writes() == wr0,
+               "an unreadable /bt_bonds.bin was written over (A %s, %u writes)",
+               n > 0 && mem_has(s_img, (uint32_t)n, "00:5b:1a:51:7e:a1", 17u) ? "kept" : "LOST",
+               bthx_bond_writes() - wr0);
+        stop_session(&base, "P15b stop, bond file unreadable");
+        bthx_fail_bond_reads(0);
+        if (p_fail) {
+            goto out;
+        }
+        rom_cmds_clear();
+        if (!wait_ready()) {
+            goto out;
+        }
+        PCHECK(WAIT(S().bonds == 1, 2000), "A not loaded back once the card reads again (bonds %d)", S().bonds);
     }
 
     /* ---- 16 ---- */

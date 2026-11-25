@@ -195,6 +195,7 @@ static int fn_stop(uint32_t a) { (void)a; return bt_hp_stop(); }
 static int fn_scan(uint32_t a) { return bt_hp_scan((uint8_t)a); }
 static int fn_pair_hp(uint32_t a) { return bt_hp_connect_addr(s_hp_bda, (int)a); }
 static int fn_suspend(uint32_t a) { (void)a; bt_hp_suspend(); return 0; }
+static int fn_forget(uint32_t a) { (void)a; return bt_hp_forget(); }
 static int fn_player_begin(uint32_t a) { (void)a; bt_hp_player_begin(); return 0; }
 static int fn_fmt(uint32_t a)
 {
@@ -1495,6 +1496,19 @@ int bth_headphones_scenario(const char *img_path)
         /* two frozen-peer teardowns in this run (S8b's stall escalation, S10), up to 16 blocks / 4 KiB each */
         SCHECK(known_leak_blocks <= 32u && known_leak_bytes <= 8192u, "frozen teardowns left %zu blocks / %zu B",
                known_leak_blocks, known_leak_bytes);
+    }
+
+    /* ---- S10c ---- (review STEP10) */
+    bth_log("[S10c] headphones mode off: Forget refused (bond kept), Just Works refused (heap seq %u)\n",
+            (unsigned)bth_heap_seq());
+    {
+        SCHECK(UI().state == BT_HP_ST_OFF && UI().has_last, "S10c: want OFF with a remembered headset (state %u last %u)",
+               UI().state, UI().has_last);
+        /* C8: with BT off the link key cannot be removed, so the headset must stay listed (Forget again later) */
+        SCHECK(bthx_call_fn(fn_forget, 0u, 2000u) != 0 && UI().has_last, "S10c: Forget with BT off accepted (last %u)",
+               UI().has_last);
+        /* C4 / A3: no headphones session -> the patch 0036 hook refuses Just Works (phone mode never keeps it) */
+        SCHECK(openfw_just_works_allowed(s_hp_bda) == 0, "S10c: Just Works allowed with no headphones session");
     }
 
 out:
