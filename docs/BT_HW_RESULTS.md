@@ -137,6 +137,12 @@ device sees a late `ev=0x36 st=0x05` with disconnect reason **0x08** (timeout). 
 unclear whether Pair was tapped) and the first control (not tapped) are therefore not evidence; tell a real key
 failure (reason 0x16, within seconds of the comparison) from a timeout (reason 0x08).
 
+### SSP auto-accept (review C2 / A8, user decision): silicon check (2026-11-25, session 9)
+Image `05f0057` bench build (FIRM CRC `0xB5DB`), run `secs=120 pair=1 pair_secs=90` (**no** `autoconfirm`), Pixel 8
+over adb: `BT SSP numeric comparison accepted (pairing window open, auto-accept), value 240476` (= phone code),
+`ev=0x36 st=0x00`, `BT SSP bonded (numeric comparison, MITM)`, phone stores the link key ~5 s after the tap. The
+phone still shows its own "Check pairing codes / Pair" dialog (Android asks its user regardless).
+
 ### Entropy source assessment: results (2026-11-25, session 9)
 Image: `DEV_EXP=1` default build from `integ/bt-all-local` `f078c9c` (FIRM CRC `0xA6BA`), gain 8, quiet room,
 device on the desk, warm (after ~1 h of BT use). 16 sequential runs + 63 restart runs (one reboot each) + 3 controls:
