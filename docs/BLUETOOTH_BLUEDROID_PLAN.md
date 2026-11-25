@@ -831,6 +831,20 @@ secret of ~33 predictable bits: bench-only waiver, see the review-round entry be
   DEL and PAIR checks fail without their fixes. Gates (0 warnings): FIRM CRC def 0xECB8, bt 0xA199, hp 0x663A,
   hpb 0xD52F, bench 0x4FED. Open: A5 XREC TX flow control, C3, A3 key downgrade, A6/A9/C7/C11 OOM paths, C13; hardware:
   C5, headset IO capability (C2/A8), C18 address, A10, A11, Exp 5.
+- 2026-11-25 (`test/aout-both-mode`, from `ab27527`): **output mode Both** read end to end (Settings row -> `bt_hp_cfg.bin`
+  `out_mode` -> `aout_set_mode` -> `aout_start` route BOTH -> tap -> DAC; player volume split; PA). Mono files after
+  the mono pass-through (`8983cb7`) are fine: the ring stays mono and `hp_sink_tap_peek` expands to L = R for the DAC.
+  Bug found: when the app task is out longer than the DAC's 4 slots last (silicon 300-480 ms), the DAC runs dry while
+  the headset keeps reading; the tap then trails the headset by the whole gap for good, the speaker stays late and the
+  tap holds that backlog in the ring, so the headset's ring shrinks after each gap and starves (23 empty packets in
+  3 s). Fix (`src/audio_out.c` `pump_dac`): with the DAC found dry and a backlog above what its queue takes at once
+  (`AOUT_RESYNC_FRAMES` = 4 x 512), the tap drops it and restarts in step with the headset
+  (`aout_stats_t.dac_resync_frames`). Tests: `test_player_bt` (test-bt-hp) now plays Both with mono and stereo files,
+  headset connected (both outputs complete, sample exact, speaker never ahead of the headset, one volume = bt_vol) and
+  not connected (speaker only, speaker volume), absolute volume (headset gain unity, speaker at bt_vol), and mono with
+  the app task out 400 ms/s (0 empty packets; 23 without the fix). Headphones S1 checks that the mode is saved
+  (byte 5 of `bt_hp_cfg.bin`, only on change). BT=1 only: default image unchanged (0xECB8); gates 0 warnings, bt
+  0xECD8, hp 0xF183, hpb 0xA698, bench 0xC057 (CRCs depend on the worktree path).
 
 ## 11. Round-1 traceability
 

@@ -843,13 +843,23 @@ What the image does:
   no headset connected a file does not start and shows `Headphones not connected`), `Both` (DAC and headset, the DAC
   delayed by the headset latency estimate). Stored in `SD:/bt_hp_cfg.bin` with `bt_vol` and the last headset, not in
   `settings.bin` (design §6.6).
-- **Player** with Headphones/Both: speaker amp off, jack plugging ignored, volume = headset volume (AVRCP absolute
-  volume when the headset supports it, else PCM gain; a volume change on the headset is followed by the device's VOL
-  keys); headset buttons PLAY and PAUSE toggle (one-button headsets guess which one to send), STOP pauses, NEXT/PREV
-  skip or seek like the device's arrow taps, VOL+/- step the volume once (`BT hp avrcp key code=.. rel=0 key=N` logs
-  each decision); a link loss, credit stall, START failure or the headset pausing itself (in-ear detection) pauses
-  the player at the last heard sample. Buttons pressed and headset events while no file plays are dropped when the
-  next file starts.
+- **Both, as the user sees it**: with a headset connected and streaming-ready when the file opens, the file plays on
+  the headset and on the speaker (or the wired jack) together, the speaker held back to match the headset. With no
+  headset at that moment the file plays on the speaker alone at the speaker volume (no toast); a headset that connects
+  later is used from the next file. Mono and stereo files both work (the headset gets mono as mono). One volume for
+  both outputs: the headset's `bt_vol` (VOL keys and headset buttons change it; with AVRCP absolute volume the headset
+  applies it and the speaker follows the same level). The speaker amp follows the jack as in Speaker mode, and pulling
+  the jack pauses both. If the app is held up long enough for the speaker to run dry, the speaker skips the missed
+  part to stay in step with the headset (the headset is not interrupted). If the headset drops mid-file the player
+  pauses (if headphones mode itself stopped, Play continues on the speaker; after a lost link reopen the file). If the
+  PCM ring had to borrow the DAC buffer (no heap), Both plays on the headset only.
+- **Player** with Headphones (Both: speaker side above): speaker amp off, jack plugging ignored, volume = headset
+  volume (AVRCP absolute volume when the headset supports it, else PCM gain; a volume change on the headset is
+  followed by the device's VOL keys); headset buttons PLAY and PAUSE toggle (one-button headsets guess which one to
+  send), STOP pauses, NEXT/PREV skip or seek like the device's arrow taps, VOL+/- step the volume once (`BT hp avrcp
+  key code=.. rel=0 key=N` logs each decision); a link loss, credit stall, START failure or the headset pausing itself
+  (in-ear detection) pauses the player at the last heard sample. Buttons pressed and headset events while no file
+  plays are dropped when the next file starts.
 - **Exit paths**: power-off, USB disk mode and phone mode stop headphones mode first; the REC switch suspends the stream
   (link kept).
 

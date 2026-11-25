@@ -55,6 +55,7 @@ void aout_bt_attach(void *tx, void *sink, const aout_bt_link_t *link, int ring_i
 
 typedef struct {
     uint32_t both_degraded, start_no_bt, ch_expand, dac_pump_frames, dac_pump_calls;
+    uint32_t dac_resync_frames;   /* BOTH: tap frames dropped after the DAC ran dry (pump_dac) */
 } aout_stats_t;
 void aout_get_stats(aout_stats_t *out);
 

@@ -196,6 +196,7 @@ static int fn_scan(uint32_t a) { return bt_hp_scan((uint8_t)a); }
 static int fn_pair_hp(uint32_t a) { return bt_hp_connect_addr(s_hp_bda, (int)a); }
 static int fn_suspend(uint32_t a) { (void)a; bt_hp_suspend(); return 0; }
 static int fn_forget(uint32_t a) { (void)a; return bt_hp_forget(); }
+static int fn_set_out(uint32_t a) { bt_hp_set_out_mode((uint8_t)a); return (int)bt_hp_out_mode(); }
 static int fn_player_begin(uint32_t a) { (void)a; bt_hp_player_begin(); return 0; }
 static int fn_fmt(uint32_t a)
 {
@@ -1147,6 +1148,18 @@ int bth_headphones_scenario(const char *img_path)
                "a headphones stop wrote phone mode's bt_bonds.bin");
         SCHECK(bthx_gate_in_lock() == 0u, "pairing gate evaluated inside the session lock %u times",
                bthx_gate_in_lock());
+    }
+    {
+        /* Settings -> Audio output (main.c UI_SET_ROW_AOUT): the mode is saved in bt_hp_cfg.bin (byte 5, after magic
+         * and version), only when it changes, and survives the session */
+        uint32_t saves = s_cfg_saves;
+        SCHECK(bthx_call_fn(fn_set_out, BT_HP_OUT_BOTH, 1000u) == (int)BT_HP_OUT_BOTH, "out mode Both not taken");
+        SCHECK(s_cfg_saves == saves + 1u && s_cfg_len >= 6u && s_cfg_blob[5] == BT_HP_OUT_BOTH,
+               "out mode Both not saved (saves %u -> %u, byte %u)", saves, s_cfg_saves, s_cfg_blob[5]);
+        SCHECK(bthx_call_fn(fn_set_out, BT_HP_OUT_BOTH, 1000u) == (int)BT_HP_OUT_BOTH && s_cfg_saves == saves + 1u,
+               "unchanged out mode saved again");
+        SCHECK(bthx_call_fn(fn_set_out, BT_HP_OUT_SPEAKER, 1000u) == (int)BT_HP_OUT_SPEAKER &&
+               s_cfg_saves == saves + 2u && s_cfg_blob[5] == BT_HP_OUT_SPEAKER, "out mode Speaker not saved");
     }
     controller_clean("S1");
     sbase_t w;

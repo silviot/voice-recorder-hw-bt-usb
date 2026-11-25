@@ -28,6 +28,9 @@
 
 #define AOUT_EXPAND_FRAMES 128u   /* mono -> stereo for the DAC route, on the stack */
 #define AOUT_TAP_FRAMES    512u   /* BOTH: DAC feed chunk (heap, allocated on first use) */
+/* BOTH: a backlog beyond what the DAC queue takes at once (4 slots of one tap chunk), found with the DAC dry, is
+ * dropped instead of played late (pump_dac) */
+#define AOUT_RESYNC_FRAMES (AUDIO_DAC_QUEUE_SLOTS * AOUT_TAP_FRAMES)
 
 /* Same Q15 curve as the DAC's digital gain (audio_dac.c): level 0 mutes, 1..31 span -48 dB .. 0 dB. */
 static const uint16_t s_gain_q15[32] = {
@@ -163,6 +166,15 @@ static void pump_dac(void)
             return;
         }
         uint32_t n = lag - hold;
+        if (q_dac == 0u && n > AOUT_RESYNC_FRAMES) {
+            /* The DAC ran dry (the app task was out longer than its 4 slots last: silicon 300-480 ms) while the
+             * headset kept reading. Played now, the backlog would leave the speaker late for good and keep the ring
+             * occupied behind the tap, so the headset starves after a few such gaps: drop it (the speaker already
+             * had its gap) and restart in step with the headset. */
+            hp_sink_tap_advance(s, n);
+            g_ao.st.dac_resync_frames += n;
+            return;
+        }
         n = hp_sink_tap_peek(s, g_ao.tap_buf, n < AOUT_TAP_FRAMES ? n : AOUT_TAP_FRAMES);
         int took = audio_dac_write_stereo(g_ao.tap_buf, n);
         if (took <= 0) {
