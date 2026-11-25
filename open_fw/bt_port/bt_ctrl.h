@@ -75,7 +75,11 @@ enum {
 };
 
 /* ---- link notes: one record per link-level controller event, for the session log (bt_ctrl_note_pop) ---- */
+#if defined(BT_CTRL_HCI_TRACE) && BT_CTRL_HCI_TRACE
+#define BT_CTRL_NOTES 64u          /* HCI trace (headphones bench images): one note per event to the host */
+#else
 #define BT_CTRL_NOTES 16u          /* a pairing adds up to 4 name notes to the link notes (session 6 review) */
+#endif
 enum {
     BT_CTRL_NOTE_CONN = 1,         /* Connection Complete from the ROM: handle, status */
     BT_CTRL_NOTE_DISC,             /* Disconnection Complete from the ROM: handle, status, reason */
@@ -89,6 +93,8 @@ enum {
     BT_CTRL_NOTE_INQ_DONE,         /* Inquiry Complete from the ROM: status, reason = results seen (<= 255) */
     BT_CTRL_NOTE_PAGE_CMD,         /* the host's 0405 Create Connection answered (CS): status; local = not by the ROM */
     BT_CTRL_NOTE_ROLE,             /* Role Change from the ROM: handle (0 if unknown), status, reason = new role */
+    BT_CTRL_NOTE_TRACE,            /* BT_CTRL_HCI_TRACE only: an event to the host: reason = event code, status = its
+                                    * first parameter byte (CC: the command's status), handle = CC/CS opcode */
 };
 
 /* Newest remote name a successful Remote Name Request Complete carried (any request: BTM's security name request at

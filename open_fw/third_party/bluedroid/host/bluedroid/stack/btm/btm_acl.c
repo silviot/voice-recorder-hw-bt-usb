@@ -1346,7 +1346,16 @@ void btm_read_remote_ext_features_complete (UINT8 *p)
 
     /* If there is the next remote features page and
      * we have space to keep this page data - read this page */
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+    /* open_fw patch 0040: read remote extended features up to page 1 only. The SL6801 ROM keeps one 8-byte slot per
+     * link for "remote page 1" and stores every LMP_features_res_ext there whatever its page (ROM 0x21E4C); reading
+     * page 2 overwrote the host-SSP bit that its initiator pairing decision tests (0x2D85C), so pairing as master
+     * fell back to a legacy PIN (silicon 2026-11-25, docs/BT_ROM_HCI_MAP.md §12). Page 2 (Secure Connections, CSB)
+     * is unused: sc_en is false. */
+    if ((page_num < max_page) && (page_num < 1)) {
+#else
     if ((page_num < max_page) && (page_num < HCI_EXT_FEATURES_PAGE_MAX)) {
+#endif
         page_num++;
         BTM_TRACE_DEBUG("BTM reads next remote extended features page (%d)\n", page_num);
         btm_read_remote_ext_features (handle, page_num);

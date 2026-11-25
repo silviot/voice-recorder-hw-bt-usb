@@ -1372,6 +1372,20 @@ int  bt_bench_boot(exfat_vol_t *vol, int sd_mounted);
 void bt_bench_begin(void);
 int  bt_bench_tick(uint32_t now_ms);
 int  bt_bench_end(exfat_vol_t *vol, int sd_mounted);
+/* Player stage: the player blocks, so its UI tick drives the bench (stats, time limit); at the limit BACK is injected
+ * once and the player returns (silicon 2026-11-25: the run outlived secs inside a 120 min recording). */
+static uint8_t s_bench_back_sent;
+static void bench_hp_play_tick(uint32_t now_ms)
+{
+    char p[4];
+    int a = bt_bench_hp_tick(now_ms, p, (uint32_t)sizeof(p));
+    if ((a & BT_BENCH_HP_ACT_EXIT) && !s_bench_back_sent) {
+        s_bench_back_sent = 1u;
+        openfw_log_puts("BENCH hp play: time limit, BACK\n");
+        keys_inject(KEY_BACK, 1u);
+        keys_inject(KEY_BACK, 0u);
+    }
+}
 #else
 #define OPENFW_BT_BENCH 0
 #endif
@@ -2006,8 +2020,10 @@ static void run_bt_hp_screen(int bench)
                     g_ui.play_has_prev = 0u;
                     g_ui.play_has_next = 0u;
                     g_ui.play_autoplay = 0u;   /* no .autoplay advance / position memory on a bench run */
-                    g_ui.play_tick_cb  = 0;
+                    g_ui.play_tick_cb  = bench_hp_play_tick;   /* stats + the run's time limit inside the player */
+                    s_bench_back_sent  = 0u;
                     int rc = openfw_play_file_ui(&g_exfat_vol, dir, name, &g_ui);
+                    g_ui.play_tick_cb  = 0;
                     keys_ignore_held();
                     openfw_log_puts("BENCH hp play end rc ");
                     openfw_log_u32((uint32_t)(rc + 10));

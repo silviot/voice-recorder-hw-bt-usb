@@ -177,7 +177,7 @@ void    bt_hp_set_out_mode(uint8_t mode);   /* applied to audio_out at the next 
  * clamp; SEP rate and max bitpool); logged. NULL = defaults. */
 typedef struct {
     uint16_t rate;                    /* 0 auto, 44100, 48000 */
-    uint8_t  bitpool, speech_bp, tick_ms, pkt_per_tick, txq, credit_ticks, pscan;
+    uint8_t  bitpool, speech_bp, tick_ms, pkt_per_tick, txq, credit_ticks, pscan, pin0000;
 } bt_hp_bench_tun_t;
 void bt_hp_set_bench_tun(const bt_hp_bench_tun_t *t);
 #endif

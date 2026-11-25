@@ -64,6 +64,7 @@ void bt_bench_cfg_default(bt_bench_cfg_t *cfg)
     cfg->hp_pick_last = 0u;
     cfg->hp_pair = 0u;
     cfg->hp_pscan = 0u;
+    cfg->hp_pin = 0u;
     cfg->hp_mono = 0u;
     cfg->hp_secs = 10u;
     cfg->hp_rate = 0u;
@@ -179,13 +180,13 @@ enum {
     K_MODE, K_HP_FIRST,                      /* K_HP_FIRST.. are the hp_* keys (need mode=hp) */
     K_HP_STAGE = K_HP_FIRST, K_HP_ADDR, K_HP_PICK, K_HP_PAIR, K_HP_PSCAN, K_HP_SECS, K_HP_RATE, K_HP_BITPOOL,
     K_HP_SPEECH_BP, K_HP_MONO, K_HP_TICK_MS, K_HP_PKT_PER_TICK, K_HP_TXQ, K_HP_CREDIT_TICKS, K_HP_TONE_HZ, K_HP_FILE,
-    K_HP_CREDITS, K_N
+    K_HP_CREDITS, K_HP_PIN, K_N
 };
 static const char *const k_keys[K_N] = { "secs", "pair", "pair_every", "pair_secs", "autoconfirm", "exit", "reboot",
                                          "xrec_pin", "mode", "hp_stage", "hp_addr", "hp_pick", "hp_pair", "hp_pscan",
                                          "hp_secs", "hp_rate", "hp_bitpool", "hp_speech_bp", "hp_mono", "hp_tick_ms",
                                          "hp_pkt_per_tick", "hp_txq", "hp_credit_ticks", "hp_tone_hz", "hp_file",
-                                         "hp_credits" };
+                                         "hp_credits", "hp_pin" };
 _Static_assert(K_N <= 32, "seen is a 32-bit key mask");
 
 /* Numeric hp_* keys: range and field. */
@@ -234,6 +235,8 @@ static int hp_num(uint32_t k, int32_t n, bt_bench_cfg_t *c)
             c->hp_pair = (uint8_t)n;
         } else if (k == K_HP_PSCAN) {
             c->hp_pscan = (uint8_t)n;
+        } else if (k == K_HP_PIN) {
+            c->hp_pin = (uint8_t)n;
         } else {
             c->hp_mono = (uint8_t)n;
         }

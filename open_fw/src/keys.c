@@ -78,6 +78,16 @@ static inline __attribute__((always_inline)) void keys_push_event(uint32_t t_ms,
     g_key_q_head = head + 1u;
 }
 
+/* A synthetic key edge from task context (bench runs end a blocking screen with BACK). The queue's producer is
+ * SysTick: push with interrupts masked so the two producers never interleave. Unused in release images (gc). */
+void keys_inject(key_id_t key, uint8_t pressed)
+{
+    uint32_t pm;
+    OPENFW_IRQ_SAVE(pm);
+    keys_push_event(millis(), key, pressed);
+    OPENFW_IRQ_RESTORE(pm);
+}
+
 static void keys_handle_overflow(void)
 {
     if (!g_key_overflow) {

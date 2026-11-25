@@ -197,6 +197,7 @@ key_id_t    keys_flush_events(void); /* held key at the queue boundary */
 void        keys_ignore_held(void); /* start a screen transition, suppress the exiting press */
 key_id_t    keys_state(uint32_t *since_ms);
 int         keys_last_activity(uint32_t *t_ms); /* 1 + time of last debounced edge */
+void        keys_inject(key_id_t key, uint8_t pressed); /* bench runs: queue a synthetic edge (task context) */
 
 /* ST7735S 80x160 / 160x80 8080 Parallel LCD + PWM3 Backlight (lcd_st7735s.c) */
 #define LCD_WIDTH   80u

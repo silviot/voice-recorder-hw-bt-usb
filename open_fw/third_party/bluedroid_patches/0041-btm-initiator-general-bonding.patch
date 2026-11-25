@@ -1,0 +1,20 @@
+diff --git a/open_fw/third_party/bluedroid/host/bluedroid/stack/btm/btm_sec.c b/open_fw/third_party/bluedroid/host/bluedroid/stack/btm/btm_sec.c
+index 8a142a9..f65a615 100644
+--- a/open_fw/third_party/bluedroid/host/bluedroid/stack/btm/btm_sec.c
++++ b/open_fw/third_party/bluedroid/host/bluedroid/stack/btm/btm_sec.c
+@@ -3526,6 +3526,15 @@ void btm_io_capabilities_req (UINT8 *p)
+         if ((btm_cb.pairing_flags & BTM_PAIR_FLAGS_WE_STARTED_DD)) {
+             evt_data.auth_req = (BTM_AUTH_DD_BOND | (evt_data.auth_req & BTM_AUTH_YN_BIT));
+         }
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++        /* open_fw patch 0041: a pairing we start for a service (headphones mode: AVDTP needs authentication on the
++         * link we paged) asked for "no bonding" (BTM_AUTH_SP_NO), so the peer was free to discard the key at
++         * disconnect (BlueZ does: silicon 2026-11-25) and the next reconnect needed a new pairing, which headphones
++         * mode refuses outside its window. Ask for general bonding; we store the key either way. */
++        else if (is_orig && (evt_data.auth_req & BTM_AUTH_BONDS) == 0) {
++            evt_data.auth_req = (BTM_AUTH_GB_BIT | (evt_data.auth_req & BTM_AUTH_YN_BIT));
++        }
++#endif
+ 
+         if (btm_cb.security_mode == BTM_SEC_MODE_SC) {
+             /* At this moment we know that both sides are SC capable, device in */

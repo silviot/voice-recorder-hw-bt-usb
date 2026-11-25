@@ -90,6 +90,10 @@ GATE_FLAGS :=
 endif
 GATE_STAMP := $(BUILD_DIR)/.gate_flags
 $(BUILD_DIR)/bt_port/bt_ctrl_cmds.o: CFLAGS += $(GATE_FLAGS)
+ifeq ($(HP_GATES),1)
+$(BUILD_DIR)/bt_port/bt_ctrl.o: CFLAGS += -DBT_CTRL_HCI_TRACE=1
+endif
+$(BUILD_DIR)/bt_port/bt_ctrl.o: $(GATE_STAMP)
 $(BUILD_DIR)/bt_port/bt_ctrl_cmds.o: $(GATE_STAMP)
 # ROM RNG hook pool (bt_rom_real.c, both ROM images); phone mode also gets the mic entropy source and the P-192 session
 # key that replaces the ROM's fixed SSP key (docs/BT_ROM_INTERFACE.md §2.3).

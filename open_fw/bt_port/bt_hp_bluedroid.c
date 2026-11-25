@@ -1479,6 +1479,22 @@ static void on_event(const ev_t *e)
     case EV_PIN_REQ: {
         esp_bt_pin_code_t pin;
         memset(pin, 0, sizeof(pin));
+        if (s_tun.pin0000) {
+            /* bench only (hp_pin=1): the ROM pairs as initiator with legacy PIN (silicon 2026-11-25); answer "0000"
+             * for the picked device inside its window, with the same gate as the Just Works hook */
+            bt_xrec_plat_lock();
+            bool ok = g->win_open && bda_eq(g->win_bda, e->bda) && g->gate_ok;
+            if (ok) {
+                g->jw_accepted = 1u;
+            }
+            bt_xrec_plat_unlock();
+            if (ok) {
+                memset(pin, '0', 4u);
+                (void)esp_bt_gap_pin_reply((uint8_t *)e->bda, true, 4u, pin);
+                log1("legacy PIN pairing answered 0000 (bench hp_pin=1, picked headset)");
+                break;
+            }
+        }
         g->d.pin_rejected++;
         (void)esp_bt_gap_pin_reply((uint8_t *)e->bda, false, 0u, pin);
         log1("legacy PIN pairing rejected");   /* design §6.3; Exp 4 records any headset that needs a PIN */

@@ -268,6 +268,7 @@ void bt_bench_hp_prepare(void)
     t.txq = s_cfg.hp_txq;
     t.credit_ticks = s_cfg.hp_credit_ticks;
     t.pscan = s_cfg.hp_pscan;
+    t.pin0000 = s_cfg.hp_pin;
     bt_hp_set_bench_tun(&t);
 }
 

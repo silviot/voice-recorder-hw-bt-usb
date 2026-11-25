@@ -339,8 +339,39 @@ static bool evt_general_space(void)
     return evt_used() + g.evt_resv < BT_CTRL_EVT_SLOTS - BT_CTRL_EVT_RESERVED;
 }
 
+static void note_add(uint8_t kind, uint16_t handle, uint8_t status, uint8_t reason, uint8_t local);
+#if defined(BT_CTRL_HCI_TRACE) && BT_CTRL_HCI_TRACE
+/* Headphones bench images: every event to the host becomes a link note (NOCP and inquiry results skipped), so the
+ * bench log shows the controller's side of paging, pairing and SSP (first master-role silicon runs, 2026-11-25). */
+static void trace_evt(const uint8_t *h4, uint16_t len)
+{
+    if (len < 4u || h4[0] != 0x04u) {
+        return;
+    }
+    uint8_t code = h4[1];
+    if (code == 0x13u || code == 0x02u || code == 0x22u || code == 0x2Fu) {
+        return;
+    }
+    uint16_t op = 0u;
+    uint8_t st = h4[3];
+    if (code == 0x0Eu && len >= 7u) {          /* CC {ncmd, op lo, op hi, status} */
+        op = (uint16_t)(h4[4] | (h4[5] << 8));
+        st = h4[6];
+        if (st == 0u && (op >> 10) != 0x01u) {
+            return;                            /* successful CC outside link control (set-up, reads): not traced */
+        }
+    } else if (code == 0x0Fu && len >= 7u) {   /* CS {status, ncmd, op lo, op hi} */
+        op = (uint16_t)(h4[5] | (h4[6] << 8));
+    }
+    note_add(BT_CTRL_NOTE_TRACE, op, st, code, 0u);
+}
+#endif
+
 static void evt_push(const uint8_t *h4, uint16_t len, uint32_t seq)
 {
+#if defined(BT_CTRL_HCI_TRACE) && BT_CTRL_HCI_TRACE
+    trace_evt(h4, len);
+#endif
     evt_slot_t *s = &g.evt[g.evt_head % BT_CTRL_EVT_SLOTS];
     memcpy(s->data, h4, len);
     s->len = len;
@@ -2385,6 +2416,10 @@ uint16_t bt_ctrl_note_format(const bt_ctrl_note_t *n, char *buf, uint16_t cap)
         at = put_hex(buf, cap, put_str(buf, cap, at, "role change"), " h=", n->handle, 4u);
         at = put_hex(buf, cap, at, " st=", n->status, 2u);
         return put_str(buf, cap, at, n->reason == BT_CTRL_ROLE_MASTER ? " master" : " slave");
+    case BT_CTRL_NOTE_TRACE:
+        at = put_hex(buf, cap, put_str(buf, cap, at, "trace"), " ev=", n->reason, 2u);
+        at = put_hex(buf, cap, at, " st=", n->status, 2u);
+        return n->handle != 0u ? put_hex(buf, cap, at, " op=", n->handle, 4u) : at;
     default:
         return put_hex(buf, cap, put_str(buf, cap, at, "note"), " ", n->kind, 2u);
     }

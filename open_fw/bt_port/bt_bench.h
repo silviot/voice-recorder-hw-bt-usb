@@ -40,6 +40,8 @@
  *                       first, bt_bench_hp_pick); last = the headset stored by an earlier stage (no scan; not with
  *                       hp_addr or hp_pair)
  *   hp_pair=0|1         default 0: open the pairing window (pair_secs) for the picked headset; not with hp_stage=scan
+ *   hp_pin=0|1          default 0: answer a legacy PIN request from the picked device inside its window with "0000"
+ *                       (bench only; the ROM pairs as initiator with legacy PIN, silicon 2026-11-25)
  *   hp_pscan=0|1        default 0: leave page scan on during 0401/0405 (Exp 4a/4b variant, design §6.2)
  *   hp_secs=N           2..61, default 10: discovery length in s (0401 Inquiry_Length = ceil(N / 1.28 s))
  *   hp_rate=44100|48000|auto   default auto: register only that SEP
@@ -109,7 +111,7 @@ typedef struct {
     uint8_t  hp_addr[6];    /* esp_bd_addr_t order: most significant byte first, as written */
     uint8_t  hp_pick_first; /* hp_pick=first */
     uint8_t  hp_pick_last;  /* hp_pick=last: the stored last headset (SD:/bt_hp_cfg.bin), no scan, no pairing */
-    uint8_t  hp_pair, hp_pscan, hp_mono;
+    uint8_t  hp_pair, hp_pscan, hp_mono, hp_pin;
     uint8_t  hp_secs;       /* discovery length (s) */
     uint16_t hp_rate;       /* 0 = auto, 44100, 48000 */
     uint8_t  hp_bitpool, hp_speech_bp, hp_tick_ms, hp_pkt_per_tick, hp_txq, hp_credit_ticks, hp_credits;
