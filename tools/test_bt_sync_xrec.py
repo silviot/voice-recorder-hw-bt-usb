@@ -365,6 +365,10 @@ def test_bench_dbg_and_load() -> None:
                                      log=lambda s: None, storm_every=0.1)
     assert res["bytes"] <= 8 * 1024 * 0.5 + 1024 + 1, res
     assert res["storms"] >= 3 and dev.dels == res["storms"] and dev.files, res   # DEL of a missing name only
+    # exFAT in 0:\record is case-insensitive: --load-file / --for-recording resolve the device's on-card name & size
+    files = client_for(FakeDevice({"/record/REC_0001.wav": bytes(4321)})).list_files()
+    assert bt_sync.find_remote_file(files, "rec_0001.WAV") == ("REC_0001.wav", 4321)
+    assert bt_sync.find_remote_file(files, "missing.wav") is None
     print("[PASS] bt_sync +XREC:DBG and --bench-load (RECSTART, GETS loop with wrap and cap, DBG polls, STAT/LS/DEL storm, RECSTOP)")
 
 

@@ -588,6 +588,7 @@ def compare(cap: Capture, base: list[Capture], lim: Limits, trim: tuple[float, f
                 "bdrift / bclk_smp needed (this firmware or record has none)", False, verdict="INCONCLUSIVE")
         elif refs:
             bd, bc = cb
+            ppm = bd / bc * 1e6
             rates = [r[0] / r[1] for r in refs]
             lo, hi = min(rates) * bc, max(rates) * bc
             exc = bd - min(max(bd, lo), hi)
@@ -596,6 +597,8 @@ def compare(cap: Capture, base: list[Capture], lim: Limits, trim: tuple[float, f
                 v = "INCONCLUSIVE"                  # the C0 block clocks disagree: the bar means nothing
             row(rows, "(e) block-clock drift vs C0", bd, f"{lo:.0f}..{hi:.0f}", rnd(exc, 1),
                 f"+-{lim.drift_smp} smp outside the C0 range", abs(exc) <= lim.drift_smp, verdict=v)
+            row(rows, "(e) block-clock rate", bd, None, rnd(ppm, 1),
+                f"|ppm| <= {lim.drift_ppm:g}", abs(ppm) <= lim.drift_ppm)
         else:
             bd, bc = cb
             ppm = bd / bc * 1e6
@@ -907,6 +910,19 @@ def self_test() -> int:
         expect("final record beats a later mid-recording line", rep, "prio", "PASS")
         expect("gain differs from the baseline -> setup", rep, "gain", "FAIL", ("(setup) gain/dsp/vor/ch",))
         expect("record without a block clock -> INCONCLUSIVE", rep, "old", "INCONCLUSIVE", ("(e) block-clock drift",))
+        # systematic gross block-clock rate error across BOTH C0 baselines and capture (> 300 ppm) must FAIL even when
+        # C0a, C0b and the capture agree with each other within +-8 samples
+        ring_sys = [
+            "BENCH rec " + _dev_line("REC_0001.wav", n, bdrift=-1000),
+            "BENCH rec " + _dev_line("REC_0002.wav", n, bdrift=-1002),
+            "BENCH rec " + _dev_line("REC_0003.wav", n, bdrift=-1001),
+        ]
+        (d / "ring_sys.log").write_text("\n".join(ring_sys) + "\n")
+        rep_sys = run(bd, [("ok", d / "REC_0003.wav")], "auto", None, trim, [d / "ring_sys.log"], None, lim)
+        expect("systematic -837 ppm block-clock drift on C0 + capture -> FAIL", rep_sys, "C0a", "FAIL",
+               ("(e) block-clock",))
+        expect("systematic -837 ppm block-clock drift on capture -> FAIL", rep_sys, "ok", "FAIL",
+               ("(e) block-clock",))
         md = markdown(rep)
         results.append(("markdown table", "| (e) device ov |" in md and "**FAIL**" in md, f"{len(md)} chars"))
         json.dumps(rep)

@@ -82,6 +82,15 @@ def crc16_ccitt_false(data: bytes, init: int = 0xFFFF) -> int:
     return crc
 
 
+def find_remote_file(files: List[Tuple[str, int]], name: str) -> Optional[Tuple[str, int]]:
+    """Case-insensitive lookup in 0:\\record (exFAT), returning the device's (on_card_name, size)."""
+    want = name.lower()
+    for fn, sz in files:
+        if fn.lower() == want:
+            return fn, sz
+    return None
+
+
 def discover_hw_mac(explicit_mac: Optional[str] = None) -> Optional[str]:
     if explicit_mac:
         return explicit_mac
@@ -796,12 +805,14 @@ def main() -> None:
             return
         if args.bench_load is not None:
             size = 0
-            if args.load_file:
-                size = dict(client.list_files()).get(args.load_file, 0)
-                if size <= 0:
-                    print(f"{args.load_file} is not in 0:\\record (LS); no GETS load.")
+            load_file = args.load_file
+            if load_file:
+                hit = find_remote_file(client.list_files(), load_file)
+                if hit is None or hit[1] <= 0:
+                    print(f"{load_file} is not in 0:\\record (LS); no GETS load.")
                     sys.exit(1)
-            client.bench_load(args.bench_load, args.load_file, size, burst_size=max(args.burst_size, args.chunk_size),
+                load_file, size = hit
+            client.bench_load(args.bench_load, load_file, size, burst_size=max(args.burst_size, args.chunk_size),
                               chunk_size=args.chunk_size, kbps=args.load_kbps, dbg_every=args.dbg_every,
                               rec=args.load_rec, log=out, storm_every=args.load_storm)
             return
@@ -844,11 +855,11 @@ def main() -> None:
             return
         if args.upload_cwx:
             if args.for_recording:
-                names = {n.lower() for n, _ in client.list_files()}
-                if args.for_recording.lower() not in names:
+                hit = find_remote_file(client.list_files(), args.for_recording)
+                if hit is None:
                     print(f"{args.for_recording} is not in 0:\\record (LS); not uploading.")
                     sys.exit(1)
-                remote = Path(args.for_recording).stem + ".cwx"
+                remote = Path(hit[0]).stem + ".cwx"
             else:
                 remote = args.upload_cwx.name
             n = client.upload_cwx(args.upload_cwx, remote)
