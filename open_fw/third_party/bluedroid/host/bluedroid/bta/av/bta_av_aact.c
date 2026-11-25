@@ -404,6 +404,25 @@ static BOOLEAN bta_av_next_getcap(tBTA_AV_SCB *p_scb, tBTA_AV_DATA *p_data)
 
 }
 
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+static size_t bta_av_avdt_evt_len(UINT8 event)
+{
+    switch (event) {
+    case AVDT_DISCOVER_CFM_EVT:     return sizeof(tAVDT_DISCOVER);
+    case AVDT_GETCAP_CFM_EVT:
+    case AVDT_RECONFIG_CFM_EVT:
+    case AVDT_RECONFIG_IND_EVT:     return sizeof(tAVDT_CONFIG);
+    case AVDT_OPEN_CFM_EVT:
+    case AVDT_OPEN_IND_EVT:         return sizeof(tAVDT_OPEN);
+    case AVDT_CONFIG_IND_EVT:       return sizeof(tAVDT_SETCONFIG);
+    case AVDT_SECURITY_CFM_EVT:
+    case AVDT_SECURITY_IND_EVT:     return sizeof(tAVDT_SECURITY);
+    case AVDT_DELAY_REPORT_EVT:     return sizeof(tAVDT_DELAY_RPT);
+    default:                        return sizeof(tAVDT_EVT_HDR);
+    }
+}
+#endif
+
 /*******************************************************************************
 **
 ** Function         bta_av_proc_stream_evt
@@ -449,7 +468,14 @@ static void bta_av_proc_stream_evt(UINT8 handle, BD_ADDR bd_addr, UINT8 event, t
         }
 
         if (p_data != NULL) {
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+            /* open_fw patch 0038: AVDTP passes each event's own struct (avdt_ad_tc_open_ind: a tAVDT_OPEN on its
+             * stack); copying sizeof(tAVDT_CTRL) from it read past it (ASan, test_bt_host_hp hps). */
+            memset(&p_msg->msg, 0, sizeof(tAVDT_CTRL));
+            memcpy(&p_msg->msg, p_data, bta_av_avdt_evt_len(event));
+#else
             memcpy(&p_msg->msg, p_data, sizeof (tAVDT_CTRL));
+#endif
             /* copy config params to event message buffer */
             switch (event) {
             case AVDT_RECONFIG_CFM_EVT:
@@ -1085,6 +1111,12 @@ void bta_av_cleanup(tBTA_AV_SCB *p_scb, tBTA_AV_DATA *p_data)
             p_scb->seps[xx].av_handle = 0;
         }
 
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+        /* open_fw patch 0038: msg was never initialised on this path; bta_av_dereg_comp finds the stream by
+         * hdr.layer_specific (an uninitialised handle could deregister another stream block). */
+        memset(&msg, 0, sizeof(msg));
+        msg.hdr.layer_specific = p_scb->hndl;
+#endif
         bta_av_dereg_comp((tBTA_AV_DATA *) &msg);
     } else {
         /* report stream closed to main SM */

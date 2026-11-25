@@ -2020,6 +2020,15 @@ void bta_av_dereg_comp(tBTA_AV_DATA *p_data)
 
     /* find the stream control block */
     p_scb = bta_av_hndl_to_scb(p_data->hdr.layer_specific);
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+    /* open_fw patch 0038: both callers hand a message smaller than tBTA_AV_API_REG (a BT_HDR from
+     * bta_av_api_deregister, a tBTA_AV_CONN_CHG from bta_av_cleanup), so p_data->api_reg.tsep below read past it
+     * (ASan, test_bt_host_hp hps). The local SEP type comes from the stream block, read before it is freed. */
+    UINT8 openfw_tsep = AVDT_TSEP_SRC;
+    if (p_scb) {
+        openfw_tsep = p_scb->seps[p_scb->sep_idx].tsep;
+    }
+#endif
 
     if (p_scb) {
         APPL_TRACE_DEBUG("deregistered %d(h%d)", p_scb->chnl, p_scb->hndl);
@@ -2099,7 +2108,12 @@ void bta_av_dereg_comp(tBTA_AV_DATA *p_data)
         }
 
         /* Clear the Capturing/Rendering service class bit */
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+        memset(&cod, 0, sizeof(cod));
+        if (openfw_tsep == AVDT_TSEP_SRC) {
+#else
         if (p_data->api_reg.tsep == AVDT_TSEP_SRC) {
+#endif
             cod.service = BTM_COD_SERVICE_CAPTURING | BTM_COD_SERVICE_AUDIO;
         } else {
 #if (BTA_AV_SINK_INCLUDED == TRUE)
