@@ -20,7 +20,7 @@ work: fold it into the design's live log section** (the design file lives in the
 | Bench | `bt_port/bt_bench.c/.h`, `bt_bench_fw.c`, `src/main.c` | `mode=hp`: stages scan / connect / tone / player with per-second stats; `hp_tone_hz=0` alternates 440/880 Hz; player stage defaults to the first recording. |
 | Host scenario S | `tests/bt_host/test_headphones.c` (`test_bt_host_hp hps`, in `make test-bt-host`) | Fake headset: L2CAP acceptor, SDP server (A2DP sink, AVRCP CT and TG records), AVDTP acceptor (SBC sink, delay report), media receiver (RTP/SBC checks, vendored SBC decoder, pacing), minimal AVCTP/AVRCP. |
 
-## Host results (`test_bt_host_hp hps`, ASan/UBSan, 117 checks, 0 failures; scenario G 20 checks)
+## Host results (`test_bt_host_hp hps`, ASan/UBSan, 120 checks, 0 failures; scenario G 20 checks)
 
 After the second review round (table below) S also runs S5b, S5c, S6b and S8b; the two frozen-peer teardowns of the
 run (S8b's escalation, S10) leave 31 blocks / 3392 B together (known leak 13, bound 32 blocks / 8 KiB).
@@ -163,10 +163,30 @@ Settings > Headset button test) merged on top of the BT branch. The BT=0 image s
 - **Transitions**: `UI_SCR_LIST` maps to the Settings page (depth 1): Home -> Bluetooth pushes forward, Phone mode
   (BT page) forward, back to Home backward; Bluetooth choice -> Headphones pushes forward through `ui_model_nav`.
 
+## First silicon runs (2026-11-25, laptop BlueZ as the sink; `docs/BT_HW_RESULTS.md` session 7)
+
+- Worked at once: inquiry (13 results) + name pass, `0405` page as master (link in 150 ms, `role=M max_slots=5
+  edr=3`), AVDTP 48 kHz SBC bp35 (on air `bp_eff=24` for the 16 kHz tone), ~375 frames/s, ~49 pkts/s, ~23 kB/s,
+  lost/drop/pads/allocf 0, AVRCP CT/TG with absolute volume, teardown 217 ms idle / 647-658 ms with the link up.
+- Pairing as initiator fell back to legacy PIN: the ROM keeps one "remote page 1" slot per link, and Bluedroid's
+  page-2 `041C` overwrote the host-SSP bit its initiator decision tests (`docs/BT_ROM_HCI_MAP.md` §12). **Patch 0040**:
+  read ext features up to page 1 → SSP Just Works. **Patch 0041**: our initiator IO capability reply asks for general
+  bonding (BlueZ dropped the no-bonding key at disconnect). Host: the fake ROM models the slot and the decision
+  (`fake_peer_cfg_t.rom_auth_decision`); `test_bt_host_hp hps` S3 pages a `max_page` 2 headset and checks SSP, one
+  page-1 read, and `auth_req` with the general-bonding bit; `test_bt_host phone` P2 checks the responder reply is
+  unchanged (`auth_req` 0x00, no PIN request). Without 0040, S3 gets `E464` and the connect fails; without 0041,
+  `auth_req` is 0x01.
+- Bench additions: HCI trace notes in `HP_GATES` bench images (`BT_CTRL_HCI_TRACE`, 64 notes; `test-bt-ctrl` builds a
+  third variant with it), `hp_pin=1` (answer a legacy PIN with 0000, diagnostic), the player stage's time limit (the
+  player blocked it: a 120 min recording outlived `secs`; the player's UI tick now drives the bench and injects BACK
+  through `keys_inject()`, called only in bench images; the default image is unchanged).
+- Open: no laptop recording of the stream yet; PipeWire showed the bluez card in `audio-gateway` with no A2DP source
+  and the transport idle during the player stage (unexplained). Not yet with real headphones.
+
 ## Not tested / open
 
-- Nothing on silicon. ROM behaviour of `0401`/`0405` as master, LM states, role switch / packet types / slots, real
-  NOCP latency, CPU of SBC from XIP, heap under streaming: the recipe's stages answer these.
+- On silicon so far only with a laptop as the sink (above). Real headphones: role switch / packet types / slots,
+  NOCP latency, CPU of SBC from XIP, heap under long streaming: the recipe's stages answer these.
 - Not on the host: the speed dial on the headset route (silent clock, link loss mid-dial), a 44.1 kHz-only sink (SEID 1 fallback), bitpool-limited peers, page-scan variants, the player and
   UI integration (no `test_player` BT=1 variant yet), wasm rendering of `UI_SCR_LIST`, TSan for scenario S, soak.
 - Design items still open: patches B/C, `bt_ctrl_rnr_pending()`, AVRCP scrub, Home PLAY, idle disconnect, mono

@@ -370,3 +370,37 @@ Connection Complete, not a link-down event). Refusal notes are drained before th
 write without inquiry scan after a discoverable one was sent means the ROM may still be at `0x03` after the window
 closed: the session fails closed with scan off (`0x00`, never refused; log `BT XREC scan mode refused while
 discoverable: scan off until it can be applied`) and retries the connectable mode on the timer.
+
+## 12. Initiator pairing decision and the single ext-features slot (2026-11-25, first headphones silicon runs)
+
+Static disassembly as above; addresses are ROM offsets. Read to explain why every pairing the device **started**
+(headphones mode pages the headset and authenticates as master) fell back to a legacy PIN with a laptop (BlueZ) that
+supports SSP, while the same laptop paired with SSP when **it** started (phone mode).
+
+| Fact | Where | Conf. |
+|---|---|---|
+| The LC env of a link (base `0x00801384`, stride `0x208`, §11) holds **one** 8-byte "remote page 1" slot at `+0x74`; remote page 0 is at `+0x6C` | `0x21E4C`, `0x2D85C` | exact (offsets); inferred (the names) |
+| `LMP_features_res_ext` rx (the peer's answer to our `041C`) copies the 8 feature bytes into `+0x74` **for any page number** (no check of the page field), then sends `E46D` | `0x21E4C` | exact |
+| The peer's `LMP_features_req_ext` rx writes **our** local page into the same slot `+0x74` (looks like a ROM bug; harmless while our page 1 has the host-SSP bit) | `0x24020` | exact (store); inferred (no other reader) |
+| `0411` (`E402`) → `0x201C4` → `0x2C38C`: always sends `0x17` Link Key Request first; the ROM key store lookup `0x31704` is a stub returning 0 | `0x201C4`, `0x2C38C`, `0x31704` | exact |
+| After the host's `040C` (LC handler `E009` `0x268C0` → `0x2D85C`), as initiator: **legacy** if `!LM[0x44C]` (local SSP mode, set by `0C56`) or `!` remote page 0 bit 51 (`+0x6C`, LMP SSP) or `!` bit 0 of `+0x74` (remote host SSP) → `E464` = HCI `0x16` PIN Code Request; else the pair lock (`0x32708`) and `E472` = `0x31` IO Capability Request | `0x268C0`, `0x2D85C`, `0x32708` | exact (branches); inferred (meaning of `LM+0x44C`) |
+| As responder the flow is driven by the peer's `LMP_io_capability_req`; `0x2D85C` is not reached | — | inferred (no path found from the responder handlers) |
+
+**What happened on silicon.** Bluedroid reads the remote extended features after the Connection Complete:
+`btm_read_remote_ext_features_complete()` reads every page up to `HCI_EXT_FEATURES_PAGE_MAX` (2). The laptop reports
+`max_page` 2; page 1 (host SSP bit set) landed in `+0x74`, then page 2 (Secure Connections / CSB bits, bit 0 = 0)
+overwrote it. The initiator test then saw "no host SSP" → `0x16` PIN Code Request (bench HCI trace: `0411` CS,
+`ev=0x17`, `040C` CC, `ev=0x16`). Headphones mode rejected the PIN (`st=0x06`). With `hp_pin=1` the legacy pairing
+worked with `0000` (combination key, `key=0`), which proved the rest of the path.
+
+**Fix: Bluedroid patch 0040** (`btm_acl.c`): read extended features up to page 1 only. Page 2 (Secure Connections,
+CSB) is unused (`sc_en` false). Silicon: one `041C` (page 1), then `ev=0x31`/`0x32`/`0x33`, Just Works, `key=4`.
+**Lesson:** this ROM keeps per-link state in fewer slots than the HCI interface suggests; a host read that looks
+side-effect free (`041C` page 2) can overwrite state the controller's own LMP logic depends on. Any new `041C` page,
+or a peer that queries our extended features before we pair (`0x24020`), needs this section re-checked.
+
+Host model: `tests/fake_rom.c` keeps `fake_rom.lc_rem_p1[link]` (zeroed at link up, overwritten by every `041C`
+answer) and `lm_ssp_mode` (last `0C56`); with `fake_peer_cfg_t.rom_auth_decision` the scripted peer answers the
+initiator's `040C` per `0x2D85C` (`E464` or `E472`) and handles `040D`/`040E`. `test_bt_host_hp hps` S3 pages a
+headset with `max_page` 2 (page 2 bit 0 clear, like the laptop) and requires SSP; without patch 0040 it gets
+`E464` and the A2DP connect fails.

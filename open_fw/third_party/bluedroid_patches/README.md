@@ -52,8 +52,9 @@ local change is a separate commit **and** a `.patch` file here, so an upgrade is
 
 All patches are guarded with `#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID`; the `#else` branch is upstream.
 Next free number on this branch: **0042**. Host coverage: `make -C open_fw test-bt-host` (Bluedroid on the FreeRTOS POSIX port,
-`tests/bt_host/`) exercises 0005-0039 through the real `bt_ctrl` and the fake ROM (0024-0028 through the phone-mode
-scenario `test_bt_host phone`: SSP, SDP, RFCOMM/SPP, XREC, teardown with a connected peer). The allocation-failure sweep runs
+`tests/bt_host/`) exercises 0005-0041 through the real `bt_ctrl` and the fake ROM (0024-0028 through the phone-mode
+scenario `test_bt_host phone`: SSP, SDP, RFCOMM/SPP, XREC, teardown with a connected peer; 0040/0041 through
+`test_bt_host_hp hps` S3, whose fake ROM models the single ext-features slot and the initiator pairing decision). The allocation-failure sweep runs
 once per lifecycle call (`run_sweep.py --mode init|enable|disable|deinit`): every allocation attempt the call makes is
 failed in turn, and each point must complete or fail cleanly, tear down to the heap/task/timer baseline and leave a
 following clean cycle working, with **no waivers** (2026-11-24, after 0011-0023). Each of 0011-0023 was verified by

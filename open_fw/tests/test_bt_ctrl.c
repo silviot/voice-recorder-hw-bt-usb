@@ -2842,11 +2842,25 @@ static void test_scan_refused_two_links(void)
     shutdown_and_check();
 }
 
+/* bt_ctrl_note_pop() without the HCI trace notes of the trace build (test_hci_trace checks those) */
+static int note_pop_nt(bt_ctrl_note_t *n)
+{
+    while (bt_ctrl_note_pop(n)) {
+#if defined(BT_CTRL_HCI_TRACE) && BT_CTRL_HCI_TRACE
+        if (n->kind == BT_CTRL_NOTE_TRACE) {
+            continue;
+        }
+#endif
+        return 1;
+    }
+    return 0;
+}
+
 static int note_line_is(const char *want)
 {
     bt_ctrl_note_t n;
     char line[BT_CTRL_NOTE_LINE];
-    if (!bt_ctrl_note_pop(&n)) {
+    if (!note_pop_nt(&n)) {
         printf("    no note, want '%s'\n", want);
         return 0;
     }
@@ -2882,7 +2896,8 @@ static void test_link_notes(void)
     CHECK(note_line_is("BT HCI disconnect cmd h=0x0080 st=0x00 rom"), "0406 CS note");
     CHECK(note_line_is("BT HCI disconnection complete h=0x0080 st=0x00 reason=0x16"), "disconnection note");
     CHECK(note_line_is("BT HCI disconnect cmd h=0x0080 st=0x02 local"), "0406 local note");
-    CHECK(!bt_ctrl_note_pop(&n), "no further note");
+    CHECK(!note_pop_nt(&n), "no further note");
+#if !(defined(BT_CTRL_HCI_TRACE) && BT_CTRL_HCI_TRACE)   /* each event adds a trace note there: depth in test_hci_trace */
     uint32_t lost0 = stats().notes_lost;
     for (uint32_t i = 0u; i < BT_CTRL_NOTES + 3u; i++) {
         inject_disc(0x81, 0x08);
@@ -2894,6 +2909,7 @@ static void test_link_notes(void)
         k++;
     }
     CHECK(k == BT_CTRL_NOTES, "%u notes kept, want %u", k, BT_CTRL_NOTES);
+#endif
     char small[12];
     n.kind = BT_CTRL_NOTE_DISC;
     uint16_t len = bt_ctrl_note_format(&n, small, sizeof(small));
@@ -2943,7 +2959,7 @@ static void test_name_notes(void)
     CHECK(note_line_is("BT HCI name request st=0x0C rom"), "0419 refused note");
     CHECK(note_line_is("BT HCI name complete st=0x22 len=0"), "failed name complete note");
     CHECK(note_line_is("BT HCI name complete st=0x00 len=37"), "name complete note");
-    CHECK(!bt_ctrl_note_pop(&n), "no further note");
+    CHECK(!note_pop_nt(&n), "no further note");
     shutdown_and_check();
     CHECK(bt_ctrl_open() == 0, "reopen");
     bring_up();
@@ -3676,6 +3692,108 @@ static void test_hp_link_view_accept(void)
     shutdown_and_check();
 }
 
+#if defined(BT_CTRL_HCI_TRACE) && BT_CTRL_HCI_TRACE
+/* HP_GATES bench images (silicon 2026-11-25): every event to the host is a TRACE link note, except NOCP and inquiry
+ * results (too many) and successful CCs outside link control (set-up, reads). 64 notes deep. */
+static uint32_t trace_drain(char lines[][BT_CTRL_NOTE_LINE], uint32_t max, uint32_t *other)
+{
+    bt_ctrl_note_t n;
+    uint32_t k = 0u;
+    *other = 0u;
+    while (bt_ctrl_note_pop(&n)) {
+        if (n.kind != BT_CTRL_NOTE_TRACE) {
+            (*other)++;
+            continue;
+        }
+        if (k < max) {
+            (void)bt_ctrl_note_format(&n, lines[k], BT_CTRL_NOTE_LINE);
+        }
+        k++;
+    }
+    return k;
+}
+
+static void test_hci_trace(void)
+{
+    static char l[80][BT_CTRL_NOTE_LINE];
+    uint32_t other;
+    CHECK(BT_CTRL_NOTES == 64u, "BT_CTRL_NOTES %u in the trace build, want 64", BT_CTRL_NOTES);
+    setup();
+    bring_up();
+    /* controller.c start-up: successful CCs of 0C03, 1005, ... (none link control): no trace */
+    uint32_t k = trace_drain(l, 80u, &other);
+    CHECK(k == 0u, "start-up traced %u events (first '%s')", k, k ? l[0] : "");
+    /* NOCP and inquiry results: not traced */
+    link_up(0);
+    inject_conn_cmp(0x80);
+    pump();
+    (void)trace_drain(l, 80u, &other);
+    fake_rom.auto_ack_acl = false;
+    send_acl(0x80, 2, 20, 1);
+    pump();
+    uint32_t rx0 = t_rx_n;
+    (void)fake_rom_ack_acl(1);
+    pump();
+    uint8_t ir[16] = { 0x01, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0x01, 0x00, 0x00, 0x18, 0x04, 0x24, 0x00, 0x00, 0x00 };
+    fake_rom_inject(0xE0D1u, ir, 16u);
+    pump();
+    uint32_t nocp = 0u, inq = 0u;
+    for (uint32_t i = rx0; i < t_rx_n; i++) {
+        nocp += is_evt(&t_rx[i], BT_HCI_EVT_NOCP);
+        inq += is_evt(&t_rx[i], 0x02u);
+    }
+    t_rx_rd = t_rx_n;
+    CHECK(nocp == 1u && inq == 1u, "host saw NOCP %u, inquiry result %u (want 1, 1)", nocp, inq);
+    k = trace_drain(l, 80u, &other);
+    CHECK(k == 0u, "NOCP / inquiry result traced %u (first '%s')", k, k ? l[0] : "");
+    /* a successful non-LC CC: not traced; a failed one: traced with its opcode and status */
+    uint8_t one = 1u;
+    (void)roundtrip(0x0C1Au, &one, 1u);
+    k = trace_drain(l, 80u, &other);
+    CHECK(k == 0u, "successful 0C1A CC traced (%u)", k);
+    fake_rom_set_reply_status(0xE02Cu, 0x12u);
+    (void)roundtrip(0x0C1Au, &one, 1u);
+    fake_rom_set_reply_status(0xE02Cu, 0x00u);
+    k = trace_drain(l, 80u, &other);
+    CHECK(k == 1u && strcmp(l[0], "BT HCI trace ev=0x0E st=0x12 op=0x0C1A") == 0, "failed 0C1A CC: %u '%s'", k,
+          k ? l[0] : "");
+    /* link control: a successful CC (041A) and a CS (0419) are traced, then events from the ROM */
+    uint8_t a[6] = { 0x01, 0x02, 0x03, 0x04, 0x05, 0x06 };
+    (void)roundtrip(0x041Au, a, 6u);
+    uint8_t rnr[10] = { 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x01, 0, 0, 0 };
+    (void)roundtrip(0x0419u, rnr, 10u);
+    inject_conn_req(0x42);
+    pump();
+    inject_disc(0x80, 0x13);
+    pump();
+    t_rx_rd = t_rx_n;
+    k = trace_drain(l, 80u, &other);
+    CHECK(k == 4u, "LC traces %u, want 4", k);
+    if (k == 4u) {
+        CHECK(strcmp(l[0], "BT HCI trace ev=0x0E st=0x00 op=0x041A") == 0, "041A CC trace '%s'", l[0]);
+        CHECK(strcmp(l[1], "BT HCI trace ev=0x0F st=0x00 op=0x0419") == 0, "0419 CS trace '%s'", l[1]);
+        CHECK(strcmp(l[2], "BT HCI trace ev=0x04 st=0xB0") == 0, "Connection Request trace '%s'", l[2]);
+        CHECK(strcmp(l[3], "BT HCI trace ev=0x05 st=0x00") == 0, "Disconnection Complete trace '%s'", l[3]);
+    }
+    CHECK(other >= 2u, "the regular link notes stay (%u)", other);
+    /* 64 deep: a burst of 70 Encryption Change events (no regular note) keeps 64, 6 lost */
+    inject_conn_cmp(0x80);
+    pump();
+    (void)trace_drain(l, 80u, &other);
+    uint32_t lost0 = stats().notes_lost;
+    for (int i = 0; i < 70; i++) {
+        uint8_t ec[5] = { 0x00, 0x00, 0x80, 0x00, 0x01 };    /* {s, pad, h, enc} */
+        fake_rom_inject(0xE45Au, ec, 5u);
+        pump();
+    }
+    t_rx_rd = t_rx_n;
+    k = trace_drain(l, 80u, &other);
+    CHECK(k == 64u && other == 0u && stats().notes_lost - lost0 == 6u, "burst: %u traces + %u notes kept, %u lost", k, other,
+          stats().notes_lost - lost0);
+    shutdown_and_check();
+}
+#endif
+
 int main(void)
 {
     struct sigaction sa;
@@ -3736,6 +3854,9 @@ int main(void)
         { "hp_create_cancel", test_hp_create_cancel },
         { "hp_link_view_accept", test_hp_link_view_accept },
         { "hp_link_view_early_role", test_hp_link_view_early_role },
+#if defined(BT_CTRL_HCI_TRACE) && BT_CTRL_HCI_TRACE
+        { "hci_trace", test_hci_trace },
+#endif
     };
     for (size_t i = 0; i < sizeof(tests) / sizeof(tests[0]); i++) {
         int before = g_fail;
@@ -3744,7 +3865,12 @@ int main(void)
     }
     fake_rom_shutdown();
     free(t_rx);
-    printf("test_bt_ctrl (%s): %d checks, %d failures\n", hp_gated_on() ? "BT_CTRL_HP_GATE_LIST" : "default gates",
+    printf("test_bt_ctrl (%s%s): %d checks, %d failures\n", hp_gated_on() ? "BT_CTRL_HP_GATE_LIST" : "default gates",
+#if defined(BT_CTRL_HCI_TRACE) && BT_CTRL_HCI_TRACE
+           " + BT_CTRL_HCI_TRACE",
+#else
+           "",
+#endif
            g_checks, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

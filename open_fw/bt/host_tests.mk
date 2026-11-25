@@ -66,6 +66,12 @@ test-bt-ctrl:
 		$(BT_CTRL_TEST_DIR)/hci_packet_parser.o $(BT_CTRL_TEST_DIR)/bt_ctrl_parser_shim.o \
 		-o $(BT_CTRL_TEST_DIR)/test_bt_ctrl_hp
 	$(BT_CTRL_TEST_DIR)/test_bt_ctrl_hp
+	@# HP_GATES bench images: the gate list plus BT_CTRL_HCI_TRACE (every event to the host as a link note, 64 deep)
+	$(HOST_CC) $(BT_CTRL_TEST_CFLAGS) -DBT_CTRL_EXP1_PASSED_LIST=BT_CTRL_HP_GATE_LIST -DBT_CTRL_HCI_TRACE=1 \
+		tests/test_bt_ctrl.c tests/fake_rom.c bt_port/bt_ctrl.c bt_port/bt_ctrl_cmds.c bt_port/bt_ctrl_evt.c \
+		$(BT_CTRL_TEST_DIR)/hci_packet_parser.o $(BT_CTRL_TEST_DIR)/bt_ctrl_parser_shim.o \
+		-o $(BT_CTRL_TEST_DIR)/test_bt_ctrl_trace
+	$(BT_CTRL_TEST_DIR)/test_bt_ctrl_trace
 
 # ---- test-bt-host: Bluedroid end-to-end on the FreeRTOS POSIX port (plan M3 path (b), step 5). ----
 # Real Bluedroid (patches 0001-0027) + bt_port + bt_ctrl + tests/fake_rom.c on FreeRTOS-Kernel V11.1.0's POSIX port,
