@@ -95,6 +95,12 @@ static uint32_t plat_now_ms(void)
     return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
 }
 
+/* ACL timing stats clock (bt_ctrl_set_clock_us): the free-running microsecond timer, low 32 bits (SRAM, no XIP). */
+BT_FAST static uint32_t plat_now_us(void)
+{
+    return now32();
+}
+
 static const bt_ctrl_platform_t k_platform = {
     plat_enter, plat_exit, plat_wake_ctrl, plat_wake_ctrl_from_isr, plat_wake_dlv, plat_stop_requested, plat_fault,
 };
@@ -181,6 +187,7 @@ int bt_ctrl_rtos_init(const bt_rom_if_t *rom, const uint8_t bd_addr[6])
     s_rom = rom;
     int err = bt_ctrl_init(rom, &k_platform, bd_addr);
     bt_ctrl_set_clock(plat_now_ms);
+    bt_ctrl_set_clock_us(plat_now_us);
     s_ctrl_task = xTaskCreateStatic(bt_ctrl_task, "bt_ctrl", BT_CTRL_STACK_WORDS, NULL, OPENFW_PRIO_BT_CTRL,
                                     s_ctrl_stack, &s_ctrl_tcb);
     s_dlv_task = xTaskCreateStatic(bt_dlv_task, "bt_dlv", BT_DLV_STACK_WORDS, NULL, OPENFW_PRIO_BT_DLV,

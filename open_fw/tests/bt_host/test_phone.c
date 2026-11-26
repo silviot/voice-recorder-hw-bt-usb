@@ -256,6 +256,7 @@ static struct {
     int tx_credits, rx_credits;
     bool withhold;
     uint32_t uih_rx, credit_grants, fcs_errors, at_lines;
+    uint32_t uih_short;            /* UIH data frames shorter than N1 (the device's RFCOMM frame size) */
     uint32_t stream_len, stream_rd;
 } P;
 
@@ -725,6 +726,9 @@ static void rfc_in(const uint8_t *p, uint16_t n)
             }
             if (len != 0u) {
                 P.uih_rx++;
+                if (len < P.n1) {
+                    P.uih_short++;
+                }
                 P.rx_credits--;
                 if (P.rx_credits < 0) {
                     PCHECK(0, "device sent UIH data without a credit");
@@ -2299,7 +2303,18 @@ int bth_phone_scenario(const char *img_path)
         static const uint8_t xkey2[32] = { 0xA5, 0x5A, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 31, 30, 29, 28,
                                            27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10 };
         PCHECK(xrec_auth_chal(xkey2), "CHAL/AUTH (D)");
+        /* BTC's TX byte ring (3960 B) wraps ~78 times in this window; the CHAL/AUTH replies before it leave the device's
+         * write position off the 990 B grid. Patch 0046 stages a frame across the wrap: only the window's last frame
+         * (and at most one per refill stall) may be short, not one per ring cycle. */
+        uint32_t uih0 = P.uih_rx, short0 = P.uih_short;
         PCHECK(gets_verify("BIG0002.WAV", 2u, 0u, 300000u, 640u, -1, NULL), "long GETS (300000 B)");
+        bth_log("    long GETS: %u RFCOMM data frames (N1 %u), %u shorter than N1\n", (unsigned)(P.uih_rx - uih0),
+                (unsigned)P.n1, (unsigned)(P.uih_short - short0));
+        /* without 0046: ~386 frames, ~155 short (one per ring cycle and more); with it 309 / 1. A few short frames are
+         * allowed for coalescing holds the host scheduler lets expire (5 ms). */
+        PCHECK(P.n1 == 990u && P.uih_short - short0 <= 8u && P.uih_rx - uih0 <= 309u + 8u,
+               "long GETS: RFCOMM frames not cut at BTC's ring wrap (%u frames, %u short)",
+               (unsigned)(P.uih_rx - uih0), (unsigned)(P.uih_short - short0));
         bthx_snap_t s0 = S();
         uint32_t fl0 = bth_ctrl_faults();
         /* the laptop closes RFCOMM, then drops the link; the ROM never reports that detach (modelled: nothing), and

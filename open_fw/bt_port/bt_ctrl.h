@@ -194,6 +194,13 @@ typedef struct {
     uint32_t fault_site, fault_a, fault_b;   /* BT_CTRL_SITE_* and key values of first_fault (this session) */
     uint32_t scan_refused;          /* 0C1A answered 0x0C by the ROM (> 1 ACL link): passed through, no fault */
     uint32_t notes_lost;            /* link notes dropped because nobody drained the ring */
+    /* host -> controller ACL timing (sync-throughput investigation, docs/BT_SYNC_THROUGHPUT.md); needs
+     * bt_ctrl_set_clock_us(), else only acl_tx_bytes counts. One FIFO over all links: exact with one link up. */
+    uint32_t acl_tx_bytes;          /* ACL payload bytes handed to the ROM (sum of the HCI data lengths) */
+    uint32_t nocp_lat_n;            /* packets whose handover -> NOCP latency was measured */
+    uint32_t nocp_lat_sum_us;       /* ...the sum of those latencies (wraps; use deltas) */
+    uint32_t nocp_lat_max_us;       /* ...the largest since bt_ctrl_tput_max_reset() */
+    uint32_t cr_full_us;            /* time with all BT_CTRL_H2C_ACL_CREDITS packets in the ROM (wraps; use deltas) */
 } bt_ctrl_stats_t;
 
 typedef struct {
@@ -210,6 +217,13 @@ int bt_ctrl_init(const bt_rom_if_t *rom, const bt_ctrl_platform_t *platform, con
 /* Optional monotonic millisecond clock (wraps at 2^32) for the forwarded-command deadline; call after bt_ctrl_init().
  * Called only from bt_ctrl_run() (bt_ctrl task context). NULL (the default) disables the deadline. */
 void bt_ctrl_set_clock(uint32_t (*now_ms)(void));
+/* Optional microsecond clock (wraps at 2^32) for the ACL timing stats above (acl_tx_bytes counts without it). Called
+ * only from bt_ctrl_run(). NULL (the default) disables the timing. */
+void bt_ctrl_set_clock_us(uint32_t (*now_us)(void));
+/* ACL packets in the ROM now (racy single-word read, any task: diagnostics only). */
+uint32_t bt_ctrl_h2c_inflight(void);
+/* Zero nocp_lat_max_us (any task; a racing update may be lost: diagnostics only). */
+void bt_ctrl_tput_max_reset(void);
 
 /* Optional NOCP observer (headphones mode: NOCP-acked stream position and the credit-stall watchdog,
  * docs/BT_A2DP_DESIGN.md §4.4/§4.6). Called from bt_ctrl_run() (bt_ctrl task context) with the packets the ROM

@@ -123,6 +123,11 @@ static struct {
     uint8_t dead;                 /* handles 0x80..0x86 whose Disconnection Complete came after their last Connection
                                      Complete: LC commands and ACL for them are answered / dropped locally */
     uint32_t (*now_ms)(void);     /* optional clock for the forwarded-command deadline (bt_ctrl_set_clock) */
+    uint32_t (*now_us)(void);     /* optional clock for the ACL timing stats (bt_ctrl_set_clock_us) */
+    uint32_t ts_fifo[16];         /* handover time of the ACL packets in the ROM, oldest first (one FIFO, all links) */
+    uint32_t ts_head, ts_n;
+    uint32_t cr_full_t0;          /* now_us() when the ROM came to hold every credit */
+    uint8_t cr_full;
 
     /* event ring (SPSC: bt_ctrl produces, bt_dlv consumes) */
     evt_slot_t evt[BT_CTRL_EVT_SLOTS];
@@ -677,6 +682,8 @@ static uint8_t handle_bit(uint16_t h)
     return (h >= 0x80u && h < 0x80u + BT_CTRL_MAX_LINKS) ? (uint8_t)(1u << (h - 0x80u)) : 0u;
 }
 
+static void acl_timing_drop(void);
+
 BT_FAST static void apply_event_side_effects(const bt_ctrl_evt_info_t *info)
 {
     if (info->kind != BT_CTRL_EVK_EVT || info->status != BT_HCI_OK) {
@@ -689,6 +696,7 @@ BT_FAST static void apply_event_side_effects(const bt_ctrl_evt_info_t *info)
          * ACL still queued for h is flushed like a real controller does: the host already reclaimed its credits,
          * and the ROM may hand h to the next connection before tx_drain() runs. */
         g.inflight_total -= hc_clear(g.inflight, h);
+        acl_timing_drop();
         (void)hc_clear(g.nocp_pend, h);
         tx_drop_acl_for(h);
         g.dead |= handle_bit(h);
@@ -736,6 +744,62 @@ void bt_ctrl_set_nocp_observer(void (*obs)(uint16_t handle, uint32_t pkts))
     s_nocp_obs = obs;
 }
 
+/* ACL timing stats (bt_ctrl_stats_t acl_tx_bytes .. cr_full_us). */
+BT_FAST static void acl_timing_full_check(void)
+{
+    if (g.now_us == NULL) {
+        return;
+    }
+    bool full = g.inflight_total >= BT_CTRL_H2C_ACL_CREDITS;
+    if (full && !g.cr_full) {
+        g.cr_full = 1u;
+        g.cr_full_t0 = g.now_us();
+    } else if (!full && g.cr_full) {
+        g.cr_full = 0u;
+        g.st.cr_full_us += g.now_us() - g.cr_full_t0;
+    }
+}
+
+BT_FAST static void acl_timing_sent(uint16_t dlen)
+{
+    g.st.acl_tx_bytes += dlen;
+    if (g.now_us == NULL) {
+        return;
+    }
+    if (g.ts_n < 16u) {
+        g.ts_fifo[(g.ts_head + g.ts_n) & 15u] = g.now_us();
+        g.ts_n++;
+    }
+    acl_timing_full_check();
+}
+
+BT_FAST static void acl_timing_done(uint32_t done)
+{
+    if (g.now_us == NULL) {
+        return;
+    }
+    uint32_t t = g.now_us();
+    while (done > 0u && g.ts_n > 0u) {
+        uint32_t lat = t - g.ts_fifo[g.ts_head & 15u];
+        g.ts_head = (g.ts_head + 1u) & 15u;
+        g.ts_n--;
+        done--;
+        g.st.nocp_lat_n++;
+        g.st.nocp_lat_sum_us += lat;
+        if (lat > g.st.nocp_lat_max_us) {
+            g.st.nocp_lat_max_us = lat;
+        }
+    }
+    acl_timing_full_check();
+}
+
+/* A link's packets went without NOCP (disconnect): the FIFO no longer matches; start it again. */
+static void acl_timing_drop(void)
+{
+    g.ts_n = 0u;
+    acl_timing_full_check();
+}
+
 BT_FAST static void rom_nocp(const uint8_t *p, uint16_t len)
 {
     g.st.nocp_from_rom++;
@@ -754,6 +818,7 @@ BT_FAST static void rom_nocp(const uint8_t *p, uint16_t len)
         uint32_t c = rd16(&p[4u + 4u * i]);
         uint32_t done = hc_sub(g.inflight, h, c);
         g.inflight_total -= done;
+        acl_timing_done(done);
         g.st.nocp_excess += c - done;
         bt_ctrl_link_info_t *l = link_of(h);
         if (l != NULL && done != 0u) {
@@ -952,6 +1017,8 @@ static void controller_state_reset(void)
     g.evt_resv = 0u;
     memset(g.inflight, 0, sizeof(g.inflight));
     g.inflight_total = 0u;
+    g.ts_n = 0u;
+    g.cr_full = 0u;
     memset(g.nocp_pend, 0, sizeof(g.nocp_pend));
     g.c2h_fc = 0u;                           /* HCI default: controller-to-host flow control off until 0C31 */
     g.c2h_len = BT_CTRL_C2H_ACL_LEN;
@@ -1429,6 +1496,7 @@ BT_FAST static int process_acl(uint32_t idx)
     }
     g.inflight_total++;
     g.st.acl_to_rom++;
+    acl_timing_sent(dlen);
     bt_ctrl_link_info_t *li = link_of(handle);
     if (li != NULL) {
         g.p.enter();
@@ -2141,6 +2209,26 @@ int bt_ctrl_init(const bt_rom_if_t *rom, const bt_ctrl_platform_t *platform, con
 void bt_ctrl_set_clock(uint32_t (*now_ms)(void))
 {
     g.now_ms = now_ms;
+}
+
+void bt_ctrl_set_clock_us(uint32_t (*now_us)(void))
+{
+    g.now_us = now_us;
+}
+
+uint32_t bt_ctrl_h2c_inflight(void)
+{
+    return *(volatile uint32_t *)&g.inflight_total;
+}
+
+void bt_ctrl_tput_max_reset(void)
+{
+    if (!g.inited) {
+        return;
+    }
+    g.p.enter();
+    g.st.nocp_lat_max_us = 0u;
+    g.p.exit();
 }
 
 int bt_ctrl_open(void)

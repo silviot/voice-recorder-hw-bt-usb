@@ -22,6 +22,7 @@
 #include "sl6801_regs.h"
 #include "openfw.h"
 #include "openfw_ui.h"
+#include "openfw_bt_ui_pace.h"            /* BT phone-mode screen pacing (pure, host-tested in test_core) */
 #include "ui/ui_port.h"
 #include "openfw_exp.h"
 #include "openfw_wav.h"
@@ -1477,8 +1478,15 @@ static void bench_hp_play_tick(uint32_t now_ms)
         keys_inject(KEY_BACK, 0u);
     }
 }
+/* Phone-mode loop profile and the ui=0 knob (sync-throughput investigation, docs/BT_SYNC_THROUGHPUT.md). */
+#define BT_PROF_T(v)         uint32_t v = (uint32_t)us_timer_now()
+#define BT_PROF_ADD(slot, v) bt_bench_prof_add((slot), (uint32_t)us_timer_now() - (v))
+#define BT_BENCH_UI_ON()     bt_bench_ui()
 #else
 #define OPENFW_BT_BENCH 0
+#define BT_PROF_T(v)         do { } while (0)
+#define BT_PROF_ADD(slot, v) do { } while (0)
+#define BT_BENCH_UI_ON()     1
 #endif
 
 #if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID && !(defined(OPENFW_HCI_PROBE) && OPENFW_HCI_PROBE)
@@ -1585,6 +1593,10 @@ static void run_bt_xrec_mode(void)
 #endif
 
     uint32_t last_ui     = 0u;
+    uint32_t last_chg    = 0u;
+#if OPENFW_BT_PROMPT
+    uint32_t prev_ui_sig = bt_xrec_ui_sig();
+#endif
     uint32_t prev_rx     = 0u;
     uint32_t prev_tx     = 0u;
     uint8_t  prev_acl    = 0u;
@@ -1597,9 +1609,14 @@ static void run_bt_xrec_mode(void)
 #endif
     /* Home consumed the opening ENTER edge. Keep subsequent queued taps. */
     while (1) {
+        BT_PROF_T(pf_loop);
         wdt_feed();
+        BT_PROF_T(pf_xrec);
         bt_xrec_poll();
+        BT_PROF_ADD(BT_BENCH_PROF_XREC, pf_xrec);
+        BT_PROF_T(pf_rec);
         recorder_poll();
+        BT_PROF_ADD(BT_BENCH_PROF_REC, pf_rec);
 
         /* Keep remote settings when the REC switch hands control to the menu. */
         if (g_ui.cfg.mic_gain != recorder_get_gain() ||
@@ -1631,6 +1648,7 @@ static void run_bt_xrec_mode(void)
             while (keys_pop_event(&kev)) {
                 if (kev.pressed) {
                     backlight_wake(kev.t_ms);
+                    last_ui = 0u;        /* a key redraws at once, whatever the pacing (bt_ui_due) */
 #if OPENFW_BT_PROMPT
                     /* A pairing prompt is up: ENTER accepts, BACK rejects (and does not leave BT mode); a key in its
                      * first 0.5 s (-2) or within 1 s after it ended by itself or was answered (-3) is swallowed. */
@@ -1667,9 +1685,26 @@ static void run_bt_xrec_mode(void)
             break;
         }
 #endif
-        if ((uint32_t)(now - last_ui) >= 150u || last_ui == 0u) {
-            last_ui = now;
+        BT_PROF_T(pf_ui);
+#if OPENFW_BT_PROMPT
+        {
+            /* a pairing prompt appearing or ending, the window opening or closing, a gate refusal: redraw at once,
+             * not at the next paced pass (up to 500 ms during a transfer) */
+            uint32_t sig = bt_xrec_ui_sig();
+            if (sig != prev_ui_sig) {
+                prev_ui_sig = sig;
+                last_ui = 0u;
+            }
+        }
+#endif
+        if ((uint32_t)(now - last_chg) >= BT_UI_PERIOD_MS || last_chg == 0u) {
+            last_chg = now;                  /* charge management keeps its 150 ms tick whatever the screen does */
             pmu_poll_charge_manage();
+        }
+        /* UI block: every 150 ms, every 500 ms while a transfer is shown, at once after a key or a prompt / pairing
+         * window change (openfw_bt_ui_pace.h); bench ui=0 skips it (charge management only) */
+        if (BT_BENCH_UI_ON() && bt_ui_due(now, last_ui, g_ui.bt_state)) {
+            last_ui = now;
 
             bt_status_t st;
             bt_xrec_get_status(&st);
@@ -1726,24 +1761,31 @@ static void run_bt_xrec_mode(void)
             }
 
             refresh_telemetry();
-            if (show_bt && !g_screen_off) {
+            if (bt_ui_render_ok(show_bt, g_screen_off != SCREEN_AWAKE, g_fade_out_reason != SCREEN_AWAKE)) {
                 ui_render_screen(UI_SCR_BT, &g_ui);
             }
         }
+        BT_PROF_ADD(BT_BENCH_PROF_UI, pf_ui);
 
         /* Sleep via WFI when idle (woken immediately by RW-BT IRQ or 1 ms SysTick) */
         if (!keys_event_pending() && !recorder_is_saving()) {
             bt_status_t cur_st;
             bt_xrec_get_status(&cur_st);
             if (cur_st.rx_acl_pkts == iter_rx && cur_st.tx_acl_pkts == iter_tx) {
+                BT_PROF_T(pf_wait);
                 OPENFW_TASK_WAIT();
+                BT_PROF_ADD(BT_BENCH_PROF_WAIT, pf_wait);
             } else {
                 iter_rx = cur_st.rx_acl_pkts;
                 iter_tx = cur_st.tx_acl_pkts;
             }
         }
+        BT_PROF_ADD(BT_BENCH_PROF_LOOP, pf_loop);
     }
 
+#if OPENFW_BT_BENCH
+    bt_bench_loop_exit();                /* the sampler reads Bluedroid state: stopped before the stack goes */
+#endif
     keys_ignore_held();
     if (recorder_is_saving()) {
         (void)recorder_stop();

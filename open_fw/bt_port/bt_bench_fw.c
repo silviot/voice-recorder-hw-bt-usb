@@ -13,6 +13,8 @@
 #include "bt_xrec_bluedroid.h"
 #include "bt_hp.h"
 #include "openfw_bench_meas.h"
+#include "bt_bench_probe.h"
+#include "timers.h"
 #include <string.h>
 
 /* SRAM_HI (.bss_hi, zeroed at boot) like hci_probe.c's log copy: .bt_bss would come out of the RTOS heap region. */
@@ -223,12 +225,11 @@ static void log_tasks(const char *tag, const cpu_take_t *c)
  * Every second: a 1 s CPU window into g_bench_meas (the +XREC:DBG idle/app/btc values and the recording's lowest
  * idle). It reads only the idle, app and BTC_TASK run-time counters (vTaskGetInfo without the stack high-water scan,
  * no scheduler suspension), and its own duration goes into take_us: the measurement must not be a 1 Hz load that
- * only the BT captures carry. With every BENCH_MEAS_EVERY-th status line (2.5 min) and at the end: "BENCH cpu" +
+ * only the BT captures carry. About every 2.5 min (every 5th status group at stat_secs=30) and at the end: "BENCH cpu" +
  * "BENCH tasks" over that window (the full uxTaskGetSystemState) and "BENCH meas" (the recording counters, live):
  * the 8 KiB capture keeps the head of the run, so fewer lines leave room for more of it. Whole-recording checks use
  * the counters (BENCH rec, +XREC:DBG), never the log text. */
 #define BENCH_CPU1_MS     1000u
-#define BENCH_MEAS_EVERY  5u
 static cpu_win_t s_win30 BENCH_HI;
 static uint32_t s_cpu1_next BENCH_HI;
 static uint32_t s_status_n BENCH_HI;
@@ -316,6 +317,270 @@ static void log_cpu30(void)
     log_tasks("tasks", &c);
 }
 
+/* ---- sync-throughput investigation (docs/BT_SYNC_THROUGHPUT.md) ----
+ * A 2 ms FreeRTOS timer (timer task: highest priority, so the samples are uniform in time, unlike the app loop)
+ * classifies the TX path state; per status group "BENCH tp" (counter deltas), "BENCH tq" (sampler, permille of the
+ * samples taken while the SPP connection was open) and "BENCH tl" (app loop profile, us per second) are logged. */
+#define SMP_PERIOD_MS 2u
+#define FRAME_BYTES   (12u + 640u)          /* one GETS frame at chunk 640 */
+typedef struct {
+    uint32_t n, on, gets, re, rf, starve, bf, cg, pok, pc0, pfc, pq, hc0, rc4;
+    uint32_t pq_max;
+    uint16_t cr_min, cr_max;
+} smp_t;
+static smp_t s_smp BENCH_HI;
+static TimerHandle_t s_smp_timer;
+static StaticTimer_t s_smp_tcb BENCH_HI;
+static uint8_t s_link_logged;
+static struct {
+    uint32_t ms;
+    uint32_t tx_writes, tx_bytes, write_evts, cong_evts, tx_nomem, tx_busy, rx_frames;
+    uint32_t acl, acl_bytes, nocp, lat_n, lat_sum, cr_full;
+    uint32_t xrec_us, xrec_n, co_waits, co_forced, wr_wrap;
+    uint32_t prof[BT_BENCH_PROF_N], prof_n;
+} s_tp_prev BENCH_HI;
+static uint32_t s_prof[BT_BENCH_PROF_N], s_prof_n;   /* app task only */
+
+static uint32_t bench_us(void)
+{
+    return (uint32_t)us_timer_now();
+}
+
+void bt_bench_prof_add(uint32_t slot, uint32_t us)
+{
+    if (!s_in || slot >= BT_BENCH_PROF_N) {
+        return;
+    }
+    s_prof[slot] += us;
+    if (slot == BT_BENCH_PROF_LOOP) {
+        s_prof_n++;
+    }
+}
+
+int bt_bench_ui(void)
+{
+    return !s_in || s_cfg.ui;
+}
+
+/* Timer task, every SMP_PERIOD_MS while the run lasts. */
+static void smp_cb(TimerHandle_t t)
+{
+    (void)t;
+    bt_xrec_bench_tput_snap_t x;
+    bt_xrec_bench_tput_snap(&x);
+    smp_t *m = &s_smp;
+    m->n++;
+    if (!x.conn) {
+        return;
+    }
+    m->on++;
+    m->gets += x.gets;
+    m->re += x.tx_used == 0u;
+    m->rf += x.tx_size - x.tx_used < FRAME_BYTES;
+    m->starve += x.gets && x.tx_used == 0u;
+    m->bf += x.inflight >= x.inflight_cap;
+    m->cg += x.cong;
+    bt_bench_probe_t p;
+    bt_bench_probe_read(x.handle, &p);
+    if (p.ok) {
+        m->pok++;
+        m->pc0 += p.credit_tx == 0u;
+        m->pfc += p.peer_fc;
+        m->pq += p.txq_bytes != 0u;
+        if (p.txq_bytes > m->pq_max) {
+            m->pq_max = p.txq_bytes;
+        }
+        if (p.credit_tx < m->cr_min) {
+            m->cr_min = p.credit_tx;
+        }
+        if (p.credit_tx > m->cr_max) {
+            m->cr_max = p.credit_tx;
+        }
+    }
+    m->hc0 += p.l2c_ok && p.xmit_window == 0u;
+    m->rc4 += bt_ctrl_h2c_inflight() >= BT_CTRL_H2C_ACL_CREDITS;
+}
+
+static void smp_take(smp_t *out)
+{
+    taskENTER_CRITICAL();
+    if (out != NULL) {
+        *out = s_smp;
+    }
+    memset(&s_smp, 0, sizeof(s_smp));
+    s_smp.cr_min = 0xFFFFu;
+    taskEXIT_CRITICAL();
+}
+
+static void smp_start(void)
+{
+    smp_take(NULL);
+    if (!s_cfg.smp) {
+        return;
+    }
+    if (s_smp_timer == NULL) {
+        s_smp_timer = xTimerCreateStatic("bench_smp", pdMS_TO_TICKS(SMP_PERIOD_MS), pdTRUE, NULL, smp_cb, &s_smp_tcb);
+    }
+    if (s_smp_timer == NULL || xTimerStart(s_smp_timer, 0) != pdPASS) {
+        lbegin("tq");
+        lks("st", "sampler_unavailable");
+        lemit();
+    }
+}
+
+static void smp_stop(void)
+{
+    if (s_smp_timer != NULL && xTimerIsTimerActive(s_smp_timer) != pdFALSE) {
+        (void)xTimerStop(s_smp_timer, portMAX_DELAY);
+    }
+}
+
+void bt_bench_loop_exit(void)
+{
+    smp_stop();
+}
+
+static uint32_t pmv(uint32_t v, uint32_t n)
+{
+    return n != 0u ? (uint32_t)((uint64_t)v * 1000u / n) : 0u;
+}
+
+static uint32_t per_s(uint32_t v, uint32_t ms)
+{
+    return ms != 0u ? (uint32_t)((uint64_t)v * 1000u / ms) : 0u;
+}
+
+static void log_tcfg(void)
+{
+    lbegin("tcfg");
+    lku("ui", s_cfg.ui);
+    lku("smp", s_cfg.smp);
+    lku("co", s_cfg.coalesce);
+    lku("wr", s_cfg.spp_wr);
+    lku("buf", s_cfg.spp_buf);
+    lku("ring", s_cfg.tx_ring);
+    lku("stat", s_cfg.stat_secs);
+    lemit();
+}
+
+/* "BENCH link": the controller's view of every ACL link up (role, max slots, packet type, the peer's page-0
+ * features: f0 bit0/1 = 3/5-slot, f3 bit1/2 = EDR 2/3 Mb/s) and the RFCOMM frame size. */
+static void log_link(void)
+{
+    static bt_xrec_debug_t dbg BENCH_HI;
+    bt_xrec_get_debug(&dbg);
+    for (uint16_t h = 0x80u; h <= 0x86u; h++) {
+        bt_ctrl_link_info_t li;
+        if (!bt_ctrl_link_info(h, &li) || !li.up) {
+            continue;
+        }
+        lbegin("link");
+        lkx("h", h);
+        lks("role", li.role == BT_CTRL_ROLE_MASTER ? "M" : li.role == BT_CTRL_ROLE_SLAVE ? "S" : "?");
+        lku("rs", li.role_changes);
+        lku("slots", li.max_slots);
+        lkx("pkt", li.pkt_type);
+        lku("mode", li.mode);
+        lku("feat", li.rmt_feat_seen);
+        lkx("f0", li.rmt_feat0);
+        lkx("f3", li.rmt_feat3);
+        lku("sent", li.acl_sent);
+        lku("done", li.acl_completed);
+        lku("mtu", dbg.mtu);
+        lemit();
+    }
+}
+
+/* New window: emit the lines for the one that ends now (unless !emit), then take the baselines. */
+static void tp_take(uint32_t now, int emit)
+{
+    static bt_xrec_debug_t d BENCH_HI;
+    static bt_ctrl_stats_t c BENCH_HI;
+    bt_xrec_get_debug(&d);
+    bt_ctrl_get_stats(&c);
+    bt_xrec_bench_tput_snap_t x;
+    bt_xrec_bench_tput_snap(&x);
+    smp_t m;
+    smp_take(&m);
+    uint32_t lat_max = c.nocp_lat_max_us;
+    bt_ctrl_tput_max_reset();
+    if (emit && s_tp_prev.ms != 0u) {
+        uint32_t ms = now - s_tp_prev.ms;
+        uint32_t wr = d.tx_writes - s_tp_prev.tx_writes, wb = d.tx_bytes - s_tp_prev.tx_bytes;
+        uint32_t acl = c.acl_to_rom - s_tp_prev.acl, ab = c.acl_tx_bytes - s_tp_prev.acl_bytes;
+        uint32_t ln = c.nocp_lat_n - s_tp_prev.lat_n, lsum = c.nocp_lat_sum_us - s_tp_prev.lat_sum;
+        lbegin("tp");
+        lku("ms", ms);
+        lku("Bps", per_s(wb, ms));
+        lku("wr", wr);
+        lku("wB", wr ? wb / wr : 0u);
+        lku("wev", d.write_evts - s_tp_prev.write_evts);
+        lku("cong", d.cong_evts - s_tp_prev.cong_evts);
+        lku("nomem", d.tx_nomem - s_tp_prev.tx_nomem);
+        lku("busy", d.tx_busy - s_tp_prev.tx_busy);
+        lku("rx", d.rx_frames - s_tp_prev.rx_frames);
+        lku("acl", acl);
+        lku("aB", acl ? ab / acl : 0u);
+        lku("nocp", c.nocp_from_rom - s_tp_prev.nocp);
+        lku("lat", ln ? lsum / ln : 0u);
+        lku("latmax", lat_max);
+        lku("cr4", pmv(c.cr_full_us - s_tp_prev.cr_full, ms * 1000u));
+        lku("co", x.co_waits - s_tp_prev.co_waits);
+        lku("cof", x.co_forced - s_tp_prev.co_forced);
+        lku("wrap", x.wr_wrap - s_tp_prev.wr_wrap);
+        lemit();
+        lbegin("tq");
+        lku("n", m.n);
+        lku("on", pmv(m.on, m.n));
+        lku("gets", pmv(m.gets, m.on));
+        lku("re", pmv(m.re, m.on));
+        lku("rf", pmv(m.rf, m.on));
+        lku("starve", pmv(m.starve, m.on));
+        lku("bf", pmv(m.bf, m.on));
+        lku("cg", pmv(m.cg, m.on));
+        lku("pc0", pmv(m.pc0, m.pok));
+        lku("pfc", pmv(m.pfc, m.pok));
+        lku("pq", pmv(m.pq, m.pok));
+        lku("pqmax", m.pq_max);
+        lku("crmin", m.pok ? m.cr_min : 0u);
+        lku("crmax", m.cr_max);
+        lku("hc0", pmv(m.hc0, m.on));
+        lku("rc4", pmv(m.rc4, m.on));
+        lemit();
+        lbegin("tl");
+        lku("it", per_s(s_prof_n - s_tp_prev.prof_n, ms));
+        lku("xrec", per_s(s_prof[BT_BENCH_PROF_XREC] - s_tp_prev.prof[BT_BENCH_PROF_XREC], ms));
+        lku("gets", per_s(x.xrec_us - s_tp_prev.xrec_us, ms));
+        lku("xn", per_s(x.xrec_n - s_tp_prev.xrec_n, ms));
+        lku("rec", per_s(s_prof[BT_BENCH_PROF_REC] - s_tp_prev.prof[BT_BENCH_PROF_REC], ms));
+        lku("ui", per_s(s_prof[BT_BENCH_PROF_UI] - s_tp_prev.prof[BT_BENCH_PROF_UI], ms));
+        lku("wait", per_s(s_prof[BT_BENCH_PROF_WAIT] - s_tp_prev.prof[BT_BENCH_PROF_WAIT], ms));
+        lku("loop", per_s(s_prof[BT_BENCH_PROF_LOOP] - s_tp_prev.prof[BT_BENCH_PROF_LOOP], ms));
+        lemit();
+    }
+    s_tp_prev.ms = now != 0u ? now : 1u;
+    s_tp_prev.tx_writes = d.tx_writes;
+    s_tp_prev.tx_bytes = d.tx_bytes;
+    s_tp_prev.write_evts = d.write_evts;
+    s_tp_prev.cong_evts = d.cong_evts;
+    s_tp_prev.tx_nomem = d.tx_nomem;
+    s_tp_prev.tx_busy = d.tx_busy;
+    s_tp_prev.rx_frames = d.rx_frames;
+    s_tp_prev.acl = c.acl_to_rom;
+    s_tp_prev.acl_bytes = c.acl_tx_bytes;
+    s_tp_prev.nocp = c.nocp_from_rom;
+    s_tp_prev.lat_n = c.nocp_lat_n;
+    s_tp_prev.lat_sum = c.nocp_lat_sum_us;
+    s_tp_prev.cr_full = c.cr_full_us;
+    s_tp_prev.xrec_us = x.xrec_us;
+    s_tp_prev.xrec_n = x.xrec_n;
+    s_tp_prev.co_waits = x.co_waits;
+    s_tp_prev.co_forced = x.co_forced;
+    s_tp_prev.wr_wrap = x.wr_wrap;
+    memcpy(s_tp_prev.prof, s_prof, sizeof(s_prof));
+    s_tp_prev.prof_n = s_prof_n;
+}
+
 static void log_status(uint32_t el_ms, int last)
 {
     bt_status_t st;
@@ -339,7 +604,14 @@ static void log_status(uint32_t el_ms, int last)
     (void)bt_ctrl_stats_format(cl, (uint16_t)sizeof(cl));
     lbegin(cl);                              /* "BENCH BT ctrl stats unk=.. short=.. ...": bt_ctrl's silent drops */
     lemit();
-    if (last || (s_status_n++ % BENCH_MEAS_EVERY) == 0u) {
+    if ((dbg.conn_open && !s_link_logged) || last) {
+        s_link_logged = dbg.conn_open;
+        log_link();
+    }
+    tp_take(millis(), 1);
+    /* "BENCH cpu/tasks/meas" about every 150 s whatever stat_secs is */
+    uint32_t every = s_cfg.stat_secs >= 150u ? 1u : 150u / (s_cfg.stat_secs != 0u ? s_cfg.stat_secs : 30u);
+    if (last || (s_status_n++ % every) == 0u) {
         log_cpu30();
         log_meas();
     }
@@ -921,6 +1193,14 @@ void bt_bench_begin(void)
             lemit();
         }
     }
+    bt_xrec_bench_tput_t tc = { s_cfg.spp_wr, s_cfg.spp_buf, s_cfg.tx_ring, s_cfg.coalesce };
+    bt_xrec_set_bench_tput(&tc);           /* before the SPP config / connection (bt_xrec_start just began) */
+    bt_xrec_set_bench_clock_us(bench_us);
+    memset(s_prof, 0, sizeof(s_prof));
+    s_prof_n = 0u;
+    s_link_logged = 0u;
+    memset(&s_tp_prev, 0, sizeof(s_tp_prev));
+    log_tcfg();
     uint32_t now = millis();
     bt_bench_run_begin(&s_run, &s_cfg, now);
     s_win1.prev_us = 0u;                     /* CPU windows start with this run (baselines) */
@@ -931,6 +1211,8 @@ void bt_bench_begin(void)
     meas_cpu1(now);
     cpu_take_t c;
     cpu_win_take(&s_win30, &c);
+    tp_take(now, 0);
+    smp_start();
     act(bt_bench_run_tick(&s_run, now), now);
     drain();
 }
@@ -982,6 +1264,11 @@ int bt_bench_end(exfat_vol_t *vol, int sd_mounted)
     }
     if (s_cfg.xrec_pin[0] != '\0') {
         bt_xrec_set_bench_xrec_pin(NULL);    /* later windows draw their PIN from the DRBG again */
+    }
+    if (s_cfg.mode == BT_BENCH_MODE_PHONE) {
+        smp_stop();                          /* normally already stopped by bt_bench_loop_exit() */
+        bt_xrec_set_bench_clock_us(NULL);
+        bt_xrec_set_bench_tput(NULL);        /* BT is off: the release TX constants for later sessions */
     }
     uint32_t el = millis() - s_run.t0;
     lbegin("end");

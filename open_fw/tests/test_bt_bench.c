@@ -187,6 +187,50 @@ static void test_parse(void)
 }
 
 /* ---------------------------------------------------------------------------------------------------------------- */
+/* phone-mode throughput keys (docs/BT_SYNC_THROUGHPUT.md): defaults, every key, ranges, rules, status period */
+static void test_parse_tput(void)
+{
+    bt_bench_cfg_t c;
+    uint32_t at = 0u;
+    CHECK(parse("", &c, NULL) == BT_BENCH_OK && c.ui == 1u && c.smp == 1u && c.coalesce == 1u && c.spp_wr == 990u &&
+          c.spp_buf == 3960u && c.tx_ring == 8192u && c.stat_secs == 30u, "tput defaults = release constants");
+    CHECK(parse("secs=240 ui=0 smp=0 coalesce=0 spp_wr=660 spp_buf=2048 tx_ring=2048 stat_secs=60", &c, &at) ==
+          BT_BENCH_OK, "all tput keys (at %u)", at);
+    CHECK(c.ui == 0u && c.smp == 0u && c.coalesce == 0u && c.spp_wr == 660u && c.spp_buf == 2048u &&
+          c.tx_ring == 2048u && c.stat_secs == 60u, "all tput keys cfg (the pre-2026-11-26 TX path)");
+    CHECK(parse("spp_wr=64 spp_buf=100", &c, NULL) == BT_BENCH_OK && c.spp_wr == 64u && c.spp_buf == 100u, "minima");
+    CHECK(parse("spp_buf=9900 tx_ring=4096 stat_secs=300", &c, NULL) == BT_BENCH_OK && c.spp_buf == 9900u &&
+          c.tx_ring == 4096u && c.stat_secs == 300u, "maxima");
+    static const char *const bad_v[] = { "ui=2", "smp=-1", "coalesce=x", "spp_wr=63", "spp_wr=991", "spp_buf=99",
+                                         "spp_buf=9901", "tx_ring=1024", "tx_ring=3000", "stat_secs=9",
+                                         "stat_secs=301" };
+    for (size_t i = 0; i < sizeof(bad_v) / sizeof(bad_v[0]); i++) {
+        CHECK(parse(bad_v[i], &c, NULL) == BT_BENCH_E_VALUE, "bad value \"%s\"", bad_v[i]);
+    }
+    CHECK(parse("spp_wr=990 spp_buf=989", &c, NULL) == BT_BENCH_E_CONFLICT, "spp_buf below spp_wr");
+    CHECK(parse("spp_buf=500", &c, NULL) == BT_BENCH_E_CONFLICT, "spp_buf below the default spp_wr");
+    CHECK(parse("ui=0 ui=0", &c, NULL) == BT_BENCH_E_DUP, "dup tput key");
+    CHECK(parse("mode=hp coalesce=1", &c, NULL) == BT_BENCH_E_CONFLICT, "tput key with mode=hp");
+    CHECK(parse("mode=hp stat_secs=60", &c, NULL) == BT_BENCH_E_CONFLICT, "stat_secs with mode=hp");
+    /* status period follows stat_secs */
+    CHECK(parse("secs=200 stat_secs=50", &c, NULL) == BT_BENCH_OK, "stat_secs=50");
+    bt_bench_run_t r;
+    uint32_t t0 = 0xFFFFF000u;   /* across the millis() wrap */
+    bt_bench_run_begin(&r, &c, t0);
+    CHECK(bt_bench_run_tick(&r, t0 + 30000u) == 0u, "no status at 30 s");
+    CHECK(bt_bench_run_tick(&r, t0 + 50000u) == BT_BENCH_ACT_STATUS, "status at 50 s");
+    CHECK(bt_bench_run_tick(&r, t0 + 99999u) == 0u, "no status at 99.999 s");
+    CHECK(bt_bench_run_tick(&r, t0 + 100000u) == BT_BENCH_ACT_STATUS, "status at 100 s");
+    CHECK(bt_bench_run_tick(&r, t0 + 200000u) == BT_BENCH_ACT_EXIT, "exit at 200 s");
+    /* a zeroed cfg (stat_secs 0) still has a finite period */
+    bt_bench_cfg_t z;
+    memset(&z, 0, sizeof(z));
+    z.secs = 100u;
+    bt_bench_run_begin(&r, &z, 0u);
+    CHECK(bt_bench_run_tick(&r, 30000u) == BT_BENCH_ACT_STATUS, "stat_secs 0: 30 s default");
+}
+
+/* ---------------------------------------------------------------------------------------------------------------- */
 /* headphones keys (docs/BT_A2DP_DESIGN.md §10.2): defaults, every key, ranges, cross-key rules */
 static void test_parse_hp(void)
 {
@@ -670,6 +714,7 @@ int main(int argc, char **argv)
     g_ro = (blkdev_t){ mem_read, NULL, g_sectors, NULL };
 
     test_parse();
+    test_parse_tput();
     test_parse_hp();
     test_take();
     test_schedule();
