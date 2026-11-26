@@ -5,7 +5,8 @@ Offline regression tests for host safety tools:
   - tools/usb_sync.py: content-hashed collision handling & deduplication
   - tools/fix_exfat_boundary.py: tail-cluster allocation bitmap check,
     MBR/VBR geometry validation, shrink, and idempotency on re-run
-  - tools/rf_audio_check.py: its synthetic self-test (clean vs spur / dropout / phase step / AM / noise; needs numpy)
+  - tools/rf_audio_check.py: its synthetic self-test (clean vs spur / dropout / phase step / AM / noise, and the
+    --band-split injections: rumble PASS / thumps REVIEW / BT-like artefacts next to rumble FAIL; needs numpy)
 
 SPDX-License-Identifier: MIT
 """

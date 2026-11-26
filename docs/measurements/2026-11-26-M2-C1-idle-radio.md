@@ -1,302 +1,149 @@
 # M2 / C1: does an idle radio change the recording? (2026-11-26, night)
 
-Design: `docs/BT_SYNC_SPEED_AND_RECORDING.md` section 3 (M2). Tool: `tools/rf_audio_check.py --quiet-mode`.
+Design: `docs/BT_SYNC_SPEED_AND_RECORDING.md` section 3 (M2). Tool: `tools/rf_audio_check.py --band-split`
+(fail-closed by construction; it replaces the exclusion-based `--quiet-mode`, which is now an alias of it).
 
 ## Setup
 
 - Night, recorder lying on the desk, USB cable plugged in (bench control + log), nobody touching it.
 - Recording profile for every run: gain 31, mono, DSP bypass (dsp=0), VOR off - set by the bench
-  `BTBENCH.RUN` recording runs, restored afterwards (counter lines confirm `ch=1 gain=31 dsp=0 vor=0` for all six).
+  `BTBENCH.RUN` recording runs, restored afterwards (counter lines confirm `ch=1 gain=31 dsp=0 vor=0` for all).
 - Firmware: bench image built from `exp/overnight-s3-rec`, `0x3FBB`.
-- C0 (radio off, `mode=rec`): C0_1 = REC_0032, C0_2 = REC_0034, C0_3 = REC_0036.
+- C0 (radio off, `mode=rec`): C0_1 = REC_0032, C0_2 = REC_0034, C0_3 = REC_0036 (75 s); later C0_b1 = REC_0039,
+  C0_b2 = REC_0041 (90 s), interleaved with the C3p runs.
 - C1 (radio on and idle, `mode=phone rec=1`, phone app stopped, no link): C1_1 = REC_0033, C1_2 = REC_0035,
   C1_3 = REC_0037. C0/C1 runs interleaved (C0_1, C1_1, C0_2, ...), 75 s each.
+- C3p (phone mode, 90 s recording requested, "sync now" pressed on the phone): C3p_1 = REC_0038, C3p_2 = REC_0040,
+  C3p_3 = REC_0042. All three recordings ended early on an SD write error (71.6 / 31.2 / 32.0 s recorded).
 - Captures are named `<label>.wav` on the host; `labels.txt` maps label -> device file for the counter lines.
 
-Command (in the capture folder):
+Commands (in the capture folder `/home/silvio/dev/.build-scratch/night/caps`; reports there as `<run>.md` / `.json`):
 
 ```
-python3 tools/rf_audio_check.py --signal silence --quiet-mode --labels labels.txt \
+# c1_bandsplit: C1 against C0_1..3
+python3 tools/rf_audio_check.py --signal silence --band-split --labels labels.txt \
   --baseline C0_1=C0_1.wav --baseline C0_2=C0_2.wav --baseline C0_3=C0_3.wav \
   --capture C1_1=C1_1.wav --capture C1_2=C1_2.wav --capture C1_3=C1_3.wav \
   --bench-log C0_1=btbench_C0_1.log ... --bench-log C1_3=btbench_C1_3.log
+# c13_bandsplit: + C0_b1, C0_b2 as baselines, + C3p_1..3 as captures (all eleven per-capture logs)
+# quietbase_bandsplit: baselines C0_2, C0_3, C0_b1, C0_b2 only (no rumble); captures C0_1, C1_*, C3p_*
+# loo_<C0>: each rumble-free C0 against the other three (leave one out)
 ```
-
-Re-run after the fail-closed quiet mode (below): the same captures and command, per-capture logs
-(`--bench-log LABEL=btbench_LABEL.log`); report in the capture folder as `c1_failclosed.md` / `.json`.
 
 ## Result
 
-- **C1_1 PASS, C1_2 PASS, C1_3 FAIL** (overall NOT PASS by the tool's bar), unchanged by the fail-closed quiet mode
-  below. All three C0 baselines pass continuity and counters.
-- Night captures contain 1-7 s of low-frequency mechanical rumble (30-260 Hz, up to +58.7 dB over the quiet level of
-  about -86.6 dBFS) in C0_1 and in all three C1 captures. Without `--quiet-mode` every whole-file metric is swamped
-  (the first pass reported C0_1 at -41.6 dBFS against -86.4 for C0_2/C0_3).
-- In the quiet seconds the radio-idle captures match the radio-off baseline: noise floor within -0.42..+0.12 dB
-  (A-weighted -0.32..+0.10 dB), no spur target on the 1600/800/400/266.7 Hz combs more than 0.73 dB above the
-  baseline (C1_1, C1_2; C1_3 see below), no envelope line, fold depth at or below the baseline. Device counters: ov = lost = acct = 0, samples =
-  wav_smp, block clock bdrift = -1 like every C0.
-- **C1_3 FAIL** is one feature: spur target 2x40 Hz +4.5 dB and two "narrow peaks" at 78/79 Hz (+4.5/+5.6 dB,
-  7 dB prominence). A per-second look shows a 76-82 Hz hump about 5 Hz wide that wanders, present only in the first
-  ~20 s of C1_3 (8-15 dB over its neighbourhood) and gone afterwards. It is not on a BT timing frequency (not a
-  sharp line, not the 7.8125 Hz DMA-block series, not the 800 Hz comb), not near C1_3's rumble burst (30-36 s), and
-  absent from C1_1 and C1_2 under the same radio state. Most likely an acoustic/mechanical source in the room
-  (a motor or fan); the tool's bar is left as is. Repeat C1 to settle it: a C1 capture without the hump passing
-  would confirm the reading; a hump that recurs with the radio would not.
+**No capture passes; these night captures cannot answer M2 / C1.** The radio is neither convicted nor cleared:
+every high-band failure of C1_1..3 and C3p_1 lies in the seconds of a mechanical rumble event. Under the band-split
+bar (below) captures with rumble events can only FAIL or be INCONCLUSIVE.
 
-## Quiet mode fails closed (review fix, same day)
+| run | baselines | C1_1 | C1_2 | C1_3 | C3p_1 | C3p_2 | C3p_3 |
+|---|---|---|---|---|---|---|---|
+| c1_bandsplit | C0_1..3 | FAIL / REVIEW | FAIL / REVIEW | FAIL / REVIEW | - | - | - |
+| c13_bandsplit | C0_1..3, C0_b1, C0_b2 | FAIL / PASS | FAIL / PASS | FAIL / PASS | FAIL / PASS | FAIL (continuity; high band INCONCLUSIVE) / REVIEW | FAIL (continuity; high band INCONCLUSIVE) / REVIEW |
+| quietbase_bandsplit | C0_2, C0_3, C0_b1, C0_b2 | FAIL / REVIEW | FAIL / REVIEW | FAIL / REVIEW | FAIL / REVIEW | FAIL (continuity, (c) envelope lines) / REVIEW | FAIL (continuity, (c) envelope lines) / REVIEW |
 
-The first quiet mode left out every loud 1 s block and only checked the excluded bursts for an 800/1600 Hz comb. A
-review injected faults into C1_1 and ran them against C0_1..3: clicks (5 x 0.2 FS), 4 x 1 s broadband hiss +12 dB,
-2 x 1 s 1-6 kHz hiss +10 dB, 4.5 ms +30 dB bursts every 10.24 s, a k*266.67 Hz (eSCO 3.75 ms) comb buzz without the
-800 Hz teeth and two low-frequency thumps all PASSED - excluded as 'transients'. The gate is "the radio never
-affects recording quality", so exclusion now fails closed (`tools/rf_audio_check.py`, (q) in its header):
+Each cell: the capture's verdict / the low band's ("PASS" there = no low-band FAIL outside rumble within the
+baseline's). Every baseline passes its own continuity and counter checks in every run.
 
-- Only a **rumble-shaped** burst may be excluded. Rumble-shaped: the 10-90 % band of its excess energy (burst PSD
-  over the quiet PSD + 3 dB) lies below 300 Hz; no 256 ms segment where an octave >= 500 Hz rises > 3 dB over the
-  quiet seconds AND > 5 dB above the segment's own 20-250 Hz excess; no click (1 ms > 1 kHz frame +20 dB over the quiet
-  median and 15 dB over the < 250 Hz power around it); no step (one sample-to-sample difference +20 dB over the
-  quiet RMS and 24 dB over its +-1 ms); no comb at k*1600 / 800 / 400 / 266.67 Hz; no 128 ms (k*7.8125 Hz, DMA
-  block) periodicity (autocorrelation at 2048 samples > 0.3 above that at 1.5 / 2.5 blocks). Anything else:
-  **(q) non-rumble burst excluded FAIL** (comb: **(q) excluded bursts on BT comb FAIL**), with band, octave excess,
-  clicks and reasons listed.
-- **(q) excluded vs baseline**: a capture may exclude at most min(baseline max + 5 s, 2 x max) seconds and
-  min(max + 2, 2 x max) bursts, the maximum taken over the baselines' rumble-shaped bursts. Above it: FAIL, or
-  INCONCLUSIVE when the baselines' own excluded seconds spread by > 5 s (here they do: C0_1 14 s, C0_2/C0_3 0 s).
-- **(q) burst periodicity**: burst peak times with an interval CV < 0.2 over any run of >= 4 bursts FAIL;
-  **(q) clicks in kept seconds**: more clicks than any baseline, or periodic ones, FAIL.
-- A low-frequency thump (supply droop) has the same spectrum as rumble and cannot be told apart by shape: the report
-  now carries a note listing every rumble exclusion, to be reviewed by ear / eye when the count exceeds the
-  baseline's. Loud rumble also masks anything quieter in the same seconds; only the count / seconds bar covers that.
-- Literal deviation from the review's rule "energy above 500 Hz not raised by more than the spur limit": every real
-  rumble burst in these captures lifts 500 Hz - 8 kHz by 14-49 dB (rattles riding on it), its loudest octave 20-32 dB below its own
-  20-250 Hz excess; the literal rule would reject all of them. The high band is therefore judged against the
-  segment's low band. Likewise the 90 % point is 300 Hz, not 250: a C1_2 rumble burst reaches 259 Hz. Real rumble
-  rattles reach +10 dB over the low band in the click test (limit 15 dB) and +20.7 dB in the step test (limit 24 dB).
+- **Real rumble is not confined below 300 Hz.** The rumble events (C0_1 at 11, 34-35, 57, 62 s; C1_1 at 3-9 s;
+  C1_2 at 19-20, 37-41 s; C1_3 at 31-35 s; C3p_1 at 15-22 s) are knocks: per second the 250-500 Hz octave reaches
+  -43..-48 dBFS, 500 Hz - 1 kHz -51..-61, 1-2 kHz -58..-71, 2-4 kHz -62..-80, 4-8 kHz -74..-87 dBFS, against a
+  quiet octave level of about -95 dBFS; 1 ms high-band frames stand 60-66 dB over the median. The report's
+  information line puts 100 % of the high band's excess energy of every rumble capture (C0_1, C1_1..3, C3p_1) in
+  its low-band burst seconds.
+- Hence C0_1 (rumble) and C0_2 / C0_3 (none) disagree in the high band (repeatability 3.8 dB, floors 10-25 dB
+  apart): against C0_1..3 the high-band floors of C1 are INCONCLUSIVE, and what FAILS is where the C1 rumble events
+  are louder than C0_1's: loudest second 2.4-8 kHz +4..+9 dB, octave floor 2.4-4.8 kHz +7.6..+11 dB, spur targets
+  +8.5..+12.7 dB (broadband knocks covering the target bins), envelope lines at 0.3-10 Hz, C1_2 15 clicks against at
+  most 10. Against the rumble-free C0s every rumble capture fails by 20-35 dB.
+- Low band of C1 against C0_1..3: REVIEW. Without the burst seconds C1_1 and C1_2 are 0.6 dB *quieter* below
+  300 Hz than the baseline (the floor bar is two-sided); C1_3 carries the 76-82 Hz hump of its first ~20 s reported
+  earlier ((L) spur target 2x40 Hz +5 dB, 3 narrow peaks, 40-80 Hz octave +1.8 dB).
+- **C3p_1..3 fail continuity, as they must**: length against the device clock -2114 / -2164 / -2278 samples
+  (tolerance 2048), `acct = 2048` on the device, and each WAV holds 234 samples more than the counter's `wav_smp` -
+  the SD write error that ended them. The recorded part is analysed all the same.
+- **C3p_2 and C3p_3** (no rumble, radio active with a sync) pass every high-band floor, octave, loudest-second,
+  spur, peak and click row against the rumble-free C0s and fail only "(c) envelope lines": C3p_2 at 15.5 / 32.0 /
+  35.7 Hz (+3.1..6.7 dB over the baseline, prominence 6.7-8.4 dB), C3p_3 at 22.9 Hz (+7.2 dB, prominence 12.5 dB)
+  and 39.1 Hz. C3p_3 also carries a 22-24 Hz line with harmonics at 45-47, 69, 114, 161 Hz in the low band (+20 dB
+  over the baseline) and the same 22.9 Hz line in its low-band envelope. These files are 31-32 s long (2-3 envelope
+  segments against 5-6 for the baselines), so their envelope rows are weaker evidence than a 75 s capture's; the
+  22.9 Hz rhythm in both bands of C3p_3 is a lead for M3 (sync while recording), not a result.
+- Leave one out among the rumble-free C0s: C0_3 and C0_b1 PASS; C0_2 and C0_b2 are REVIEW with the high band PASS
+  (C0_b2: 20-300 Hz floor +3.8 dB over the others, +9 dB at 20-40 Hz; C0_2: one low-band envelope line). The night
+  low band varies between radio-off repeats by more than the 0.5 dB floor bar: it is a REVIEW region by design.
 
-Review injections, re-run on C1_1 vs C0_1..3 with the new tool (scratch script; the reviewer's cases plus thumps,
-DC pulses and spikes; the review's '1.5 ms' bursts are 72 samples = 4.5 ms):
+What it takes to answer C1: captures without rumble events (a quieter hour or a decoupled support - the knocks come
+through the desk), or enough repeats that the baselines' rumble statistics cover the captures'. Rumble-free C1
+captures against C0_2, C0_3, C0_b1, C0_b2 would be judged on the full bar: those C0s pass each other's high band.
 
-| injection into C1_1 | verdict | what catches it |
+## Band split: fail-closed by construction (replaces `--quiet-mode`, same day)
+
+History. The first `--quiet-mode` left out loud 1 s blocks; a review injected faults that it passed as
+"transients". The fail-closed version (b460fe8, 0a1eedb) allowed only rumble-shaped bursts to be left out, but
+re-reviews kept finding false passes: the guard seconds around a burst hid tones and BT-like trains; 250-500 Hz was
+unchecked; a 330 Hz tone or 300-480 Hz noise next to rumble, and 11.25 ms trains of 330 + 450 Hz bursts, passed.
+Any scheme that leaves seconds out has seconds to hide in. It is withdrawn; `--quiet-mode` is now an alias of
+`--band-split`, and the earlier quiet-mode verdicts in this report (C1_1 PASS, C1_2 PASS, C1_3 FAIL) are void.
+
+`--band-split` (`tools/rf_audio_check.py`, (s) in its header) leaves NO second out of any verdict:
+
+- **Split**: a linear-phase FIR high-pass (Kaiser, 3419 taps; stop edge 300 Hz at -100 dB, pass edge 330 Hz,
+  ripple 0.0001 dB) over the whole file, identical for baselines and captures; the low band is the signal minus the
+  high band. Rumble below 300 Hz cannot reach the high band; whatever a rumble event has above 300 Hz is judged
+  there like anything else.
+- **High band (>= 300 Hz)**, whole analysis window, decides FAIL / INCONCLUSIVE together with continuity: (a) floor
+  and A-weighted floor 300 Hz - 8 kHz, each octave from 300 Hz (one-sided: a rise above +0.5 dB inside the
+  baselines' spread is INCONCLUSIVE, beyond it FAIL), and the loudest 1 s of the band and of each octave against
+  the baselines' loudest + 1 dB (a short event is not diluted by the average); (b) spur targets >= 300 Hz
+  (k*1600 / 800 / 400 / 266.67 Hz, and now k*216.67 Hz, a 4.615 ms TDMA frame) and narrow peaks; (c) envelope of
+  the high-passed signal (targets, lines, 1.28 s fold) and clicks: 1 ms frames 20 dB over the window's median, or a
+  filter matched to a DC step's high-band shape 20 dB over its robust RMS (a 0.002 FS step: about 35 dB), counted
+  against the baselines scaled to length - up to their most PASS, above it INCONCLUSIVE, more than 2 above FAIL,
+  periodic FAIL, one event 10 dB louder than any baseline event FAIL; (d) tones >= 300 Hz. A baseline that fails
+  its own repeatability (rumble in some repeats only) turns an excess over its mean + sd into INCONCLUSIVE unless
+  the excess also clears the loudest repeat (then FAIL). Never PASS.
+- **Low band (< 300 Hz)**, rows `(L) ...`, the same metrics on the whole window, reported separately as the
+  "mechanical rumble region". They never FAIL a capture: a low-band row that does not pass makes the capture REVIEW
+  unless rumble within the baseline's explains it - low-band bursts (1 s blocks > median + 6 dB, +-1 block) no more
+  and no longer in total than in the baseline with the most, no burst rhythm (interval CV >= 0.2), no burst
+  periodic at one DMA block (128 ms autocorrelation), and with the burst seconds left out (in the baselines too) no
+  (L) row FAILS. The explanation never touches the high band.
+- **Continuity (e)** unchanged, whole file; tone phase steps on the high band for tones >= 300 Hz.
+- Verdicts: FAIL / INCONCLUSIVE (high band, continuity) before REVIEW (low band) before PASS; exit status 0 only
+  when every capture passes. Information only: the share of the high band's excess energy in low-band burst seconds.
+
+Self-test (`python3 tools/test_tools.py`; 86 checks): synthetic rumble in baselines and capture PASSES (low band
+explained), 2 thumps within the baseline's PASS; 7 thumps, periodic thumps, a 128 ms periodic low-band burst and a
+steady 120 Hz line -> REVIEW; clicks, broadband and 1-6 kHz hiss, sparse +30 dB bursts, combs on k*266.67 (no
+800 Hz teeth), k*400 and k*800 Hz, comb lines under rumble, page-scan cadence, a DC step, single-sample spikes, a
++1 dB floor, a 330 Hz tone next to rumble and in quiet, 300-480 Hz noise next to rumble, 11.25 ms 330 + 450 Hz
+bursts every 1.28 s, and 1.25 ms bursts every 11.25 ms next to rumble -> FAIL; a baseline with a knock in one repeat
+-> INCONCLUSIVE, not PASS; 997 Hz tone captures with rumble PASS, +3 dB noise and a 1-sample loss FAIL; the FIR's
+stop band and ripple.
+
+Injections on real captures (scratch script; levels relative to the host's high-band quiet level, -87.7 dBFS):
+host C0_3 against C0_2, C0_b1, C0_b2 (clean host PASS), and the same host with C1_1's rumble (its part below
+200-280 Hz) pasted at 20-30 s (clean host: high band PASS, low band REVIEW - that rumble is not in these baselines):
+
+| injection | C0_3 host | C0_3 + rumble host |
 |---|---|---|
-| floor +1.5 dB | FAIL | (a), (b) |
-| page-scan 4.5 ms every 1.28 s, +10 / +20 / +30 dB | FAIL | (c); +20/+30 also (a), non-rumble, kept clicks |
-| 4.5 ms +30 dB every 2.56 / 5.12 / 10.24 s | FAIL | non-rumble (clicks), periodicity (5.12, 10.24), kept clicks (2.56), excluded vs baseline INCONCLUSIVE |
-| 4 x 1 s broadband hiss +12 dB | FAIL | non-rumble (high band led), excluded vs baseline INCONCLUSIVE |
-| 5 clicks 0.2 FS | FAIL | non-rumble (clicks), periodicity |
-| 400 Hz comb buzz 1.5 s | FAIL | BT comb, non-rumble |
-| 800 Hz comb buzz at quiet -5 dB | FAIL | (b), (c), non-rumble |
-| 266.67 Hz comb (no 800 Hz teeth) 1.5 s | FAIL | BT comb, non-rumble |
-| 2 x 1 s 1-6 kHz hiss +10 dB | FAIL | non-rumble (band, high band led) |
-| 2 low-frequency thumps (10-80 Hz, +20 dB) | INCONCLUSIVE | excluded vs baseline (13 s > 12 s; baseline noisy) |
-| 6 thumps / 5 thumps every 7.68 s | FAIL | periodicity, excluded vs baseline INCONCLUSIVE |
-| floor +1.5 dB with 2 rumble bursts | FAIL | (a), (b) |
-| 2 extra rumble bursts (40-150 Hz) | INCONCLUSIVE | excluded vs baseline (15 s in 4) |
-| C1_1 unchanged | PASS | - |
-| DC pulse 2 s (0.002 / 0.01 / 0.05 FS) | FAIL | non-rumble (steps) |
-| 3 single-sample spikes 0.002 FS (not excluded) | FAIL | clicks in kept seconds |
+| none | PASS | REVIEW (low band) |
+| floor +1.5 dB | FAIL | FAIL |
+| page scan 4.5 ms every 1.28 s, +10 / +20 / +30 dB | FAIL | FAIL |
+| 4.5 ms +30 dB every 2.56 / 5.12 / 10.24 s | FAIL | FAIL |
+| 4 x 1 s broadband hiss +12 dB; 2 x 1 s 1-6 kHz hiss +10 dB | FAIL | FAIL |
+| 5 clicks 0.2 FS; 3 spikes 0.002 / 0.02 FS; 3 x 1 ms 0.01 FS pulses | FAIL | FAIL |
+| combs k*400, k*800 (-5 dB), k*266.67 Hz (no 800 Hz teeth), 2 x 1-1.5 s | FAIL | FAIL |
+| DC pulse 2 s, 0.002 / 0.01 / 0.05 FS | FAIL | FAIL |
+| 330 Hz 1 s at the quiet level and 10 dB under it, next to the rumble and in quiet | FAIL | FAIL |
+| 300-480 Hz noise 1 s next to the rumble, +10 / +0 dB | FAIL | FAIL |
+| 11.25 ms 330 + 450 Hz bursts every 1.28 s, +10 / +0 dB | FAIL | FAIL |
+| 1.25 ms 330 + 450 Hz bursts every 11.25 ms for 1 s next to the rumble, +10 dB | FAIL | FAIL |
+| the same at +0 dB | **PASS** | REVIEW (low band only) |
+| 2 / 6 / periodic low-frequency thumps (10-80 Hz) | REVIEW (low band) | REVIEW |
 
-The synthetic self-test carries the same cases (clicks, broadband and 1-6 kHz hiss, sparse +30 dB bursts, 266.67 and
-400 Hz combs, a 128 ms periodic burst, a DC step, kept-second spikes, thumps within / above the baseline count and
-periodic, a noisy baseline -> INCONCLUSIVE); `python3 tools/test_tools.py` passes (80 checks).
-
-On the real captures the verdicts do not change: every excluded burst in C1_1..3 is rumble-shaped (excess bands
-30-129 ... 73-259 Hz, loudest octave >= 500 Hz 20-29 dB under the 20-250 Hz excess, no click, no comb, 128 ms
-correlation excess <= 0.0), and
-C1_1 9.0 s / 2, C1_2 11.53 s / 3, C1_3 6.0 s / 1 stay within the bar of 12 s / 4 bursts (C1_2 by 0.47 s). No burst
-rhythm, no clicks in the kept seconds. C0_1 holds two non-rumble bursts (radio off): 55.25 s (excess 54-1353 Hz,
-knocks at 57.1-57.35 s, -55 dBFS broadband) and 61.25 s (94-896 Hz, a knock at 62.45 s); they are reported and left
-out of the allowance (C0_1's rumble: 7 s in 2 bursts). The low-frequency-exclusion note applies to all three C1
-captures: their counts are within the baseline's, so no ear review is forced, but the excluded seconds (0.25-10.25 s
-of C1_1, 18.25-21.25 / 36.25-43.25 / 73.25-end of C1_2, 30.25-36.25 s of C1_3) carry no radio verdict.
-
-## Tool report
-
-## RF audio check
-
-Baseline: C0_1.wav, C0_2.wav, C0_3.wav
-
-**Overall: NOT PASS**
-
-### C0_1 - PASS
-
-baseline (continuity, counters, quiet bursts): `C0_1.wav`, 74.88 s, 1 ch, ch0 silence floor -86.383 dBFS (-88.111 A); quiet mode: 60.53 s kept, 14.0 s excluded in 4 burst(s), quiet block level -86.78 dBFS
-
-> Note: 2 low-frequency burst(s) (7 s, at 10.25, 33.25 s) were excluded as rumble. A supply-droop thump has the same spectrum: if their count or seconds exceed the baseline's (row '(q) excluded vs baseline'), review them by ear / eye.
-
-| metric | ch | value | baseline | delta | limit | verdict |
-|---|---|---|---|---|---|---|
-| (q) quiet seconds kept |  | 60.53 | 14.0 s excluded |  | >= 30 s (blocks > median +6 dB, +-1 guard) | **PASS** |
-| (q) excluded bursts on BT comb |  | 0 | 0 |  | none: k*1600/800/400/266.7 Hz comb share < 0.05, no tooth >= 10 dB prom and > quiet +3 dB, 128 ms autocorr <= 0.3 | **PASS** |
-| (q) non-rumble burst excluded |  | 2 | 0 |  | baseline (radio off): reported, left out of the exclusion allowance | **PASS** |
-| (q) burst periodicity |  | 0.496 | None |  | interval CV >= 0.2 (lowest over runs of >= 4 bursts) | **PASS** |
-| (q) clicks in kept seconds |  | 0 | None |  | <= baseline max, interval CV >= 0.2 (1 ms > 1 kHz +20 dB, 15 dB over < 250 Hz) | **PASS** |
-| (e) zero runs |  | 0 | 0 |  | none >= 2048 samples | **PASS** |
-| (e) device record |  | REC_0032.wav | None |  | matched by REC_0032.WAV in C0_1's log (explicit name) | **PASS** |
-| (e) length vs device clock |  | 1198080 | 1199442 | -1362 | +-2048 | **PASS** |
-| (e) samples = device wav_smp |  | 1198080 | 1198080 | 0 | exact | **PASS** |
-| (e) device ov |  | 0 | 0 |  | 0 | **PASS** |
-| (e) device lost |  | 0 | 0 |  | 0 | **PASS** |
-| (e) device acct |  | 0 | 0 |  | 0 | **PASS** |
-| (e) block-clock drift vs C0 |  | -1 | -1..-1 | 0.0 | +-8 smp outside the C0 range | **PASS** |
-| (setup) gain/dsp/vor/ch |  | 31/0/0/1 | 31/0/0/1 |  | = baseline | **PASS** |
-
-- (q) excluded bursts on BT comb: `[{"t_s": 10.25, "dur_s": 3.0, "peak_db_re_quiet": 57.6, "band_hz": "36-175", "peak_hz": 45.0, "share_800": 0.0, "share_1600": 0.0, "max_tooth": {"hz": 800.0, "prom_db": 3.3, "re_quiet_db": 36.2}, "dma_corr": -0.0, "bt_comb": false}, {"t_s": 33.25, "dur_s": 4.0, "peak_db_re_quiet": 58.7, "band_hz": "53-134", "peak_hz": 85.0, "share_800": 0.0, "share_1600": 0.0, "max_tooth": {"hz": 2400.0, "prom_db": 3.0, "re_quiet_db": 17.4}, "dma_corr": -0.0, "bt_comb": false}, {"t_s": 55.25, "dur_s": 4.0, "peak_db_re_quiet": 19.5, "band_hz": "54-1353", "peak_hz": 74.0, "share_800": 0.0007, "share_1600": 0.0002, "max_tooth": {"hz": 4000.0, "prom_db": 2.7, "re_quiet_db": 2.0}, "dma_corr": -0.006, "bt_comb": false}, {"t_s": 61.25, "dur_s": 3.0, "peak_db_re_quiet": 11.0, "band_hz": "94-896", "peak_hz": 500.0, "share_800": 0.0012, "share_1600": 0.0001, "max_tooth": {"hz": 800.0, "prom_db": 1.9, "re_quiet_db": -1.6}, "dma_corr": 0.015, "bt_comb": false}]`
-
-- (q) non-rumble burst excluded: `[{"t_s": 55.25, "dur_s": 4.0, "peak_db_re_quiet": 19.5, "band_hz": "54-1353", "oct_ex_db": {"lf": 30.3, "500": 20.7, "1000": 24.9, "2000": 22.0, "4000": 13.2}, "clicks": 0, "dma_corr": -0.006, "why": ["excess band 54-1353 Hz (90 % point > 300 Hz)"]}, {"t_s": 61.25, "dur_s": 3.0, "peak_db_re_quiet": 11.0, "band_hz": "94-896", "oct_ex_db": {"lf": 18.4, "500": 9.1, "1000": 9.3, "2000": 11.6, "4000": 8.5}, "clicks": 0, "dma_corr": 0.015, "why": ["excess band 94-896 Hz (90 % point > 300 Hz)"]}]`
-
-- (q) burst periodicity: `[11.33, 35.91, 57.21, 62.46]`
-
-### C0_2 - PASS
-
-baseline (continuity, counters, quiet bursts): `C0_2.wav`, 74.88 s, 1 ch, ch0 silence floor -86.459 dBFS (-87.793 A); quiet mode: 74.53 s kept, 0.0 s excluded in 0 burst(s), quiet block level -86.57 dBFS
-
-| metric | ch | value | baseline | delta | limit | verdict |
-|---|---|---|---|---|---|---|
-| (q) quiet seconds kept |  | 74.53 | 0.0 s excluded |  | >= 30 s (blocks > median +6 dB, +-1 guard) | **PASS** |
-| (q) excluded bursts on BT comb |  | 0 | 0 |  | none: k*1600/800/400/266.7 Hz comb share < 0.05, no tooth >= 10 dB prom and > quiet +3 dB, 128 ms autocorr <= 0.3 | **PASS** |
-| (q) non-rumble burst excluded |  | 0 | 0 |  | baseline (radio off): reported, left out of the exclusion allowance | **PASS** |
-| (q) burst periodicity |  | - | None |  | interval CV >= 0.2 (lowest over runs of >= 4 bursts) | **PASS** |
-| (q) clicks in kept seconds |  | 0 | None |  | <= baseline max, interval CV >= 0.2 (1 ms > 1 kHz +20 dB, 15 dB over < 250 Hz) | **PASS** |
-| (e) zero runs |  | 0 | 0 |  | none >= 2048 samples | **PASS** |
-| (e) device record |  | REC_0034.wav | None |  | matched by REC_0034.WAV in C0_2's log (explicit name) | **PASS** |
-| (e) length vs device clock |  | 1198080 | 1199570 | -1490 | +-2048 | **PASS** |
-| (e) samples = device wav_smp |  | 1198080 | 1198080 | 0 | exact | **PASS** |
-| (e) device ov |  | 0 | 0 |  | 0 | **PASS** |
-| (e) device lost |  | 0 | 0 |  | 0 | **PASS** |
-| (e) device acct |  | 0 | 0 |  | 0 | **PASS** |
-| (e) block-clock drift vs C0 |  | -1 | -1..-1 | 0.0 | +-8 smp outside the C0 range | **PASS** |
-| (setup) gain/dsp/vor/ch |  | 31/0/0/1 | 31/0/0/1 |  | = baseline | **PASS** |
-
-### C0_3 - PASS
-
-baseline (continuity, counters, quiet bursts): `C0_3.wav`, 74.88 s, 1 ch, ch0 silence floor -86.441 dBFS (-87.848 A); quiet mode: 74.53 s kept, 0.0 s excluded in 0 burst(s), quiet block level -86.56 dBFS
-
-| metric | ch | value | baseline | delta | limit | verdict |
-|---|---|---|---|---|---|---|
-| (q) quiet seconds kept |  | 74.53 | 0.0 s excluded |  | >= 30 s (blocks > median +6 dB, +-1 guard) | **PASS** |
-| (q) excluded bursts on BT comb |  | 0 | 0 |  | none: k*1600/800/400/266.7 Hz comb share < 0.05, no tooth >= 10 dB prom and > quiet +3 dB, 128 ms autocorr <= 0.3 | **PASS** |
-| (q) non-rumble burst excluded |  | 0 | 0 |  | baseline (radio off): reported, left out of the exclusion allowance | **PASS** |
-| (q) burst periodicity |  | - | None |  | interval CV >= 0.2 (lowest over runs of >= 4 bursts) | **PASS** |
-| (q) clicks in kept seconds |  | 0 | None |  | <= baseline max, interval CV >= 0.2 (1 ms > 1 kHz +20 dB, 15 dB over < 250 Hz) | **PASS** |
-| (e) zero runs |  | 0 | 0 |  | none >= 2048 samples | **PASS** |
-| (e) device record |  | REC_0036.wav | None |  | matched by REC_0036.WAV in C0_3's log (explicit name) | **PASS** |
-| (e) length vs device clock |  | 1198080 | 1199461 | -1381 | +-2048 | **PASS** |
-| (e) samples = device wav_smp |  | 1198080 | 1198080 | 0 | exact | **PASS** |
-| (e) device ov |  | 0 | 0 |  | 0 | **PASS** |
-| (e) device lost |  | 0 | 0 |  | 0 | **PASS** |
-| (e) device acct |  | 0 | 0 |  | 0 | **PASS** |
-| (e) block-clock drift vs C0 |  | -1 | -1..-1 | 0.0 | +-8 smp outside the C0 range | **PASS** |
-| (setup) gain/dsp/vor/ch |  | 31/0/0/1 | 31/0/0/1 |  | = baseline | **PASS** |
-
-### C1_1 - PASS
-
-capture: `C1_1.wav`, 74.88 s, 1 ch, ch0 silence floor -86.851 dBFS (-88.235 A); quiet mode: 65.53 s kept, 9.0 s excluded in 2 burst(s), quiet block level -86.88 dBFS
-
-> Note: 2 low-frequency burst(s) (9 s, at 0.25, 3.25 s) were excluded as rumble. A supply-droop thump has the same spectrum: if their count or seconds exceed the baseline's (row '(q) excluded vs baseline'), review them by ear / eye.
-
-| metric | ch | value | baseline | delta | limit | verdict |
-|---|---|---|---|---|---|---|
-| (b) baseline repeatability | 0 | 0.28 | None |  | median level offset spread <= 1.0 dB | **PASS** |
-| (a) noise floor | 0 | -86.85 | -86.43 | -0.42 | +-0.5 dB (spread 0.08) | **PASS** |
-| (a) noise floor A-wtd | 0 | -88.23 | -87.92 | -0.32 | +-0.5 dB (spread 0.32) | **PASS** |
-| (b) spur targets | 0 | worst 5x800 Hz | C0 mean+sd | 0.68 | <= +3.0 dB | **PASS** |
-| (b) new narrow peaks | 0 | 0 | 0 |  | none > +3.0 dB with >= 6.0 dB prominence | **PASS** |
-| (c) envelope 0.78125 Hz | 0 | -47.64 | -39.92 | -7.72 | line: <= +3.0 dB or prom < 6.0 dB (prom 1.3) | **PASS** |
-| (c) envelope 2.34375 Hz | 0 | -51.33 | -39.83 | -11.5 | line: <= +3.0 dB or prom < 6.0 dB (prom -2.4) | **PASS** |
-| (c) envelope 7.5 Hz | 0 | -48.28 | -41.42 | -6.86 | line: <= +3.0 dB or prom < 6.0 dB (prom 0.6) | **PASS** |
-| (c) envelope lines | 0 | 0 | 0 |  | none 0.2-40 Hz > +3.0 dB with >= 6.0 dB prom | **PASS** |
-| (c) 1.28 s fold depth | 0 | -32.98 | -31.36 | -1.62 | <= +3.0 dB | **PASS** |
-| (q) quiet seconds kept |  | 65.53 | 9.0 s excluded |  | >= 30 s (blocks > median +6 dB, +-1 guard) | **PASS** |
-| (q) excluded bursts on BT comb |  | 0 | 0 |  | none: k*1600/800/400/266.7 Hz comb share < 0.05, no tooth >= 10 dB prom and > quiet +3 dB, 128 ms autocorr <= 0.3 | **PASS** |
-| (q) non-rumble burst excluded |  | 0 | 0 |  | none: excess 90 % < 300 Hz, >= 500 Hz not led (+3 dB / 5 dB over 20-250 Hz), no click, no comb | **PASS** |
-| (q) excluded vs baseline |  | 9.0 s in 2 | max 7 s in 2 (rumble bursts) |  | <= 12 s and <= 4 bursts (min of max + 5 s / +2, 2x max); baseline excluded spread 14 s (> 5: INCONCLUSIVE) | **PASS** |
-| (q) burst periodicity |  | - | None |  | interval CV >= 0.2 (lowest over runs of >= 4 bursts) | **PASS** |
-| (q) clicks in kept seconds |  | 0 | 0 |  | <= baseline max, interval CV >= 0.2 (1 ms > 1 kHz +20 dB, 15 dB over < 250 Hz) | **PASS** |
-| (e) zero runs |  | 0 | 0 |  | none >= 2048 samples | **PASS** |
-| (e) device record |  | REC_0033.wav | None |  | matched by REC_0033.WAV in C1_1's log (explicit name) | **PASS** |
-| (e) length vs device clock |  | 1198080 | 1199170 | -1090 | +-2048 | **PASS** |
-| (e) samples = device wav_smp |  | 1198080 | 1198080 | 0 | exact | **PASS** |
-| (e) device ov |  | 0 | 0 |  | 0 | **PASS** |
-| (e) device lost |  | 0 | 0 |  | 0 | **PASS** |
-| (e) device acct |  | 0 | 0 |  | 0 | **PASS** |
-| (e) block-clock drift vs C0 |  | -1 | -1..-1 | 0.0 | +-8 smp outside the C0 range | **PASS** |
-| (setup) gain/dsp/vor/ch |  | 31/0/0/1 | 31/0/0/1 |  | = baseline | **PASS** |
-
-- (q) excluded bursts on BT comb: `[{"t_s": 0.25, "dur_s": 2.0, "peak_db_re_quiet": 55.0, "band_hz": "30-129", "peak_hz": 42.0, "share_800": 0.0, "share_1600": 0.0, "max_tooth": {"hz": 4800.0, "prom_db": 2.4, "re_quiet_db": 10.8}, "dma_corr": 0.0, "bt_comb": false}, {"t_s": 3.25, "dur_s": 7.0, "peak_db_re_quiet": 58.3, "band_hz": "38-130", "peak_hz": 65.0, "share_800": 0.0, "share_1600": 0.0, "max_tooth": {"hz": 5600.0, "prom_db": 1.3, "re_quiet_db": 4.5}, "dma_corr": -0.033, "bt_comb": false}]`
-
-### C1_2 - PASS
-
-capture: `C1_2.wav`, 74.88 s, 1 ch, ch0 silence floor -86.563 dBFS (-87.819 A); quiet mode: 63.0 s kept, 11.53 s excluded in 3 burst(s), quiet block level -86.59 dBFS
-
-> Note: 3 low-frequency burst(s) (11.53 s, at 18.25, 36.25, 73.25 s) were excluded as rumble. A supply-droop thump has the same spectrum: if their count or seconds exceed the baseline's (row '(q) excluded vs baseline'), review them by ear / eye.
-
-| metric | ch | value | baseline | delta | limit | verdict |
-|---|---|---|---|---|---|---|
-| (b) baseline repeatability | 0 | 0.28 | None |  | median level offset spread <= 1.0 dB | **PASS** |
-| (a) noise floor | 0 | -86.56 | -86.43 | -0.14 | +-0.5 dB (spread 0.08) | **PASS** |
-| (a) noise floor A-wtd | 0 | -87.82 | -87.92 | 0.1 | +-0.5 dB (spread 0.32) | **PASS** |
-| (b) spur targets | 0 | worst 9x400 Hz | C0 mean+sd | 0.73 | <= +3.0 dB | **PASS** |
-| (b) new narrow peaks | 0 | 0 | 0 |  | none > +3.0 dB with >= 6.0 dB prominence | **PASS** |
-| (c) envelope 0.78125 Hz | 0 | -44.92 | -39.92 | -5.0 | line: <= +3.0 dB or prom < 6.0 dB (prom 3.6) | **PASS** |
-| (c) envelope 2.34375 Hz | 0 | -46.98 | -39.83 | -7.15 | line: <= +3.0 dB or prom < 6.0 dB (prom 1.6) | **PASS** |
-| (c) envelope 7.5 Hz | 0 | -46.06 | -41.42 | -4.64 | line: <= +3.0 dB or prom < 6.0 dB (prom 2.5) | **PASS** |
-| (c) envelope lines | 0 | 0 | 0 |  | none 0.2-40 Hz > +3.0 dB with >= 6.0 dB prom | **PASS** |
-| (c) 1.28 s fold depth | 0 | -34.48 | -31.36 | -3.12 | <= +3.0 dB | **PASS** |
-| (q) quiet seconds kept |  | 63.0 | 11.53 s excluded |  | >= 30 s (blocks > median +6 dB, +-1 guard) | **PASS** |
-| (q) excluded bursts on BT comb |  | 0 | 0 |  | none: k*1600/800/400/266.7 Hz comb share < 0.05, no tooth >= 10 dB prom and > quiet +3 dB, 128 ms autocorr <= 0.3 | **PASS** |
-| (q) non-rumble burst excluded |  | 0 | 0 |  | none: excess 90 % < 300 Hz, >= 500 Hz not led (+3 dB / 5 dB over 20-250 Hz), no click, no comb | **PASS** |
-| (q) excluded vs baseline |  | 11.53 s in 3 | max 7 s in 2 (rumble bursts) |  | <= 12 s and <= 4 bursts (min of max + 5 s / +2, 2x max); baseline excluded spread 14 s (> 5: INCONCLUSIVE) | **PASS** |
-| (q) burst periodicity |  | - | None |  | interval CV >= 0.2 (lowest over runs of >= 4 bursts) | **PASS** |
-| (q) clicks in kept seconds |  | 0 | 0 |  | <= baseline max, interval CV >= 0.2 (1 ms > 1 kHz +20 dB, 15 dB over < 250 Hz) | **PASS** |
-| (e) zero runs |  | 0 | 0 |  | none >= 2048 samples | **PASS** |
-| (e) device record |  | REC_0035.wav | None |  | matched by REC_0035.WAV in C1_2's log (explicit name) | **PASS** |
-| (e) length vs device clock |  | 1198080 | 1199150 | -1070 | +-2048 | **PASS** |
-| (e) samples = device wav_smp |  | 1198080 | 1198080 | 0 | exact | **PASS** |
-| (e) device ov |  | 0 | 0 |  | 0 | **PASS** |
-| (e) device lost |  | 0 | 0 |  | 0 | **PASS** |
-| (e) device acct |  | 0 | 0 |  | 0 | **PASS** |
-| (e) block-clock drift vs C0 |  | -1 | -1..-1 | 0.0 | +-8 smp outside the C0 range | **PASS** |
-| (setup) gain/dsp/vor/ch |  | 31/0/0/1 | 31/0/0/1 |  | = baseline | **PASS** |
-
-- (q) excluded bursts on BT comb: `[{"t_s": 18.25, "dur_s": 3.0, "peak_db_re_quiet": 53.3, "band_hz": "73-259", "peak_hz": 135.0, "share_800": 0.0001, "share_1600": 0.0, "max_tooth": {"hz": 5600.0, "prom_db": 1.4, "re_quiet_db": 7.1}, "dma_corr": -0.0, "bt_comb": false}, {"t_s": 36.25, "dur_s": 7.0, "peak_db_re_quiet": 56.0, "band_hz": "39-147", "peak_hz": 70.0, "share_800": 0.0, "share_1600": 0.0, "max_tooth": {"hz": 1600.0, "prom_db": 1.6, "re_quiet_db": 21.3}, "dma_corr": 0.0, "bt_comb": false}, {"t_s": 73.25, "dur_s": 1.53, "peak_db_re_quiet": 57.0, "band_hz": "63-165", "peak_hz": 500.0, "share_800": 0.0006, "share_1600": 0.0002, "max_tooth": {"hz": 4000.0, "prom_db": 3.5, "re_quiet_db": -2.7}, "dma_corr": -0.049, "bt_comb": false}]`
-
-### C1_3 - FAIL
-
-capture: `C1_3.wav`, 74.88 s, 1 ch, ch0 silence floor -86.312 dBFS (-87.877 A); quiet mode: 68.53 s kept, 6.0 s excluded in 1 burst(s), quiet block level -86.47 dBFS
-
-> Note: 1 low-frequency burst(s) (6 s, at 30.25 s) were excluded as rumble. A supply-droop thump has the same spectrum: if their count or seconds exceed the baseline's (row '(q) excluded vs baseline'), review them by ear / eye.
-
-| metric | ch | value | baseline | delta | limit | verdict |
-|---|---|---|---|---|---|---|
-| (b) baseline repeatability | 0 | 0.28 | None |  | median level offset spread <= 1.0 dB | **PASS** |
-| (a) noise floor | 0 | -86.31 | -86.43 | 0.12 | +-0.5 dB (spread 0.08) | **PASS** |
-| (a) noise floor A-wtd | 0 | -87.88 | -87.92 | 0.04 | +-0.5 dB (spread 0.32) | **PASS** |
-| (b) spur targets | 0 | worst 2x40 Hz | C0 mean+sd | 4.49 | <= +3.0 dB | **FAIL** |
-| (b) new narrow peaks | 0 | 2 | 0 |  | none > +3.0 dB with >= 6.0 dB prominence | **FAIL** |
-| (c) envelope 0.78125 Hz | 0 | -43.21 | -39.92 | -3.29 | line: <= +3.0 dB or prom < 6.0 dB (prom 4.0) | **PASS** |
-| (c) envelope 2.34375 Hz | 0 | -47.62 | -39.83 | -7.79 | line: <= +3.0 dB or prom < 6.0 dB (prom -0.4) | **PASS** |
-| (c) envelope 7.5 Hz | 0 | -46.83 | -41.42 | -5.41 | line: <= +3.0 dB or prom < 6.0 dB (prom 0.4) | **PASS** |
-| (c) envelope lines | 0 | 0 | 0 |  | none 0.2-40 Hz > +3.0 dB with >= 6.0 dB prom | **PASS** |
-| (c) 1.28 s fold depth | 0 | -34.23 | -31.36 | -2.87 | <= +3.0 dB | **PASS** |
-| (q) quiet seconds kept |  | 68.53 | 6.0 s excluded |  | >= 30 s (blocks > median +6 dB, +-1 guard) | **PASS** |
-| (q) excluded bursts on BT comb |  | 0 | 0 |  | none: k*1600/800/400/266.7 Hz comb share < 0.05, no tooth >= 10 dB prom and > quiet +3 dB, 128 ms autocorr <= 0.3 | **PASS** |
-| (q) non-rumble burst excluded |  | 0 | 0 |  | none: excess 90 % < 300 Hz, >= 500 Hz not led (+3 dB / 5 dB over 20-250 Hz), no click, no comb | **PASS** |
-| (q) excluded vs baseline |  | 6.0 s in 1 | max 7 s in 2 (rumble bursts) |  | <= 12 s and <= 4 bursts (min of max + 5 s / +2, 2x max); baseline excluded spread 14 s (> 5: INCONCLUSIVE) | **PASS** |
-| (q) burst periodicity |  | - | None |  | interval CV >= 0.2 (lowest over runs of >= 4 bursts) | **PASS** |
-| (q) clicks in kept seconds |  | 0 | 0 |  | <= baseline max, interval CV >= 0.2 (1 ms > 1 kHz +20 dB, 15 dB over < 250 Hz) | **PASS** |
-| (e) zero runs |  | 0 | 0 |  | none >= 2048 samples | **PASS** |
-| (e) device record |  | REC_0037.wav | None |  | matched by REC_0037.WAV in C1_3's log (explicit name) | **PASS** |
-| (e) length vs device clock |  | 1198080 | 1199152 | -1072 | +-2048 | **PASS** |
-| (e) samples = device wav_smp |  | 1198080 | 1198080 | 0 | exact | **PASS** |
-| (e) device ov |  | 0 | 0 |  | 0 | **PASS** |
-| (e) device lost |  | 0 | 0 |  | 0 | **PASS** |
-| (e) device acct |  | 0 | 0 |  | 0 | **PASS** |
-| (e) block-clock drift vs C0 |  | -1 | -1..-1 | 0.0 | +-8 smp outside the C0 range | **PASS** |
-| (setup) gain/dsp/vor/ch |  | 31/0/0/1 | 31/0/0/1 |  | = baseline | **PASS** |
-
-- (b) spur targets: `["2x40 Hz +4.5 dB"]`
-
-- (b) new narrow peaks: `[{"hz": 78.0, "excess_db": 4.49, "prom_db": 7.27}, {"hz": 79.0, "excess_db": 5.64, "prom_db": 7.08}]`
-
-- (q) excluded bursts on BT comb: `[{"t_s": 30.25, "dur_s": 6.0, "peak_db_re_quiet": 53.2, "band_hz": "60-182", "peak_hz": 98.0, "share_800": 0.0, "share_1600": 0.0, "max_tooth": {"hz": 4000.0, "prom_db": 1.8, "re_quiet_db": 13.0}, "dma_corr": 0.0, "bt_comb": false}]`
+On the reviewer's host (C1_1 against C0_1..3) every case, the uninjected host included, FAILS. The one pass is a
+sensitivity limit, not a place to hide: one second at 11 % duty at the floor's own level adds 0.03 dB to the
+300-600 Hz floor and lifts that octave's loudest second by about 1 dB, inside the 0.9 dB by which radio-off repeats
+differ (1/3-octave bands give about 1 dB as well). The same train 10 dB stronger, longer or periodic FAILS.
