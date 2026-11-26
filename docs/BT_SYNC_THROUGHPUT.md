@@ -247,6 +247,23 @@ Expected on silicon: ~55 KB/s (E1 + `ui=0` is the upper bound; 500 ms pacing kee
   no-hold TX path: re-run M3 with these defaults after the merge. S3's F2 row also asks for a cap of 3-4 frames per
   `xrec_poll`, which this branch does not add (outside recording one `xrec_poll` may now read ~8 KiB, ~12 chunks).
 
+## 6b. Silicon confirmation of the defaults (2026-11-26 01:25, run F2)
+
+Bench image of `feat/sync-throughput-defaults` (a4c23dc: coalesced writes, BTC wrap fix patch 0046, paced BT screen),
+`BTBENCH.RUN` = `secs=200 stat_secs=50` (no knobs: the new defaults), Pixel 8 within 30 cm, app "Sync now".
+
+| Window | Bps | write avg | ACL avg | ACL latency mean | all 4 ACL credits held |
+|---|---|---|---|---|---|
+| 1 (sync starting) | 31,789 | 976 B | 975 B | 56 ms | 38 % |
+| 2 | **57,110** | 981 B | 990 B | 57 ms | 68 % |
+| 3 | **56,595** | 982 B | 991 B | 58 ms | 69 % |
+| 4 | **56,312** | 981 B | 990 B | 57 ms | 67 % |
+
+Steady state **56.3-57.1 KB/s** (was 38.4-39.4 KB/s before: **+46 %**), every ACL packet a full 990-byte frame
+(patch 0046 removed the short frames at BTC's ring wrap), `cong=0`. The link is air-limited from here (the 8-credit
+image gave no gain); EDR (section 7) is the next lever. Run F1 (same image, first run after the flash) produced no
+`tp` lines because the phone's "Sync now" tap did not register; it is not used.
+
 ## 7. Next lever: EDR
 
 At ~860 B per ACL packet the link moves ~77 ACL packets/s in steady state, which fits basic rate (DH5, 339 B per
