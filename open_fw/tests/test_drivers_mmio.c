@@ -141,6 +141,15 @@ static struct {
     uint32_t sdio_cmd18_cnt;
     uint32_t sdio_cmd24_cnt;
     uint32_t sdio_cmd25_cnt;
+    /* SD card state machine (R1 CURRENT_STATE) and fault injection for the busy / BCI / lost-CMD12 tests */
+    uint32_t sdio_state;         /* 0 idle, 4 tran, 5 data, 6 rcv, 7 prg */
+    uint32_t sdio_prg_polls;     /* CMD13 polls a written block stays in prg (busy, DAT0 low) */
+    uint32_t sdio_prg_left;
+    uint32_t sdio_bci_single;    /* next N CMD24: the app task "was preempted" past the busy end: DTO + bit 13 (BCI) */
+    int      sdio_bci_multi;     /* CMD25 of >1 block: bit 13 (BCI) at DTO, as the inter-block busy ends before it */
+    uint32_t sdio_drop_cmd12;    /* next N CMD12 get no response (RTO); the card keeps its state (streaming) */
+    uint32_t sdio_fail_cmd24;    /* next N CMD24 get no response (RTO) */
+    uint32_t sdio_illegal;       /* data commands sent while the card was not in tran (busy / streaming) */
     uint8_t  *sd_sectors;
     uint32_t sd_num_sectors;
 
@@ -260,6 +269,8 @@ static void st7735s_on_byte(int is_data, uint8_t b)
     }
 }
 
+static void test_sd_busy_bci_and_recovery(sd_card_t *card);
+
 static void sdio_exec_cmd(uint32_t val)
 {
     uint32_t cmd = val & 0x3Fu;
@@ -271,6 +282,9 @@ static void sdio_exec_cmd(uint32_t val)
 
     switch (cmd) {
     case 0u: /* CMD0 GO_IDLE */
+        g_soc.sdio_state        = 0u;
+        g_soc.sdio_prg_left     = 0u;
+        g_soc.sdio_blocks_rem   = 0u;
         g_soc.sdio_selected     = 0;
         g_soc.sdio_app_cmd      = 0;
         g_soc.sdio_acmd41_polls = 0;
@@ -307,20 +321,51 @@ static void sdio_exec_cmd(uint32_t val)
     }
     case 7u: /* CMD7 SELECT_CARD */
         g_soc.sdio_selected = 1;
+        g_soc.sdio_state    = 4u;
         g_soc.sdio_resp[0] = 0x00000700u;
         break;
-    case 12u: /* CMD12 STOP_TRANSMISSION */
+    case 12u: /* CMD12 STOP_TRANSMISSION (R1b) */
+        if (g_soc.sdio_drop_cmd12 > 0u) {
+            g_soc.sdio_drop_cmd12--;
+            g_soc.sdio_rintsts |= SDIO_INT_RTO;
+            break;
+        }
+        if (g_soc.sdio_state == 5u) {
+            g_soc.sdio_state = 4u;
+        } else if (g_soc.sdio_state == 6u) {
+            g_soc.sdio_state    = 7u;
+            g_soc.sdio_prg_left = g_soc.sdio_prg_polls;
+        } else {
+            g_soc.sdio_rintsts |= SDIO_INT_RTO;   /* illegal in tran / prg: no response */
+            break;
+        }
         g_soc.sdio_blocks_rem = 0u;
+        g_soc.sdio_fifo_pos   = g_soc.sdio_fifo_len;
         g_soc.sdio_resp[0] = 0x00000900u;
         break;
-    case 13u: /* CMD13 SEND_STATUS */
+    case 13u: /* CMD13 SEND_STATUS: R1 with the current state; prg ends after sdio_prg_polls polls */
         g_soc.sdio_last_cmd13 = val;
-        g_soc.sdio_resp[0] = 0x00000900u; /* READY_FOR_DATA | TRAN */
+        if (g_soc.sdio_state == 7u) {
+            if (g_soc.sdio_prg_left > 0u) {
+                g_soc.sdio_prg_left--;
+            } else {
+                g_soc.sdio_state = 4u;
+            }
+        }
+        g_soc.sdio_resp[0] = (g_soc.sdio_state << 9) | ((g_soc.sdio_state == 4u) ? 0x100u : 0u);
         break;
     case 17u: /* CMD17 READ_SINGLE_BLOCK */
     case 18u: /* CMD18 READ_MULTIPLE_BLOCK (finite or BYTCNT=0 open-ended) */
     {
+        if (g_soc.sdio_state != 4u) {
+            g_soc.sdio_illegal++;
+            g_soc.sdio_rintsts |= SDIO_INT_RTO;
+            break;
+        }
         if (cmd == 17u) g_soc.sdio_cmd17_cnt++; else g_soc.sdio_cmd18_cnt++;
+        if (cmd == 18u) {
+            g_soc.sdio_state = 5u;   /* streams until CMD12 */
+        }
         uint32_t lba = g_soc.sdio_arg;
         uint32_t blks = (cmd == 18u)
             ? ((g_soc.sdio_bytcnt == 0u) ? 0xFFFFFFFFu : (g_soc.sdio_bytcnt / 512u))
@@ -349,7 +394,18 @@ static void sdio_exec_cmd(uint32_t val)
     case 24u: /* CMD24 WRITE_BLOCK */
     case 25u: /* CMD25 WRITE_MULTIPLE_BLOCK */
     {
+        if (g_soc.sdio_state != 4u) {
+            g_soc.sdio_illegal++;
+            g_soc.sdio_rintsts |= SDIO_INT_RTO;
+            break;
+        }
+        if (cmd == 24u && g_soc.sdio_fail_cmd24 > 0u) {
+            g_soc.sdio_fail_cmd24--;
+            g_soc.sdio_rintsts |= SDIO_INT_RTO;
+            break;
+        }
         if (cmd == 24u) g_soc.sdio_cmd24_cnt++; else g_soc.sdio_cmd25_cnt++;
+        g_soc.sdio_state = 6u;
         uint32_t blks = (cmd == 25u) ? (g_soc.sdio_bytcnt / 512u) : 1u;
         assert(g_soc.sdio_selected);
         assert(blks >= 1u && g_soc.sdio_arg + blks <= g_soc.sd_num_sectors);
@@ -631,6 +687,18 @@ void openfw_mmio_wr32(uint32_t addr, uint32_t val)
             g_soc.sdio_fifo_pos = 0u;
             if (g_soc.sdio_blocks_rem == 0u) {
                 g_soc.sdio_rintsts |= SDIO_INT_DTO;
+                if ((g_soc.sdio_cmd & 0x3Fu) == 24u) {
+                    /* single block: programming (busy) follows */
+                    g_soc.sdio_state    = 7u;
+                    g_soc.sdio_prg_left = g_soc.sdio_prg_polls;
+                    if (g_soc.sdio_bci_single > 0u) {
+                        g_soc.sdio_bci_single--;
+                        g_soc.sdio_rintsts |= (1u << 13);   /* busy already over when the status is read */
+                        g_soc.sdio_state = 4u;
+                    }
+                } else if (g_soc.sdio_bci_multi && g_soc.sdio_bytcnt > 512u) {
+                    g_soc.sdio_rintsts |= (1u << 13);       /* inter-block busy cleared before DTO */
+                }
             }
         }
         return;
@@ -1661,6 +1729,7 @@ static void test_sdio_exfat_and_usb_msc(const char *exfat_img_path)
     assert(memcmp(tail_rd, tail_wr, sizeof(tail_wr)) == 0);
     assert(sd_read_blocks(&card, 16380u, 5u, tail_rd) != 0); /* Out of bounds rejected */
     assert(sd_flush(&card) == 0);
+    test_sd_busy_bci_and_recovery(&card);
 
     /* Now exercise full USB PHY + MUSB enumeration + SCSI BOT R/W over SDIO */
     usb_phy_det_arm();
@@ -1869,6 +1938,109 @@ static void test_sdio_exfat_and_usb_msc(const char *exfat_img_path)
     free(g_soc.sd_sectors);
     g_soc.sd_sectors = NULL;
     printf("[OK] sdio + exfat + usb_musb + usb_scsi + 0xE0 E2E MMIO (rx=%u tx=%u)\n", rx_p, tx_p);
+}
+
+/* Silicon 2026-11-26 (docs/BT_HW_RESULTS.md, "SD writes during XREC GETS"): RINTSTS bit 13 is the busy clear interrupt
+ * (BCI) on writes, the recorder ended on the first single-block write whose status was read after the busy ended, and
+ * every first CMD25 of a recording fell back to CMD24 (SDW_MDTO). The model: CMD13 reports the real card state, a
+ * written block stays in prg for sdio_prg_polls polls, data commands outside tran are illegal (no response). */
+static void fill_pattern(uint8_t *p, uint32_t n, uint32_t seed)
+{
+    for (uint32_t i = 0u; i < n; i++) {
+        p[i] = (uint8_t)((i * 31u + seed * 7u + (i >> 9)) & 0xFFu);
+    }
+}
+
+static void test_sd_busy_bci_and_recovery(sd_card_t *card)
+{
+    static uint8_t wr[16u * 512u];
+    static uint8_t rd[32u * 512u];
+    g_soc.sdio_prg_polls = 3u;      /* every write is followed by a busy period CMD13 has to wait out */
+    g_soc.sdio_illegal   = 0u;
+
+    /* 1. A CMD24 whose status is read after the card released busy (DTO + bit 13 = BCI) is a completed write.
+     *    Old driver: SDIO_INT_DATA_ERRS included bit 13 -> sd_write_blocks() == -1 -> REC_ERR write. */
+    fill_pattern(wr, 512u, 1u);
+    g_soc.sdio_bci_single = 1u;
+    uint32_t bci0 = card->wr_bci;
+    assert(sd_write_blocks(card, 9000u, 1u, wr) == 0);
+    assert(g_soc.sdio_bci_single == 0u && card->wr_bci == bci0 + 1u);
+    assert(sd_read_blocks(card, 9000u, 1u, rd) == 0 && memcmp(rd, wr, 512u) == 0);
+
+    /* 2. CMD25 with BCI at DTO (the inter-block busy ends before DTO, on every multi-block write): no fallback, the
+     *    single-block latch stays off. Old driver: SDW_MDTO + SDW_MFAIL, no_multi_write = 1 for the session. */
+    g_soc.sdio_bci_multi = 1;
+    card->no_multi_write = 0u;
+    g_soc.sdio_cmd24_cnt = g_soc.sdio_cmd25_cnt = 0u;
+    fill_pattern(wr, 7u * 512u, 2u);
+    assert(sd_write_blocks(card, 9001u, 7u, wr) == 0);
+    assert(card->no_multi_write == 0u && g_soc.sdio_cmd25_cnt == 1u && g_soc.sdio_cmd24_cnt == 0u);
+    assert(sd_read_blocks(card, 9001u, 7u, rd) == 0 && memcmp(rd, wr, 7u * 512u) == 0);
+    g_soc.sdio_bci_multi = 0;
+
+    /* 3. Recorder + XREC GETS interleaving: single-block writes (busy after each) between multi-block reads of another
+     *    file, with BCI on some writes. Every data command must find the card in tran. */
+    card->no_multi_write = 1u;      /* the silicon state after the first SDW_MFAIL */
+    fill_pattern(rd, 32u * 512u, 3u);
+    for (uint32_t i = 0u; i < 32u; i++) {
+        assert(sd_write_blocks(card, 10000u + i, 1u, rd + i * 512u) == 0);
+    }
+    for (uint32_t it = 0u; it < 24u; it++) {
+        fill_pattern(wr, 512u, 100u + it);
+        g_soc.sdio_bci_single = (it % 3u == 0u) ? 1u : 0u;
+        assert(sd_write_blocks(card, 11000u + it, 1u, wr) == 0);
+        assert(sd_read_blocks(card, 10000u, 32u, rd) == 0);       /* GETS chunk: CMD18 + CMD12 */
+        static uint8_t chk[512];
+        assert(sd_read_blocks(card, 11000u + it, 1u, chk) == 0 && memcmp(chk, wr, 512u) == 0);
+    }
+    assert(g_soc.sdio_illegal == 0u);
+    card->no_multi_write = 0u;
+
+    /* 4. A GETS read whose CMD12 response is lost leaves the card streaming (data state). Old driver: the read fails
+     *    and the next CMD24 is illegal in data state -> no response -> SDW_1_FAIL. New: CMD13 sees data, CMD12 again,
+     *    the read is retried and the write goes through. */
+    g_soc.sdio_drop_cmd12 = 1u;
+    assert(sd_read_blocks(card, 10000u, 32u, rd) == 0);
+    assert(g_soc.sdio_drop_cmd12 == 0u && g_soc.sdio_state == 4u);
+    fill_pattern(wr, 512u, 7u);
+    assert(sd_write_blocks(card, 11100u, 1u, wr) == 0);
+    /* A read that gives up (every CMD12 lost, the card still streaming): the next write recovers the state first. */
+    g_soc.sdio_drop_cmd12 = 10u;
+    assert(sd_read_blocks(card, 10000u, 32u, rd) != 0);
+    assert(g_soc.sdio_state == 5u);
+    g_soc.sdio_drop_cmd12 = 0u;
+    fill_pattern(wr, 512u, 8u);
+    assert(sd_write_blocks(card, 11101u, 1u, wr) == 0);
+    assert(sd_read_blocks(card, 11101u, 1u, rd) == 0 && memcmp(rd, wr, 512u) == 0);
+
+    /* 5. Transient CMD24 failures are retried in place (same LBA, same data): no gap, no duplicate. */
+    uint16_t r0 = card->wr_retries;
+    g_soc.sdio_fail_cmd24 = 2u;
+    card->no_multi_write = 1u;
+    fill_pattern(wr, 4u * 512u, 9u);
+    assert(sd_write_blocks(card, 11200u, 4u, wr) == 0);
+    assert(g_soc.sdio_fail_cmd24 == 0u && card->wr_retries == (uint16_t)(r0 + 2u) && card->reinits == 0u);
+    assert(sd_read_blocks(card, 11200u, 4u, rd) == 0 && memcmp(rd, wr, 4u * 512u) == 0);
+
+    /* 6. Four failures in a row: three soft retries, then an in-place re-init, then success. */
+    g_soc.sdio_fail_cmd24 = 3u;
+    fill_pattern(wr, 512u, 10u);
+    assert(sd_write_blocks(card, 11300u, 1u, wr) == 0);
+    assert(card->reinits == 1u && card->initialized && card->no_multi_write == 1u);
+    assert(sd_read_blocks(card, 11300u, 1u, rd) == 0 && memcmp(rd, wr, 512u) == 0);
+
+    /* 7. A card that never accepts the write: bounded (soft tries + re-init tries), then -1; the card stays usable. */
+    g_soc.sdio_fail_cmd24 = 1000u;
+    uint32_t c24 = g_soc.sdio_fail_cmd24;
+    assert(sd_write_blocks(card, 11400u, 1u, wr) != 0);
+    assert(c24 - g_soc.sdio_fail_cmd24 == 5u);     /* SDIO_WR_SOFT_TRIES + SDIO_WR_REINIT_TRIES */
+    g_soc.sdio_fail_cmd24 = 0u;
+    assert(card->initialized && sd_write_blocks(card, 11400u, 1u, wr) == 0);
+    card->no_multi_write = 0u;
+    assert(g_soc.sdio_illegal == 0u);
+    g_soc.sdio_prg_polls = 0u;
+    printf("[PASS] SDIO write BCI (bit 13) is completion, busy/stream state recovered before data commands, "
+           "bounded write retries + re-init\n");
 }
 
 int main(int argc, char **argv)

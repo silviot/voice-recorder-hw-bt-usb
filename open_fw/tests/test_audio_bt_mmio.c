@@ -527,10 +527,22 @@ static int mem_read_sectors(void *ctx, uint32_t lba, uint32_t count, void *buf)
 }
 
 static int g_sd_fail_after = -1;
+static uint32_t g_sd_fail_skip;    /* transient fault: let this many writes through, then ... */
+static uint32_t g_sd_fail_n;       /* ... fail this many, then succeed again */
+static uint32_t g_sd_fail_hits;
 
 static int mem_write_sectors(void *ctx, uint32_t lba, uint32_t count, const void *buf)
 {
     (void)ctx;
+    if (g_sd_fail_n > 0u) {
+        if (g_sd_fail_skip > 0u) {
+            g_sd_fail_skip--;
+        } else {
+            g_sd_fail_n--;
+            g_sd_fail_hits++;
+            return -1;
+        }
+    }
     if (g_sd_fail_after >= 0) {
         if (g_sd_fail_after == 0) {
             return -1;
@@ -950,6 +962,50 @@ static void test_recorder(const char *exfat_img_path)
     assert(exfat_find_path(&vol, "/record/REC_0007.wav", &ent8b) == 0 && ent8b.size == 44u + 4096u);
     recorder_test_set_split_bytes(0u);
 
+    /* Recording #9 (silicon 2026-11-26, SDW_1_FAIL during XREC GETS): a write error that reaches the recorder is retried
+     * with the unconsumed rest of the block, for every write position inside a block (sector-buffer fill, direct
+     * multi-sector run, cluster allocation bitmap / FAT): the recording goes on, the WAV is bit-exact, nothing is
+     * written twice, skipped or reordered. */
+    recorder_set_channels(1u);
+    recorder_set_dsp_profile(AUDIO_DSP_BYPASS);
+    for (uint32_t skip = 0u; skip < 8u; skip++) {
+        static int16_t exp9[4u * 2048u];
+        assert(recorder_start(&vol, 1) == 0);
+        char name9[24];
+        snprintf(name9, sizeof(name9), "/record/%s", recorder_get_filename());
+        for (uint32_t f = 0u; f < 4u; f++) {
+            if (f == 1u) {
+                g_sd_fail_skip = skip;
+                g_sd_fail_n    = 1u + (skip & 1u);      /* one or two failures in a row */
+                g_sd_fail_hits = 0u;
+            }
+            sim_dma_deliver_frame(50 * (int32_t)(f + 1u + skip), 9000, &exp9[f * 2048u]);
+            recorder_poll();
+            assert(recorder_has_error() == 0 && recorder_is_saving() == 1);
+        }
+        assert(g_sd_fail_n == 0u && g_sd_fail_hits == 1u + (skip & 1u));
+        assert(recorder_stop() == 0);
+        exfat_entry_t ent9;
+        assert(exfat_find_path(&vol, name9, &ent9) == 0);
+        assert(ent9.size == 44u + 4u * 4096u);
+        static uint8_t wav9[44u + 4u * 4096u];
+        uint32_t got9 = 0u;
+        assert(exfat_read_file(&vol, &ent9, 0u, wav9, sizeof(wav9), &got9) == 0 && got9 == sizeof(wav9));
+        wav_info_t info9;
+        assert(wav_parse_header(wav9, &info9) == 0 && info9.data_bytes == 4u * 4096u);
+        assert(memcmp(wav9 + 44u, exp9, 4u * 4096u) == 0);
+    }
+    g_sd_fail_skip = g_sd_fail_n = 0u;
+    {
+        /* fsck.exfat -n checks this state too (the Makefile runs it on <image>.retry) */
+        char retry_path[512];
+        snprintf(retry_path, sizeof(retry_path), "%s.retry", exfat_img_path);
+        FILE *rf = fopen(retry_path, "wb");
+        assert(rf != NULL);
+        assert(fwrite(g_soc.sd_buf, 1u, (size_t)sz, rf) == (size_t)sz);
+        fclose(rf);
+    }
+
     /* Restore clean snapshot for fsck.exfat validation */
     memcpy(g_soc.sd_buf, sd_clean, (size_t)sz);
     free(sd_clean);
@@ -1013,7 +1069,7 @@ static void test_recorder(const char *exfat_img_path)
     free(g_soc.sd_buf);
     g_soc.sd_buf     = NULL;
     g_soc.sd_sectors = 0u;
-    printf("[OK] recorder -> exFAT (REC_0001..0004 + checkpoint recovery + write/close fault injection)\n");
+    printf("[OK] recorder -> exFAT (REC_0001..0004 + checkpoint recovery + write/close fault injection + transient write retry)\n");
 }
 
 /* ============================================================================

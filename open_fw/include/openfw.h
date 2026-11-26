@@ -247,6 +247,10 @@ typedef struct {
     uint8_t  async_last_desc;
     uint8_t  no_multi_write;
     uint32_t async_t0_us;
+    uint8_t  need_status;     /* card state not verified since the last CMD12 / error: CMD13 (+ CMD12) before the next data command */
+    uint8_t  reinits;         /* in-place re-initialisations by the write retry path (saturates at 255) */
+    uint16_t wr_retries;      /* sector writes that needed a retry (saturates) */
+    uint32_t wr_bci;          /* write data phases that reported RINTSTS bit 13 = busy clear (benign, counted only) */
 } sd_card_t;
 
 int      sd_init(sd_card_t *card);

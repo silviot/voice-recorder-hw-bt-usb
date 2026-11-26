@@ -41,6 +41,7 @@
 
 /* Checkpoint every ~160 KiB (~5s mono / ~2.5s stereo) and after first 4 KiB */
 #define REC_CKPT_INTERVAL_BYTES 163840u
+#define REC_WRITE_RETRIES       2u      /* extra exfat_write attempts for one PCM block (rec_write_retry) */
 /* Split WAV files safely below signed 32-bit / 4 GiB RIFF limit (~2 GiB) */
 #define REC_MAX_PCM_BYTES       0x7FFF0000u
 #if defined(OPENFW_HOST_MMIO)
@@ -289,6 +290,32 @@ static void recorder_checkpoint_if_due(void)
     }
 }
 
+/* exfat_write() with bounded retries. The SD driver already retries every sector (state recovery, re-init); this
+ * layer covers a failure that surfaced anyway (e.g. a cluster allocation that failed and was rolled back). exfat_write
+ * advances bytes_written by exactly the bytes it consumed, also when it fails part-way, so a retry continues with the
+ * unconsumed remainder: nothing is written twice, skipped or reordered. */
+static int rec_write_retry(const int16_t *pcm, uint32_t nbytes)
+{
+    const uint8_t *src = (const uint8_t *)pcm;
+    uint64_t bw0 = g_writer.bytes_written;
+    for (uint32_t attempt = 0u; attempt <= REC_WRITE_RETRIES; attempt++) {
+        uint64_t took = g_writer.bytes_written - bw0;
+        if (took > (uint64_t)nbytes) {
+            return -1;                               /* cannot happen: the writer took more than it was given */
+        }
+        if (attempt > 0u) {
+            rec_log_err("wretry", g_pcm_bytes + (uint32_t)took);
+        }
+        if (exfat_write(&g_writer, src + took, nbytes - (uint32_t)took) == 0) {
+            return 0;
+        }
+        if (!g_writer.active) {
+            return -1;
+        }
+    }
+    return -1;
+}
+
 static void rec_vor_emit_cb(void *user, const int16_t *pcm, size_t num_frames)
 {
     (void)user;
@@ -311,7 +338,7 @@ static void rec_vor_emit_cb(void *user, const int16_t *pcm, size_t num_frames)
 #if OPENFW_BENCH_MEAS
     uint32_t bm_t0 = (uint32_t)us_timer_now();
 #endif
-    if (exfat_write(&g_writer, pcm, nbytes) != 0) {
+    if (rec_write_retry(pcm, nbytes) != 0) {
         rec_log_err("write", g_pcm_bytes);
         g_rec_error = 1;
         /* Best-effort commit of whatever was already flushed */

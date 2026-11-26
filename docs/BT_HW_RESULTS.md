@@ -1378,6 +1378,36 @@ passes but C2/C3 fail -> L2 (radio up, no ACL during REC); C1 fails -> L3 or no 
 means the controller is not fully off after a session (a bug to fix before anything else). C5 is today's shipped
 headphones behaviour: report it, it gates nothing here.
 
+### SD writes during XREC GETS: recording ended by `SDW_1_FAIL` (2026-11-26, fixed in `fix/sd-concurrent-rw`)
+
+Image `exp/overnight-s3-rec` (bench, mono, gain 31). In 3/3 runs where the Pixel downloaded finished recordings with
+GETS while the recorder recorded (C3p), the recording ended early: `SDW_1_FAIL a=<LBA> b=1` then `REC_ERR write=<pcm
+bytes>`, `acct=2048` (one 2048-frame block not written), `ov=0 lost=0`, `gets_b` 180864..869676. Radio off (C0) and BT
+idle (C1) runs never failed. Every recording also showed one `SDW_MDTO a=0x00002018 b=0` + `SDW_MFAIL a=0x000Bxx41 b=7`
+at its start (the first `CMD25`: 7 sectors right after the header sector at the cluster start), recovered by falling
+back to `CMD24` for the rest of the session.
+
+Decoding: `SDW_MDTO a` = RINTSTS at DTO, `b` = (DTO timeout << 16) | CMD12 failed; `0x2018` = DTO + TXDR + bit 13 with
+DTO and CMD12 fine, so bit 13 alone failed the write. `SDW_1_FAIL` had no inner log (no FIFO / R1 / ready-timeout
+line), so the CMD24 failed at the command or at the DTO status check, without any long stall (`gap_max_us` 64 ms).
+Root cause (inferred from the above; the failing stage was not logged, the new `SDW_1_CMD` / `SDW_1_DTO` lines will
+show it if it ever recurs): bit 13 is the busy-clear interrupt on writes (`sd_init()` enables it in `CARDTHRCTL`, see
+`SL6801_HW76_HARDWARE.md`), and the driver counted it as a data error. A `CMD24` sees it when the app task (priority 1,
+which runs the recorder, XREC and all SD I/O sequentially; GETS reads and recorder writes never overlap) is preempted
+between DTO and the status read for longer than the card's programming time. During GETS the BT tasks (BTC 4 .. ctrl
+8) run constantly (`idle_min_pm` 63..106 vs ~400 idle) and the window opens; the interleaved reads are not the cause.
+The recorder then ended the recording on the first failed block.
+
+Fix (`open_fw/src/sdio.c`, `open_fw/src/recorder.c`): write data phases ignore bit 13 (counted in `wr_bci`), so
+`CMD25` works again; the card state is verified (`CMD13`; `CMD12` if stuck in data/rcv; busy wait) before the next data
+command after every `CMD12` or error; a failed sector write is retried in place (idempotent) with recovery, then
+after an in-place re-init; reads get one retry; the recorder retries the unconsumed rest of a block twice before
+giving up. Host tests: `test_sd_busy_bci_and_recovery` in `tests/test_drivers_mmio.c` (card state model: prg busy,
+BCI, lost CMD12, CMD24 faults; the old driver fails scenarios 1, 2, 4 and 5) and recording #9 in
+`tests/test_audio_bt_mmio.c` (transient faults at every write position: bit-exact WAV, fsck clean).
+What to look for on the re-run: no `SDW_MDTO` / `SDW_MFAIL`; `SDW_RETRY` lines (counted in `sd_err`) mean a retry
+was needed and the recording survived; `rec=time`, `acct=0`.
+
 ### M3 — CPU and timing margin with today's firmware (~1.5 h, mostly unattended)
 
 Gain 20, mono, DSP 1 (the user's usual settings; audio is not analysed), cable may stay in (charging is fine here).
