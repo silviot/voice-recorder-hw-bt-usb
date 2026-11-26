@@ -456,6 +456,8 @@ every few seconds and dropped the link after 5-9 s.
   reconnected at 09:11 with the stored key (no auth failure) and completed a sync (`done`, nothing new).
   Watch over the next days: a recurrence would now show as a working reconnect instead of Key Missing.
 
+**Open (2026-11-26):** `REC_0052.wav` (stereo: 2,203,692 B = 34.4 s at 16 kHz x 2 ch; the app's import is a mono downmix) plays only in the LEFT headphone; the stereo audiobook plays on both. Code read: capture (`audio_dma.c` ch1+ch2 mux, AMIC2 PGA), DSP (`audio_dsp.c` all profiles process both channels) and the headset path (`hp_sink_pull` mono->stereo) look right. Unverified: the file's right-channel level (needs the card). Suspects: AMIC2 (second mic) silent / no bias on this board, or the player's stereo-file path to the headset. Workaround: record mono (Settings channels = 1).
+
 ## Exp 1 stages A and B: how to run
 
 Probe image for plan M5 Exp 1 stage A and stage B (step 4): `bt_ctrl` (plan M1) drives the real RW-BT ROM through
