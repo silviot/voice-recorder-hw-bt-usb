@@ -31,12 +31,22 @@ static uint32_t g_reads;            /* read_sectors calls */
 static uint32_t g_writes;           /* write_sectors calls */
 static uint32_t g_read_cost_us;     /* fake time one read_sectors call takes */
 static uint32_t g_now_us = 5000000u;
+static uint32_t g_tx_room_cap;   /* 0 = unlimited; else all-or-nothing send limit (like bt_xrec_bluedroid xo_send) */
+
+static uint32_t fake_tx_free(void *user)
+{
+    (void)user;
+    return g_tx_room_cap ? g_tx_room_cap : 65536u;
+}
 
 static int cap_send(void *user, const uint8_t *data, uint16_t len)
 {
     (void)user;
     if (g_send_fail > 0) {
         g_send_fail--;
+        return -1;
+    }
+    if (g_tx_room_cap != 0u && len > g_tx_room_cap) {
         return -1;
     }
     assert(g_out_len + len < sizeof(g_out));
@@ -716,6 +726,7 @@ int main(int argc, char **argv)
     xrec_ops_t ops;
     memset(&ops, 0, sizeof(ops));
     ops.send = cap_send;
+    ops.tx_free = fake_tx_free;
     ops.now_ms = fake_now;
     xrec_init(&g_x, &g_vol, &ops, NULL);
     xrec_set_bound_key(&g_x, g_key);
@@ -760,6 +771,11 @@ int main(int argc, char **argv)
     assert(!exists("/cassini/REC_0001.cwx"));
     /* PUTEND is idempotent until the next PUT: a retry after a lost reply gets the same OK */
     assert(strcmp(cmd("+XREC:PUTEND"), "+XREC:OK,PUTEND,700\r\n") == 0);
+    /* Any next PUT header (even one rejected early on length/offset with ERR,ARG) invalidates the previous PUTEND */
+    clear_out();
+    rx_str("+XREC:PUT,0,9999,0,REC,REC_0001.cwx:");
+    assert(strcmp(g_out, "+XREC:ERR,ARG\r\n") == 0);
+    assert(strcmp(cmd("+XREC:PUTEND"), "+XREC:ERR,NOPUT\r\n") == 0);
     {
         const char *l = ls();
         assert(strstr(l, "+XREC:F,700,REC_0001.cwx\r\n") != NULL && strstr(l, "+XREC:F,300,REC_0001.wav\r\n") != NULL);
@@ -923,10 +939,11 @@ int main(int argc, char **argv)
     make_wav("REC_0003.wav", c, 100u);
     expect_put_ok(0u, "REC,REC_0003.cwx", a, 100u);
     assert(strcmp(cmd("+XREC:DEL,REC_0003.WAV"), "+XREC:OK,DEL\r\n") == 0);
-    assert(strcmp(cmd("+XREC:PUTEND"), "+XREC:ERR,NOENT\r\n") == 0);
+    assert(!exists("/record/.xrec_rec.tmp"));                  /* temp closed & removed at once when its .wav is deleted */
+    make_wav("REC_0003.wav", c, 100u);                         /* next recording reuses REC_0003.wav before PUTEND */
+    assert(strcmp(cmd("+XREC:PUTEND"), "+XREC:ERR,NOENT\r\n") == 0);   /* old sidecar NEVER attaches to the new .wav */
     assert(!exists("/record/REC_0003.cwx") && !exists("/record/.xrec_rec.tmp"));
     assert(strcmp(cmd("+XREC:PUTEND"), "+XREC:ERR,NOPUT\r\n") == 0);
-    make_wav("REC_0003.wav", c, 100u);
     expect_put_ok(0u, "REC,REC_0003.cwx", a, 100u);
     assert(strcmp(cmd("+XREC:PUTEND"), "+XREC:OK,PUTEND,100\r\n") == 0);
 
@@ -1043,6 +1060,15 @@ int main(int argc, char **argv)
         g_now += 2000u;
         xrec_get_xfer(&g_x, g_now, &x);
         assert(!x.active);
+        /* an upload that aborts mid-way (SDIO) clears the upload view at once instead of holding stale progress */
+        expect_put_ok(0u, "REC,REC_0001.cwx", a, 600u);
+        xrec_get_xfer(&g_x, g_now, &x);
+        assert(x.active && x.upload && x.done == 600u);
+        g_fail_writes = 1;
+        assert(strcmp(put(600u, "REC,REC_0001.cwx", b, 40u), "+XREC:ERR,SDIO\r\n") == 0);
+        g_fail_writes = 0;
+        xrec_get_xfer(&g_x, g_now, &x);
+        assert(!x.active);
 
         /* a UTF-8 name longer than the display copy is cut on a character boundary (12 x U+00E0 = 24 bytes) */
         static const char utf_name[] = "\xC3\xA0\xC3\xA0\xC3\xA0\xC3\xA0\xC3\xA0\xC3\xA0\xC3\xA0\xC3\xA0\xC3\xA0\xC3\xA0"
@@ -1108,6 +1134,33 @@ int main(int argc, char **argv)
         assert(strcmp(cmd("+XREC:DBG,PACE,48000,1"), "+XREC:ERR,ARGS\r\n") == 0);
         assert(strcmp(cmd("+XREC:DBG,PACE,48000,5000,1"), "+XREC:ERR,ARGS\r\n") == 0);
         assert(strncmp(cmd("+XREC:DBG,PACE,48000,5000"), "+XREC:DBG,PACE,rate=48000,budget_us=5000,", sizeof("+XREC:DBG,PACE,rate=48000,budget_us=5000,") - 1u) == 0);
+        /* Worst-case +XREC:DBG,LIVE with exactly XREC_REPLY_MAX bytes free in the TX ring must not be dropped */
+        {
+            bench_meas_rec_t *wr = &g_bench_meas.cur;
+            memset(wr, 0xFF, sizeof(*wr));
+            memcpy(wr->file, "ABCDEFGHIJKLMNO", 16u);
+            wr->idle_min_pm = 65534u;
+            wr->dma_blk = 0x1FFFFFu;
+            wr->ov = 4000000000u;
+            wr->comp = 1000000000u;
+            wr->wav_frames = 3219126272u;
+            wr->el_ms = 134217600u;
+            wr->el_us_rem = 0u;
+            wr->b_el_ms = 134217600u;
+            wr->b_el_us_rem = 0u;
+            wr->b_first_blk = 0u;
+            wr->b_last_blk = 0x1FFFFFu;
+            g_bench_meas.take_max_us = 0xFFFFFFFFu;
+            g_bench_meas.gets_b_total = g_bench_meas.gets_frames_total = 0xFFFFFFFFu;
+            g_bench_meas.idle_pm = g_bench_meas.app_pm = g_bench_meas.btc_pm = 0xFFFFu;
+            g_bench_meas.cpu_win_ms = 0xFFFFu;
+            g_tx_room_cap = XREC_REPLY_MAX;
+            r = cmd("+XREC:DBG");
+            g_tx_room_cap = 0u;
+            n = strlen(r);
+            assert(n > 0u && n <= XREC_REPLY_MAX && strncmp(r, "+XREC:DBG,LIVE,", 15) == 0);
+            assert(strstr(r, ",take_us=4294967295\r\n") != NULL);
+        }
         xrec_on_disconnect(&g_x);                            /* a new link: DBG needs AUTH like every data command */
         assert(strcmp(cmd("+XREC:DBG"), "+XREC:ERR,LOCKED\r\n") == 0);
         authenticate();

@@ -2662,6 +2662,10 @@ int bt_hp_connect_addr(const uint8_t bda[6], int pair)
     if (hp_rows_refused("connect")) {
         return -1;
     }
+    if (!pair && !bonded(bda)) {
+        pair_again("no stored key");   /* a connect without a pairing window cannot pair: refuse at once */
+        return -1;
+    }
     if (pair) {
         const char *why = gate_block();
         if (why != NULL) {

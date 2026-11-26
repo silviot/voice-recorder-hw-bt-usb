@@ -1005,6 +1005,8 @@ static void handle_get_common(xrec_ctx_t *ctx, const char *args, int is_stream)
     xrec_poll(ctx);
 }
 
+static void abort_staged_put(xrec_ctx_t *ctx);
+
 static void handle_del(xrec_ctx_t *ctx, const char *filename)
 {
     if (!ctx->vol) {
@@ -1035,6 +1037,10 @@ static void handle_del(xrec_ctx_t *ctx, const char *filename)
     char cwx_name[80];
     if (swap_ext3(cwx_name, (uint32_t)sizeof(cwx_name), filename, ".wav", ".cwx")) {
         (void)exfat_delete_file(ctx->vol, "/record", cwx_name);
+        if (ctx->put_stream_mode == XREC_PUT_REC && str_eq_ci(ctx->put_stream_name, cwx_name)) {
+            abort_staged_put(ctx);
+            ctx->put_rec_deleted = 1u;
+        }
     }
     static const char ok[] = "+XREC:OK,DEL\r\n";
     send_text(ctx, ok, (int)(sizeof(ok) - 1u));
@@ -1124,6 +1130,9 @@ static void abort_staged_put(xrec_ctx_t *ctx)
     ctx->put_has_last       = 0u;
     ctx->put_written        = 0u;
     ctx->put_stream_name[0] = '\0';
+    if (ctx->xfer_upload) {
+        ctx->xfer_valid = 0u;
+    }
 }
 
 static void handle_put_complete(xrec_ctx_t *ctx)
@@ -1257,6 +1266,11 @@ static void handle_putend(xrec_ctx_t *ctx)
         return;
     }
     if (!put_is_named(ctx->put_stream_mode)) {
+        if (ctx->put_rec_deleted) {
+            ctx->put_rec_deleted = 0u;
+            send_err(ctx, "NOENT");
+            return;
+        }
         if (ctx->put_done_valid) {
             /* repeated PUTEND after a lost reply: the commit already happened, answer it again */
             send_putend_ok(ctx, ctx->put_done_total);
@@ -1280,11 +1294,17 @@ static void handle_putend(xrec_ctx_t *ctx)
     if (rc == 0 && mode == XREC_PUT_REC && !rec_wav_exists(ctx, final_name)) {
         /* the recording was deleted during the upload: never leave an orphan sidecar */
         (void)exfat_delete_file(ctx->vol, dir, tmp);
+        if (ctx->xfer_upload) {
+            ctx->xfer_valid = 0u;
+        }
         send_err(ctx, "NOENT");
         return;
     }
     if (rc != 0 || exfat_replace_file(ctx->vol, dir, tmp, final_name) != 0) {
         (void)exfat_delete_file(ctx->vol, dir, tmp);
+        if (ctx->xfer_upload) {
+            ctx->xfer_valid = 0u;
+        }
         send_err(ctx, "SDIO");
         return;
     }
@@ -1315,6 +1335,9 @@ static void handle_ota(xrec_ctx_t *ctx)
     ctx->put_stream_name[0] = '\0';
     if (rc != 0 || exfat_replace_file(ctx->vol, "/", ".xrec_ota.tmp", "update.up") != 0) {
         (void)exfat_delete_file(ctx->vol, "/", ".xrec_ota.tmp");
+        if (ctx->xfer_upload) {
+            ctx->xfer_valid = 0u;
+        }
         send_err(ctx, "SDIO");
         return;
     }
@@ -1499,7 +1522,8 @@ static void handle_log_cmd(xrec_ctx_t *ctx, const char *args)
  *                       +XREC:ERR,NOENT when there is none (BENCH_MEAS_HIST are kept) */
 static void handle_dbg(xrec_ctx_t *ctx, const char *args)
 {
-    char line[24u + BENCH_MEAS_LINE_MAX];
+    _Static_assert(24u + BENCH_MEAS_LINE_MAX <= XREC_REPLY_MAX, "+XREC:DBG reply must fit XREC_REPLY_MAX");
+    char line[XREC_REPLY_MAX + 1u];
     int pos = 0;
     const bench_meas_rec_t *r = &g_bench_meas.cur;
     if (str_starts_with(args, ",PACE")) {
@@ -1547,7 +1571,7 @@ static void handle_dbg(xrec_ctx_t *ctx, const char *args)
         return;
     }
     if (*args == '\0') {
-        append_str(line, &pos, (int)sizeof(line), "+XREC:DBG,LIVE,");
+        append_str(line, &pos, (int)XREC_REPLY_MAX - 1, "+XREC:DBG,LIVE,");
     } else if (str_starts_with(args, ",REC,")) {
         const char *p = args + 5;
         uint32_t i = 0u;
@@ -1560,18 +1584,18 @@ static void handle_dbg(xrec_ctx_t *ctx, const char *args)
             send_err(ctx, "NOENT");
             return;
         }
-        append_str(line, &pos, (int)sizeof(line), "+XREC:DBG,REC,");
-        append_u32(line, &pos, (int)sizeof(line), i);
-        append_str(line, &pos, (int)sizeof(line), ",");
+        append_str(line, &pos, (int)XREC_REPLY_MAX - 1, "+XREC:DBG,REC,");
+        append_u32(line, &pos, (int)XREC_REPLY_MAX - 1, i);
+        append_str(line, &pos, (int)XREC_REPLY_MAX - 1, ",");
     } else {
         send_err(ctx, "ARGS");
         return;
     }
-    /* room for ",<cpu fields>\r\n" is kept by BENCH_MEAS_LINE_MAX (rec 432 B + cpu 107 B worst case) */
-    pos += (int)bench_meas_format_rec(r, ',', &line[pos], (uint32_t)((int)sizeof(line) - pos - 2));
+    /* Cap at XREC_REPLY_MAX - 2 before "\r\n" (rec 457 B + ',' + cpu 110 B = 568 B, reply <= 585 B <= 600 B) */
+    pos += (int)bench_meas_format_rec(r, ',', &line[pos], (uint32_t)XREC_REPLY_MAX - 1u - (uint32_t)pos);
     if (*args == '\0') {
-        append_str(line, &pos, (int)sizeof(line) - 2, ",");
-        pos += (int)bench_meas_format_cpu(&g_bench_meas, ',', &line[pos], (uint32_t)((int)sizeof(line) - pos - 2));
+        append_str(line, &pos, (int)XREC_REPLY_MAX - 1, ",");
+        pos += (int)bench_meas_format_cpu(&g_bench_meas, ',', &line[pos], (uint32_t)XREC_REPLY_MAX - 1u - (uint32_t)pos);
     }
     line[pos++] = '\r';
     line[pos++] = '\n';
@@ -1595,7 +1619,9 @@ static void put_refuse(xrec_ctx_t *ctx, uint32_t chunk_len, const char *err)
 static void try_start_put_header(xrec_ctx_t *ctx)
 {
     ctx->rx_line[ctx->rx_len] = '\0';
-    ctx->rx_len = 0u;
+    ctx->rx_len          = 0u;
+    ctx->put_done_valid  = 0u;
+    ctx->put_rec_deleted = 0u;
 
     const char *p = ctx->rx_line + 10; /* after "+XREC:PUT," */
     uint32_t off = 0u, chunk_len = 0u, crc = 0u;
@@ -1847,6 +1873,7 @@ void xrec_on_disconnect(xrec_ctx_t *ctx)
     ctx->put_active         = 0u;
     ctx->put_discard        = 0u;
     ctx->put_done_valid     = 0u;
+    ctx->put_rec_deleted    = 0u;
     ctx->put_target         = XREC_PUT_NONE;
     ctx->put_name[0]        = '\0';
     ctx->put_got            = 0u;

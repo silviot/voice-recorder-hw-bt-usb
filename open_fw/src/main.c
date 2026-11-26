@@ -2312,6 +2312,16 @@ static void run_bt_choice(void)
     }
 }
 
+#include "../bt_port/bt_hp_autoconn.h"
+
+static const bt_hp_autoconn_ops_t k_hp_autoconn_ops = {
+    .stream_ready = bt_hp_stream_ready,
+    .get_ui       = bt_hp_get_ui,
+    .connect_addr = bt_hp_connect_addr,
+    .stop         = bt_hp_stop,
+    .disconnect   = bt_hp_disconnect,
+};
+
 /*
  * When "BT" (AOUT_MODE_HEADPHONES) is selected as output and no headset stream
  * is ready yet, automatically start headphones mode (if off) and connect to
@@ -2326,7 +2336,6 @@ static int hp_auto_connect_for_play(void)
     }
 
     int started_here = !bt_hp_active();
-    uint32_t t0 = millis();
     if (started_here) {
         if (hp_start_session() != 0) {
             if (g_ui.toast_msg[0] == '\0') {
@@ -2338,8 +2347,8 @@ static int hp_auto_connect_for_play(void)
 
     bt_hp_ui_t u;
     bt_hp_get_ui(&u);
-    uint32_t seen_seq = u.msg_seq;
-    int tried_connect = 0;
+    bt_hp_autoconn_t ac;
+    bt_hp_autoconn_init(&ac, started_here, millis(), u.msg_seq);
     uint32_t last_ui = 0u;
     uint8_t shown_phase = 0u; /* 1=Starting, 2=Connecting */
 
@@ -2348,86 +2357,57 @@ static int hp_auto_connect_for_play(void)
         wdt_feed();
         bt_hp_poll();
         recorder_poll();
-        if (keys_read_rec_switch()) {
-            g_ui.toast_msg[0] = '\0';
-            backlight_wake(millis());
-            return 0;
-        }
 
+        int rec_sw = keys_read_rec_switch() != 0;
         uint32_t now = millis();
-        if (bt_lowbatt_service(now)) {
-            return 0;
-        }
+        int lowbatt = !rec_sw && bt_lowbatt_service(now);
 
-        int show = ui_poll_power_button(g_ui_screen, &g_ui, now);
-        key_event_t kev;
-        while (keys_pop_event(&kev)) {
-            if (!show || !kev.pressed) {
-                continue;
-            }
-            backlight_wake(kev.t_ms);
-            if (kev.key == KEY_BACK) {
-                g_ui.toast_msg[0] = '\0';
-                keys_ignore_held();
-                if (started_here && !bt_hp_stream_ready()) {
-                    (void)bt_hp_stop();
+        int show = 0;
+        int back_pressed = 0;
+        if (!rec_sw && !lowbatt) {
+            show = ui_poll_power_button(g_ui_screen, &g_ui, now);
+            key_event_t kev;
+            while (keys_pop_event(&kev)) {
+                if (!show || !kev.pressed) {
+                    continue;
                 }
-                return 0;
+                backlight_wake(kev.t_ms);
+                if (kev.key == KEY_BACK) {
+                    back_pressed = 1;
+                    break;
+                }
             }
         }
 
-        if (bt_hp_stream_ready()) {
-            bt_hp_get_ui(&u);
-            g_hp_msg_seen = u.msg_seq;
+        int rc = bt_hp_autoconn_step(&ac, now, rec_sw, lowbatt, back_pressed, &k_hp_autoconn_ops);
+        g_hp_msg_seen = ac.seen_seq;
+        if (rc == BT_HP_AC_READY) {
             g_ui.toast_msg[0] = '\0';
             keys_ignore_held();
             return 1;
         }
-
-        bt_hp_get_ui(&u);
-        if (u.state == BT_HP_ST_OFF || u.state == BT_HP_ST_FAULTED || u.state == BT_HP_ST_DEAD) {
-            ui_show_toast(ui_tr_bt(UI_BT_STR_HP_NOT_CONNECTED), UI_COL_AMBER, now, 2000u);
-            return 0;
-        }
-
-        if (u.state == BT_HP_ST_READY) {
-            if (!u.has_last && u.link == BT_HP_LINK_NONE) {
-                if (started_here) {
-                    (void)bt_hp_stop();
-                }
+        if (rc != BT_HP_AC_WAIT) {
+            if (rec_sw) {
+                g_ui.toast_msg[0] = '\0';
+                backlight_wake(millis());
+            } else if (back_pressed) {
+                g_ui.toast_msg[0] = '\0';
+                keys_ignore_held();
+            } else if (rc == BT_HP_AC_FAIL_NOT_CONNECTED) {
                 ui_show_toast(ui_tr_bt(UI_BT_STR_HP_NOT_CONNECTED), UI_COL_AMBER, now, 2000u);
-                return 0;
-            }
-            if (u.has_last && u.link == BT_HP_LINK_NONE && !tried_connect) {
-                tried_connect = 1;
-                if (bt_hp_connect_addr(u.last, 0) != 0) {
-                    ui_show_toast(ui_tr_bt(UI_BT_STR_CONNECT_FAILED), UI_COL_AMBER, now, 2000u);
-                    return 0;
-                }
-            }
-        }
-
-        if (u.msg_seq != seen_seq) {
-            seen_seq = u.msg_seq;
-            g_hp_msg_seen = seen_seq;
-            if (u.msg == BT_HP_MSG_CONNECT_FAIL || u.msg == BT_HP_MSG_PAIR_AGAIN ||
-                u.msg == BT_HP_MSG_UNSUPPORTED) {
-                const char *t = hp_msg_text(u.msg);
+            } else if (rc == BT_HP_AC_FAIL_CONNECT) {
+                ui_show_toast(ui_tr_bt(UI_BT_STR_CONNECT_FAILED), UI_COL_AMBER, now, 2000u);
+            } else if (rc == BT_HP_AC_FAIL_MSG) {
+                const char *t = hp_msg_text(ac.fail_msg);
                 ui_show_toast(t[0] ? t : ui_tr_bt(UI_BT_STR_HP_NOT_CONNECTED), UI_COL_AMBER, now, 2000u);
-                return 0;
             }
-        }
-
-        if ((uint32_t)(now - t0) >= BT_HP_CONNECT_TO_MS) {
-            ui_show_toast(ui_tr_bt(UI_BT_STR_CONNECT_FAILED), UI_COL_AMBER, now, 2000u);
             return 0;
         }
 
-        uint8_t phase = (u.state == BT_HP_ST_READY) ? 2u : 1u;
-        if (phase != shown_phase) {
-            shown_phase = phase;
-            ui_show_toast(ui_tr_bt(phase == 2u ? UI_BT_STR_CONNECTING : UI_BT_STR_STARTING),
-                          UI_COL_CYAN, now, BT_HP_CONNECT_TO_MS + 1000u);
+        if (ac.phase != shown_phase) {
+            shown_phase = ac.phase;
+            ui_show_toast(ui_tr_bt(ac.phase == 2u ? UI_BT_STR_CONNECTING : UI_BT_STR_STARTING),
+                          UI_COL_CYAN, now, BT_HP_AUTOCONN_READY_TO_MS);
             last_ui = 0u;
         }
 

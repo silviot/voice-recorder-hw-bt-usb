@@ -218,6 +218,13 @@ static int fn_remove_last_bond(uint32_t a)
     bt_hp_get_ui(&u);
     return u.has_last && esp_bt_gap_remove_bond_device(u.last) == ESP_OK ? 0 : -1;
 }
+static int fn_connect_last_nopair(uint32_t a)
+{
+    (void)a;
+    bt_hp_ui_t u;
+    bt_hp_get_ui(&u);
+    return u.has_last ? bt_hp_connect_addr(u.last, 0) : -1;
+}
 static int fn_set_out(uint32_t a) { bt_hp_set_out_mode((uint8_t)a); return (int)bt_hp_out_mode(); }
 static int fn_pair_hp2(uint32_t a) { return bt_hp_connect_addr(s_hp2_bda, (int)a); }
 static int fn_disconnect(uint32_t a) { (void)a; return bt_hp_disconnect(); }
@@ -1877,6 +1884,13 @@ int bth_headphones_scenario(const char *img_path)
         bt_hp_debug_t a0, a1;
         bt_hp_get_debug(&a0);
         uint32_t pages0 = fake_peer.conn_count;
+        /* auto-connect on play calls bt_hp_connect_addr(last, 0) without a pairing window: must refuse at once, keep
+         * PAIR_AGAIN, and never clear pair_again or page the keyless headset */
+        uint32_t seq0 = UI().msg_seq;
+        SCHECK(bthx_call_fn(fn_connect_last_nopair, 0u, 2000u) != 0,
+               "S13a: bt_hp_connect_addr(last, 0) accepted without a stored key");
+        SCHECK(UI().msg == BT_HP_MSG_PAIR_AGAIN && UI().msg_seq != seq0 && UI().link == BT_HP_LINK_NONE,
+               "S13a: connect(last, 0) msg %u link %u", UI().msg, UI().link);
         (void)WAIT(0, 12000);                            /* past the 3 s and 10 s backoff steps */
         bt_hp_get_debug(&a1);
         SCHECK(a1.reconnect_tries == a0.reconnect_tries && fake_peer.conn_count == pages0 && UI().has_last,

@@ -27,8 +27,10 @@ void     openfw_host_dmac_register_ptr(uint32_t ch, void *buf, uint32_t len);
 #define OPENFW_DSB() openfw_mmio_dsb()
 #define OPENFW_ISB() __asm__ volatile ("" ::: "memory")
 #define OPENFW_WFI() openfw_mmio_wfi()
+#ifndef OPENFW_IRQ_SAVE
 #define OPENFW_IRQ_SAVE(pm)                do { (pm) = 0u; } while (0)
 #define OPENFW_IRQ_RESTORE(pm)             do { (void)(pm); } while (0)
+#endif
 #define OPENFW_HOST_DMAC_BUF(ch, ptr, len) do { openfw_host_dmac_register_ptr((ch), (ptr), (len)); } while (0)
 #else
 #define REG32(addr) (*(volatile uint32_t *)(uintptr_t)(addr))

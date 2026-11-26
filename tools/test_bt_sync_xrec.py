@@ -409,6 +409,10 @@ def test_bench_dbg_and_load() -> None:
                                pace_bps=64000)
     assert dev.pace_bps == 64000 and "+XREC:DBG,PACE,rate=64000" in lines[0], lines
     assert sum("+XREC:DBG,PACE," in ln for ln in lines) == 2, lines
+    # exFAT in 0:\record is case-insensitive: --load-file / --for-recording resolve the device's on-card name & size
+    files = client_for(FakeDevice({"/record/REC_0001.wav": bytes(4321)})).list_files()
+    assert bt_sync.find_remote_file(files, "rec_0001.WAV") == ("REC_0001.wav", 4321)
+    assert bt_sync.find_remote_file(files, "missing.wav") is None
     print("[PASS] bt_sync +XREC:DBG and --bench-load (RECSTART, GETS loop with wrap and cap, DBG polls, STAT/LS/DEL storm, RECSTOP, STAT 8/10 fields, DBG,PACE)")
 
 

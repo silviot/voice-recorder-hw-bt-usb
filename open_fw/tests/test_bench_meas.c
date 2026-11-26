@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "openfw_bench_meas.h"
+#include "openfw_xrec.h"
 
 static int g_checks, g_fails;
 #define CHECK(c, ...)                                                                                                 \
@@ -169,35 +170,38 @@ static void t_live_cpu_gets(void)
     CHECK(m.hist_n == n && m.cur.ov == 0u && m.cur.wr_n == 0u, "idle hooks ignored");
 }
 
-/* Worst-case line length: every field at its widest; the XREC reply must fit XREC_REPLY_MAX (576 B). */
+/* Worst-case line length: every field at its widest; the XREC reply must fit XREC_REPLY_MAX. */
 static void t_widths(void)
 {
     printf("[4] worst-case widths and truncation\n");
     bench_meas_reset(&m);
     bench_meas_rec_t *r = &m.cur;
     memset(r, 0xFF, sizeof(*r));
-    memcpy(r->file, "REC_9999.wav", 13u);
-    r->idle_min_pm = 999u;
-    r->dma_blk = 0x7FFFFu;
-    r->ov = 0u;
-    r->comp = 0xFFFFFFFFu;
-    r->el_ms = 0xFFFFFFFFu;
-    r->el_us_rem = 999u;
-    r->b_el_us_rem = 999u;
+    memcpy(r->file, "ABCDEFGHIJKLMNO", 16u);   /* max 15-char file field */
+    r->idle_min_pm = 65534u;                   /* widest non-BENCH_MEAS_NONE16 uint16_t */
+    r->dma_blk = 0x1FFFFFu;                     /* dma_smp = 4294965248 (10 digits) */
+    r->ov = 4000000000u;                        /* 10-digit ov, 10-digit comp, and 10-digit lost simultaneously */
+    r->comp = 1000000000u;
+    r->wav_frames = 3219126272u;                /* 10-digit wav_smp; acct = -2147483648 (11 chars) */
+    r->el_ms = 134217600u;                      /* clk_smp = 2147481600 (10 digits); drift = -2147483648 (11 chars) */
+    r->el_us_rem = 0u;
+    r->b_el_ms = 134217600u;                    /* bclk_smp = 2147481600 (10 digits); bdrift = -2147483648 (11 chars) */
+    r->b_el_us_rem = 0u;
     r->b_first_blk = 0u;
-    r->b_last_blk = 0x7FFFFu;
+    r->b_last_blk = 0x1FFFFFu;
     m.take_max_us = 0xFFFFFFFFu;
     m.sd_err_total = 0xFFFFFFFFu;
     m.gets_b_total = m.gets_frames_total = 0xFFFFFFFFu;
-    m.idle_pm = m.app_pm = m.btc_pm = 1000u;
+    m.idle_pm = m.app_pm = m.btc_pm = 0xFFFFu;
     m.cpu_win_ms = 0xFFFFu;
     char line[1024];
     uint32_t a = bench_meas_format_rec(r, ',', line, sizeof(line));
     uint32_t b = bench_meas_format_cpu(&m, ',', line, sizeof(line));
     uint32_t reply = (uint32_t)strlen("+XREC:DBG,LIVE,") + a + 1u + b + 2u;
     printf("    rec %u B, cpu %u B, LIVE reply %u B\n", a, b, reply);
-    CHECK(a + 1u + b < BENCH_MEAS_LINE_MAX, "line fits BENCH_MEAS_LINE_MAX (%u)", a + 1u + b);
-    CHECK(reply <= 576u, "reply fits XREC_REPLY_MAX (%u)", reply);
+    CHECK(a + 1u + b < BENCH_MEAS_LINE_MAX, "line fits BENCH_MEAS_LINE_MAX (%u vs %u)", a + 1u + b,
+          BENCH_MEAS_LINE_MAX);
+    CHECK(reply <= XREC_REPLY_MAX, "reply fits XREC_REPLY_MAX (%u vs %u)", reply, XREC_REPLY_MAX);
     char small[20];
     uint32_t s = bench_meas_format_rec(r, ',', small, sizeof(small));
     CHECK(s == 19u && small[19] == '\0' && strncmp(small, "seq=4294967295,file", 19) == 0, "truncated '%s'", small);

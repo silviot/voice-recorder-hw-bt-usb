@@ -14,10 +14,11 @@
 
 #define XREC_RX_LINE_MAX  192u
 #define XREC_MAX_CHUNK    640u
-/* Largest single reply one command line (or one completed PUT chunk) can produce: the LOG frame (header <= 64 B +
- * 512 B payload). LS / GETS stream from xrec_poll() and retry on their own. Flow control (review STEP10 A5): with
- * ops.tx_free set, xrec_on_rx() stops before any byte that would produce a reply while less than this is free. */
-#define XREC_REPLY_MAX    (64u + 512u)
+/* Largest single reply one command line (or one completed PUT chunk) can produce: +XREC:DBG,LIVE (~585 B worst case)
+ * and the +XREC:LOG frame (header <= 64 B + 512 B payload). LS / GETS stream from xrec_poll() and retry on their own.
+ * Flow control (review STEP10 A5): with ops.tx_free set, xrec_on_rx() stops before any byte that would produce a reply
+ * while less than this is free. */
+#define XREC_REPLY_MAX    (88u + 512u)
 
 /* ---- Sync while recording (docs/BT_SYNC_SPEED_AND_RECORDING.md F1, F1b, F6, F7; docs/XREC_PROTOCOL.md) ----
  * While ops.rec_channels reports a recording:
@@ -214,6 +215,7 @@ typedef struct {
     uint16_t       put_last_crc;
     /* last PUTEND commit, so a repeated PUTEND (lost reply) answers the same OK until the next PUT header */
     uint8_t        put_done_valid;
+    uint8_t        put_rec_deleted;
     uint32_t       put_done_total;
 
     /* Transfer status (xrec_get_xfer): updated where GETS / PUT chunks move, read by the UI from the same task */
