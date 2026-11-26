@@ -423,6 +423,9 @@ ROM link table cleared, `fwd_to=0`, no stalls. The ~40 s dead link seen in sessi
 `LMP_detach` right after a 581 KB transfer) is therefore not reproduced by a peer power-off; H1/H2 stay open for the
 remote-detach path, which needs a peer that sends `LMP_detach` (a laptop `bluetoothctl disconnect`, or the phone's
 "Disconnect" in its Bluetooth settings while a transfer is in flight).
+App force-stopped mid-transfer (same image): the phone closed RFCOMM only; the recorder's session then ended the link
+itself (`HCI disconnect cmd`, `lc=20 03..`, `disconnection complete reason=0x16`, table cleared), also clean. The phone
+never sent its own `LMP_detach`, so the peer-initiated detach after a large transfer is still the open case.
 
 **App note:** a recording whose transcript has no words (e.g. a silence capture) stays "Imported" on the app's
 Recorder screen although the note is transcribed; nothing is uploaded. The screen should say "Transcribed, no speech".
