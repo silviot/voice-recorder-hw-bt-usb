@@ -527,10 +527,23 @@ static int mem_read_sectors(void *ctx, uint32_t lba, uint32_t count, void *buf)
 }
 
 static int g_sd_fail_after = -1;
+static uint32_t g_sd_fail_skip;    /* transient fault: let this many writes through, then ... */
+static uint32_t g_sd_fail_n;       /* ... fail this many, then succeed again */
+static uint32_t g_sd_fail_hits;
+static int      g_sd_fail_code = -1;   /* what the transient fault returns (BLKDEV_ERR_FINAL: the driver gave up) */
 
 static int mem_write_sectors(void *ctx, uint32_t lba, uint32_t count, const void *buf)
 {
     (void)ctx;
+    if (g_sd_fail_n > 0u) {
+        if (g_sd_fail_skip > 0u) {
+            g_sd_fail_skip--;
+        } else {
+            g_sd_fail_n--;
+            g_sd_fail_hits++;
+            return g_sd_fail_code;
+        }
+    }
     if (g_sd_fail_after >= 0) {
         if (g_sd_fail_after == 0) {
             return -1;
@@ -601,20 +614,42 @@ static void test_audio_dma(void)
     assert(f1 != NULL && nbytes == 4096u && f1[0] == 4100);
     assert(audio_pop_frame(&nbytes) == NULL);
 
-    /* Ring overrun test: > 3 unconsumed frames drops oldest (4200), keeping 4300, 4400, 4500 */
-    sim_dma_deliver_frame(4200, 16384, NULL);
-    sim_dma_deliver_frame(4300, 16384, NULL);
-    sim_dma_deliver_frame(4400, 16384, NULL);
+    /* Ring overrun test (F1c, docs/BT_SYNC_SPEED_AND_RECORDING.md): mono has 8 slots of 128 ms in the same 32 KiB,
+     * one reserved for the DMAC, so 7 unconsumed blocks (896 ms) queue without loss; the 8th drops the oldest (4200) */
+    assert(audio_ring_slots() == 8u && audio_ring_pending() == 0u);
+    for (int32_t k = 0; k < 7; k++) {
+        sim_dma_deliver_frame(4200 + 100 * k, 16384, NULL);   /* 4200 .. 4800 */
+        assert(audio_ring_pending() == (uint32_t)k + 1u);
+    }
     assert(audio_get_overruns() == 0u);
-    sim_dma_deliver_frame(4500, 16384, NULL);
-    assert(audio_get_overruns() == 1u);
+    {
+        /* the 7 queued slots and the DMAC's next one are 8 distinct 4 KiB slots inside the one 32 KiB buffer */
+        const uint8_t *dma_next = (const uint8_t *)g_soc.dmac_buf[1];
+        uint32_t peek_n = 0u;
+        const int16_t *q[7];
+        for (int k = 0; k < 7; k++) {
+            q[k] = audio_pop_frame(&nbytes);
+            assert(q[k] != NULL && nbytes == 4096u && q[k][0] == 4200 + 100 * k);
+            assert((const uint8_t *)q[k] != dma_next);
+            for (int j = 0; j < k; j++) {
+                intptr_t d = (const uint8_t *)q[k] - (const uint8_t *)q[j];
+                assert(d >= 4096 || d <= -4096);
+            }
+            peek_n++;
+        }
+        assert(peek_n == 7u && audio_pop_frame(&nbytes) == NULL && audio_ring_pending() == 0u);
+    }
+    for (int32_t k = 0; k < 8; k++) {
+        sim_dma_deliver_frame(5000 + 100 * k, 16384, NULL);   /* 5000 .. 5700: one more than fits */
+    }
+    assert(audio_get_overruns() == 1u && audio_ring_pending() == 7u);
 
     const int16_t *r0 = audio_pop_frame(&nbytes);
-    const int16_t *r1 = audio_pop_frame(&nbytes);
-    const int16_t *r2 = audio_pop_frame(&nbytes);
-    assert(r0 != NULL && r0[0] == 4300);
-    assert(r1 != NULL && r1[0] == 4400);
-    assert(r2 != NULL && r2[0] == 4500);
+    assert(r0 != NULL && r0[0] == 5100);                      /* 5000 was dropped */
+    for (int32_t k = 2; k < 8; k++) {
+        const int16_t *rk = audio_pop_frame(&nbytes);
+        assert(rk != NULL && rk[0] == 5000 + 100 * k);
+    }
     assert(audio_pop_frame(&nbytes) == NULL);
 
     /* Race-free audio_pop_frame_copy(): preserves FIFO order when 3 slots queued */
@@ -639,13 +674,32 @@ static void test_audio_dma(void)
 
     g_soc.dmac_regs[1][9] |= 0x02u; /* Transfer complete */
     DMAC_CH1_IRQHandler();
-    assert(audio_get_frames() == 9u);
+    assert(audio_get_frames() == 20u);
+    assert(audio_ring_pending() == 0u);            /* capture off: nothing pending for the XREC gate */
+
+    /* Stereo keeps 4 slots of 8 KiB (384 ms of queue) in the same buffer: 3 queue, the 4th drops the oldest */
+    assert(audio_capture_start_ex(24u, 2u) == 0);
+    assert(audio_ring_slots() == 4u);
+    for (int32_t k = 0; k < 3; k++) {
+        sim_dma_deliver_stereo_frame(6000 + 100 * k, 0, 0, 0);
+    }
+    assert(audio_get_overruns() == 0u && audio_ring_pending() == 3u);
+    sim_dma_deliver_stereo_frame(6300, 0, 0, 0);
+    assert(audio_get_overruns() == 1u && audio_ring_pending() == 3u);
+    for (int32_t k = 1; k < 4; k++) {
+        const int16_t *sk = audio_pop_frame(&nbytes);
+        assert(sk != NULL && nbytes == 8192u && sk[0] == 6000 + 100 * k);
+    }
+    assert(audio_pop_frame(&nbytes) == NULL);
+    audio_capture_stop();
     printf("[OK] audio_dma MMIO + DMAC CH1 ring + audio_pop_frame_copy + on-demand AC VU\n");
 }
 
 /* ============================================================================
  * Suite 2: Real-Time WAV Recorder + exFAT Flush Tests
  * ============================================================================ */
+void recorder_test_set_split_bytes(uint32_t n);   /* src/recorder.c, OPENFW_HOST_MMIO only */
+
 static void test_recorder(const char *exfat_img_path)
 {
     soc_reset();
@@ -864,6 +918,113 @@ static void test_recorder(const char *exfat_img_path)
     assert(ent7.size == 44u); /* 0 PCM bytes emitted while VOR gate stayed closed */
     recorder_set_vor(0);
 
+    /* STAT rec_idx (F7): the pure REC_NNNN.wav parser */
+    assert(recorder_rec_index_of("REC_0001.wav") == 1u);
+    assert(recorder_rec_index_of("REC_9999.wav") == 9999u);
+    assert(recorder_rec_index_of("rec_0042.WAV") == 42u);
+    assert(recorder_rec_index_of("REC_0000.wav") == 0u);
+    assert(recorder_rec_index_of("REC_12a4.wav") == 0u);
+    assert(recorder_rec_index_of("REC_0001.wa") == 0u);
+    assert(recorder_rec_index_of("REC_0001.wavx") == 0u);
+    assert(recorder_rec_index_of("REC_001.wav") == 0u);
+    assert(recorder_rec_index_of("XEC_0001.wav") == 0u);
+    assert(recorder_rec_index_of("REC-0001.wav") == 0u);
+    assert(recorder_rec_index_of("REC_0001.cwx") == 0u);
+    assert(recorder_rec_index_of("") == 0u && recorder_rec_index_of(NULL) == 0u);
+    assert(recorder_get_rec_index() == 0u);           /* not recording */
+
+    /* Recording #8: a 2 GiB split (threshold 8 KiB here) moves rec_idx to the next file; the finished one is no
+     * longer the active file (GETS of it is allowed again, the new one answers BUSY) */
+    recorder_test_set_split_bytes(8192u);
+    recorder_set_channels(1u);
+    assert(recorder_start(&vol, 1) == 0);
+    char split_a[16];
+    snprintf(split_a, sizeof(split_a), "%s", recorder_get_filename());
+    uint32_t idx_a = recorder_get_rec_index();
+    assert(idx_a != 0u && idx_a == recorder_rec_index_of(split_a));
+    assert(recorder_is_recording_file(split_a) == 1);
+    for (int f = 0; f < 2; f++) {                     /* 2 x 4096 B: exactly at the threshold, no split yet */
+        sim_dma_deliver_frame(500, 0, NULL);
+        recorder_poll();
+    }
+    assert(recorder_get_rec_index() == idx_a);
+    sim_dma_deliver_frame(500, 0, NULL);              /* the third frame does not fit: split */
+    recorder_poll();
+    assert(recorder_is_saving() == 1);
+    uint32_t idx_b = recorder_get_rec_index();
+    assert(idx_b == idx_a + 1u);
+    assert(recorder_is_recording_file(split_a) == 0);
+    assert(recorder_is_recording_file(recorder_get_filename()) == 1);
+    assert(recorder_rec_index_of(recorder_get_filename()) == idx_b);
+    assert(recorder_stop() == 0);
+    assert(recorder_get_rec_index() == 0u && recorder_is_recording_file(split_a) == 0);
+    exfat_entry_t ent8a, ent8b;
+    assert(exfat_find_path(&vol, "/record/REC_0006.wav", &ent8a) == 0 && ent8a.size == 44u + 8192u);
+    assert(exfat_find_path(&vol, "/record/REC_0007.wav", &ent8b) == 0 && ent8b.size == 44u + 4096u);
+    recorder_test_set_split_bytes(0u);
+
+    /* Recording #9 (silicon 2026-11-26, SDW_1_FAIL during XREC GETS): a write error that reaches the recorder is retried
+     * with the unconsumed rest of the block, for every write position inside a block (sector-buffer fill, direct
+     * multi-sector run, cluster allocation bitmap / FAT): the recording goes on, the WAV is bit-exact, nothing is
+     * written twice, skipped or reordered. */
+    recorder_set_channels(1u);
+    recorder_set_dsp_profile(AUDIO_DSP_BYPASS);
+    for (uint32_t skip = 0u; skip < 8u; skip++) {
+        static int16_t exp9[4u * 2048u];
+        assert(recorder_start(&vol, 1) == 0);
+        char name9[24];
+        snprintf(name9, sizeof(name9), "/record/%s", recorder_get_filename());
+        for (uint32_t f = 0u; f < 4u; f++) {
+            if (f == 1u) {
+                g_sd_fail_skip = skip;
+                g_sd_fail_n    = 1u + (skip & 1u);      /* one or two failures in a row */
+                g_sd_fail_hits = 0u;
+            }
+            sim_dma_deliver_frame(50 * (int32_t)(f + 1u + skip), 9000, &exp9[f * 2048u]);
+            recorder_poll();
+            assert(recorder_has_error() == 0 && recorder_is_saving() == 1);
+        }
+        assert(g_sd_fail_n == 0u && g_sd_fail_hits == 1u + (skip & 1u));
+        assert(recorder_stop() == 0);
+        exfat_entry_t ent9;
+        assert(exfat_find_path(&vol, name9, &ent9) == 0);
+        assert(ent9.size == 44u + 4u * 4096u);
+        static uint8_t wav9[44u + 4u * 4096u];
+        uint32_t got9 = 0u;
+        assert(exfat_read_file(&vol, &ent9, 0u, wav9, sizeof(wav9), &got9) == 0 && got9 == sizeof(wav9));
+        wav_info_t info9;
+        assert(wav_parse_header(wav9, &info9) == 0 && info9.data_bytes == 4u * 4096u);
+        assert(memcmp(wav9 + 44u, exp9, 4u * 4096u) == 0);
+    }
+    g_sd_fail_skip = g_sd_fail_n = 0u;
+    {
+        /* fsck.exfat -n checks this state too (the Makefile runs it on <image>.retry) */
+        char retry_path[512];
+        snprintf(retry_path, sizeof(retry_path), "%s.retry", exfat_img_path);
+        FILE *rf = fopen(retry_path, "wb");
+        assert(rf != NULL);
+        assert(fwrite(g_soc.sd_buf, 1u, (size_t)sz, rf) == (size_t)sz);
+        fclose(rf);
+    }
+
+    /* Recording #10: the SD driver reports BLKDEV_ERR_FINAL (it already retried, re-initialised and gave up): the
+     * recorder must not spend another retry round on top (a retry here would succeed - the fault is one-shot - so
+     * a recording that goes on means it retried). */
+    assert(recorder_start(&vol, 1) == 0);
+    sim_dma_deliver_frame(70, 9000, NULL);
+    recorder_poll();
+    assert(recorder_has_error() == 0);
+    g_sd_fail_skip = 0u;
+    g_sd_fail_n    = 1u;
+    g_sd_fail_hits = 0u;
+    g_sd_fail_code = BLKDEV_ERR_FINAL;
+    sim_dma_deliver_frame(80, 9000, NULL);
+    recorder_poll();
+    assert(g_sd_fail_hits == 1u && g_sd_fail_n == 0u);
+    assert(recorder_has_error() == 1 && recorder_is_saving() == 0);
+    assert(recorder_stop() == -1);
+    g_sd_fail_code = -1;
+
     /* Restore clean snapshot for fsck.exfat validation */
     memcpy(g_soc.sd_buf, sd_clean, (size_t)sz);
     free(sd_clean);
@@ -927,7 +1088,7 @@ static void test_recorder(const char *exfat_img_path)
     free(g_soc.sd_buf);
     g_soc.sd_buf     = NULL;
     g_soc.sd_sectors = 0u;
-    printf("[OK] recorder -> exFAT (REC_0001..0004 + checkpoint recovery + write/close fault injection)\n");
+    printf("[OK] recorder -> exFAT (REC_0001..0004 + checkpoint recovery + write/close fault injection + transient write retry)\n");
 }
 
 /* ============================================================================

@@ -247,6 +247,12 @@ typedef struct {
     uint8_t  async_last_desc;
     uint8_t  no_multi_write;
     uint32_t async_t0_us;
+    uint8_t  need_status;     /* 1: card state not verified since the last CMD12 / error: CMD13 (+ CMD12) before the next data
+                               * command; 2: the controller data path may still be armed: CMD12 abort + controller reset first */
+    uint8_t  reinits;         /* in-place re-initialisations by the write retry path (saturates at 255) */
+    uint16_t wr_retries;      /* sector writes that needed a retry (saturates) */
+    uint32_t wr_bci1;         /* CMD24 data phases that reported RINTSTS bit 13 = busy clear (benign, counted only) */
+    uint32_t wr_bcim;         /* CMD25 data phases (FIFO wait or DTO) that reported it */
 } sd_card_t;
 
 int      sd_init(sd_card_t *card);
@@ -272,6 +278,11 @@ uint32_t       audio_get_frames(void);
 const int16_t *audio_pop_frame(uint32_t *out_bytes);
 int            audio_pop_frame_copy(int16_t *dst, uint32_t max_bytes, uint32_t *out_bytes);
 uint32_t       audio_get_overruns(void);
+/* 128 ms blocks the ISR completed that the recorder has not taken yet (0 when capture is off): background work
+ * (XREC GETS / LS while recording) runs only when this is 0 (docs/BT_SYNC_SPEED_AND_RECORDING.md F1). */
+uint32_t       audio_ring_pending(void);
+/* Ring slots of the current (or last) capture: 8 mono, 4 stereo; slots - 1 may queue before an overrun (F1c). */
+uint32_t       audio_ring_slots(void);
 
 /* Audio DAC0+DAC1 Stereo Headphone + Built-in Speaker PA (PB30) + DMAC CH0 TX (audio_dac.c) */
 void     audio_pll_set(uint32_t sample_rate);
@@ -308,6 +319,8 @@ uint32_t            recorder_get_committed_bytes(void);
 uint32_t            recorder_get_created_timestamp(void);
 const char         *recorder_get_filename(void);
 int                 recorder_is_recording_file(const char *name); /* /record/<name> is open for recording */
+uint32_t            recorder_rec_index_of(const char *name);      /* NNNN of REC_NNNN.wav, else 0 (pure) */
+uint32_t            recorder_get_rec_index(void);                 /* STAT rec_idx: the file being written, 0 none */
 
 /* USB Mass Storage Full-Speed MUSB & PHY Plug Detect (usb_musb.c) */
 typedef int (*usb_audio_cfg_cb_t)(int set, uint8_t cfg[4], int16_t *rms_x10, uint16_t *clips);

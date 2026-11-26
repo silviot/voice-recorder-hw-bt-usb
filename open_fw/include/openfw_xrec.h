@@ -20,6 +20,34 @@
  * while less than this is free. */
 #define XREC_REPLY_MAX    (88u + 512u)
 
+/* ---- Sync while recording (docs/BT_SYNC_SPEED_AND_RECORDING.md F1, F1b, F6, F7; docs/XREC_PROTOCOL.md) ----
+ * While ops.rec_channels reports a recording:
+ *   - XREC work waits for the recorder: no command runs and no GETS / LS chunk is read from the card while
+ *     ops.rec_pending reports audio blocks the recorder has not taken yet (the caller polls the recorder first);
+ *   - one xrec_poll() pass stops reading the card once it used XREC_REC_PASS_BUDGET_US: GETS chunks, LS directory
+ *     chunks and the GET / GETS lookup in /record (both resume at the next pass);
+ *   - GETS payload is capped by a token bucket at XREC_REC_GETS_RATE_BPS (bucket XREC_REC_GETS_BURST bytes);
+ *   - writers answer +XREC:ERR,LATER,<XREC_LATER_MS> (DEL, PUT to the card, PUTEND, OTA, PAIR), RTC set is not
+ *     applied (+XREC:OK,RTC,LATER), and in a stereo recording GETS / GET answer LATER too (mono only, decision 5);
+ *   - GETS / GET of the file being recorded answers +XREC:ERR,BUSY (ops.file_busy);
+ *   - a disconnect keeps a staged upload's writer and temp until the recording stopped (xrec_deferred_poll).
+ * The cap and the budget are compile-time defaults (-D...) and can be changed per context (xrec_set_rec_pace; the
+ * bench image's +XREC:DBG,PACE,<bytes/s>). */
+#ifndef XREC_REC_GETS_RATE_BPS
+#define XREC_REC_GETS_RATE_BPS  48000u   /* bytes/s of GETS payload while recording (M3 sets the final value) */
+#endif
+#ifndef XREC_REC_PASS_BUDGET_US
+#define XREC_REC_PASS_BUDGET_US 5000u    /* card reads per xrec_poll() pass while recording */
+#endif
+#ifndef XREC_REC_GETS_BURST
+#define XREC_REC_GETS_BURST     2048u    /* token-bucket depth, bytes (>= XREC_MAX_CHUNK) */
+#endif
+#define XREC_LATER_MS           30000u   /* the <ms> of +XREC:ERR,LATER: ask again after this long */
+#define XREC_PACE_WINDOW        16384u   /* app GETS window while recording (A1): STAT pace_ms is its time at the cap */
+#if XREC_REC_GETS_BURST < XREC_MAX_CHUNK
+#error "XREC_REC_GETS_BURST must hold one full chunk"
+#endif
+
 typedef struct {
     uint16_t voltage_mv;
     uint8_t  bat_pct;
@@ -29,6 +57,8 @@ typedef struct {
     uint32_t rec_sec;
     uint32_t free_mb;
     uint32_t total_mb;
+    uint32_t rec_idx;      /* NNNN of the REC_NNNN.wav being recorded, 0 = none (STAT field 9) */
+    uint32_t pace_ms;      /* filled by xrec_proto (STAT field 10): 0 = no pacing (not recording) */
 } xrec_stat_t;
 
 typedef struct {
@@ -73,7 +103,25 @@ typedef struct {
     /* Millisecond clock for the transfer status (xrec_get_xfer). Optional: NULL = a transfer stays shown until the
      * link drops. */
     uint32_t (*now_ms)(void *user);
+    /* Sync while recording (see above). All optional: NULL = never recording / nothing pending. rec_channels: 0 when
+     * not recording, else the running recording's channel count (1 mono, 2 stereo). rec_pending: audio blocks the
+     * recorder has not taken yet (audio_ring_pending). now_us: microsecond clock, wraps at 2^32 (NULL: now_ms x 1000). */
+    uint8_t  (*rec_channels)(void *user);
+    uint32_t (*rec_pending)(void *user);
+    uint32_t (*now_us)(void *user);
 } xrec_ops_t;
+
+/* Pacing counters (bench +XREC:DBG,PACE; tests). */
+typedef struct {
+    uint32_t rate_bps;         /* GETS cap while recording */
+    uint32_t budget_us;        /* card-read budget per pass while recording */
+    uint32_t ring_waits;       /* a command / chunk waited because the recorder had blocks pending */
+    uint32_t budget_stops;     /* a pass stopped at its budget */
+    uint32_t cap_stops;        /* a pass stopped for lack of tokens */
+    uint32_t later;            /* +XREC:ERR,LATER replies (and RTC sets not applied) */
+    uint32_t busy;             /* GETS / GET of the file being recorded (ERR,BUSY) */
+    uint32_t rec_bytes;        /* GETS payload read while recording */
+} xrec_pace_stats_t;
 
 typedef enum {
     XREC_PUT_NONE = 0,
@@ -125,12 +173,18 @@ typedef struct {
     uint32_t       gets_offset;
     uint32_t       gets_rem;
     uint16_t       gets_chunk_max;
+    /* While recording, the GET / GETS file lookup in /record runs over several polls within the pass budget */
+    uint8_t        gets_lookup;
+    exfat_entry_t  gets_dir;
+    exfat_dir_pos_t gets_find_pos;
+    char           gets_name[EXFAT_MAX_NAME];
+    uint32_t       walk_t0;            /* pace_now_us() at the start of the lookup pass */
 
     /* Resumable +XREC:LS state */
     uint8_t        ls_active;
     uint8_t        ls_has_dir;
     exfat_entry_t  ls_dir;
-    uint32_t       ls_sent_cnt;
+    exfat_dir_pos_t ls_pos;            /* the first directory slot not yet listed (entries before it were sent) */
 
     /* Streaming +XREC:PUT -> OTA / EXP / CAS / REC upload state */
     uint8_t        put_active;
@@ -149,6 +203,8 @@ typedef struct {
     } xfer;
 
     uint8_t        put_stream_mode;
+    uint8_t        put_orphan;         /* a staged upload whose link went during a recording: put_writer still open,
+                                        * closed and its temp deleted once the recording stopped (F6) */
     uint8_t        put_has_last;
     uint8_t        put_last_mode;
     char           put_stream_name[32];
@@ -170,6 +226,12 @@ typedef struct {
     uint32_t       xfer_done;
     uint32_t       xfer_total;
     uint32_t       xfer_t_ms;          /* ops.now_ms at the last chunk */
+
+    /* Sync while recording: GETS token bucket (bytes), its last refill (ops.now_us), counters */
+    uint8_t        pace_live;          /* the bucket runs (a recording was seen by the last pass) */
+    uint32_t       pace_tokens;
+    uint32_t       pace_t_us;
+    xrec_pace_stats_t pace;
 } xrec_ctx_t;
 
 void xrec_init(xrec_ctx_t *ctx, exfat_vol_t *vol, const xrec_ops_t *ops, void *user);
@@ -177,6 +239,11 @@ void xrec_set_bound_key(xrec_ctx_t *ctx, const uint8_t key[32]);
 void xrec_open_pairing(xrec_ctx_t *ctx, const char pin_6digits[6]);
 void xrec_close_pairing(xrec_ctx_t *ctx);
 void xrec_on_disconnect(xrec_ctx_t *ctx);
+/* Card work a disconnect deferred while recording (a staged upload's temp): runs it once no recording is running.
+ * Call it every session poll, connected or not. No card access while recording. */
+void xrec_deferred_poll(xrec_ctx_t *ctx);
+/* The same now, recording or not (session end: the context goes away). */
+void xrec_deferred_flush(xrec_ctx_t *ctx);
 /* Returns the bytes consumed. Fewer than len only when ops.tx_free reports less than XREC_REPLY_MAX free before a byte
  * that completes a command (line end, PUT header ':' or the last PUT payload byte): the caller keeps the rest and
  * hands it in again after the transport drained (xrec_poll() first). */
@@ -185,5 +252,8 @@ void xrec_poll(xrec_ctx_t *ctx);
 /* The transfer shown on the BT screen; out->active = 0 once no chunk moved for XREC_XFER_HOLD_MS (now_ms: the clock
  * of ops.now_ms). No SD access. */
 void xrec_get_xfer(const xrec_ctx_t *ctx, uint32_t now_ms, xrec_xfer_t *out);
+/* GETS cap (bytes/s, 0 keeps the current one) and card-read budget per pass (us, 0 keeps) while recording. */
+void xrec_set_rec_pace(xrec_ctx_t *ctx, uint32_t rate_bps, uint32_t budget_us);
+void xrec_get_pace_stats(const xrec_ctx_t *ctx, xrec_pace_stats_t *out);
 
 #endif /* OPENFW_XREC_H */

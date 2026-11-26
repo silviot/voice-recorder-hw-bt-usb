@@ -154,6 +154,7 @@ static struct {
     uint8_t  reboot_mode;
     uint32_t reboot_at;
     uint32_t last_fault;
+    uint8_t  parked;          /* F8: silenced by a fault during a recording (state DEAD); hard path after REC */
     bt_xrec_debug_t d;          /* counters only (the rest is filled by bt_xrec_get_debug) */
 } s;
 
@@ -1684,6 +1685,7 @@ static void free_session(void)
     memset(s.nm, 0, sizeof(s.nm));
     bt_xrec_plat_unlock();
     if (b != NULL) {
+        xrec_deferred_flush(&b->xrec);          /* a staged upload kept for a recording: the context goes now */
         wipe_free(b);
     }
 }
@@ -1698,6 +1700,9 @@ int bt_shutdown(void)
         return bt_hp_shutdown_hook();          /* one exit path for both modes (docs/BT_A2DP_DESIGN.md §6.7) */
     }
     if (s.state == BT_XREC_ST_DEAD) {
+        if (s.parked && bt_xrec_plat_park_poll() == 0) {
+            s.parked = 0u;                     /* REC stopped: the deferred hard path ran (host: returned) */
+        }
         return (int)s.last_fault;
     }
     /* 1. quiesce: late BTC callbacks no longer touch the session; pending XREC work is cancelled. */
@@ -1746,6 +1751,13 @@ int bt_shutdown(void)
     if (reason != BT_XREC_FAULT_NONE) {
         s.last_fault = reason;
         set_state(BT_XREC_ST_DEAD);
+        if (bt_xrec_plat_rec_active()) {
+            /* F8: a recording runs (it started during the teardown wait): BT silenced, the reboot waits for REC */
+            bt_xrec_plat_log_u32("BT shutdown failed while recording: BT parked, reason", reason);
+            bt_xrec_plat_park(reason);
+            s.parked = 1u;
+            return (int)reason;
+        }
         bt_xrec_plat_log_u32("BT shutdown: hard path, reason", reason);
         bt_xrec_plat_hard_path(reason);        /* target: finalise recording, fault record 0xB1, reboot */
         return (int)reason;
@@ -1756,6 +1768,38 @@ int bt_shutdown(void)
     return 0;
 }
 
+/* F8: a fault while a recording runs. No graceful teardown (its RF/controller work and the 2 s wait), no recovery
+ * ladder and no reboot: the platform silences RW-BT at once (bt_stop, IRQ 26 masked, no ROM call) and the session
+ * only drops its own state, calling no Bluedroid API (a stuck BT task may hold its locks) and writing nothing to the
+ * card (a staged PUT temp stays; the next upload replaces it). The session memory stays allocated: BT tasks are not
+ * torn down. The recording continues; the hard path (fault record, reboot) runs once REC stops (park_poll). */
+static void park(uint32_t reason)
+{
+    bt_xrec_plat_lock();
+    s.cb_open = 0u;                            /* late BTC callbacks drop their events */
+    if (s.cb_rx_bound) {
+        s.cb_rx_bound = s.cb_rx_closing = s.cb_rx_overflow = 0u;
+    }
+    bt_xrec_plat_unlock();
+    if (s.b != NULL) {
+        xrec_close_pairing(&s.b->xrec);
+        s.b->xrec.auth = 0u;
+        s.b->xrec.gets_active = s.b->xrec.gets_staged = s.b->xrec.ls_active = 0u;
+    }
+    s.conn_open = s.conn_authorized = s.conn_closing = s.cong = 0u;
+    s.close_retry = 0u;
+    s.xrec_reset_pending = 0u;
+    tx_drop();
+    s.window_open = s.xrec_pin_issued = s.ssp_showing = s.ssp_window = s.ssp_deferred = 0u;
+    s.cfm_pending = 0u;                        /* no reply: the link is gone with the controller */
+    s.reboot_mode = 0u;
+    bt_xrec_plat_park(reason);
+    s.parked = 1u;
+    set_state(BT_XREC_ST_DEAD);
+    bt_xrec_plat_log_u32("BT fault while recording: BT silenced, recording continues, recovery after REC; reason",
+                         reason);
+}
+
 static void fault(uint32_t reason)
 {
     if (s.state == BT_XREC_ST_OFF || s.state == BT_XREC_ST_FAULTED || s.state == BT_XREC_ST_DEAD) {
@@ -1763,6 +1807,10 @@ static void fault(uint32_t reason)
     }
     s.last_fault = reason;
     bt_xrec_plat_log_u32("BT fault, reason", reason);
+    if (bt_xrec_plat_rec_active()) {
+        park(reason);                          /* F8: the recording first */
+        return;
+    }
     if (bt_shutdown() == 0) {
         set_state(BT_XREC_ST_FAULTED);         /* graceful recovery done: BT off until the next bt_xrec_start() */
     }
@@ -1898,6 +1946,12 @@ void bt_xrec_open_pairing(uint32_t duration_ms)
 
 void bt_xrec_poll(void)
 {
+    if (s.parked) {
+        if (bt_xrec_plat_park_poll() == 0) {   /* REC stopped: the deferred hard path (target: reboot) */
+            s.parked = 0u;
+        }
+        return;
+    }
     if (s.state == BT_XREC_ST_OFF || s.state == BT_XREC_ST_FAULTED || s.state == BT_XREC_ST_DEAD) {
         return;
     }
@@ -2006,6 +2060,9 @@ void bt_xrec_poll(void)
 #endif
     tx_kick();
     xrec_reset_flush();
+    if (s.b != NULL) {
+        xrec_deferred_poll(&s.b->xrec);         /* F6: card work a disconnect deferred, once REC stopped */
+    }
 
     if (s.reboot_mode != 0u && time_reached(now, s.reboot_at) &&
         ((s.tx_head == s.tx_tail && s.inflight == 0u) || now - s.reboot_at >= BT_XREC_REBOOT_DRAIN_MAX_MS)) {
@@ -2021,7 +2078,7 @@ void bt_xrec_poll(void)
     uint32_t why = bt_xrec_plat_poll();
     if (why != 0u) {
         bt_xrec_plat_log_u32("BT platform fault", why);
-        fault(BT_XREC_FAULT_PLATFORM);
+        fault(why == 5u ? BT_XREC_FAULT_ASSERT : BT_XREC_FAULT_PLATFORM);
     }
 }
 
@@ -2101,6 +2158,7 @@ void bt_xrec_get_debug(bt_xrec_debug_t *out)
     out->acl_closing = links_closing();
     out->mtu = s.mtu;
     out->last_fault = s.last_fault;
+    out->parked = s.parked;
     bt_xrec_plat_lock();
     out->rx_used = s.rx_head - s.rx_tail;
     out->evq_used = s.ev_head - s.ev_tail;

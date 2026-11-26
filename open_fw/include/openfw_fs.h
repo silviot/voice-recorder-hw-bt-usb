@@ -18,6 +18,10 @@ typedef struct {
     void *ctx;
 } blkdev_t;
 
+/* write_sectors() result: the device already retried (state recovery, re-initialisation) and gave up. Callers must
+ * not retry on top of it (the time is already spent); exfat_write() passes it through. Any other non-zero = error. */
+#define BLKDEV_ERR_FINAL (-2)
+
 typedef struct {
     uint32_t first_cluster;
     uint32_t cluster_idx;
@@ -38,12 +42,19 @@ typedef struct {
     uint32_t bitmap_cluster;
     uint32_t bitmap_bytes;
     uint32_t alloc_hint;
+    /* Free-cluster count cache (docs/BT_SYNC_SPEED_AND_RECORDING.md F4): computed by the first exfat_stat_fs() after
+     * exfat_mount() (which clears it), then kept by every bitmap change made through this volume (allocate / free).
+     * Any bitmap I/O error drops it (recomputed by the next exfat_stat_fs). Writers that bypass this volume (USB MSC)
+     * are followed by a remount (AGENTS.md MSC boundary), or by exfat_invalidate_free_cache(). */
+    uint32_t free_clusters;
+    uint8_t  free_valid;
     uint32_t default_timestamp;
     exfat_rd_cache_t rd_cache[4];
     uint8_t  rd_cache_rr;
     uint8_t  fat_cache_valid;
     uint32_t fat_cache_lba;
     uint8_t  fat_cache[512] __attribute__((aligned(4)));
+    uint8_t  wr_final;        /* a device write returned BLKDEV_ERR_FINAL during the current exfat_write() */
 } exfat_vol_t;
 
 #define EXFAT_MAX_NAME 64u
@@ -84,12 +95,40 @@ int exfat_list_dir(const exfat_vol_t *vol, uint32_t dir_cluster, uint8_t no_fat_
 int exfat_list_dir_entry(const exfat_vol_t *vol, const exfat_entry_t *dir,
                          exfat_dir_cb_t cb, void *user);
 int exfat_find_path(const exfat_vol_t *vol, const char *path, exfat_entry_t *out);
+
+/* Resumable directory walks (XREC LS / GETS lookups while recording: a bounded amount of card reads per call).
+ * A position names a directory slot; cls == 0 means the start of the directory. slot 16 / sec == sectors per cluster
+ * mean "after the last one" and are normalised on resume. */
+typedef struct {
+    uint32_t cls;
+    uint32_t cls_idx;   /* the cluster's index in the directory's chain */
+    uint32_t sec;
+    uint32_t slot;
+} exfat_dir_pos_t;
+/* next: the position right after this entry set (resume there to continue after it). Non-zero stops the walk. */
+typedef int (*exfat_dir_pos_cb_t)(const exfat_entry_t *entry, const exfat_dir_pos_t *next, void *user);
+/* Asked before each card read except the first one of a call, never inside an entry set: non-zero stops the walk. */
+typedef int (*exfat_dir_yield_t)(void *user);
+/* Walks dir from *pos. Returns 0 at the end of the directory, 1 when cb stopped it, 2 when yield stopped it (*pos is
+ * then where to resume: every entry before it went to cb), -1 on a read error. *pos changes only on 2. */
+int exfat_list_dir_resume(const exfat_vol_t *vol, const exfat_entry_t *dir, exfat_dir_pos_t *pos,
+                          exfat_dir_pos_cb_t cb, exfat_dir_yield_t yield, void *user);
+/* Looks name up in dir (case-insensitive, as exfat_find_path) from *pos. Returns 0 found (*out), 1 not in the
+ * directory, 2 yielded (*pos: resume there), -1 on a read error. */
+int exfat_find_in_dir_resume(const exfat_vol_t *vol, const exfat_entry_t *dir, const char *name,
+                             exfat_dir_pos_t *pos, exfat_dir_yield_t yield, void *user, exfat_entry_t *out);
 int exfat_read_file(const exfat_vol_t *vol, const exfat_entry_t *file,
                     uint64_t offset, void *dst, uint32_t len, uint32_t *bytes_read);
 
 /* Write & maintenance operations (requires dev->write_sectors != NULL and 0x81 Allocation Bitmap) */
 void exfat_set_timestamp(exfat_vol_t *vol, uint32_t dos_timestamp);
-int  exfat_stat_fs(const exfat_vol_t *vol, uint32_t *free_mb, uint32_t *total_mb);
+/* free_mb from the volume's free-cluster cache (one bitmap scan after a mount, then none); total_mb from the VBR. */
+int  exfat_stat_fs(exfat_vol_t *vol, uint32_t *free_mb, uint32_t *total_mb);
+/* The cached free-cluster count (scans the bitmap when the cache is not valid). */
+int  exfat_free_clusters(exfat_vol_t *vol, uint32_t *out_free);
+/* Uncached: counts the clear bits of the allocation bitmap (the reference the cache is tested against). */
+int  exfat_count_free_scan(const exfat_vol_t *vol, uint32_t *out_free);
+void exfat_invalidate_free_cache(exfat_vol_t *vol);
 int  exfat_mkdir(exfat_vol_t *vol, const char *name);
 int  exfat_create_file(exfat_vol_t *vol, const char *dir_path, const char *filename, exfat_writer_t *out);
 int  exfat_write(exfat_writer_t *w, const void *data, uint32_t len);

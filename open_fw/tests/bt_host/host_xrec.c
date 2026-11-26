@@ -610,6 +610,28 @@ void bt_xrec_plat_hard_path(uint32_t reason)
     bth_log("    [xrec] HARD PATH reason %u (target: fault record 0xB1 + reboot)\n", (unsigned)reason);
 }
 
+/* F8 (fault while recording): the harness never records (the session-level park is unit-tested in test_bt_xrec);
+ * these keep the firmware's contract: park = no teardown, hard path once REC stopped. */
+static uint32_t s_park_reason;
+int bt_xrec_plat_rec_active(void) { return 0; }
+void bt_xrec_plat_park(uint32_t reason)
+{
+    if (s_park_reason == 0u) {
+        s_park_reason = reason;
+    }
+    bth_log("    [xrec] PARK reason %u (target: RW-BT silenced, recording continues)\n", (unsigned)reason);
+}
+int bt_xrec_plat_park_poll(void)
+{
+    uint32_t r = s_park_reason;
+    if (r == 0u) {
+        return 0;
+    }
+    s_park_reason = 0u;
+    bt_xrec_plat_hard_path(r);
+    return 0;
+}
+
 uint32_t bt_xrec_plat_poll(void)
 {
     uint32_t fl = bth_store_flush_requests();

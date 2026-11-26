@@ -40,17 +40,42 @@
 #define SDIO_DAT_TIMEOUT_US  500000u
 #define SDIO_MAX_MULTI_BLKS  64u
 
-static void sdio_log_err(const char *tag, uint32_t a, uint32_t b)
+/* R1 CURRENT_STATE (bits 12:9) and READY_FOR_DATA (bit 8) */
+#define SD_R1_STATE(r1)      (((r1) >> 9) & 0xFu)
+#define SD_R1_READY          (1u << 8)
+#define SD_STATE_TRAN        4u
+#define SD_STATE_DATA        5u
+#define SD_STATE_RCV         6u
+#define SD_STATE_PRG         7u
+
+/* RINTSTS bit 13 is SBE (start-bit error) on reads but BCI (busy clear interrupt) on writes: sd_init() sets bit 1 of
+ * +0x100 (dw_mmc CARDTHRCTL.BsyClrIntEn; the register is named SDIO_BMOD here after the factory firmware), so the
+ * controller raises bit 13 every time the card releases DAT0 busy after a written block. That is completion, not an
+ * error. A CMD25 always shows it at DTO (the busy between blocks ends before the last block), and a CMD24 shows it
+ * whenever the CPU reads RINTSTS after the card finished programming - i.e. whenever the (priority 1) app task was
+ * preempted for longer than the card's programming time between DTO and the status read, which BT traffic does
+ * (silicon 2026-11-26: SDW_MDTO a=0x2018 at the first CMD25 of every recording; SDW_1_FAIL during XREC GETS).
+ * Write data phases check this mask; real write failures are DCRC (CRC status negative), EBE (no CRC status),
+ * DRTO/HTO-class timeouts and the R1 error bits of the CMD13 that follows. */
+#define SDIO_INT_WR_DATA_ERRS (SDIO_INT_DATA_ERRS & ~SDIO_INT_SBE)
+
+/* Sector write retries (sd_write_blocks): up to SDIO_WR_SOFT_TRIES attempts with a card-state recovery (data path
+ * abort + controller reset when it may still be armed, CMD13, CMD12 if the card is stuck in data/rcv, busy wait) before
+ * each retry, all within SDIO_WR_SOFT_BUDGET_US from the first failure of the sd_write_blocks() call (below the 384 ms
+ * stereo ring tolerance); then one in-place re-initialisation per call and SDIO_WR_REINIT_TRIES more. A retry rewrites
+ * the same sector with the same data at the same LBA: idempotent. */
+#define SDIO_WR_SOFT_TRIES     3u
+#define SDIO_WR_REINIT_TRIES   2u
+#define SDIO_WR_SOFT_BUDGET_US 250000u
+#define SDIO_RD_TRIES          2u
+
+/* card->need_status levels */
+#define SD_NS_CHECK 1u   /* verify the card state (CMD13) before the next data command */
+#define SD_NS_ABORT 2u   /* the controller data path may still be armed: CMD12 abort + controller reset first */
+
+static void sdio_log_line(const char *tag, uint32_t a, uint32_t b)
 {
 #if !defined(OPENFW_HOST_MMIO) || defined(OPENFW_WASM)
-#if OPENFW_BENCH_MEAS
-    bench_meas_sd_err(&g_bench_meas, tag);   /* every error, also past the 8-line log cap */
-#endif
-    static uint8_t s_err_logs = 0u;
-    if (s_err_logs >= 8u) {
-        return;
-    }
-    s_err_logs++;
     openfw_log_puts(tag);
     openfw_log_puts(" a=");
     openfw_log_hex(a);
@@ -64,7 +89,35 @@ static void sdio_log_err(const char *tag, uint32_t a, uint32_t b)
 #endif
 }
 
+static void sdio_log_err(const char *tag, uint32_t a, uint32_t b)
+{
+#if !defined(OPENFW_HOST_MMIO) || defined(OPENFW_WASM)
+#if OPENFW_BENCH_MEAS
+    bench_meas_sd_err(&g_bench_meas, tag);   /* every error, also past the 8-line log cap */
+#endif
+    static uint8_t s_err_logs = 0u;
+    if (s_err_logs >= 8u) {
+        return;
+    }
+    s_err_logs++;
+#endif
+    sdio_log_line(tag, a, b);
+}
+
+/* Write-path event counters for the bench "BENCH rec" line (bench images only). */
+static void sdio_bench_wr(uint32_t kind)
+{
+#if (!defined(OPENFW_HOST_MMIO) || defined(OPENFW_WASM)) && OPENFW_BENCH_MEAS
+    bench_meas_sd_wr(&g_bench_meas, kind);
+#else
+    (void)kind;
+#endif
+}
+
 static int sdio_read_one_sector(sd_card_t *card, uint32_t lba, uint8_t *dst);
+
+/* RINTSTS of the last sdio_send_cmd() (0xFFFFFFFF: never accepted / no CMD_DONE): for the failure logs only. */
+static uint32_t s_last_cmd_st;
 
 static void sdio_reset_fifo(void)
 {
@@ -105,8 +158,42 @@ static void sdio_set_clk_div(uint32_t div)
     rom_clk_enable(CRU_CLK_SDIO);
 }
 
+/* Controller + FIFO reset (dw_mmc CTRL bits 0 and 1). It ends a data transfer the CIU still has armed - a data
+ * command whose response failed (RCRC / RTO after the card accepted it), a write starved of FIFO data, a DTO timeout -
+ * and clears the START bit of a command stuck behind that transfer: every command word here except CMD12 has bit 13
+ * (wait_prvdata_complete) set, so a CMD13 is never accepted while the data path is armed. A FIFO reset alone does not
+ * end the transfer. The CTRL configuration bits are kept; the CIU clock is re-latched as after sd_init(). */
+static void sdio_ctrl_reset(void)
+{
+    openfw_mmio_set32(SDIO_CTRL_ADDR, 0x3u);
+    uint64_t t0 = us_timer_now();
+    while (openfw_mmio_rd32(SDIO_CTRL_ADDR) & 0x3u) {
+        if ((uint32_t)(us_timer_now() - t0) >= SDIO_CMD_TIMEOUT_US) {
+            break;
+        }
+    }
+    openfw_mmio_wr32(SDIO_RINTSTS_ADDR, 0xFFFFFFFFu);
+    (void)sdio_update_clk();
+}
+
+static int sdio_send_cmd(uint32_t cmd_word, uint32_t arg, int ignore_rcrc);
+
+/* After a data command or data phase failed: stop the card (CMD12 has stop_abort, bit 14, and no wait_prvdata_complete:
+ * it goes out at once even with the data path armed; harmless (no response) when the card is already in tran), then
+ * reset the controller so the next command is accepted. The card state is verified before the next data command. */
+static void sdio_abort_data(sd_card_t *card)
+{
+    if (openfw_mmio_rd32(SDIO_CMD_ADDR) & SDIO_CMD_START) {
+        sdio_ctrl_reset();     /* a command stuck behind the armed data path would block the CMD12 */
+    }
+    (void)sdio_send_cmd(SD_CMD12_STOP, 0u, 1);
+    sdio_ctrl_reset();
+    card->need_status = SD_NS_CHECK;
+}
+
 static int sdio_send_cmd(uint32_t cmd_word, uint32_t arg, int ignore_rcrc)
 {
+    s_last_cmd_st = 0xFFFFFFFFu;
     if (sdio_wait_cmd_accept() != 0) {
         return -1;
     }
@@ -125,6 +212,7 @@ static int sdio_send_cmd(uint32_t cmd_word, uint32_t arg, int ignore_rcrc)
 
     uint32_t st = openfw_mmio_rd32(SDIO_RINTSTS_ADDR);
     openfw_mmio_wr32(SDIO_RINTSTS_ADDR, 0x00000344u);
+    s_last_cmd_st = st;
 
     if (st & (SDIO_INT_RTO | SDIO_INT_DRTO)) {
         return -1;
@@ -185,6 +273,11 @@ int sd_init(sd_card_t *card)
     card->async_last_desc = 0u;
     card->no_multi_write = 0u;
     card->async_t0_us  = 0u;
+    card->need_status  = 0u;
+    card->reinits      = 0u;
+    card->wr_retries   = 0u;
+    card->wr_bci1      = 0u;
+    card->wr_bcim      = 0u;
 
     /* 1-bit SDIO pins on Port D: PD5=CLK, PD4=CMD (PU), PD6=D0 (PU) */
     rom_gpio_config(0x00032D90u);
@@ -319,7 +412,8 @@ static int sdio_wait_card_ready(sd_card_t *card)
                 sdio_log_err("SD_R1_ERR", r1, openfw_mmio_rd32(SDIO_RINTSTS_ADDR));
                 return -1;
             }
-            if ((r1 & (1u << 8)) && (((r1 >> 9) & 0xFu) != 7u)) {
+            if ((r1 & SD_R1_READY) && (SD_R1_STATE(r1) != SD_STATE_PRG)) {
+                card->need_status = 0u;
                 return 0;
             }
         }
@@ -369,7 +463,8 @@ static int sdio_fifo_read_words(uint8_t *dst, uint32_t words, uint64_t t0, uint3
     return 0;
 }
 
-static int sdio_fifo_write_words(const uint8_t *src, uint32_t words, uint64_t t0, uint32_t timeout_us)
+static int sdio_fifo_write_words_bci(const uint8_t *src, uint32_t words, uint64_t t0, uint32_t timeout_us,
+                                     uint32_t *bci)
 {
     int aligned = (((uintptr_t)src & 3u) == 0u);
     const uint32_t *src32 = (const uint32_t *)(const void *)src;
@@ -378,10 +473,13 @@ static int sdio_fifo_write_words(const uint8_t *src, uint32_t words, uint64_t t0
         while (openfw_mmio_rd32(SDIO_STATUS_ADDR) & SDIO_STAT_FIFO_FULL) {
             if ((polls & 31u) == 31u) {
                 uint32_t st = openfw_mmio_rd32(SDIO_RINTSTS_ADDR);
-                if (st & SDIO_INT_DATA_ERRS) {
+                if (st & SDIO_INT_WR_DATA_ERRS) {   /* bit 13 here = busy clear between CMD25 blocks */
                     sdio_log_err("SDW_FIFO_ERR", st, w);
                     openfw_mmio_wr32(SDIO_RINTSTS_ADDR, 0xFFFFFFFFu);
                     return -1;
+                }
+                if (st & SDIO_INT_SBE) {
+                    *bci = 1u;
                 }
                 if ((uint32_t)(us_timer_now() - t0) >= timeout_us) {
                     sdio_log_err("SDW_FIFO_TMO", st, w);
@@ -406,18 +504,88 @@ static int sdio_fifo_write_words(const uint8_t *src, uint32_t words, uint64_t t0
     return 0;
 }
 
+static int sdio_fifo_write_words(const uint8_t *src, uint32_t words, uint64_t t0, uint32_t timeout_us)
+{
+    uint32_t bci = 0u;
+    return sdio_fifo_write_words_bci(src, words, t0, timeout_us, &bci);
+}
+
 static int sdio_wait_dto(uint64_t t0, uint32_t timeout_us, uint32_t *out_st)
 {
-    while (!(openfw_mmio_rd32(SDIO_RINTSTS_ADDR) & SDIO_INT_DTO)) {
+    uint32_t st;
+    while (!((st = openfw_mmio_rd32(SDIO_RINTSTS_ADDR)) & SDIO_INT_DTO)) {
         if ((uint32_t)(us_timer_now() - t0) >= timeout_us) {
+            *out_st = st;
             openfw_mmio_wr32(SDIO_RINTSTS_ADDR, 0xFFFFFFFFu);
             return -1;
         }
     }
-    uint32_t st = openfw_mmio_rd32(SDIO_RINTSTS_ADDR);
     openfw_mmio_wr32(SDIO_RINTSTS_ADDR, 0xFFFFFFFFu);
     *out_st = st;
     return 0;
+}
+
+/* Bring the card back to tran/ready before a data command: abort an armed data path (CMD12 + controller reset; see
+ * sdio_ctrl_reset) when an error left it armed or STATUS shows it busy; CMD13; data/rcv (an open read or write whose
+ * CMD12 was lost) -> abort again; prg -> poll until programming ends. The budget is checked before every command, so
+ * the overrun past budget_us is at most one command (<= 2 x SDIO_CMD_TIMEOUT_US). Clears card->need_status. */
+static int sdio_recover_state(sd_card_t *card, uint32_t budget_us)
+{
+    uint64_t t0 = us_timer_now();
+    uint32_t stops = 0u;
+    uint32_t last_r1 = 0xFFFFFFFFu;
+    if (card->need_status >= SD_NS_ABORT ||
+        (openfw_mmio_rd32(SDIO_STATUS_ADDR) & SDIO_STAT_DSM_BUSY) ||
+        (openfw_mmio_rd32(SDIO_CMD_ADDR) & SDIO_CMD_START)) {
+        stops++;
+        sdio_abort_data(card);
+    } else {
+        sdio_reset_fifo();
+    }
+    openfw_mmio_wr32(SDIO_RINTSTS_ADDR, 0xFFFFFFFFu);
+    while (1) {
+        wdt_feed();
+        if ((uint32_t)(us_timer_now() - t0) >= budget_us) {
+            sdio_log_err("SD_RECOVER", last_r1, stops);
+            return -1;
+        }
+        if (sdio_send_cmd(SD_CMD13_STATUS, (uint32_t)card->rca << 16, 0) == 0) {
+            uint32_t r1 = openfw_mmio_rd32(SDIO_RESP0_ADDR);
+            uint32_t state = SD_R1_STATE(r1);
+            last_r1 = r1;
+            if (state == SD_STATE_TRAN && (r1 & SD_R1_READY)) {
+                card->need_status = 0u;
+                return 0;
+            }
+            if ((state == SD_STATE_DATA || state == SD_STATE_RCV) && stops < 4u) {
+                stops++;
+                if ((uint32_t)(us_timer_now() - t0) < budget_us) {
+                    sdio_abort_data(card);
+                }
+                continue;
+            }
+        } else if (stops < 4u) {
+            /* No answer to CMD13: a card still streaming an open-ended read can garble it, or the command was not
+             * accepted behind an armed data path; stop the card, reset the controller and ask again. */
+            stops++;
+            if ((uint32_t)(us_timer_now() - t0) < budget_us) {
+                sdio_abort_data(card);
+            }
+        }
+        rom_us_delay(50u);
+    }
+}
+
+static int sdio_ensure_ready(sd_card_t *card)
+{
+    return card->need_status ? sdio_recover_state(card, SDIO_DAT_TIMEOUT_US) : 0;
+}
+
+static void sdio_mark_unknown(sd_card_t *card)
+{
+    if (card->need_status < SD_NS_CHECK) {
+        card->need_status = SD_NS_CHECK;
+    }
 }
 
 static int sdio_read_one_sector(sd_card_t *card, uint32_t lba, uint8_t *dst)
@@ -430,18 +598,22 @@ static int sdio_read_one_sector(sd_card_t *card, uint32_t lba, uint8_t *dst)
     openfw_mmio_wr32(SDIO_RINTSTS_ADDR, 0xFFFFFFFFu);
 
     if (sdio_send_cmd(SD_CMD17_READ1, arg, 0) != 0) {
+        sdio_abort_data(card);     /* an RCRC'd CMD17 still armed the data path */
         return -1;
     }
 
     uint64_t t0 = us_timer_now();
     if (sdio_fifo_read_words(dst, 128u, t0, SDIO_DAT_TIMEOUT_US) != 0) {
         sdio_reset_fifo();
+        card->need_status = SD_NS_ABORT;
         return -1;
     }
 
     uint32_t st = 0u;
-    if (sdio_wait_dto(us_timer_now(), SDIO_DAT_TIMEOUT_US, &st) != 0 || (st & SDIO_INT_DATA_ERRS)) {
+    int dto_rc = sdio_wait_dto(us_timer_now(), SDIO_DAT_TIMEOUT_US, &st);
+    if (dto_rc != 0 || (st & SDIO_INT_DATA_ERRS)) {
         sdio_reset_fifo();
+        card->need_status = (dto_rc != 0) ? SD_NS_ABORT : SD_NS_CHECK;
         return -1;
     }
     return 0;
@@ -481,6 +653,7 @@ void sd_read_async_abort(sd_card_t *card)
         return;
     }
     card->async_active = 0u;
+    card->need_status  = 1u;
     openfw_mmio_wr32(SDIO_IDMAC_BMOD_ADDR, 0u);
     openfw_mmio_clr32(SDIO_CTRL_ADDR, SDIO_CTRL_USE_IDMAC);
     (void)sdio_send_cmd(SD_CMD12_STOP, 0u, 1);
@@ -514,6 +687,9 @@ int sd_read_async_start(sd_card_t *card, uint32_t lba, uint32_t count, void *buf
     }
     if (count < 2u || count > 16u || (((uintptr_t)buf & 3u) != 0u)) {
         return -2; /* Caller falls back to synchronous PIO */
+    }
+    if (sdio_ensure_ready(card) != 0) {
+        return -1;
     }
     if (card->sector_count > 0u &&
         ((uint64_t)lba + (uint64_t)count) > (uint64_t)card->sector_count) {
@@ -571,6 +747,7 @@ int sd_read_async_start(sd_card_t *card, uint32_t lba, uint32_t count, void *buf
         openfw_mmio_wr32(SDIO_IDMAC_BMOD_ADDR, 0u);
         openfw_mmio_clr32(SDIO_CTRL_ADDR, SDIO_CTRL_USE_IDMAC);
         sdio_reset_dma_and_fifo();
+        sdio_abort_data(card);     /* the card may be streaming (RCRC on the response) */
         return -1;
     }
     openfw_mmio_wr32(SDIO_PLDMND_ADDR, 1u);
@@ -606,6 +783,7 @@ int sd_read_async_poll(sd_card_t *card)
         openfw_mmio_clr32(SDIO_CTRL_ADDR,      SDIO_CTRL_USE_IDMAC);
         int stop_rc = sdio_send_cmd(SD_CMD12_STOP, 0u, 1);
         sdio_reset_fifo();
+        card->need_status = 1u;
         OPENFW_DSB();
         return (stop_rc == 0) ? 1 : -1;
     }
@@ -652,14 +830,14 @@ static int sdio_read_multi(sd_card_t *card, uint32_t lba, uint32_t count, uint8_
     openfw_mmio_wr32(SDIO_RINTSTS_ADDR, 0xFFFFFFFFu);
 
     if (sdio_send_cmd(SD_CMD18_READ_MULTI, arg, 0) != 0) {
+        sdio_abort_data(card);     /* an RCRC'd CMD18: the card streams and the data path is armed */
         return -1;
     }
 
     uint32_t xfer_timeout = SDIO_DAT_TIMEOUT_US + (count * 50000u);
     uint64_t t0 = us_timer_now();
     if (sdio_fifo_read_words(dst, count * 128u, t0, xfer_timeout) != 0) {
-        (void)sdio_send_cmd(SD_CMD12_STOP, 0u, 1);
-        sdio_reset_fifo();
+        sdio_abort_data(card);
         return -1;
     }
 
@@ -667,6 +845,9 @@ static int sdio_read_multi(sd_card_t *card, uint32_t lba, uint32_t count, uint8_
     int dto_rc = sdio_wait_dto(us_timer_now(), SDIO_DAT_TIMEOUT_US, &st);
     int stop_rc = sdio_send_cmd(SD_CMD12_STOP, 0u, 1);
     sdio_reset_fifo();
+    /* CMD12 is R1b and its response can be lost while the card streams: the state is checked (CMD13, cheap) before
+     * the next data command instead of assuming tran. */
+    card->need_status = (dto_rc != 0) ? SD_NS_ABORT : SD_NS_CHECK;
     if (dto_rc != 0 || stop_rc != 0 || (st & SDIO_INT_DATA_ERRS)) {
         return -1;
     }
@@ -683,19 +864,34 @@ static int sdio_write_one_sector(sd_card_t *card, uint32_t lba, const uint8_t *s
     openfw_mmio_wr32(SDIO_RINTSTS_ADDR, 0xFFFFFFFFu);
 
     if (sdio_send_cmd(SD_CMD24_WRITE1, arg, 0) != 0) {
+        sdio_log_err("SDW_1_CMD", lba, s_last_cmd_st);
+        /* RCRC (or a lost response) after the card accepted the CMD24: the card waits in rcv and the controller waits
+         * for FIFO data. Without the abort the next CMD13 is never accepted (wait_prvdata_complete). */
+        sdio_abort_data(card);
         return -1;
     }
 
     uint64_t t0 = us_timer_now();
     if (sdio_fifo_write_words(src, 128u, t0, SDIO_DAT_TIMEOUT_US) != 0) {
         sdio_reset_fifo();
+        card->need_status = SD_NS_ABORT;
         return -1;
     }
 
     uint32_t st = 0u;
-    if (sdio_wait_dto(us_timer_now(), SDIO_DAT_TIMEOUT_US, &st) != 0 || (st & SDIO_INT_DATA_ERRS)) {
+    int dto_rc = sdio_wait_dto(us_timer_now(), SDIO_DAT_TIMEOUT_US, &st);
+    if (dto_rc != 0 || (st & SDIO_INT_WR_DATA_ERRS)) {
+        sdio_log_err("SDW_1_DTO", lba, dto_rc != 0 ? (st | 0x80000000u) : st);
         sdio_reset_fifo();
+        card->need_status = (dto_rc != 0) ? SD_NS_ABORT : SD_NS_CHECK;
         return -1;
+    }
+    if (st & SDIO_INT_SBE) {
+        card->wr_bci1++;
+        sdio_bench_wr(BENCH_MEAS_SDW_BCI1);
+        if (card->wr_bci1 == 1u) {
+            sdio_log_line("SDW_BCI1", lba, st);   /* the first CMD24 busy-clear since init: not an error */
+        }
     }
     return sdio_wait_card_ready(card);
 }
@@ -711,26 +907,129 @@ static int sdio_write_multi(sd_card_t *card, uint32_t lba, uint32_t count, const
 
     if (sdio_send_cmd(SD_CMD25_WRITE_MULTI, arg, 0) != 0) {
         sdio_log_err("SDW_CMD25", lba, count);
+        sdio_abort_data(card);
         return -1;
     }
 
     uint32_t xfer_timeout = SDIO_DAT_TIMEOUT_US + (count * 50000u);
     uint64_t t0 = us_timer_now();
-    if (sdio_fifo_write_words(src, count * 128u, t0, xfer_timeout) != 0) {
-        (void)sdio_send_cmd(SD_CMD12_STOP, 0u, 1);
-        sdio_reset_fifo();
+    uint32_t bci_fifo = 0u;
+    if (sdio_fifo_write_words_bci(src, count * 128u, t0, xfer_timeout, &bci_fifo) != 0) {
+        sdio_abort_data(card);
         return -1;
     }
 
     uint32_t st = 0u;
     int dto_rc = sdio_wait_dto(us_timer_now(), SDIO_DAT_TIMEOUT_US, &st);
     int stop_rc = sdio_send_cmd(SD_CMD12_STOP, 0u, 1);
-    if (dto_rc != 0 || stop_rc != 0 || (st & SDIO_INT_DATA_ERRS)) {
+    if (dto_rc != 0 || stop_rc != 0 || (st & SDIO_INT_WR_DATA_ERRS)) {
         sdio_log_err("SDW_MDTO", st, ((uint32_t)(dto_rc != 0) << 16) | (uint32_t)(stop_rc != 0));
         sdio_reset_fifo();
+        card->need_status = (dto_rc != 0) ? SD_NS_ABORT : SD_NS_CHECK;
         return -1;
     }
+    if ((st & SDIO_INT_SBE) || bci_fifo) {
+        card->wr_bcim++;
+        sdio_bench_wr(BENCH_MEAS_SDW_BCIM);
+    }
     return sdio_wait_card_ready(card);
+}
+
+/* Full in-place re-initialisation (controller reset, CMD0 .. CMD7, clock probe) for the write retry path. Keeps the
+ * latched single-block mode: a card that stalled on CMD25 once keeps using CMD24. */
+static int sdio_reinit(sd_card_t *card)
+{
+    uint8_t  nmw     = card->no_multi_write;
+    uint8_t  reinits = card->reinits;
+    uint16_t retries = card->wr_retries;
+    uint32_t bci1    = card->wr_bci1;
+    uint32_t bcim    = card->wr_bcim;
+    int rc = sd_init(card);
+    card->no_multi_write = nmw;
+    card->reinits        = (uint8_t)(reinits < 255u ? reinits + 1u : 255u);
+    card->wr_retries     = retries;
+    card->wr_bci1        = bci1;
+    card->wr_bcim        = bcim;
+    sdio_bench_wr(BENCH_MEAS_SDW_REINIT);
+    sdio_log_err("SD_REINIT", (uint32_t)rc, card->reinits);
+    return rc;
+}
+
+/* Retry state of one sd_write_blocks() call: the soft-retry budget runs from its first failure, and the card is
+ * re-initialised at most once per call. */
+typedef struct {
+    uint64_t t_fail;
+    uint8_t  failed;
+    uint8_t  reinit_done;
+} sdio_wr_budget_t;
+
+/* A step that started at t_start failed: the soft budget runs from there (the first failure of the call only). */
+static void sdio_budget_fail(sdio_wr_budget_t *b, uint64_t t_start)
+{
+    if (!b->failed) {
+        b->failed = 1u;
+        b->t_fail = t_start;
+    }
+}
+
+static uint32_t sdio_budget_left(const sdio_wr_budget_t *b)
+{
+    uint32_t el = (uint32_t)(us_timer_now() - b->t_fail);
+    return (el >= SDIO_WR_SOFT_BUDGET_US) ? 0u : (SDIO_WR_SOFT_BUDGET_US - el);
+}
+
+/* One sector, retried: a failed attempt marks the card state unknown, the next attempt first brings the card back
+ * to tran (sdio_recover_state, bounded by what is left of the soft budget); once SDIO_WR_SOFT_TRIES attempts or the
+ * budget are used up the card is re-initialised (once per call) and SDIO_WR_REINIT_TRIES more attempts follow.
+ * Rewriting the same LBA with the same data is idempotent, so a write that did reach the card before its status was
+ * lost costs nothing. */
+static int sdio_write_one_retry(sd_card_t *card, uint32_t lba, const uint8_t *src, sdio_wr_budget_t *b)
+{
+    uint32_t soft = 0u;    /* attempts of this sector before the call's re-init */
+    uint32_t hard = 0u;    /* attempts after it */
+    while (1) {
+        wdt_feed();
+        uint64_t t_att = us_timer_now();
+        uint32_t n = soft + hard;
+        uint32_t budget = SDIO_DAT_TIMEOUT_US;
+        if (!b->reinit_done) {
+            budget = b->failed ? sdio_budget_left(b) : SDIO_WR_SOFT_BUDGET_US;
+            if (soft > 0u && (soft >= SDIO_WR_SOFT_TRIES || budget == 0u)) {
+                b->reinit_done = 1u;
+                if (sdio_reinit(card) != 0) {
+                    break;
+                }
+                budget = SDIO_DAT_TIMEOUT_US;
+            }
+        }
+        if (b->reinit_done) {
+            if (hard >= SDIO_WR_REINIT_TRIES) {
+                break;
+            }
+            hard++;
+        } else {
+            soft++;
+        }
+        if (n > 0u) {
+            sdio_mark_unknown(card);
+            if (card->wr_retries < 0xFFFFu) {
+                card->wr_retries++;
+            }
+            sdio_bench_wr(BENCH_MEAS_SDW_RETRY);
+            sdio_log_err("SDW_RETRY", lba, n);
+        }
+        if (card->need_status && sdio_recover_state(card, budget) != 0) {
+            sdio_budget_fail(b, t_att);
+            continue;
+        }
+        if (sdio_write_one_sector(card, lba, src) == 0) {
+            return 0;
+        }
+        sdio_budget_fail(b, t_att);
+        sdio_mark_unknown(card);
+    }
+    sdio_log_err("SDW_1_FAIL", lba, 1u);
+    return -1;
 }
 
 int sd_read_blocks(sd_card_t *card, uint32_t lba, uint32_t count, void *buf)
@@ -760,18 +1059,28 @@ int sd_read_blocks(sd_card_t *card, uint32_t lba, uint32_t count, void *buf)
                 max_multi = safe_limit - cur_lba;
             }
         }
+        uint32_t chunk = 1u;
         if (max_multi >= 2u) {
-            uint32_t chunk = (max_multi > SDIO_MAX_MULTI_BLKS) ? SDIO_MAX_MULTI_BLKS : max_multi;
-            if (sdio_read_multi(card, cur_lba, chunk, dst + (done * 512u)) != 0) {
-                return -1;
-            }
-            done += chunk;
-        } else {
-            if (sdio_read_one_sector(card, cur_lba, dst + (done * 512u)) != 0) {
-                return -1;
-            }
-            done++;
+            chunk = (max_multi > SDIO_MAX_MULTI_BLKS) ? SDIO_MAX_MULTI_BLKS : max_multi;
         }
+        int rc = -1;
+        for (uint32_t t = 0u; t < SDIO_RD_TRIES && rc != 0; t++) {
+            if (t > 0u) {
+                sdio_mark_unknown(card);
+            }
+            if (sdio_ensure_ready(card) != 0) {
+                continue;
+            }
+            rc = (chunk >= 2u) ? sdio_read_multi(card, cur_lba, chunk, dst + (done * 512u))
+                               : sdio_read_one_sector(card, cur_lba, dst + (done * 512u));
+            if (rc != 0) {
+                sdio_mark_unknown(card);
+            }
+        }
+        if (rc != 0) {
+            return -1;
+        }
+        done += chunk;
     }
     return 0;
 }
@@ -789,8 +1098,12 @@ int sd_write_blocks(sd_card_t *card, uint32_t lba, uint32_t count, const void *b
     uint32_t safe_limit = (card->sector_count > 3u) ? (card->sector_count - 3u) : 0u;
     const uint8_t *src = (const uint8_t *)buf;
     uint32_t done = 0u;
+    sdio_wr_budget_t budget = { 0u, 0u, 0u };
     while (done < count) {
         wdt_feed();
+        if (!card->initialized) {
+            return BLKDEV_ERR_FINAL;   /* a failed re-initialisation in the retry path */
+        }
         uint32_t rem = count - done;
         uint32_t cur_lba = lba + done;
         uint32_t max_multi = rem;
@@ -803,25 +1116,34 @@ int sd_write_blocks(sd_card_t *card, uint32_t lba, uint32_t count, const void *b
         }
         if (!card->no_multi_write && max_multi >= 2u) {
             uint32_t chunk = (max_multi > SDIO_MAX_MULTI_BLKS) ? SDIO_MAX_MULTI_BLKS : max_multi;
-            if (sdio_write_multi(card, cur_lba, chunk, src + (done * 512u)) != 0) {
+            int fallback = 0;
+            uint64_t t_rec = us_timer_now();
+            if (card->need_status && sdio_recover_state(card, SDIO_WR_SOFT_BUDGET_US) != 0) {
+                /* The state recovery before the CMD25 failed, the CMD25 never ran: not a multi-block problem. This
+                 * chunk goes sector by sector (each with its own recovery and retries); the latch stays off. */
+                sdio_budget_fail(&budget, t_rec);
+                sdio_mark_unknown(card);
+                fallback = 1;
+            } else if (sdio_write_multi(card, cur_lba, chunk, src + (done * 512u)) != 0) {
                 /* Some cards / SL6801 dw_mmc revisions stall on CMD25+CMD12;
-                 * log once, latch single-block CMD24 mode, and retry cleanly. */
+                 * log once, latch single-block CMD24 mode, and rewrite the chunk sector by sector. */
                 sdio_log_err("SDW_MFAIL", cur_lba, chunk);
                 card->no_multi_write = 1u;
-                sdio_reset_fifo();
-                (void)sdio_wait_card_ready(card);
+                sdio_mark_unknown(card);
+                fallback = 1;
+            }
+            if (fallback) {
                 for (uint32_t k = 0u; k < chunk; k++) {
-                    if (sdio_write_one_sector(card, cur_lba + k, src + ((done + k) * 512u)) != 0) {
+                    if (sdio_write_one_retry(card, cur_lba + k, src + ((done + k) * 512u), &budget) != 0) {
                         sdio_log_err("SDW_FB_FAIL", cur_lba + k, chunk);
-                        return -1;
+                        return BLKDEV_ERR_FINAL;
                     }
                 }
             }
             done += chunk;
         } else {
-            if (sdio_write_one_sector(card, cur_lba, src + (done * 512u)) != 0) {
-                sdio_log_err("SDW_1_FAIL", cur_lba, 1u);
-                return -1;
+            if (sdio_write_one_retry(card, cur_lba, src + (done * 512u), &budget) != 0) {
+                return BLKDEV_ERR_FINAL;
             }
             done++;
         }

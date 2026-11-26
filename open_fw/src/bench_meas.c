@@ -127,6 +127,21 @@ void bench_meas_sd_err(bench_meas_t *m, const char *tag)
     }
 }
 
+void bench_meas_sd_wr(bench_meas_t *m, uint32_t kind)
+{
+    bench_meas_rec_t *r = &m->cur;
+    if (!r->active) {
+        return;
+    }
+    switch (kind) {
+    case BENCH_MEAS_SDW_BCI1:   r->sd_bci1++;   break;
+    case BENCH_MEAS_SDW_BCIM:   r->sd_bcim++;   break;
+    case BENCH_MEAS_SDW_RETRY:  r->sd_retry++;  break;
+    case BENCH_MEAS_SDW_REINIT: r->sd_reinit++; break;
+    default: break;
+    }
+}
+
 void bench_meas_overrun(bench_meas_t *m, uint32_t dropped, uint32_t comp)
 {
     if (!m->cur.active) {
@@ -384,6 +399,20 @@ uint32_t bench_meas_format_rec(const bench_meas_rec_t *r, char sep, char *buf, u
     }
     fku(&f, "sd_err", r->sd_err);
     fku(&f, "sd_mdto", r->sd_mdto);
+    return f.len;
+}
+
+uint32_t bench_meas_format_sdw(const bench_meas_rec_t *r, char sep, char *buf, uint32_t cap)
+{
+    fmt_t f;
+    fmt_init(&f, sep, buf, cap);
+    if (cap == 0u) {
+        return 0u;
+    }
+    fku(&f, "sd_bci1", r->sd_bci1);
+    fku(&f, "sd_bcim", r->sd_bcim);
+    fku(&f, "sd_retry", r->sd_retry);
+    fku(&f, "sd_reinit", r->sd_reinit);
     return f.len;
 }
 

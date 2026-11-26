@@ -2155,6 +2155,194 @@ static int file_write_sectors(void *ctx, uint32_t lba, uint32_t count, const voi
     return fflush(fp) == 0 ? 0 : -1;
 }
 
+/* ---- F4 free-cluster cache (docs/BT_SYNC_SPEED_AND_RECORDING.md): counting / fault-injecting block device ---- */
+typedef struct {
+    FILE    *fp;
+    uint32_t reads;
+    int      fail_writes;   /* > 0: this many more writes succeed, then every write fails; < 0: never fail */
+} fc_dev_t;
+
+static int fc_read(void *ctx, uint32_t lba, uint32_t count, void *buf)
+{
+    fc_dev_t *d = (fc_dev_t *)ctx;
+    d->reads += count;
+    return file_read_sectors(d->fp, lba, count, buf);
+}
+
+static int fc_write(void *ctx, uint32_t lba, uint32_t count, const void *buf)
+{
+    fc_dev_t *d = (fc_dev_t *)ctx;
+    if (d->fail_writes == 0) {
+        return -1;
+    }
+    if (d->fail_writes > 0) {
+        d->fail_writes--;
+    }
+    return file_write_sectors(d->fp, lba, count, buf);
+}
+
+/* The cache (as exfat_stat_fs reports it) equals a fresh bitmap scan. */
+static void fc_expect_consistent(exfat_vol_t *v, const char *what)
+{
+    uint32_t cached = 0u, scanned = 0u;
+    assert(exfat_free_clusters(v, &cached) == 0);
+    assert(exfat_count_free_scan(v, &scanned) == 0);
+    if (cached != scanned) {
+        fprintf(stderr, "free-cluster cache after %s: cached %u, bitmap %u\n", what, (unsigned)cached,
+                (unsigned)scanned);
+        assert(0);
+    }
+}
+
+static void fc_write_file(exfat_vol_t *v, const char *dir, const char *name, uint32_t bytes, uint32_t step)
+{
+    static uint8_t blk[8192];
+    for (uint32_t i = 0u; i < sizeof(blk); i++) {
+        blk[i] = (uint8_t)(i * 7u + bytes);
+    }
+    exfat_writer_t w;
+    assert(exfat_create_file(v, dir, name, &w) == 0);
+    for (uint32_t done = 0u; done < bytes; ) {
+        uint32_t n = bytes - done;
+        if (n > step) {
+            n = step;
+        }
+        assert(exfat_write(&w, blk, n) == 0);
+        done += n;
+    }
+    assert(exfat_close_file(&w) == 0);
+}
+
+static void test_exfat_free_cache_img(FILE *fp, uint32_t sectors)
+{
+    fc_dev_t d = { fp, 0u, -1 };
+    blkdev_t dev = { fc_read, fc_write, sectors, &d };
+    exfat_vol_t vol;
+    assert(exfat_mount(&vol, &dev) == 0);
+    assert(vol.free_valid == 0u);                       /* computed lazily by the first stat after a mount */
+
+    uint32_t free_mb = 0u, total_mb = 0u, f0 = 0u;
+    d.reads = 0u;
+    assert(exfat_stat_fs(&vol, &free_mb, &total_mb) == 0);
+    assert(d.reads > 0u && vol.free_valid == 1u);       /* the one bitmap scan */
+    assert(exfat_free_clusters(&vol, &f0) == 0);
+    d.reads = 0u;
+    for (int i = 0; i < 20; i++) {
+        uint32_t again = 0u;
+        assert(exfat_stat_fs(&vol, &again, NULL) == 0 && again == free_mb);
+    }
+    assert(d.reads == 0u);                              /* STAT no longer scans the bitmap (the XREC stall) */
+    fc_expect_consistent(&vol, "mount");
+
+    /* allocate: contiguous growth, a fragmented chain (two files written interleaved), a directory, deletes */
+    assert(exfat_mkdir(&vol, "fcache") == 0);
+    fc_expect_consistent(&vol, "mkdir");
+    fc_write_file(&vol, "/fcache", "A.BIN", 3u * vol.cluster_size + 100u, 4096u);
+    fc_expect_consistent(&vol, "contiguous file");
+    {
+        exfat_writer_t w1, w2;
+        static uint8_t blk[4096];
+        memset(blk, 0x5A, sizeof(blk));
+        assert(exfat_create_file(&vol, "/fcache", "B.BIN", &w1) == 0);
+        assert(exfat_create_file(&vol, "/fcache", "C.BIN", &w2) == 0);
+        for (int k = 0; k < 4; k++) {                   /* interleaved: both chains fragment (FAT chains) */
+            assert(exfat_write(&w1, blk, vol.cluster_size) == 0);
+            assert(exfat_write(&w2, blk, vol.cluster_size) == 0);
+        }
+        assert(exfat_close_file(&w1) == 0 && exfat_close_file(&w2) == 0);
+    }
+    fc_expect_consistent(&vol, "fragmented files");
+    uint32_t f1 = 0u;
+    assert(exfat_free_clusters(&vol, &f1) == 0 && f1 < f0);
+    /* a directory growing past one cluster (dir_alloc_slots: alloc + free_cluster_bit paths) */
+    for (int i = 0; i < 50; i++) {
+        char fn[16];
+        snprintf(fn, sizeof(fn), "F%02d.TXT", i);
+        fc_write_file(&vol, "/fcache", fn, 1u, 1u);
+    }
+    fc_expect_consistent(&vol, "directory growth");
+    assert(exfat_delete_file(&vol, "/fcache", "B.BIN") == 0);
+    fc_expect_consistent(&vol, "delete (FAT chain)");
+    assert(exfat_delete_file(&vol, "/fcache", "A.BIN") == 0);
+    fc_expect_consistent(&vol, "delete (NoFatChain)");
+    fc_write_file(&vol, "/fcache", "T.TMP", 2u * vol.cluster_size, 512u);
+    assert(exfat_replace_file(&vol, "/fcache", "T.TMP", "C.BIN") == 0);   /* frees the old C.BIN */
+    fc_expect_consistent(&vol, "replace");
+    {
+        exfat_writer_t cw;                              /* checkpoint publishes the chain without closing */
+        assert(exfat_create_file(&vol, "/fcache", "CK.BIN", &cw) == 0);
+        static uint8_t blk[4096];
+        memset(blk, 0x11, sizeof(blk));
+        assert(exfat_write(&cw, blk, sizeof(blk)) == 0);
+        assert(exfat_write(&cw, blk, sizeof(blk)) == 0);
+        assert(exfat_checkpoint_file(&cw, 0, 0u) == 0);
+        fc_expect_consistent(&vol, "checkpoint");
+        assert(exfat_close_file(&cw) == 0);
+    }
+    for (int i = 0; i < 50; i++) {
+        char fn[16];
+        snprintf(fn, sizeof(fn), "F%02d.TXT", i);
+        assert(exfat_delete_file(&vol, "/fcache", fn) == 0);
+    }
+    fc_expect_consistent(&vol, "deletes");
+
+    /* a write failure mid-allocation: the cache is dropped (or still exact), never wrong */
+    {
+        exfat_writer_t fw;
+        static uint8_t blk[4096];
+        memset(blk, 0x22, sizeof(blk));
+        assert(exfat_create_file(&vol, "/fcache", "FAIL.BIN", &fw) == 0);
+        for (int budget = 0; budget < 6; budget++) {
+            d.fail_writes = budget;
+            (void)exfat_write(&fw, blk, sizeof(blk));
+            d.fail_writes = -1;
+            fc_expect_consistent(&vol, "write fault");
+        }
+        (void)exfat_close_file(&fw);
+        fc_expect_consistent(&vol, "close after write fault");
+    }
+
+    /* USB MSC: another writer (the PC) changes the bitmap behind this volume. The cache cannot see it; the remount
+     * that ends every MSC session (AGENTS.md MSC boundary, main.c run_usb_msc_mode) recomputes it. */
+    uint32_t before_pc = 0u;
+    assert(exfat_free_clusters(&vol, &before_pc) == 0);
+    {
+        exfat_vol_t pc;
+        assert(exfat_mount(&pc, &dev) == 0);
+        fc_write_file(&pc, "/fcache", "PC.BIN", 5u * pc.cluster_size, 4096u);
+    }
+    uint32_t stale = 0u, truth = 0u;
+    assert(exfat_free_clusters(&vol, &stale) == 0 && stale == before_pc);
+    assert(exfat_count_free_scan(&vol, &truth) == 0 && truth + 5u <= stale);   /* stale until the remount */
+    assert(exfat_mount(&vol, &dev) == 0);
+    assert(vol.free_valid == 0u);
+    fc_expect_consistent(&vol, "remount after a foreign writer");
+    exfat_invalidate_free_cache(&vol);                  /* explicit drop: the next stat rescans */
+    assert(vol.free_valid == 0u);
+    fc_expect_consistent(&vol, "explicit invalidate");
+    /* a failed remount (bad device) drops the cache too: the old volume's count must not survive */
+    {
+        fc_dev_t bad = { fp, 0u, -1 };
+        blkdev_t baddev = { fc_read, fc_write, 1u, &bad };   /* 1 sector: the VBR's geometry does not fit */
+        uint32_t tmp = 0u;
+        assert(exfat_free_clusters(&vol, &tmp) == 0 && vol.free_valid == 1u);
+        assert(exfat_mount(&vol, &baddev) != 0);
+        assert(vol.free_valid == 0u);
+        assert(exfat_mount(&vol, &dev) == 0);
+    }
+
+    assert(exfat_delete_file(&vol, "/fcache", "PC.BIN") == 0);
+    assert(exfat_delete_file(&vol, "/fcache", "C.BIN") == 0);
+    assert(exfat_delete_file(&vol, "/fcache", "CK.BIN") == 0);
+    (void)exfat_delete_file(&vol, "/fcache", "FAIL.BIN");
+    fc_expect_consistent(&vol, "cleanup");
+    uint32_t f_end = 0u;
+    assert(exfat_free_clusters(&vol, &f_end) == 0);
+    /* only /fcache's own clusters stay allocated (it grew for 50 entries) */
+    assert(f_end <= f0 && f0 - f_end <= 4u);
+    printf("  [PASS] exfat free-cluster cache (F4): == bitmap scan after alloc/free/replace/checkpoint/faults/remount\n");
+}
+
 static void run_exfat_img_test(const char *path)
 {
     FILE *fp = fopen(path, "r+b");
@@ -2416,6 +2604,7 @@ static void run_exfat_img_test(const char *path)
                se.size == APMEM_FILE_BYTES && !se.is_dir);
     }
 
+    test_exfat_free_cache_img(fp, (uint32_t)(sz / 512L));
     fclose(fp);
     printf("  [PASS] exfat-img (%s: 16,428 B multi-cluster WAV + checkpoint + atomic replace + NoFatChain grow + settings.bin verified)\n", path);
 }
@@ -2849,6 +3038,7 @@ static void test_xrec_session(void)
         mock_xrec_exp_write, mock_xrec_exp_run, mock_xrec_read_log,
         mock_xrec_reset_log, mock_xrec_on_dfu, mock_xrec_audio_cfg,
         mock_xrec_get_mtu, mock_xrec_file_busy, NULL, NULL,
+        NULL, NULL, NULL,
     };
     xrec_init(&xrec, &vol, &ops, &sp);
 
@@ -2910,7 +3100,7 @@ static void test_xrec_session(void)
     assert(strstr(phone_text(&sp), "+XREC:ERR,RTCRNG") != NULL);
     assert(strstr(phone_text(&sp), "+XREC:OK,RTC") != NULL);
     assert(strstr(phone_text(&sp), "+XREC:RTC,2026-11-19 17:05:30,3") != NULL);
-    assert(strstr(phone_text(&sp), "+XREC:STAT,87,4095,1,1,16,0,30100,30500") != NULL);
+    assert(strstr(phone_text(&sp), "+XREC:STAT,87,4095,1,1,16,0,30100,30500,0,0\r\n") != NULL);   /* + rec_idx, pace_ms (F7) */
 
     /* Replenish credits & test coalesced 10-file +XREC:LS + +XREC:DEL + path traversal block */
     sp.credits += 10u;

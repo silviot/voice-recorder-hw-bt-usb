@@ -2139,8 +2139,15 @@ static void sleep_1ms(uint32_t ms)
     bt_xrec_plat_wait();
 }
 
+static uint8_t s_hp_parked HP_HI;   /* F8: parked by a fault during a recording */
+static int park_poll(void);
+
 static int shutdown_now(void)
 {
+    if (s_hp_parked) {
+        (void)park_poll();            /* F8: the deferred hard path once REC stopped */
+        return (int)s_last_fault;
+    }
     if (g == NULL) {
         return s_state == BT_HP_ST_DEAD ? (int)s_last_fault : 0;
     }
@@ -2203,6 +2210,12 @@ static int shutdown_now(void)
         bt_xrec_plat_set_mode(BT_XREC_MODE_PHONE, NULL);
         s_last_fault = reason;
         set_state(BT_HP_ST_DEAD);
+        if (bt_xrec_plat_rec_active()) {
+            /* F8: a recording runs: parked (the session stays allocated, see park()), hard path after REC */
+            bt_xrec_plat_park(reason);
+            s_hp_parked = 1u;
+            return (int)reason;
+        }
         bt_xrec_plat_hard_path(reason);
         free_session();
         return (int)reason;
@@ -2221,6 +2234,41 @@ static int shutdown_now(void)
     return 0;
 }
 
+/* F8 (docs/BT_SYNC_SPEED_AND_RECORDING.md 2.5; bt_xrec_bluedroid.h bt_xrec_plat_park): a fault while a recording
+ * runs. No graceful teardown, no automatic restart, no reboot: the output leaves the headset, late BTC callbacks are
+ * dropped, the platform silences RW-BT. No Bluedroid API is called and the session memory stays allocated (the BTC
+ * tick may still touch it). The deferred hard path runs once REC stops (bt_hp_poll / bt_hp_stop). */
+
+static void park(uint32_t reason)
+{
+    bt_hp_plat_attach_sink(NULL, NULL, NULL, 0);
+    bt_xrec_plat_lock();
+    g->cb_open = 0u;
+    g->link = BT_HP_LINK_NONE;
+    bt_xrec_plat_unlock();
+    s_auto_restart = 0u;
+    bt_xrec_plat_park(reason);
+    s_hp_parked = 1u;
+    s_last_fault = reason;
+    set_state(BT_HP_ST_DEAD);
+    lbegin("fault while recording: BT silenced, recording continues, recovery after REC");
+    lku("reason", reason);
+    lend();
+}
+
+/* Parked: 1 while the recording runs; then the deferred hard path (target: reboot; host: returns 0). */
+static int park_poll(void)
+{
+    if (!s_hp_parked) {
+        return 0;
+    }
+    if (bt_xrec_plat_park_poll() != 0) {
+        return 1;
+    }
+    s_hp_parked = 0u;
+    return 0;
+}
+
 static void fault(uint32_t reason)
 {
     if (g == NULL || s_state == BT_HP_ST_OFF || s_state == BT_HP_ST_FAULTED || s_state == BT_HP_ST_DEAD) {
@@ -2230,6 +2278,10 @@ static void fault(uint32_t reason)
     lbegin("fault");
     lku("reason", reason);
     lend();
+    if (bt_xrec_plat_rec_active()) {
+        park(reason);                 /* F8: the recording first */
+        return;
+    }
     if (shutdown_now() == 0) {
         set_state(BT_HP_ST_FAULTED);
     }
@@ -2458,6 +2510,10 @@ static void auto_restart_poll(void)
 
 void bt_hp_poll(void)
 {
+    if (s_hp_parked) {
+        (void)park_poll();
+        return;
+    }
     if (g == NULL) {
         auto_restart_poll();
         return;
@@ -2518,13 +2574,17 @@ void bt_hp_poll(void)
         lbegin("platform fault");
         lku("why", why);
         lend();
-        fault(BT_XREC_FAULT_PLATFORM);
+        fault(why == 5u ? BT_XREC_FAULT_ASSERT : BT_XREC_FAULT_PLATFORM);
     }
 }
 
 int bt_hp_stop(void)
 {
     s_auto_restart = 0u;              /* an explicit stop (BACK + off, phone mode, USB disk, power) wins */
+    if (s_hp_parked) {
+        (void)park_poll();
+        return (int)s_last_fault;
+    }
     if (g == NULL) {
         return s_state == BT_HP_ST_DEAD ? (int)s_last_fault : 0;
     }

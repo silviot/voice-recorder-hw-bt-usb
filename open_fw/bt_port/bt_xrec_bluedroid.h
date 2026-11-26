@@ -83,7 +83,7 @@ enum {
     BT_XREC_ST_CONFIG,    /* Bluedroid enabled; GAP set, waiting for SPP INIT/START */
     BT_XREC_ST_READY,     /* SPP server listening on channel 1 */
     BT_XREC_ST_FAULTED,   /* graceful recovery done after a fault: off until the next bt_xrec_start() */
-    BT_XREC_ST_DEAD,      /* hard path taken (host tests only: on target it reboots) */
+    BT_XREC_ST_DEAD,      /* hard path taken (host tests only: on target it reboots), or parked (F8, below) */
 };
 
 /* Coordinated teardown (plan M4): every exit (BT-mode exit, power-off, deferred reboot/OTA/DFU, faults) goes through
@@ -121,6 +121,7 @@ typedef struct {
     uint32_t scan_failsafe;      /* scan switched off (0x00) because a write dropping discoverability was refused */
     uint32_t rx_lost;            /* SPP reported an RX frame lost for lack of memory (patch 0044): link closed */
     uint32_t close_retries;      /* esp_spp_disconnect() retried after a refusal (review STEP10 C11) */
+    uint8_t  parked;             /* F8: a fault during a recording silenced BT (state DEAD); hard path after REC */
 } bt_xrec_debug_t;
 void bt_xrec_get_debug(bt_xrec_debug_t *out);
 
@@ -252,12 +253,22 @@ int      bt_xrec_plat_job_done(int *result);
 /* Disarm the hard-stop deadline; returns 1 if it had already latched (bt_stop + IRQ 26 masked). */
 int      bt_xrec_plat_deadline_disarm(void);
 /* Heap-free hard path: mask IRQ 26 / bt_stop, silence RW-BT, finalise the recording, fault record 0xB1 + reason,
- * reboot. Does not return on target. */
+ * reboot. Does not return on target. Never taken while a recording runs (F8): the sessions park instead. */
 void     bt_xrec_plat_hard_path(uint32_t reason);
+/* F8 (docs/BT_SYNC_SPEED_AND_RECORDING.md 2.5): a BT fault must not end a recording. rec_active: nonzero while a
+ * recording is being written. park: the fault path for that case: no graceful teardown, no recovery ladder, no reboot:
+ * bt_stop + IRQ 26 masked, RW-BT silenced without the ROM, the task supervisor and the bt_ctrl hang guard disarmed;
+ * the recording continues and BT stays silent; no Bluedroid API may be called afterwards. Idempotent (the first
+ * reason is kept). park_poll: 0 when not parked; while parked, 1 as long as the recording runs, then the deferred
+ * hard path (fault record 0xB1 + reboot; on the host it returns 0 and counts as a hard path). */
+int      bt_xrec_plat_rec_active(void);
+void     bt_xrec_plat_park(uint32_t reason);
+int      bt_xrec_plat_park_poll(void);
 void     bt_xrec_plat_service(void);         /* keep the recorder serviced while waiting (recorder_poll) */
 void     bt_xrec_plat_wait(void);            /* sleep about one tick */
-/* Bond-store flush when requested; returns a platform fault (0 = none): 1 bt_ctrl hung / over its CPU share, 2 bt_ctrl
- * fault, 3 HCI command timeout, 4 a Bluedroid task stalled (bt_task_sup.h: ping unanswered for 8 s). */
+/* Bond-store flush when requested (deferred while recording, F6); returns a platform fault (0 = none): 1 bt_ctrl hung /
+ * over its CPU share, 2 bt_ctrl fault, 3 HCI command timeout, 4 a Bluedroid task stalled (bt_task_sup.h: ping
+ * unanswered for 8 s), 5 an assert() in a BT task while recording (BT already parked: the session parks too). */
 uint32_t bt_xrec_plat_poll(void);
 void     bt_xrec_plat_session_end(void);     /* final bond-store flush; release the volume */
 void     bt_xrec_plat_reboot(uint8_t mode);  /* 1 reboot, 2 SD OTA, 3 USB DFU (legacy F:2138-2147) */

@@ -1220,6 +1220,14 @@ Laptop side (`tools/bt_sync.py`): `--bench-load SECONDS` holds one link for SECO
 `--load-file NAME` pulls GETS bursts of that `/record` file in a loop (`--load-kbps N` caps the average in KiB/s,
 0 = as fast as the link goes; `--burst-size`, `--chunk-size` as for a sync); `--load-storm S` adds STAT + LS + a DEL
 of a name that does not exist every S s (directory scans, nothing deleted); `--dbg-log FILE` appends every line.
+From stage S3 on (docs/BT_SYNC_SPEED_AND_RECORDING.md F1-F8) the firmware paces itself while recording: GETS
+payload is capped (48000 B/s by default), card reads wait for a drained audio ring and stop after 5 ms per pass,
+STAT reads a cached free count, and a DEL during a recording answers `ERR,LATER` without touching the card (so the
+storm's DEL no longer scans the directory while recording; STAT and LS still run). `--load-pace B` sets that cap
+first (`+XREC:DBG,PACE,<B>`; M3 runs B = 24000 / 48000 / 64000 / 96000) and logs the pacing counters
+(`ring_waits`, `budget_stops`, `cap_stops`, `later`, `busy`, `rec_b`) at the end; `--load-kbps` stays the laptop's
+own cap. Mono capture now queues 7 x 128 ms = 896 ms before an overrun (stereo 384 ms): the M3 gap limit (25 % of
+the ring tolerance) is 224 ms mono, 96 ms stereo. Stereo recordings refuse GETS (`ERR,LATER`): M3 load runs are mono.
 
 Analysis: `tools/rf_audio_check.py` (numpy; `--self-test`, also run by `make -C open_fw test-host` and
 `tools/test_tools.py`) implements the M2 metrics (a)-(e) against the C0 repeats and prints a Markdown table (`--md`,
@@ -1369,6 +1377,57 @@ trials with any ABX tool on the laptop; pass at <= 12/20 correct.
 passes but C2/C3 fail -> L2 (radio up, no ACL during REC); C1 fails -> L3 or no background sync (Q3). C0b failing
 means the controller is not fully off after a session (a bug to fix before anything else). C5 is today's shipped
 headphones behaviour: report it, it gates nothing here.
+
+### SD writes during XREC GETS: recording ended by `SDW_1_FAIL` (2026-11-26, fix pending silicon confirmation, `fix/sd-concurrent-rw`)
+
+Image `exp/overnight-s3-rec` (bench, mono, gain 31). In 3/3 runs where the Pixel downloaded finished recordings with
+GETS while the recorder recorded (C3p), the recording ended early: `SDW_1_FAIL a=<LBA> b=1` then `REC_ERR write=<pcm
+bytes>`, `acct=2048` (one 2048-frame block not written), `ov=0 lost=0`, `gets_b` 180864..869676. Radio off (C0) and BT
+idle (C1) runs never failed. Every recording also showed one `SDW_MDTO a=0x00002018 b=0` + `SDW_MFAIL a=0x000Bxx41 b=7`
+at its start (the first `CMD25`: 7 sectors right after the header sector at the cluster start), recovered by falling
+back to `CMD24` for the rest of the session.
+
+Decoding: `SDW_MDTO a` = RINTSTS at DTO, `b` = (DTO timeout << 16) | CMD12 failed; `0x2018` = DTO + TXDR + bit 13 with
+DTO and CMD12 fine, so bit 13 alone failed the write. `SDW_1_FAIL` had no inner log (no FIFO / R1 / ready-timeout
+line), so the CMD24 failed at the command or at the DTO status check, without any long stall (`gap_max_us` 64 ms).
+Proven: the `SDW_MDTO` part (all 12 lines read `a=0x00002018 b=0`: bit 13 alone, the register layout is dw_mmc's).
+Not proven: the `SDW_1_FAIL` mechanism. The old driver had two silent fast exits for a CMD24 - the command (RTO,
+RCRC) and the DTO check against `SDIO_INT_DATA_ERRS` (bit 13, DCRC, EBE, RCRC, RTO, DRTO) - and `wr_max_us` 28..58 ms
+(the failing write plus finalize) rules out the 100 ms / 500 ms timeouts but not RCRC or DCRC. Three explanations fit
+equally well, all correlated with GETS (C3p: `tx` 606 -> 2317, C1 idle): busy clear (bit 13) seen at DTO, a response
+CRC / no response on the CMD24, or a data CRC error from RF interference during heavy BT TX.
+Most likely root cause (inferred; the new `SDW_1_CMD` / `SDW_1_DTO` lines and counters below will show it if it
+recurs): bit 13 is the busy-clear interrupt on writes (`sd_init()` enables it in `CARDTHRCTL`, see
+`SL6801_HW76_HARDWARE.md`), and the driver counted it as a data error. A `CMD24` sees it when the app task (priority 1,
+which runs the recorder, XREC and all SD I/O sequentially; GETS reads and recorder writes never overlap) is preempted
+between DTO and the status read for longer than the card's programming time. During GETS the BT tasks (BTC 4 .. ctrl
+8) run constantly (`idle_min_pm` 63..106 vs ~400 idle) and the window opens; the interleaved reads are not the cause.
+The recorder then ended the recording on the first failed block.
+
+Fix (`open_fw/src/sdio.c`, `open_fw/src/recorder.c`): write data phases ignore bit 13 (counted in `wr_bci`), so
+`CMD25` works again; the card state is verified (`CMD13`; `CMD12` if stuck in data/rcv; busy wait) before the next data
+command after every `CMD12` or error; a failed sector write is retried in place (idempotent) with recovery, then
+after an in-place re-init; reads get one retry; the recorder retries the unconsumed rest of a block twice before
+giving up. Host tests: `test_sd_busy_bci_and_recovery` in `tests/test_drivers_mmio.c` (card state model: prg busy,
+BCI, lost CMD12, CMD24 faults; the old driver fails scenarios 1, 2, 4 and 5) and recording #9 in
+`tests/test_audio_bt_mmio.c` (transient faults at every write position: bit-exact WAV, fsck clean).
+Review follow-up (same branch): an error that leaves the controller data path armed (RCRC / lost response on a
+`CMD24` or `CMD18` the card accepted, a FIFO or DTO timeout) is now aborted (`CMD12` with stop_abort, then a controller
++ FIFO reset) before the state check - every other command word has wait_prvdata_complete (bit 13), so without the
+abort each recovery `CMD13` was held until its timeouts and only the re-init recovered (~1.1 s). Write retries of one
+`sd_write_blocks()` call share a 250 ms soft budget from the first failure (checked before every recovery command),
+then one re-init; the driver then returns `BLKDEV_ERR_FINAL` and the recorder does not retry on top. A recovery
+failure before a `CMD25` no longer latches single-block mode. Host tests: scenarios 8-11 of
+`test_sd_busy_bci_and_recovery` (the fake controller now holds wait_prvdata commands while a transfer is armed and
+models a 16-word TX FIFO with busy clear between `CMD25` blocks; the previous driver fails 8 and 9) and recording #10.
+
+What to look for on the re-run (C3p, bench image): the `BENCH rec` line now ends with `sd_bci1 sd_bcim sd_retry
+sd_reinit`, and the first busy clear on a `CMD24` since init logs `SDW_BCI1 a=<LBA> b=<RINTSTS>` (not an error, not in
+`sd_err`). Proof of the busy-clear mechanism: `sd_bci1 > 0` only in runs with `gets_b > 0`, with no `SDW_1_CMD`,
+`SDW_1_DTO` or `SDW_RETRY` lines; `sd_bcim` > 0 in every recording (each `CMD25`) and no `SDW_MDTO` / `SDW_MFAIL`.
+`SDW_1_CMD` (RCRC / RTO on the command) or `SDW_1_DTO` with bit 7 (DCRC) instead point at the other explanations; the
+retry path covers them, and `sd_retry` / `sd_reinit` show what it cost. Either way `rec=time`, `acct=0`. Until that run,
+this section stays "fix pending silicon confirmation".
 
 ### M3 — CPU and timing margin with today's firmware (~1.5 h, mostly unattended)
 

@@ -311,6 +311,7 @@ test-host: $(LVGL_DIR)/lvgl.h $(BUILD_DIR)/liblvgl_host.a tests/test_core.c test
 	/usr/sbin/mkfs.exfat -q -b 4096 -c 4096 $(BUILD_DIR)/test_rec_exfat.img
 	$(BUILD_DIR)/test_audio_bt_mmio $(BUILD_DIR)/test_rec_exfat.img
 	/usr/sbin/fsck.exfat -n $(BUILD_DIR)/test_rec_exfat.img
+	/usr/sbin/fsck.exfat -n $(BUILD_DIR)/test_rec_exfat.img.retry
 	@# bench recorder hooks + BASEPRI critical-section invariant (OPENFW_BT_BENCH_IMAGE, OPENFW_RTOS)
 	$(HOST_CC) $(HOST_CFLAGS) -DOPENFW_HOST_MMIO -DOPENFW_BT_BENCH_IMAGE=1 -DOPENFW_RTOS=1 \
 		'-DOPENFW_IRQ_SAVE(pm)=do { (pm) = openfw_host_irq_save(); } while (0)' \
@@ -324,6 +325,7 @@ test-host: $(LVGL_DIR)/lvgl.h $(BUILD_DIR)/liblvgl_host.a tests/test_core.c test
 	/usr/sbin/mkfs.exfat -q -b 4096 -c 4096 $(BUILD_DIR)/test_rec_exfat.img
 	$(BUILD_DIR)/test_audio_bt_mmio_bench $(BUILD_DIR)/test_rec_exfat.img
 	/usr/sbin/fsck.exfat -n $(BUILD_DIR)/test_rec_exfat.img
+	/usr/sbin/fsck.exfat -n $(BUILD_DIR)/test_rec_exfat.img.retry
 	$(HOST_CC) $(HOST_CFLAGS) -DOPENFW_HOST_MMIO tests/test_hsprobe.c src/hsprobe_log.c src/hsprobe.c \
 		src/keys.c src/exfat.c -o $(BUILD_DIR)/test_hsprobe
 	dd if=/dev/zero of=$(BUILD_DIR)/test_hsp_exfat.img bs=512 count=4096 status=none

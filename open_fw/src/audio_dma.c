@@ -3,7 +3,14 @@
  *
  * Configures Audio PLL (24.576 MHz), AMIC1 differential PGA (PB12/PB13) and
  * optional AMIC2 differential PGA (PB14/PB15), 16 kHz 16-bit ADC capture,
- * and DMAC Channel 1 (NVIC IRQ 61) into a 4-slot (32 KiB) lock-free ring buffer.
+ * and DMAC Channel 1 (NVIC IRQ 61) into a lock-free ring of 128 ms blocks in one 32 KiB buffer: 8 slots of 4 KiB
+ * in mono, 4 slots of 8 KiB in stereo (docs/BT_SYNC_SPEED_AND_RECORDING.md F1c). One slot is always reserved for the
+ * DMAC, so the app task may be away for up to 7 x 128 ms = 896 ms (mono) or 3 x 128 ms = 384 ms (stereo) before the
+ * ISR drops the oldest block (an overrun).
+ *
+ * Priorities (AGENTS.md): DMAC CH1 (IRQ 61) keeps the reset priority 0x00, above configMAX_SYSCALL_INTERRUPT_PRIORITY
+ * (0x80), so neither BASEPRI critical sections nor the BT stack (IRQ 26 at 0x80) ever delay it. Nothing in this
+ * file (or anywhere else) calls nvic_set_priority() on it; the ISR touches no FreeRTOS API.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -13,9 +20,14 @@
 #include "openfw_bench_meas.h"   /* block clock stamp: bench images only (OPENFW_BENCH_MEAS), compiled out otherwise */
 
 #define AUDIO_DMA_CH           1u
-#define AUDIO_RING_SLOTS       4u
 #define AUDIO_FRAMES_PER_SLOT  2048u /* 128 ms @ 16 kHz */
-#define AUDIO_MAX_SLOT_SAMPLES (AUDIO_FRAMES_PER_SLOT * 2u)
+#define AUDIO_RING_SAMPLES     (AUDIO_FRAMES_PER_SLOT * 2u * 4u)   /* 32 KiB: 4 stereo or 8 mono 128 ms blocks */
+#define AUDIO_RING_SLOTS_MONO  8u
+#define AUDIO_RING_SLOTS_STEREO 4u
+_Static_assert(AUDIO_RING_SLOTS_MONO * AUDIO_FRAMES_PER_SLOT == AUDIO_RING_SAMPLES, "mono ring must fill the buffer");
+_Static_assert(AUDIO_RING_SLOTS_STEREO * AUDIO_FRAMES_PER_SLOT * 2u == AUDIO_RING_SAMPLES, "stereo ring likewise");
+_Static_assert((AUDIO_RING_SLOTS_MONO & (AUDIO_RING_SLOTS_MONO - 1u)) == 0u &&
+               (AUDIO_RING_SLOTS_STEREO & (AUDIO_RING_SLOTS_STEREO - 1u)) == 0u, "slot counts are powers of two");
 #define AUDIO_WAIT_MAX_ITERS   1000000u
 
 #ifdef OPENFW_HOST_MMIO
@@ -24,7 +36,7 @@
 #define AUDIO_DMA_ISB() __asm__ volatile ("isb" ::: "memory")
 #endif
 
-static int16_t g_pcm_buf[AUDIO_RING_SLOTS][AUDIO_MAX_SLOT_SAMPLES] __attribute__((aligned(4)));
+static int16_t g_pcm_buf[AUDIO_RING_SAMPLES] __attribute__((aligned(4)));
 static volatile uint8_t  g_dma_slot       = 0u;
 static volatile uint8_t  g_last_done_slot = 0u;
 static volatile uint8_t  g_running        = 0u;
@@ -39,6 +51,13 @@ static volatile uint32_t g_frames         = 0u;
 static volatile uint32_t g_wr_idx         = 0u;
 static volatile uint32_t g_rd_idx         = 0u;
 static volatile uint32_t g_overruns       = 0u;
+static volatile uint32_t g_slot_mask      = AUDIO_RING_SLOTS_MONO - 1u;   /* slots - 1 (set at capture start) */
+
+/* Start of ring slot `slot` (g_frame_samples samples per slot). */
+static inline int16_t *slot_buf(uint32_t slot)
+{
+    return &g_pcm_buf[slot * g_frame_samples];
+}
 #if OPENFW_BENCH_MEAS
 static volatile uint32_t g_bench_dma_us;   /* us_timer at the latest completed block (include/openfw_bench_meas.h) */
 
@@ -88,7 +107,7 @@ static void audio_update_peak_if_needed(void)
 
     uint8_t slot = g_last_done_slot;
     uint8_t ch   = g_channels;
-    const int16_t *samples = g_pcm_buf[slot];
+    const int16_t *samples = slot_buf(slot);
 
     const uint32_t *w32 = (const uint32_t *)(const void *)samples;
     if (ch == 2u) {
@@ -147,16 +166,17 @@ void DMAC_CH1_IRQHandler(void)
         g_bench_dma_us = openfw_mmio_rd32(US_TIMER_LO_ADDR);   /* inline MMIO read: this ISR runs from RAM */
 #endif
         uint8_t done_slot = g_dma_slot;
-        uint8_t next_slot = (uint8_t)((done_slot + 1u) & (AUDIO_RING_SLOTS - 1u));
+        uint32_t mask      = g_slot_mask;
+        uint8_t  next_slot = (uint8_t)((done_slot + 1u) & mask);
         g_dma_slot = next_slot;
 
         /* Reserve next_slot exclusively for DMAC: keep at most SLOTS-1 queued */
-        if ((g_wr_idx - g_rd_idx) >= (AUDIO_RING_SLOTS - 1u)) {
+        if ((g_wr_idx - g_rd_idx) >= mask) {
             g_rd_idx++;
             g_overruns++;
         }
 
-        dmac_arm_rx(g_pcm_buf[next_slot], g_frame_bytes);
+        dmac_arm_rx(&g_pcm_buf[(uint32_t)next_slot * g_frame_samples], g_frame_bytes);
         OPENFW_DSB();
 
         g_last_done_slot = done_slot;
@@ -295,6 +315,7 @@ int audio_capture_start_ex(uint8_t gain_0_31, uint8_t channels)
     g_channels        = ch;
     g_frame_samples   = AUDIO_FRAMES_PER_SLOT * (uint32_t)ch;
     g_frame_bytes     = g_frame_samples * (uint32_t)sizeof(int16_t);
+    g_slot_mask       = ((ch == 2u) ? AUDIO_RING_SLOTS_STEREO : AUDIO_RING_SLOTS_MONO) - 1u;
     g_dma_slot        = 0u;
     g_last_done_slot  = 0u;
     g_peak_pct        = 0u;
@@ -311,7 +332,7 @@ int audio_capture_start_ex(uint8_t gain_0_31, uint8_t channels)
 
     /* Arm DMAC CH1 before enabling ADC digital RUN bit (0x2) */
     g_running = 1u;
-    dmac_arm_rx(g_pcm_buf[0], g_frame_bytes);
+    dmac_arm_rx(slot_buf(0u), g_frame_bytes);
     OPENFW_DSB();
     openfw_mmio_set32(CODEC_ADC_DIG_CTRL_ADDR, 0x2u);
     return 0;
@@ -372,7 +393,7 @@ const int16_t *audio_pop_frame(uint32_t *out_bytes)
         return 0;
     }
 
-    uint32_t slot = g_rd_idx & (AUDIO_RING_SLOTS - 1u);
+    uint32_t slot = g_rd_idx & g_slot_mask;
     g_rd_idx++;
 
     OPENFW_IRQ_RESTORE(primask);
@@ -381,7 +402,7 @@ const int16_t *audio_pop_frame(uint32_t *out_bytes)
     if (out_bytes) {
         *out_bytes = g_frame_bytes;
     }
-    return g_pcm_buf[slot];
+    return slot_buf(slot);
 }
 
 int audio_pop_frame_copy(int16_t *dst, uint32_t max_bytes, uint32_t *out_bytes)
@@ -406,8 +427,8 @@ int audio_pop_frame_copy(int16_t *dst, uint32_t max_bytes, uint32_t *out_bytes)
         }
         bytes &= ~1u;
 
-        uint32_t slot = rd & (AUDIO_RING_SLOTS - 1u);
-        const int16_t *src = g_pcm_buf[slot];
+        uint32_t slot = rd & g_slot_mask;
+        const int16_t *src = slot_buf(slot);
         if (((uintptr_t)dst & 3u) == 0u) {
             const uint32_t *s32 = (const uint32_t *)(const void *)src;
             uint32_t       *d32 = (uint32_t *)(void *)dst;
@@ -476,7 +497,7 @@ uint32_t audio_dma_peek_pcm(int16_t *dst, uint32_t max_frames, uint8_t *out_chan
     }
     s_sub_chunk++;
 
-    const int16_t *src = &g_pcm_buf[slot][off * (uint32_t)ch];
+    const int16_t *src = slot_buf(slot) + off * (uint32_t)ch;
     uint32_t total = n * (uint32_t)ch;
     for (uint32_t i = 0u; i < total; i++) {
         dst[i] = src[i];
@@ -495,4 +516,14 @@ uint32_t audio_get_frames(void)
 uint32_t audio_get_overruns(void)
 {
     return g_overruns;
+}
+
+uint32_t audio_ring_pending(void)
+{
+    return g_running ? (uint32_t)(g_wr_idx - g_rd_idx) : 0u;
+}
+
+uint32_t audio_ring_slots(void)
+{
+    return g_slot_mask + 1u;
 }
