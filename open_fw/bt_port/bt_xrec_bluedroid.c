@@ -148,6 +148,8 @@ static struct {
     uint32_t tx_urgent;         /* ring position (like tx_head) up to which bytes go out unheld: text replies */
     uint8_t  co_holding;        /* a short write is being held for coalescing since co_t0 (ms) */
     uint32_t co_t0;
+    uint8_t  gets_stalled;      /* the last xrec_poll left a GETS running with room for a frame: it is paced or
+                                 * waiting, not producing, so a short write is not held for it (tx_hold) */
     /* deferred reboot */
     uint8_t  reboot_mode;
     uint32_t reboot_at;
@@ -192,6 +194,11 @@ static volatile uint32_t s_inflight_max = BT_XREC_INFLIGHT_MAX;
 #define INFLIGHT_MAX s_inflight_max
 void bt_xrec_test_set_inflight_max(uint32_t n);
 void bt_xrec_test_set_inflight_max(uint32_t n) { s_inflight_max = n != 0u ? n : BT_XREC_INFLIGHT_MAX; }
+/* Host tests only: xo_send refuses GETS frames past this many per xrec_poll (0 = no limit), as a paced producer
+ * (sync while recording: rate cap, per-poll budget) leaves a GETS running with room in the ring (test_bt_xrec [26]). */
+static uint32_t s_test_gets_budget, s_test_gets_sent;
+void bt_xrec_test_set_gets_budget(uint32_t frames);
+void bt_xrec_test_set_gets_budget(uint32_t frames) { s_test_gets_budget = frames; }
 #elif BENCH_IMAGE
 #define INFLIGHT_MAX ((uint32_t)s_bench_tput.spp_buf)
 #else
@@ -555,6 +562,7 @@ static void tx_drop(void)
 {
     s.tx_head = s.tx_tail = s.tx_urgent = 0u;
     s.co_holding = 0u;
+    s.gets_stalled = 0u;
 }
 
 /* Disconnect cancels pending work and clears XREC authorization (plan M4), immediately, before Bluedroid's CLOSE.
@@ -646,7 +654,9 @@ static void conn_reset(void)
 
 /* Coalescing (docs/BT_SYNC_THROUGHPUT.md): hold a write of n < wr_max bytes while it is worth waiting for more.
  * - never while text replies are queued (tx_urgent ahead of tx_tail: PONG, OK, STAT, LS lines, ERR go out at once);
- * - while a GETS stream keeps producing (the producer still has room for a frame): xo_send kicks again per frame;
+ * - while a GETS stream keeps producing (the producer still has room for a frame): xo_send kicks again per frame.
+ *   Not when the last xrec_poll returned with such room (gets_stalled: a producer that is paced, out of its per-poll
+ *   budget or waiting on something else adds no frame for a while; holding would only add latency);
  * - while the in-flight cap, not the ring, made the write short: the next ESP_SPP_WRITE_EVT frees room;
  * - at most BT_XREC_COALESCE_MS, then the short write goes out anyway.
  * Every RFCOMM frame is then as large as possible: fewer ACL packets, RFCOMM credits and Bluedroid task hops per byte. */
@@ -656,7 +666,7 @@ static bool tx_hold(uint32_t n, uint32_t used)
         return false;
     }
     const xrec_ctx_t *x = &s.b->xrec;
-    bool more = x->gets_active && TXSZ - used >= 12u + (uint32_t)x->gets_chunk_max;
+    bool more = x->gets_active && !s.gets_stalled && TXSZ - used >= 12u + (uint32_t)x->gets_chunk_max;
     bool capped = n < used && s.inflight > 0u;   /* the in-flight cap (not the ring) made the write short */
     if (!more && !capped) {
         return false;
@@ -712,6 +722,7 @@ static void tx_kick(void)
             s_bench_wr_wrap++;   /* a write cut short by the ring wrap (coalesce=0) */
         }
 #endif
+        s.co_holding = 0u;       /* any write attempt ends a hold: a later short write gets its own full wait */
         const uint8_t *src = &s.b->tx[off];
         if (n > TXSZ - off) {    /* only a coalesced write crosses the wrap */
             uint32_t first = TXSZ - off;
@@ -721,9 +732,13 @@ static void tx_kick(void)
         }
         esp_err_t r = esp_spp_write(s.conn_handle, (int)n, (uint8_t *)src);
         if (r == ESP_OK) {       /* BTC copied the bytes into its ring (btc_spp.c esp_spp_write CB mode) */
+            bool urgent_left = (int32_t)(s.tx_urgent - s.tx_tail) > (int32_t)n;
             s.tx_tail += n;
             s.inflight += n;
-            s.co_holding = 0u;
+            if (!urgent_left) {
+                s.tx_urgent = s.tx_tail;   /* reply bytes all written: tx_urgent never falls behind tx_tail, so a
+                                            * >2 GiB GETS run with no text reply cannot wrap it into "queued" */
+            }
             s.d.tx_writes++;
             s.d.tx_bytes += n;
         } else if (r == ESP_ERR_NO_MEM) {
@@ -739,6 +754,18 @@ static void tx_kick(void)
     }
 }
 
+/* After xrec_poll: a GETS still running with room for another frame means the producer stopped on its own (paced,
+ * per-poll budget, waiting on the card or the recorder, a send refused for another reason), not on a full ring. Until the next xrec_poll, tx_hold does
+ * not wait for it. (Today's xrec_proto only stops on a full ring; a paced producer returns with room.) */
+static void gets_stall_note(void)
+{
+#if defined(BT_XREC_TEST_HOOKS) && BT_XREC_TEST_HOOKS
+    s_test_gets_sent = 0u;
+#endif
+    const xrec_ctx_t *x = &s.b->xrec;
+    s.gets_stalled = (uint8_t)(x->gets_active && TXSZ - (s.tx_head - s.tx_tail) >= 12u + (uint32_t)x->gets_chunk_max);
+}
+
 /* ---- xrec_proto ops owned by the session ---- */
 static int xo_send(void *user, const uint8_t *data, uint16_t len)
 {
@@ -752,6 +779,11 @@ static int xo_send(void *user, const uint8_t *data, uint16_t len)
     if (data == NULL) {
         return -1;
     }
+#if defined(BT_XREC_TEST_HOOKS) && BT_XREC_TEST_HOOKS
+    if (data == s.b->xrec.xfer.gets_frame && s_test_gets_budget != 0u && s_test_gets_sent++ >= s_test_gets_budget) {
+        return -1;
+    }
+#endif
     uint32_t used = s.tx_head - s.tx_tail;
     if ((uint32_t)len > TXSZ - used) {
         s.d.tx_busy++;
@@ -1953,14 +1985,18 @@ void bt_xrec_poll(void)
         uint32_t (*clk)(void) = s_bench_clock_us;
         uint32_t t0 = clk != NULL ? clk() : 0u;
         s_bench_gets = s.b->xrec.gets_active;
+        s.gets_stalled = 0u;
         xrec_poll(&s.b->xrec);
+        gets_stall_note();
         s_bench_gets = s.b->xrec.gets_active;
         if (clk != NULL) {
             s_bench_xrec_us += clk() - t0;
         }
         s_bench_xrec_n++;
 #else
+        s.gets_stalled = 0u;
         xrec_poll(&s.b->xrec);
+        gets_stall_note();
 #endif
     }
 #if BENCH_IMAGE
@@ -2081,6 +2117,12 @@ static uint32_t secs_left(uint32_t now, uint32_t at)
         return 0u;
     }
     return (at - now + 999u) / 1000u;
+}
+
+uint32_t bt_xrec_ui_sig(void)
+{
+    return (uint32_t)(s.cfm_pending ? 1u : 0u) | (s.window_open ? 2u : 0u) | (s.ssp_showing ? 4u : 0u) |
+           (s.d.ssp_gate_refused << 3);
 }
 
 void bt_xrec_get_ui(bt_xrec_ui_t *out)
@@ -2258,6 +2300,19 @@ int bt_xrec_test_close_request(uint32_t arg)
     return 0;
 }
 
+/* Host tests only: move the (empty) TX ring's positions to pos, the last text reply urgent_behind bytes before it,
+ * so a test reaches the 2^31 distance between tx_urgent and tx_tail without streaming 2 GiB. */
+int bt_xrec_test_tx_rebase(uint32_t pos, uint32_t urgent_behind);
+int bt_xrec_test_tx_rebase(uint32_t pos, uint32_t urgent_behind)
+{
+    if (s.tx_head != s.tx_tail) {
+        return -1;
+    }
+    s.tx_head = s.tx_tail = pos;
+    s.tx_urgent = pos - urgent_behind;
+    return 0;
+}
+
 /* Host tests only: forget a DEAD session (on target the hard path reboots). */
 void bt_xrec_test_reset(void);
 void bt_xrec_test_reset(void)
@@ -2267,6 +2322,7 @@ void bt_xrec_test_reset(void)
     }
     memset(&s, 0, sizeof(s));
     s_spp_uninit_seen = 0u;
+    s_test_gets_budget = s_test_gets_sent = 0u;
 #if BENCH_IMAGE
     s_bench_autoconfirm = 0u;
     memset(s_bench_pin, 0, sizeof(s_bench_pin));

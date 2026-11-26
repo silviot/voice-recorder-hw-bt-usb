@@ -201,23 +201,51 @@ Reading:
 
 1. `bt_port/bt_xrec_bluedroid.c` `tx_kick`: coalesced writes of up to `min(990, peer RFCOMM MTU)` bytes, staged in a
    990 B buffer when they cross the ring wrap (never cut by it). A shorter write is held only while a GETS stream keeps
-   producing (the producer still has room for a frame) or while the in-flight cap made it short (the next
-   `ESP_SPP_WRITE_EVT` frees room), and at most `BT_XREC_COALESCE_MS` = 5 ms (app-task ms clock: 5-6 ms). **Text
+   producing (the producer still has room for a frame and did not stop with that room at its last `xrec_poll`:
+   `gets_stalled`, so a paced or budget-limited producer is not waited for) or while the in-flight cap made it short
+   (the next `ESP_SPP_WRITE_EVT` frees room), and at most `BT_XREC_COALESCE_MS` = 5 ms (app-task ms clock: 5-6 ms);
+   every write attempt ends a hold, so a write BTC refuses (`ESP_ERR_NO_MEM`) gets a full hold again after
+   `CONG_EVT(false)`. **Text
    replies are never held**: `xo_send` marks everything up to a non-GETS frame (PONG, OK, STAT, LS lines, ERR, LOG)
-   as urgent (`tx_urgent`), so their latency is unchanged. `BT_XREC_SPP_TX_BUF` = 4 x 990 = 3960, `BT_XREC_TX_RING` =
+   as urgent (`tx_urgent`, which never falls behind `tx_tail`, so a >2 GiB GETS run cannot wrap it), so their latency
+   is unchanged. `BT_XREC_SPP_TX_BUF` = 4 x 990 = 3960, `BT_XREC_TX_RING` =
    8192 (+~7 KB heap per session vs. the old 2048/2048, +1.9 KB in BTC while connected; the bench measured 28 KB free
    at the minimum with these sizes, the release image has more because it carries no bench code).
 2. `src/main.c` `run_bt_xrec_mode` + `include/openfw_bt_ui_pace.h`: the UI block (status, telemetry, toast, render)
-   runs every 150 ms, but every **500 ms while a transfer is shown** (`bt_state 2`); any key press forces it at once;
-   nothing is rendered while the screen is off or fading out. Charge management keeps its own 150 ms tick.
+   runs every 150 ms, but every **500 ms while a transfer is shown** (`bt_state 2`); any key press, and any change of
+   `bt_xrec_ui_sig()` (an SSP prompt appearing or ending, the pairing window opening or closing, a gate refusal),
+   forces it at once; nothing is rendered while the screen is off or fading out (the frame would not be seen; a wake
+   redraws). Charge management keeps its own 150 ms tick. The toast expiry and the idle dim/sleep check of
+   `backlight_update` move to the paced period too (the fade itself is hardware-timed and finished every loop).
+4. Bluedroid patch 0046 (`btc_spp.c`, `third_party/bluedroid_patches/README.md`): BTC's 3960 B TX ring is a byte
+   buffer whose receive returns only the contiguous piece up to its end, so with the app's 990 B writes off the
+   990 B grid (any text reply moves it) every ring cycle sent one extra short RFCOMM frame. The drain now stages a
+   frame across the wrap. Host phone scenario, 300000 B GETS: 386 RFCOMM frames / 155 short without it, 309 / 1 with
+   it. This likely explains part of the ~860 B average ACL size measured in section 6 (the bench image had no 0046).
 3. The bench keys stay; their defaults are the new values (section 3), `coalesce=0 spp_buf=2048 tx_ring=2048` gives
    the old path, `ui=0` still skips the UI block entirely.
 
 Host tests: `test-bt-xrec` [26] (GETS from a real exFAT image: frames merge into 990 B writes across the wrap, the
-5 ms bound on an in-flight shortfall, text replies written at once, a 660 B peer MTU, the `coalesce=0` path),
-[6]/[6b] adapted to the new sizes; `test-host` `test_bt_ui_pace` (period, forced pass, millis wrap, render gate).
+5 ms bound on an in-flight shortfall, text replies written at once, a 660 B peer MTU, a paced producer not waited
+for, a refused forced write held again after `CONG_EVT`, `tx_urgent` across 2^31, the `coalesce=0` path), run twice:
+built as a bench image and as a release image (constant knobs, no counters; bench-only cases compiled out); [27]
+`bt_xrec_ui_sig`; [6]/[6b] adapted to the new sizes; `test-host` `test_bt_ui_pace` (period, forced pass, millis wrap,
+render gate); `test-bt-host` phone [P20] (RFCOMM frames not cut at BTC's ring wrap).
 Expected on silicon: ~55 KB/s (E1 + `ui=0` is the upper bound; 500 ms pacing keeps ~70 % of the UI saving).
 **Not yet measured on silicon with the default image** (bench image of this branch: rerun E0 with no keys).
+
+### Merging the sync-while-recording branch (S3, `feat/bt-sync-rec-hardening`)
+
+- `src/main.c` conflicts at the top of the BT loop (this branch profiles `bt_xrec_poll`, S3 adds a recorder-first
+  `recorder_poll()`). Resolve as: `recorder_poll();` then `BT_PROF_T(pf_xrec); bt_xrec_poll();
+  BT_PROF_ADD(..XREC..);` then `BT_PROF_T(pf_rec); recorder_poll(); BT_PROF_ADD(..REC..);`: the profiler must not
+  wrap the first `recorder_poll()` (it would inflate the bench XREC share). The sleep block merges into S3's
+  three-way `if` (key / recording: `OPENFW_TASK_WAIT` / idle check).
+- S3's `xrec_poll` returns with a GETS running and room in the ring when it is rate-capped, out of budget or waiting
+  on the recorder; `gets_stalled` makes `tx_hold` send the tail at once in that case (test-bt-xrec [26] (e) models it
+  with a per-poll frame budget). S3's M3 pace tuning (48 KB/s cap, 2048 B bucket) was made against the old 2 KiB /
+  no-hold TX path: re-run M3 with these defaults after the merge. S3's F2 row also asks for a cap of 3-4 frames per
+  `xrec_poll`, which this branch does not add (outside recording one `xrec_poll` may now read ~8 KiB, ~12 chunks).
 
 ## 7. Next lever: EDR
 

@@ -140,6 +140,13 @@ test-bt-xrec:
 	dd if=/dev/zero of=$(BT_XREC_TEST_DIR)/xrec_tx.img bs=512 count=4096 status=none
 	/usr/sbin/mkfs.exfat -q -b 4096 -c 4096 $(BT_XREC_TEST_DIR)/xrec_tx.img
 	$(BT_XREC_TEST_DIR)/test_bt_xrec --exfat-img $(BT_XREC_TEST_DIR)/xrec_tx.img
+	@# the same session built as in a release image (no OPENFW_BT_BENCH_IMAGE: constant TX knobs, no bench counters or
+	@# overrides): [26] runs the release TX path itself; tests that need a bench override are compiled out (TB_BENCH)
+	$(HOST_CC) $(BT_CTRL_TEST_CFLAGS) $(BT_CTRL_BD_DEFS) $(BT_CTRL_BD_INCS) -DBT_XREC_TEST_HOOKS=1 \
+		tests/test_bt_xrec.c bt_port/bt_xrec_bluedroid.c src/xrec_proto.c src/crypto.c src/exfat.c src/bench_meas.c \
+		-o $(BT_XREC_TEST_DIR)/test_bt_xrec_rel
+	/usr/sbin/mkfs.exfat -q -b 4096 -c 4096 $(BT_XREC_TEST_DIR)/xrec_tx.img
+	$(BT_XREC_TEST_DIR)/test_bt_xrec_rel --exfat-img $(BT_XREC_TEST_DIR)/xrec_tx.img
 	@# A release BT=1 session (no BENCH=1) must not contain the SD bench overrides (autoconfirm, fixed XREC PIN).
 	$(HOST_CC) $(BT_CTRL_TEST_CFLAGS) $(BT_CTRL_BD_DEFS) $(BT_CTRL_BD_INCS) -c bt_port/bt_xrec_bluedroid.c \
 		-o $(BT_XREC_TEST_DIR)/bt_xrec_release.o

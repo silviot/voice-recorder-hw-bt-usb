@@ -3,8 +3,13 @@
  * The BT screen's UI block (status, telemetry, toast, render) costs the app task time that the XREC GETS producer
  * shares (silicon 2026-11-26: skipping it raised a sync from ~39 to ~42 KB/s). It runs every BT_UI_PERIOD_MS, but at
  * most every BT_UI_XFER_PERIOD_MS while a file transfer is shown (bt_state 2: the progress still moves twice a second).
- * A key press, a pairing-prompt answer or the first pass force it at once (last_ui = 0). Charge management keeps its
- * own BT_UI_PERIOD_MS tick outside this block. Nothing is rendered while the screen is off or fading out.
+ * A key press, a pairing-prompt answer, a change of bt_xrec_ui_sig() (an SSP prompt appearing or ending, the pairing
+ * window opening or closing, a gate refusal) or the first pass force it at once (last_ui = 0). Charge management keeps
+ * its own BT_UI_PERIOD_MS tick outside this block. What else moves to the paced period: the toast expiry and
+ * backlight_update's idle dim/sleep check (the backlight fade itself is timed by lcd_backlight_fade and finished by
+ * backlight_service in ui_poll_power_button every loop, so it is not slowed down).
+ * Nothing is rendered while the screen is off or fading out: the frame would not be seen (the backlight ramps to 0)
+ * and a render costs the app task what the GETS producer needs; a wake (key, power button) redraws at once anyway.
  * SPDX-License-Identifier: MIT */
 #ifndef OPENFW_BT_UI_PACE_H
 #define OPENFW_BT_UI_PACE_H

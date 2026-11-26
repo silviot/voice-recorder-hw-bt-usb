@@ -1594,6 +1594,9 @@ static void run_bt_xrec_mode(void)
 
     uint32_t last_ui     = 0u;
     uint32_t last_chg    = 0u;
+#if OPENFW_BT_PROMPT
+    uint32_t prev_ui_sig = bt_xrec_ui_sig();
+#endif
     uint32_t prev_rx     = 0u;
     uint32_t prev_tx     = 0u;
     uint8_t  prev_acl    = 0u;
@@ -1683,12 +1686,23 @@ static void run_bt_xrec_mode(void)
         }
 #endif
         BT_PROF_T(pf_ui);
+#if OPENFW_BT_PROMPT
+        {
+            /* a pairing prompt appearing or ending, the window opening or closing, a gate refusal: redraw at once,
+             * not at the next paced pass (up to 500 ms during a transfer) */
+            uint32_t sig = bt_xrec_ui_sig();
+            if (sig != prev_ui_sig) {
+                prev_ui_sig = sig;
+                last_ui = 0u;
+            }
+        }
+#endif
         if ((uint32_t)(now - last_chg) >= BT_UI_PERIOD_MS || last_chg == 0u) {
             last_chg = now;                  /* charge management keeps its 150 ms tick whatever the screen does */
             pmu_poll_charge_manage();
         }
-        /* UI block: every 150 ms, every 500 ms while a transfer is shown, at once after a key (openfw_bt_ui_pace.h);
-         * bench ui=0 skips it (charge management only) */
+        /* UI block: every 150 ms, every 500 ms while a transfer is shown, at once after a key or a prompt / pairing
+         * window change (openfw_bt_ui_pace.h); bench ui=0 skips it (charge management only) */
         if (BT_BENCH_UI_ON() && bt_ui_due(now, last_ui, g_ui.bt_state)) {
             last_ui = now;
 

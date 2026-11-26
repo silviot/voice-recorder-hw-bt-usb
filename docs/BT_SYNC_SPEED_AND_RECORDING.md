@@ -64,7 +64,7 @@ engineering for the packet-type state, and only then a decision on a `040F` path
 
 A1 was expected to give most of the gain with **no firmware change**. Measured, it did not on its own (39 KB/s, below
 the 53-67 KB/s of 3840 B stop-and-wait bursts): a continuous stream exposed the small-frame TX path, which the table
-above fixes in firmware. A1 still works with every open_fw build. While the recorder records, sync is deliberately paced (section 2.4). Recording produces 32 KB/s mono and 64 KB/s stereo, so a paced sync still keeps up. Today's ~60 KB/s would barely keep up with stereo.
+above fixes in firmware. A1 still works with every open_fw build. While the recorder records, sync is deliberately paced (section 2.4). Recording produces 32 KB/s mono and 64 KB/s stereo. The measured ~55 KB/s (39 KB/s before the coalesced TX path) is below stereo's 64 KB/s, so a paced sync while recording stereo falls behind; mono (32 KB/s) keeps up.
 
 ---
 
@@ -111,7 +111,7 @@ All BT code stays behind the BT build flag. **The default (non-BT) image is byte
 | F8 | **Fault while recording:** no hard-path reboot and no bt_ctrl recovery ladder. Silence RW-BT, mask IRQ 26, keep recording, reboot or recover after REC stops. | a BT fault must not end a recording |
 | F9 | Background session: bring-up on Home only, the start/stop rules in 2.1, Home/REC BT icon, Settings toggle "Sync in background" (English, `TODO(i18n)`), **default OFF**. | the feature |
 | F10 | Device pages the bonded phone once after REC stops (if background sync is on). | wakes the app |
-| F2 | `BT_XREC_TX_RING` 2048 → 8192, `SPP_TX_BUF` 2048 → 4096–8192 (~8–12 KB heap; free-heap minimum was 44–62 KB). Cap at 3–4 frames per `xrec_poll`. | keeps air busy across recorder writes |
+| F2 | **Done** (`feat/sync-throughput-defaults`, `docs/BT_SYNC_THROUGHPUT.md` §6): `BT_XREC_TX_RING` 2048 → 8192, `SPP_TX_BUF` 2048 → 3960 (4 x 990) + coalesced 990 B writes, +~9 KB heap; measured free-heap minimum 28.1–28.6 KB on the bench image. Still open: cap at 3–4 frames per `xrec_poll` while recording (one poll may now read ~8 KiB). | keeps air busy across recorder writes |
 | F3 | Cache the exFAT entry across GETS of the same name (invalidated on DEL/PUT; the active file is never cached). Sector-aligned 4–8 KiB CMD18 read-ahead. | ~12 → 1–2 SD commands per 4 KiB |
 | F5 | PONG flag `gmax=<n>`; GETS `chunk` allowed up to `mtu-12`. | +3–8 % |
 

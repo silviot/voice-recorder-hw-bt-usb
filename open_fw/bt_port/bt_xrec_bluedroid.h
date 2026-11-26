@@ -167,6 +167,10 @@ typedef struct {
     uint8_t  bonded;                       /* that peer holds a MITM bond (just bonded, or authorized SPP link) */
 } bt_xrec_ui_t;
 void bt_xrec_get_ui(bt_xrec_ui_t *out);
+/* Changes whenever a prompt appears or ends, the pairing window opens or closes, a bench-accepted value is shown or
+ * the M2.3 gate refuses a window: the BT screen redraws at once instead of at its paced period (main.c,
+ * openfw_bt_ui_pace.h). Cheap (no lock, no copy). App task only. */
+uint32_t bt_xrec_ui_sig(void);
 /* The local user's answer: accept != 0 accepts. 0 = applied, -1 no prompt pending, -2 not armed yet (ignored),
  * -3 no prompt pending but one ended less than BT_XREC_SSP_AFTER_MS ago (swallowed: the key was meant for it).
  * The caller treats every value but -1 as consumed. Accepting re-checks the M2.3 gate first (rejects if it fails). */

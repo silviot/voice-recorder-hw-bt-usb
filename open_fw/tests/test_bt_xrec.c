@@ -5,7 +5,9 @@
  * numeric-comparison prompt (accept, reject, timeout, window closing, peer gone, second request, bench autoconfirm),
  * bonded reconnect, stop during transfer, deferred reboot behind congestion, entropy fail-closed, event-queue
  * overflow, platform faults, bring-up/config failures and timeouts, the shutdown deadline / latch hard paths.
- * Built by make test-bt-xrec (bt/host_tests.mk) with ASan/UBSan.
+ * Built by make test-bt-xrec (bt/host_tests.mk) with ASan/UBSan, twice: as in a bench image (OPENFW_BT_BENCH_IMAGE=1,
+ * every test) and as in a release image (no bench knobs or counters: the release TX path of [26] and every test that
+ * needs no bench override; TB_BENCH below).
  * SPDX-License-Identifier: MIT */
 #include <stdarg.h>
 #include <stdbool.h>
@@ -21,6 +23,14 @@
 #include "bt_xrec_bluedroid.h"
 
 void bt_xrec_test_reset(void);
+void bt_xrec_test_set_gets_budget(uint32_t frames);
+int bt_xrec_test_tx_rebase(uint32_t pos, uint32_t urgent_behind);
+
+#if defined(OPENFW_BT_BENCH_IMAGE) && OPENFW_BT_BENCH_IMAGE
+#define TB_BENCH 1      /* the session is built as in a bench image: bench overrides, TX knobs and counters */
+#else
+#define TB_BENCH 0      /* as in a release image */
+#endif
 
 static int g_checks, g_fails;
 #define CHECK(c, ...)                                                                                                  \
@@ -1107,6 +1117,7 @@ static void t_congestion_partial(void)
 /* Review STEP10 A5: commands pipelined in one SPP write while BTC is congested. The replies outgrow the 2 KiB TX ring;
  * xrec_proto holds the next command back (xo_tx_free) instead of dropping its reply, and the WRITE / CONG events
  * queued behind the held DATA still run, so the session drains and every reply arrives in order. */
+#if TB_BENCH
 static void t_tx_flow_control(void)
 {
     printf("[6b] XREC RX flow control: pipelined replies larger than the TX ring are not dropped (A5)\n");
@@ -1148,6 +1159,7 @@ static void t_tx_flow_control(void)
           "held bytes dropped on close (rx_used %u)", dbg().rx_used);
     stop_ok();
 }
+#endif
 
 static void t_write_error(void)
 {
@@ -1748,6 +1760,7 @@ static void t_ssp_auto_accept(void)
     stop_ok();
 }
 
+#if TB_BENCH
 static void t_bench_autoconfirm(void)
 {
     printf("[15] BENCH autoconfirm override (bt_xrec_set_bench_autoconfirm)\n");
@@ -1815,6 +1828,7 @@ static void t_bench_autoconfirm(void)
     CHECK(strcmp(status().pair_pin, "654321") != 0, "NULL: off again");
     stop_ok();
 }
+#endif
 
 
 /* Review findings (2026-11-24): the ROM never validates the peer's P-192 key, so an accepted pairing that fails tells
@@ -1925,11 +1939,14 @@ static void t_scan_refused_retry(void)
 static void t_ssp_key_spent(void)
 {
     printf("[17] accepted pairing that fails: P-192 key spent, SSP refused until the next BT-mode entry\n");
-    for (int variant = 0; variant < 3; variant++) {   /* 0 bench autoconfirm + AUTH_CMPL fail, 1 user + fail, 2 ACL drop */
+    for (int variant = TB_BENCH ? 0 : 1; variant < 3; variant++) {   /* 0 bench autoconfirm + AUTH_CMPL fail, 1 user +
+                                                                        * fail, 2 ACL drop */
         mocks_reset();
+#if TB_BENCH
         if (variant == 0) {
             bt_xrec_set_bench_autoconfirm(1);
         }
+#endif
         bring_up();
         bt_xrec_open_pairing(60000u);
         bt_xrec_poll();
@@ -1966,9 +1983,11 @@ static void t_ssp_key_spent(void)
         bt_xrec_poll();
         CHECK(dbg().ssp_window && !dbg().ssp_burned, "v%d: next session offers SSP again", variant);
         stop_ok();
+#if TB_BENCH
         if (variant == 0) {
             bt_xrec_set_bench_autoconfirm(0);
         }
+#endif
     }
     /* a rejected (never accepted) comparison that fails spends nothing: the peer never reached the DHKey check */
     mocks_reset();
@@ -1983,6 +2002,7 @@ static void t_ssp_key_spent(void)
     stop_ok();
 
     printf("[18] M2.3 gate re-checked at the request and at the answer (pool ran dry between two polls)\n");
+#if TB_BENCH
     mocks_reset();
     bt_xrec_set_bench_autoconfirm(1);
     bring_up();
@@ -1997,6 +2017,7 @@ static void t_ssp_key_spent(void)
     CHECK(dbg().ssp_gate_cfm_rejects == 1u && !dbg().ssp_window, "counted, SSP part closed");
     bt_xrec_set_bench_autoconfirm(0);
     stop_ok();
+#endif
     mocks_reset();
     bring_up();
     bt_xrec_open_pairing(60000u);
@@ -2178,6 +2199,7 @@ static void t_session6_review(void)
     stop_ok();
 }
 
+#if TB_BENCH
 /* Bench TX knobs (sync-throughput investigation, bt_xrec_set_bench_tput): the write cap, the BTC ring size handed to
  * esp_spp_enhanced_init, the TX ring size, staged (coalesced) writes that cross the ring wrap without a cut, and the
  * range check. LOG replies stand in for GETS frames (no volume here): the stream must stay byte-exact. */
@@ -2231,6 +2253,7 @@ static void t_bench_tput(void)
     stop_ok();
     bt_xrec_set_bench_tput(NULL);
 }
+#endif
 
 
 /* ---- [26] the release TX path: coalesced full-size writes (docs/BT_SYNC_THROUGHPUT.md) ---- */
@@ -2323,9 +2346,54 @@ static int co_all_len(uint32_t from, uint32_t to, uint16_t len)
     return 1;
 }
 
+/* bt_xrec_ui_sig: the BT screen redraws at once (not at its paced 500 ms during a transfer) when a prompt appears or
+ * ends, or the pairing window opens or closes (main.c run_bt_xrec_mode). */
+static void t_ui_sig(void)
+{
+    printf("[27] UI signature: prompt and pairing-window changes force a redraw\n");
+    mocks_reset();
+    bring_up();
+    uint32_t s0 = bt_xrec_ui_sig();
+    bt_xrec_poll();
+    CHECK(bt_xrec_ui_sig() == s0, "idle poll: unchanged");
+    bt_xrec_open_pairing(60000u);
+    bt_xrec_poll();
+    uint32_t s1 = bt_xrec_ui_sig();
+    CHECK(s1 != s0, "window opened: changed");
+    cfm_req(PEER, 4242u);
+    bt_xrec_poll();
+    uint32_t s2 = bt_xrec_ui_sig();
+    CHECK(ui().prompt && s2 != s1, "prompt up: changed");
+    m_now += BT_XREC_SSP_ARM_MS;
+    bt_xrec_poll();
+    CHECK(bt_xrec_ui_sig() == s2, "prompt counting down: unchanged");
+    CHECK(user_answer(0) == 0, "BACK");
+    bt_xrec_poll();
+    uint32_t s3 = bt_xrec_ui_sig();
+    CHECK(!ui().prompt && s3 != s2, "prompt answered: changed");
+    m_now += 60000u;
+    bt_xrec_poll();
+    CHECK(!dbg().window_open && bt_xrec_ui_sig() != s3, "window closed by its deadline: changed");
+    stop_ok();
+}
+
+/* A fresh authorized session for the GETS tests: peer RFCOMM MTU mtu, the in-flight window empty, wire cleared. */
+static void co_session(uint16_t mtu)
+{
+    mocks_reset();
+    m_vol = &g_vol;
+    m_peer_mtu = mtu;
+    bring_up();
+    pair_and_auth();
+    btc_drain(H1, m_btc_used, 1000u);
+    bt_xrec_poll();
+    wire_clear();
+}
+
 static void t_coalesce(void)
 {
-    printf("[26] release TX path: GETS frames merge into full-MTU writes, text replies are never held, 5 ms bound\n");
+    printf("[26] %s TX path: GETS frames merge into full-MTU writes, text replies are never held, 5 ms bound\n",
+           TB_BENCH ? "default (bench build)" : "release");
     if (!g_have_vol) {
         CHECK(0, "no exFAT test image (make test-bt-xrec passes one)");
         return;
@@ -2340,10 +2408,12 @@ static void t_coalesce(void)
     pair_and_auth();
     btc_drain(H1, m_btc_used, 1000u);   /* the OK,PAIR reply: an empty in-flight window */
     bt_xrec_poll();
+#if TB_BENCH
     bt_xrec_bench_tput_snap_t x0, x;
     bt_xrec_bench_tput_snap(&x0);
     CHECK(x0.tx_size == 8192u && x0.inflight_cap == 3960u, "TX ring %u, in-flight cap %u", (unsigned)x0.tx_size,
           (unsigned)x0.inflight_cap);
+#endif
     wire_clear();
     uint32_t t0 = m_now;
     rx(H1, "+XREC:GETS,0,30000,640,CO.wav\r\n");
@@ -2358,9 +2428,11 @@ static void t_coalesce(void)
           (unsigned)m_wire_len);
     CHECK(co_all_len(0u, m_wlen_n - 1u, 990u) && m_wlen[m_wlen_n - 1u] == 30564u - 30u * 990u,
           "all writes 990 B, the last %u B", (unsigned)m_wlen[m_wlen_n - 1u]);
+#if TB_BENCH
     bt_xrec_bench_tput_snap(&x);
     CHECK(x.wr_wrap == x0.wr_wrap && x.co_forced == x0.co_forced && x.co_waits > x0.co_waits,
           "no wrap cut, no forced write, short writes held (%u holds)", (unsigned)(x.co_waits - x0.co_waits));
+#endif
 
     /* (b) a write the in-flight cap shortens (BTC reported 300 B) is held for more room, at most 5 ms */
     wire_clear();
@@ -2381,8 +2453,10 @@ static void t_coalesce(void)
     CHECK(check_gets_frames(0u, 30000u) == 0, "stream intact around the forced write (%d)",
           check_gets_frames(0u, 30000u));
     CHECK(co_all_len(5u, m_wlen_n - 1u, 990u), "full writes again after it");
+#if TB_BENCH
     bt_xrec_bench_tput_snap(&x0);
     CHECK(x0.co_forced == x.co_forced + 1u, "one forced write (%u)", (unsigned)(x0.co_forced - x.co_forced));
+#endif
 
     /* (c) text replies are never held: the same in-flight shortfall, LOG replies -> written at once */
     wire_clear();
@@ -2422,7 +2496,72 @@ static void t_coalesce(void)
           "(max %u, %u writes)", (unsigned)m_write_max, (unsigned)m_wlen_n);
     stop_ok();
 
-    /* (e) bench coalesce=0 (the pre-2026-11-26 path): one write per frame, cut at the ring wrap */
+    /* (e) a producer that stops with room in the ring (paced while recording, per-poll budget; here the test hook
+     * refuses GETS frames past 2 per xrec_poll): the tail after the last frame goes out at the end of the poll, not
+     * after a 5 ms hold; during the poll frames still merge */
+    co_session(990u);
+    bt_xrec_test_set_gets_budget(2u);
+    uint32_t t1 = m_now;
+    rx(H1, "+XREC:GETS,0,30000,640,CO.wav\r\n");
+    CHECK(m_wlen_n == 2u && m_wlen[0] == 990u && m_wlen[1] == 2u * 652u - 990u,
+          "paced: 2 frames -> 990 + %u B in the same poll (%u writes)", 2u * 652u - 990u, (unsigned)m_wlen_n);
+    btc_drain(H1, m_btc_used, 990u);
+    bt_xrec_poll();
+    CHECK(m_wlen_n == 4u && m_wlen[2] == 990u && m_wlen[3] == 314u, "next poll: 990 + 314 again (%u writes)",
+          (unsigned)m_wlen_n);
+    co_drain_all(990u);
+    CHECK(m_now == t1 && check_gets_frames(0u, 30000u) == 0, "paced: stream intact, no clock advance (%d)",
+          check_gets_frames(0u, 30000u));
+    bt_xrec_test_set_gets_budget(0u);
+    stop_ok();
+
+    /* (f) a forced write that BTC refuses (ESP_ERR_NO_MEM): after CONG_EVT(false) the next short write gets a full
+     * hold of its own, not the old one's expired clock */
+    co_session(990u);
+    rx(H1, "+XREC:GETS,0,30000,640,CO.wav\r\n");
+    btc_drain(H1, 300u, 300u);
+    bt_xrec_poll();
+    CHECK(m_wlen_n == 4u && dbg().inflight == 3660u, "300 B of room: held (%u writes)", (unsigned)m_wlen_n);
+    m_btc_cap = m_btc_used + 100u;      /* BTC's ring has 100 B left: the forced 300 B write is refused */
+    uint32_t nomem = dbg().tx_nomem;
+    m_now += BT_XREC_COALESCE_MS;
+    bt_xrec_poll();
+    CHECK(m_wlen_n == 4u && dbg().cong == 1u && dbg().tx_nomem == nomem + 1u, "forced write refused: congested");
+    m_now += 20u;
+    m_btc_cap = 100000u;
+    m_upper_cong = 0;
+    esp_spp_cb_param_t cp;
+    memset(&cp, 0, sizeof(cp));
+    cp.cong.handle = H1;
+    spp_evt(ESP_SPP_CONG_EVT, &cp);
+    bt_xrec_poll();
+    CHECK(dbg().cong == 0u && m_wlen_n == 4u, "CONG_EVT(false): the 300 B write is held again (%u writes)",
+          (unsigned)m_wlen_n);
+    m_now += BT_XREC_COALESCE_MS;
+    bt_xrec_poll();
+    CHECK(m_wlen_n == 5u && m_wlen[4] == 300u, "then forced after its own %u ms (%u writes)", BT_XREC_COALESCE_MS,
+          (unsigned)m_wlen_n);
+    co_drain_all(990u);
+    CHECK(check_gets_frames(0u, 30000u) == 0, "stream intact around the refused write (%d)",
+          check_gets_frames(0u, 30000u));
+    stop_ok();
+
+    /* (g) the last text reply 2^31 - 256 B behind tx_tail (a >2 GiB GETS run with no text command in between): the
+     * first write crosses 2^31, which must not make that reply look queued again (coalescing would turn off and the
+     * 314 B after it would go out at once) */
+    co_session(990u);
+    CHECK(bt_xrec_test_tx_rebase(0x7FFFF000u, 0x7FFFFF00u) == 0, "TX ring rebased");
+    rx(H1, "+XREC:GETS,0,30000,640,CO.wav\r\n");
+    CHECK(m_wlen_n == 4u && co_all_len(0u, 4u, 990u), "rebased: first poll 4 full writes (%u writes, 2nd %u B)",
+          (unsigned)m_wlen_n, (unsigned)m_wlen[1]);
+    co_drain_all(990u);
+    CHECK(check_gets_frames(0u, 30000u) == 0, "rebased: frames intact (%d)", check_gets_frames(0u, 30000u));
+    CHECK(m_wlen_n == 31u && co_all_len(0u, m_wlen_n - 1u, 990u), "rebased: still 31 writes of 990 B but the last "
+          "(%u writes)", (unsigned)m_wlen_n);
+    stop_ok();
+
+#if TB_BENCH
+    /* (h) bench coalesce=0 (the pre-2026-11-26 path): one write per frame, cut at the ring wrap */
     mocks_reset();
     m_vol = &g_vol;
     m_peer_mtu = 990u;
@@ -2440,6 +2579,7 @@ static void t_coalesce(void)
           "coalesce=0: writes cut at the wrap (%u), never held, more writes (%u)", (unsigned)(x.wr_wrap - x0.wr_wrap),
           (unsigned)m_wlen_n);
     stop_ok();
+#endif
 }
 
 int main(int argc, char **argv)
@@ -2463,7 +2603,9 @@ int main(int argc, char **argv)
     t_bonded_reconnect();
     t_rx_overflow();
     t_congestion_partial();
-    t_tx_flow_control();
+#if TB_BENCH
+    t_tx_flow_control();                  /* needs the 2 KiB rings of the bench knobs */
+#endif
     t_write_error();
     t_disconnect_mid_transfer();
     t_stop_during_transfer();
@@ -2472,16 +2614,21 @@ int main(int argc, char **argv)
     t_evq_overflow_and_faults();
     t_hard_paths();
     t_ssp_prompt();
+#if TB_BENCH
     t_bench_autoconfirm();
+#endif
     t_pairing_gate();
     t_ssp_key_spent();
     t_scan_refused();
     t_scan_refused_retry();
     t_session6_name_and_link();
     t_session6_review();
+#if TB_BENCH
     t_bench_tput();
+#endif
     t_coalesce();
+    t_ui_sig();
     bt_xrec_test_reset();
-    printf("test_bt_xrec: %d checks, %d failures\n", g_checks, g_fails);
+    printf("test_bt_xrec (%s build): %d checks, %d failures\n", TB_BENCH ? "bench" : "release", g_checks, g_fails);
     return g_fails == 0 ? 0 : 1;
 }
