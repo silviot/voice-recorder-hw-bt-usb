@@ -1,0 +1,113 @@
+diff --git a/open_fw/third_party/bluedroid/host/bluedroid/btc/profile/std/spp/btc_spp.c b/open_fw/third_party/bluedroid/host/bluedroid/btc/profile/std/spp/btc_spp.c
+index 2f8beac..f149c06 100644
+--- a/open_fw/third_party/bluedroid/host/bluedroid/btc/profile/std/spp/btc_spp.c
++++ b/open_fw/third_party/bluedroid/host/bluedroid/btc/profile/std/spp/btc_spp.c
+@@ -82,6 +82,10 @@ typedef struct {
+     bool rx_broken_reported;       /* the loss was reported to the application (DATA_IND, status NO_RESOURCE) */
+     uint16_t rx_lost;              /* frames dropped since the last DATA_IND drain: their credits go back with it */
+     tBTA_JV_RFCOMM_WRITE fb_write;
++    /* open_fw patch 0046 (TX frames not cut at the ring wrap) */
++    bool write_staged;             /* write_data points into tx_stage: its ring bytes were already returned */
++    uint16_t tx_stage_cap;
++    uint8_t *tx_stage;             /* one RFCOMM frame copied from both sides of the ring wrap (allocated on first use) */
+ #endif
+ } spp_slot_t;
+ 
+@@ -202,6 +206,9 @@ static spp_slot_t *spp_malloc_slot(void)
+             (*slot)->ringbuf_write = NULL;
+ #if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+             (*slot)->fb_write_set = false;          /* patch 0044 */
++            (*slot)->write_staged = false;          /* patch 0046 */
++            (*slot)->tx_stage_cap = 0;
++            (*slot)->tx_stage = NULL;
+             (*slot)->rx_broken = false;
+             (*slot)->rx_broken_reported = false;
+             (*slot)->rx_lost = 0;
+@@ -465,6 +472,12 @@ static void spp_free_slot(spp_slot_t *slot)
+         xEventGroupSetBits(s_spp_resident.tx_event_group, SLOT_CLOSE_BIT(slot->serial));
+     }
+     vRingbufferDelete(slot->ringbuf_write);
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++    if (slot->tx_stage) {                   /* patch 0046 */
++        osi_free(slot->tx_stage);
++        slot->tx_stage = NULL;
++    }
++#endif
+     free_slot_data(&slot->rx);
+     if (slot->close_alarm) {
+         osi_alarm_free(slot->close_alarm);
+@@ -503,6 +516,52 @@ static size_t spp_get_tx_items_waiting_under_lock(spp_slot_t *slot)
+     return items_waiting;
+ }
+ 
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++/* open_fw patch 0046: the byte ring returns only the contiguous piece up to its end, so a frame that reaches the wrap
++ * was sent short (one extra small RFCOMM frame per ring cycle once the write position is no longer MTU aligned, e.g.
++ * after a text reply). When more bytes wait behind the wrap, copy both pieces (up to one MTU) into tx_stage and send
++ * that as one frame. The ring bytes are returned at once (a byte buffer allows one checked-out piece at a time);
++ * write_held keeps counting them, so esp_spp_write()'s room check and the congestion watermarks see no change.
++ * No stage memory (allocation failed): the short piece goes out as upstream does. Caller holds spp_lock. */
++static uint8_t *spp_stage_across_wrap_under_lock(spp_slot_t *slot, uint8_t *data, size_t *item_size)
++{
++    size_t first = *item_size;
++    UBaseType_t waiting = 0;
++    if (first >= slot->mtu) {
++        return data;
++    }
++    vRingbufferGetInfo(slot->ringbuf_write, NULL, NULL, NULL, NULL, &waiting);
++    if (waiting == 0) {
++        return data;                      /* everything there is: not a wrap */
++    }
++    if (slot->tx_stage == NULL || slot->tx_stage_cap < slot->mtu) {
++        uint8_t *st = osi_malloc(slot->mtu);
++        if (st == NULL) {
++            return data;
++        }
++        if (slot->tx_stage) {
++            osi_free(slot->tx_stage);
++        }
++        slot->tx_stage = st;
++        slot->tx_stage_cap = slot->mtu;
++    }
++    memcpy(slot->tx_stage, data, first);
++    vRingbufferReturnItem(slot->ringbuf_write, data);
++    size_t second = 0;
++    uint8_t *rest = xRingbufferReceiveUpTo(slot->ringbuf_write, &second, 0, slot->mtu - first);
++    if (rest) {
++        memcpy(slot->tx_stage + first, rest, second);
++        vRingbufferReturnItem(slot->ringbuf_write, rest);
++    } else {
++        second = 0;
++    }
++    *item_size = first + second;
++    slot->write_held = (uint16_t)(first + second);
++    slot->write_staged = true;
++    return slot->tx_stage;
++}
++#endif
++
+ /*
+  * false: write_data is held and BTA_JvRfcommWrite did not accept it; the caller retries.
+  * true: otherwise.
+@@ -523,6 +582,9 @@ static bool spp_drain_tx_under_lock(spp_slot_t *slot)
+         if (data) {
+             /* Keep the original checkout size. A partial accept shrinks write_data_len only. */
+             slot->write_held = (uint16_t)item_size;
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++            data = spp_stage_across_wrap_under_lock(slot, data, &item_size);
++#endif
+         }
+     }
+ 
+@@ -1478,6 +1540,11 @@ void btc_spp_cb_handler(btc_msg_t *msg)
+ 
+             if (p_data->rfc_write.status == BTA_JV_SUCCESS) {
+                 if (accepted_len == slot->write_data_len) {
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++                    if (slot->write_staged) {
++                        slot->write_staged = false;   /* patch 0046: its ring bytes were returned when staged */
++                    } else
++#endif
+                     vRingbufferReturnItem(slot->ringbuf_write, slot->write_data);
+                     slot->write_data = NULL;
+                     slot->write_data_len = 0;
