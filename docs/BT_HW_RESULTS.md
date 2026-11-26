@@ -374,6 +374,48 @@ Review C5 / A11 run: image `029f2a8` (bench lines `hp ctrl ... more streak_max s
 | C5 (`bt_ctrl` zero-wait loop) | `more=0` in every window and **`streak_max=0 streak_us=0`** since boot (ROM start, page, auth, AVDTP setup, streaming): `bt_ctrl_run()` never returned "more work" on silicon, ~1700-1900 runs/s at 49-58 us each. The zero-wait path is not exercised; no yield bound needed. |
 | A11 (stack headroom, words free) | BTC_TASK **543** (2172 B), BTU_TASK 869, bt_ctrl 721, hciT 425, bt_dlv 313, bt_recover 695, bt_alarm 191, Tmr Svc 356, IDLE 103, app 2065. All far above the 512 B threshold. Caveat: SSP pairing was not in this run (stored key); the session-9 pairing run predates the `hp stack` line. |
 
+
+## Session 10 (2026-11-25/26, overnight, hands-free): sync speed, sync while recording, SD write bug
+
+Unattended: the agent flashed bench images over USB, staged `SD:/BTBENCH.RUN` requests (including the new recording
+runs `mode=rec` / `rec=1`) and drove the Pixel 8 app over adb. Recorder on the desk, USB cable in, phone within 30 cm.
+
+**Phone sync speed** (details: `docs/BT_SYNC_THROUGHPUT.md` sections 6, 6b)
+- Baseline 38.4-39.4 KB/s. Cause: ~505 B SPP writes (one per GETS frame, cut again at the 2 KiB TX ring wrap) and
+  slow per-packet completion (ACL handover -> NOCP ~38 ms, all 4 ACL credits busy ~57 % of the time).
+- Full-size coalesced 990 B writes + BTC ring-wrap fix (Bluedroid patch 0046) + paced BT screen: **56-57 KB/s**, and
+  **59.4-60.4 KB/s** on the integrated image (53bb001 bench). 8 ACL credits gave no gain: the link is air-limited
+  (basic-rate-like); EDR is the next lever (section 7 there).
+
+**SD write bug that stopped recordings during downloads** (fixed in `fix/sd-concurrent-rw`, now in main)
+- With the phone downloading (XREC GETS) while the recorder recorded, 3/3 recordings ended early: `SDW_1_FAIL` then
+  `REC_ERR write=..` (the recorder stops on a write error). Radio off / idle: never. Every recording also had one
+  recovered `SDW_MDTO`/`SDW_MFAIL` at its start.
+- Cause: the controller's busy-clear interrupt (RINTSTS bit 13, enabled by CARDTHRCTL bit 1, set since the factory
+  init) means "card finished programming" on writes, but the driver counted it as a start-bit error. A CMD25 always
+  shows it (hence the one MDTO per recording and the latched single-block mode); a CMD24 shows it when the status is
+  read late, i.e. when the BT tasks preempt the app task during a download.
+- Fix: bit 13 ignored on write data phases; card-state recovery after errors; abort of an armed data path; bounded
+  in-place write retries; recorder block retry. Silicon after the fix: 0 SD errors in 8 recordings, about 418
+  multi-block busy-clears per recording (normal), and single-block busy-clears (the old killer) seen 1-2 times in
+  syncing runs and handled with 0 retries.
+
+**Recording integrity while the phone downloads** (stage 3 firmware + SD fix; mono, gain 31)
+
+| Run | Length | ov / lost / acct | SD errors | downloaded during the recording |
+|---|---|---|---|---|
+| S3p_1..3, I3p_1..2 (syncing) | 90 s each, complete | 0 / 0 / 0 | 0 | 1.96-2.15 MB each |
+| S0_1..2, I0_1 (radio off) | 90 s each, complete | 0 / 0 / 0 | 0 | - |
+
+Worst recorder-loop gap 48-74 ms (mono ring tolerance 896 ms); block-clock drift -2 samples in all runs.
+
+**Audio "no effect" (M2): not answered.** Night silence captures contain mechanical knocks whose energy reaches up to
+8 kHz, so the fail-closed gate (`tools/rf_audio_check.py --band-split`) can only return FAIL/INCONCLUSIVE on them, also
+between radio-off repeats; earlier provisional "idle radio passes" verdicts are void
+(`docs/measurements/2026-11-26-M2-C1-idle-radio.md`). The design's controlled M2 session (foam box, 997 Hz tone,
+user present) remains the gate; "Sync while the recorder records" stays off by default until it passes. Weak lead to
+check then: a 22.9 Hz rhythm in one of the early (pre-fix, shortened) syncing captures.
+
 ## Exp 1 stages A and B: how to run
 
 Probe image for plan M5 Exp 1 stage A and stage B (step 4): `bt_ctrl` (plan M1) drives the real RW-BT ROM through
