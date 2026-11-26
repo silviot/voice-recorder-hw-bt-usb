@@ -45,10 +45,23 @@ PASS, FAIL or INCONCLUSIVE (the baseline cannot support the bar, or the setup di
       out of (a), (b), (c) and (d) - in the baseline and the captures alike (Welch segments must lie in kept
       seconds; the envelope's power is held at the kept mean over excluded seconds so the time base stays intact).
       Continuity (e) still covers the whole file. Fewer than --lim-quiet-min-s kept seconds -> INCONCLUSIVE.
-      Every excluded burst is classified (dominant band, energy share on the k*800 / k*1600 Hz combs +-10 Hz above
-      the +-15..60 Hz flanks): a burst whose comb share >= --lim-quiet-comb-share, or with a comb tooth >=
-      --lim-quiet-comb-prom-db above its flanks that is also > --lim-spur-db above the same tooth in the quiet
-      seconds, FAILS the capture - an RF burst cannot hide as a 'transient'.
+      Exclusion fails closed: only RUMBLE-SHAPED bursts may be left out (classify_burst), everything else FAILS:
+        BT comb   - energy share on the k*1600 / 800 / 400 / 266.67 Hz combs (+-10 Hz above the +-15..60 Hz flanks)
+                    >= --lim-quiet-comb-share, a tooth >= --lim-quiet-comb-prom-db above its flanks and > --lim-spur-db
+                    above the same tooth in the quiet seconds, or 128 ms periodicity (k*7.8125 Hz, DMA blocks)
+        non-rumble - 10-90 % band of the excess energy not below --lim-rumble-hi-hz (300 Hz); a 256 ms segment whose
+                    500 Hz - 8 kHz octaves rise > --lim-spur-db over the quiet seconds AND > --lim-rumble-hf-tol-db
+                    above its own 20-250 Hz excess (real rumble lifts the high band by 14-49 dB, always far below
+                    its low band); a click (1 ms > 1 kHz frame +--lim-click-db over the quiet median and
+                    --lim-click-lf-db over the < 250 Hz power around it) or a step (sample-to-sample difference) inside
+        vs baseline - more excluded seconds / bursts than the baseline's rumble bursts allow (min of max +
+                    --lim-quiet-excl-margin-s / +--lim-quiet-count-margin, 2x max): FAIL, or INCONCLUSIVE when the
+                    baselines' own excluded seconds spread by > --lim-quiet-noisy-s
+        periodic  - burst peak times (or clicks in the kept seconds) with an interval CV < --lim-periodic-cv over any
+                    run of >= --lim-periodic-min-n; more clicks in the kept seconds than any baseline
+      A low-frequency supply-droop thump looks like rumble: the report notes every rumble exclusion, to be reviewed by
+      ear / eye when the count exceeds the baseline's. Loud rumble also masks anything quieter in the same seconds.
+      In a baseline (radio off) non-rumble bursts are reported and left out of the exclusion allowance.
 
 Usage:
   rf_audio_check.py --baseline C0_1.wav --baseline C0_2.wav --capture C3=REC_0012.wav [--capture C1=...]
@@ -114,6 +127,18 @@ class Limits:
     quiet_min_s: float = 30.0        # --quiet-mode: fewer kept seconds -> INCONCLUSIVE
     quiet_comb_share: float = 0.05   # --quiet-mode: excluded burst energy share on the 800 Hz comb -> FAIL
     quiet_comb_prom_db: float = 10.0  # --quiet-mode: a comb tooth this far above its flanks (and above quiet) -> FAIL
+    quiet_dma_corr: float = 0.3      # --quiet-mode: burst autocorrelation at one DMA block (128 ms) above this -> comb
+    rumble_hi_hz: float = 300.0      # --quiet-mode rumble shape: 90 % of the burst's excess energy below this
+    rumble_hf_tol_db: float = 5.0    # ... no 256 ms segment whose >= 500 Hz excess tops its < 250 Hz excess by more
+    click_db: float = 20.0           # click: a 1 ms frame of the > 1 kHz signal this far above the quiet frames' median
+    click_lf_db: float = 15.0        # ... and this far above the < 250 Hz power around it (+-16 ms): not rumble rattle
+    step_db: float = 24.0            # step: a sample-to-sample difference click_db above the quiet seconds' RMS
+                                     # difference AND this far above the RMS difference of the +-1 ms around it
+    quiet_excl_margin_s: float = 5.0  # excluded seconds above the baseline's maximum (rumble bursts) by more -> FAIL
+    quiet_count_margin: int = 2      # excluded bursts above the baseline's maximum by more -> FAIL
+    quiet_noisy_s: float = 5.0       # baselines whose excluded seconds spread by more: those FAILs are INCONCLUSIVE
+    periodic_cv: float = 0.2         # burst / click intervals with a coefficient of variation below this -> FAIL
+    periodic_min_n: int = 4          # ... with at least this many events
 
 
 # ------------------------------------------------------------------------------------------------------------- io
@@ -481,56 +506,205 @@ def quiet_blocks(xw: np.ndarray, lim: Limits, f0s: list[float | None] | None = N
         excl[max(0, i - g):i + g + 1] = True
     mask = np.repeat(~excl, FS)[:n]
     edges = np.diff(np.r_[0, excl.astype(np.int8), 0])
+    fr = FS // 100                                    # 10 ms frames: where in the burst its energy peaks
+    nfr = n // fr
+    p10 = ((xd[:nfr * fr] - xd.mean(axis=0)) ** 2).reshape(nfr, fr, nch).mean(axis=1)
+    p10 = (p10 / np.maximum(10 ** (med / 10), 1e-30)).max(axis=1)
     bursts = []
     for s0, e0 in zip(np.nonzero(edges == 1)[0], np.nonzero(edges == -1)[0]):
+        a0, a1 = int(s0) * FS // fr, max(int(s0) * FS // fr + 1, min(int(e0) * FS, n) // fr)
         bursts.append({"b0": int(s0), "b1": int(e0), "s": int(s0) * FS, "e": min(int(e0) * FS, n),
-                       "core_s": int(core[s0:e0].sum()), "peak_db_re_quiet": round(float(over[s0:e0].max()), 1)})
+                       "core_s": int(core[s0:e0].sum()), "peak_db_re_quiet": round(float(over[s0:e0].max()), 1),
+                       "pk": (a0 + int(np.argmax(p10[a0:a1]))) * fr if a1 <= nfr else int(s0) * FS})
     return {"mask": mask, "quiet_db": [round(float(v), 2) for v in med], "kept_s": round(float(mask.sum()) / FS, 2),
             "excl_s": round(float((~mask).sum()) / FS, 2), "bursts": bursts}
 
 
-def classify_burst(seg: np.ndarray, fq: np.ndarray, pq: np.ndarray, lim: Limits) -> dict:
-    """An excluded burst (one channel): its dominant band (10-90 % of the energy 20 Hz - 7.99 kHz), its peak bin, and
-    the energy on the k*800 Hz comb (k*1600 Hz: the even teeth) +-10 Hz above what the tooth's flanks predict, as a
-    share of the burst's energy. A tooth that stands lim.quiet_comb_prom_db above its flanks and whose excess is more
-    than lim.spur_db above the same tooth in the quiet seconds (fq, pq: the quiet PSD) is a burst-borne line: with a
-    comb share >= lim.quiet_comb_share it marks the burst bt_comb (an RF burst, not a mechanical transient)."""
-    f, p = welch(seg, FS, min(FS, len(seg)))
+COMB_BASES = (1600.0, 800.0, 400.0, 800.0 / 3.0)   # --quiet-mode burst combs (+ the 7.8125 Hz DMA-block period)
+OCTAVES = ((500.0, 1000.0), (1000.0, 2000.0), (2000.0, 4000.0), (4000.0, BAND[1]))
+LF_BAND = (20.0, 250.0)
+
+
+def _band(x: np.ndarray, lo: float, hi: float) -> np.ndarray:
+    """x band-limited to lo..hi Hz (FFT brick wall over the whole signal)."""
+    spec = np.fft.rfft(x)
+    f = np.fft.rfftfreq(len(x), 1.0 / FS)
+    spec[(f < lo) | (f >= hi)] = 0.0
+    return np.fft.irfft(spec, len(x))
+
+
+def click_events(x: np.ndarray, mask: np.ndarray | None, lim: Limits, f0: float | None = None) -> list[dict]:
+    """Clicks (fast onsets) in one channel of the analysis window: 1 ms frames of the > 1 kHz signal that stand
+    lim.click_db above the median frame of the kept (quiet) seconds AND lim.click_lf_db above the < 250 Hz power
+    around them (+-16 ms). The second condition separates a click (or a 1-5 ms RF burst) from the rattle inside
+    loud rumble, whose high band rides on 20-60 dB more low band (measured: <= +10 dB on the night captures; a
+    5-sample 0.2 FS click: +18.5 dB, a 4.5 ms +30 dB noise burst: +20..31 dB). Also steps: a sample-to-sample
+    difference lim.click_db above the quiet seconds' RMS difference and lim.step_db above its own +-1 ms (night
+    captures: <= +20.7 dB; a 0.002 FS DC step: +32 dB). Frames within 50 ms are one event.
+    Returns [{"i": first sample, "ex_db", "rel_db"}]."""
+    xd = notch_tone(x, f0) if f0 else x
+    fr = FS // 1000
+    nf = len(xd) // fr
+    hp = (_band(xd, 1000.0, BAND[1])[:nf * fr].reshape(nf, fr) ** 2).mean(axis=1)
+    lp = (_band(xd, *LF_BAND)[:nf * fr].reshape(nf, fr) ** 2).mean(axis=1)
+    lp = np.convolve(lp, np.ones(33) / 33.0, mode="same")
+    mk = np.ones(nf, dtype=bool) if mask is None else mask[:nf * fr].reshape(nf, fr).all(axis=1)
+    ref = float(np.median(hp[mk] if mk.any() else hp))
+    ex, rel = db(hp) - db(ref), db(hp) - db(lp)
+    hit = (ex >= lim.click_db) & (rel >= lim.click_lf_db)
+    # steps (a DC jump: mostly low band, so the frame test above misses it): one sample-to-sample difference far above
+    # both the quiet seconds' and its own +-1 ms neighbourhood's (rumble is smooth at the sample scale)
+    d2 = np.diff(xd, prepend=xd[0]) ** 2
+    ker = np.ones(33)
+    ker[15:18] = 0.0
+    loc = np.convolve(d2, ker, mode="same") / ker.sum()
+    mq = np.ones(len(d2), dtype=bool) if mask is None else mask[:len(d2)]
+    dq = float(np.mean(d2[mq] if mq.any() else d2))
+    st = np.nonzero((db(d2) - db(dq) >= lim.click_db) & (db(d2) - db(loc) >= lim.step_db))[0] // fr
+    hit[st[st < nf]] = True
+    ex[st[st < nf]] = np.maximum(ex[st[st < nf]], lim.click_db)
+    out: list[dict] = []
+    for i in np.nonzero(hit)[0]:
+        if out and i * fr - out[-1]["_last"] <= 50 * fr:
+            out[-1]["_last"] = int(i * fr)
+            out[-1]["ex_db"] = max(out[-1]["ex_db"], round(float(ex[i]), 1))
+            out[-1]["rel_db"] = max(out[-1]["rel_db"], round(float(rel[i]), 1))
+        else:
+            out.append({"i": int(i * fr), "_last": int(i * fr), "ex_db": round(float(ex[i]), 1),
+                        "rel_db": round(float(rel[i]), 1)})
+    for ev in out:
+        del ev["_last"]
+    return out
+
+
+def _comb(f: np.ndarray, p: np.ndarray, pqi: np.ndarray, base: float, lim: Limits) -> dict:
+    """Energy on the k*base comb (+-10 Hz teeth) above what the +-15..60 Hz flanks predict, and the most prominent
+    tooth; a tooth >= lim.quiet_comb_prom_db above its flanks AND > lim.spur_db above the same tooth in the quiet
+    seconds is a burst-borne line."""
     df = float(f[1] - f[0])
-    band = (f >= BAND[0]) & (f <= BAND[1])
-    fb, pb = f[band], p[band]
-    tot = float(pb.sum() * df)
-    cum = np.cumsum(pb)
-    lo = float(fb[min(int(np.searchsorted(cum, 0.1 * cum[-1])), len(fb) - 1)])
-    hi = float(fb[min(int(np.searchsorted(cum, 0.9 * cum[-1])), len(fb) - 1)])
-    pqi = np.interp(f, fq, pq)
-    ex800 = ex1600 = 0.0
+    ex_all = ex_even = 0.0
     best: dict | None = None
     line = False
     k = 1
-    while 800.0 * k + COMB_FLANK_HZ[1] < BAND[1]:
-        ft = 800.0 * k
+    while base * k + COMB_FLANK_HZ[1] < BAND[1]:
+        ft = base * k
         dist = np.abs(f - ft)
         t = dist <= COMB_HALF_HZ
         fl = (dist >= COMB_FLANK_HZ[0]) & (dist <= COMB_FLANK_HZ[1])
+        if ft - COMB_FLANK_HZ[1] < BAND[0]:
+            k += 1
+            continue
         tp = float(p[t].sum() * df)
         exp = float(p[fl].mean() * t.sum() * df)
         ex = max(tp - exp, 0.0)
         qp = float(pqi[t].sum() * df)
         prom, req = float(db(tp) - db(exp)), float(db(ex) - db(qp))
-        ex800 += ex
+        ex_all += ex
         if k % 2 == 0:
-            ex1600 += ex
+            ex_even += ex
         if prom >= lim.quiet_comb_prom_db and req > lim.spur_db:
             line = True
         if best is None or prom > best["prom_db"]:
-            best = {"hz": ft, "prom_db": round(prom, 1), "re_quiet_db": round(req, 1)}
+            best = {"hz": round(ft, 2), "prom_db": round(prom, 1), "re_quiet_db": round(req, 1)}
         k += 1
-    share = ex800 / tot if tot > 0 else 0.0
-    return {"band_hz": f"{lo:.0f}-{hi:.0f}", "peak_hz": float(fb[int(np.argmax(pb))]),
-            "level_dbfs": round(float(db(tot)), 1), "share_800": round(share, 4),
-            "share_1600": round(ex1600 / tot if tot > 0 else 0.0, 4), "max_tooth": best,
-            "bt_comb": bool(share >= lim.quiet_comb_share or line)}
+    return {"ex": ex_all, "ex_even": ex_even, "best": best, "line": line}
+
+
+def classify_burst(seg: np.ndarray, fq: np.ndarray, pq: np.ndarray, lim: Limits,
+                   clicks: list[dict] | None = None) -> dict:
+    """An excluded burst (one channel; fq, pq: the channel's quiet PSD). It may be excluded as harmless only when it
+    is RUMBLE-SHAPED; every reason it is not goes to "why":
+      band    - the 10-90 % band of its EXCESS energy (burst PSD minus the quiet PSD + lim.spur_db) must lie below
+                lim.rumble_hi_hz (the floor inside the guard blocks would otherwise stretch the band of a quiet burst)
+      hf      - per 256 ms Hann segment, every octave >= 500 Hz: raised by at most lim.spur_db over the quiet
+                seconds, or by at most lim.rumble_hf_tol_db more than the 20-250 Hz band of the same segment
+                (loud real rumble lifts 500 Hz - 8 kHz by 14-49 dB, always well below its own low band: hiss,
+                RF bursts and clicks raise the high band with little low band)
+      clicks  - no click (click_events) inside the burst
+      comb    - no comb on k*1600, k*800, k*400, k*266.67 Hz (eSCO 3.75 ms): share of the excess energy on the
+                teeth (re the burst's energy) >= lim.quiet_comb_share, or a burst-borne tooth line (_comb); no
+                128 ms (DMA block, k*7.8125 Hz) periodicity: autocorrelation at 2048 +-1 samples above that at 3072 / 5120 samples by
+                more than lim.quiet_dma_corr
+    "bt_comb" keeps the comb verdict alone (the "(q) excluded bursts on BT comb" row); "rumble" is the whole test."""
+    f, p = welch(seg, FS, min(FS, len(seg)))
+    df = float(f[1] - f[0])
+    band = (f >= BAND[0]) & (f <= BAND[1])
+    pqi = np.interp(f, fq, pq)
+    exs = np.maximum(p - pqi * 10 ** (lim.spur_db / 10.0), 0.0)[band]   # bins > quiet + spur_db (not the floor's
+    #                                                                     own scatter, summed over 8 kHz of bins)
+    fb = f[band]
+    tot = float(p[band].sum() * df)
+    cum = np.cumsum(exs)
+    if cum[-1] > 0:
+        lo = float(fb[min(int(np.searchsorted(cum, 0.1 * cum[-1])), len(fb) - 1)])
+        hi = float(fb[min(int(np.searchsorted(cum, 0.9 * cum[-1])), len(fb) - 1)])
+    else:
+        lo = hi = 0.0
+    why: list[str] = []
+    if hi > lim.rumble_hi_hz:
+        why.append(f"excess band {lo:.0f}-{hi:.0f} Hz (90 % point > {lim.rumble_hi_hz:g} Hz)")
+    # high band per 256 ms segment vs the low band of the same segment
+    nper = min(4096, len(seg))
+    hop = max(1, nper // 2)
+    sz = np.r_[np.zeros(hop), seg - seg.mean(), np.zeros(nper)]     # Hann segments that also centre on both ends
+    nseg = 1 + (len(seg) + hop - 1) // hop
+    w = np.hanning(nper)
+    idx = np.arange(nper)[None, :] + hop * np.arange(nseg)[:, None]
+    sp = np.abs(np.fft.rfft(sz[idx] * w, axis=1)) ** 2
+    sp *= 2.0 / (FS * (w ** 2).sum())
+    fs_ = np.fft.rfftfreq(nper, 1.0 / FS)
+    dfs = float(fs_[1] - fs_[0])
+    pqs = np.interp(fs_, fq, pq)
+
+    def band_ex(lo_: float, hi_: float) -> np.ndarray:
+        sel = (fs_ >= lo_) & (fs_ < hi_)
+        return db(sp[:, sel].sum(axis=1) * dfs) - db(float(pqs[sel].sum() * dfs))
+
+    lf_ex = band_ex(*LF_BAND)
+    oct_ex = np.stack([band_ex(a_, b_) for a_, b_ in OCTAVES], axis=1)
+    hf_ex = oct_ex.max(axis=1)
+    led = (hf_ex > lim.spur_db) & (hf_ex - lf_ex > lim.rumble_hf_tol_db)
+    if led.any():
+        j = int(np.argmax(np.where(led, hf_ex - lf_ex, -np.inf)))
+        why.append(f"high band led in {int(led.sum())} of {nseg} 256 ms segments (>= 500 Hz +{hf_ex[j]:.1f} dB "
+                   f"over quiet, {hf_ex[j] - lf_ex[j]:.1f} dB above the 20-250 Hz excess)")
+    clicks = clicks or []
+    if clicks:
+        why.append(f"{len(clicks)} click(s) (1 ms > 1 kHz up to +{max(c['ex_db'] for c in clicks):.1f} dB, "
+                   f"{max(c['rel_db'] for c in clicks):.1f} dB above the low band)")
+    # combs
+    combs = {}
+    bt = []
+    for base in COMB_BASES:
+        cb = _comb(f, p, pqi, base, lim)
+        share = cb["ex"] / tot if tot > 0 else 0.0
+        combs[f"{base:.2f}".rstrip("0").rstrip(".")] = {"share": round(share, 4), "max_tooth": cb["best"]}
+        if share >= lim.quiet_comb_share or cb["line"]:
+            bt.append(f"comb k*{base:.2f} Hz (share {share:.3f}, tooth {cb['best']})")
+    s0 = seg - seg.mean()
+
+    def acorr(lag: int) -> float:
+        if len(s0) <= lag + FS // 4:
+            return 0.0
+        a_, b_ = s0[:-lag], s0[lag:]
+        return float(np.dot(a_, b_) / max(math.sqrt(float(np.dot(a_, a_)) * float(np.dot(b_, b_))), 1e-30))
+
+    # periodic at one block, not merely slow (a plateau or a sub-8 Hz swell correlates at every lag): the lag-2048
+    # correlation above the correlation at 1.5 and 2.5 blocks
+    ac = max(acorr(lag) for lag in (BLOCK - 1, BLOCK, BLOCK + 1))
+    ac -= max(0.0, acorr(3 * BLOCK // 2), acorr(5 * BLOCK // 2))
+    if ac > lim.quiet_dma_corr:
+        bt.append(f"128 ms (DMA block, k*7.8125 Hz) periodicity: autocorrelation {ac:.2f}")
+    why += bt
+    c800 = _comb(f, p, pqi, 800.0, lim)
+    return {"band_hz": f"{lo:.0f}-{hi:.0f}", "peak_hz": float(fb[int(np.argmax(p[band]))]),
+            "level_dbfs": round(float(db(tot)), 1),
+            "share_800": round(c800["ex"] / tot if tot > 0 else 0.0, 4),
+            "share_1600": round(c800["ex_even"] / tot if tot > 0 else 0.0, 4), "max_tooth": c800["best"],
+            "combs": combs, "dma_corr": round(ac, 3),
+            "oct_ex_db": {"lf": round(float(lf_ex.max()), 1),
+                          **{f"{int(a_)}": round(float(oct_ex[:, k_].max()), 1) for k_, (a_, _) in enumerate(OCTAVES)}},
+            "clicks": len(clicks), "bt_comb": bool(bt), "rumble": not why, "why": why}
 
 
 def load_capture(label: str, path: Path, signal: str, tone_hz: float | None, trim: tuple[float, float],
@@ -560,12 +734,27 @@ def load_capture(label: str, path: Path, signal: str, tone_hz: float | None, tri
             ch["phase_steps"] = phase_steps(xc, ch["tone_hz"], lim.phase_rad, e / FS)
         c.ch.append(ch)
     if c.quiet is not None:   # classify every excluded burst on every channel against that channel's quiet PSD
+        # tone captures: the tone and its harmonics notched out first (a Hann segment leaks a 997 Hz tone into the
+        # 1-2 kHz octave), the quiet PSD taken from the same notched signal
+        xn = [notch_tone(x[a:b, k], ch["tone_hz"]) if ch["tone_hz"] else x[a:b, k] for k, ch in enumerate(c.ch)]
+        qp = [(ch["_f"], ch["_p"]) if not ch["tone_hz"] else welch(xn[k], FS, FS, mask=mask)
+              for k, ch in enumerate(c.ch)]
+        clicks = [click_events(xn[k], mask, lim) for k in range(len(c.ch))]
         for bu in c.quiet["bursts"]:
-            cls = [classify_burst(x[a + bu["s"]:a + bu["e"], k], ch["_f"], ch["_p"], lim)
-                   for k, ch in enumerate(c.ch)]
-            worst = max(range(len(cls)), key=lambda k: (cls[k]["bt_comb"], cls[k]["share_800"]))
+            cls = [classify_burst(xn[k][bu["s"]:bu["e"]], qp[k][0], qp[k][1], lim,
+                                  [ev for ev in clicks[k] if bu["s"] <= ev["i"] < bu["e"]])
+                   for k in range(len(c.ch))]
+            worst = max(range(len(cls)), key=lambda k: (cls[k]["bt_comb"], not cls[k]["rumble"], cls[k]["share_800"]))
             bu.update({"t_s": round((a + bu["s"]) / FS, 2), "dur_s": round((bu["e"] - bu["s"]) / FS, 2),
-                       "ch": worst, **cls[worst]})
+                       "t_pk_s": round((a + bu["pk"]) / FS, 2), "ch": worst, **cls[worst]})
+        # clicks in the kept seconds (they stay in the spectral metrics, where a few ms do not move a 1 s average)
+        kept = sorted({round((a + ev["i"]) / FS, 3) for k in range(len(clicks)) for ev in clicks[k]
+                       if mask[min(ev["i"], len(mask) - 1)]})
+        merged: list[float] = []
+        for t_ in kept:
+            if not merged or t_ - merged[-1] > 0.05:
+                merged.append(t_)
+        c.quiet["kept_clicks"] = merged
     return c
 
 
@@ -598,9 +787,24 @@ def _bdrift(d: dict | None) -> tuple[int, int] | None:
     return (bd, bc) if bc > 0 else None
 
 
+def _cv(times: list[float], lim: Limits) -> float | None:
+    """The lowest coefficient of variation of the intervals of any run of >= lim.periodic_min_n consecutive events
+    (a rhythm interleaved with a few unrelated bursts still shows), or None with fewer events."""
+    t = np.sort(np.asarray(times, dtype=float))
+    n, m = len(t), max(2, lim.periodic_min_n)
+    if n < m:
+        return None
+    best = math.inf
+    for i in range(n - m + 1):
+        for j in range(i + m, n + 1):
+            d = np.diff(t[i:j])
+            best = min(best, float(d.std() / d.mean()) if d.mean() > 0 else 0.0)
+    return best
+
+
 def compare(cap: Capture, base: list[Capture], lim: Limits, trim: tuple[float, float], dev: dict | None,
             expect_s: float | None, dev_state: str = "none", ref_devs: list[dict] | None = None,
-            dev_how: str = "") -> list[dict]:
+            dev_how: str = "", is_base: bool = False) -> list[dict]:
     """dev_state: "none" (no --bench-log), "found", "missing" (no line for this file) or "waived".
     ref_devs: the baseline captures' counters (the other baselines when cap is one). dev_how: how the counter line
     was matched (or which names were tried)."""
@@ -724,7 +928,8 @@ def compare(cap: Capture, base: list[Capture], lim: Limits, trim: tuple[float, f
             if r["metric"][:3] in ("(a)", "(b)", "(c)", "(d)") and r["verdict"] == "FAIL":
                 r["verdict"] = "INCONCLUSIVE"
                 r["note"] = f"too few quiet seconds in {', '.join(short)}"
-    # (q) --quiet-mode: kept seconds, and no excluded burst on the BT comb
+    # (q) --quiet-mode: kept seconds; every excluded burst rumble-shaped and off the BT combs; no more exclusion than
+    # the baseline; no rhythm in the bursts or in the clicks of the kept seconds
     if cap.quiet is not None:
         q = cap.quiet
         row(rows, "(q) quiet seconds kept", q["kept_s"], f"{q['excl_s']} s excluded", None,
@@ -732,12 +937,56 @@ def compare(cap: Capture, base: list[Capture], lim: Limits, trim: tuple[float, f
             True, verdict=None if q["kept_s"] >= lim.quiet_min_s else "INCONCLUSIVE")
         bt = [bu for bu in q["bursts"] if bu.get("bt_comb")]
         row(rows, "(q) excluded bursts on BT comb", len(bt), 0, None,
-            f"none: 800 Hz comb share < {lim.quiet_comb_share:g}, no tooth >= {lim.quiet_comb_prom_db:g} dB prom "
-            f"and > quiet +{lim.spur_db:g} dB", not bt)
+            f"none: k*1600/800/400/266.7 Hz comb share < {lim.quiet_comb_share:g}, no tooth >= "
+            f"{lim.quiet_comb_prom_db:g} dB prom and > quiet +{lim.spur_db:g} dB, 128 ms autocorr <= "
+            f"{lim.quiet_dma_corr:g}", not bt)
         if q["bursts"]:
             rows[-1]["detail"] = [{k: bu[k] for k in ("t_s", "dur_s", "peak_db_re_quiet", "band_hz", "peak_hz",
-                                                       "share_800", "share_1600", "max_tooth", "bt_comb")}
+                                                       "share_800", "share_1600", "max_tooth", "dma_corr", "bt_comb")}
                                   for bu in (bt + [b_ for b_ in q["bursts"] if not b_.get("bt_comb")])][:20]
+        nr = [bu for bu in q["bursts"] if not bu.get("rumble", True)]
+        row(rows, "(q) non-rumble burst excluded", len(nr), 0, None,
+            ("baseline (radio off): reported, left out of the exclusion allowance" if is_base else
+             f"none: excess 90 % < {lim.rumble_hi_hz:g} Hz, >= 500 Hz not led (+{lim.spur_db:g} dB / "
+             f"{lim.rumble_hf_tol_db:g} dB over 20-250 Hz), no click, no comb"),
+            not nr or is_base)
+        if nr:
+            rows[-1]["detail"] = [{k: bu[k] for k in ("t_s", "dur_s", "peak_db_re_quiet", "band_hz", "oct_ex_db",
+                                                       "clicks", "dma_corr", "why")} for bu in nr][:20]
+        if base and all(b.quiet is not None for b in base):
+            rb = [[bu for bu in b.quiet["bursts"] if bu.get("rumble", True)] for b in base]
+            b_s = [sum(bu["dur_s"] for bu in r) for r in rb]
+            b_n = [len(r) for r in rb]
+            lim_s = min(max(b_s) + lim.quiet_excl_margin_s, 2 * max(b_s))
+            lim_n = min(max(b_n) + lim.quiet_count_margin, 2 * max(b_n))
+            spread = max(b.quiet["excl_s"] for b in base) - min(b.quiet["excl_s"] for b in base)
+            over = q["excl_s"] > lim_s + 1e-9 or len(q["bursts"]) > lim_n
+            v = None
+            if over and spread > lim.quiet_noisy_s:
+                v = "INCONCLUSIVE"               # the baselines themselves disagree by more than the margin
+            row(rows, "(q) excluded vs baseline", f"{q['excl_s']} s in {len(q['bursts'])}",
+                f"max {max(b_s):g} s in {max(b_n)} (rumble bursts)", None,
+                f"<= {lim_s:g} s and <= {lim_n} bursts (min of max + {lim.quiet_excl_margin_s:g} s / "
+                f"+{lim.quiet_count_margin}, 2x max); baseline excluded spread {spread:g} s "
+                f"(> {lim.quiet_noisy_s:g}: INCONCLUSIVE)", not over, verdict=v)
+        tp = [bu.get("t_pk_s", bu.get("t_s", 0.0)) for bu in q["bursts"]]
+        cv = _cv(tp, lim)
+        row(rows, "(q) burst periodicity", "-" if cv is None else rnd(cv, 3), None, None,
+            f"interval CV >= {lim.periodic_cv:g} (lowest over runs of >= {lim.periodic_min_n} bursts)",
+            cv is None or cv >= lim.periodic_cv,
+            verdict="INCONCLUSIVE" if is_base and cv is not None and cv < lim.periodic_cv else None)
+        if cv is not None:
+            rows[-1]["detail"] = [round(float(t_), 2) for t_ in sorted(tp)][:20]
+        kc = q.get("kept_clicks", [])
+        kcv = _cv(kc, lim)
+        bmax = max((len(b.quiet.get("kept_clicks", [])) for b in base if b.quiet is not None), default=None)
+        ok = (bmax is None or len(kc) <= bmax) and (kcv is None or kcv >= lim.periodic_cv)
+        row(rows, "(q) clicks in kept seconds", len(kc), bmax, None,
+            f"<= baseline max, interval CV >= {lim.periodic_cv:g} (1 ms > 1 kHz +{lim.click_db:g} dB, "
+            f"{lim.click_lf_db:g} dB over < 250 Hz)" + (f"; CV {kcv:.3f}" if kcv is not None else ""),
+            ok or is_base)
+        if kc:
+            rows[-1]["detail"] = kc[:20]
     # (e) zero runs and length: the whole file but the edges
     e = min(int(lim.cont_edge_s * FS), cap.n // 4)
     zr = zero_runs(cap.raw[e:cap.n - e], lim.zero_run)
@@ -877,7 +1126,7 @@ def run(base_paths: list[tuple[str, Path]], caps: list[tuple[str, Path]], signal
               "captures": []}
     for i, b in enumerate(base):   # the baseline itself must be continuous; its counters vs the other repeats
         others = [d for j, (d, _, _) in enumerate(bdev) if j != i and d is not None]
-        rows = compare(b, [], lim, trim, bdev[i][0], expect_s, bdev[i][1], others, bdev[i][2])
+        rows = compare(b, [], lim, trim, bdev[i][0], expect_s, bdev[i][1], others, bdev[i][2], is_base=True)
         report["captures"].append(summary(b, rows, is_base=True))
     refs = [d for d, _, _ in bdev if d is not None]
     for lb, p in caps:
@@ -901,7 +1150,14 @@ def summary(c: Capture, rows: list[dict], is_base: bool) -> dict:
     q = None
     if c.quiet is not None:
         q = {k: v for k, v in c.quiet.items() if k != "mask"}
-        q["bursts"] = [{k: v for k, v in bu.items() if k not in ("s", "e", "b0", "b1")} for bu in q["bursts"]]
+        q["bursts"] = [{k: v for k, v in bu.items() if k not in ("s", "e", "b0", "b1", "pk")} for bu in q["bursts"]]
+        lf = [bu for bu in q["bursts"] if bu.get("rumble", True)]
+        if lf:   # rumble and a supply-droop thump look alike: only their number and rhythm tell them apart
+            at = ", ".join(f"{bu['t_s']:g}" for bu in lf)
+            q["note"] = (f"{len(lf)} low-frequency burst(s) ({sum(bu['dur_s'] for bu in lf):g} s, at "
+                         f"{at} s) were excluded as rumble. A "
+                         f"supply-droop thump has the same spectrum: if their count or seconds exceed the baseline's "
+                         f"(row '(q) excluded vs baseline'), review them by ear / eye.")
     return {"label": c.label, "file": str(c.path), "baseline": is_base, "samples": c.n, "channels": len(c.ch),
             "seconds": round(c.n / FS, 3), "per_channel": per_ch, "quiet": q, "rows": rows, "verdict": verdict,
             "pass": verdict == "PASS"}
@@ -920,6 +1176,8 @@ def markdown(rep: dict) -> str:
             q = c["quiet"]
             qs = (f"; quiet mode: {q['kept_s']} s kept, {q['excl_s']} s excluded in {len(q['bursts'])} burst(s), "
                   f"quiet block level {', '.join(f'{v:g}' for v in q['quiet_db'])} dBFS")
+            if q.get("note"):
+                qs += f"\n\n> Note: {q['note']}"
         out += [f"## {c['label']} - {c['verdict']}", "",
                 f"{kind}: `{c['file']}`, {c['seconds']} s, {c['channels']} ch, {sig}{qs}", "",
                 "| metric | ch | value | baseline | delta | limit | verdict |", "|---|---|---|---|---|---|---|"]
@@ -1242,7 +1500,7 @@ def self_test() -> int:
         caps = [save("qclean", rumble(_synth(sec, 63), [12.4, 33.3, 60.6], 3, dur_ms=70.0)),
                 save("qcomb", comb_burst(rumble(_synth(sec, 64), [12.4], 4), 45.2, 1.5, -40.0)),
                 save("qhidden", rumble(_synth(sec, 65), [12.4, 30.2], 5, dur_ms=900.0, comb_dbfs=-60.0)),
-                save("qfew", rumble(_synth(sec, 66), [8.3 + 2.5 * i for i in range(24)], 6)),
+                save("qfew", rumble(_synth(sec, 66), [8.3 + 2.5 * i + 0.9 * math.sin(1.7 * i) for i in range(24)], 6)),
                 save("qfloor", rumble(_synth(sec, 67, floor_dbfs=-69.0), [20.5], 7))]
         rep = run(bq, caps[:1], "silence", None, trim, [], None, lim)
         expect("rumble bursts without --quiet-mode -> whole-file metrics fail", rep, "qclean", "FAIL")
@@ -1252,17 +1510,108 @@ def self_test() -> int:
         qc = next(c for c in rep["captures"] if c["label"] == "qclean")
         results.append(("... excluded seconds reported", qc["quiet"]["excl_s"] >= 3 and len(qc["quiet"]["bursts"]) == 3,
                         f"excl {qc['quiet']['excl_s']} s in {len(qc['quiet']['bursts'])} bursts"))
-        results.append(("... rumble classified 40-150 Hz, no comb",
-                        all(not bu["bt_comb"] and bu["peak_hz"] < 160 for bu in qc["quiet"]["bursts"]),
-                        str([(bu["band_hz"], bu["share_800"]) for bu in qc["quiet"]["bursts"]])))
+        results.append(("... rumble classified 40-150 Hz, rumble-shaped, no comb",
+                        all(bu["rumble"] and not bu["bt_comb"] and bu["peak_hz"] < 160 for bu in qc["quiet"]["bursts"]),
+                        str([(bu["band_hz"], bu["share_800"], bu["why"]) for bu in qc["quiet"]["bursts"]])))
+        results.append(("... the low-frequency exclusion note is in the report", "supply-droop" in markdown(rep),
+                        qc["quiet"].get("note", "-")[:60]))
         expect("--quiet-mode: an 800 Hz-comb burst is excluded but FAILS", rep, "qcomb", "FAIL",
                ("(q) excluded bursts on BT comb",), ("(b) spur targets", "(a) noise floor"))
         expect("--quiet-mode: comb lines hidden under rumble -> FAIL", rep, "qhidden", "FAIL",
                ("(q) excluded bursts on BT comb",))
-        expect("--quiet-mode: too few quiet seconds -> INCONCLUSIVE", rep, "qfew", "INCONCLUSIVE",
-               ("(q) quiet seconds kept",))
+        expect("--quiet-mode: too few quiet seconds -> INCONCLUSIVE, far more exclusion than C0 -> FAIL", rep, "qfew",
+               "FAIL", ("(q) quiet seconds kept", "(q) excluded vs baseline"))
+        qf = next(c for c in rep["captures"] if c["label"] == "qfew")
+        results.append(("... with too few quiet seconds (a)-(c) are INCONCLUSIVE, not FAIL",
+                        all(r["verdict"] != "FAIL" for r in qf["rows"] if r["metric"][:3] in ("(a)", "(b)", "(c)")),
+                        str(sorted({r["verdict"] for r in qf["rows"] if r["metric"][:3] in ("(a)", "(b)", "(c)")}))))
         expect("--quiet-mode: +1 dB floor in the quiet seconds still fails", rep, "qfloor", "FAIL",
                ("(a) noise floor",), ("(q) excluded bursts on BT comb",))
+        # what may NOT hide as a 'transient' (the injections that passed before: each must FAIL or be INCONCLUSIVE)
+        def add(x: np.ndarray, t0: float, y: np.ndarray) -> np.ndarray:
+            x[int(t0 * FS):int(t0 * FS) + len(y), :] += y[:, None]
+            return x
+
+        def tones(base_hz: float, ks: list[int], dur_s: float, dbfs: float) -> np.ndarray:
+            tt = np.arange(int(dur_s * FS)) / FS
+            return sum(10 ** (dbfs / 20.0) * math.sqrt(2) * np.sin(2 * np.pi * base_hz * k_ * tt + k_) for k_ in ks)
+
+        def thumps(x: np.ndarray, times: list[float], seed: int) -> np.ndarray:
+            """Supply-droop-like thumps: 10-80 Hz, 300 ms Hann, +20 dB over the floor - shaped like rumble."""
+            rng = np.random.default_rng(seed)
+            m = int(0.3 * FS)
+            for t0 in times:
+                add(x, t0, _band_noise(rng, m, 10.0, 80.0, -50.0) * np.hanning(m))
+            return x
+
+        rng_i = np.random.default_rng(81)
+        x = rumble(_synth(sec, 81), [12.4], 21)
+        for t0 in (19.1, 31.6, 38.2, 52.9, 61.0):
+            x[int(t0 * FS):int(t0 * FS) + 5, :] += 0.2
+        inj = [save("qclicks", x)]
+        x = rumble(_synth(sec, 82), [12.4], 22)
+        for t0 in (18.4, 30.2, 47.7, 58.1):
+            add(x, t0, rng_i.standard_normal(FS) * 10 ** ((-70.0 + 12.0) / 20.0))
+        inj.append(save("qhiss", x))
+        x = rumble(_synth(sec, 83), [12.4], 23)
+        for t0 in (25.0, 50.0):
+            add(x, t0, _band_noise(rng_i, FS, 1000.0, 6000.0, -60.0))
+        inj.append(save("qhfhiss", x))
+        x = _synth(sec, 84)
+        t0 = 0.3
+        while int(t0 * FS) + 72 < len(x):      # 4.5 ms (72 samples) +30 dB every 10.24 s
+            add(x, t0, rng_i.standard_normal(72) * 10 ** ((-70.0 + 30.0) / 20.0))
+            t0 += 10.24
+        inj.append(save("qsparse", x))
+        inj.append(save("q266", add(add(rumble(_synth(sec, 85), [12.4], 25), 30.0,
+                                        tones(800.0 / 3.0, [k_ for k_ in range(1, 25) if k_ % 3], 1.5, -70.0)),
+                                    55.0, tones(800.0 / 3.0, [k_ for k_ in range(1, 25) if k_ % 3], 1.5, -70.0))))
+        inj.append(save("q400", add(rumble(_synth(sec, 86), [12.4], 26), 40.0, tones(400.0, list(range(1, 20)), 1.5,
+                                                                                     -70.0))))
+        pat = _band_noise(rng_i, BLOCK, 40.0, 150.0, -45.0)      # one DMA block's worth, repeated: k*7.8125 Hz
+        inj.append(save("qdma", add(_synth(sec, 87), 30.0, np.tile(pat, 16) * np.hanning(16 * BLOCK))))
+        x = rumble(_synth(sec, 88), [12.4], 28)
+        x[int(40.0 * FS):int(42.0 * FS), :] += 0.01                 # a DC step up and back down 2 s later
+        inj.append(save("qstep", x))
+        x = _synth(sec, 89)
+        for t0 in (21.3, 37.9, 55.2):
+            x[int(t0 * FS), :] += 0.02                                 # single-sample spikes, too short to exclude
+        inj.append(save("qkeptclick", x))
+        inj += [save("qthump2", thumps(_synth(sec, 90), [24.6, 49.3], 30)),
+                save("qthumps", thumps(_synth(sec, 91), [9.2, 17.9, 23.1, 34.6, 41.0, 50.3, 62.8], 31)),
+                save("qthumpper", thumps(_synth(sec, 92), [14.0 + 7.68 * i for i in range(4)], 32))]
+        rep = run(bq, inj, "silence", None, trim, [], None, lim, quiet=True)
+        expect("--quiet-mode: 5 clicks (0.2 FS) -> non-rumble", rep, "qclicks", "FAIL",
+               ("(q) non-rumble burst excluded",))
+        expect("--quiet-mode: 4 x 1 s broadband hiss +12 dB -> non-rumble", rep, "qhiss", "FAIL",
+               ("(q) non-rumble burst excluded",))
+        expect("--quiet-mode: 2 x 1 s 1-6 kHz hiss +10 dB -> non-rumble", rep, "qhfhiss", "FAIL",
+               ("(q) non-rumble burst excluded",))
+        expect("--quiet-mode: 4.5 ms +30 dB bursts every 10.24 s -> non-rumble, periodic", rep, "qsparse", "FAIL",
+               ("(q) non-rumble burst excluded", "(q) burst periodicity"))
+        expect("--quiet-mode: k*266.67 Hz comb (no 800 Hz teeth) -> BT comb", rep, "q266", "FAIL",
+               ("(q) excluded bursts on BT comb",))
+        expect("--quiet-mode: k*400 Hz comb -> BT comb", rep, "q400", "FAIL", ("(q) excluded bursts on BT comb",))
+        expect("--quiet-mode: 128 ms periodic low-band burst (k*7.8125 Hz) -> BT comb", rep, "qdma", "FAIL",
+               ("(q) excluded bursts on BT comb",))
+        expect("--quiet-mode: 0.01 FS DC step (+43 dB sample step) -> click", rep, "qstep", "FAIL",
+               ("(q) non-rumble burst excluded",), ("(q) excluded bursts on BT comb",))
+        expect("--quiet-mode: single-sample spikes in the kept seconds", rep, "qkeptclick", "FAIL",
+               ("(q) clicks in kept seconds",))
+        expect("--quiet-mode: 2 low-frequency thumps (within the baseline's count) PASS, with the note", rep,
+               "qthump2", "PASS")
+        expect("--quiet-mode: 7 low-frequency thumps (more than the baseline) -> FAIL", rep, "qthumps", "FAIL",
+               ("(q) excluded vs baseline",), ("(q) non-rumble burst excluded",))
+        expect("--quiet-mode: 4 thumps every 7.68 s -> periodic", rep, "qthumpper", "FAIL", ("(q) burst periodicity",),
+               ("(q) non-rumble burst excluded",))
+        # baselines that disagree on their exclusion: exceeding the bar is INCONCLUSIVE, not FAIL
+        bqn = [bq[0], save("Q0n", rumble(_synth(sec, 93), [14.1, 29.3, 41.2, 55.9], 33, dur_ms=1500.0))]
+        rep = run(bqn, [("qthumps", d / "qthumps.wav")], "silence", None, trim, [], None, lim, quiet=True)
+        c_ = next(c for c in rep["captures"] if c["label"] == "qthumps")
+        r_ = next(r for r in c_["rows"] if r["metric"] == "(q) excluded vs baseline")
+        results.append(("noisy baseline (exclusion spread > 5 s): exceeding it -> INCONCLUSIVE",
+                        r_["verdict"] == "INCONCLUSIVE" and c_["verdict"] != "PASS", f"{r_['verdict']} {r_['limit']}"))
+        json.dumps(rep)
         # tone captures: (d) uses the kept seconds only
         bqt = [save("QT0a", rumble(_synth(sec, 71, tone), [15.3], 11)),
                save("QT0b", rumble(_synth(sec, 72, tone), [41.7], 12))]
