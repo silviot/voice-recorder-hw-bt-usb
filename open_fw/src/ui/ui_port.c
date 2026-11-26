@@ -176,8 +176,27 @@ void ui_port_task_handler(void)
     if (!s_port_inited) {
         return;
     }
-    if (s_tr_active) tr_advance(tr_target(lv_tick_get()));
-    lv_timer_handler();
+    bool was_tr = s_tr_active;
+    if (was_tr) {
+        tr_advance(tr_target(lv_tick_get()));
+    }
+    if (!was_tr || lv_anim_count_running() > 0u) {
+        lv_timer_handler();
+    }
+}
+
+uint32_t ui_port_anim_period_ms(void)
+{
+    if (!s_port_inited) {
+        return 0u;
+    }
+    if (s_tr_active) {
+        return 4u; /* 250 Hz hardware-scroll push steps from zero-wait SRAM */
+    }
+    if (lv_anim_count_running() > 0u) {
+        return 16u; /* 60 Hz panel refresh parity */
+    }
+    return 0u;
 }
 
 int ui_port_is_animating(void)

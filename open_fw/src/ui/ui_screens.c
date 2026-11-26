@@ -1564,6 +1564,7 @@ static void bind_about(const ui_model_t *m)
     set_changed_text(objects.about_title, BOARD_FW_TITLE_STR);
     set_changed_text_color(objects.about_title, lv_color_hex(UI_HEX_TEXT));
     if (lv_label_get_long_mode(objects.about_storage) != LV_LABEL_LONG_WRAP) {
+        lv_obj_set_user_data(objects.about_storage, NULL);
         lv_label_set_long_mode(objects.about_storage, LV_LABEL_LONG_WRAP);
     }
     uint32_t gb10 = (m->sd_total_mb * 10u) / 1024u;
@@ -1595,8 +1596,9 @@ static void bind_hsprobe(const ui_model_t *m)
         set_changed_text_color(objects.about_title, lv_color_hex(UI_HEX_TEXT));
     }
     set_changed_text(objects.about_title, t1);
-    if (lv_label_get_long_mode(objects.about_storage) != LV_LABEL_LONG_SCROLL_CIRCULAR) {
-        lv_label_set_long_mode(objects.about_storage, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    if (lv_label_get_long_mode(objects.about_storage) != LV_LABEL_LONG_DOT) {
+        lv_obj_set_user_data(objects.about_storage, NULL);
+        lv_label_set_long_mode(objects.about_storage, LV_LABEL_LONG_DOT);
     }
     set_changed_text(objects.about_storage, ui_tr(UI_STR_HSP_HINT));
     /* TODO(i18n): plug state words */

@@ -58,6 +58,8 @@ SECTIONS
             *lv_font_fmt_txt.o
             *lv_style.o
             *lv_tlsf.o
+            *lv_tick.o
+            *lv_timer.o
             *libbt_port.a:hp_sink.o
             *libbluedroid.a:sbc_analysis.o
             *libbluedroid.a:sbc_dct.o
@@ -87,6 +89,8 @@ SECTIONS
         *lv_font_fmt_txt.o(.text .text.*)
         *lv_style.o(.text .text.*)
         *lv_tlsf.o(.text .text.*)
+        *lv_tick.o(.text .text.*)
+        *lv_timer.o(.text .text.*)
         . = ALIGN(4);
         /* BT=1: Bluedroid/port/libc initialised data goes to .bt_data instead (main SRAM is nearly full) */
         *(EXCLUDE_FILE(*libbluedroid.a:* *libbt_port.a:* *libc.a:* *libclang_rt_min.a:*) .data .data.*)

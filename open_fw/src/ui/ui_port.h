@@ -40,6 +40,9 @@ bool ui_transition_busy(void);
 /* Returns non-zero while an LVGL animation is actively running. */
 int ui_port_is_animating(void);
 
+/* Required wake interval in ms when animating (4 ms during SRAM push, 16 ms during LVGL anims, 0 when idle). */
+uint32_t ui_port_anim_period_ms(void);
+
 /* Force an immediate synchronous display refresh (used by screen switches & tests). */
 void ui_port_render_now(void);
 

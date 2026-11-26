@@ -1213,6 +1213,7 @@ int main(int argc, char **argv)
         m.hsp_prompt = 2; m.hsp_phase = 2;
         ui_render_screen(UI_SCR_HSPROBE, &m);
         capture_shot(0);
+        assert(!ui_port_is_animating());
         {
             int amber = 0;
             for (int y = 14; y < 34; y++)

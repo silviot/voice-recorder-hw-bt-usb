@@ -64,11 +64,13 @@ volatile uint32_t g_ui_heap_used      = 0u;
 static uint32_t       g_cpu1_stack[CPU1_STACK_WORDS] __attribute__((aligned(8)));
 static cpu1_ui_slot_t s_slots[2] OPENFW_SRAM_HI;
 
-static volatile uint32_t s_req_word          = 0u;    /* (seq << 1) | slot_idx */
-static volatile uint32_t s_ack_seq           = 0u;
-static volatile uint32_t s_cpu1_reading_slot = 0xFFu; /* 0, 1, or 0xFF (idle) */
-static volatile uint32_t s_cpu1_animating    = 0u;
-static volatile uint32_t s_cpu1_stop_req     = 0u;
+static volatile uint32_t s_req_word             = 0u;    /* (seq << 1) | slot_idx */
+static volatile uint32_t s_ack_seq              = 0u;
+static volatile uint32_t s_cpu1_reading_slot    = 0xFFu; /* 0, 1, or 0xFF (idle) */
+static volatile uint32_t s_cpu1_anim_period_ms  = 0u;    /* 0 = static, 4 = push, 16 = LVGL anim */
+static uint32_t          s_cpu1_last_wake_ms    = 0u;
+static volatile uint8_t  s_cpu0_in_mbox         = 0u;
+static volatile uint32_t s_cpu1_stop_req        = 0u;
 static volatile uint32_t s_cpu1_stopped      = 0u;
 static volatile uint32_t s_mbox_probe_done   = 0u;
 static volatile uint8_t  s_spec_reset_pend   = 0u;
@@ -113,8 +115,7 @@ static void cpu1_poison_and_stop(const char *why)
 
 static inline void cpu1_mbox_drain_and_clear(void)
 {
-    while ((MBOX_CH_CNT(0u) & 7u) >= 2u) {
-        (void)MBOX_CH_DATA(0u);
+    while ((MBOX_CH_CNT(0u) & 7u) != 0u) {
         (void)MBOX_CH_DATA(0u);
     }
     MBOX_CPU1_IRQ_STAT = 0x01u;
@@ -123,7 +124,29 @@ static inline void cpu1_mbox_drain_and_clear(void)
 
 static inline void cpu1_ring_mbox(void)
 {
+    s_cpu0_in_mbox = 1u;
+    __asm__ volatile ("" ::: "memory");
     if ((MBOX_CH_CNT(0u) & 7u) <= 2u) {
+        MBOX_CH_DATA(0u) = 1u;
+        MBOX_CH_DATA(0u) = 1u;
+        OPENFW_DSB();
+    }
+    __asm__ volatile ("" ::: "memory");
+    s_cpu0_in_mbox = 0u;
+}
+
+OPENFW_FASTFUNC void cpu1_ui_systick_tick(uint32_t now_ms)
+{
+    uint32_t period = s_cpu1_anim_period_ms;
+    if (period == 0u || s_cpu1_active == 0u || s_cpu1_stop_req != 0u ||
+        s_cpu1_stopped != 0u || g_cpu1_wfe_ok == 0u) {
+        return;
+    }
+    if ((uint32_t)(now_ms - s_cpu1_last_wake_ms) < period) {
+        return;
+    }
+    s_cpu1_last_wake_ms = now_ms;
+    if (s_cpu0_in_mbox == 0u && (MBOX_CH_CNT(0u) & 7u) == 0u) {
         MBOX_CH_DATA(0u) = 1u;
         MBOX_CH_DATA(0u) = 1u;
         OPENFW_DSB();
@@ -164,10 +187,10 @@ static void cpu1_fault_c(const uint32_t *frame, uint32_t ipsr)
         faddr <= (uint32_t)(uintptr_t)&g_cpu1_stack[CPU1_STACK_WORDS] - 28u) {
         pc = frame[6];
     }
-    g_cpu1_fault_pc     = pc;
-    g_cpu1_fault_cfsr   = SCB_CFSR;
-    s_cpu1_animating    = 0u;
-    s_cpu1_reading_slot = 0xFFu;
+    g_cpu1_fault_pc       = pc;
+    g_cpu1_fault_cfsr     = SCB_CFSR;
+    s_cpu1_anim_period_ms = 0u;
+    s_cpu1_reading_slot   = 0xFFu;
     g_cpu1_faulted      = 1u;
     s_cpu1_stopped      = 1u;
     OPENFW_DSB();
@@ -197,10 +220,10 @@ void openfw_lv_assert_handler(const char *file, int line)
 {
     __asm__ volatile ("cpsid i" ::: "memory");
     if (SCB_VTOR == (uint32_t)(uintptr_t)g_cpu1_isr_vector) {
-        g_cpu1_fault_pc     = (uint32_t)(uintptr_t)file;
-        g_cpu1_fault_cfsr   = 0x4C560000u | ((uint32_t)line & 0xFFFFu);
-        s_cpu1_animating    = 0u;
-        s_cpu1_reading_slot = 0xFFu;
+        g_cpu1_fault_pc       = (uint32_t)(uintptr_t)file;
+        g_cpu1_fault_cfsr     = 0x4C560000u | ((uint32_t)line & 0xFFFFu);
+        s_cpu1_anim_period_ms = 0u;
+        s_cpu1_reading_slot   = 0xFFu;
         g_cpu1_faulted      = 2u;
         s_cpu1_stopped      = 1u;
         OPENFW_DSB();
@@ -281,9 +304,9 @@ static void cpu1_entry_c(void)
 
     while (1) {
         if (s_cpu1_stop_req != 0u) {
-            s_cpu1_animating    = 0u;
-            s_cpu1_reading_slot = 0xFFu;
-            s_cpu1_stopped      = 1u;
+            s_cpu1_anim_period_ms = 0u;
+            s_cpu1_reading_slot   = 0xFFu;
+            s_cpu1_stopped        = 1u;
             OPENFW_DSB();
             /* Halt completely bus-silent (IRQs are masked) before CPU0 asserts reset */
             while (1) {
@@ -328,12 +351,12 @@ static void cpu1_entry_c(void)
             }
             if (cpu1_canary_corrupt()) {
                 __asm__ volatile ("cpsid i" ::: "memory");
-                g_cpu1_fault_pc     = 0xDEAD57ACu;
-                g_cpu1_fault_cfsr   = 0x57AC0000u;
-                s_cpu1_animating    = 0u;
-                s_cpu1_reading_slot = 0xFFu;
-                g_cpu1_faulted      = 3u;
-                s_cpu1_stopped      = 1u;
+                g_cpu1_fault_pc       = 0xDEAD57ACu;
+                g_cpu1_fault_cfsr     = 0x57AC0000u;
+                s_cpu1_anim_period_ms = 0u;
+                s_cpu1_reading_slot   = 0xFFu;
+                g_cpu1_faulted        = 3u;
+                s_cpu1_stopped        = 1u;
                 OPENFW_DSB();
                 while (1) {
                     __asm__ volatile ("wfi" ::: "memory");
@@ -350,7 +373,7 @@ static void cpu1_entry_c(void)
                 lv_mem_monitor(&mon);
                 g_ui_heap_used = (uint32_t)(mon.total_size - mon.free_size);
             }
-            s_cpu1_animating = (uint32_t)ui_port_is_animating();
+            s_cpu1_anim_period_ms = ui_port_anim_period_ms();
 
             OPENFW_DSB();
             s_ack_seq           = seq;
@@ -360,11 +383,37 @@ static void cpu1_entry_c(void)
             continue;
         }
 
-        if (!s_cpu1_animating && g_cpu1_wfe_ok != 0u) {
+        uint32_t anim_period = s_cpu1_anim_period_ms;
+        uint32_t now_ms      = millis();
+        uint32_t tick_gap    = (anim_period != 0u) ? anim_period : 100u;
+        if ((anim_period != 0u || g_cpu1_wfe_ok == 0u) &&
+            (uint32_t)(now_ms - last_tick_ms) >= tick_gap) {
+            last_tick_ms = now_ms;
+            ui_port_task_handler();
+            if (cpu1_canary_corrupt()) {
+                __asm__ volatile ("cpsid i" ::: "memory");
+                g_cpu1_fault_pc       = 0xDEAD57ACu;
+                g_cpu1_fault_cfsr     = 0x57AC0001u;
+                s_cpu1_anim_period_ms = 0u;
+                s_cpu1_reading_slot   = 0xFFu;
+                g_cpu1_faulted        = 3u;
+                s_cpu1_stopped        = 1u;
+                OPENFW_DSB();
+                while (1) {
+                    __asm__ volatile ("wfi" ::: "memory");
+                }
+            }
+            s_cpu1_anim_period_ms = ui_port_anim_period_ms();
+            continue;
+        }
+
+        if (g_cpu1_wfe_ok != 0u) {
             /* True zero-power Cortex-M4 WFE sleep woken in <1 us by CPU0 IPC Mailbox ch0 */
             cpu1_mbox_drain_and_clear();
             OPENFW_DSB();
-            if ((s_req_word >> 1) != s_ack_seq || s_cpu1_stop_req != 0u) {
+            if ((s_req_word >> 1) != s_ack_seq || s_cpu1_stop_req != 0u ||
+                (s_cpu1_anim_period_ms != 0u &&
+                 (uint32_t)(millis() - last_tick_ms) >= s_cpu1_anim_period_ms)) {
                 continue;
             }
             __asm__ volatile ("wfe" ::: "memory");
@@ -372,28 +421,8 @@ static void cpu1_entry_c(void)
             continue;
         }
 
-        uint32_t now_ms   = millis();
-        uint32_t tick_gap = s_cpu1_animating ? 1u : 100u;
-        if ((uint32_t)(now_ms - last_tick_ms) >= tick_gap) {
-            last_tick_ms = now_ms;
-            ui_port_task_handler();
-            if (cpu1_canary_corrupt()) {
-                __asm__ volatile ("cpsid i" ::: "memory");
-                g_cpu1_fault_pc     = 0xDEAD57ACu;
-                g_cpu1_fault_cfsr   = 0x57AC0001u;
-                s_cpu1_animating    = 0u;
-                s_cpu1_reading_slot = 0xFFu;
-                g_cpu1_faulted      = 3u;
-                s_cpu1_stopped      = 1u;
-                OPENFW_DSB();
-                while (1) {
-                    __asm__ volatile ("wfi" ::: "memory");
-                }
-            }
-            s_cpu1_animating = (uint32_t)ui_port_is_animating();
-        } else {
-            /* Keep SRAM bus nearly idle when static (~10 us wake latency) and light during anims */
-            uint32_t nops = s_cpu1_animating ? 64u : 1024u;
+        {
+            uint32_t nops = (anim_period != 0u) ? 64u : 1024u;
             for (volatile uint32_t d = 0u; d < nops; d++) {
                 OPENFW_NOP();
             }
@@ -536,9 +565,11 @@ int cpu1_ui_start(void)
     g_cpu1_wfe_ok       = 0u;
     s_req_word          = 0u;
     s_ack_seq           = 0u;
-    s_cpu1_reading_slot = 0xFFu;
-    s_cpu1_animating    = 0u;
-    s_cpu1_stop_req     = 0u;
+    s_cpu1_reading_slot   = 0xFFu;
+    s_cpu1_anim_period_ms = 0u;
+    s_cpu1_last_wake_ms   = 0u;
+    s_cpu0_in_mbox        = 0u;
+    s_cpu1_stop_req       = 0u;
     s_cpu1_stopped      = 0u;
     s_mbox_probe_done   = 0u;
     s_last_seq          = 0u;
@@ -604,9 +635,9 @@ void cpu1_ui_stop(void)
             OPENFW_NOP();
         }
         int unclean = (s_cpu1_stopped == 0u || g_cpu1_faulted != 0u || cpu1_canary_corrupt());
-        s_cpu1_active       = 0u;
-        s_cpu1_animating    = 0u;
-        s_cpu1_reading_slot = 0xFFu;
+        s_cpu1_active         = 0u;
+        s_cpu1_anim_period_ms = 0u;
+        s_cpu1_reading_slot   = 0xFFu;
         if (unclean) {
             s_lvgl_poisoned = 1u;
             cpu1_log_poison("unclean stop");
@@ -766,7 +797,7 @@ void ui_dispatch_tick(void)
 int ui_dispatch_is_animating(void)
 {
     if (cpu1_ui_is_active()) {
-        return (s_cpu1_animating != 0u || s_ack_seq != (s_req_word >> 1)) ? 1 : 0;
+        return (s_cpu1_anim_period_ms != 0u || s_ack_seq != (s_req_word >> 1)) ? 1 : 0;
     }
     if (s_lvgl_poisoned != 0u) {
         return 0;
@@ -781,6 +812,7 @@ void cpu1_ui_stop(void)                  { }
 int cpu1_ui_is_active(void)              { return 0; }
 int cpu1_ui_wfe_active(void)             { return 0; }
 void cpu1_ui_sync(uint32_t timeout_ms)   { (void)timeout_ms; }
+void cpu1_ui_systick_tick(uint32_t now_ms) { (void)now_ms; }
 
 void ui_render_screen(ui_screen_id_t scr, const ui_model_t *m)
 {

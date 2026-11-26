@@ -12,6 +12,7 @@
 
 #include "openfw_apmem.h"
 #include "openfw_bt_ui_pace.h"
+#include "openfw_power_policy.h"
 #include "openfw_crypto.h"
 #include "openfw_cwx.h"
 #include "openfw_fs.h"
@@ -3481,6 +3482,38 @@ static void test_bt_ui_pace(void)
     assert(!bt_ui_render_ok(0, 1, 1));
 }
 
+/* Regression test: SysTick key edge stamped after loop-top timestamp (key_ms > now_ms) must never underflow. */
+static void test_auto_poweroff_policy(void)
+{
+    printf("Testing auto power-off wrap-safe idle policy...\n");
+
+    /* 1. key_ms newer than now_ms (SysTick preempted loop before auto_poweroff_poll): clamps to 0, never shuts off */
+    assert(openfw_idle_elapsed_ms(10000u, 9000u, 1, 10001u) == 0u);
+    assert(openfw_idle_elapsed_ms(10000u, 9000u, 1, 10025u) == 0u);
+    assert(openfw_idle_elapsed_ms(10000u, 9000u, 1, 15000u) == 0u);
+    assert(openfw_auto_poweroff_due(300000u, 10000u, 9000u, 1, 10001u) == 0);
+    assert(openfw_auto_poweroff_due(120000u, 10000u, 9000u, 1, 10500u) == 0);
+
+    /* 2. last_activity_ms newer than now_ms (e.g. RTOS/wake update): clamps to 0 */
+    assert(openfw_idle_elapsed_ms(10000u, 10005u, 0, 0u) == 0u);
+    assert(openfw_auto_poweroff_due(300000u, 10000u, 10005u, 0, 0u) == 0);
+
+    /* 3. Genuine timeout without newer key edge */
+    assert(openfw_idle_elapsed_ms(309999u, 10000u, 1, 5000u) == 299999u);
+    assert(openfw_auto_poweroff_due(300000u, 309999u, 10000u, 1, 5000u) == 0);
+    assert(openfw_idle_elapsed_ms(310000u, 10000u, 1, 5000u) == 300000u);
+    assert(openfw_auto_poweroff_due(300000u, 310000u, 10000u, 1, 5000u) == 1);
+
+    /* 4. 32-bit millis() wraparound (0xFFFFFFFF -> 0x00000000) */
+    assert(openfw_idle_elapsed_ms(0xFFFFFFFEu, 0xFFFFF000u, 1, 0x00000003u) == 0u);
+    assert(openfw_auto_poweroff_due(300000u, 0xFFFFFFFEu, 0xFFFFF000u, 1, 0x00000003u) == 0);
+    assert(openfw_auto_poweroff_due(300000u, 0xFFFFFF00u + 299999u, 0xFFFFFF00u, 0, 0u) == 0);
+    assert(openfw_auto_poweroff_due(300000u, 0xFFFFFF00u + 300000u, 0xFFFFFF00u, 0, 0u) == 1);
+
+    /* 5. limit_ms == 0 ("Off") never fires regardless of idle elapsed time */
+    assert(openfw_auto_poweroff_due(0u, 9000000u, 0u, 0, 0u) == 0);
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 3 && strcmp(argv[1], "--exfat-img") == 0) {
@@ -3509,6 +3542,7 @@ int main(int argc, char **argv)
     test_xrec_flow_control();
     test_xrec_session();
     test_bt_ui_pace();
+    test_auto_poweroff_policy();
     printf("All open_fw host unit tests PASSED!\n");
     return 0;
 }

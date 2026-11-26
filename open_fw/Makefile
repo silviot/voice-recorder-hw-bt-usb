@@ -222,7 +222,7 @@ $(BUILD_DIR)/lvgl_host/%.o: $(LVGL_DIR)/%.c include/lv_conf.h include/board_conf
 $(BUILD_DIR)/liblvgl_host.a: $(LVGL_HOST_OBJS)
 	$(AR) rcs $@ $^
 
-$(BUILD_DIR)/main.o: src/main.c $(SPLASH_HDR) $(CONFIG_STAMP) include/sl6801_regs.h include/openfw.h include/openfw_ui.h include/openfw_i18n.h include/openfw_i18n_bt.h include/openfw_exp.h include/openfw_player.h include/openfw_apmem.h include/openfw_hsprobe.h include/board_config.h src/ui/ui_port.h | $(BUILD_DIR)
+$(BUILD_DIR)/main.o: src/main.c $(SPLASH_HDR) $(CONFIG_STAMP) include/sl6801_regs.h include/openfw.h include/openfw_ui.h include/openfw_i18n.h include/openfw_i18n_bt.h include/openfw_power_policy.h include/openfw_exp.h include/openfw_player.h include/openfw_apmem.h include/openfw_hsprobe.h include/board_config.h src/ui/ui_port.h | $(BUILD_DIR)
 	$(CLANG) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/%.o: src/%.c $(CONFIG_STAMP) include/sl6801_regs.h include/sl6801_rom.h include/openfw.h include/openfw_ui.h include/openfw_i18n.h include/openfw_i18n_bt.h include/audio_dsp.h include/openfw_exp.h include/openfw_crypto.h include/openfw_wav.h include/openfw_cwx.h include/openfw_player.h include/openfw_apmem.h include/openfw_fs.h include/openfw_usb_msc.h include/openfw_xrec.h include/openfw_hsprobe.h include/board_config.h include/lv_conf.h | $(BUILD_DIR)
@@ -251,7 +251,7 @@ $(BUILD_DIR)/xip.bin: $(BUILD_DIR)/open_fw.elf
 $(BUILD_DIR)/open_fw_firm.bin: $(BUILD_DIR)/ram_boot.bin $(BUILD_DIR)/xip.bin tools/pack_firm.py
 	python3 tools/pack_firm.py --ram-boot $(BUILD_DIR)/ram_boot.bin --xip $(BUILD_DIR)/xip.bin --out-firm $@
 
-test-host: $(LVGL_DIR)/lvgl.h $(BUILD_DIR)/liblvgl_host.a tests/test_core.c tests/test_xrec_rec.c src/bench_meas.c src/crypto.c src/wav.c src/cwx.c src/exfat.c src/persist.c src/apmem.c src/usb_scsi.c src/xrec_proto.c | $(BUILD_DIR)
+test-host: $(LVGL_DIR)/lvgl.h $(BUILD_DIR)/liblvgl_host.a tests/test_core.c include/openfw_power_policy.h tests/test_xrec_rec.c src/bench_meas.c src/crypto.c src/wav.c src/cwx.c src/exfat.c src/persist.c src/apmem.c src/usb_scsi.c src/xrec_proto.c | $(BUILD_DIR)
 	$(HOST_CC) $(HOST_CFLAGS) tests/test_core.c src/crypto.c src/wav.c src/cwx.c src/exfat.c src/persist.c src/apmem.c src/usb_scsi.c src/xrec_proto.c -o $(BUILD_DIR)/test_core
 	$(BUILD_DIR)/test_core
 	dd if=/dev/zero of=$(BUILD_DIR)/test_exfat.img bs=512 count=4096 status=none

@@ -154,7 +154,7 @@ void system_reboot(void)
 #endif
 }
 
-uint64_t us_timer_now(void)
+OPENFW_FASTFUNC uint64_t us_timer_now(void)
 {
     /* Lock-free 64-bit counter read (re-read hi if lo wrapped) */
     uint32_t hi1, lo, hi2;
@@ -202,7 +202,7 @@ void systick_init(uint32_t cpu_hz)
     openfw_mmio_wr32(SYSTICK_CSR_ADDR, 0x7u); /* CLKSOURCE=CPU | TICKINT | ENABLE */
 }
 
-uint32_t millis(void)
+OPENFW_FASTFUNC uint32_t millis(void)
 {
     return g_systick_ms;
 }

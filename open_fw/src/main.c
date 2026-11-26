@@ -23,6 +23,7 @@
 #include "openfw.h"
 #include "openfw_ui.h"
 #include "openfw_bt_ui_pace.h"            /* BT phone-mode screen pacing (pure, host-tested in test_core) */
+#include "openfw_power_policy.h"
 #include "ui/ui_port.h"
 #include "openfw_exp.h"
 #include "openfw_wav.h"
@@ -3173,7 +3174,7 @@ static void bt_bg_poll(uint32_t now_ms, int rec_active, int usb_busy, int bench_
     }
 }
 
-static void auto_poweroff_poll(ui_screen_id_t scr, uint32_t now_ms, int rec_active, int bench_active)
+static void auto_poweroff_poll(ui_screen_id_t scr, int rec_active, int bench_active)
 {
     if (g_poweroff_after_sync && !g_bt_bg.active && !rec_active) {
         openfw_log_puts("Deferred power-off: background sync finished\n");
@@ -3183,30 +3184,34 @@ static void auto_poweroff_poll(ui_screen_id_t scr, uint32_t now_ms, int rec_acti
     static const uint32_t k_auto_off_ms[4] = { 0u, 120000u, 300000u, 900000u };
     uint8_t idx = g_phone_cfg.auto_off_idx <= 3u ? g_phone_cfg.auto_off_idx : 2u;
     uint32_t limit_ms = k_auto_off_ms[idx];
-    if (limit_ms == 0u || bench_active || rec_active || recorder_is_saving() ||
-        keys_read_rec_switch() || vbus_present_cached(now_ms) || g_bt_bg.active) {
-        return;
-    }
-    if (bt_hp_active()) {
+    uint32_t fresh_now = millis();
+    int inhibited = bench_active || rec_active || recorder_is_saving() ||
+                    keys_read_rec_switch() || vbus_present_cached(fresh_now) || g_bt_bg.active;
+    if (!inhibited && bt_hp_active()) {
         bt_hp_ui_t hu;
         bt_hp_get_ui(&hu);
         if (hu.scanning || hu.pairing || hu.link == BT_HP_LINK_CONNECTING ||
             hu.link == BT_HP_LINK_OPEN || hu.link == BT_HP_LINK_STARTED) {
-            return;
+            inhibited = 1;
         }
     }
-    uint32_t last = g_last_activity_ms;
-    uint32_t key_ms;
-    if (keys_last_activity(&key_ms) && (int32_t)(key_ms - last) > 0) {
-        last = key_ms;
+    if (inhibited) {
+        /* Keep idle window fresh while on USB, recording, or active BT so unplugging/finishing starts cleanly. */
+        g_last_activity_ms = fresh_now;
+        return;
     }
-    if ((uint32_t)(now_ms - last) >= limit_ms) {
+    if (limit_ms == 0u) {
+        return;
+    }
+    uint32_t key_ms = 0u;
+    int has_key = keys_last_activity(&key_ms);
+    uint32_t check_now = millis();
+    if (openfw_auto_poweroff_due(limit_ms, check_now, g_last_activity_ms, has_key, key_ms)) {
         openfw_log_puts("Auto power-off: idle timeout reached\n");
         perform_clean_poweroff(scr);
     }
 #else
     (void)scr;
-    (void)now_ms;
     (void)rec_active;
     (void)bench_active;
 #endif
@@ -4146,7 +4151,8 @@ int openfw_main(void)
             prev_vbus   = vbus_present_cached(now_ms);
             usb_probing = 0;
 
-            if (!g_screen_off && (uint32_t)(now_ms - last_spec_ms) >= 50u) {
+            /* 12.5 Hz live spectrogram (~11.5 s scrolling waterfall) + VU/clip updates */
+            if (!g_screen_off && (uint32_t)(now_ms - last_spec_ms) >= 80u) {
                 last_spec_ms = now_ms;
                 int16_t pcm_peek[UI_SPEC_FFT_N * 2u];
                 uint8_t ch = g_ui.cfg.channels;
@@ -4294,7 +4300,7 @@ int openfw_main(void)
 #if OPENFW_BT_BENCH
             bench_active = bench_home;
 #endif
-            auto_poweroff_poll(scr, now_ms, rec_active, bench_active);
+            auto_poweroff_poll(scr, rec_active, bench_active);
         }
 #endif
 
@@ -4387,6 +4393,7 @@ int openfw_main(void)
 #else
                                 run_bt_unavailable(); /* BT=0, HCI probe */
 #endif
+                                backlight_note_activity(millis());
                                 g_ui_screen = (uint32_t)scr;
                                 dirty       = 1;
                                 modal_done  = 1;
