@@ -58,6 +58,8 @@ static const char *const k_bt_strings[UI_LANG_COUNT][UI_BT_STR_COUNT] = {
         [UI_BT_STR_DESC_AUTO_SYNC]       = "Auto-sync with phone app",
         [UI_BT_STR_AUTO_OFF]             = "Auto off",
         [UI_BT_STR_DESC_AUTO_OFF]        = "Power off when idle",
+        [UI_BT_STR_TRANSCRIBING]         = "Transcribing…",
+        [UI_BT_STR_IN_QUEUE_FMT]         = "In queue: %u",
     },
     [UI_LANG_IT] = {
         [UI_BT_STR_PAIR_Q_FMT]           = "Associare? %u s",
@@ -103,6 +105,8 @@ static const char *const k_bt_strings[UI_LANG_COUNT][UI_BT_STR_COUNT] = {
         [UI_BT_STR_HP_NOT_CONNECTED]     = "Cuffie non connesse",
         [UI_BT_STR_HP_PAUSED]            = "Cuffie in pausa",
         [UI_BT_STR_LOWBATT_BT_OFF]       = "Batteria bassa: BT off",
+        [UI_BT_STR_TRANSCRIBING]         = "Trascrizione…",
+        [UI_BT_STR_IN_QUEUE_FMT]         = "In coda: %u",
     },
     [UI_LANG_FR] = {
         [UI_BT_STR_PAIR_Q_FMT]           = "Associer ? %u s",
@@ -148,6 +152,8 @@ static const char *const k_bt_strings[UI_LANG_COUNT][UI_BT_STR_COUNT] = {
         [UI_BT_STR_HP_NOT_CONNECTED]     = "Casque non connecté",
         [UI_BT_STR_HP_PAUSED]            = "Casque en pause",
         [UI_BT_STR_LOWBATT_BT_OFF]       = "Batterie faible : BT coupé",
+        [UI_BT_STR_TRANSCRIBING]         = "Transcription…",
+        [UI_BT_STR_IN_QUEUE_FMT]         = "En file : %u",
     },
     [UI_LANG_ES] = {
         [UI_BT_STR_PAIR_Q_FMT]           = "¿Vincular? %u s",
@@ -193,6 +199,8 @@ static const char *const k_bt_strings[UI_LANG_COUNT][UI_BT_STR_COUNT] = {
         [UI_BT_STR_HP_NOT_CONNECTED]     = "Auriculares sin conexión",
         [UI_BT_STR_HP_PAUSED]            = "Auriculares en pausa",
         [UI_BT_STR_LOWBATT_BT_OFF]       = "Batería baja: BT apagado",
+        [UI_BT_STR_TRANSCRIBING]         = "Transcribiendo…",
+        [UI_BT_STR_IN_QUEUE_FMT]         = "En cola: %u",
     },
     [UI_LANG_DE] = {
         [UI_BT_STR_PAIR_Q_FMT]           = "Koppeln? %u s",
@@ -238,6 +246,8 @@ static const char *const k_bt_strings[UI_LANG_COUNT][UI_BT_STR_COUNT] = {
         [UI_BT_STR_HP_NOT_CONNECTED]     = "Kopfhörer fehlt",
         [UI_BT_STR_HP_PAUSED]            = "Kopfhörer pausiert",
         [UI_BT_STR_LOWBATT_BT_OFF]       = "Akku schwach: BT aus",
+        [UI_BT_STR_TRANSCRIBING]         = "Transkribiere…",
+        [UI_BT_STR_IN_QUEUE_FMT]         = "Wartend: %u",
     },
     [UI_LANG_NL] = {
         [UI_BT_STR_PAIR_Q_FMT]           = "Koppelen? %u s",
@@ -283,6 +293,8 @@ static const char *const k_bt_strings[UI_LANG_COUNT][UI_BT_STR_COUNT] = {
         [UI_BT_STR_HP_NOT_CONNECTED]     = "Geen koptelefoon",
         [UI_BT_STR_HP_PAUSED]            = "Koptelefoon gepauzeerd",
         [UI_BT_STR_LOWBATT_BT_OFF]       = "Batterij laag: BT uit",
+        [UI_BT_STR_TRANSCRIBING]         = "Transcriberen…",
+        [UI_BT_STR_IN_QUEUE_FMT]         = "Wachtrij: %u",
     },
     [UI_LANG_DA] = {
         [UI_BT_STR_PAIR_Q_FMT]           = "Parre? %u s",
@@ -328,6 +340,8 @@ static const char *const k_bt_strings[UI_LANG_COUNT][UI_BT_STR_COUNT] = {
         [UI_BT_STR_HP_NOT_CONNECTED]     = "Hovedtlf. ikke forbundet",
         [UI_BT_STR_HP_PAUSED]            = "Hovedtlf. på pause",
         [UI_BT_STR_LOWBATT_BT_OFF]       = "Lavt batteri: BT slukket",
+        [UI_BT_STR_TRANSCRIBING]         = "Transskriberer…",
+        [UI_BT_STR_IN_QUEUE_FMT]         = "I kø: %u",
     },
     [UI_LANG_PL] = {
         [UI_BT_STR_PAIR_Q_FMT]           = "Sparować? %u s",
@@ -373,6 +387,8 @@ static const char *const k_bt_strings[UI_LANG_COUNT][UI_BT_STR_COUNT] = {
         [UI_BT_STR_HP_NOT_CONNECTED]     = "Słuchawki niepołączone",
         [UI_BT_STR_HP_PAUSED]            = "Słuchawki wstrzymane",
         [UI_BT_STR_LOWBATT_BT_OFF]       = "Słaba bateria: BT wył.",
+        [UI_BT_STR_TRANSCRIBING]         = "Transkrypcja…",
+        [UI_BT_STR_IN_QUEUE_FMT]         = "W kolejce: %u",
     },
     [UI_LANG_SK] = {
         [UI_BT_STR_PAIR_Q_FMT]           = "Spárovať? %u s",
@@ -418,6 +434,8 @@ static const char *const k_bt_strings[UI_LANG_COUNT][UI_BT_STR_COUNT] = {
         [UI_BT_STR_HP_NOT_CONNECTED]     = "Slúchadlá nepripojené",
         [UI_BT_STR_HP_PAUSED]            = "Slúchadlá pozastavené",
         [UI_BT_STR_LOWBATT_BT_OFF]       = "Slabá batéria: BT vyp.",
+        [UI_BT_STR_TRANSCRIBING]         = "Prepisujem…",
+        [UI_BT_STR_IN_QUEUE_FMT]         = "V rade: %u",
     },
     [UI_LANG_SL] = {
         [UI_BT_STR_PAIR_Q_FMT]           = "Seznanim? %u s",
@@ -463,6 +481,8 @@ static const char *const k_bt_strings[UI_LANG_COUNT][UI_BT_STR_COUNT] = {
         [UI_BT_STR_HP_NOT_CONNECTED]     = "Slušalke niso povezane",
         [UI_BT_STR_HP_PAUSED]            = "Slušalke na premoru",
         [UI_BT_STR_LOWBATT_BT_OFF]       = "Prazna baterija: BT izkl.",
+        [UI_BT_STR_TRANSCRIBING]         = "Prepisujem…",
+        [UI_BT_STR_IN_QUEUE_FMT]         = "V vrsti: %u",
     },
     [UI_LANG_SV] = {
         [UI_BT_STR_PAIR_Q_FMT]           = "Parkoppla? %u s",
@@ -508,6 +528,8 @@ static const char *const k_bt_strings[UI_LANG_COUNT][UI_BT_STR_COUNT] = {
         [UI_BT_STR_HP_NOT_CONNECTED]     = "Hörlurar inte anslutna",
         [UI_BT_STR_HP_PAUSED]            = "Hörlurar pausade",
         [UI_BT_STR_LOWBATT_BT_OFF]       = "Låg batterinivå: BT av",
+        [UI_BT_STR_TRANSCRIBING]         = "Transkriberar…",
+        [UI_BT_STR_IN_QUEUE_FMT]         = "I kö: %u",
     },
     [UI_LANG_FI] = {
         [UI_BT_STR_PAIR_Q_FMT]           = "Paritetaanko? %u s",
@@ -553,6 +575,8 @@ static const char *const k_bt_strings[UI_LANG_COUNT][UI_BT_STR_COUNT] = {
         [UI_BT_STR_HP_NOT_CONNECTED]     = "Kuulokkeet ei yhteydessä",
         [UI_BT_STR_HP_PAUSED]            = "Kuulokkeet tauolla",
         [UI_BT_STR_LOWBATT_BT_OFF]       = "Akku vähissä: BT pois",
+        [UI_BT_STR_TRANSCRIBING]         = "Litteroidaan…",
+        [UI_BT_STR_IN_QUEUE_FMT]         = "Jonossa: %u",
     },
     [UI_LANG_CS] = {
         [UI_BT_STR_PAIR_Q_FMT]           = "Spárovat? %u s",
@@ -598,6 +622,8 @@ static const char *const k_bt_strings[UI_LANG_COUNT][UI_BT_STR_COUNT] = {
         [UI_BT_STR_HP_NOT_CONNECTED]     = "Sluchátka nepřipojena",
         [UI_BT_STR_HP_PAUSED]            = "Sluchátka pozastavena",
         [UI_BT_STR_LOWBATT_BT_OFF]       = "Slabá baterie: BT vyp.",
+        [UI_BT_STR_TRANSCRIBING]         = "Přepisuji…",
+        [UI_BT_STR_IN_QUEUE_FMT]         = "Ve frontě: %u",
     },
     [UI_LANG_ET] = {
         [UI_BT_STR_PAIR_Q_FMT]           = "Sidumine? %u s",
@@ -643,6 +669,8 @@ static const char *const k_bt_strings[UI_LANG_COUNT][UI_BT_STR_COUNT] = {
         [UI_BT_STR_HP_NOT_CONNECTED]     = "Kõrvaklapid ühenduseta",
         [UI_BT_STR_HP_PAUSED]            = "Kõrvaklapid pausil",
         [UI_BT_STR_LOWBATT_BT_OFF]       = "Aku tühjeneb: BT väljas",
+        [UI_BT_STR_TRANSCRIBING]         = "Transkribeerin…",
+        [UI_BT_STR_IN_QUEUE_FMT]         = "Järjekorras: %u",
     },
     [UI_LANG_HU] = {
         [UI_BT_STR_PAIR_Q_FMT]           = "Párosítás? %u s",
@@ -688,6 +716,8 @@ static const char *const k_bt_strings[UI_LANG_COUNT][UI_BT_STR_COUNT] = {
         [UI_BT_STR_HP_NOT_CONNECTED]     = "Fejhallgató nincs kapcs.",
         [UI_BT_STR_HP_PAUSED]            = "Fejhallgató szünetel",
         [UI_BT_STR_LOWBATT_BT_OFF]       = "Lemerülőben: BT ki",
+        [UI_BT_STR_TRANSCRIBING]         = "Átírás…",
+        [UI_BT_STR_IN_QUEUE_FMT]         = "Sorban: %u",
     },
     [UI_LANG_BG] = {
         [UI_BT_STR_PAIR_Q_FMT]           = "Сдвояване? %u s",
@@ -733,6 +763,8 @@ static const char *const k_bt_strings[UI_LANG_COUNT][UI_BT_STR_COUNT] = {
         [UI_BT_STR_HP_NOT_CONNECTED]     = "Слушалки без връзка",
         [UI_BT_STR_HP_PAUSED]            = "Слушалки на пауза",
         [UI_BT_STR_LOWBATT_BT_OFF]       = "Слаба батерия, без BT",
+        [UI_BT_STR_TRANSCRIBING]         = "Транскрипция…",
+        [UI_BT_STR_IN_QUEUE_FMT]         = "На опашка: %u",
     },
     [UI_LANG_RO] = {
         [UI_BT_STR_PAIR_Q_FMT]           = "Asociez? %u s",
@@ -778,6 +810,8 @@ static const char *const k_bt_strings[UI_LANG_COUNT][UI_BT_STR_COUNT] = {
         [UI_BT_STR_HP_NOT_CONNECTED]     = "Căști neconectate",
         [UI_BT_STR_HP_PAUSED]            = "Căști în pauză",
         [UI_BT_STR_LOWBATT_BT_OFF]       = "Baterie slabă: BT oprit",
+        [UI_BT_STR_TRANSCRIBING]         = "Transcriere…",
+        [UI_BT_STR_IN_QUEUE_FMT]         = "În coadă: %u",
     },
     [UI_LANG_RU] = {
         [UI_BT_STR_PAIR_Q_FMT]           = "Сопряжение? %u s",
@@ -823,6 +857,8 @@ static const char *const k_bt_strings[UI_LANG_COUNT][UI_BT_STR_COUNT] = {
         [UI_BT_STR_HP_NOT_CONNECTED]     = "Наушники без связи",
         [UI_BT_STR_HP_PAUSED]            = "Наушники на паузе",
         [UI_BT_STR_LOWBATT_BT_OFF]       = "Батарея села: BT выкл.",
+        [UI_BT_STR_TRANSCRIBING]         = "Транскрипция…",
+        [UI_BT_STR_IN_QUEUE_FMT]         = "В очереди: %u",
     },
 };
 

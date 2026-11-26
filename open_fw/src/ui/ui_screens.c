@@ -440,6 +440,25 @@ static void home_scroll_event(lv_event_t *event)
     }
 }
 
+/* "1.2 / 7.5 MB" (one unit when both sizes share it), "512 KB / 7.5 MB", or just "12 KB" when the total is unknown. */
+static void bt_xfer_sizes(char *dst, int cap, uint32_t done, uint32_t total)
+{
+    char ds[16], ts[16];
+    ui_format_bytes_short(ds, (int)sizeof(ds), done);
+    if (total == 0u) {
+        lv_snprintf(dst, (uint32_t)cap, "%s", ds);
+        return;
+    }
+    ui_format_bytes_short(ts, (int)sizeof(ts), total);
+    int du = 0, tu = 0;                       /* the unit: after the last space */
+    for (int i = 0; ds[i] != '\0'; i++) if (ds[i] == ' ') du = i;
+    for (int i = 0; ts[i] != '\0'; i++) if (ts[i] == ' ') tu = i;
+    if (du > 0 && tu > 0 && lv_strcmp(&ds[du], &ts[tu]) == 0) {
+        ds[du] = '\0';
+    }
+    lv_snprintf(dst, (uint32_t)cap, "%s / %s", ds, ts);
+}
+
 static void bind_home_detail(const ui_model_t *m, unsigned page, lv_obj_t *title, lv_obj_t *detail)
 {
     char l1[64] = "", l2[64] = "";
@@ -477,15 +496,30 @@ static void bind_home_detail(const ui_model_t *m, unsigned page, lv_obj_t *title
                     sound_mode_name(m->cfg.sound_mode));
         lv_snprintf(l2, sizeof(l2), "%s", ui_tr(m->cfg.vor_enabled ? UI_STR_VOR_ON : UI_STR_VOR_OFF));
     } else {
-        lv_snprintf(l1, sizeof(l1), "%s", ui_tr(UI_STR_BT_FILE_SYNC));
 #if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID
-        if (m->bt_bg_syncing) {
+        if (m->bt_bg_state == UI_BT_BG_XFER) {
+            lv_snprintf(l1, sizeof(l1), "%s %s", m->bt_xfer_up ? "\xE2\x96\xB2" : "\xE2\x96\xBC", m->bt_xfer_name);
+            col1 = m->bt_xfer_up ? UI_HEX_AMBER : UI_HEX_CYAN;
+            bt_xfer_sizes(l2, (int)sizeof(l2), m->bt_xfer_done, m->bt_xfer_total);
+        } else if (m->bt_bg_state == UI_BT_BG_QUEUE && m->bt_sync_pending > 0u) {
+            lv_snprintf(l1, sizeof(l1), "%s", ui_tr_bt(UI_BT_STR_TRANSCRIBING));
+            col1 = UI_HEX_CYAN;
+            lv_snprintf(l2, sizeof(l2), ui_tr_bt(UI_BT_STR_IN_QUEUE_FMT), (unsigned)m->bt_sync_pending);
+        } else if (m->bt_bg_state == UI_BT_BG_CONN || m->bt_bg_syncing) {
+            lv_snprintf(l1, sizeof(l1), "%s", ui_tr(UI_STR_BT_FILE_SYNC));
+            col1 = UI_HEX_CYAN;
             lv_snprintf(l2, sizeof(l2), "%s", ui_tr_bt(UI_BT_STR_CONNECTING));
-        } else
-#endif
-        {
+        } else if (m->bt_auto_sync && m->bt_unsynced_count > 0u) {
+            lv_snprintf(l1, sizeof(l1), "%s", ui_tr(UI_STR_BT_FILE_SYNC));
+            lv_snprintf(l2, sizeof(l2), ui_tr_bt(UI_BT_STR_IN_QUEUE_FMT), (unsigned)m->bt_unsynced_count);
+        } else {
+            lv_snprintf(l1, sizeof(l1), "%s", ui_tr(UI_STR_BT_FILE_SYNC));
             lv_snprintf(l2, sizeof(l2), ui_tr(UI_STR_DEVICE_NAME_FMT), m->bt_name[0] ? m->bt_name : "HW_76");
         }
+#else
+        lv_snprintf(l1, sizeof(l1), "%s", ui_tr(UI_STR_BT_FILE_SYNC));
+        lv_snprintf(l2, sizeof(l2), ui_tr(UI_STR_DEVICE_NAME_FMT), m->bt_name[0] ? m->bt_name : "HW_76");
+#endif
     }
     set_changed_text(title, l1);
     set_changed_text_color(title, lv_color_hex(col1));
@@ -541,6 +575,42 @@ static void bind_home(const ui_model_t *m, bool entering)
                            entering ? LV_ANIM_OFF : LV_ANIM_ON);
         previous_focus = focus;
     }
+#if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID
+    {
+        char ic3[12] = "BT";
+        uint32_t ic3_col = (focus == 3u) ? UI_HEX_TEXT : UI_HEX_DIM;
+        if (m->bt_bg_state == UI_BT_BG_XFER) {
+            if (!m->bt_xfer_up && m->bt_xfer_total > 0u) {
+                lv_snprintf(ic3, sizeof(ic3), "\xE2\x96\xBC%u%%", (unsigned)(m->bt_pct > 99u ? 99u : m->bt_pct));
+                if (lv_text_get_width(ic3, (uint32_t)lv_strlen(ic3), &ui_font_md, 0) > 35) {
+                    lv_snprintf(ic3, sizeof(ic3), "%u%%", (unsigned)(m->bt_pct > 99u ? 99u : m->bt_pct));
+                }
+            } else {
+                lv_snprintf(ic3, sizeof(ic3), "%sBT", m->bt_xfer_up ? "\xE2\x96\xB2" : "\xE2\x96\xBC");
+            }
+            if (focus != 3u) {
+                ic3_col = m->bt_xfer_up ? UI_HEX_AMBER : UI_HEX_CYAN;
+            }
+        } else if (m->bt_bg_state == UI_BT_BG_QUEUE && m->bt_sync_pending > 0u) {
+            lv_snprintf(ic3, sizeof(ic3), "Q:%u", (unsigned)(m->bt_sync_pending > 99u ? 99u : m->bt_sync_pending));
+            if (focus != 3u) {
+                ic3_col = UI_HEX_CYAN;
+            }
+        } else if (m->bt_bg_state == UI_BT_BG_CONN || m->bt_bg_syncing) {
+            lv_snprintf(ic3, sizeof(ic3), "BT\xE2\x80\xA6");
+            if (focus != 3u) {
+                ic3_col = UI_HEX_CYAN;
+            }
+        } else if (m->bt_auto_sync && m->bt_unsynced_count > 0u) {
+            lv_snprintf(ic3, sizeof(ic3), "Q:%u", (unsigned)(m->bt_unsynced_count > 99u ? 99u : m->bt_unsynced_count));
+            if (focus != 3u) {
+                ic3_col = UI_HEX_AMBER;
+            }
+        }
+        set_changed_text(ics[3], ic3);
+        set_changed_text_color(ics[3], lv_color_hex(ic3_col));
+    }
+#endif
 
     lv_obj_t *titles[] = {objects.home_detail_0_0, objects.home_detail_1_0,
                           objects.home_detail_2_0, objects.home_detail_3_0};
@@ -739,6 +809,20 @@ static void bind_saved(const ui_model_t *m)
     set_changed_bar_value(objects.saved_prog, (int32_t)m->saved_frac_pct);
 }
 
+#if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID
+static int same_stem_ci(const char *a, const char *b)
+{
+    if (!a || !b || a[0] == '\0' || b[0] == '\0') return 0;
+    while (*a != '\0' && *a != '.' && *b != '\0' && *b != '.') {
+        char ca = *a++, cb = *b++;
+        if (ca >= 'A' && ca <= 'Z') ca = (char)(ca + ('a' - 'A'));
+        if (cb >= 'A' && cb <= 'Z') cb = (char)(cb + ('a' - 'A'));
+        if (ca != cb) return 0;
+    }
+    return (*a == '\0' || *a == '.') && (*b == '\0' || *b == '.');
+}
+#endif
+
 static void bind_files(const ui_model_t *m)
 {
     int sel_disp = m->file_sel;
@@ -799,8 +883,26 @@ static void bind_files(const ui_model_t *m)
 
         if (!f->is_dir && f->has_transcript) {
             set_hidden(badges[r], false);
+            set_changed_text(badges[r], "T");
             set_changed_bg_color(badges[r], lv_color_hex(sel ? UI_HEX_TEXT : UI_HEX_FAINT));
             set_changed_text_color(badges[r], lv_color_hex(sel ? UI_HEX_PILL : UI_HEX_TEXT));
+#if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID
+        } else if (!f->is_dir && m->files_title[0] == '\0' && is_generic_recording_name(f->filename)) {
+            if (m->bt_bg_state == UI_BT_BG_XFER && same_stem_ci(f->filename, m->bt_xfer_name)) {
+                set_hidden(badges[r], false);
+                set_changed_text(badges[r], m->bt_xfer_up ? "\xE2\x96\xB2" : "\xE2\x96\xBC");
+                set_changed_bg_color(badges[r], lv_color_hex(m->bt_xfer_up ? UI_HEX_AMBER : UI_HEX_CYAN));
+                set_changed_text_color(badges[r], lv_color_hex(UI_HEX_BLACK));
+            } else if (m->bt_auto_sync && (m->bt_bg_state != UI_BT_BG_OFF || m->bt_unsynced_count > 0u)) {
+                int live = m->bt_bg_state != UI_BT_BG_OFF;
+                set_hidden(badges[r], false);
+                set_changed_text(badges[r], "\xE2\x80\xA6");
+                set_changed_bg_color(badges[r], lv_color_hex(live ? UI_HEX_PILL_HI : UI_HEX_OFF));
+                set_changed_text_color(badges[r], lv_color_hex(live ? UI_HEX_CYAN : UI_HEX_AMBER));
+            } else {
+                set_hidden(badges[r], true);
+            }
+#endif
         } else {
             set_hidden(badges[r], true);
         }
@@ -1522,25 +1624,6 @@ static void bind_usb(const ui_model_t *m)
     set_changed_text(objects.usb_batt_lbl, bp);
 }
 
-/* "1.2 / 7.5 MB" (one unit when both sizes share it), "512 KB / 7.5 MB", or just "12 KB" when the total is unknown. */
-static void bt_xfer_sizes(char *dst, int cap, uint32_t done, uint32_t total)
-{
-    char ds[16], ts[16];
-    ui_format_bytes_short(ds, (int)sizeof(ds), done);
-    if (total == 0u) {
-        lv_snprintf(dst, (uint32_t)cap, "%s", ds);
-        return;
-    }
-    ui_format_bytes_short(ts, (int)sizeof(ts), total);
-    int du = 0, tu = 0;                       /* the unit: after the last space */
-    for (int i = 0; ds[i] != '\0'; i++) if (ds[i] == ' ') du = i;
-    for (int i = 0; ts[i] != '\0'; i++) if (ts[i] == ' ') tu = i;
-    if (du > 0 && tu > 0 && lv_strcmp(&ds[du], &ts[tu]) == 0) {
-        ds[du] = '\0';
-    }
-    lv_snprintf(dst, (uint32_t)cap, "%s / %s", ds, ts);
-}
-
 /* eez layout: line 1 y 41, line 2 y 53 (bt_prog is only shown in the transfer view). The transfer view packs name,
  * bar and sizes into the same rows: name y 40, bar y 54..56, sizes y 56 (ink clear of the footer at y 67). */
 #define BT_L1_Y        41
@@ -1612,8 +1695,19 @@ static void bind_bt(const ui_model_t *m)
     set_changed_text(objects.bt_footer, ui_tr(UI_STR_BT_FOOTER));
 #endif
     if (m->bt_state == 0u) {
-        set_changed_text(objects.bt_l1_lbl, ui_tr(UI_STR_BT_WAITING));
-        set_changed_text_color(objects.bt_l1_lbl, lv_color_hex(UI_HEX_DIM));
+#if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID
+        if (m->bt_window_s == 0u && m->bt_sync_pending > 0u) {
+            set_changed_text(objects.bt_l1_lbl, ui_tr_bt(UI_BT_STR_TRANSCRIBING));
+            set_changed_text_color(objects.bt_l1_lbl, lv_color_hex(UI_HEX_CYAN));
+            lv_snprintf(l2s, sizeof(l2s), ui_tr_bt(UI_BT_STR_IN_QUEUE_FMT), (unsigned)m->bt_sync_pending);
+            set_changed_text(objects.bt_l2_lbl, l2s);
+            set_changed_text_color(objects.bt_l2_lbl, lv_color_hex(UI_HEX_AMBER));
+        } else
+#endif
+        {
+            set_changed_text(objects.bt_l1_lbl, ui_tr(UI_STR_BT_WAITING));
+            set_changed_text_color(objects.bt_l1_lbl, lv_color_hex(UI_HEX_DIM));
+        }
         set_hidden(objects.bt_l2_lbl, false);
         set_hidden(objects.bt_prog, true);
     } else if (m->bt_state == 1u) {
@@ -1622,7 +1716,16 @@ static void bind_bt(const ui_model_t *m)
         set_changed_text(objects.bt_l1_lbl, cs);
         set_changed_text_color(objects.bt_l1_lbl, lv_color_hex(UI_HEX_GREEN));
 #if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID
-        set_hidden(objects.bt_l2_lbl, !m->bt_bonded);   /* "Bonded" */
+        if (m->bt_sync_pending > 0u) {
+            set_changed_text(objects.bt_l1_lbl, ui_tr_bt(UI_BT_STR_TRANSCRIBING));
+            set_changed_text_color(objects.bt_l1_lbl, lv_color_hex(UI_HEX_CYAN));
+            lv_snprintf(l2s, sizeof(l2s), ui_tr_bt(UI_BT_STR_IN_QUEUE_FMT), (unsigned)m->bt_sync_pending);
+            set_changed_text(objects.bt_l2_lbl, l2s);
+            set_changed_text_color(objects.bt_l2_lbl, lv_color_hex(UI_HEX_AMBER));
+            set_hidden(objects.bt_l2_lbl, false);
+        } else {
+            set_hidden(objects.bt_l2_lbl, !m->bt_bonded);   /* "Bonded" */
+        }
 #else
         set_hidden(objects.bt_l2_lbl, true);
 #endif

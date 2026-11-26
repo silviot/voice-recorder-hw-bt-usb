@@ -373,7 +373,8 @@ static const struct { ui_bt_str_id_t id; uint8_t kind; } k_bt_kinds[] = {
     { UI_BT_STR_HP_SPK_ONLY, BK_TOAST },      { UI_BT_STR_NO_SPEECH, BK_LBL },
     { UI_BT_STR_SYNC_DEFER_OFF, BK_TOAST },   { UI_BT_STR_AUTO_SYNC, BK_SETLBL },
     { UI_BT_STR_DESC_AUTO_SYNC, BK_FOOT },    { UI_BT_STR_AUTO_OFF, BK_SETLBL },
-    { UI_BT_STR_DESC_AUTO_OFF, BK_FOOT },
+    { UI_BT_STR_DESC_AUTO_OFF, BK_FOOT },     { UI_BT_STR_TRANSCRIBING, BK_BTL2 },
+    { UI_BT_STR_IN_QUEUE_FMT, BK_BTL2 },
 };
 
 static void check_bt_i18n(void)
@@ -622,6 +623,47 @@ static void check_bt_ui(ui_model_t *m)
     b.toast_msg[0] = '\0';
     ui_render_screen(UI_SCR_HOME, &b);
     for (int frame = 0; frame < 14; frame++) { s_now += 16u; ui_port_task_handler(); }
+
+    /* Background sync & queue indicators on Home Sync tile, Files list, and BT screen */
+    b.home_focus = 3u;
+    b.bt_auto_sync = 1u;
+    b.bt_unsynced_count = 2u;
+    b.bt_bg_state = UI_BT_BG_OFF;
+    ui_render_screen(UI_SCR_HOME, &b);
+    assert(strcmp(lv_label_get_text(objects.home_tile_ic_3), "Q:2") == 0);
+    assert(strcmp(lv_label_get_text(objects.home_detail_3_1), "In queue: 2") == 0);
+
+    b.bt_bg_state = UI_BT_BG_CONN;
+    ui_render_screen(UI_SCR_HOME, &b);
+    assert(strcmp(lv_label_get_text(objects.home_tile_ic_3), "BT\xE2\x80\xA6") == 0);
+    assert(strcmp(lv_label_get_text(objects.home_detail_3_1), "Connecting\xE2\x80\xA6") == 0);
+
+    b.bt_bg_state = UI_BT_BG_XFER;
+    b.bt_xfer_up = 0u;
+    strcpy(b.bt_xfer_name, "REC_0056.wav");
+    b.bt_xfer_done = 420u * 1024u;
+    b.bt_xfer_total = 1000u * 1024u;
+    b.bt_pct = 42u;
+    ui_render_screen(UI_SCR_HOME, &b);
+    assert(lv_text_get_width(lv_label_get_text(objects.home_tile_ic_3),
+                             (uint32_t)strlen(lv_label_get_text(objects.home_tile_ic_3)),
+                             &ui_font_md, 0) <= 35);
+    assert(strcmp(lv_label_get_text(objects.home_detail_3_0), "\xE2\x96\xBC REC_0056.wav") == 0);
+    ui_render_screen(UI_SCR_FILES, &b);
+    assert(strcmp(lv_label_get_text(objects.files_badge_2), "\xE2\x80\xA6") == 0);
+
+    b.bt_bg_state = UI_BT_BG_QUEUE;
+    b.bt_sync_pending = 2u;
+    ui_render_screen(UI_SCR_HOME, &b);
+    assert(strcmp(lv_label_get_text(objects.home_tile_ic_3), "Q:2") == 0);
+    assert(strcmp(lv_label_get_text(objects.home_detail_3_0), "Transcribing\xE2\x80\xA6") == 0);
+    assert(strcmp(lv_label_get_text(objects.home_detail_3_1), "In queue: 2") == 0);
+    b.bt_state = 1u;
+    b.bt_window_s = 0u;
+    b.bt_prompt = 0u;
+    ui_render_screen(UI_SCR_BT, &b);
+    assert(strcmp(lv_label_get_text(objects.bt_l1_lbl), "Transcribing\xE2\x80\xA6") == 0);
+    assert(strcmp(lv_label_get_text(objects.bt_l2_lbl), "In queue: 2") == 0);
 }
 #endif
 

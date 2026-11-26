@@ -66,6 +66,8 @@ typedef enum {
     UI_BT_STR_DESC_AUTO_SYNC, /* Settings description of Auto sync */
     UI_BT_STR_AUTO_OFF, /* Settings row label: smart idle auto-power-off */
     UI_BT_STR_DESC_AUTO_OFF, /* Settings description of Auto off */
+    UI_BT_STR_TRANSCRIBING, /* Home/BT status: phone app is transcribing queued recordings */
+    UI_BT_STR_IN_QUEUE_FMT, /* Home/BT detail: "%u" items waiting in sync/transcription queue */
     UI_BT_STR_COUNT
 } ui_bt_str_id_t;
 

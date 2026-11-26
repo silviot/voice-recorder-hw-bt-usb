@@ -631,6 +631,13 @@ void bt_modem_init(uint32_t clk6_hz)
 
 uint32_t bt_rf_init_calibrated(uint32_t freq_drift, uint32_t clk6_hz)
 {
+#ifndef OPENFW_HOST_MMIO
+    /* Never reset BT CRU clocks/EM calibration while RW-BT IRQ 26 is live under bt_ctrl ownership. */
+    if ((openfw_mmio_rd32(0xE000E100u) & (1u << 26u)) != 0u) {
+        openfw_log_puts("WARN: bt_rf_init_calibrated skipped while RW-BT active\n");
+        return 0u;
+    }
+#endif
     uint8_t tx_band[86], tx_cap[86], rx_band[86], rx_cap[86];
 
     bt_rf_cal_mode_reset();

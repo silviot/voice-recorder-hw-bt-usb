@@ -492,6 +492,41 @@ soon as `+XREC:SYNC,0` arrives.
 - **Left on hardware:** clean release `BT=1` (`BENCH=0`) image (`FIRM CRC-16=0xB75A`, 858,496 B) flashed & verified on
   SL6801; updated debug APK (`15f9608f`) installed on Pixel 8 (`mNotifyOnDeviceNearby=true`).
 
+## Session 13 (2026-11-26): background-sync RF crash fix, transfer/queue UI cues, and live round-trip
+
+- **Crash root cause:** opening `Phone (sync)` (`run_bt_xrec_mode()`) while background sync (`g_bt_bg.active == 1`) was
+  running cleared `g_bt_bg.active` without stopping Bluedroid and called `bt_rf_init_calibrated()` (`rf_cru_reset()` +
+  tone calibration over Exchange Memory) on top of live RW-BT + IRQ 26.
+- **Firmware fixes (`feat/bt-just-works`):**
+  - `run_bt_xrec_mode()` in `open_fw/src/main.c` adopts an active background session (`adopted_bg`, skipping
+    `bt_rf_init_calibrated()` / `bt_xrec_start()`, logging `"BT bg sync adopted by phone screen"`) and hands it back
+    on `KEY_BACK` while work/link remains (`"BT bg sync handed back on exit"`).
+  - `bt_rf_init_calibrated()` in `open_fw/src/bt_rf.c` refuses to reset RF/EM while NVIC IRQ 26 (`0xE000E100` bit 26)
+    is enabled.
+  - `run_bt_choice()`, `run_headset_probe()`, `hp_start_session()`, `play_*()`, and `delete_selected_file()` coordinate
+    `bt_bg_stop()` / `bt_bg_rearm_if_needed()`, and `openfw_main()` yields via `OPENFW_TASK_WAIT()` while
+    `g_bt_bg.active && (bst.spp_open || bst.xfer_active)`.
+  - Added live transfer and pending-queue cues across Home, Home detail, Files (`"▼"`, `"▲"`, `"T"`), and BT screens
+    (`openfw_ui.h`, `openfw_i18n_bt.h`, `ui_i18n_bt.c` across all 18 languages, `ui_screens.c`, `test_ui_render.c`).
+- **Cassini app (`feat/recorder-sync`):** added Library `ProgressBannerCard` (transfer/queue status + tap to open
+  Recorder), Settings Recorder queue/activity subtitle, Recorder queue summary (`RecorderQueueCounts`) and
+  `RecordingStatus.UPLOADED_NO_SPEECH`, and `RecorderNotifications.buildWaiting()` during round-trip holds.
+- **Hardware verification (`HW_76` + Pixel 8 `49101FDJH002K4`):**
+  - *Adopt/handback silicon probe (`BT=1 BENCH=1`, `mode=rec secs=10 sync_s=15` with temporary `#if OPENFW_BT_BENCH`
+    entry/exit hook during `bt_bg`):* entered and exited `run_bt_xrec_mode()` while `BT HCI create connection` was in
+    flight; logged `"BT bg sync adopted by phone screen"` and `"BT bg sync handed back on exit"`, `prev_fault=0x00000000`,
+    `stalls 0`, `mallocfail 0`, USB MSC re-enumerated cleanly.
+  - *Live round-trip (`BT=1 BENCH=1`, `mode=rec secs=10 sync_s=90`, Pixel 8 running updated `app-arm64-v8a-debug.apk`):*
+    Library banner initially showed `"Connecting to the recorder…, Cassini_1D · 1 waiting for the recorder"` (`REC_0056`),
+    then `"Downloading REC_0057.wav, 0%, Cassini_1D · 1 waiting for the recorder"` mid-transfer. SL6801 paged Pixel 8,
+    committed queued `REC_0056.cwx` (660 B, `state 1`), transferred `REC_0057.wav` (630,828 B), accepted `REC_0057.cwx`
+    (168 B zero-speech sidecar, `state 2`, `sync pending 0`), and closed via `BT bg sync stop: sync complete (SYNC,0)` at
+    `BENCH bgsync st=done ms=50058` (`stalls 0`, `mallocfail 0`). Recorder screen showed `"Transcript sent to the recorder"`
+    for `REC_0056.wav` and `"Transcript sent to the recorder (no speech)"` for `REC_0057.wav` (temporary `REC_0057.*`
+    removed from `/record/`, `REC_0056.wav` + `REC_0056.cwx` retained).
+- **Left on hardware:** clean release `BT=1` (`BENCH=0`, `863,616 B`, `FIRM CRC-16=0xDA9F`) flashed & verified on
+  SL6801; updated debug APK installed on Pixel 8.
+
 ## Exp 1 stages A and B: how to run
 
 Probe image for plan M5 Exp 1 stage A and stage B (step 4): `bt_ctrl` (plan M1) drives the real RW-BT ROM through

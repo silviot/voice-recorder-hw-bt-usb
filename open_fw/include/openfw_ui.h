@@ -191,6 +191,11 @@ typedef struct {
     uint8_t        is_dir;
 } ui_file_entry_t;
 
+#define UI_BT_BG_OFF    0u
+#define UI_BT_BG_CONN   1u
+#define UI_BT_BG_XFER   2u
+#define UI_BT_BG_QUEUE  3u
+
 typedef struct {
     /* Global hardware telemetry */
     rtc_datetime_t now;
@@ -321,6 +326,9 @@ typedef struct {
     uint8_t        bt_auto_sync;    /* Settings "Auto sync": 0 Off, 1 On (default) */
     uint8_t        bt_auto_off;     /* Settings "Auto off": 0 Off, 1 2m, 2 5m (default), 3 15m */
     uint8_t        bt_bg_syncing;   /* 1 while background phone sync is active */
+    uint8_t        bt_bg_state;     /* UI_BT_BG_* */
+    uint8_t        bt_sync_pending; /* +XREC:SYNC,<pending> count on phone (0..99) */
+    uint8_t        bt_unsynced_count; /* untranscribed WAV files in /record (0..99) */
 #endif
 
     /* Power off */
