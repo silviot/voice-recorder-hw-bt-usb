@@ -416,6 +416,17 @@ between radio-off repeats; earlier provisional "idle radio passes" verdicts are 
 user present) remains the gate; "Sync while the recorder records" stays off by default until it passes. Weak lead to
 check then: a 22.9 Hz rhythm in one of the early (pre-fix, shortened) syncing captures.
 
+**Dead link (BT_ROM_HCI_MAP.md section 11, H1/H2): phone power-off is clean.** Bench phone session on the merged
+image, Pixel app downloading, then `adb shell cmd bluetooth_manager disable` mid-transfer: `BT ROM links lc=26 03..`
+(LC detach states), then `BT HCI disconnection complete h=0x0080 st=0x00 reason=0x15` (remote power off), SPP closed,
+ROM link table cleared, `fwd_to=0`, no stalls. The ~40 s dead link seen in session 6 (laptop's acknowledged
+`LMP_detach` right after a 581 KB transfer) is therefore not reproduced by a peer power-off; H1/H2 stay open for the
+remote-detach path, which needs a peer that sends `LMP_detach` (a laptop `bluetoothctl disconnect`, or the phone's
+"Disconnect" in its Bluetooth settings while a transfer is in flight).
+
+**App note:** a recording whose transcript has no words (e.g. a silence capture) stays "Imported" on the app's
+Recorder screen although the note is transcribed; nothing is uploaded. The screen should say "Transcribed, no speech".
+
 ## Exp 1 stages A and B: how to run
 
 Probe image for plan M5 Exp 1 stage A and stage B (step 4): `bt_ctrl` (plan M1) drives the real RW-BT ROM through
