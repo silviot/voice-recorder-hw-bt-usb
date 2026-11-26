@@ -1364,6 +1364,42 @@ static bool plant_bond(const char *bdstr, int key_type, const uint8_t wire_key[1
            exfat_close_file(&w) == 0;
 }
 
+/* Mark a stored bond in /bt_bonds.bin as "peer supports Secure Connections" (SCSupport = 1), as Bluedroid stores a
+ * phone's bond (a Pixel sets the SC host bit). Session stopped. */
+static bool bond_set_sc(const char *bdstr)
+{
+    int n = bthx_read_root_file("bt_bonds.bin", s_img, sizeof(s_img));
+    if (n <= 0 || bt_store_load(s_img, (size_t)n) != ESP_OK) {
+        return false;
+    }
+    nvs_handle_t h;
+    if (nvs_open("bt_config.conf", NVS_READWRITE, &h) != ESP_OK) {
+        return false;
+    }
+    static char cfg[1600];
+    size_t len = sizeof(cfg) - 1u;
+    bool ok = nvs_get_blob(h, "bt_cfg_key0", cfg, &len) == ESP_OK;
+    if (ok) {
+        cfg[len] = '\0';
+        char *sec = strstr(cfg, bdstr);
+        char *sc = sec != NULL ? strstr(sec, "SCSupport = ") : NULL;
+        ok = sc != NULL && (sc[12] == '0' || sc[12] == '1');
+        if (ok) {
+            sc[12] = '1';
+            ok = nvs_set_blob(h, "bt_cfg_key0", cfg, len) == ESP_OK;
+        }
+    }
+    nvs_close(h);
+    size_t m = ok ? bt_store_serialize(s_img, sizeof(s_img)) : 0u;
+    if (m == 0u) {
+        return false;
+    }
+    exfat_writer_t w;
+    (void)exfat_delete_file(&s_card, "/", "bt_bonds.bin");
+    return exfat_create_file(&s_card, "/", "bt_bonds.bin", &w) == 0 && exfat_write(&w, s_img, (uint32_t)m) == 0 &&
+           exfat_close_file(&w) == 0;
+}
+
 /* The supervisor over a quiet stretch: every thread answered, no fault, no WDT hold (plan M4 "Watchdog" tests). */
 static void sup_quiet(const char *what, uint32_t ms)
 {
@@ -1716,6 +1752,42 @@ int bth_phone_scenario(const char *img_path)
     PCHECK(gets_verify("BIG0002.WAV", 2u, 250000u, 3000u, 640u, -1, NULL), "GETS after restart");
     peer_drop(0x13u);
     PCHECK(WAIT(!S().d.conn_open && S().d.acl_links == 0u, 3000), "link not down");
+
+    /* ---- 9b ---- */
+    /* Silicon 2026-11-26 (patch 0047): a phone's bond vanished from bt_bonds.bin with no app log line; the phone then
+     * got Key Missing on every reconnect. Upstream BTM deletes the link key, and BTC the stored bond, whenever a
+     * reconnect's page-1 features show no Secure Connections host support after an earlier link showed it (a Pixel
+     * sets it; a failed or empty 041C page-1 read reads as "no SC"). Our keys are P-192, never SC: keep the bond. */
+    bth_log("[P9b] A's bond stored with SCSupport=1; restart; A reconnects with SC, then without it: bond kept\n");
+    stop_session(&base, "stop before P9b");
+    if (p_fail) {
+        goto out;
+    }
+    PCHECK(bond_set_sc("00:5b:1a:51:7e:a1"), "could not mark A's bond SCSupport = 1 in /bt_bonds.bin");
+    rom_cmds_clear();
+    if (!wait_ready()) {
+        goto out;
+    }
+    PCHECK(S().bonds == 1, "P9b: bond not restored (%d)", S().bonds);
+    for (int pass = 0; pass < 2; pass++) {
+        fake_peer_cfg_t a;
+        peer_cfg(&a, 0xA1u, 0x01u, 0x05u, 0x05u, "laptop-A");
+        a.features_p1[0] = pass == 0 ? 0x09u : 0x00u;   /* SSP + SC host, then nothing (bit 3: SC host support) */
+        peer_attach(&a, lkey);
+        if (!peer_page_and_connect()) {
+            goto out;
+        }
+        peer_authenticate();
+        PCHECK(WAIT(fake_peer.authenticated && fake_peer.encrypted, 3000),
+               "pass %d: authentication with the stored key (key replies %u neg %u)", pass, fake_peer.host_key_replies,
+               fake_peer.host_key_neg);
+        PCHECK(fake_peer.pairings == 0u && fake_peer.host_key_neg == 0u, "pass %d: stored key not used (pairings %u "
+               "neg %u)", pass, fake_peer.pairings, fake_peer.host_key_neg);
+        peer_drop(0x13u);
+        PCHECK(WAIT(!S().d.conn_open && S().d.acl_links == 0u, 3000), "pass %d: link not down", pass);
+        PCHECK(S().bonds == 1, "pass %d: bond dropped (%d bonds)", pass, S().bonds);
+    }
+    PCHECK(WAIT(bond_file_has_key(lkey) > 0, 3000), "A's key no longer in /bt_bonds.bin (%d)", bond_file_has_key(lkey));
 
     /* ---- 10 ---- */
     bth_log("[P10] laptop B pairs with the window closed: rejected\n");

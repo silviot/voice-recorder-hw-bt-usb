@@ -430,6 +430,29 @@ never sent its own `LMP_detach`, so the peer-initiated detach after a large tran
 **App note:** a recording whose transcript has no words (e.g. a silence capture) stays "Imported" on the app's
 Recorder screen although the note is transcribed; nothing is uploaded. The screen should say "Transcribed, no speech".
 
+## Session 11 (2026-11-26 morning): the phone's bond vanished (patch 0047)
+
+Image `53bb001` (bench). The app synced in the morning, then stopped: the recorder in BT mode, the phone connected
+every few seconds and dropped the link after 5-9 s.
+
+- **Phone (logcat):** `pairingContext=REPAIRING`, `KEY_MISSING`, `Bonding failed ... HCI_ERR_AUTH_FAILURE`: the phone
+  still held its key, the recorder had none and refused the re-pairing (`BT SSP numeric comparison rejected: pairing
+  window closed` in the ring). Correct policy; the missing key was the fault.
+- **Card:** `bt_bonds.bin` 43 B (empty store); `bt_hp_bonds.bin` intact (Jabra + one other headset), last written at
+  the end of a headphones session between "worked" and "broken". The ring had wrapped: no line about the removal, and
+  none of our removal paths (`purge_unauthenticated_bonds`, `reject_bond`, the mode-switch flush) can remove silently.
+- **Cause found in Bluedroid (upstream, unpatched until now):** `btm_sec_set_peer_sec_caps()` wipes the link key, and
+  `btc_dm_link_up_evt()` removes the stored bond, when a reconnect's page-1 features lack the Secure Connections host
+  bit after the stored bond (`SCSupport = 1`, a Pixel sets it) or an earlier link showed it. Features are re-read on
+  every reconnect of such a bond, so one failed or empty 041C page-1 read (the link is busy, the peer slow to answer)
+  unpairs the phone. Only a `BTM_TRACE` line, never our log.
+- **Fix:** patch 0047 keeps the key (P-192 only: SC never protected it; any device paging with the phone's address
+  and no SC bit could otherwise unpair it). Host test `test_bt_host phone` [P9b] reproduces it without the patch (the
+  host detached the second link with 0x16 and dropped the bond) and passes with it.
+- **HW8 (session 8) path (c):** the laptop bond lost from `bt_hp_bonds.bin` fits the same mechanism if that laptop
+  set the SC host bit; 0047 closes it either way.
+- Recovery on the device: one re-pairing inside the window (the phone's old key is replaced).
+
 ## Exp 1 stages A and B: how to run
 
 Probe image for plan M5 Exp 1 stage A and stage B (step 4): `bt_ctrl` (plan M1) drives the real RW-BT ROM through

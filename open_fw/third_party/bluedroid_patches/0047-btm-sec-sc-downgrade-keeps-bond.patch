@@ -1,0 +1,32 @@
+diff --git a/open_fw/third_party/bluedroid/host/bluedroid/stack/btm/btm_sec.c b/open_fw/third_party/bluedroid/host/bluedroid/stack/btm/btm_sec.c
+index f65a615..615385d 100644
+--- a/open_fw/third_party/bluedroid/host/bluedroid/stack/btm/btm_sec.c
++++ b/open_fw/third_party/bluedroid/host/bluedroid/stack/btm/btm_sec.c
+@@ -6275,7 +6275,18 @@ void btm_sec_set_peer_sec_caps(tACL_CONN *p_acl_cb, tBTM_SEC_DEV_REC *p_dev_rec)
+ #if (CLASSIC_BT_INCLUDED == TRUE)
+     if (p_dev_rec->remote_supports_secure_connections >= p_dev_rec->remote_secure_connection_previous_state) {
+         p_dev_rec->remote_secure_connection_previous_state = p_dev_rec->remote_supports_secure_connections;
+-    } else {
++    } else
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++    /* open_fw patch 0047: a stored bond is never dropped because a reconnect's page-1 features lack the Secure
++     * Connections host bit (silicon 2026-11-26: a phone's bond vanished from bt_bonds.bin; a failed or empty 041C
++     * page-1 read reads as "no SC"). Our controller makes P-192 keys only, so SC never protected the stored key, and
++     * any device paging with a bonded address and no SC bit could unpair the real phone (same rule as 0042). The
++     * stored key stays; the link still has to authenticate with it, and a new pairing still needs the window. */
++    {
++        BTM_TRACE_WARNING("Remote Device reports no SC after an SC link: link key kept (open_fw 0047)\n");
++    }
++#else
++    {
+         BTM_TRACE_ERROR("Remote Device downgraded security from SC, deleting Link Key");
+ 
+         /* Mark in ACL packet that secure connection is downgraded. */
+@@ -6292,6 +6303,7 @@ void btm_sec_set_peer_sec_caps(tACL_CONN *p_acl_cb, tBTM_SEC_DEV_REC *p_dev_rec)
+                                 | BTM_SEC_ROLE_SWITCHED | BTM_SEC_16_DIGIT_PIN_AUTHED);
+         return;
+     }
++#endif /* OPENFW_BLUEDROID */
+ #endif
+ 
+     if (p_dev_rec->remote_features_needed) {
