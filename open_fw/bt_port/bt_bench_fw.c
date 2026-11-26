@@ -1,6 +1,7 @@
 /* bt_bench firmware glue (BT=1 phone images): the SD request (bt_bench.c) turned into a BT-mode run. Hooks in
  * src/main.c: bt_bench_boot() before the home loop, bt_bench_begin() / bt_bench_tick() in run_bt_xrec_mode(),
- * bt_bench_end() after it. App task only. Log lines start with "BENCH ".
+ * bt_bench_end() after it; mode=rec: bt_bench_home_tick() / bt_bench_rec_apply() in the home loop's REC-switch path,
+ * then bt_bench_end(). App task only. Log lines start with "BENCH ".
  * SPDX-License-Identifier: MIT */
 #include <stddef.h>
 #include <stdint.h>
@@ -33,6 +34,17 @@ static uint8_t s_armed;          /* request taken this boot, run not ended yet *
 static uint8_t s_in;             /* between bt_bench_begin() and bt_bench_end() */
 static uint8_t s_why_time;       /* left BT mode because the time was up */
 static volatile uint8_t s_ac_weak;   /* the weak bt_xrec_set_bench_autoconfirm() below was called */
+static bt_xrec_debug_t s_dbg BENCH_HI;   /* bt_xrec_get_debug() scratch, app task only (off the stack) */
+
+/* Recording runs (mode=rec; rec=1 in phone mode): the one recording of the run and the user's settings around it. */
+static bt_bench_rec_t s_rec;
+static exfat_vol_t *s_vol;
+static int s_sd;
+static uint8_t s_rec_run;        /* this run records */
+static uint8_t s_home;           /* mode=rec: the home loop drives the recording, not ended yet */
+static uint8_t s_cfg_held;       /* the request's rec_* settings are applied; s_user_* restore them */
+static uint8_t s_rec_ours;       /* phone mode: this run's recorder_start() succeeded (the recording is the run's) */
+static uint8_t s_user_ch, s_user_gain, s_user_dsp, s_user_vor;
 
 /* Bench SSP auto-confirm override: provided by the phone-mode confirm UI (bt_xrec_bluedroid.c). This weak no-op
  * keeps images without it linking; the run then logs that the override is unavailable. Declared here only, so a
@@ -595,17 +607,19 @@ static void log_status(uint32_t el_ms, int last)
     lku("rx", st.rx_acl_pkts);
     lku("tx", st.tx_acl_pkts);
     lku("pairs", s_run.pairs);
-    static bt_xrec_debug_t dbg BENCH_HI;    /* app task only, off the stack */
-    bt_xrec_get_debug(&dbg);
-    lku("links", dbg.acl_links);             /* acl= is the screen's "connected" (hides links the host is closing): */
-    lku("closing", dbg.acl_closing);         /* links= / closing= keep the raw ACL picture (BT_ROM_HCI_MAP §11 H1/H2) */
+    bt_xrec_get_debug(&s_dbg);
+    lku("links", s_dbg.acl_links);           /* acl= is the screen's "connected" (hides links the host is closing): */
+    lku("closing", s_dbg.acl_closing);       /* links= / closing= keep the raw ACL picture (BT_ROM_HCI_MAP §11 H1/H2) */
+    if (s_rec_run) {
+        lku("rec", recorder_is_saving());
+    }
     lemit();
     static char cl[BT_CTRL_STATS_LINE] BENCH_HI;
     (void)bt_ctrl_stats_format(cl, (uint16_t)sizeof(cl));
     lbegin(cl);                              /* "BENCH BT ctrl stats unk=.. short=.. ...": bt_ctrl's silent drops */
     lemit();
-    if ((dbg.conn_open && !s_link_logged) || last) {
-        s_link_logged = dbg.conn_open;
+    if ((s_dbg.conn_open && !s_link_logged) || last) {
+        s_link_logged = s_dbg.conn_open;
         log_link();
     }
     tp_take(millis(), 1);
@@ -615,6 +629,203 @@ static void log_status(uint32_t el_ms, int last)
         log_cpu30();
         log_meas();
     }
+}
+
+/* ---- recording runs ---- */
+static void lk_keep(const char *k, uint8_t v)
+{
+    if (v == BT_BENCH_REC_KEEP) {
+        lks(k, "cur");
+    } else {
+        lku(k, v);
+    }
+}
+
+static void lrec_settings(void)
+{
+    lku("ch", recorder_get_channels());
+    lku("gain", recorder_get_gain());
+    lku("dsp", (uint32_t)recorder_get_dsp_profile());
+    lku("vor", (uint32_t)recorder_get_vor());
+}
+
+/* The request's rec_* settings for this recording only (never saved: restored by rec_cfg_restore()). */
+static void rec_cfg_apply(void)
+{
+    if (s_cfg_held) {
+        return;
+    }
+    if (s_cfg.rec_ch != BT_BENCH_REC_KEEP || s_cfg.rec_gain != BT_BENCH_REC_KEEP ||
+        s_cfg.rec_dsp != BT_BENCH_REC_KEEP || s_cfg.rec_vor != BT_BENCH_REC_KEEP) {
+        s_user_ch = recorder_get_channels();          /* not recording yet: the configured channel count */
+        s_user_gain = recorder_get_gain();
+        s_user_dsp = (uint8_t)recorder_get_dsp_profile();
+        s_user_vor = (uint8_t)recorder_get_vor();
+        s_cfg_held = 1u;
+        if (s_cfg.rec_ch != BT_BENCH_REC_KEEP) {
+            recorder_set_channels(s_cfg.rec_ch);
+        }
+        if (s_cfg.rec_gain != BT_BENCH_REC_KEEP) {
+            recorder_set_gain(s_cfg.rec_gain);
+        }
+        if (s_cfg.rec_dsp != BT_BENCH_REC_KEEP) {
+            recorder_set_dsp_profile((audio_dsp_profile_t)s_cfg.rec_dsp);
+        }
+        if (s_cfg.rec_vor != BT_BENCH_REC_KEEP) {
+            recorder_set_vor((int)s_cfg.rec_vor);
+        }
+    }
+    lbegin("recrun cfg");
+    lrec_settings();
+    lks("src", s_cfg_held ? "request" : "user");
+    lemit();
+}
+
+static void rec_cfg_restore(void)
+{
+    if (!s_cfg_held) {
+        return;
+    }
+    recorder_set_channels(s_user_ch);
+    recorder_set_gain(s_user_gain);
+    recorder_set_dsp_profile((audio_dsp_profile_t)s_user_dsp);
+    recorder_set_vor((int)s_user_vor);
+    s_cfg_held = 0u;
+    lbegin("recrun cfg_restored");
+    lrec_settings();
+    lemit();
+}
+
+/* After a bt_bench_rec_tick() / bt_bench_rec_cut() in phone mode: start / stop as +XREC:RECSTART / RECSTOP do
+ * (bt_xrec_fw.c dev_rec_start / dev_rec_stop), log, and restore the settings once the recording is over. */
+static void phone_rec_act(uint32_t a, uint8_t prev_st, uint32_t now)
+{
+    if (a & BT_BENCH_REC_ACT_START) {
+        rec_cfg_apply();
+        int rc = recorder_start(s_vol, s_sd);
+        if (rc == 0 && !recorder_is_saving()) {
+            (void)recorder_stop();                    /* as dev_rec_start: a start that is not saving is undone */
+            rc = -1;
+        }
+        s_rec_ours = (uint8_t)(rc == 0);
+        lbegin("recrun start");
+        lku("t", (now - s_run.t0) / 1000u);
+        lks("name", rc == 0 ? recorder_get_filename() : "-");   /* not file=: rf_audio_check's counter lines */
+        lks("rc", rc == 0 ? "OK" : "FAIL");
+        lemit();
+    }
+    if (a & BT_BENCH_REC_ACT_STOP) {
+        uint32_t secs = recorder_get_seconds();
+        int rc = recorder_stop();
+        lbegin("recrun stop");
+        lks("why", bt_bench_rec_why_name(s_rec.why));
+        lku("t", (now - s_run.t0) / 1000u);
+        lku("secs", secs);
+        lks("rc", rc == 0 ? "OK" : "FAIL");
+        lemit();
+    } else if (prev_st != BT_BENCH_REC_DONE && s_rec.st == BT_BENCH_REC_DONE) {
+        lbegin("recrun done");
+        lks("why", bt_bench_rec_why_name(s_rec.why));
+        lku("t", (now - s_run.t0) / 1000u);
+        if (s_rec_ours) {
+            /* Ended by itself (write error, storage full): the recorder stopped saving but capture still runs
+             * (recorder.c leaves it active until recorder_stop(), as the home loop does on recorder_has_error()).
+             * No-op when it is no longer active. Logs the recorder's counters line. */
+            lks("rc", recorder_stop() == 0 ? "OK" : "FAIL");
+        }
+        lemit();
+    }
+    if (s_rec.st == BT_BENCH_REC_DONE) {
+        s_rec_ours = 0u;
+    }
+    if (s_rec.st == BT_BENCH_REC_DONE) {
+        rec_cfg_restore();
+    }
+}
+
+static void phone_rec_tick(uint32_t now)
+{
+    if (!s_rec_run || s_rec.st == BT_BENCH_REC_DONE) {
+        return;
+    }
+    uint8_t prev = s_rec.st;
+    if (s_rec.st == BT_BENCH_REC_GATE) {
+        bt_xrec_get_debug(&s_dbg);
+        if (s_dbg.state == BT_XREC_ST_READY) {
+            bt_bench_rec_open(&s_rec, now);
+            lbegin("recrun gate");
+            lks("st", "ready");
+            lku("t_ms", now - s_run.t0);
+            lku("delay_s", s_cfg.delay_s);
+            lemit();
+        } else if (s_dbg.state == BT_XREC_ST_FAULTED || s_dbg.state == BT_XREC_ST_DEAD) {
+            phone_rec_act(bt_bench_rec_cut(&s_rec, recorder_is_saving()), prev, now);   /* no C1 without a radio */
+            return;
+        }
+    } else {
+        /* after READY: a session that faults during the pre-roll or the recording leaves the radio down, so the
+         * capture would be a C0 on the BT screen, not a C1 / C3p: stop it and mark it why=fault */
+        bt_xrec_get_debug(&s_dbg);
+        if (s_dbg.state == BT_XREC_ST_FAULTED || s_dbg.state == BT_XREC_ST_DEAD) {
+            lbegin("recrun fault");
+            lku("st", (uint32_t)s_dbg.state);
+            lku("rec_st", prev);
+            lku("t", (now - s_run.t0) / 1000u);
+            lemit();
+            phone_rec_act(bt_bench_rec_fault(&s_rec, recorder_is_saving()), prev, now);
+            return;
+        }
+    }
+    phone_rec_act(bt_bench_rec_tick(&s_rec, now, recorder_is_saving()), prev, now);
+}
+
+int bt_bench_rec_cfg_held(void)
+{
+    return s_cfg_held;
+}
+
+void bt_bench_rec_apply(void)
+{
+    if (s_home && s_rec.st == BT_BENCH_REC_ON) {
+        rec_cfg_apply();
+    }
+}
+
+/* mode=rec, every home-loop pass before the REC switch is read. */
+int bt_bench_home_tick(uint32_t now_ms, int saving)
+{
+    if (!s_home) {
+        return 0;
+    }
+    uint32_t a = bt_bench_rec_tick(&s_rec, now_ms, saving);
+    if (a & BT_BENCH_REC_ACT_START) {
+        lbegin("recrun start");
+        lku("t", (now_ms - s_run.t0) / 1000u);
+        lks("via", "rec_switch_path");
+        lemit();
+    }
+    if (a & BT_BENCH_REC_ACT_STOP) {
+        lbegin("recrun stop");
+        lks("why", bt_bench_rec_why_name(s_rec.why));
+        lku("t", (now_ms - s_run.t0) / 1000u);
+        lku("secs", recorder_get_seconds());
+        lemit();
+    }
+    int r = 0;
+    if (s_rec.st == BT_BENCH_REC_ON) {
+        r = BT_BENCH_HOME_HOLD;
+    } else if (s_rec.st == BT_BENCH_REC_DONE && !saving) {   /* stopped (this pass's REC-off path ran before) */
+        lbegin("recrun done");
+        lks("why", bt_bench_rec_why_name(s_rec.why));
+        lks("name", recorder_get_filename());
+        lku("t", (now_ms - s_run.t0) / 1000u);
+        lemit();
+        rec_cfg_restore();
+        s_home = 0u;
+        r = BT_BENCH_HOME_DONE;
+    }
+    drain();
+    return r;
 }
 
 static void act(uint32_t a, uint32_t now)
@@ -1144,6 +1355,39 @@ int bt_bench_boot(exfat_vol_t *vol, int sd_mounted)
         return 0;
     }
     bt_bench_cap_init(&s_cap, s_cap_buf, sizeof(s_cap_buf), g_openfw_log.write_idx);
+    s_vol = vol;
+    s_sd = sd_mounted;
+    s_rec_run = (uint8_t)(s_cfg.mode == BT_BENCH_MODE_REC || s_cfg.rec);
+    s_home = 0u;
+    s_cfg_held = 0u;
+    s_rec_ours = 0u;
+    s_rec.st = BT_BENCH_REC_DONE;
+    s_rec.why = BT_BENCH_REC_WHY_NONE;
+    if (s_cfg.mode == BT_BENCH_MODE_REC) {
+        /* No Bluetooth this boot (C0): the home loop records through the REC-switch path (main.c). */
+        s_armed = 1u;
+        s_in = 1u;
+        s_why_time = 0u;
+        uint32_t now = millis();
+        bt_bench_run_begin(&s_run, &s_cfg, now);   /* t0 for the log; its schedule is not used */
+        bt_bench_rec_init(&s_rec, s_cfg.delay_s, s_cfg.secs, 0, now);
+        s_home = 1u;
+        lbegin("start");
+        lks("mode", "rec");
+        lku("secs", s_cfg.secs);
+        lku("delay_s", s_cfg.delay_s);
+        lk_keep("rec_ch", s_cfg.rec_ch);
+        lk_keep("rec_gain", s_cfg.rec_gain);
+        lk_keep("rec_dsp", s_cfg.rec_dsp);
+        lk_keep("rec_vor", s_cfg.rec_vor);
+        lks("bt", "off");
+        lku("reboot", s_cfg.reboot);
+        lkx("prev_fault", g_prev_fault_code);
+        lks("log", BT_BENCH_LOG_FILE);
+        lemit();
+        drain();
+        return 3;
+    }
     if (s_cfg.mode == BT_BENCH_MODE_HP) {
         hp_boot_log();
         s_armed = 1u;
@@ -1166,6 +1410,18 @@ int bt_bench_boot(exfat_vol_t *vol, int sd_mounted)
     lkx("prev_fault", g_prev_fault_code);
     lks("log", BT_BENCH_LOG_FILE);
     lemit();
+    if (s_cfg.rec) {
+        lbegin("start+");
+        lku("rec", 1u);
+        lku("rec_secs", s_cfg.rec_secs);
+        lku("delay_s", s_cfg.delay_s);
+        lk_keep("rec_ch", s_cfg.rec_ch);
+        lk_keep("rec_gain", s_cfg.rec_gain);
+        lk_keep("rec_dsp", s_cfg.rec_dsp);
+        lk_keep("rec_vor", s_cfg.rec_vor);
+        lks("gate", "ready");
+        lemit();
+    }
     return 1;
 }
 
@@ -1213,18 +1469,28 @@ void bt_bench_begin(void)
     cpu_win_take(&s_win30, &c);
     tp_take(now, 0);
     smp_start();
+    if (s_rec_run) {
+        bt_bench_rec_init(&s_rec, s_cfg.delay_s, s_cfg.rec_secs, 1, now);   /* starts delay_s after READY */
+    }
     act(bt_bench_run_tick(&s_run, now), now);
     drain();
 }
 
 int bt_bench_tick(uint32_t now_ms)
 {
-    if (!s_in) {
+    if (!s_in || s_cfg.mode == BT_BENCH_MODE_REC) {   /* mode=rec: no BT run (a BT mode entered by hand is not one) */
         return 0;
     }
     meas_cpu1(now_ms);
     uint32_t a = bt_bench_run_tick(&s_run, now_ms);
+    if (!(a & BT_BENCH_ACT_EXIT)) {
+        phone_rec_tick(now_ms);
+    }
     if (a & BT_BENCH_ACT_EXIT) {
+        if (s_rec_run && s_rec.st != BT_BENCH_REC_DONE) {   /* stopped before BT mode is left */
+            uint8_t prev = s_rec.st;
+            phone_rec_act(bt_bench_rec_cut(&s_rec, recorder_is_saving()), prev, now_ms);
+        }
         if (!s_why_time) {
             s_why_time = 1u;
             log_status(now_ms - s_run.t0, 1);
@@ -1271,10 +1537,35 @@ int bt_bench_end(exfat_vol_t *vol, int sd_mounted)
         bt_xrec_set_bench_tput(NULL);        /* BT is off: the release TX constants for later sessions */
     }
     uint32_t el = millis() - s_run.t0;
+    if (s_rec_run && s_rec.st != BT_BENCH_REC_DONE) {
+        /* phone mode left early (BACK, REC slide, low battery): run_bt_xrec_mode() already stopped a recording that
+         * was saving (why=left); one that ended by itself is still active and is stopped here */
+        uint8_t prev = s_rec.st;
+        int saving = recorder_is_saving();
+        uint32_t a = bt_bench_rec_leave(&s_rec, saving, recorder_has_error());
+        lbegin("recrun done");
+        lks("why", bt_bench_rec_why_name(s_rec.why));
+        lku("from", prev);
+        if ((a & BT_BENCH_REC_ACT_STOP) || s_rec_ours) {
+            lks("rc", recorder_stop() == 0 ? "OK" : "FAIL");   /* no-op when no longer active */
+        }
+        lemit();
+        s_rec_ours = 0u;
+    }
+    rec_cfg_restore();                       /* the user's settings, whatever happened */
+    s_home = 0u;
     lbegin("end");
-    lks("why", s_why_time ? "time" : "user");   /* user: BACK, REC slide, or BT mode left by itself */
+    lks("mode", bt_bench_mode_name(s_cfg.mode));
+    if (s_cfg.mode == BT_BENCH_MODE_REC) {
+        lks("why", "rec");
+    } else {
+        lks("why", s_why_time ? "time" : "user");   /* user: BACK, REC slide, or BT mode left by itself */
+    }
     lku("ms", s_in ? el : 0u);
     lku("pairs", s_run.pairs);
+    if (s_rec_run) {
+        lks("rec", bt_bench_rec_why_name(s_rec.why));
+    }
     lku("reboot", s_cfg.reboot);
     lemit();
     drain();

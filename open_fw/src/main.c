@@ -1624,10 +1624,14 @@ static void run_bt_xrec_mode(void)
         BT_PROF_ADD(BT_BENCH_PROF_REC, pf_rec);
 
         /* Keep remote settings when the REC switch hands control to the menu. */
-        if (g_ui.cfg.mic_gain != recorder_get_gain() ||
-            g_ui.cfg.sound_mode != (uint8_t)recorder_get_dsp_profile() ||
-            g_ui.cfg.channels != recorder_get_channels() ||
-            g_ui.cfg.vor_enabled != (uint8_t)recorder_get_vor()) {
+        if (
+#if OPENFW_BT_BENCH
+            !bt_bench_rec_cfg_held() && /* a bench recording's rec_* settings (BTBENCH.RUN) are never saved */
+#endif
+            (g_ui.cfg.mic_gain != recorder_get_gain() ||
+             g_ui.cfg.sound_mode != (uint8_t)recorder_get_dsp_profile() ||
+             g_ui.cfg.channels != recorder_get_channels() ||
+             g_ui.cfg.vor_enabled != (uint8_t)recorder_get_vor())) {
             g_ui.cfg.mic_gain = recorder_get_gain();
             g_ui.cfg.sound_mode = (uint8_t)recorder_get_dsp_profile();
             g_ui.cfg.channels = recorder_get_channels();
@@ -3139,9 +3143,13 @@ int openfw_main(void)
     hci_probe_start(&g_exfat_vol, g_sd_mounted); /* runs only if SD:/HCIPROBE.RUN exists (deleted first) */
 #endif
 #if OPENFW_BT_BENCH
-    /* Unattended phone-mode run: only if SD:/BTBENCH.RUN exists (deleted first). BT mode, then the normal boot. */
+    /* Unattended phone-mode run: only if SD:/BTBENCH.RUN exists (deleted first). BT mode, then the normal boot.
+     * mode=rec (3): no BT; the home loop below records once through the REC-switch path (bt_bench_home_tick). */
+    int bench_home = 0;
     int bench_kind = bt_bench_boot(&g_exfat_vol, g_sd_mounted);
-    if (bench_kind) {
+    if (bench_kind == 3) {
+        bench_home = 1;
+    } else if (bench_kind) {
         if (bench_kind == 2) {
             run_bt_hp_screen(1);       /* mode=hp: headphones bench run (scan / connect / tone / player) */
         } else {
@@ -3183,6 +3191,25 @@ int openfw_main(void)
 
         /* 2. Record slide switch (overrides any screen immediately) */
         int rec_sw = keys_read_rec_switch();
+#if OPENFW_BT_BENCH
+        if (bench_home) {
+            /* BTBENCH.RUN mode=rec: the switch is held on for the run's recording (the same path as the slide) */
+            int ba = bt_bench_home_tick(now_ms, recorder_is_saving());
+            if (ba & BT_BENCH_HOME_HOLD) {
+                rec_sw = 1;
+            }
+            if (ba & BT_BENCH_HOME_DONE) {
+                bench_home = 0;
+                if (bt_bench_end(&g_exfat_vol, g_sd_mounted)) {
+                    (void)sd_flush(&g_sd_card);
+                    system_reboot();
+                }
+                prev_vbus               = 0; /* USB disk mode again with the cable in (as after boot) */
+                usb_probing             = 0;
+                usb_suppress_until_unpl = 0;
+            }
+        }
+#endif
         if (rec_sw != prev_rec_sw) {
             backlight_wake(now_ms);
             prev_rec_sw      = rec_sw;
@@ -3219,6 +3246,9 @@ int openfw_main(void)
                 prev_clip_events        = 0u;
 
                 apply_cfg_to_recorder();
+#if OPENFW_BT_BENCH
+                bt_bench_rec_apply(); /* BTBENCH.RUN mode=rec: rec_* for this recording only (no-op otherwise) */
+#endif
                 if (!g_sd_mounted) {
                     g_ui.sd_ok = 0;
                     rec_active = 0;
@@ -3388,6 +3418,9 @@ int openfw_main(void)
             } else if (!usb_suppress_until_unpl
 #if defined(OPENFW_HCI_PROBE) && OPENFW_HCI_PROBE
                        && !hci_probe_running() /* USB MSC starts after the probe's END */
+#endif
+#if OPENFW_BT_BENCH
+                       && !bench_home /* BTBENCH.RUN mode=rec: USB disk mode once the recording and its log are done */
 #endif
                        ) {
 #if OPENFW_UNATTENDED_DEV

@@ -86,6 +86,13 @@ void bt_bench_cfg_default(bt_bench_cfg_t *cfg)
     for (uint32_t i = 0u; i < sizeof(cfg->hp_file); i++) {
         cfg->hp_file[i] = '\0';
     }
+    cfg->rec = 0u;
+    cfg->rec_ch = BT_BENCH_REC_KEEP;
+    cfg->rec_gain = BT_BENCH_REC_KEEP;
+    cfg->rec_dsp = BT_BENCH_REC_KEEP;
+    cfg->rec_vor = BT_BENCH_REC_KEEP;
+    cfg->rec_secs = 0u;
+    cfg->delay_s = 0u;
 }
 
 static int hexval(uint8_t c)
@@ -188,15 +195,20 @@ enum {
     K_MODE, K_HP_FIRST,                      /* K_HP_FIRST.. are the hp_* keys (need mode=hp) */
     K_HP_STAGE = K_HP_FIRST, K_HP_ADDR, K_HP_PICK, K_HP_PAIR, K_HP_PSCAN, K_HP_SECS, K_HP_RATE, K_HP_BITPOOL,
     K_HP_SPEECH_BP, K_HP_MONO, K_HP_TICK_MS, K_HP_PKT_PER_TICK, K_HP_TXQ, K_HP_CREDIT_TICKS, K_HP_TONE_HZ, K_HP_FILE,
-    K_HP_CREDITS, K_HP_PIN, K_N
+    K_HP_CREDITS, K_HP_PIN,
+    K_REC_FIRST,                             /* K_REC_FIRST.. are the recording keys (mode=rec, or rec=1) */
+    K_REC = K_REC_FIRST, K_REC_SECS, K_REC_CH, K_REC_GAIN, K_REC_DSP, K_REC_VOR, K_DELAY_S, K_N
 };
 static const char *const k_keys[K_N] = { "secs", "pair", "pair_every", "pair_secs", "autoconfirm", "exit", "reboot",
                                          "xrec_pin", "ui", "smp", "coalesce", "spp_wr", "spp_buf", "tx_ring",
                                          "stat_secs", "mode", "hp_stage", "hp_addr", "hp_pick", "hp_pair", "hp_pscan",
                                          "hp_secs", "hp_rate", "hp_bitpool", "hp_speech_bp", "hp_mono", "hp_tick_ms",
                                          "hp_pkt_per_tick", "hp_txq", "hp_credit_ticks", "hp_tone_hz", "hp_file",
-                                         "hp_credits", "hp_pin" };
+                                         "hp_credits", "hp_pin", "rec", "rec_secs", "rec_ch", "rec_gain",
+                                         "rec_dsp", "rec_vor", "delay_s" };
 _Static_assert(K_N <= 64, "seen is a 64-bit key mask");
+#define KBIT(k) (1ull << (k))
+#define SEEN(k) ((seen & KBIT(k)) != 0u)
 
 /* Numeric hp_* keys: range and field. */
 static int hp_num(uint32_t k, int32_t n, bt_bench_cfg_t *c)
@@ -256,8 +268,7 @@ static int hp_num(uint32_t k, int32_t n, bt_bench_cfg_t *c)
 /* Cross-key rules of mode=hp (bt_bench.h). Returns 0 when consistent. */
 static int hp_rules(uint64_t seen, bt_bench_cfg_t *c)
 {
-#define SEEN(k) ((seen & (1ull << (k))) != 0u)
-    uint64_t hp_keys = ~((1ull << K_HP_FIRST) - 1u);
+    uint64_t hp_keys = KBIT(K_REC_FIRST) - KBIT(K_HP_FIRST);
     if (c->mode != BT_BENCH_MODE_HP) {
         return (seen & hp_keys) != 0u ? -1 : 0;
     }
@@ -293,7 +304,70 @@ static int hp_rules(uint64_t seen, bt_bench_cfg_t *c)
         c->hp_speech_bp = c->hp_bitpool;                 /* a nonzero default under a smaller explicit max */
     }
     return 0;
-#undef SEEN
+}
+
+/* Recording keys (bt_bench.h "Recording runs"). Returns 0 when consistent. */
+static int rec_rules(uint64_t seen, const bt_bench_cfg_t *c)
+{
+    uint64_t rec_settings = KBIT(K_N) - KBIT(K_REC_SECS);  /* rec_secs, rec_ch, rec_gain, rec_dsp, rec_vor, delay_s */
+    if (c->mode == BT_BENCH_MODE_HP) {
+        return (seen & (KBIT(K_REC) | rec_settings)) != 0u ? -1 : 0;
+    }
+    if (c->mode == BT_BENCH_MODE_REC) {
+        /* no Bluetooth this boot: the phone-session keys mean nothing; secs is the recording length */
+        if (SEEN(K_PAIR) || SEEN(K_PAIR_EVERY) || SEEN(K_PAIR_SECS) || SEEN(K_AUTOCONFIRM) || SEEN(K_XREC_PIN) ||
+            SEEN(K_REC) || SEEN(K_REC_SECS) || SEEN(K_UI) || SEEN(K_SMP) || SEEN(K_COALESCE) || SEEN(K_SPP_WR) ||
+            SEEN(K_SPP_BUF) || SEEN(K_TX_RING) || SEEN(K_STAT_SECS)) {
+            return -1;
+        }
+        return 0;
+    }
+    if (!c->rec) {
+        return (seen & rec_settings) != 0u ? -1 : 0;   /* recording settings without a recording */
+    }
+    /* the pre-roll starts at READY, not at t0: leave the bring-up's allowance on top */
+    if ((uint32_t)c->delay_s + BT_BENCH_REC_READY_S >= (uint32_t)c->secs) {
+        return -1;                                       /* the recording would not start */
+    }
+    if (c->rec_secs != 0u && (uint32_t)c->delay_s + c->rec_secs + BT_BENCH_REC_READY_S > (uint32_t)c->secs) {
+        return -1;                                       /* it would not reach its length */
+    }
+    return 0;
+}
+
+/* Numeric recording keys: range and field. */
+static int rec_num(uint32_t k, int32_t n, bt_bench_cfg_t *c)
+{
+    switch (k) {
+    case K_REC:
+        if (n != 0 && n != 1) return -1;
+        c->rec = (uint8_t)n;
+        return 0;
+    case K_REC_SECS:
+        if (n != 0 && (n < (int32_t)BT_BENCH_SECS_MIN || n > (int32_t)BT_BENCH_SECS_MAX)) return -1;
+        c->rec_secs = (uint16_t)n;
+        return 0;
+    case K_REC_CH:
+        if (n != 1 && n != 2) return -1;
+        c->rec_ch = (uint8_t)n;
+        return 0;
+    case K_REC_GAIN:
+        if (n < 0 || n > 31) return -1;
+        c->rec_gain = (uint8_t)n;
+        return 0;
+    case K_REC_DSP:
+        if (n < 0 || n > 2) return -1;                   /* ASR raw, Voice Clarity, bypass (audio_dsp.h) */
+        c->rec_dsp = (uint8_t)n;
+        return 0;
+    case K_REC_VOR:
+        if (n != 0 && n != 1) return -1;
+        c->rec_vor = (uint8_t)n;
+        return 0;
+    default:                                             /* K_DELAY_S */
+        if (n < 0 || n > (int32_t)BT_BENCH_DELAY_MAX) return -1;
+        c->delay_s = (uint16_t)n;
+        return 0;
+    }
 }
 
 bt_bench_err_t bt_bench_parse(const uint8_t *buf, uint32_t len, bt_bench_cfg_t *cfg, uint32_t *err_at)
@@ -349,13 +423,19 @@ bt_bench_err_t bt_bench_parse(const uint8_t *buf, uint32_t len, bt_bench_cfg_t *
         if (k == K_N) {
             return BT_BENCH_E_KEY;
         }
-        if (seen & (1ull << k)) {
+        if (SEEN(k)) {
             return BT_BENCH_E_DUP;
         }
-        seen |= 1ull << k;
+        seen |= KBIT(k);
         const uint8_t *v = &buf[eq + 1u];
         uint32_t vn = i - eq - 1u;
         int32_t n = number(v, vn);
+        if (k >= K_REC_FIRST) {
+            if (rec_num(k, n, &c) != 0) {
+                return BT_BENCH_E_VALUE;
+            }
+            continue;
+        }
         if (k >= K_HP_FIRST && k != K_HP_STAGE && k != K_HP_ADDR && k != K_HP_PICK && k != K_HP_RATE &&
             k != K_HP_FILE) {
             if (hp_num(k, n, &c) != 0) {
@@ -369,6 +449,8 @@ bt_bench_err_t bt_bench_parse(const uint8_t *buf, uint32_t len, bt_bench_cfg_t *
                 c.mode = BT_BENCH_MODE_PHONE;
             } else if (word_is(v, vn, "hp")) {
                 c.mode = BT_BENCH_MODE_HP;
+            } else if (word_is(v, vn, "rec")) {
+                c.mode = BT_BENCH_MODE_REC;
             } else {
                 return BT_BENCH_E_VALUE;
             }
@@ -504,7 +586,8 @@ bt_bench_err_t bt_bench_parse(const uint8_t *buf, uint32_t len, bt_bench_cfg_t *
             break;
         }
     }
-    if (((c.pair_every != 0u || c.xrec_pin[0] != '\0') && !c.pair) || c.spp_buf < c.spp_wr || hp_rules(seen, &c) != 0) {
+    if (((c.pair_every != 0u || c.xrec_pin[0] != '\0') && !c.pair) || c.spp_buf < c.spp_wr || hp_rules(seen, &c) != 0 ||
+        rec_rules(seen, &c) != 0) {
         if (err_at != NULL) {
             *err_at = 0u;
         }
@@ -565,6 +648,134 @@ bt_bench_trig_t bt_bench_take(exfat_vol_t *vol, int mounted, bt_bench_cfg_t *cfg
         *cfg = c;
     }
     return BT_BENCH_TRIG_TAKEN;
+}
+
+const char *bt_bench_mode_name(uint8_t mode)
+{
+    return mode == BT_BENCH_MODE_PHONE ? "phone" : mode == BT_BENCH_MODE_HP ? "hp" : mode == BT_BENCH_MODE_REC ? "rec"
+                                                                                                         : "?";
+}
+
+const char *bt_bench_rec_why_name(uint8_t why)
+{
+    switch (why) {
+    case BT_BENCH_REC_WHY_NONE:
+        return "-";
+    case BT_BENCH_REC_WHY_TIME:
+        return "time";
+    case BT_BENCH_REC_WHY_CUT:
+        return "cut";
+    case BT_BENCH_REC_WHY_ENDED:
+        return "ended";
+    case BT_BENCH_REC_WHY_NOSTART:
+        return "nostart";
+    case BT_BENCH_REC_WHY_NOTSTARTED:
+        return "notstarted";
+    case BT_BENCH_REC_WHY_FAULT:
+        return "fault";
+    case BT_BENCH_REC_WHY_LEFT:
+        return "left";
+    default:
+        return "?";
+    }
+}
+
+void bt_bench_rec_init(bt_bench_rec_t *r, uint32_t delay_s, uint32_t len_s, int gated, uint32_t now)
+{
+    r->delay_ms = delay_s * 1000u;
+    r->len_ms = len_s * 1000u;
+    r->t_gate = now;
+    r->t_start = now;
+    r->st = gated ? BT_BENCH_REC_GATE : BT_BENCH_REC_PREROLL;
+    r->why = BT_BENCH_REC_WHY_NONE;
+    r->seen = 0u;
+}
+
+void bt_bench_rec_open(bt_bench_rec_t *r, uint32_t now)
+{
+    if (r->st == BT_BENCH_REC_GATE) {
+        r->st = BT_BENCH_REC_PREROLL;
+        r->t_gate = now;
+    }
+}
+
+static void rec_done(bt_bench_rec_t *r, uint8_t why)
+{
+    r->st = BT_BENCH_REC_DONE;
+    r->why = why;
+}
+
+uint32_t bt_bench_rec_tick(bt_bench_rec_t *r, uint32_t now, int saving)
+{
+    switch (r->st) {
+    case BT_BENCH_REC_PREROLL:
+        if (now - r->t_gate >= r->delay_ms) {           /* wrap-safe */
+            r->st = BT_BENCH_REC_ON;
+            r->t_start = now;
+            r->seen = 0u;
+            return BT_BENCH_REC_ACT_START;
+        }
+        return 0u;
+    case BT_BENCH_REC_ON:
+        if (!saving) {                                   /* never started, or stopped by itself: nothing to stop */
+            rec_done(r, r->seen ? BT_BENCH_REC_WHY_ENDED : BT_BENCH_REC_WHY_NOSTART);
+            return 0u;
+        }
+        r->seen = 1u;
+        if (r->len_ms != 0u && now - r->t_start >= r->len_ms) {
+            rec_done(r, BT_BENCH_REC_WHY_TIME);
+            return BT_BENCH_REC_ACT_STOP;
+        }
+        return 0u;
+    default:
+        return 0u;
+    }
+}
+
+uint32_t bt_bench_rec_cut(bt_bench_rec_t *r, int saving)
+{
+    switch (r->st) {
+    case BT_BENCH_REC_GATE:
+    case BT_BENCH_REC_PREROLL:
+        rec_done(r, BT_BENCH_REC_WHY_NOTSTARTED);
+        return 0u;
+    case BT_BENCH_REC_ON:
+        if (!saving) {
+            rec_done(r, r->seen ? BT_BENCH_REC_WHY_ENDED : BT_BENCH_REC_WHY_NOSTART);
+            return 0u;
+        }
+        rec_done(r, BT_BENCH_REC_WHY_CUT);
+        return BT_BENCH_REC_ACT_STOP;
+    default:
+        return 0u;
+    }
+}
+
+uint32_t bt_bench_rec_fault(bt_bench_rec_t *r, int saving)
+{
+    switch (r->st) {
+    case BT_BENCH_REC_PREROLL:
+        rec_done(r, BT_BENCH_REC_WHY_FAULT);
+        return 0u;
+    case BT_BENCH_REC_ON:
+        if (!saving) {
+            rec_done(r, r->seen ? BT_BENCH_REC_WHY_ENDED : BT_BENCH_REC_WHY_NOSTART);
+            return 0u;
+        }
+        rec_done(r, BT_BENCH_REC_WHY_FAULT);
+        return BT_BENCH_REC_ACT_STOP;
+    default:
+        return bt_bench_rec_cut(r, saving);
+    }
+}
+
+uint32_t bt_bench_rec_leave(bt_bench_rec_t *r, int saving, int rec_error)
+{
+    if (r->st == BT_BENCH_REC_ON && !saving && r->seen && !rec_error) {
+        rec_done(r, BT_BENCH_REC_WHY_LEFT);
+        return 0u;
+    }
+    return bt_bench_rec_cut(r, saving);
 }
 
 const char *bt_bench_trig_name(bt_bench_trig_t t)
