@@ -283,6 +283,30 @@ static void t_sd_take(void)
     bench_meas_rec_stop(&m, 0u, 0u);
     bench_meas_rec_start(&m, "REC_0013.wav", 1u, 20u, 2u, 0u, 0u);
     CHECK(m.cur.sd_err == 0u && m.cur.sd_mdto == 0u && m.sd_err_total == 6u, "reset per recording");
+    /* SD write-path counters: only while recording, per recording, on their own "BENCH rec" suffix */
+    bench_meas_sd_wr(&m, BENCH_MEAS_SDW_BCI1);
+    bench_meas_sd_wr(&m, BENCH_MEAS_SDW_BCI1);
+    bench_meas_sd_wr(&m, BENCH_MEAS_SDW_BCIM);
+    bench_meas_sd_wr(&m, BENCH_MEAS_SDW_RETRY);
+    bench_meas_sd_wr(&m, BENCH_MEAS_SDW_RETRY);
+    bench_meas_sd_wr(&m, BENCH_MEAS_SDW_RETRY);
+    bench_meas_sd_wr(&m, BENCH_MEAS_SDW_REINIT);
+    bench_meas_sd_wr(&m, 99u);
+    bench_meas_format_sdw(&m.cur, ' ', line, sizeof(line));
+    CHECK(strcmp(line, "sd_bci1=2 sd_bcim=1 sd_retry=3 sd_reinit=1") == 0, "sdw '%s'", line);
+    {
+        bench_meas_rec_t wide;
+        memset(&wide, 0xFF, sizeof(wide));
+        char sdw[BENCH_MEAS_SDW_LINE_MAX];
+        uint32_t n = bench_meas_format_sdw(&wide, ' ', sdw, sizeof(sdw));
+        CHECK(n + 1u < BENCH_MEAS_SDW_LINE_MAX && n == strlen(sdw), "sdw width %u", n);
+    }
+    bench_meas_capture_end(&m, 2u);
+    bench_meas_rec_stop(&m, 0u, 0u);
+    bench_meas_sd_wr(&m, BENCH_MEAS_SDW_RETRY);                /* not recording: ignored */
+    CHECK(bench_meas_hist(&m, 0u)->sd_retry == 3u, "idle sd_wr ignored");
+    bench_meas_rec_start(&m, "REC_0014.wav", 1u, 20u, 2u, 0u, 0u);
+    CHECK(m.cur.sd_bci1 == 0u && m.cur.sd_retry == 0u && m.cur.sd_reinit == 0u, "sd_wr reset per recording");
     bench_meas_cpu_take(&m, 120u);
     bench_meas_cpu_take(&m, 90u);
     bench_meas_format_cpu(&m, ',', line, sizeof(line));

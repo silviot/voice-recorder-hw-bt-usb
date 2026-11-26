@@ -95,6 +95,24 @@ static void mem_copy(void *dst, const void *src, uint32_t n)
     }
 }
 
+/* Every device write goes through here: a BLKDEV_ERR_FINAL (the device already retried and gave up) is remembered
+ * for exfat_write(), which reports it to its caller instead of a plain -1, also when it happened in a FAT / bitmap
+ * write of a cluster allocation. */
+static int dev_write(exfat_vol_t *vol, uint32_t lba, uint32_t count, const void *buf)
+{
+    int rc = vol->dev->write_sectors(vol->dev->ctx, lba, count, buf);
+    if (rc == BLKDEV_ERR_FINAL) {
+        vol->wr_final = 1u;
+    }
+    return rc;
+}
+
+/* The same for the directory / zeroing helpers that hold a const volume (not on the exfat_write() path). */
+static int dev_write_c(const exfat_vol_t *vol, uint32_t lba, uint32_t count, const void *buf)
+{
+    return vol->dev->write_sectors(vol->dev->ctx, lba, count, buf);
+}
+
 static char ascii_lower(char c)
 {
     if (c >= 'A' && c <= 'Z') {
@@ -941,7 +959,7 @@ static int fat_set_entry(const exfat_vol_t *cvol, uint32_t cluster, uint32_t val
     }
     exfat_vol_t *vol = (exfat_vol_t *)(uintptr_t)cvol;
     put_le32(vol->fat_cache + fat_in_sec, value);
-    if (vol->dev->write_sectors(vol->dev->ctx, lba, 1u, vol->fat_cache) != 0) {
+    if (dev_write(vol, lba, 1u, vol->fat_cache) != 0) {
         vol->fat_cache_valid = 0u;
         return -1;
     }
@@ -1027,7 +1045,7 @@ static int scan_bitmap_range(exfat_vol_t *vol, uint32_t start_byte, uint32_t end
                         }
                         uint32_t new_c = idx + 2u;
                         sec[b] |= (uint8_t)(1u << bit);
-                        if (vol->dev->write_sectors(vol->dev->ctx, base_lba + s, 1u, sec) != 0) {
+                        if (dev_write(vol, base_lba + s, 1u, sec) != 0) {
                             vol->free_valid = 0u;   /* the bit may or may not be on the card */
                             return -1;
                         }
@@ -1044,7 +1062,7 @@ static int scan_bitmap_range(exfat_vol_t *vol, uint32_t start_byte, uint32_t end
                                 } else {
                                     put_le32(vol->fat_cache + ((new_c & 127u) << 2), 0xFFFFFFFFu);
                                     put_le32(vol->fat_cache + ((prev_cluster & 127u) << 2), new_c);
-                                    if (vol->dev->write_sectors(vol->dev->ctx, flba, 1u, vol->fat_cache) != 0) {
+                                    if (dev_write(vol, flba, 1u, vol->fat_cache) != 0) {
                                         vol->fat_cache_valid = 0u;
                                         fat_rc = -1;
                                     }
@@ -1060,7 +1078,7 @@ static int scan_bitmap_range(exfat_vol_t *vol, uint32_t start_byte, uint32_t end
                         }
                         if (fat_rc != 0) {
                             sec[b] &= (uint8_t)~(1u << bit);
-                            if (vol->dev->write_sectors(vol->dev->ctx, base_lba + s, 1u, sec) != 0) {
+                            if (dev_write(vol, base_lba + s, 1u, sec) != 0) {
                                 vol->free_valid = 0u;   /* the rollback did not reach the card */
                             }
                             return -1;
@@ -1147,7 +1165,7 @@ static int free_cluster_bit(exfat_vol_t *vol, uint32_t cluster)
     }
     int was_set = (sec[in_sec] & (1u << bit)) != 0u;
     sec[in_sec] &= (uint8_t)~(1u << bit);
-    if (vol->dev->write_sectors(vol->dev->ctx, lba, 1u, sec) != 0) {
+    if (dev_write(vol, lba, 1u, sec) != 0) {
         vol->free_valid = 0u;
         return -1;
     }
@@ -1172,7 +1190,7 @@ static int zero_cluster(const exfat_vol_t *vol, uint32_t cluster)
         if (chunk > 4u) {
             chunk = 4u;
         }
-        if (vol->dev->write_sectors(vol->dev->ctx, base_lba + s, chunk, zero) != 0) {
+        if (dev_write_c(vol, base_lba + s, chunk, zero) != 0) {
             return -1;
         }
         s += chunk;
@@ -1306,7 +1324,7 @@ static int grow_dir_size_in_parent(const exfat_vol_t *vol, const exfat_parent_lo
         put_le64(s + 8u, new_len);
         put_le64(s + 24u, new_len);
         put_le16(f + 2u, exfat_entry_set_checksum(f, total_ents));
-        return vol->dev->write_sectors(vol->dev->ctx, lba0, 1u, sec0);
+        return dev_write_c(vol, lba0, 1u, sec0);
     }
 
     /* Sector-spanning path (handles slot 15 and entries crossing sector/cluster boundaries) */
@@ -1379,11 +1397,11 @@ static int grow_dir_size_in_parent(const exfat_vol_t *vol, const exfat_parent_lo
 
     put_le16(f + 2u, sum);
     if (s_in_sec1) {
-        if (vol->dev->write_sectors(vol->dev->ctx, lba1, 1u, sec1) != 0) {
+        if (dev_write_c(vol, lba1, 1u, sec1) != 0) {
             return -1;
         }
     }
-    return vol->dev->write_sectors(vol->dev->ctx, lba0, 1u, sec0);
+    return dev_write_c(vol, lba0, 1u, sec0);
 }
 
 static int dir_alloc_slots(exfat_vol_t *vol, uint32_t dir_cluster, uint8_t *dir_no_fat_chain,
@@ -1436,7 +1454,7 @@ static int dir_alloc_slots(exfat_vol_t *vol, uint32_t dir_cluster, uint8_t *dir_
                                 for (uint32_t k = pad_slot; k < 16u; k++) {
                                     psec[k * 32u] = 0x05u;
                                 }
-                                if (vol->dev->write_sectors(vol->dev->ctx, pad_lba, 1u, psec) != 0) {
+                                if (dev_write(vol, pad_lba, 1u, psec) != 0) {
                                     return -1;
                                 }
                             }
@@ -1577,7 +1595,7 @@ int exfat_mkdir(exfat_vol_t *vol, const char *name)
     }
     build_entry_set(&sec[(uint32_t)slot_idx * 32u], total_ents, name, name_len,
                     EXFAT_ATTR_DIR, dir_cls, vol->cluster_size, vol->default_timestamp);
-    if (vol->dev->write_sectors(vol->dev->ctx, slot_lba, 1u, sec) != 0) {
+    if (dev_write(vol, slot_lba, 1u, sec) != 0) {
         (void)fat_set_entry(vol, dir_cls, 0u);
         (void)free_cluster_bit(vol, dir_cls);
         return -1;
@@ -1627,7 +1645,7 @@ int exfat_create_file(exfat_vol_t *vol, const char *dir_path, const char *filena
     }
     build_entry_set(&sec[(uint32_t)slot_idx * 32u], total_ents, filename, name_len,
                     EXFAT_ATTR_ARCHIVE, 0u, 0u, vol->default_timestamp);
-    if (vol->dev->write_sectors(vol->dev->ctx, slot_lba, 1u, sec) != 0) {
+    if (dev_write(vol, slot_lba, 1u, sec) != 0) {
         return -1;
     }
 
@@ -1659,7 +1677,7 @@ static int writer_write_sectors(exfat_writer_t *w, const uint8_t *sec_data, uint
     }
 
     uint32_t lba = cluster_to_lba(w->vol, w->cur_cluster) + w->sec_in_cluster;
-    if (w->vol->dev->write_sectors(w->vol->dev->ctx, lba, count, sec_data) != 0) {
+    if (dev_write(w->vol, lba, count, sec_data) != 0) {
         if (allocated) {
             /* Unlink and free freshly allocated unused cluster so FAT chain stays fsck-clean */
             if (prev_cluster >= 2u) {
@@ -1683,6 +1701,7 @@ int exfat_write(exfat_writer_t *w, const void *data, uint32_t len)
     if (!w || !w->active || (!data && len > 0u)) {
         return -1;
     }
+    w->vol->wr_final = 0u;
     if (len == 0u) {
         return 0;
     }
@@ -1700,7 +1719,7 @@ int exfat_write(exfat_writer_t *w, const void *data, uint32_t len)
                 nsec = cls_avail;
             }
             if (writer_write_sectors(w, src, nsec) != 0) {
-                return -1;
+                return w->vol->wr_final ? BLKDEV_ERR_FINAL : -1;
             }
             uint32_t bytes = nsec << 9;
             src              += bytes;
@@ -1717,7 +1736,7 @@ int exfat_write(exfat_writer_t *w, const void *data, uint32_t len)
         if (prev_used + take == 512u) {
             if (writer_write_sectors(w, w->sec_buf, 1u) != 0) {
                 /* Leave w->sec_buf_used at prev_used (< 512) and do not advance bytes_written */
-                return -1;
+                return w->vol->wr_final ? BLKDEV_ERR_FINAL : -1;
             }
             w->sec_buf_used   = 0u;
             w->bytes_written += take;
@@ -1756,7 +1775,7 @@ int exfat_patch_header(exfat_writer_t *w, const void *hdr, uint32_t len)
         return -1;
     }
     mem_copy(sec, hdr, len);
-    return w->vol->dev->write_sectors(w->vol->dev->ctx, lba, 1u, sec);
+    return dev_write(w->vol, lba, 1u, sec);
 }
 
 int exfat_checkpoint_file(exfat_writer_t *w, const void *hdr, uint32_t hdr_len)
@@ -1803,7 +1822,7 @@ int exfat_checkpoint_file(exfat_writer_t *w, const void *hdr, uint32_t hdr_len)
     put_le32(s + 20u, w->first_cluster);
     put_le64(s + 24u, flushed);
     put_le16(f + 2u, exfat_entry_set_checksum(f, w->total_ents));
-    if (w->vol->dev->write_sectors(w->vol->dev->ctx, w->dir_lba, 1u, sec) != 0) {
+    if (dev_write(w->vol, w->dir_lba, 1u, sec) != 0) {
         return -1;
     }
 
@@ -1841,7 +1860,7 @@ int exfat_overwrite_sector(exfat_vol_t *vol, const exfat_entry_t *file, uint64_t
         cls = nxt;
     }
     uint32_t sec_in_cls = (uint32_t)((offset & ((uint64_t)vol->cluster_size - 1u)) >> 9);
-    return vol->dev->write_sectors(vol->dev->ctx, cluster_to_lba(vol, cls) + sec_in_cls, 1u, sec512);
+    return dev_write(vol, cluster_to_lba(vol, cls) + sec_in_cls, 1u, sec512);
 }
 
 static int free_file_clusters(exfat_vol_t *vol, uint32_t first_cluster, uint64_t size, uint8_t no_fat_chain);
@@ -1897,7 +1916,7 @@ int exfat_close_file(exfat_writer_t *w)
     put_le64(s + 24u, w->bytes_written);
     put_le16(f + 2u, exfat_entry_set_checksum(f, w->total_ents));
 
-    if (w->vol->dev->write_sectors(w->vol->dev->ctx, w->dir_lba, 1u, sec) != 0) {
+    if (dev_write(w->vol, w->dir_lba, 1u, sec) != 0) {
         return -1;
     }
 
@@ -2075,7 +2094,7 @@ int exfat_delete_file(exfat_vol_t *vol, const char *dir_path, const char *filena
             sl++;
             rem--;
         }
-        if (vol->dev->write_sectors(vol->dev->ctx, lba, 1u, sec) != 0) {
+        if (dev_write(vol, lba, 1u, sec) != 0) {
             return -1;
         }
         sl = 0u;
@@ -2120,7 +2139,7 @@ typedef struct {
 static int sec_wb_flush(const exfat_vol_t *vol, sec_wb_cache_t *c)
 {
     if (c->dirty) {
-        if (vol->dev->write_sectors(vol->dev->ctx, c->lba, 1u, c->buf) != 0) {
+        if (dev_write_c(vol, c->lba, 1u, c->buf) != 0) {
             return -1;
         }
         c->dirty = 0u;
@@ -2391,7 +2410,7 @@ int exfat_replace_file(exfat_vol_t *vol, const char *dir_path, const char *src_n
         put_le32(s + 20u, sc.result.first_cluster);
         put_le64(s + 24u, sc.result.size);
         put_le16(f + 2u, exfat_entry_set_checksum(f, 1u + (uint32_t)dc.loc.sec_cnt));
-        if (vol->dev->write_sectors(vol->dev->ctx, dc.loc.lba, 1u, sec) != 0) {
+        if (dev_write(vol, dc.loc.lba, 1u, sec) != 0) {
             return -1;
         }
     } else {
@@ -2422,7 +2441,7 @@ int exfat_replace_file(exfat_vol_t *vol, const char *dir_path, const char *src_n
             put_le64(ent + 32u + 8u, sc.result.valid_data_len);
             put_le16(ent + 2u, exfat_entry_set_checksum(ent, total_ents));
         }
-        if (vol->dev->write_sectors(vol->dev->ctx, slot_lba, 1u, sec) != 0) {
+        if (dev_write(vol, slot_lba, 1u, sec) != 0) {
             return -1;
         }
         /* If dst existed spanning sectors, unlink its old dir slots now */
@@ -2444,7 +2463,7 @@ int exfat_replace_file(exfat_vol_t *vol, const char *dir_path, const char *src_n
                     dsl++;
                     drem--;
                 }
-                if (vol->dev->write_sectors(vol->dev->ctx, dlba, 1u, sec) != 0) {
+                if (dev_write(vol, dlba, 1u, sec) != 0) {
                     return -1;
                 }
                 dsl = 0u;
@@ -2479,7 +2498,7 @@ int exfat_replace_file(exfat_vol_t *vol, const char *dir_path, const char *src_n
             sl++;
             rem--;
         }
-        if (vol->dev->write_sectors(vol->dev->ctx, lba, 1u, sec) != 0) {
+        if (dev_write(vol, lba, 1u, sec) != 0) {
             return -1;
         }
         sl = 0u;

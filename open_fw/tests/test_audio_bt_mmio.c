@@ -530,6 +530,7 @@ static int g_sd_fail_after = -1;
 static uint32_t g_sd_fail_skip;    /* transient fault: let this many writes through, then ... */
 static uint32_t g_sd_fail_n;       /* ... fail this many, then succeed again */
 static uint32_t g_sd_fail_hits;
+static int      g_sd_fail_code = -1;   /* what the transient fault returns (BLKDEV_ERR_FINAL: the driver gave up) */
 
 static int mem_write_sectors(void *ctx, uint32_t lba, uint32_t count, const void *buf)
 {
@@ -540,7 +541,7 @@ static int mem_write_sectors(void *ctx, uint32_t lba, uint32_t count, const void
         } else {
             g_sd_fail_n--;
             g_sd_fail_hits++;
-            return -1;
+            return g_sd_fail_code;
         }
     }
     if (g_sd_fail_after >= 0) {
@@ -1005,6 +1006,24 @@ static void test_recorder(const char *exfat_img_path)
         assert(fwrite(g_soc.sd_buf, 1u, (size_t)sz, rf) == (size_t)sz);
         fclose(rf);
     }
+
+    /* Recording #10: the SD driver reports BLKDEV_ERR_FINAL (it already retried, re-initialised and gave up): the
+     * recorder must not spend another retry round on top (a retry here would succeed - the fault is one-shot - so
+     * a recording that goes on means it retried). */
+    assert(recorder_start(&vol, 1) == 0);
+    sim_dma_deliver_frame(70, 9000, NULL);
+    recorder_poll();
+    assert(recorder_has_error() == 0);
+    g_sd_fail_skip = 0u;
+    g_sd_fail_n    = 1u;
+    g_sd_fail_hits = 0u;
+    g_sd_fail_code = BLKDEV_ERR_FINAL;
+    sim_dma_deliver_frame(80, 9000, NULL);
+    recorder_poll();
+    assert(g_sd_fail_hits == 1u && g_sd_fail_n == 0u);
+    assert(recorder_has_error() == 1 && recorder_is_saving() == 0);
+    assert(recorder_stop() == -1);
+    g_sd_fail_code = -1;
 
     /* Restore clean snapshot for fsck.exfat validation */
     memcpy(g_soc.sd_buf, sd_clean, (size_t)sz);

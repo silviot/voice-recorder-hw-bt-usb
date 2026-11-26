@@ -290,8 +290,9 @@ static void recorder_checkpoint_if_due(void)
     }
 }
 
-/* exfat_write() with bounded retries. The SD driver already retries every sector (state recovery, re-init); this
- * layer covers a failure that surfaced anyway (e.g. a cluster allocation that failed and was rolled back). exfat_write
+/* exfat_write() with bounded retries. The SD driver already retries every sector (state recovery, re-init) and reports
+ * BLKDEV_ERR_FINAL when it gave up; that is not retried here. This layer covers a failure that surfaced anyway (e.g.
+ * a cluster allocation that failed and was rolled back). exfat_write
  * advances bytes_written by exactly the bytes it consumed, also when it fails part-way, so a retry continues with the
  * unconsumed remainder: nothing is written twice, skipped or reordered. */
 static int rec_write_retry(const int16_t *pcm, uint32_t nbytes)
@@ -306,11 +307,12 @@ static int rec_write_retry(const int16_t *pcm, uint32_t nbytes)
         if (attempt > 0u) {
             rec_log_err("wretry", g_pcm_bytes + (uint32_t)took);
         }
-        if (exfat_write(&g_writer, src + took, nbytes - (uint32_t)took) == 0) {
+        int rc = exfat_write(&g_writer, src + took, nbytes - (uint32_t)took);
+        if (rc == 0) {
             return 0;
         }
-        if (!g_writer.active) {
-            return -1;
+        if (rc == BLKDEV_ERR_FINAL || !g_writer.active) {
+            return -1;     /* the SD driver already retried and re-initialised: another round only stalls longer */
         }
     }
     return -1;
@@ -534,14 +536,16 @@ void recorder_poll(void)
  * Pushed whole under FreeRTOS BASEPRI (no task switch or BT IRQ, priority-0 audio DMAC IRQs stay unmasked). */
 static void bm_log_rec(void)
 {
-    static char bm_line[16u + BENCH_MEAS_LINE_MAX];
+    static char bm_line[16u + BENCH_MEAS_LINE_MAX + BENCH_MEAS_SDW_LINE_MAX];
     static const char k_tag[] = "BENCH rec ";
     uint32_t n = 0u;
     while (k_tag[n] != '\0') {
         bm_line[n] = k_tag[n];
         n++;
     }
-    n += bench_meas_format_rec(&g_bench_meas.cur, ' ', &bm_line[n], (uint32_t)sizeof(bm_line) - n - 1u);
+    n += bench_meas_format_rec(&g_bench_meas.cur, ' ', &bm_line[n], (uint32_t)sizeof(bm_line) - n - 2u);
+    bm_line[n++] = ' ';
+    n += bench_meas_format_sdw(&g_bench_meas.cur, ' ', &bm_line[n], (uint32_t)sizeof(bm_line) - n - 1u);
     bm_line[n++] = '\n';
     bm_line[n] = '\0';
     REC_LOG_CRIT_ENTER();

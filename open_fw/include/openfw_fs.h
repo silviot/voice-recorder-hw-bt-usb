@@ -18,6 +18,10 @@ typedef struct {
     void *ctx;
 } blkdev_t;
 
+/* write_sectors() result: the device already retried (state recovery, re-initialisation) and gave up. Callers must
+ * not retry on top of it (the time is already spent); exfat_write() passes it through. Any other non-zero = error. */
+#define BLKDEV_ERR_FINAL (-2)
+
 typedef struct {
     uint32_t first_cluster;
     uint32_t cluster_idx;
@@ -50,6 +54,7 @@ typedef struct {
     uint8_t  fat_cache_valid;
     uint32_t fat_cache_lba;
     uint8_t  fat_cache[512] __attribute__((aligned(4)));
+    uint8_t  wr_final;        /* a device write returned BLKDEV_ERR_FINAL during the current exfat_write() */
 } exfat_vol_t;
 
 #define EXFAT_MAX_NAME 64u

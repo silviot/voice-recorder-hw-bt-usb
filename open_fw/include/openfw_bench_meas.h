@@ -63,6 +63,10 @@ typedef struct {
     uint32_t b_el_us_rem;
     uint32_t sd_err;        /* SD driver errors while recording (SDW_MDTO included) */
     uint32_t sd_mdto;       /* SDW_MDTO among them */
+    uint32_t sd_bci1;       /* CMD24 data phases that saw RINTSTS bit 13 (busy clear: benign, not an error) */
+    uint32_t sd_bcim;       /* CMD25 data phases that saw it */
+    uint32_t sd_retry;      /* sector write retries (SDW_RETRY) */
+    uint32_t sd_reinit;     /* in-place SD re-initialisations by the write retry path (SD_REINIT) */
     uint32_t ov;            /* ring overruns (blocks dropped by the ISR) */
     uint32_t comp;          /* zero blocks written for them */
     uint32_t wav_frames;    /* frames written to the WAV (zero blocks included) */
@@ -113,6 +117,12 @@ void bench_meas_rec_stop(bench_meas_t *m, uint32_t dma_blk, uint32_t ov_total);
 void bench_meas_dma_stamp(bench_meas_t *m, uint32_t blk, uint32_t blk_us);
 /* One SD driver error (sdio_log_err tag; "SDW_MDTO" also counts as sd_mdto). */
 void bench_meas_sd_err(bench_meas_t *m, const char *tag);
+/* One SD write-path event (BENCH_MEAS_SDW_*), counted while recording. */
+#define BENCH_MEAS_SDW_BCI1   0u
+#define BENCH_MEAS_SDW_BCIM   1u
+#define BENCH_MEAS_SDW_RETRY  2u
+#define BENCH_MEAS_SDW_REINIT 3u
+void bench_meas_sd_wr(bench_meas_t *m, uint32_t kind);
 /* GETS payload bytes of one frame sent. */
 void bench_meas_gets(bench_meas_t *m, uint32_t bytes);
 /* One CPU window (permille of wall time; win_ms its length). */
@@ -139,5 +149,9 @@ int32_t  bench_meas_bdrift(const bench_meas_rec_t *r);
  * cpu: gets_tot gets_fr idle_pm app_pm btc_pm cpu_ms take_us (sd_err_total: the BTBENCH.LOG trailer) */
 uint32_t bench_meas_format_rec(const bench_meas_rec_t *r, char sep, char *buf, uint32_t cap);
 uint32_t bench_meas_format_cpu(const bench_meas_t *m, char sep, char *buf, uint32_t cap);
+/* SD write-path counters of one recording (appended to the "BENCH rec" log line only, not to +XREC:DBG):
+ * sd_bci1 sd_bcim sd_retry sd_reinit. Same contract as above. */
+#define BENCH_MEAS_SDW_LINE_MAX 96u        /* 4 x (10-digit value + key) + separators = 79 B */
+uint32_t bench_meas_format_sdw(const bench_meas_rec_t *r, char sep, char *buf, uint32_t cap);
 
 #endif /* OPENFW_BENCH_MEAS_H */

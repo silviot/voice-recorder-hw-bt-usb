@@ -528,6 +528,8 @@ static inline int gpio_read(uint32_t port, uint32_t pin)
 #define SDIO_INT_DATA_ERRS  (SDIO_INT_RCRC | SDIO_INT_DCRC | SDIO_INT_RTO | SDIO_INT_DRTO | SDIO_INT_SBE | SDIO_INT_EBE)
 #define SDIO_STAT_FIFO_EMP  (1u << 2)
 #define SDIO_STAT_FIFO_FULL (1u << 3)
+#define SDIO_STAT_DATA_BUSY (1u << 9)    /* dw_mmc STATUS.data_busy: card holds DAT0 low (programming) */
+#define SDIO_STAT_DSM_BUSY  (1u << 10)   /* dw_mmc STATUS.data_state_mc_busy: the CIU data path is still armed */
 #define SDIO_CTRL_USE_IDMAC (1u << 25)
 #define SDIO_IDMAC_BMOD_SWR (1u << 0)
 #define SDIO_IDMAC_BMOD_FB  (1u << 1)
