@@ -37,6 +37,9 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             clang lld llvm exfatprogs python3 python3-pil
 
+      - name: Fetch LVGL sources
+        run: make -C open_fw fetch-lvgl
+
       - name: Run OpenFW host unit and MMIO driver tests
         run: make -C open_fw test-host
 

@@ -846,12 +846,14 @@ static void bind_files(const ui_model_t *m)
 
     for (int r = 0; r < 3; r++) {
         int idx = m->file_scroll + r;
-        if (idx < 0 || idx >= m->file_count) {
+        int rel = idx - m->files_offset;
+        if (!m->files || idx < 0 || idx >= m->file_count || rel < 0 ||
+            (m->files_cap > 0 && rel >= m->files_cap)) {
             set_hidden(rows[r], true);
             continue;
         }
         set_hidden(rows[r], false);
-        const ui_file_entry_t *f = &m->files[idx];
+        const ui_file_entry_t *f = &m->files[rel];
         int sel = (idx == m->file_sel);
         set_changed_bg_opa(rows[r], sel ? LV_OPA_COVER : LV_OPA_TRANSP);
 
@@ -887,7 +889,7 @@ static void bind_files(const ui_model_t *m)
             set_changed_bg_color(badges[r], lv_color_hex(sel ? UI_HEX_TEXT : UI_HEX_FAINT));
             set_changed_text_color(badges[r], lv_color_hex(sel ? UI_HEX_PILL : UI_HEX_TEXT));
 #if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID
-        } else if (!f->is_dir && m->files_title[0] == '\0' && is_generic_recording_name(f->filename)) {
+        } else if (!f->is_dir && f->in_record_dir && is_generic_recording_name(f->filename)) {
             if (m->bt_bg_state == UI_BT_BG_XFER && same_stem_ci(f->filename, m->bt_xfer_name)) {
                 set_hidden(badges[r], false);
                 set_changed_text(badges[r], m->bt_xfer_up ? "\xE2\x96\xB2" : "\xE2\x96\xBC");
@@ -919,15 +921,22 @@ static lv_color_t tr_speaker_lv_color(uint8_t idx, uint16_t rgb565)
     return lv_color_hex(fallback[idx & 3u]);
 }
 
-static void format_vol_label(char *dst, size_t cap, int hp_plugged, uint8_t vol)
+static void format_vol_label(char *dst, size_t cap, const char *src_tag, uint8_t vol)
 {
     uint32_t tenths = ((uint32_t)vol * 100u + 15u) / 31u;
     if (tenths % 10u != 0u) {
-        lv_snprintf(dst, cap, "%s %u.%u", hp_plugged ? "HP" : "SPK",
+        lv_snprintf(dst, cap, "%s %u.%u", src_tag,
                     (unsigned)(tenths / 10u), (unsigned)(tenths % 10u));
     } else {
-        lv_snprintf(dst, cap, "%s %u", hp_plugged ? "HP" : "SPK", (unsigned)(tenths / 10u));
+        lv_snprintf(dst, cap, "%s %u", src_tag, (unsigned)(tenths / 10u));
     }
+}
+
+static void format_model_vol(char *dst, size_t cap, const ui_model_t *m)
+{
+    const char *tag = m->play_bt_audio ? "BT" : (m->hp_plugged ? "HP" : "SPK");
+    uint8_t     vol = m->play_bt_audio ? m->play_bt_vol : (m->hp_plugged ? m->cfg.hp_vol : m->cfg.spk_vol);
+    format_vol_label(dst, cap, tag, vol);
 }
 
 /* "2×", "−4×" (U+2212 minus) */
@@ -969,8 +978,7 @@ static void bind_player_tr(const ui_model_t *m, bool entering)
     int32_t dot_x = (pos >= 3600u) ? 51 : 43;
     if (m->play_vol_hi) {
         char vbuf[16];
-        uint8_t vol = m->hp_plugged ? m->cfg.hp_vol : m->cfg.spk_vol;
-        format_vol_label(vbuf, sizeof(vbuf), m->hp_plugged, vol);
+        format_model_vol(vbuf, sizeof(vbuf), m);
         set_hidden(objects.ptr_spk_dot, true);
         set_hidden(objects.ptr_bar_sub, true);
         set_hidden(objects.ptr_vol_pill, false);
@@ -1265,14 +1273,7 @@ static void bind_player(const ui_model_t *m, bool entering)
     format_file_title(dt_s, (int)sizeof(dt_s), &m->now, &m->play_file);
     set_changed_text(objects.player_date, dt_s);
 
-    uint8_t  vol    = m->hp_plugged ? m->cfg.hp_vol : m->cfg.spk_vol;
-    uint32_t tenths = (vol * 100u + 15u) / 31u;
-    if (tenths % 10u != 0u) {
-        lv_snprintf(vbuf, sizeof(vbuf), "%s %u.%u", m->hp_plugged ? "HP" : "SPK",
-                    (unsigned)(tenths / 10u), (unsigned)(tenths % 10u));
-    } else {
-        lv_snprintf(vbuf, sizeof(vbuf), "%s %u", m->hp_plugged ? "HP" : "SPK", (unsigned)(tenths / 10u));
-    }
+    format_model_vol(vbuf, sizeof(vbuf), m);
     if (speed != 0 && !m->play_vol_hi) {
         /* Speed dial: the pill shows the speed; amber when seeking silently. */
         format_speed(vbuf, sizeof(vbuf), speed);
@@ -1332,7 +1333,11 @@ static void bind_delete(const ui_model_t *m)
                     objects.del_batt_fill, objects.del_batt_nub,
                     m, UI_COL_RED, UI_COL_TEXT, UI_ICON_NONE, UI_COL_TEXT, ui_tr(UI_STR_DELETE_Q), NULL, NULL, 1);
     const ui_file_entry_t *f = &m->play_file;
-    if (m->files && m->file_sel >= 0 && m->file_sel < m->file_count) f = &m->files[m->file_sel];
+    int rel = m->file_sel - m->files_offset;
+    if (m->files && m->file_sel >= 0 && m->file_sel < m->file_count && rel >= 0 &&
+        (m->files_cap <= 0 || rel < m->files_cap)) {
+        f = &m->files[rel];
+    }
     char dt_s[32], dur_s[12], sub[52];
     format_file_title(dt_s, (int)sizeof(dt_s), &m->now, f);
     ui_format_duration(dur_s, (int)sizeof(dur_s), f->duration_sec);

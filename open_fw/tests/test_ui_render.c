@@ -651,6 +651,21 @@ static void check_bt_ui(ui_model_t *m)
     assert(strcmp(lv_label_get_text(objects.home_detail_3_0), "\xE2\x96\xBC REC_0056.wav") == 0);
     ui_render_screen(UI_SCR_FILES, &b);
     assert(strcmp(lv_label_get_text(objects.files_badge_2), "\xE2\x80\xA6") == 0);
+    /* Generic 4-digit/REC names outside /record (e.g. root folder) must NOT get the sync badge */
+    {
+        ui_file_entry_t non_rec = m->files[2];
+        non_rec.in_record_dir = 0u;
+        b.files = &non_rec;
+        b.file_count = 1;
+        b.file_sel = 0;
+        b.file_scroll = 0;
+        ui_render_screen(UI_SCR_FILES, &b);
+        assert(lv_obj_has_flag(objects.files_badge_0, LV_OBJ_FLAG_HIDDEN));
+        b.files = m->files;
+        b.file_count = m->file_count;
+        b.file_sel = m->file_sel;
+        b.file_scroll = m->file_scroll;
+    }
 
     b.bt_bg_state = UI_BT_BG_QUEUE;
     b.bt_sync_pending = 2u;
@@ -708,10 +723,10 @@ int main(int argc, char **argv)
     }
 
     static const ui_file_entry_t demo_files[4] = {
-        { "REC_0043.wav", { 2026, 11, 20, 5, 14, 32, 0 }, 192,  65, 1, 1, 2, 0 },
-        { "REC_0042.wav", { 2026, 11, 20, 5,  9,  5, 0 }, 1475, 0,  0, 1, 2, 0 },
-        { "REC_0041.wav", { 2026, 11, 19, 4, 18, 47, 0 }, 38,   0,  1, 0, 1, 0 },
-        { "REC_0040.wav", { 2026, 11, 16, 1,  8,  2, 0 }, 245,  0,  0, 0, 2, 0 },
+        { "REC_0043.wav", { 2026, 11, 20, 5, 14, 32, 0 }, 192,  65, 1, 1, 2, 0, 1 },
+        { "REC_0042.wav", { 2026, 11, 20, 5,  9,  5, 0 }, 1475, 0,  0, 1, 2, 0, 1 },
+        { "REC_0041.wav", { 2026, 11, 19, 4, 18, 47, 0 }, 38,   0,  1, 0, 1, 0, 1 },
+        { "REC_0040.wav", { 2026, 11, 16, 1,  8,  2, 0 }, 245,  0,  0, 0, 2, 0, 1 },
     };
 
     ui_model_t m;
@@ -854,8 +869,8 @@ int main(int argc, char **argv)
     /* Exercise folder row + Italian accented audiobook title rendering */
     {
         static const ui_file_entry_t folder_files[2] = {
-            { "Jekyll_Hyde",     { 2026, 11, 20, 5, 14, 32, 0 }, 41,  0, 0, 0, 0, 1 },
-            { "JH_01a_Cap1.wav", { 2026, 11, 20, 5, 14, 32, 0 }, 185, 0, 1, 1, 1, 0 },
+            { "Jekyll_Hyde",     { 2026, 11, 20, 5, 14, 32, 0 }, 41,  0, 0, 0, 0, 1, 0 },
+            { "JH_01a_Cap1.wav", { 2026, 11, 20, 5, 14, 32, 0 }, 185, 0, 1, 1, 1, 0, 0 },
         };
         m.files = folder_files;
         m.file_count = 2;
@@ -903,6 +918,42 @@ int main(int argc, char **argv)
     m.play_vu_l = 20u;
     ui_render_screen(UI_SCR_PLAYER, &m);
     assert(g_written_pixels > player_pixels && g_written_pixels - player_pixels < 160u * 10u);
+
+    /* BT headphone route must label volume pill "BT <vol>", not "SPK"/"HP" */
+    m.play_bt_audio = 1u;
+    m.play_bt_vol   = 31u;
+    m.play_vol_hi   = 1u;
+    ui_render_screen(UI_SCR_PLAYER, &m);
+    assert(strcmp(lv_label_get_text(objects.player_vol_lbl), "BT 10") == 0);
+    m.play_bt_audio = 0u;
+    m.play_bt_vol   = 0u;
+    m.play_vol_hi   = 0u;
+
+    /* Windowed CPU1 IPC file slice (files_offset / files_cap) preserves full file_count/index */
+    {
+        static const ui_file_entry_t slice_files[2] = {
+            { "WIN_0041.wav", { 2026, 11, 20, 5, 14, 32, 0 }, 42, 0, 1, 1, 1, 0, 1 },
+            { "WIN_0042.wav", { 2026, 11, 20, 5, 15,  0, 0 }, 99, 0, 1, 0, 2, 0, 1 },
+        };
+        ui_model_t wm = m;
+        wm.files        = slice_files;
+        wm.files_offset = 41;
+        wm.files_cap    = 2;
+        wm.file_count   = 50;
+        wm.file_sel     = 42;
+        wm.file_scroll  = 41;
+        ui_render_screen(UI_SCR_FILES, &wm);
+        assert(strcmp(lv_label_get_text(objects.files_bar_sub), "43 / 50") == 0);
+        assert(!lv_obj_has_flag(objects.files_row_0, LV_OBJ_FLAG_HIDDEN));
+        assert(!lv_obj_has_flag(objects.files_row_1, LV_OBJ_FLAG_HIDDEN));
+        assert(lv_obj_has_flag(objects.files_row_2, LV_OBJ_FLAG_HIDDEN));
+
+        wm.files_offset = 42;
+        wm.files_cap    = 1;
+        wm.files        = &slice_files[1];
+        ui_render_screen(UI_SCR_DELETE, &wm);
+        assert(strstr(lv_label_get_text(objects.del_sub), "WIN_0042.wav") != NULL);
+    }
 
     /* 5b: Player speed dial: speed pill, header state, and dial footer */
     {
@@ -1060,6 +1111,12 @@ int main(int argc, char **argv)
     m.play_vol_hi = 1u;
     ui_render_screen(UI_SCR_PLAYER, &m);
     assert(!lv_obj_has_flag(objects.ptr_vol_pill, LV_OBJ_FLAG_HIDDEN));
+    m.play_bt_audio = 1u;
+    m.play_bt_vol   = 31u;
+    ui_render_screen(UI_SCR_PLAYER, &m);
+    assert(strcmp(lv_label_get_text(objects.ptr_vol_lbl), "BT 10") == 0);
+    m.play_bt_audio    = 0u;
+    m.play_bt_vol      = 0u;
     m.play_vol_hi      = 0u;
     m.play_scrub_speed = 3;
     m.tr_word_len      = 0u; /* silence hides pill */

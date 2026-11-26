@@ -181,7 +181,7 @@ typedef struct {
 } ui_settings_t;
 
 typedef struct {
-    char           filename[32];
+    char           filename[64];
     rtc_datetime_t dt;
     uint32_t       duration_sec;
     uint32_t       resume_sec;
@@ -189,6 +189,7 @@ typedef struct {
     uint8_t        has_transcript;
     uint8_t        channels;
     uint8_t        is_dir;
+    uint8_t        in_record_dir;
 } ui_file_entry_t;
 
 #define UI_BT_BG_OFF    0u
@@ -222,7 +223,7 @@ typedef struct {
     uint8_t        rec_vor_wait;    /* 1 when VOR paused */
     uint8_t        rec_stopped;     /* 1 when stopped with REC switch still ON */
     char           rec_stop_reason[24];
-    char           rec_filename[32];
+    char           rec_filename[64];
     uint16_t       rec_markers;
     uint8_t        rec_vu_l;
     uint8_t        rec_vu_r;
@@ -239,11 +240,13 @@ typedef struct {
     uint32_t       saved_sec;
     uint8_t        saved_channels;
     uint8_t        saved_frac_pct;  /* 0..100 remaining green countdown bar */
-    char           saved_filename[32];
+    char           saved_filename[64];
     rtc_datetime_t saved_dt;
 
     /* Files */
     const ui_file_entry_t *files;
+    int            files_offset;    /* logical index of files[0] (0 unless windowed for CPU1 IPC) */
+    int            files_cap;       /* >0 caps readable entries in files[]; 0 means file_count */
     int            file_count;
     int            file_sel;
     int            file_scroll;
@@ -261,6 +264,8 @@ typedef struct {
     uint8_t        play_state;       /* 0=Playing, 1=Paused, 2=End */
     int8_t         play_scrub_speed; /* speed dial: 0=1x normal, else -32..-1, 2..32 */
     uint8_t        play_vol_hi;      /* 1 for 1.5s after VOL+/- */
+    uint8_t        play_bt_audio;    /* 1 when routed over BT headphones */
+    uint8_t        play_bt_vol;      /* 0..31 BT headphone volume */
     uint8_t        play_vu_l;
     uint8_t        play_vu_r;
     int            play_has_transcript;

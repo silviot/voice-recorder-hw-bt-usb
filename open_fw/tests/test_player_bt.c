@@ -279,6 +279,10 @@ static void play(aout_mode_t mode, unsigned ch, int stall)
     aout_set_mode(mode);
     assert(openfw_play_file_ui(&vol, "/record", "test.wav", &m) == 2);
     assert(ended);
+    assert(m.play_bt_audio == ((mode != AOUT_MODE_SPEAKER && bt_ready) ? 1u : 0u));
+    if (m.play_bt_audio) {
+        assert(m.play_bt_vol == bt_vol31);
+    }
     advance(50);   /* the encoder takes the last chunk */
     aout_set_src_channels(2u);
 }

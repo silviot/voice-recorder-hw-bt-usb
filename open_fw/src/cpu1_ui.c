@@ -24,7 +24,7 @@
 
 #define CPU1_CMD_RENDER        1u
 #define CPU1_CMD_REC_LIVE      2u
-#define CPU1_MAX_FILES         96u
+#define CPU1_MAX_FILES         4u
 
 typedef struct {
     ui_screen_id_t  scr;
@@ -58,7 +58,8 @@ volatile uint32_t g_ui_heap_used      = 0u;
 
 #ifndef OPENFW_HOST_MMIO
 
-#define CPU1_STACK_WORDS 768u /* 3 KiB stack for LVGL + EEZ rendering */
+#define CPU1_STACK_WORDS  2048u /* 8 KiB stack for LVGL + EEZ rendering */
+#define CPU1_STACK_CANARY 0xC0DE57ACu
 
 static uint32_t       g_cpu1_stack[CPU1_STACK_WORDS] __attribute__((aligned(8)));
 static cpu1_ui_slot_t s_slots[2] OPENFW_SRAM_HI;
@@ -74,10 +75,41 @@ static volatile uint8_t  s_spec_reset_pend   = 0u;
 static volatile uint8_t  s_spec_marker_pend  = 0u;
 static ui_spectrogram_t *volatile s_spec_ptr = NULL;
 static uint8_t           s_cpu1_active       = 0u;
+static uint8_t           s_lvgl_poisoned     = 0u;
+static uint8_t           s_poison_logged     = 0u;
 static uint32_t          s_last_seq          = 0u;
 static uint32_t          s_last_slot         = 0u;
 static uint32_t          s_stall_ack_seen    = 0u;
 static uint64_t          s_stall_since_us    = 0ull;
+
+static inline int cpu1_canary_corrupt(void)
+{
+    return g_cpu1_stack[0] != CPU1_STACK_CANARY || g_cpu1_stack[1] != CPU1_STACK_CANARY;
+}
+
+static void cpu1_log_poison(const char *why)
+{
+    if (s_poison_logged) {
+        return;
+    }
+    s_poison_logged = 1u;
+    openfw_log_puts("CPU1 UI poisoned (");
+    openfw_log_puts(why ? why : "unknown");
+    openfw_log_puts("): fault=");
+    openfw_log_u32(g_cpu1_faulted);
+    openfw_log_puts(" pc=0x");
+    openfw_log_hex(g_cpu1_fault_pc);
+    openfw_log_puts(" cfsr=0x");
+    openfw_log_hex(g_cpu1_fault_cfsr);
+    openfw_log_putc('\n');
+}
+
+static void cpu1_poison_and_stop(const char *why)
+{
+    s_lvgl_poisoned = 1u;
+    cpu1_ui_stop();
+    cpu1_log_poison(why);
+}
 
 static inline void cpu1_mbox_drain_and_clear(void)
 {
@@ -158,6 +190,35 @@ static void cpu1_fault_asm(void)
         "mov sp, r2\n"
         "b.w cpu1_fault_c\n"
     );
+}
+
+OPENFW_FASTFUNC __attribute__((used, noreturn))
+void openfw_lv_assert_handler(const char *file, int line)
+{
+    __asm__ volatile ("cpsid i" ::: "memory");
+    if (SCB_VTOR == (uint32_t)(uintptr_t)g_cpu1_isr_vector) {
+        g_cpu1_fault_pc     = (uint32_t)(uintptr_t)file;
+        g_cpu1_fault_cfsr   = 0x4C560000u | ((uint32_t)line & 0xFFFFu);
+        s_cpu1_animating    = 0u;
+        s_cpu1_reading_slot = 0xFFu;
+        g_cpu1_faulted      = 2u;
+        s_cpu1_stopped      = 1u;
+        OPENFW_DSB();
+        while (1) {
+            __asm__ volatile ("wfi" ::: "memory");
+        }
+    }
+    AON_BACKUP(0u) = OPENFW_FAULT_MAGIC_BASE | 0xF3u;
+    AON_BACKUP(1u) = (uint32_t)line;
+    AON_BACKUP(2u) = (uint32_t)(uintptr_t)file;
+    AON_BACKUP(3u) = g_cpu1_fault_pc;
+    AON_BACKUP(4u) = g_cpu1_fault_cfsr;
+    AON_BACKUP(5u) = 0u;
+    OPENFW_DSB();
+    system_reboot();
+    while (1) {
+        OPENFW_NOP();
+    }
 }
 
 /* Exact SL6801 CPU1 boot trampoline (mirrors stock FIRM 0x00CE7370) */
@@ -265,6 +326,19 @@ static void cpu1_entry_c(void)
             } else {
                 ui_render_screen_sync(slot->scr, &slot->model);
             }
+            if (cpu1_canary_corrupt()) {
+                __asm__ volatile ("cpsid i" ::: "memory");
+                g_cpu1_fault_pc     = 0xDEAD57ACu;
+                g_cpu1_fault_cfsr   = 0x57AC0000u;
+                s_cpu1_animating    = 0u;
+                s_cpu1_reading_slot = 0xFFu;
+                g_cpu1_faulted      = 3u;
+                s_cpu1_stopped      = 1u;
+                OPENFW_DSB();
+                while (1) {
+                    __asm__ volatile ("wfi" ::: "memory");
+                }
+            }
             uint32_t dt_us = (uint32_t)(us_timer_now() - t0);
             g_ui_last_render_us = dt_us;
             if (dt_us > g_ui_max_render_us) {
@@ -303,6 +377,19 @@ static void cpu1_entry_c(void)
         if ((uint32_t)(now_ms - last_tick_ms) >= tick_gap) {
             last_tick_ms = now_ms;
             ui_port_task_handler();
+            if (cpu1_canary_corrupt()) {
+                __asm__ volatile ("cpsid i" ::: "memory");
+                g_cpu1_fault_pc     = 0xDEAD57ACu;
+                g_cpu1_fault_cfsr   = 0x57AC0001u;
+                s_cpu1_animating    = 0u;
+                s_cpu1_reading_slot = 0xFFu;
+                g_cpu1_faulted      = 3u;
+                s_cpu1_stopped      = 1u;
+                OPENFW_DSB();
+                while (1) {
+                    __asm__ volatile ("wfi" ::: "memory");
+                }
+            }
             s_cpu1_animating = (uint32_t)ui_port_is_animating();
         } else {
             /* Keep SRAM bus nearly idle when static (~10 us wake latency) and light during anims */
@@ -318,58 +405,27 @@ static void cpu1_submit_slot(uint8_t kind, ui_screen_id_t scr, const ui_model_t 
                              const int16_t *spec_pcm, uint32_t spec_frames,
                              uint8_t spec_ch, int spec_vor_wait, int has_spec_pcm)
 {
+    if (s_lvgl_poisoned != 0u) {
+        return;
+    }
     uint64_t now_us = us_timer_now();
-    /* Guard against a stalled CPU1 (e.g. missed WFE wake): if prior work went
-     * unacknowledged for >250 ms, park CPU1 cleanly and fall back to CPU0. */
+    /* Guard against a stalled/faulted CPU1: park it and mark LVGL poisoned
+     * so CPU0 never renders against partially mutated LVGL/EEZ heap state. */
     if (s_ack_seq == s_last_seq) {
         s_stall_since_us = 0ull;
     } else if (s_stall_since_us == 0ull || s_ack_seq != s_stall_ack_seen) {
         s_stall_ack_seen = s_ack_seq;
         s_stall_since_us = now_us;
     } else if ((now_us - s_stall_since_us) > 250000ull) {
-        cpu1_ui_stop();
-        if (s_spec_reset_pend && m->spec) {
-            s_spec_reset_pend  = 0u;
-            s_spec_marker_pend = 0u;
-            ui_spec_reset(m->spec);
-        }
-        if (has_spec_pcm && m->spec) {
-            ui_spec_push_pcm(m->spec, spec_pcm, spec_frames, spec_ch, spec_vor_wait);
-        }
-        if (s_spec_marker_pend && m->spec) {
-            s_spec_marker_pend = 0u;
-            ui_spec_drop_marker(m->spec);
-        }
-        if (kind == CPU1_CMD_REC_LIVE) {
-            ui_rec_update_live_sync(m);
-        } else {
-            ui_render_screen_sync(scr, m);
-        }
+        cpu1_poison_and_stop("stall");
         return;
     }
 
     uint32_t next = s_last_slot ^ 1u;
     uint64_t t0   = now_us;
     while (s_cpu1_reading_slot == next) {
-        if (g_cpu1_faulted != 0u || (us_timer_now() - t0) > 100000ull) {
-            cpu1_ui_stop();
-            if (s_spec_reset_pend && m->spec) {
-                s_spec_reset_pend  = 0u;
-                s_spec_marker_pend = 0u;
-                ui_spec_reset(m->spec);
-            }
-            if (has_spec_pcm && m->spec) {
-                ui_spec_push_pcm(m->spec, spec_pcm, spec_frames, spec_ch, spec_vor_wait);
-            }
-            if (s_spec_marker_pend && m->spec) {
-                s_spec_marker_pend = 0u;
-                ui_spec_drop_marker(m->spec);
-            }
-            if (kind == CPU1_CMD_REC_LIVE) {
-                ui_rec_update_live_sync(m);
-            } else {
-                ui_render_screen_sync(scr, m);
-            }
+        if (g_cpu1_faulted != 0u || cpu1_canary_corrupt() || (us_timer_now() - t0) > 100000ull) {
+            cpu1_poison_and_stop(g_cpu1_faulted ? "fault" : (cpu1_canary_corrupt() ? "canary" : "slot busy"));
             return;
         }
         OPENFW_NOP();
@@ -387,21 +443,39 @@ static void cpu1_submit_slot(uint8_t kind, ui_screen_id_t scr, const ui_model_t 
     if (kind == CPU1_CMD_RENDER &&
         (scr == UI_SCR_FILES || scr == UI_SCR_DELETE) &&
         m->files != NULL && m->file_count > 0) {
-        uint32_t n = (uint32_t)m->file_count;
-        if (n > CPU1_MAX_FILES) {
-            n = CPU1_MAX_FILES;
+        int base = 0;
+        if (scr == UI_SCR_DELETE) {
+            if (m->file_sel >= 0 && m->file_sel < m->file_count) {
+                base = m->file_sel - m->files_offset;
+                if (base < 0) base = 0;
+            }
+        } else {
+            int start = (m->file_scroll > 0) ? m->file_scroll : 0;
+            base = start - m->files_offset;
+            if (base < 0) base = 0;
         }
-        for (uint32_t i = 0u; i < n; i++) {
-            slot->payload.files[i] = m->files[i];
+        int avail_total = (m->files_cap > 0) ? m->files_cap : (m->file_count - m->files_offset);
+        uint32_t n = 0u;
+        if (base < avail_total) {
+            n = (uint32_t)(avail_total - base);
+            if (n > CPU1_MAX_FILES) {
+                n = CPU1_MAX_FILES;
+            }
+            for (uint32_t i = 0u; i < n; i++) {
+                slot->payload.files[i] = m->files[base + (int)i];
+            }
         }
-        slot->has_files         = 1u;
-        slot->file_count_copied = (uint16_t)n;
-        slot->model.files       = slot->payload.files;
-        slot->model.file_count  = (int)n;
+        slot->has_files          = 1u;
+        slot->file_count_copied  = (uint16_t)n;
+        slot->model.files        = slot->payload.files;
+        slot->model.files_offset = m->files_offset + base;
+        slot->model.files_cap    = (int)n;
     } else {
-        slot->has_files         = 0u;
-        slot->file_count_copied = 0u;
-        slot->model.files       = NULL;
+        slot->has_files          = 0u;
+        slot->file_count_copied  = 0u;
+        slot->model.files        = NULL;
+        slot->model.files_offset = 0;
+        slot->model.files_cap    = 0;
         if (has_spec_pcm && spec_pcm != NULL && spec_frames > 0u) {
             uint32_t nf = (spec_frames > UI_SPEC_FFT_N) ? UI_SPEC_FFT_N : spec_frames;
             uint32_t ns = nf * ((spec_ch >= 2u) ? 2u : 1u);
@@ -432,6 +506,9 @@ int cpu1_ui_start(void)
     if (s_cpu1_active) {
         return 1;
     }
+    if (s_lvgl_poisoned != 0u) {
+        return 0;
+    }
 
     /* Enable SL6801 Hardware IPC Mailbox (0x40070000) ch0 CPU0 -> CPU1 for WFE wakeups */
     rom_rst_hold(CRU_RST_IPC_MBOX);
@@ -449,6 +526,9 @@ int cpu1_ui_start(void)
 
     /* Reset all shared IPC state before releasing CPU1 (preserve lifetime stats) */
     rom_rst_hold(CRU_RST_CPU1);
+    for (uint32_t i = 0u; i < CPU1_STACK_WORDS; i++) {
+        g_cpu1_stack[i] = CPU1_STACK_CANARY;
+    }
     g_cpu1_alive        = 0u;
     g_cpu1_faulted      = 0u;
     g_cpu1_fault_pc     = 0u;
@@ -484,7 +564,7 @@ int cpu1_ui_start(void)
         OPENFW_TASK_WAIT();
     }
 
-    if (g_cpu1_alive != 0u && g_cpu1_faulted == 0u) {
+    if (g_cpu1_alive != 0u && g_cpu1_faulted == 0u && !cpu1_canary_corrupt()) {
         /* Trigger 2-word ch0 doorbell so CPU1 self-verifies NVIC IRQ 55 -> SEVONPEND WFE */
         cpu1_ring_mbox();
         uint64_t t_p = us_timer_now();
@@ -492,8 +572,17 @@ int cpu1_ui_start(void)
                (us_timer_now() - t_p) < 5000ull) {
             OPENFW_NOP();
         }
+        if (g_cpu1_faulted != 0u || cpu1_canary_corrupt()) {
+            cpu1_poison_and_stop("mbox probe");
+            return 0;
+        }
         s_cpu1_active = 1u;
         return 1;
+    }
+
+    if (g_cpu1_faulted != 0u || cpu1_canary_corrupt()) {
+        cpu1_poison_and_stop("boot fault");
+        return 0;
     }
 
     /* CPU1 did not boot (e.g. single-core QEMU) — park cleanly and use CPU0 fallback */
@@ -514,9 +603,14 @@ void cpu1_ui_stop(void)
         while (s_cpu1_stopped == 0u && (us_timer_now() - t0) < 50000ull) {
             OPENFW_NOP();
         }
+        int unclean = (s_cpu1_stopped == 0u || g_cpu1_faulted != 0u || cpu1_canary_corrupt());
         s_cpu1_active       = 0u;
         s_cpu1_animating    = 0u;
         s_cpu1_reading_slot = 0xFFu;
+        if (unclean) {
+            s_lvgl_poisoned = 1u;
+            cpu1_log_poison("unclean stop");
+        }
     }
     rom_rst_hold(CRU_RST_CPU1);
     OPENFW_DSB();
@@ -524,8 +618,8 @@ void cpu1_ui_stop(void)
 
 int cpu1_ui_is_active(void)
 {
-    if (s_cpu1_active && g_cpu1_faulted != 0u) {
-        cpu1_ui_stop();
+    if (s_cpu1_active && (g_cpu1_faulted != 0u || cpu1_canary_corrupt())) {
+        cpu1_poison_and_stop(g_cpu1_faulted ? "fault" : "canary");
     }
     return (int)s_cpu1_active;
 }
@@ -543,8 +637,8 @@ void cpu1_ui_sync(uint32_t timeout_ms)
     uint64_t t0      = us_timer_now();
     uint64_t lim_us  = (uint64_t)timeout_ms * 1000ull;
     while (s_ack_seq != (s_req_word >> 1) || s_cpu1_reading_slot != 0xFFu) {
-        if (g_cpu1_faulted != 0u) {
-            cpu1_ui_stop();
+        if (g_cpu1_faulted != 0u || cpu1_canary_corrupt()) {
+            cpu1_poison_and_stop(g_cpu1_faulted ? "sync fault" : "sync canary");
             return;
         }
         if ((us_timer_now() - t0) >= lim_us) {
@@ -593,6 +687,9 @@ void ui_render_screen(ui_screen_id_t scr, const ui_model_t *m)
         cpu1_submit_slot(CPU1_CMD_RENDER, scr, m, NULL, 0u, 0u, 0, 0);
         return;
     }
+    if (s_lvgl_poisoned != 0u) {
+        return;
+    }
     if (s_spec_reset_pend && m->spec) {
         s_spec_reset_pend  = 0u;
         s_spec_marker_pend = 0u;
@@ -625,6 +722,9 @@ void ui_rec_update_live(const ui_model_t *m)
         }
         return;
     }
+    if (s_lvgl_poisoned != 0u) {
+        return;
+    }
     ui_rec_update_live_sync(m);
 }
 
@@ -645,6 +745,9 @@ void ui_rec_push_live(const ui_model_t *m, const int16_t *pcm, uint32_t frames,
     if (m->spec) {
         ui_spec_push_pcm(m->spec, pcm, frames, channels, vor_paused);
     }
+    if (s_lvgl_poisoned != 0u) {
+        return;
+    }
     if (full_render) {
         ui_render_screen_sync(UI_SCR_REC, m);
     } else {
@@ -654,7 +757,7 @@ void ui_rec_push_live(const ui_model_t *m, const int16_t *pcm, uint32_t frames,
 
 void ui_dispatch_tick(void)
 {
-    if (cpu1_ui_is_active()) {
+    if (cpu1_ui_is_active() || s_lvgl_poisoned != 0u) {
         return; /* CPU1 drives LVGL timers & 125 Hz animations autonomously */
     }
     ui_port_task_handler();
@@ -664,6 +767,9 @@ int ui_dispatch_is_animating(void)
 {
     if (cpu1_ui_is_active()) {
         return (s_cpu1_animating != 0u || s_ack_seq != (s_req_word >> 1)) ? 1 : 0;
+    }
+    if (s_lvgl_poisoned != 0u) {
+        return 0;
     }
     return ui_port_is_animating();
 }

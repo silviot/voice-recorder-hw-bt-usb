@@ -110,7 +110,7 @@ static int8_t           g_autoplay_state = -1;
  * position write deferred while a recording owns the card. */
 static struct {
     char          dir[MENU_DIR_CAP];
-    char          name[32];
+    char          name[64];
     uint32_t      tag;      /* low 32 bits of the WAV size: detects a replaced file */
     uint8_t       active;   /* the player's track lives in an autoplay folder */
     uint8_t       failed;   /* a write failed (read-only/full card): quiet until reload */
@@ -142,6 +142,8 @@ static int              g_cpu1_booted      = 0;
 static bt_phone_cfg_t   g_phone_cfg;
 static uint8_t          g_phone_cfg_dirty;
 static uint8_t          g_poweroff_after_sync;
+static uint8_t          g_record_unsynced_count;
+static void             refresh_record_unsynced_count(void);
 static struct {
     uint8_t  active;
     uint8_t  requested;
@@ -733,6 +735,7 @@ static void load_persisted_state(void)
                     g_ui.last_file.unplayed       = 0u;
                     g_ui.last_file.has_transcript = 0u;
                     g_ui.last_file.is_dir         = 0u;
+                    g_ui.last_file.in_record_dir  = str_eq_ci(g_file_dirs[i], "/record") ? 1u : 0u;
                     copy_cstr(g_last_dir, (int)sizeof(g_last_dir), g_file_dirs[i]);
                     g_ui.has_last = 1;
                     found = 1;
@@ -754,6 +757,7 @@ static void load_persisted_state(void)
                 g_ui.last_file.unplayed       = 0u;
                 g_ui.last_file.has_transcript = 0u;
                 g_ui.last_file.is_dir         = 0u;
+                g_ui.last_file.in_record_dir  = 1u;
                 copy_cstr(g_last_dir, (int)sizeof(g_last_dir), "/record");
                 g_ui.has_last = 1;
             }
@@ -930,6 +934,7 @@ static int menu_collect_dirs_cb(const exfat_entry_t *entry, void *user)
     dst->has_transcript = 0u;
     dst->channels       = 0u;
     dst->is_dir         = 1u;
+    dst->in_record_dir  = 0u;
     ctx->locs[idx].size          = 0u;
     ctx->locs[idx].valid_data_len = 0u;
     ctx->locs[idx].first_cluster = entry->first_cluster;
@@ -971,6 +976,7 @@ static int menu_collect_cb(const exfat_entry_t *entry, void *user)
     dst->has_transcript = 0u;
     dst->channels       = 1u;
     dst->is_dir         = 0u;
+    dst->in_record_dir  = str_eq_ci(ctx->dir_path, "/record") ? 1u : 0u;
     dst->duration_sec   = (entry->size > 44u) ? ((uint32_t)(entry->size - 44u) / 32000u) : 0u;
 
     ctx->locs[idx].valid_data_len = entry->valid_data_len;
@@ -1018,6 +1024,9 @@ static void reload_files_and_sd_stats(void)
         g_ui.sd_total_mb = 0u;
         g_ui.sd_free_sec = 0u;
         g_browse_dir[0]  = '\0';
+#if OPENFW_BT_HP
+        g_record_unsynced_count = 0u;
+#endif
         return;
     }
 
@@ -1175,7 +1184,7 @@ static void reload_files_and_sd_stats(void)
             }
         }
         if (!has_cwx && cwx_overflow) {
-            char cpath[96];
+            char cpath[128];
             int p = 0;
             if (!(g_file_dirs[i][0] == '/' && g_file_dirs[i][1] == '\0')) {
                 append_str(cpath, &p, (int)sizeof(cpath), g_file_dirs[i]);
@@ -1183,7 +1192,7 @@ static void reload_files_and_sd_stats(void)
             append_str(cpath, &p, (int)sizeof(cpath), "/");
             append_str(cpath, &p, (int)sizeof(cpath), g_files[i].filename);
             cpath[p] = '\0';
-            if (p >= 4) {
+            if (p >= 5 && cpath[p - 4] == '.') {
                 cpath[p - 3] = 'c';
                 cpath[p - 2] = 'w';
                 cpath[p - 1] = 'x';
@@ -1215,6 +1224,7 @@ static void reload_files_and_sd_stats(void)
     }
     refresh_telemetry();
 #if OPENFW_BT_HP
+    refresh_record_unsynced_count();
     bt_ui_sync_refresh(0);
 #endif
 }
@@ -1304,6 +1314,7 @@ static void prepend_saved_recording_fast(const char *saved_name, uint32_t rec_s,
     f->has_transcript = 0u;
     f->channels       = rec_ch ? rec_ch : 1u;
     f->is_dir         = 0u;
+    f->in_record_dir  = 1u;
 
     uint32_t used_mb = (committed_bytes + 0xFFFFFu) >> 20;
     if (g_sd_free_mb > used_mb) {
@@ -1317,6 +1328,9 @@ static void prepend_saved_recording_fast(const char *saved_name, uint32_t rec_s,
     g_ui.has_last  = 1;
     refresh_telemetry();
 #if OPENFW_BT_HP
+    if (existing < 0 && g_record_unsynced_count < 99u) {
+        g_record_unsynced_count++;
+    }
     bt_ui_sync_refresh(0);
 #endif
 }
@@ -1646,11 +1660,22 @@ static void run_bt_xrec_mode(void)
     if (g_bt_bg.active) {
         bt_status_t st0;
         bt_xrec_get_status(&st0);
-        adopted_bg         = st0.active ? 1 : 0;
-        g_bt_bg.active     = 0u;
-        g_bt_bg.requested  = 0u;
-        g_ui.bt_bg_syncing = 0u;
-        g_ui.bt_bg_state   = UI_BT_BG_OFF;
+        if (st0.active) {
+            adopted_bg         = 1;
+            g_bt_bg.active     = 0u;
+            g_bt_bg.requested  = 0u;
+            g_ui.bt_bg_syncing = 0u;
+            g_ui.bt_bg_state   = UI_BT_BG_OFF;
+        } else {
+            bt_bg_stop("stale bg");
+        }
+    }
+#endif
+    refresh_telemetry();
+#if OPENFW_BT_HP
+    if (!adopted_bg && bt_lowbatt_refuse_now(millis())) {
+        backlight_wake(millis());
+        return;                          /* toast "Low battery: BT off" on the screen we came from */
     }
 #endif
     g_ui_screen   = UI_SCR_BT;
@@ -1669,13 +1694,6 @@ static void run_bt_xrec_mode(void)
     g_ui.bt_window_s     = 0u;
     g_ui.bt_digits[0]    = '\0';
     g_ui.bt_sync_pending = 0u;
-#endif
-    refresh_telemetry();
-#if OPENFW_BT_HP
-    if (!adopted_bg && bt_lowbatt_refuse_now(millis())) {
-        backlight_wake(millis());
-        return;                          /* toast "Low battery: BT off" on the screen we came from */
-    }
 #endif
     uint32_t last_ui     = 0u;
     uint32_t last_chg    = 0u;
@@ -2780,17 +2798,91 @@ static int hp_auto_connect_for_play(void)
 #define BT_BG_SYNC0_OPEN_MS 4000u
 #define BT_BG_LEGACY_IDLE_MS 20000u
 
-static uint8_t count_untranscribed_recordings(void)
+typedef struct {
+    uint64_t *cwx_hashes;
+    int       cwx_count;
+    int       cwx_cap;
+    int       cwx_overflow;
+    uint8_t   unsynced;
+} record_unsynced_ctx_t;
+
+static int collect_record_cwx_cb(const exfat_entry_t *entry, void *user)
 {
-    uint8_t n = 0u;
-    for (int i = 0; i < g_ui.file_count; i++) {
-        if (!g_files[i].is_dir && str_eq_ci(g_file_dirs[i], "/record") && !g_files[i].has_transcript) {
-            if (n < 99u) {
-                n++;
+    record_unsynced_ctx_t *ctx = (record_unsynced_ctx_t *)user;
+    wdt_feed();
+    if (entry->is_dir || entry->name[0] == '.' || !name_ends_with_ci(entry->name, ".cwx")) {
+        return 0;
+    }
+    if (ctx->cwx_count < ctx->cwx_cap) {
+        ctx->cwx_hashes[ctx->cwx_count++] = hash_dir_stem_ci("/record", entry->name);
+    } else {
+        ctx->cwx_overflow = 1;
+    }
+    return 0;
+}
+
+static int count_record_wav_cb(const exfat_entry_t *entry, void *user)
+{
+    record_unsynced_ctx_t *ctx = (record_unsynced_ctx_t *)user;
+    wdt_feed();
+    if (entry->is_dir || entry->name[0] == '.' || !name_ends_with_ci(entry->name, ".wav")) {
+        return 0;
+    }
+    uint64_t h = hash_dir_stem_ci("/record", entry->name);
+    int has_cwx = 0;
+    for (int i = 0; i < ctx->cwx_count; i++) {
+        if (ctx->cwx_hashes[i] == h) {
+            has_cwx = 1;
+            break;
+        }
+    }
+    if (!has_cwx && ctx->cwx_overflow) {
+        char cpath[80];
+        int p = 0;
+        append_str(cpath, &p, (int)sizeof(cpath), "/record/");
+        append_str(cpath, &p, (int)sizeof(cpath), entry->name);
+        cpath[p] = '\0';
+        if (p >= 5 && cpath[p - 4] == '.') {
+            cpath[p - 3] = 'c';
+            cpath[p - 2] = 'w';
+            cpath[p - 1] = 'x';
+            exfat_entry_t cent;
+            if (exfat_find_path(&g_exfat_vol, cpath, &cent) == 0 && !cent.is_dir) {
+                has_cwx = 1;
             }
         }
     }
-    return n;
+    if (!has_cwx && ctx->unsynced < 99u) {
+        ctx->unsynced++;
+        if (ctx->unsynced >= 99u) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void refresh_record_unsynced_count(void)
+{
+    exfat_entry_t rec_dir;
+    if (!g_sd_mounted || exfat_find_path(&g_exfat_vol, "/record", &rec_dir) != 0 || !rec_dir.is_dir) {
+        g_record_unsynced_count = 0u;
+        return;
+    }
+    record_unsynced_ctx_t ctx = {
+        .cwx_hashes   = g_scan_cwx_hashes,
+        .cwx_count    = 0,
+        .cwx_cap      = MENU_MAX_CWX,
+        .cwx_overflow = 0,
+        .unsynced     = 0u,
+    };
+    (void)exfat_list_dir_entry(&g_exfat_vol, &rec_dir, collect_record_cwx_cb, &ctx);
+    (void)exfat_list_dir_entry(&g_exfat_vol, &rec_dir, count_record_wav_cb, &ctx);
+    g_record_unsynced_count = ctx.unsynced;
+}
+
+static uint8_t count_untranscribed_recordings(void)
+{
+    return g_sd_mounted ? g_record_unsynced_count : 0u;
 }
 
 static int has_untranscribed_recording(void)
@@ -2801,7 +2893,7 @@ static int has_untranscribed_recording(void)
 static void bt_ui_sync_refresh(int *dirty)
 {
     static uint32_t s_last_xfer_ui_ms;
-    uint8_t unsynced = (g_browse_dir[0] == '\0') ? count_untranscribed_recordings() : g_ui.bt_unsynced_count;
+    uint8_t unsynced = count_untranscribed_recordings();
     uint8_t bg_state = UI_BT_BG_OFF;
     uint8_t pending  = 0u;
     int xfer_changed = 0;
@@ -2879,7 +2971,7 @@ static void bt_bg_apply_cwx(const char *cwx_name, uint8_t tr_state, int *dirty)
     if (!cwx_name || cwx_name[0] == '\0') {
         return;
     }
-    char wav_name[32];
+    char wav_name[64];
     copy_cstr(wav_name, (int)sizeof(wav_name), cwx_name);
     int len = 0;
     while (wav_name[len] != '\0') {
@@ -2908,6 +3000,7 @@ static void bt_bg_apply_cwx(const char *cwx_name, uint8_t tr_state, int *dirty)
             *dirty = 1;
         }
     }
+    refresh_record_unsynced_count();
 }
 
 static void bt_bg_poll(uint32_t now_ms, int rec_active, int usb_busy, int bench_block_bt, int *dirty)
@@ -3530,11 +3623,11 @@ static void delete_selected_file(uint32_t now_ms)
     int rc = exfat_delete_file(&g_exfat_vol, dir, name);
     if (rc == 0) {
         /* Also remove matching .cwx sidecar if present */
-        char cwx_name[32];
+        char cwx_name[64];
         copy_cstr(cwx_name, (int)sizeof(cwx_name), name);
         int len = 0;
         while (cwx_name[len] != '\0') len++;
-        if (len >= 5) {
+        if (len >= 5 && cwx_name[len - 4] == '.') {
             cwx_name[len - 3] = 'c';
             cwx_name[len - 2] = 'w';
             cwx_name[len - 1] = 'x';
@@ -4326,14 +4419,32 @@ int openfw_main(void)
                 case UI_SCR_SAVED:
                     if (rising) {
                         if (key == KEY_ENTER && g_sd_mounted && g_ui.saved_filename[0] != '\0') {
-                            ui_file_entry_t saved;
+                            ui_file_entry_t saved = {0};
                             saved.dt             = g_ui.saved_dt;
                             saved.duration_sec   = g_ui.saved_sec;
                             saved.resume_sec     = 0u;
                             saved.unplayed       = 0u;
                             saved.has_transcript = 0u;
                             saved.channels       = g_ui.saved_channels ? g_ui.saved_channels : 1u;
+                            saved.is_dir         = 0u;
+                            saved.in_record_dir  = 1u;
                             copy_cstr(saved.filename, (int)sizeof(saved.filename), g_ui.saved_filename);
+                            {
+                                char cpath[96];
+                                int p = 0;
+                                append_str(cpath, &p, (int)sizeof(cpath), "/record/");
+                                append_str(cpath, &p, (int)sizeof(cpath), saved.filename);
+                                cpath[p] = '\0';
+                                if (p >= 5 && cpath[p - 4] == '.') {
+                                    cpath[p - 3] = 'c';
+                                    cpath[p - 2] = 'w';
+                                    cpath[p - 1] = 'x';
+                                    exfat_entry_t cent;
+                                    if (exfat_find_path(&g_exfat_vol, cpath, &cent) == 0 && !cent.is_dir) {
+                                        saved.has_transcript = 1u;
+                                    }
+                                }
+                            }
                             play_named_file("/record", &saved);
                             if (g_ui.has_last && str_eq_ci(g_ui.last_file.filename, saved.filename)) {
                                 g_ui.last_file.resume_sec = saved.resume_sec;

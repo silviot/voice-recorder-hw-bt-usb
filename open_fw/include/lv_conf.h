@@ -95,9 +95,13 @@
 #if !defined(OPENFW_WASM) && (defined(OPENFW_HOST_MMIO) || (defined(__STDC_HOSTED__) && __STDC_HOSTED__ == 1))
 #define LV_ASSERT_HANDLER_INCLUDE       <stdlib.h>
 #define LV_ASSERT_HANDLER               abort();
-#else
+#elif defined(OPENFW_WASM) && OPENFW_WASM
 #define LV_ASSERT_HANDLER_INCLUDE       <stdint.h>
 #define LV_ASSERT_HANDLER               while(1) {}
+#else
+#define LV_ASSERT_HANDLER_INCLUDE       <stdint.h>
+extern void openfw_lv_assert_handler(const char *file, int line) __attribute__((noreturn));
+#define LV_ASSERT_HANDLER               openfw_lv_assert_handler(__FILE__, __LINE__);
 #endif
 
 /*====================

@@ -171,6 +171,8 @@ typedef struct {
 static hp_t *g HP_HI;
 static hp_cfg_t s_cfg HP_HI;
 static uint8_t s_cfg_loaded HP_HI;
+static uint8_t s_cfg_dirty HP_HI;
+static uint32_t s_cfg_dirty_t HP_HI;
 static uint8_t s_state HP_HI;          /* session state, readable without g (OFF / FAULTED / DEAD) */
 static uint32_t s_last_fault HP_HI;
 static uint8_t s_restart_required HP_HI; /* A2DP deinit never confirmed: no new session this boot (STEP10 C14) */
@@ -365,6 +367,7 @@ static void cfg_defaults(void)
     s_cfg.version = 1u;
     s_cfg.out_mode = BT_HP_OUT_SPEAKER;
     s_cfg.bt_vol = BT_HP_VOL_DEF;
+    s_cfg_dirty = 0u;
 }
 
 static void cfg_load(void)
@@ -381,13 +384,21 @@ static void cfg_load(void)
         c.last_name[BT_HP_NAME_MAX - 1u] = '\0';
         s_cfg = c;
     }
+    s_cfg_dirty = 0u;
 }
 
 static void cfg_save(void)
 {
+    s_cfg_dirty = 0u;
     if (bt_hp_plat_cfg_save((const uint8_t *)&s_cfg, sizeof(s_cfg)) != 0) {
         log1("settings not saved (SD write failed)");
     }
+}
+
+static void cfg_mark_dirty(void)
+{
+    s_cfg_dirty = 1u;
+    s_cfg_dirty_t = bt_xrec_plat_now_ms();
 }
 
 uint8_t bt_hp_out_mode(void)
@@ -1853,16 +1864,25 @@ static void on_event(const ev_t *e)
     case EV_CT_NTF:
         if (e->a == ESP_AVRC_RN_VOLUME_CHANGE) {
             g->d.avrc_vol_ntf++;
-            s_cfg.bt_vol = (uint8_t)(e->b & 0x7Fu);
+            uint8_t nv = (uint8_t)(e->b & 0x7Fu);
+            if (nv != s_cfg.bt_vol) {
+                s_cfg.bt_vol = nv;
+                cfg_mark_dirty();
+            }
             lbegin("headset volume");
             lku("v", s_cfg.bt_vol);
             lend();
             vol_register();            /* notifications are one-shot (design §6.6) */
         }
         break;
-    case EV_CT_VOL:
-        s_cfg.bt_vol = (uint8_t)(e->a & 0x7Fu);
+    case EV_CT_VOL: {
+        uint8_t nv = (uint8_t)(e->a & 0x7Fu);
+        if (nv != s_cfg.bt_vol) {
+            s_cfg.bt_vol = nv;
+            cfg_mark_dirty();
+        }
         break;
+    }
     case EV_TG_CONN:
         lbegin("avrcp tg");
         lku("conn", e->a);
@@ -1871,9 +1891,14 @@ static void on_event(const ev_t *e)
     case EV_TG_KEY:
         on_tg_key(e);
         break;
-    case EV_TG_VOL:
-        s_cfg.bt_vol = (uint8_t)(e->a & 0x7Fu);
+    case EV_TG_VOL: {
+        uint8_t nv = (uint8_t)(e->a & 0x7Fu);
+        if (nv != s_cfg.bt_vol) {
+            s_cfg.bt_vol = nv;
+            cfg_mark_dirty();
+        }
         break;
+    }
     case EV_TX_STALL:
         g->d.stalls++;
         set_msg(BT_HP_MSG_STALLED);
@@ -2441,6 +2466,10 @@ static void ready_poll(uint32_t now)
         }
         g->start_demand = 0u;
     }
+    /* persist BT volume changes once audio is idle or after a short debounce window */
+    if (s_cfg_dirty && (g->link != BT_HP_LINK_STARTED || time_reached(now, s_cfg_dirty_t + 2000u))) {
+        cfg_save();
+    }
     /* idle suspend (design §6.5): STARTED, no real audio taken from the ring for BT_HP_IDLE_SUSPEND_MS */
     if (g->link == BT_HP_LINK_STARTED) {
         uint32_t real = hp_tx_bd()->st.real_pcm;
@@ -2580,6 +2609,9 @@ void bt_hp_poll(void)
 
 int bt_hp_stop(void)
 {
+    if (s_cfg_dirty) {
+        cfg_save();
+    }
     s_auto_restart = 0u;              /* an explicit stop (BACK + off, phone mode, USB disk, power) wins */
     if (s_hp_parked) {
         (void)park_poll();
@@ -2900,6 +2932,7 @@ void bt_hp_set_vol31(uint8_t v31)
         return;
     }
     s_cfg.bt_vol = v;
+    cfg_mark_dirty();
     if (g != NULL && s_state == BT_HP_ST_READY) {
         abs_vol_send();
     }

@@ -55,6 +55,7 @@ typedef struct {
     uint32_t fat_cache_lba;
     uint8_t  fat_cache[512] __attribute__((aligned(4)));
     uint8_t  wr_final;        /* a device write returned BLKDEV_ERR_FINAL during the current exfat_write() */
+    uint8_t  io_buf[4u * 512u] __attribute__((aligned(4))); /* scratch buffer for cluster/bitmap scans */
 } exfat_vol_t;
 
 #define EXFAT_MAX_NAME 64u

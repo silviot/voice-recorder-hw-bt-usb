@@ -216,13 +216,28 @@ int cwx_next_word(cwx_stream_t *s, cwx_word_t *out)
     out->flags       = whdr[9];
     out->word_idx    = s->cur_word_idx;
 
-    uint8_t copy_len = (tlen < (CWX_MAX_WORD_TEXT - 1u)) ? tlen : (uint8_t)(CWX_MAX_WORD_TEXT - 1u);
-    out->text_len = copy_len;
-    if (copy_len > 0u) {
-        if (stream_read_exact(s, s->cur_byte_off + 11u, out->text, copy_len) != 0) {
+    uint8_t copy_len;
+    if (tlen < CWX_MAX_WORD_TEXT) {
+        copy_len = tlen;
+        if (copy_len > 0u) {
+            if (stream_read_exact(s, s->cur_byte_off + 11u, out->text, copy_len) != 0) {
+                return -1;
+            }
+        }
+    } else {
+        uint8_t raw[CWX_MAX_WORD_TEXT];
+        if (stream_read_exact(s, s->cur_byte_off + 11u, raw, CWX_MAX_WORD_TEXT) != 0) {
             return -1;
         }
+        copy_len = (uint8_t)(CWX_MAX_WORD_TEXT - 1u);
+        while (copy_len > 0u && (raw[copy_len] & 0xC0u) == 0x80u) {
+            copy_len--;
+        }
+        if (copy_len > 0u) {
+            mem_copy(out->text, raw, copy_len);
+        }
     }
+    out->text_len       = copy_len;
     out->text[copy_len] = '\0';
 
     s->cur_byte_off += 11u + (uint32_t)tlen;

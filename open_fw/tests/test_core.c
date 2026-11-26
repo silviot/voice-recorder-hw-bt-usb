@@ -438,6 +438,71 @@ static void test_cwx_engine(void)
         assert(v.active_slot == 1 && strcmp(v.lines[1].text, line0_saved) == 0);
     }
 
+    /* Long UTF-8 words (>= CWX_MAX_WORD_TEXT bytes) must cut cleanly on UTF-8 boundaries */
+    {
+        static uint8_t utf8_img[512];
+        memset(utf8_img, 0, sizeof(utf8_img));
+        uint32_t s_off = CWX_HEADER_SIZE;
+        uint32_t k_off = s_off + CWX_SPEAKER_SIZE;
+        uint32_t w_off = k_off + 2u * CWX_SEEK_SIZE;
+        uint32_t wp    = w_off;
+
+        /* 23 x 2-byte 'А' (46 B) + 1 x 2-byte 'Б' (bytes 46..47 = 48 B total) -> must cut at 46 */
+        char long2[52];
+        for (int i = 0; i < 23; i++) {
+            long2[i * 2]     = '\xD0';
+            long2[i * 2 + 1] = '\x90';
+        }
+        long2[46] = '\xD0';
+        long2[47] = '\x91';
+        long2[48] = '\0';
+        uint32_t rel0 = wp - w_off;
+        append_cwx_word(utf8_img, &wp, 0u, 400u, 0u, CWX_FLAG_TURN_START, long2);
+
+        /* 15 x 3-byte '中' (45 B) + 1 x 3-byte '文' (bytes 45..47 = 48 B total) -> must cut at 45 */
+        char long3[52];
+        for (int i = 0; i < 15; i++) {
+            long3[i * 3]     = '\xE4';
+            long3[i * 3 + 1] = '\xB8';
+            long3[i * 3 + 2] = '\xAD';
+        }
+        long3[45] = '\xE6';
+        long3[46] = '\x96';
+        long3[47] = '\x87';
+        long3[48] = '\0';
+        append_cwx_word(utf8_img, &wp, 450u, 800u, 0u, 0u, long3);
+        append_cwx_word(utf8_img, &wp, 850u, 1100u, 0u, 0u, "end");
+
+        memcpy(&utf8_img[0], "CWX1", 4u);
+        put_le16(&utf8_img[4], 1u);
+        put_le16(&utf8_img[6], 1u);
+        put_le32(&utf8_img[8], 1200u);
+        put_le32(&utf8_img[12], 3u);
+        put_le32(&utf8_img[16], s_off);
+        put_le32(&utf8_img[20], k_off);
+        put_le32(&utf8_img[24], 2u);
+        put_le32(&utf8_img[28], w_off);
+        memcpy(&utf8_img[32], "UTF8 Cut", 8u);
+        put_le16(&utf8_img[s_off], 0x07FFu);
+        memcpy(&utf8_img[s_off + 4u], "A", 1u);
+        put_le32(&utf8_img[k_off], rel0);
+        put_le32(&utf8_img[k_off + 4u], 0u);
+        put_le32(&utf8_img[k_off + 8u], rel0);
+        put_le32(&utf8_img[k_off + 12u], 0u);
+
+        mem_cwx_src_t usrc = { utf8_img, wp };
+        cwx_stream_t ucwx;
+        cwx_word_t uw;
+        assert(cwx_open(&ucwx, mem_cwx_read, &usrc, wp) == 0);
+        assert(cwx_seek_ms(&ucwx, 0u) == 0);
+        assert(cwx_next_word(&ucwx, &uw) == 1);
+        assert(uw.text_len == 46u && strlen(uw.text) == 46u);
+        assert(cwx_next_word(&ucwx, &uw) == 1);
+        assert(uw.text_len == 45u && strlen(uw.text) == 45u);
+        assert(cwx_next_word(&ucwx, &uw) == 1);
+        assert(strcmp(uw.text, "end") == 0);
+    }
+
     printf("  [PASS] cwx_engine (header, speakers, seek table, next_word, read_window, tr_pager)\n");
 }
 

@@ -1005,7 +1005,7 @@ static int scan_bitmap_range(exfat_vol_t *vol, uint32_t start_byte, uint32_t end
 
     uint32_t cur_byte = target_cidx << cls_shift;
     uint32_t s_start  = (start_byte & cls_mask) >> 9;
-    uint8_t  buf[4u * 512u];
+    uint8_t *buf      = vol->io_buf;
 
     while (bmp_cls >= 2u && cur_byte < end_byte) {
         uint32_t base_lba = cluster_to_lba(vol, bmp_cls);
@@ -1179,10 +1179,10 @@ static int free_cluster_bit(exfat_vol_t *vol, uint32_t cluster)
     return 0;
 }
 
-static int zero_cluster(const exfat_vol_t *vol, uint32_t cluster)
+static int zero_cluster(exfat_vol_t *vol, uint32_t cluster)
 {
-    uint8_t zero[4u * 512u];
-    mem_zero(zero, sizeof(zero));
+    uint8_t *zero = vol->io_buf;
+    mem_zero(zero, sizeof(vol->io_buf));
     uint32_t base_lba = cluster_to_lba(vol, cluster);
     uint32_t s = 0u;
     while (s < vol->sectors_per_cluster) {
@@ -1190,7 +1190,7 @@ static int zero_cluster(const exfat_vol_t *vol, uint32_t cluster)
         if (chunk > 4u) {
             chunk = 4u;
         }
-        if (dev_write_c(vol, base_lba + s, chunk, zero) != 0) {
+        if (dev_write(vol, base_lba + s, chunk, zero) != 0) {
             return -1;
         }
         s += chunk;
@@ -1424,7 +1424,7 @@ static int dir_alloc_slots(exfat_vol_t *vol, uint32_t dir_cluster, uint8_t *dir_
     uint32_t cls_idx  = 0u;
     uint32_t pad_lba  = 0u;
     uint8_t  pad_slot = 0u;
-    uint8_t  buf[4u * 512u];
+    uint8_t *buf      = vol->io_buf;
 
     while (cls >= 2u && (cls - 2u) < vol->cluster_count) {
         uint32_t base_lba = cluster_to_lba(vol, cls);
@@ -1447,7 +1447,7 @@ static int dir_alloc_slots(exfat_vol_t *vol, uint32_t dir_cluster, uint8_t *dir_
                         if ((16u - idx) >= total_ents) {
                             /* Allocation succeeded: flush deferred 0x05 tail padding if any */
                             if (pad_lba != 0u) {
-                                uint8_t psec[512];
+                                uint8_t *psec = vol->io_buf;
                                 if (vol->dev->read_sectors(vol->dev->ctx, pad_lba, 1u, psec) != 0) {
                                     return -1;
                                 }

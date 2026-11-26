@@ -732,6 +732,8 @@ static void player_pause_rewind(const wav_stream_info_t *winfo,
     aout_flush();
 }
 
+static cwx_stream_t g_player_cwx;
+
 int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_name,
                         ui_model_t *m)
 {
@@ -751,7 +753,7 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
         m = &local_m;
     }
 
-    char wav_path[96];
+    char wav_path[128];
     build_path(wav_path, (int)sizeof(wav_path), dir_path, wav_name);
 
     exfat_entry_t wav_ent;
@@ -813,17 +815,16 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
 
     /* Optional companion Cassini timed-word sidecar (.cwx) */
     int has_cwx = 0;
-    cwx_stream_t cwx;
     exfat_entry_t cwx_ent;
     exfat_cwx_io_t cwx_io = { .vol = vol, .ent = &cwx_ent };
-    char cwx_path[96];
+    char cwx_path[128];
     if (make_cwx_path(cwx_path, (int)sizeof(cwx_path), dir_path, wav_name) == 0 &&
         exfat_find_path(vol, cwx_path, &cwx_ent) == 0 && !cwx_ent.is_dir &&
         cwx_ent.size <= 0xFFFFFFFFu &&
-        cwx_open(&cwx, exfat_cwx_read_cb, &cwx_io, (uint32_t)cwx_ent.size) == 0) {
-        has_cwx = (cwx.word_count == 0u) ? 2 : 1;
+        cwx_open(&g_player_cwx, exfat_cwx_read_cb, &cwx_io, (uint32_t)cwx_ent.size) == 0) {
+        has_cwx = (g_player_cwx.word_count == 0u) ? 2 : 1;
         if (has_cwx == 1) {
-            cwx_tr_pager_init(&g_tr_pager, &cwx, CWX_TR_MAX_LINE_W);
+            cwx_tr_pager_init(&g_tr_pager, &g_player_cwx, CWX_TR_MAX_LINE_W);
         }
     }
 
@@ -877,13 +878,20 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
     /* Panel is already configured for 160x80 landscape at boot; avoid touching LCDC
      * directly from CPU0 while CPU1 owns the display controller. */
 
-    uint32_t dur_ms = (has_cwx && cwx.duration_ms > 0u) ? cwx.duration_ms : winfo.duration_ms;
+    uint32_t dur_ms = (has_cwx && g_player_cwx.duration_ms > 0u) ? g_player_cwx.duration_ms : winfo.duration_ms;
     str_copy_cap(m->play_file.filename, (int)sizeof(m->play_file.filename), wav_name);
     m->play_file.duration_sec   = (dur_ms + 500u) / 1000u;
     m->play_file.has_transcript = (uint8_t)has_cwx;
     m->play_file.channels       = (uint8_t)winfo.channels;
     m->play_has_transcript      = has_cwx;
     m->play_vol_hi              = 0u;
+#if PLAYER_BT
+    m->play_bt_audio            = aout_is_bt() ? 1u : 0u;
+    m->play_bt_vol              = volume;
+#else
+    m->play_bt_audio            = 0u;
+    m->play_bt_vol              = 0u;
+#endif
     m->play_vu_l                = 0u;
     m->play_vu_r                = 0u;
     /* Live position for a power-off mid-track (refreshed on every UI tick) */
@@ -1415,6 +1423,13 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
             m->play_state       = scrub.speed ? 0u : eof_reached ? 2u : (paused ? 1u : 0u);
             m->play_scrub_speed = (int8_t)(scrub.speed && scrub.target != 1 ? scrub.target : 0);
             m->play_vol_hi      = (last_vol_ms != 0u && (uint32_t)(now - last_vol_ms) < 1500u) ? 1u : 0u;
+#if PLAYER_BT
+            m->play_bt_audio    = aout_is_bt() ? 1u : 0u;
+            m->play_bt_vol      = volume;
+#else
+            m->play_bt_audio    = 0u;
+            m->play_bt_vol      = 0u;
+#endif
             m->play_vu_l        = (paused || eof_reached || scrub.speed) ? 0u : peak_l_pct;
             m->play_vu_r        = (paused || eof_reached || scrub.speed) ? 0u : peak_r_pct;
 

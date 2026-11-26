@@ -1466,9 +1466,13 @@ int bth_headphones_scenario(const char *img_path)
     SCHECK(WAIT(UI().bt_vol == 90u && H.regs >= 2u, 2000), "CHANGED: bt_vol %u, registrations %u", UI().bt_vol,
            H.regs);
     uint32_t sv = H.setvol;
+    uint32_t cfg_saves0 = s_cfg_saves;
     s_vol31_req = 10u;
     SCHECK(WAIT(H.setvol > sv && H.setvol_last == (10u * 127u + 15u) / 31u, 2000), "SetAbsoluteVolume %u (last %u)",
            H.setvol, H.setvol_last);
+    SCHECK(WAIT(s_cfg_saves > cfg_saves0 && s_cfg_len >= 7u && s_cfg_blob[6] == (10u * 127u + 15u) / 31u, 3000),
+           "bt_vol not saved after vol31 change (saves %u -> %u, byte %u)", cfg_saves0, s_cfg_saves,
+           s_cfg_len >= 7u ? s_cfg_blob[6] : 0u);
     {
         /* VOL+ passthrough: one player key; bt_vol moves only through the player's bt_hp_set_vol31 */
         (void)WAIT(0, 100);
