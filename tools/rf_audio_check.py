@@ -36,11 +36,26 @@ PASS, FAIL or INCONCLUSIVE (the baseline cannot support the bar, or the setup di
       a few samples) within the C0 captures' drift range +- 8 samples - the detector for silent sub-block loss.
       With --bench-log a capture without a counter line FAILS (ring wrapped, renamed file) unless waived with
       --no-device-counters LABEL. Settings (gain, dsp, vor, ch) from the counters must match the baseline's.
+      A capture is matched to its counter line by device file name: LABEL=path@REC_0032.wav, then --labels FILE
+      (lines "LABEL REC_0032.wav", e.g. the bench runner's labels.txt), then the WAV's own name; a log given as
+      --bench-log LABEL=log serves that capture first, and when it holds a single finished record that one is used.
+  (q) --quiet-mode: night captures carry seconds of mechanical rumble (40-150 Hz, near full scale) that swamp every
+      whole-file metric. 1 s blocks of the analysis window whose RMS (any channel) exceeds the capture's own median
+      block by --lim-quiet-db (default 6 dB), plus --lim-quiet-guard-blocks on each side (the decay tails), are left
+      out of (a), (b), (c) and (d) - in the baseline and the captures alike (Welch segments must lie in kept
+      seconds; the envelope's power is held at the kept mean over excluded seconds so the time base stays intact).
+      Continuity (e) still covers the whole file. Fewer than --lim-quiet-min-s kept seconds -> INCONCLUSIVE.
+      Every excluded burst is classified (dominant band, energy share on the k*800 / k*1600 Hz combs +-10 Hz above
+      the +-15..60 Hz flanks): a burst whose comb share >= --lim-quiet-comb-share, or with a comb tooth >=
+      --lim-quiet-comb-prom-db above its flanks that is also > --lim-spur-db above the same tooth in the quiet
+      seconds, FAILS the capture - an RF burst cannot hide as a 'transient'.
 
 Usage:
   rf_audio_check.py --baseline C0_1.wav --baseline C0_2.wav --capture C3=REC_0012.wav [--capture C1=...]
-                    [--bench-log ring.log] [--no-device-counters LABEL] [--signal auto|silence|tone]
+                    [--bench-log ring.log | --bench-log LABEL=btbench_LABEL.log] [--labels labels.txt]
+                    [--no-device-counters LABEL] [--signal auto|silence|tone] [--quiet-mode]
                     [--json out.json] [--md out.md]
+  (a capture may name its device file: --capture C1_1=C1_1.wav@REC_0033.wav)
   rf_audio_check.py --self-test
 Exit status: 0 all captures pass, 1 a capture fails or is inconclusive, 2 usage / input error. numpy only (scipy is not needed).
 
@@ -50,6 +65,8 @@ SPDX-License-Identifier: MIT
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import math
 import re
@@ -92,6 +109,11 @@ class Limits:
     tone_level_db: float = 0.3       # tone level vs the baseline: outside -> INCONCLUSIVE
     noise_db: float = 0.5            # tone captures: residual noise (dBFS) above the baseline
     cont_edge_s: float = 0.5         # continuity checks skip this much at each end (REC switch click)
+    quiet_db: float = 6.0            # --quiet-mode: 1 s blocks above the capture's median block by this are excluded
+    quiet_guard_blocks: int = 1      # --quiet-mode: also exclude this many blocks on each side (decay tails)
+    quiet_min_s: float = 30.0        # --quiet-mode: fewer kept seconds -> INCONCLUSIVE
+    quiet_comb_share: float = 0.05   # --quiet-mode: excluded burst energy share on the 800 Hz comb -> FAIL
+    quiet_comb_prom_db: float = 10.0  # --quiet-mode: a comb tooth this far above its flanks (and above quiet) -> FAIL
 
 
 # ------------------------------------------------------------------------------------------------------------- io
@@ -144,13 +166,21 @@ def bh4(n: int) -> np.ndarray:
     return 0.35875 - 0.48829 * np.cos(k) + 0.14128 * np.cos(2 * k) - 0.01168 * np.cos(3 * k)
 
 
-def welch(x: np.ndarray, fs: float, nper: int, window: str = "bh4") -> tuple[np.ndarray, np.ndarray]:
-    """One-sided PSD (density), Blackman-Harris (or Hann), 50 % overlap, mean removed per segment."""
+def welch(x: np.ndarray, fs: float, nper: int, window: str = "bh4",
+          mask: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """One-sided PSD (density), Blackman-Harris (or Hann), 50 % overlap, mean removed per segment. mask (per sample,
+    True = usable): only segments that lie wholly in usable samples are averaged (all of them if none does)."""
     nper = min(nper, len(x))
     hop = max(1, nper // 2)
     w = bh4(nper) if window == "bh4" else np.hanning(nper)
     nseg = 1 + (len(x) - nper) // hop
     idx = np.arange(nper)[None, :] + hop * np.arange(nseg)[:, None]
+    if mask is not None:
+        bad = np.r_[0, np.cumsum(~np.asarray(mask[:len(x)], dtype=bool))]
+        st = hop * np.arange(nseg)
+        ok = bad[st + nper] == bad[st]
+        if ok.any():
+            idx = idx[ok]
     seg = x[idx]
     seg = (seg - seg.mean(axis=1, keepdims=True)) * w
     p = (np.abs(np.fft.rfft(seg, axis=1)) ** 2).mean(axis=0) / (fs * (w ** 2).sum())
@@ -303,20 +333,26 @@ def zero_runs(x2d: np.ndarray, min_len: int) -> list[dict]:
     return [{"t_s": round(s / FS, 3), "samples": int(e - s)} for s, e in zip(starts, ends) if e - s >= min_len]
 
 
-def envelope(x: np.ndarray) -> np.ndarray:
+def envelope(x: np.ndarray, mask: np.ndarray | None = None) -> np.ndarray:
     """RMS envelope at ENV_FS: x^2 low-passed below 45 Hz (brick wall), then decimated. A plain 10 ms mean would alias
-    a tone's 2 f0 power ripple into the envelope band (997 Hz -> a 6 Hz line that moves with the tone frequency)."""
+    a tone's 2 f0 power ripple into the envelope band (997 Hz -> a 6 Hz line that moves with the tone frequency).
+    mask (True = usable): x^2 is held at the usable samples' mean elsewhere (an excluded burst would otherwise ring
+    through the brick-wall filter for seconds; holding keeps the time base for the 1.28 s fold)."""
     m = int(FS / ENV_FS)
     n = len(x) // m
     p = x[:n * m] ** 2
+    if mask is not None and not mask[:n * m].all() and mask[:n * m].any():
+        p = p.copy()
+        mk = mask[:n * m]
+        p[~mk] = p[mk].mean()
     spec = np.fft.rfft(p)
     spec[np.fft.rfftfreq(len(p), 1.0 / FS) > 0.45 * ENV_FS] = 0.0
     lp = np.fft.irfft(spec, len(p))
     return np.sqrt(np.maximum(lp[m // 2::m][:n], 0.0))
 
 
-def env_metrics(x: np.ndarray) -> dict:
-    e = envelope(x)
+def env_metrics(x: np.ndarray, mask: np.ndarray | None = None) -> dict:
+    e = envelope(x, mask)
     mean = float(e.mean())
     if len(e) < 2 * FOLD_PERIOD or mean <= 0:
         return {}
@@ -347,7 +383,9 @@ def env_metrics(x: np.ndarray) -> dict:
             "_f": f, "_pdb": pdb, "_med": local_median(pdb, f, half_hz=2.0, excl_hz=0.3)}
 
 
-def analyse_channel(x: np.ndarray, signal: str, tone_hz: float | None, lim: Limits) -> dict:
+def analyse_channel(x: np.ndarray, signal: str, tone_hz: float | None, lim: Limits,
+                    mask: np.ndarray | None = None) -> dict:
+    """mask (per sample, True = usable): --quiet-mode's kept seconds for the spectral and envelope metrics."""
     out: dict = {}
     f0 = None
     if signal in ("auto", "tone"):
@@ -356,7 +394,7 @@ def analyse_channel(x: np.ndarray, signal: str, tone_hz: float | None, lim: Limi
             raise ValueError("--signal tone, but no tone found (give --tone-hz)")
     out["signal"] = "tone" if f0 else "silence"
     out["tone_hz"] = round(f0, 3) if f0 else None
-    f, p = welch(x, FS, FS)
+    f, p = welch(x, FS, FS, mask=mask)
     band = (f >= BAND[0]) & (f <= BAND[1])
     keep = band & tone_mask(f, f0)
     if not f0:
@@ -364,7 +402,11 @@ def analyse_channel(x: np.ndarray, signal: str, tone_hz: float | None, lim: Limi
         out["floor_a_db"] = round(float(db((p * a_weight(f))[band].sum())), 3)
     else:
         fr, amp, res = tone_fit(x, f0, FS)
-        fr_, pr = welch(res, FS, FS)
+        if mask is not None:
+            kb = np.array([mask[k * FS:(k + 1) * FS].all() for k in range(len(amp))], dtype=bool)
+            if kb.any():
+                fr, amp = fr[kb], amp[kb]
+        fr_, pr = welch(res, FS, FS, mask=None if mask is None else mask[:len(res)])
         bandr = (fr_ >= BAND[0]) & (fr_ <= BAND[1])
         p_fund = float(np.mean(amp ** 2) / 2.0)
         p_thdn = float(pr[bandr].sum())
@@ -375,9 +417,10 @@ def analyse_channel(x: np.ndarray, signal: str, tone_hz: float | None, lim: Limi
         out["thdn_db"] = round(float(db(p_thdn) - db(p_fund)), 3)
         out["tone_wander_hz"] = round(float(fr.max() - fr.min()), 4) if len(fr) else 0.0
     out["_psd_db"] = db(p)
+    out["_p"] = p
     out["_keep"] = keep
     out["_f"] = f
-    out["env"] = env_metrics(x)
+    out["env"] = env_metrics(x, mask)
     return out
 
 
@@ -390,10 +433,108 @@ class Capture:
     n: int = 0
     ch: list[dict] = field(default_factory=list)
     raw: np.ndarray | None = None
+    quiet: dict | None = None        # --quiet-mode: kept / excluded seconds and the excluded bursts
+
+
+COMB_HALF_HZ = 10.0              # --quiet-mode burst classification: comb tooth +-10 Hz
+COMB_FLANK_HZ = (15.0, 60.0)     # ... measured against the mean of the +-15..60 Hz flanks
+
+
+def notch_tone(x: np.ndarray, f0: float, half_hz: float = 20.0) -> np.ndarray:
+    """x without the tone and its harmonics (+-half_hz, FFT over the whole signal)."""
+    spec = np.fft.rfft(x)
+    f = np.fft.rfftfreq(len(x), 1.0 / FS)
+    k = np.round(f / f0)
+    spec[(k >= 1) & (np.abs(f - k * f0) <= half_hz)] = 0.0
+    return np.fft.irfft(spec, len(x))
+
+
+def highpass(x: np.ndarray, f_lo: float, f_hi: float) -> np.ndarray:
+    """FFT high-pass, raised-cosine transition f_lo..f_hi (the tone's phase is untouched above f_hi)."""
+    spec = np.fft.rfft(x)
+    f = np.fft.rfftfreq(len(x), 1.0 / FS)
+    g = np.clip((f - f_lo) / max(f_hi - f_lo, 1e-9), 0.0, 1.0)
+    return np.fft.irfft(spec * (0.5 - 0.5 * np.cos(np.pi * g)), len(x))
+
+
+def quiet_blocks(xw: np.ndarray, lim: Limits, f0s: list[float | None] | None = None) -> dict:
+    """--quiet-mode: 1 s blocks of the analysis window (all channels) whose RMS exceeds the channel's median block by
+    lim.quiet_db, widened by lim.quiet_guard_blocks on each side. f0s: a channel's test tone, notched out first (a
+    -23 dBFS tone would otherwise hide a burst that is loud against the noise). Returns the per-sample keep mask and
+    the bursts (runs of excluded blocks) as sample ranges of the window."""
+    n, nch = xw.shape
+    xd = xw.copy()
+    for k, f0 in enumerate(f0s or []):
+        if f0:
+            xd[:, k] = notch_tone(xw[:, k], f0)
+    nb = -(-n // FS)
+    lv = np.empty((nb, nch))
+    for i in range(nb):
+        seg = xd[i * FS:(i + 1) * FS]
+        lv[i] = db(((seg - seg.mean(axis=0)) ** 2).mean(axis=0))
+    med = np.median(lv, axis=0)
+    over = lv - med
+    core = (over > lim.quiet_db).any(axis=1)
+    excl = core.copy()
+    g = max(0, int(lim.quiet_guard_blocks))
+    for i in np.nonzero(core)[0]:
+        excl[max(0, i - g):i + g + 1] = True
+    mask = np.repeat(~excl, FS)[:n]
+    edges = np.diff(np.r_[0, excl.astype(np.int8), 0])
+    bursts = []
+    for s0, e0 in zip(np.nonzero(edges == 1)[0], np.nonzero(edges == -1)[0]):
+        bursts.append({"b0": int(s0), "b1": int(e0), "s": int(s0) * FS, "e": min(int(e0) * FS, n),
+                       "core_s": int(core[s0:e0].sum()), "peak_db_re_quiet": round(float(over[s0:e0].max()), 1)})
+    return {"mask": mask, "quiet_db": [round(float(v), 2) for v in med], "kept_s": round(float(mask.sum()) / FS, 2),
+            "excl_s": round(float((~mask).sum()) / FS, 2), "bursts": bursts}
+
+
+def classify_burst(seg: np.ndarray, fq: np.ndarray, pq: np.ndarray, lim: Limits) -> dict:
+    """An excluded burst (one channel): its dominant band (10-90 % of the energy 20 Hz - 7.99 kHz), its peak bin, and
+    the energy on the k*800 Hz comb (k*1600 Hz: the even teeth) +-10 Hz above what the tooth's flanks predict, as a
+    share of the burst's energy. A tooth that stands lim.quiet_comb_prom_db above its flanks and whose excess is more
+    than lim.spur_db above the same tooth in the quiet seconds (fq, pq: the quiet PSD) is a burst-borne line: with a
+    comb share >= lim.quiet_comb_share it marks the burst bt_comb (an RF burst, not a mechanical transient)."""
+    f, p = welch(seg, FS, min(FS, len(seg)))
+    df = float(f[1] - f[0])
+    band = (f >= BAND[0]) & (f <= BAND[1])
+    fb, pb = f[band], p[band]
+    tot = float(pb.sum() * df)
+    cum = np.cumsum(pb)
+    lo = float(fb[min(int(np.searchsorted(cum, 0.1 * cum[-1])), len(fb) - 1)])
+    hi = float(fb[min(int(np.searchsorted(cum, 0.9 * cum[-1])), len(fb) - 1)])
+    pqi = np.interp(f, fq, pq)
+    ex800 = ex1600 = 0.0
+    best: dict | None = None
+    line = False
+    k = 1
+    while 800.0 * k + COMB_FLANK_HZ[1] < BAND[1]:
+        ft = 800.0 * k
+        dist = np.abs(f - ft)
+        t = dist <= COMB_HALF_HZ
+        fl = (dist >= COMB_FLANK_HZ[0]) & (dist <= COMB_FLANK_HZ[1])
+        tp = float(p[t].sum() * df)
+        exp = float(p[fl].mean() * t.sum() * df)
+        ex = max(tp - exp, 0.0)
+        qp = float(pqi[t].sum() * df)
+        prom, req = float(db(tp) - db(exp)), float(db(ex) - db(qp))
+        ex800 += ex
+        if k % 2 == 0:
+            ex1600 += ex
+        if prom >= lim.quiet_comb_prom_db and req > lim.spur_db:
+            line = True
+        if best is None or prom > best["prom_db"]:
+            best = {"hz": ft, "prom_db": round(prom, 1), "re_quiet_db": round(req, 1)}
+        k += 1
+    share = ex800 / tot if tot > 0 else 0.0
+    return {"band_hz": f"{lo:.0f}-{hi:.0f}", "peak_hz": float(fb[int(np.argmax(pb))]),
+            "level_dbfs": round(float(db(tot)), 1), "share_800": round(share, 4),
+            "share_1600": round(ex1600 / tot if tot > 0 else 0.0, 4), "max_tooth": best,
+            "bt_comb": bool(share >= lim.quiet_comb_share or line)}
 
 
 def load_capture(label: str, path: Path, signal: str, tone_hz: float | None, trim: tuple[float, float],
-                 lim: Limits) -> Capture:
+                 lim: Limits, quiet: bool = False) -> Capture:
     rate, x = load_wav(path)
     if rate != FS:
         raise ValueError(f"{path}: {rate} Hz, expected {FS}")
@@ -402,12 +543,29 @@ def load_capture(label: str, path: Path, signal: str, tone_hz: float | None, tri
     if b - a < 4 * FS:
         raise ValueError(f"{path}: too short after trimming ({(b - a) / FS:.1f} s, need >= 4 s)")
     c.raw = x
+    mask = None
+    if quiet:
+        f0s = [None] * x.shape[1]
+        if signal in ("auto", "tone"):
+            f0s = [tone_hz or detect_tone(x[a:b, k]) for k in range(x.shape[1])]
+        c.quiet = quiet_blocks(x[a:b], lim, f0s)
+        mask = c.quiet["mask"]
     e = min(int(lim.cont_edge_s * FS), len(x) // 4)
     for k in range(x.shape[1]):
-        ch = analyse_channel(x[a:b, k], signal, tone_hz, lim)
+        ch = analyse_channel(x[a:b, k], signal, tone_hz, lim, mask)
         if ch["tone_hz"]:   # continuity: the whole file but the edges (the spectral metrics keep the middle window)
-            ch["phase_steps"] = phase_steps(x[e:len(x) - e, k], ch["tone_hz"], lim.phase_rad, e / FS)
+            xc = x[e:len(x) - e, k]
+            if quiet:      # rumble (40-150 Hz) leaks into the 16 ms fits: high-pass well below the tone
+                xc = highpass(xc, ch["tone_hz"] / 4.0, ch["tone_hz"] / 2.0)
+            ch["phase_steps"] = phase_steps(xc, ch["tone_hz"], lim.phase_rad, e / FS)
         c.ch.append(ch)
+    if c.quiet is not None:   # classify every excluded burst on every channel against that channel's quiet PSD
+        for bu in c.quiet["bursts"]:
+            cls = [classify_burst(x[a + bu["s"]:a + bu["e"], k], ch["_f"], ch["_p"], lim)
+                   for k, ch in enumerate(c.ch)]
+            worst = max(range(len(cls)), key=lambda k: (cls[k]["bt_comb"], cls[k]["share_800"]))
+            bu.update({"t_s": round((a + bu["s"]) / FS, 2), "dur_s": round((bu["e"] - bu["s"]) / FS, 2),
+                       "ch": worst, **cls[worst]})
     return c
 
 
@@ -441,9 +599,11 @@ def _bdrift(d: dict | None) -> tuple[int, int] | None:
 
 
 def compare(cap: Capture, base: list[Capture], lim: Limits, trim: tuple[float, float], dev: dict | None,
-            expect_s: float | None, dev_state: str = "none", ref_devs: list[dict] | None = None) -> list[dict]:
+            expect_s: float | None, dev_state: str = "none", ref_devs: list[dict] | None = None,
+            dev_how: str = "") -> list[dict]:
     """dev_state: "none" (no --bench-log), "found", "missing" (no line for this file) or "waived".
-    ref_devs: the baseline captures' counters (the other baselines when cap is one)."""
+    ref_devs: the baseline captures' counters (the other baselines when cap is one). dev_how: how the counter line
+    was matched (or which names were tried)."""
     rows: list[dict] = []
     ref_devs = ref_devs or []
     if base and len(base[0].ch) != len(cap.ch):
@@ -556,6 +716,28 @@ def compare(cap: Capture, base: list[Capture], lim: Limits, trim: tuple[float, f
             row(rows, "(e) tone phase steps", len(st), 0, None, f"none > {lim.phase_rad} rad", not st, k)
             if st:
                 rows[-1]["detail"] = st
+    # --quiet-mode: with too few quiet seconds (here or in a baseline) the spectral / envelope / tone rows measure the
+    # bursts, not the radio: they cannot pass or fail
+    short = [x.label for x in [cap] + base if x.quiet is not None and x.quiet["kept_s"] < lim.quiet_min_s]
+    if short:
+        for r in rows:
+            if r["metric"][:3] in ("(a)", "(b)", "(c)", "(d)") and r["verdict"] == "FAIL":
+                r["verdict"] = "INCONCLUSIVE"
+                r["note"] = f"too few quiet seconds in {', '.join(short)}"
+    # (q) --quiet-mode: kept seconds, and no excluded burst on the BT comb
+    if cap.quiet is not None:
+        q = cap.quiet
+        row(rows, "(q) quiet seconds kept", q["kept_s"], f"{q['excl_s']} s excluded", None,
+            f">= {lim.quiet_min_s:g} s (blocks > median +{lim.quiet_db:g} dB, +-{lim.quiet_guard_blocks} guard)",
+            True, verdict=None if q["kept_s"] >= lim.quiet_min_s else "INCONCLUSIVE")
+        bt = [bu for bu in q["bursts"] if bu.get("bt_comb")]
+        row(rows, "(q) excluded bursts on BT comb", len(bt), 0, None,
+            f"none: 800 Hz comb share < {lim.quiet_comb_share:g}, no tooth >= {lim.quiet_comb_prom_db:g} dB prom "
+            f"and > quiet +{lim.spur_db:g} dB", not bt)
+        if q["bursts"]:
+            rows[-1]["detail"] = [{k: bu[k] for k in ("t_s", "dur_s", "peak_db_re_quiet", "band_hz", "peak_hz",
+                                                       "share_800", "share_1600", "max_tooth", "bt_comb")}
+                                  for bu in (bt + [b_ for b_ in q["bursts"] if not b_.get("bt_comb")])][:20]
     # (e) zero runs and length: the whole file but the edges
     e = min(int(lim.cont_edge_s * FS), cap.n // 4)
     zr = zero_runs(cap.raw[e:cap.n - e], lim.zero_run)
@@ -567,10 +749,14 @@ def compare(cap: Capture, base: list[Capture], lim: Limits, trim: tuple[float, f
     n = cap.n
     if dev_state == "missing":
         row(rows, "(e) device counters", "missing", None, None,
-            "a counter line for this file (ring wrapped? renamed?) or --no-device-counters LABEL", False)
+            "a counter line for this file (ring wrapped? renamed? map it: --labels, LABEL=path@REC_NNNN.wav, "
+            "--bench-log LABEL=log) or --no-device-counters LABEL", False)
+        if dev_how:
+            rows[-1]["detail"] = [dev_how]
     elif dev_state == "waived":
         row(rows, "(e) device counters", "waived", None, None, "--no-device-counters: audio metrics only", True)
     if dev is not None:
+        row(rows, "(e) device record", dev.get("file", "?"), None, None, f"matched by {dev_how or 'file name'}", True)
         clk = int(dev.get("clk_smp", "0") or 0)
         row(rows, "(e) length vs device clock", n, clk, n - clk, f"+-{lim.len_tol}", abs(n - clk) <= lim.len_tol)
         wav = int(dev.get("wav_smp", "-1") or -1)
@@ -618,32 +804,86 @@ def compare(cap: Capture, base: list[Capture], lim: Limits, trim: tuple[float, f
 
 
 # ----------------------------------------------------------------------------------------------------- report
+def dev_key(name: str) -> str:
+    """A device file name as the counter lines key it: no directory, upper case, .WAV added when missing."""
+    k = Path(name.strip().replace("\\", "/")).name.upper()
+    return k if k.endswith(".WAV") else k + ".WAV"
+
+
+def parse_labels(paths: list[Path]) -> dict[str, str]:
+    """LABEL -> device file from lines "LABEL REC_0032.wav" (also "LABEL=..." / "LABEL,..."; '#' comments)."""
+    out: dict[str, str] = {}
+    for p in paths:
+        for line in p.read_text(errors="replace").splitlines():
+            line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            parts = [t for t in re.split(r"[\s,=;]+", line) if t]
+            if len(parts) < 2:
+                raise ValueError(f"{p}: cannot read label line {line!r} (want: LABEL REC_NNNN.wav)")
+            out[parts[0]] = parts[-1]
+    return out
+
+
+def match_device(label: str, p: Path, dev: dict[str, dict[str, str]], label_logs: dict[str, dict[str, dict]],
+                 dev_names: dict[str, str]) -> tuple[dict | None, str]:
+    """The counter line for a capture, and how it was matched (or what was tried). Order: the explicit device name
+    (LABEL=path@REC_x.wav or --labels), then the WAV's own name; the capture's own log (--bench-log LABEL=log) first,
+    then all logs; a capture's own log with a single finished record serves it when no explicit name is given."""
+    explicit = dev_names.get(label)
+    names = [dev_key(explicit)] if explicit else []
+    if dev_key(p.name) not in names and not explicit:
+        names.append(dev_key(p.name))
+    own = label_logs.get(label)
+    if own is not None:
+        for nm in names:
+            if nm in own:
+                return own[nm], f"{nm} in {label}'s log" + (" (explicit name)" if explicit else "")
+    for nm in names:
+        if nm in dev:
+            return dev[nm], nm + (" (explicit name)" if explicit else " (WAV name)")
+    if own is not None and not explicit:
+        fin = [k for k, v in own.items() if v.get("rec") == "0"] or list(own)
+        if len(fin) == 1:
+            return own[fin[0]], f"{fin[0]}: the only finished record in {label}'s log"
+    tried = ", ".join(names) + (f"; {label}'s log holds {sorted(own)}" if own is not None else "")
+    return None, "tried " + tried
+
+
 def run(base_paths: list[tuple[str, Path]], caps: list[tuple[str, Path]], signal: str, tone_hz: float | None,
         trim: tuple[float, float], bench_logs: list[Path], expect_s: float | None, lim: Limits,
-        waive: set[str] | None = None) -> dict:
+        waive: set[str] | None = None, quiet: bool = False, dev_names: dict[str, str] | None = None,
+        label_logs: dict[str, list[Path]] | None = None) -> dict:
+    """dev_names: capture label -> device file name (REC_0032.wav); label_logs: label -> that capture's own logs
+    (also searched for every other capture)."""
     waive = waive or set()
-    dev = parse_bench_log(bench_logs) if bench_logs else {}
+    dev_names = dev_names or {}
+    label_logs = label_logs or {}
+    all_logs = list(bench_logs) + [q for ps in label_logs.values() for q in ps if q not in bench_logs]
+    dev = parse_bench_log(all_logs) if all_logs else {}
+    own = {lb: parse_bench_log(ps) for lb, ps in label_logs.items()}
 
-    def lookup(label: str, p: Path) -> tuple[dict | None, str]:
-        if not bench_logs:
-            return None, "none"
-        d = dev.get(p.name.upper())
+    def lookup(label: str, p: Path) -> tuple[dict | None, str, str]:
+        if not all_logs:
+            return None, "none", ""
+        d, how = match_device(label, p, dev, own, dev_names)
         if d is not None:
-            return d, "found"
-        return None, "waived" if label in waive else "missing"
+            return d, "found", how
+        return None, "waived" if label in waive else "missing", how
 
-    base = [load_capture(lb, p, signal, tone_hz, trim, lim) for lb, p in base_paths]
+    base = [load_capture(lb, p, signal, tone_hz, trim, lim, quiet) for lb, p in base_paths]
     bdev = [lookup(lb, p) for lb, p in base_paths]
-    report = {"baseline": [str(p) for _, p in base_paths], "limits": lim.__dict__, "captures": []}
+    report = {"baseline": [str(p) for _, p in base_paths], "limits": lim.__dict__, "quiet_mode": quiet,
+              "captures": []}
     for i, b in enumerate(base):   # the baseline itself must be continuous; its counters vs the other repeats
-        others = [d for j, (d, _) in enumerate(bdev) if j != i and d is not None]
-        rows = compare(b, [], lim, trim, bdev[i][0], expect_s, bdev[i][1], others)
+        others = [d for j, (d, _, _) in enumerate(bdev) if j != i and d is not None]
+        rows = compare(b, [], lim, trim, bdev[i][0], expect_s, bdev[i][1], others, bdev[i][2])
         report["captures"].append(summary(b, rows, is_base=True))
-    refs = [d for d, _ in bdev if d is not None]
+    refs = [d for d, _, _ in bdev if d is not None]
     for lb, p in caps:
-        c = load_capture(lb, p, signal, tone_hz, trim, lim)
-        d, st = lookup(lb, p)
-        rows = compare(c, base, lim, trim, d, expect_s, st, refs)
+        c = load_capture(lb, p, signal, tone_hz, trim, lim, quiet)
+        d, st, how = lookup(lb, p)
+        rows = compare(c, base, lim, trim, d, expect_s, st, refs, how)
         report["captures"].append(summary(c, rows, is_base=False))
     report["pass"] = all(c["pass"] for c in report["captures"])
     return report
@@ -658,8 +898,12 @@ def summary(c: Capture, rows: list[dict], is_base: bool) -> dict:
         if isinstance(d.get("env"), dict):
             d["env"] = {k: v for k, v in d["env"].items() if not k.startswith("_")}
         per_ch.append(d)
+    q = None
+    if c.quiet is not None:
+        q = {k: v for k, v in c.quiet.items() if k != "mask"}
+        q["bursts"] = [{k: v for k, v in bu.items() if k not in ("s", "e", "b0", "b1")} for bu in q["bursts"]]
     return {"label": c.label, "file": str(c.path), "baseline": is_base, "samples": c.n, "channels": len(c.ch),
-            "seconds": round(c.n / FS, 3), "per_channel": per_ch, "rows": rows, "verdict": verdict,
+            "seconds": round(c.n / FS, 3), "per_channel": per_ch, "quiet": q, "rows": rows, "verdict": verdict,
             "pass": verdict == "PASS"}
 
 
@@ -667,12 +911,17 @@ def markdown(rep: dict) -> str:
     out = ["# RF audio check", "", f"Baseline: {', '.join(rep['baseline'])}", "",
            f"**Overall: {'PASS' if rep['pass'] else 'NOT PASS'}**", ""]
     for c in rep["captures"]:
-        kind = "baseline (continuity only)" if c["baseline"] else "capture"
+        kind = "baseline (continuity, counters, quiet bursts)" if c["baseline"] else "capture"
         sig = ", ".join(f"ch{i} {ch['signal']}" + (f" {ch['tone_hz']} Hz at {ch['tone_dbfs']} dBFS" if ch["tone_hz"] else
                         (f" floor {ch.get('floor_db')} dBFS ({ch.get('floor_a_db')} A)" if "floor_db" in ch else ""))
                         for i, ch in enumerate(c["per_channel"]))
+        qs = ""
+        if c.get("quiet"):
+            q = c["quiet"]
+            qs = (f"; quiet mode: {q['kept_s']} s kept, {q['excl_s']} s excluded in {len(q['bursts'])} burst(s), "
+                  f"quiet block level {', '.join(f'{v:g}' for v in q['quiet_db'])} dBFS")
         out += [f"## {c['label']} - {c['verdict']}", "",
-                f"{kind}: `{c['file']}`, {c['seconds']} s, {c['channels']} ch, {sig}", "",
+                f"{kind}: `{c['file']}`, {c['seconds']} s, {c['channels']} ch, {sig}{qs}", "",
                 "| metric | ch | value | baseline | delta | limit | verdict |", "|---|---|---|---|---|---|---|"]
         for r in c["rows"]:
             ch = "" if r["ch"] is None else r["ch"]
@@ -686,10 +935,22 @@ def markdown(rep: dict) -> str:
 
 
 def parse_labeled(s: str) -> tuple[str, Path]:
+    lb, p, _ = parse_capture_arg(s)
+    return lb, p
+
+
+def parse_capture_arg(s: str) -> tuple[str, Path, str | None]:
+    """[LABEL=]path[@DEVICE.wav] -> (label, path, device file name or None). The @ suffix is only taken when the
+    whole string is not an existing file and the suffix is a bare *.wav name."""
+    dev = None
+    if not Path(s).exists() and "@" in s:
+        head, tail = s.rsplit("@", 1)
+        if re.fullmatch(r"[^/\\=@]+\.wav", tail, flags=re.I):
+            s, dev = head, tail
     if "=" in s and not Path(s).exists():
         lb, p = s.split("=", 1)
-        return lb, Path(p)
-    return Path(s).stem, Path(s)
+        return lb, Path(p), dev
+    return Path(s).stem, Path(s), dev
 
 
 # ----------------------------------------------------------------------------------------------------- self-test
@@ -911,6 +1172,112 @@ def self_test() -> int:
         results.append(("markdown table", "| (e) device ov |" in md and "**FAIL**" in md, f"{len(md)} chars"))
         json.dumps(rep)
 
+        # ---- device counters matched by label (captures saved as LABEL.wav, not REC_NNNN.wav), via the CLI
+        for nm in ("M0a", "M0b", "M1", "M2", "M3", "M4", "M5"):
+            save_wav(d / f"{nm}.wav", x)
+        (d / "m_ring.log").write_text("\n".join([
+            "BENCH recrun start t=5", "BENCH rec " + _dev_line("REC_0101.wav", n, bdrift=-1),
+            "BENCH rec " + _dev_line("REC_0102.wav", n, bdrift=0),
+            "BENCH rec " + _dev_line("REC_0103.wav", n, bdrift=-1),
+            "BENCH rec " + _dev_line("REC_0104.wav", n, bdrift=0),
+            "BENCH rec " + _dev_line("REC_0106.wav", n, bdrift=0, ov=1)]) + "\n")
+        (d / "m3.log").write_text("BENCH rec " + _dev_line("REC_0105.wav", n // 2, bdrift=0, rec=1) + "\n"
+                                  "BENCH rec " + _dev_line("REC_0105.wav", n, bdrift=-1) + "\n")
+        (d / "m4.log").write_text("BENCH rec " + _dev_line("REC_0107.wav", n, bdrift=0) + "\n"
+                                  "BENCH rec " + _dev_line("REC_0108.wav", n, bdrift=0) + "\n")
+        (d / "labels.txt").write_text("# label device-file\nM0a REC_0101.wav\nM0b=REC_0102.wav\nM1 REC_0103.wav\n"
+                                      "M5 REC_0106.wav\n")
+        argv = ["--labels", str(d / "labels.txt"), "--bench-log", str(d / "m_ring.log"),
+                "--baseline", f"M0a={d / 'M0a.wav'}", "--baseline", f"M0b={d / 'M0b.wav'}",
+                "--capture", f"M1={d / 'M1.wav'}", "--capture", f"M2={d / 'M2.wav'}@REC_0104.wav",
+                "--capture", f"M3={d / 'M3.wav'}", "--bench-log", f"M3={d / 'm3.log'}",
+                "--capture", f"M4={d / 'M4.wav'}", "--bench-log", f"M4={d / 'm4.log'}",
+                "--capture", f"M5={d / 'M5.wav'}", "--trim-start-s", "7.5", "--trim-end-s", "7.5",
+                "--json", str(d / "m.json")]
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = main(argv)
+        rep = json.loads((d / "m.json").read_text())
+        results.append(("label mapping: CLI exit status 1 (M4, M5 fail)", rc == 1, f"rc={rc}"))
+        expect("labels.txt maps a baseline to its device record", rep, "M0a", "PASS")
+        expect("labels.txt maps a capture (LABEL.wav) to REC_0103", rep, "M1", "PASS")
+        expect("LABEL=path@REC_0104.wav names the device file", rep, "M2", "PASS")
+        expect("--bench-log LABEL=log: its only finished record (rec=1 line ignored)", rep, "M3", "PASS")
+        expect("--bench-log LABEL=log with two records and no name -> missing", rep, "M4", "FAIL",
+               ("(e) device counters",))
+        expect("labels.txt match uses that record's counters (ov=1)", rep, "M5", "FAIL", ("(e) device ov",))
+        m1 = next(c for c in rep["captures"] if c["label"] == "M1")
+        results.append(("... the matched record is named in the report",
+                        any(r["metric"] == "(e) device record" and r["value"] == "REC_0103.wav" for r in m1["rows"]),
+                        "REC_0103.wav"))
+        pc = parse_capture_arg("C1_1=caps/C1_1.wav@REC_0033.wav")
+        results.append(("parse LABEL=path@DEVICE.wav", pc == ("C1_1", Path("caps/C1_1.wav"), "REC_0033.wav"),
+                        str(pc)))
+
+        # ---- --quiet-mode: mechanical rumble bursts (40-150 Hz, near full scale) in the baseline and the captures
+        def rumble(x: np.ndarray, times: list[float], seed: int, lvl: float = -10.0, dur_ms: float = 300.0,
+                   comb_dbfs: float | None = None) -> np.ndarray:
+            """Hann-shaped 40-150 Hz noise bursts; comb_dbfs adds 800/1600/2400 Hz lines inside each burst."""
+            rng = np.random.default_rng(seed)
+            m = int(dur_ms * FS / 1000)
+            w = np.hanning(m)
+            for t0 in times:
+                s0 = int(t0 * FS)
+                b_ = _band_noise(rng, m, 40.0, 150.0, lvl) * w
+                if comb_dbfs is not None:
+                    tt = np.arange(m) / FS
+                    b_ = b_ + sum(10 ** (comb_dbfs / 20.0) * math.sqrt(2) * np.sin(2 * np.pi * fk * tt)
+                                  for fk in (800.0, 1600.0, 2400.0))
+                x[s0:s0 + m, :] += b_[:, None]
+            return x
+
+        def comb_burst(x: np.ndarray, t0: float, dur_s: float, dbfs: float) -> np.ndarray:
+            m = int(dur_s * FS)
+            tt = np.arange(m) / FS
+            lines = sum(10 ** (dbfs / 20.0) * math.sqrt(2) * np.sin(2 * np.pi * 800.0 * k_ * tt) for k_ in range(1, 10))
+            x[int(t0 * FS):int(t0 * FS) + m, :] += lines[:, None]
+            return x
+
+        bq = [save("Q0a", rumble(_synth(sec, 61), [15.3, 40.2], 1)),
+              save("Q0b", rumble(_synth(sec, 62), [22.7, 51.1], 2, dur_ms=900.0))]
+        caps = [save("qclean", rumble(_synth(sec, 63), [12.4, 33.3, 60.6], 3, dur_ms=70.0)),
+                save("qcomb", comb_burst(rumble(_synth(sec, 64), [12.4], 4), 45.2, 1.5, -40.0)),
+                save("qhidden", rumble(_synth(sec, 65), [12.4, 30.2], 5, dur_ms=900.0, comb_dbfs=-60.0)),
+                save("qfew", rumble(_synth(sec, 66), [8.3 + 2.5 * i for i in range(24)], 6)),
+                save("qfloor", rumble(_synth(sec, 67, floor_dbfs=-69.0), [20.5], 7))]
+        rep = run(bq, caps[:1], "silence", None, trim, [], None, lim)
+        expect("rumble bursts without --quiet-mode -> whole-file metrics fail", rep, "qclean", "FAIL")
+        rep = run(bq, caps, "silence", None, trim, [], None, lim, quiet=True)
+        expect("--quiet-mode: rumbling baseline continuity", rep, "Q0a", "PASS")
+        expect("--quiet-mode: rumble in baseline and capture -> PASS", rep, "qclean", "PASS")
+        qc = next(c for c in rep["captures"] if c["label"] == "qclean")
+        results.append(("... excluded seconds reported", qc["quiet"]["excl_s"] >= 3 and len(qc["quiet"]["bursts"]) == 3,
+                        f"excl {qc['quiet']['excl_s']} s in {len(qc['quiet']['bursts'])} bursts"))
+        results.append(("... rumble classified 40-150 Hz, no comb",
+                        all(not bu["bt_comb"] and bu["peak_hz"] < 160 for bu in qc["quiet"]["bursts"]),
+                        str([(bu["band_hz"], bu["share_800"]) for bu in qc["quiet"]["bursts"]])))
+        expect("--quiet-mode: an 800 Hz-comb burst is excluded but FAILS", rep, "qcomb", "FAIL",
+               ("(q) excluded bursts on BT comb",), ("(b) spur targets", "(a) noise floor"))
+        expect("--quiet-mode: comb lines hidden under rumble -> FAIL", rep, "qhidden", "FAIL",
+               ("(q) excluded bursts on BT comb",))
+        expect("--quiet-mode: too few quiet seconds -> INCONCLUSIVE", rep, "qfew", "INCONCLUSIVE",
+               ("(q) quiet seconds kept",))
+        expect("--quiet-mode: +1 dB floor in the quiet seconds still fails", rep, "qfloor", "FAIL",
+               ("(a) noise floor",), ("(q) excluded bursts on BT comb",))
+        # tone captures: (d) uses the kept seconds only
+        bqt = [save("QT0a", rumble(_synth(sec, 71, tone), [15.3], 11)),
+               save("QT0b", rumble(_synth(sec, 72, tone), [41.7], 12))]
+        rep = run(bqt, [save("qtclean", rumble(_synth(sec, 73, tone), [25.2, 52.9], 13)),
+                        save("qtnoise", rumble(_synth(sec, 74, tone, floor_dbfs=-67.0), [25.2], 14))],
+                  "auto", None, trim, [], sec, lim, quiet=True)
+        expect("--quiet-mode tone: rumble excluded -> PASS", rep, "qtclean", "PASS")
+        expect("--quiet-mode tone: +3 dB noise -> SNR", rep, "qtnoise", "FAIL", ("(d) SNR",))
+        x = rumble(_synth(sec, 75, tone), [25.2, 52.9], 15)
+        rep = run(bqt, [save("qtstep", np.delete(x, 40 * FS, axis=0))], "auto", None, trim, [], None, lim,
+                  quiet=True)
+        expect("--quiet-mode tone: 1-sample loss between rumble bursts -> phase step", rep, "qtstep", "FAIL",
+               ("(e) tone phase steps",))
+        json.dumps(rep)
+
     bad = 0
     for name, ok, info in results:
         print(f"[{'PASS' if ok else 'FAIL'}] {name}: {info}")
@@ -926,8 +1293,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--capture", action="append", default=[], help="[LABEL=]capture.wav (repeatable)")
     ap.add_argument("--signal", choices=("auto", "silence", "tone"), default="auto")
     ap.add_argument("--tone-hz", type=float, default=None, help="test tone frequency (default: detected)")
-    ap.add_argument("--bench-log", action="append", default=[], type=Path,
-                    help="device counters: dev_cycle.py log output, BTBENCH.LOG or saved +XREC:DBG replies")
+    ap.add_argument("--bench-log", action="append", default=[],
+                    help="[LABEL=]log - device counters: dev_cycle.py log output, BTBENCH.LOG or saved +XREC:DBG "
+                         "replies; LABEL= makes it that capture's own log (searched first)")
+    ap.add_argument("--labels", action="append", default=[], type=Path,
+                    help="file of 'LABEL REC_NNNN.wav' lines: the device file behind each capture label")
+    ap.add_argument("--quiet-mode", "--exclude-transients", action="store_true", dest="quiet_mode",
+                    help="exclude loud 1 s blocks (rumble) from (a)-(d); classify them against the BT comb")
     ap.add_argument("--no-device-counters", action="append", default=[], metavar="LABEL",
                     help="with --bench-log: this capture has no counter line on purpose (audio metrics only)")
     ap.add_argument("--expect-seconds", type=float, default=None, help="length check without --bench-log")
@@ -945,8 +1317,27 @@ def main(argv: list[str] | None = None) -> int:
         ap.error("--baseline and --capture are required (or --self-test)")
     lim = Limits(**{k: getattr(a, "lim_" + k) for k in Limits().__dict__})
     try:
-        rep = run([parse_labeled(s) for s in a.baseline], [parse_labeled(s) for s in a.capture], a.signal, a.tone_hz,
-                  (a.trim_start_s, a.trim_end_s), a.bench_log, a.expect_seconds, lim, set(a.no_device_counters))
+        dev_names = parse_labels(a.labels)
+        base = [parse_capture_arg(s) for s in a.baseline]
+        caps = [parse_capture_arg(s) for s in a.capture]
+        for lb, _, dn in base + caps:
+            if dn:
+                dev_names[lb] = dn
+        logs: list[Path] = []
+        label_logs: dict[str, list[Path]] = {}
+        for s_ in a.bench_log:
+            if "=" in s_ and not Path(s_).exists():
+                lb, p_ = s_.split("=", 1)
+                label_logs.setdefault(lb, []).append(Path(p_))
+            else:
+                logs.append(Path(s_))
+        labels = {lb for lb, _, _ in base + caps}
+        for lb in label_logs:
+            if lb not in labels:
+                raise ValueError(f"--bench-log {lb}=...: no capture or baseline labelled {lb}")
+        rep = run([(lb, p) for lb, p, _ in base], [(lb, p) for lb, p, _ in caps], a.signal, a.tone_hz,
+                  (a.trim_start_s, a.trim_end_s), logs, a.expect_seconds, lim, set(a.no_device_counters),
+                  a.quiet_mode, dev_names, label_logs)
     except (OSError, ValueError, wave.Error) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
