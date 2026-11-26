@@ -74,7 +74,7 @@ int bt_entropy_mic_collect(void)
     if (adc_busy()) {
         return BT_ENT_MIC_BUSY;
     }
-    if (keys_read_rec_switch()) {
+    if (keys_read_rec_switch() && bt_entropy_ready()) {
         return BT_ENT_MIC_ABORTED;
     }
     uint32_t t0 = millis();
@@ -86,7 +86,7 @@ int bt_entropy_mic_collect(void)
     uint8_t sym[128];
     while (fed < BT_ENT_MIC_SAMPLES && (uint32_t)(millis() - t0) < BT_ENT_MIC_TIMEOUT_MS) {
         wdt_feed();
-        if (keys_read_rec_switch()) {
+        if (keys_read_rec_switch() && bt_entropy_ready()) {
             rc = BT_ENT_MIC_ABORTED;       /* the user wants to record: hand the ADC over now */
             goto stop;
         }

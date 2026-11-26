@@ -142,6 +142,7 @@ typedef struct {
     uint8_t  last_peer_bda[6];
 } bt_xrec_sync_info_t;
 void bt_xrec_get_sync_info(bt_xrec_sync_info_t *out);
+void bt_xrec_clear_sync_done(void);
 /* Outbound "doorbell poke": while READY with no open link and no open pairing window, page a MITM-bonded phone and
  * query its SDP server (esp_spp_start_discovery) so Android wakes CompanionDeviceService / ACTION_ACL_CONNECTED and
  * opens RFCOMM back to our server. Prefers hint_bda (when non-NULL and MITM-bonded), else the first MITM bond in

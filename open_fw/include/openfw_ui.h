@@ -119,20 +119,20 @@ typedef enum {
 #endif
 } ui_screen_id_t;
 
-/* Settings rows 0..9 are fixed (mic gain .. USB disk); then BT=1 (not HCI_PROBE) adds "Audio output" (output
- * routing for the headphones mode), then About, then the Headset button test diagnostic last. Row indices are
+/* Settings rows 0..8 are fixed (sound .. USB disk; mic gain is automatic); then BT=1 (not HCI_PROBE) adds
+ * "Audio output", "Auto sync", "Auto off", then About, then Headset button test last. Row indices are
  * UI-only: nothing persisted is indexed by them (settings.bin stores fields, bt_hp_cfg.bin the output mode). */
 #if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID && !(defined(OPENFW_HCI_PROBE) && OPENFW_HCI_PROBE)
-#define UI_SET_ROW_AOUT      10
-#define UI_SET_ROW_AUTO_SYNC 11
-#define UI_SET_ROW_AUTO_OFF  12
-#define UI_SET_ROW_ABOUT     13
-#define UI_SET_HSPROBE       14
-#define UI_SET_COUNT         15
+#define UI_SET_ROW_AOUT      9
+#define UI_SET_ROW_AUTO_SYNC 10
+#define UI_SET_ROW_AUTO_OFF  11
+#define UI_SET_ROW_ABOUT     12
+#define UI_SET_HSPROBE       13
+#define UI_SET_COUNT         14
 #else
-#define UI_SET_ROW_ABOUT  10
-#define UI_SET_HSPROBE    11
-#define UI_SET_COUNT      12
+#define UI_SET_ROW_ABOUT  9
+#define UI_SET_HSPROBE    10
+#define UI_SET_COUNT      11
 #endif
 #define UI_LIST_ROWS      12        /* UI_SCR_LIST rows (title + 3 visible, scrolled) */
 

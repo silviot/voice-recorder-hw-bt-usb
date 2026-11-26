@@ -24,20 +24,27 @@
  * While ops.rec_channels reports a recording:
  *   - XREC work waits for the recorder: no command runs and no GETS / LS chunk is read from the card while
  *     ops.rec_pending reports audio blocks the recorder has not taken yet (the caller polls the recorder first);
- *   - one xrec_poll() pass stops reading the card once it used XREC_REC_PASS_BUDGET_US: GETS chunks, LS directory
- *     chunks and the GET / GETS lookup in /record (both resume at the next pass);
- *   - GETS payload is capped by a token bucket at XREC_REC_GETS_RATE_BPS (bucket XREC_REC_GETS_BURST bytes);
+ *   - one xrec_poll() pass stops reading the card once it used its pass budget (5 ms mono, 2.5 ms stereo): GETS chunks,
+ *     LS directory chunks and the GET / GETS lookup in /record (both resume at the next pass);
+ *   - GETS payload is capped by a token bucket (48 KB/s mono, 36 KB/s stereo; bucket XREC_REC_GETS_BURST bytes);
  *   - writers answer +XREC:ERR,LATER,<XREC_LATER_MS> (DEL, PUT to the card, PUTEND, OTA, PAIR), RTC set is not
- *     applied (+XREC:OK,RTC,LATER), and in a stereo recording GETS / GET answer LATER too (mono only, decision 5);
- *   - GETS / GET of the file being recorded answers +XREC:ERR,BUSY (ops.file_busy);
+ *     applied (+XREC:OK,RTC,LATER);
+ *   - GETS / GET of the file being recorded streams best-effort up to ops.rec_flushed_size (checkpointed disk bytes),
+ *     answering +XREC:ERR,BUSY while flushed <= 44 B (or when ops.rec_flushed_size is NULL); DEL answers ERR,BUSY;
  *   - a disconnect keeps a staged upload's writer and temp until the recording stopped (xrec_deferred_poll).
  * The cap and the budget are compile-time defaults (-D...) and can be changed per context (xrec_set_rec_pace; the
  * bench image's +XREC:DBG,PACE,<bytes/s>). */
 #ifndef XREC_REC_GETS_RATE_BPS
-#define XREC_REC_GETS_RATE_BPS  48000u   /* bytes/s of GETS payload while recording (M3 sets the final value) */
+#define XREC_REC_GETS_RATE_BPS     48000u   /* bytes/s of GETS payload while mono recording */
+#endif
+#ifndef XREC_REC_STEREO_RATE_BPS
+#define XREC_REC_STEREO_RATE_BPS   36000u   /* bytes/s of GETS payload while stereo recording */
 #endif
 #ifndef XREC_REC_PASS_BUDGET_US
-#define XREC_REC_PASS_BUDGET_US 5000u    /* card reads per xrec_poll() pass while recording */
+#define XREC_REC_PASS_BUDGET_US    5000u    /* card reads per xrec_poll() pass while mono recording */
+#endif
+#ifndef XREC_REC_STEREO_BUDGET_US
+#define XREC_REC_STEREO_BUDGET_US  2500u    /* card reads per xrec_poll() pass while stereo recording */
 #endif
 #ifndef XREC_REC_GETS_BURST
 #define XREC_REC_GETS_BURST     2048u    /* token-bucket depth, bytes (>= XREC_MAX_CHUNK) */
@@ -59,6 +66,7 @@ typedef struct {
     uint32_t total_mb;
     uint32_t rec_idx;      /* NNNN of the REC_NNNN.wav being recorded, 0 = none (STAT field 9) */
     uint32_t pace_ms;      /* filled by xrec_proto (STAT field 10): 0 = no pacing (not recording) */
+    uint32_t rec_bytes;    /* checkpointed readable bytes of active WAV, 0 = none (STAT field 11) */
 } xrec_stat_t;
 
 typedef struct {
@@ -108,6 +116,7 @@ typedef struct {
      * recorder has not taken yet (audio_ring_pending). now_us: microsecond clock, wraps at 2^32 (NULL: now_ms x 1000). */
     uint8_t  (*rec_channels)(void *user);
     uint32_t (*rec_pending)(void *user);
+    uint32_t (*rec_flushed_size)(void *user);
     uint32_t (*now_us)(void *user);
     /* Cooperative background sync (+XREC:SYNC,<pending>[,<eta_s>]) and live CWX commit notification. Optional. */
     void     (*on_sync_state)(void *user, uint32_t pending, uint32_t eta_sec);

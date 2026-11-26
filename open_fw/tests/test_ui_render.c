@@ -1149,8 +1149,8 @@ int main(int argc, char **argv)
     m.set_scroll = 0;
 
     /* 9: Settings Clock Edit */
-    m.set_sel        = 6;
-    m.set_scroll     = 5;
+    m.set_sel        = 5;
+    m.set_scroll     = 4;
     m.set_edit_clock = 1;
     m.set_edit_h     = 14;
     m.set_edit_m     = 32;
@@ -1554,8 +1554,8 @@ int main(int argc, char **argv)
         };
         for (size_t li = 0u; li < sizeof(sample_langs) / sizeof(sample_langs[0]); li++) {
             m.cfg.lang   = sample_langs[li];
-            m.set_sel    = 8;
-            m.set_scroll = 6;
+            m.set_sel    = 7;
+            m.set_scroll = 5;
             ui_render_screen(UI_SCR_SETTINGS, &m);
             ui_render_screen(UI_SCR_HOME, &m);
             ui_render_screen(UI_SCR_ABOUT, &m);

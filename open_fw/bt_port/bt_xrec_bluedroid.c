@@ -2389,6 +2389,13 @@ void bt_xrec_set_bench_xrec_pin(const char *pin6)
 }
 #endif
 
+void bt_xrec_clear_sync_done(void)
+{
+    s.sync_seen    = 0u;
+    s.sync_pending = 0u;
+    s.sync_eta_sec = 0u;
+}
+
 void bt_xrec_get_sync_info(bt_xrec_sync_info_t *out)
 {
     if (out == NULL) {

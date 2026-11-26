@@ -3098,13 +3098,21 @@ static void test_xrec_session(void)
     sp.vor_enabled = 0u;
 
     xrec_ops_t ops = {
-        mock_xrec_send, mock_xrec_get_stat, mock_xrec_get_rtc,
-        mock_xrec_set_rtc, mock_xrec_entropy, mock_xrec_bound, NULL,
-        NULL, NULL, mock_xrec_on_ota,
-        mock_xrec_exp_write, mock_xrec_exp_run, mock_xrec_read_log,
-        mock_xrec_reset_log, mock_xrec_on_dfu, mock_xrec_audio_cfg,
-        mock_xrec_get_mtu, mock_xrec_file_busy, NULL, NULL,
-        NULL, NULL, NULL, NULL, NULL,
+        .send         = mock_xrec_send,
+        .get_stat     = mock_xrec_get_stat,
+        .get_rtc      = mock_xrec_get_rtc,
+        .set_rtc      = mock_xrec_set_rtc,
+        .get_entropy  = mock_xrec_entropy,
+        .on_bound_key = mock_xrec_bound,
+        .on_ota       = mock_xrec_on_ota,
+        .exp_write    = mock_xrec_exp_write,
+        .exp_run      = mock_xrec_exp_run,
+        .read_log     = mock_xrec_read_log,
+        .reset_log    = mock_xrec_reset_log,
+        .on_dfu       = mock_xrec_on_dfu,
+        .audio_cfg    = mock_xrec_audio_cfg,
+        .get_mtu      = mock_xrec_get_mtu,
+        .file_busy    = mock_xrec_file_busy,
     };
     xrec_init(&xrec, &vol, &ops, &sp);
 
@@ -3166,7 +3174,7 @@ static void test_xrec_session(void)
     assert(strstr(phone_text(&sp), "+XREC:ERR,RTCRNG") != NULL);
     assert(strstr(phone_text(&sp), "+XREC:OK,RTC") != NULL);
     assert(strstr(phone_text(&sp), "+XREC:RTC,2026-11-19 17:05:30,3") != NULL);
-    assert(strstr(phone_text(&sp), "+XREC:STAT,87,4095,1,1,16,0,30100,30500,0,0\r\n") != NULL);   /* + rec_idx, pace_ms (F7) */
+    assert(strstr(phone_text(&sp), "+XREC:STAT,87,4095,1,1,16,0,30100,30500,0,0,0\r\n") != NULL); /* + rec_idx, pace_ms, rec_bytes */
 
     /* Replenish credits & test coalesced 10-file +XREC:LS + +XREC:DEL + path traversal block */
     sp.credits += 10u;

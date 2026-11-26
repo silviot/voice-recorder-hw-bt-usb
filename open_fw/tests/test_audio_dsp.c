@@ -419,6 +419,100 @@ static void test_vor_stereo_and_fades(void)
     printf("  [PASS] audio_vor stereo RMS/ZCR + 5ms fade-in/out + Nyquist clamp\n");
 }
 
+/* Test 7: Speech-gated stereo-linked digital AGC */
+static double frame_rms_dbfs(const int16_t *pcm, size_t n)
+{
+    double sum = 0.0;
+    for (size_t i = 0u; i < n; i++) {
+        double s = (double)pcm[i] / 32768.0;
+        sum += s * s;
+    }
+    double r = sqrt(sum / (double)n);
+    return (r > 1.5e-5) ? 20.0 * log10(r) : -96.0;
+}
+
+static void test_auto_mic_gain(void)
+{
+    /* 1. Quiet -36 dBFS speech boosts cleanly to ~ -18 dBFS in ASR_RAW and VOICE_CLARITY */
+    for (int prof = 0; prof < 2; prof++) {
+        audio_dsp_t dsp;
+        audio_dsp_profile_t p = (prof == 0) ? AUDIO_DSP_ASR_RAW : AUDIO_DSP_VOICE_CLARITY;
+        audio_dsp_init(&dsp, p, 16000u, 1u);
+        audio_dsp_set_agc(&dsp, 1);
+
+        int16_t buf[2048];
+        double last_db = -96.0;
+        for (int b = 0; b < 18; b++) {
+            for (size_t i = 0u; i < 2048u; i++) {
+                buf[i] = (int16_t)llround(735.0 * sin(2.0 * M_PI * 1000.0 * (double)i / 16000.0));
+            }
+            audio_dsp_process_i16(&dsp, buf, 2048u);
+            last_db = frame_rms_dbfs(buf, 2048u);
+        }
+        assert(last_db >= -22.5 && last_db <= -13.5);
+    }
+
+    /* 2. Loud -3 dBFS input pulls AGC gain down and never wraps or exceeds limiter ceiling */
+    {
+        audio_dsp_t dsp;
+        audio_dsp_init(&dsp, AUDIO_DSP_VOICE_CLARITY, 16000u, 1u);
+        audio_dsp_set_agc(&dsp, 1);
+        int16_t buf[2048];
+        for (int b = 0; b < 8; b++) {
+            for (size_t i = 0u; i < 2048u; i++) {
+                buf[i] = (int16_t)llround(23000.0 * sin(2.0 * M_PI * 1000.0 * (double)i / 16000.0));
+            }
+            audio_dsp_process_i16(&dsp, buf, 2048u);
+            for (size_t i = 0u; i < 2048u; i++) {
+                assert(buf[i] <= 31200 && buf[i] >= -31200);
+            }
+        }
+        assert(dsp.agc_target_gain < 0.85f);
+    }
+
+    /* 3. Stationary low-level room floor (-62 dBFS) does NOT pump upward */
+    {
+        audio_dsp_t dsp;
+        audio_dsp_init(&dsp, AUDIO_DSP_ASR_RAW, 16000u, 1u);
+        audio_dsp_set_agc(&dsp, 1);
+        int16_t buf[2048];
+        double out_db = -96.0;
+        for (int b = 0; b < 16; b++) {
+            for (size_t i = 0u; i < 2048u; i++) {
+                buf[i] = (int16_t)llround(26.0 * sin(2.0 * M_PI * 600.0 * (double)i / 16000.0));
+            }
+            audio_dsp_process_i16(&dsp, buf, 2048u);
+            out_db = frame_rms_dbfs(buf, 2048u);
+        }
+        assert(out_db <= -60.0);
+        assert(dsp.agc_gain <= 1.05f);
+    }
+
+    /* 4. Stereo-linked AGC preserves exact L/R amplitude ratio (2.0:1) */
+    {
+        audio_dsp_t dsp;
+        audio_dsp_init(&dsp, AUDIO_DSP_ASR_RAW, 16000u, 2u);
+        audio_dsp_set_agc(&dsp, 1);
+        int16_t st[2048 * 2];
+        for (int b = 0; b < 12; b++) {
+            for (size_t i = 0u; i < 2048u; i++) {
+                double s = sin(2.0 * M_PI * 1000.0 * (double)i / 16000.0);
+                st[i * 2u + 0u] = (int16_t)llround(1600.0 * s);
+                st[i * 2u + 1u] = (int16_t)llround(800.0 * s);
+            }
+            audio_dsp_process_i16(&dsp, st, 2048u);
+        }
+        double sum_l = 0.0, sum_r = 0.0;
+        for (size_t i = 512u; i < 2048u; i++) {
+            sum_l += (double)st[i * 2u + 0u] * (double)st[i * 2u + 0u];
+            sum_r += (double)st[i * 2u + 1u] * (double)st[i * 2u + 1u];
+        }
+        double ratio = sqrt(sum_l / sum_r);
+        assert(fabs(ratio - 2.0) <= 0.02);
+    }
+    printf("  [PASS] audio_dsp automatic speech-gated stereo-linked AGC\n");
+}
+
 int main(void)
 {
     printf("Running test_audio_dsp...\n");
@@ -430,6 +524,7 @@ int main(void)
     test_bypass_and_rms();
     test_vor_gate();
     test_vor_stereo_and_fades();
-    printf("ALL 8 AUDIO DSP + VOR SUITES PASSED!\n");
+    test_auto_mic_gain();
+    printf("ALL 9 AUDIO DSP + AGC + VOR SUITES PASSED!\n");
     return 0;
 }

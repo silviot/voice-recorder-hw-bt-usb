@@ -300,6 +300,7 @@ void     audio_dac_stop(void);
 
 /* Real-Time WAV Recorder + Clean-Room DSP (recorder.c) */
 void                recorder_set_gain(uint8_t gain_0_31);
+void                recorder_enable_auto_gain(void);
 uint8_t             recorder_get_gain(void);
 void                recorder_set_dsp_profile(audio_dsp_profile_t profile);
 audio_dsp_profile_t recorder_get_dsp_profile(void);
@@ -317,6 +318,7 @@ int                 recorder_has_error(void);
 int                 recorder_is_vor_waiting(void);
 uint32_t            recorder_get_seconds(void);
 uint32_t            recorder_get_committed_bytes(void);
+uint32_t            recorder_get_flushed_wav_bytes(void);
 uint32_t            recorder_get_created_timestamp(void);
 const char         *recorder_get_filename(void);
 int                 recorder_is_recording_file(const char *name); /* /record/<name> is open for recording */

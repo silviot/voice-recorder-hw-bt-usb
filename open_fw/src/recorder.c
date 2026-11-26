@@ -39,8 +39,8 @@
 #endif
 #endif
 
-/* Checkpoint every ~160 KiB (~5s mono / ~2.5s stereo) and after first 4 KiB */
-#define REC_CKPT_INTERVAL_BYTES 163840u
+/* Checkpoint every 64 KiB (~2.0 s mono / ~1.0 s stereo) and after first 4 KiB */
+#define REC_CKPT_INTERVAL_BYTES 65536u
 #define REC_WRITE_RETRIES       2u      /* extra exfat_write attempts for one PCM block (rec_write_retry) */
 /* Split WAV files safely below signed 32-bit / 4 GiB RIFF limit (~2 GiB) */
 #define REC_MAX_PCM_BYTES       0x7FFF0000u
@@ -61,6 +61,10 @@ static int                 g_rec_active      = 0;
 static int                 g_rec_saving      = 0;
 static int                 g_rec_error       = 0;
 static uint8_t             g_mic_gain        = 20u;
+static uint8_t             g_gain_locked     = 0u;
+static uint8_t             g_active_pga      = 20u;
+static uint8_t             g_pga_cooldown    = 0u;
+static uint16_t            g_pga_quiet_blks  = 0u;
 static uint8_t             g_cfg_channels    = 1u;
 static uint8_t             g_active_channels = 1u;
 static audio_dsp_profile_t g_dsp_profile     = AUDIO_DSP_DEFAULT_PROFILE;
@@ -73,6 +77,7 @@ static exfat_vol_t        *g_rec_vol         = 0;
 static exfat_writer_t      g_writer;
 static uint32_t            g_pcm_bytes       = 0u;
 static uint32_t            g_last_ckpt_bytes = 0u;
+static uint32_t            g_flushed_wav_bytes = 0u;
 static uint32_t            g_prev_split_sec  = 0u;
 static uint32_t            g_last_overruns   = 0u;
 static uint32_t            g_created_timestamp;
@@ -225,9 +230,10 @@ static int open_next_wav_file(exfat_vol_t *vol)
             g_filename[i] = name[i];
         }
         g_created_timestamp = vol->default_timestamp;
-        g_pcm_bytes       = 0u;
-        g_last_ckpt_bytes = 0u;
-        g_rec_saving      = 1;
+        g_pcm_bytes         = 0u;
+        g_last_ckpt_bytes   = 0u;
+        g_flushed_wav_bytes = 0u;
+        g_rec_saving        = 1;
         return 0;
     }
     return -1;
@@ -254,7 +260,8 @@ static int finalize_current_wav_file(void)
     int rc_patch = (g_writer.first_cluster >= 2u)
                  ? exfat_patch_header(&g_writer, hdr, 44u)
                  : -1;
-    g_rec_saving = 0;
+    g_flushed_wav_bytes = 0u;
+    g_rec_saving        = 0;
     return (rc_patch == 0 && rc_close == 0) ? 0 : -1;
 }
 
@@ -286,7 +293,8 @@ static void recorder_checkpoint_if_due(void)
         rec_log_err("ckpt", flushed_pcm);
         g_rec_error = 1;
     } else {
-        g_last_ckpt_bytes = flushed_pcm;
+        g_last_ckpt_bytes   = flushed_pcm;
+        g_flushed_wav_bytes = (uint32_t)flushed;
     }
 }
 
@@ -364,7 +372,19 @@ static void rec_vor_emit_cb(void *user, const int16_t *pcm, size_t num_frames)
 
 void recorder_set_gain(uint8_t gain_0_31)
 {
-    g_mic_gain = (gain_0_31 > 31u) ? 31u : gain_0_31;
+    g_gain_locked = 1u;
+    g_mic_gain    = (gain_0_31 > 31u) ? 31u : gain_0_31;
+    g_active_pga  = g_mic_gain;
+    audio_capture_set_gain(g_mic_gain);
+}
+
+void recorder_enable_auto_gain(void)
+{
+    g_gain_locked    = 0u;
+    g_mic_gain       = 20u;
+    g_active_pga     = 20u;
+    g_pga_cooldown   = 0u;
+    g_pga_quiet_blks = 0u;
     audio_capture_set_gain(g_mic_gain);
 }
 
@@ -427,21 +447,32 @@ int recorder_start(exfat_vol_t *vol, int sd_mounted)
     if (g_rec_active) {
         return 0;
     }
-    g_rec_error       = 0;
-    g_rec_saving      = 0;
-    g_rec_vol         = vol;
-    g_pcm_bytes       = 0u;
-    g_last_ckpt_bytes = 0u;
-    g_prev_split_sec  = 0u;
-    g_filename[0]     = '\0';
+    g_rec_error         = 0;
+    g_rec_saving        = 0;
+    g_rec_vol           = vol;
+    g_pcm_bytes         = 0u;
+    g_last_ckpt_bytes   = 0u;
+    g_flushed_wav_bytes = 0u;
+    g_prev_split_sec    = 0u;
+    g_filename[0]       = '\0';
 
     if (!sd_mounted || !vol) {
         g_rec_error = 1;
         return -1;
     }
 
+    if (!g_gain_locked) {
+        g_active_pga     = 20u;
+        g_mic_gain       = 20u;
+        g_pga_cooldown   = 0u;
+        g_pga_quiet_blks = 0u;
+    } else {
+        g_active_pga = g_mic_gain;
+    }
+
     g_active_channels = g_cfg_channels;
     audio_dsp_init(&g_dsp, g_dsp_profile, 16000u, g_active_channels);
+    audio_dsp_set_agc(&g_dsp, (g_dsp_profile != AUDIO_DSP_BYPASS) ? 1 : 0);
     audio_vor_init(&g_vor, 16000u, g_active_channels, g_vor_enabled);
 
     if (open_next_wav_file(vol) != 0) {
@@ -520,6 +551,34 @@ void recorder_poll(void)
     while (audio_pop_frame_copy(g_proc_buf, (uint32_t)sizeof(g_proc_buf), &nbytes)) {
         uint32_t total_samples = nbytes / (uint32_t)sizeof(int16_t);
         size_t num_frames = total_samples / (size_t)g_active_channels;
+        if (!g_gain_locked && g_dsp_profile != AUDIO_DSP_BYPASS && g_rec_saving) {
+            int32_t raw_peak = 0;
+            for (uint32_t i = 0u; i < total_samples; i++) {
+                int32_t a = g_proc_buf[i];
+                if (a < 0) a = -a;
+                if (a > raw_peak) raw_peak = a;
+            }
+            if (g_pga_cooldown > 0u) {
+                g_pga_cooldown--;
+            }
+            if (raw_peak >= 31200 && g_active_pga > 8u && g_pga_cooldown == 0u) {
+                g_active_pga = (g_active_pga >= 10u) ? (uint8_t)(g_active_pga - 2u) : 8u;
+                g_mic_gain   = g_active_pga;
+                audio_capture_set_gain(g_active_pga);
+                g_pga_cooldown   = 4u;
+                g_pga_quiet_blks = 0u;
+            } else if (raw_peak < 2000 && (!g_vor.enabled || g_vor.gate_open) && g_active_pga < 20u) {
+                g_pga_quiet_blks++;
+                if (g_pga_quiet_blks >= 64u) {
+                    g_pga_quiet_blks = 0u;
+                    g_active_pga++;
+                    g_mic_gain = g_active_pga;
+                    audio_capture_set_gain(g_active_pga);
+                }
+            } else {
+                g_pga_quiet_blks = 0u;
+            }
+        }
         audio_dsp_process_i16(&g_dsp, g_proc_buf, num_frames);
         if (g_rec_saving) {
             audio_vor_feed(&g_vor, g_proc_buf, num_frames, rec_vor_emit_cb, 0);
@@ -614,6 +673,11 @@ uint32_t recorder_get_seconds(void)
 uint32_t recorder_get_committed_bytes(void)
 {
     return (g_pcm_bytes > 0u) ? (g_pcm_bytes + 44u) : 0u;
+}
+
+uint32_t recorder_get_flushed_wav_bytes(void)
+{
+    return g_rec_saving ? g_flushed_wav_bytes : 0u;
 }
 
 uint32_t recorder_get_created_timestamp(void)

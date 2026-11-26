@@ -288,6 +288,99 @@ static inline int16_t float_to_i16(float s)
     return (scaled >= 0.0f) ? (int16_t)(scaled + 0.5f) : (int16_t)(scaled - 0.5f);
 }
 
+static void agc_reset_state(audio_dsp_t *dsp)
+{
+    dsp->agc_gain        = 1.0f;
+    dsp->agc_target_gain = 1.0f;
+    dsp->agc_noise_rms   = 0.003f;
+    dsp->agc_sub_sq      = 0.0f;
+    dsp->agc_sub_peak    = 0.0f;
+    dsp->agc_prev_s      = 0.0f;
+    dsp->agc_sub_n       = 0u;
+    dsp->agc_sub_zcr     = 0u;
+    dsp->agc_hang_sub    = 0u;
+}
+
+/* Speech-gated, stereo-linked digital AGC updated on 20 ms post-HPF windows.
+ * Keeps stationary room noise from pumping up during silence while swiftly
+ * pulling back close/loud peaks and smoothing gain per sample. */
+static inline float agc_step_frame(audio_dsp_t *dsp, float l, float r, uint8_t ch)
+{
+    if (!dsp->agc_enabled) {
+        return 1.0f;
+    }
+    float al = dsp_fabsf(l);
+    float ar = (ch == 2u) ? dsp_fabsf(r) : 0.0f;
+    float linked = (ch == 2u && ar > al) ? ar : al;
+    float zsig = (ch == 2u && ar > al) ? r : l;
+
+    dsp->agc_sub_sq += linked * linked;
+    if (linked > dsp->agc_sub_peak) {
+        dsp->agc_sub_peak = linked;
+    }
+    if (dsp->agc_prev_s * zsig < 0.0f && dsp_fabsf(zsig) > 0.0002f) {
+        dsp->agc_sub_zcr++;
+    }
+    if (dsp_fabsf(zsig) > 0.0002f) {
+        dsp->agc_prev_s = zsig;
+    }
+    dsp->agc_sub_n++;
+
+    uint32_t sub_len = dsp->sample_rate / 50u;
+    if (sub_len < 64u) {
+        sub_len = 64u;
+    }
+    if (dsp->agc_sub_n >= sub_len) {
+        float sub_rms = dsp_sqrtf(dsp->agc_sub_sq / (float)dsp->agc_sub_n);
+        if (sub_rms < dsp->agc_noise_rms) {
+            float floor_s = (sub_rms > 0.0005f) ? sub_rms : 0.0005f;
+            dsp->agc_noise_rms = 0.85f * dsp->agc_noise_rms + 0.15f * floor_s;
+        } else if (sub_rms < dsp->agc_noise_rms * 1.8f) {
+            float creep = dsp->agc_noise_rms * 1.005f;
+            dsp->agc_noise_rms = (creep < 0.02f) ? creep : 0.02f;
+        }
+
+        const int is_clarity = (dsp->profile == AUDIO_DSP_VOICE_CLARITY);
+        const float target_rms = is_clarity ? 0.0794f : 0.1259f;
+        const float max_gain   = is_clarity ? 5.0f    : 7.94f;
+        const float min_gain   = 0.25f;
+
+        if (dsp->agc_sub_peak * dsp->agc_target_gain > 0.55f) {
+            float denom = (dsp->agc_sub_peak > 1e-4f) ? dsp->agc_sub_peak : 1e-4f;
+            float desired = 0.50f / denom;
+            if (desired < min_gain) desired = min_gain;
+            if (desired > max_gain) desired = max_gain;
+            dsp->agc_target_gain = 0.35f * dsp->agc_target_gain + 0.65f * desired;
+        } else {
+            int speech = (sub_rms > 0.005f &&
+                          sub_rms > dsp->agc_noise_rms * 2.5f &&
+                          ((dsp->agc_sub_zcr >= 4u && dsp->agc_sub_zcr <= 200u) || sub_rms > 0.025f));
+            if (speech) {
+                dsp->agc_hang_sub = 75u; /* 1.5 s hold at 20 ms/step */
+                float denom = (sub_rms > 1e-4f) ? sub_rms : 1e-4f;
+                float desired = target_rms / denom;
+                if (desired < min_gain) desired = min_gain;
+                if (desired > max_gain) desired = max_gain;
+                float alpha = (desired < dsp->agc_target_gain) ? 0.15f : 0.05f;
+                dsp->agc_target_gain += alpha * (desired - dsp->agc_target_gain);
+            } else if (dsp->agc_hang_sub > 0u) {
+                dsp->agc_hang_sub--;
+            } else if (dsp->agc_target_gain > 2.0f) {
+                dsp->agc_target_gain = 0.995f * dsp->agc_target_gain + 0.005f * 2.0f;
+            }
+        }
+
+        dsp->agc_sub_sq   = 0.0f;
+        dsp->agc_sub_peak = 0.0f;
+        dsp->agc_sub_n    = 0u;
+        dsp->agc_sub_zcr  = 0u;
+    }
+
+    float rate = (dsp->agc_target_gain < dsp->agc_gain) ? 0.008f : 0.001f;
+    dsp->agc_gain += rate * (dsp->agc_target_gain - dsp->agc_gain);
+    return dsp->agc_gain;
+}
+
 void audio_dsp_init(audio_dsp_t *dsp, audio_dsp_profile_t profile,
                     uint32_t sample_rate, uint8_t channels)
 {
@@ -298,12 +391,14 @@ void audio_dsp_init(audio_dsp_t *dsp, audio_dsp_profile_t profile,
     dsp->sample_rate   = (sample_rate > 0u) ? sample_rate : 16000u;
     dsp->channels      = (channels == 2u) ? 2u : 1u;
     dsp->beamform_mono = 0u;
+    dsp->agc_enabled   = 0u;
     dsp->lim_att       = dsp_exp_decay(0.001f, dsp->sample_rate);
     dsp->lim_rel       = dsp_exp_decay(0.080f, dsp->sample_rate);
     dsp->comp_att      = dsp_exp_decay(0.005f, dsp->sample_rate);
     dsp->comp_rel      = dsp_exp_decay(0.120f, dsp->sample_rate);
     dsp->comp_env      = 0.0f;
     dsp->lim_env       = 0.0f;
+    agc_reset_state(dsp);
     dsp->clip_events   = 0u;
     dsp->rms_dbfs      = -96.0f;
 
@@ -334,6 +429,7 @@ void audio_dsp_reset(audio_dsp_t *dsp)
     }
     dsp->comp_env    = 0.0f;
     dsp->lim_env     = 0.0f;
+    agc_reset_state(dsp);
     dsp->clip_events = 0u;
     dsp->rms_dbfs    = -96.0f;
 }
@@ -342,6 +438,13 @@ void audio_dsp_set_beamform(audio_dsp_t *dsp, int enabled)
 {
     if (dsp) {
         dsp->beamform_mono = enabled ? 1u : 0u;
+    }
+}
+
+void audio_dsp_set_agc(audio_dsp_t *dsp, int enabled)
+{
+    if (dsp) {
+        dsp->agc_enabled = enabled ? 1u : 0u;
     }
 }
 
@@ -377,6 +480,7 @@ void audio_dsp_process_i16(audio_dsp_t *dsp, int16_t *pcm, size_t num_frames)
         if (ch == 1u) {
             for (size_t i = 0u; i < num_frames; i++) {
                 float l = biquad_step(&dsp->hpf[0], (float)pcm[i] * inv_i16);
+                l *= agc_step_frame(dsp, l, 0.0f, 1u);
                 float lpeak = dsp_fabsf(l);
                 float lc = (lpeak > lim_env) ? lim_att : lim_rel;
                 lim_env = lpeak + lc * (lim_env - lpeak);
@@ -389,6 +493,9 @@ void audio_dsp_process_i16(audio_dsp_t *dsp, int16_t *pcm, size_t num_frames)
             for (size_t i = 0u; i < num_frames; i++) {
                 float l = biquad_step(&dsp->hpf[0], (float)pcm[i * 2u + 0u] * inv_i16);
                 float r = biquad_step(&dsp->hpf[1], (float)pcm[i * 2u + 1u] * inv_i16);
+                float again = agc_step_frame(dsp, l, r, 2u);
+                l *= again;
+                r *= again;
                 float al = dsp_fabsf(l);
                 float ar = dsp_fabsf(r);
                 float lpeak = (ar > al) ? ar : al;
@@ -411,6 +518,7 @@ void audio_dsp_process_i16(audio_dsp_t *dsp, int16_t *pcm, size_t num_frames)
                     ? ((float)((int32_t)pcm[i * 2u + 0u] + (int32_t)pcm[i * 2u + 1u]) * half_inv_i16)
                     : ((float)pcm[i] * inv_i16);
             m = biquad_step(&dsp->hpf[0], m);
+            m *= agc_step_frame(dsp, m, 0.0f, 1u);
             m = biquad_step(&dsp->shelf[0], m);
 
             float cpeak = dsp_fabsf(m);
@@ -442,6 +550,9 @@ void audio_dsp_process_i16(audio_dsp_t *dsp, int16_t *pcm, size_t num_frames)
         for (size_t i = 0u; i < num_frames; i++) {
             float l = biquad_step(&dsp->hpf[0], (float)pcm[i * 2u + 0u] * inv_i16);
             float r = biquad_step(&dsp->hpf[1], (float)pcm[i * 2u + 1u] * inv_i16);
+            float again = agc_step_frame(dsp, l, r, 2u);
+            l *= again;
+            r *= again;
             l = biquad_step(&dsp->shelf[0], l);
             r = biquad_step(&dsp->shelf[1], r);
 

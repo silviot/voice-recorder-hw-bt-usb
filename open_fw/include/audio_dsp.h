@@ -31,6 +31,7 @@ typedef struct {
     uint32_t sample_rate;
     uint8_t  channels;          /* 1 (mono) or 2 (interleaved stereo) */
     uint8_t  beamform_mono;     /* Optional broadside (L+R)*0.5 downmix in VOICE_CLARITY */
+    uint8_t  agc_enabled;       /* Speech-gated stereo-linked digital AGC */
     audio_biquad_t hpf[2];
     audio_biquad_t shelf[2];
     float lim_att;              /* Precomputed limiter attack coeff */
@@ -39,6 +40,15 @@ typedef struct {
     float comp_rel;             /* Precomputed compressor release coeff */
     float comp_env;             /* Linear peak envelope for compressor */
     float lim_env;              /* Linear peak envelope for safety limiter */
+    float    agc_gain;          /* Current smoothed linear AGC gain */
+    float    agc_target_gain;   /* Target linear AGC gain from 20 ms speech gate */
+    float    agc_noise_rms;     /* Adaptive background noise floor RMS */
+    float    agc_sub_sq;        /* Energy accumulator for current 20 ms sub-window */
+    float    agc_sub_peak;      /* Peak |sample| in current 20 ms sub-window */
+    float    agc_prev_s;        /* Previous dominant sample for ZCR estimation */
+    uint16_t agc_sub_n;         /* Frames accumulated in current 20 ms sub-window */
+    uint16_t agc_sub_zcr;       /* Zero crossings in current 20 ms sub-window */
+    uint16_t agc_hang_sub;      /* Remaining speech hangover in 20 ms steps */
     uint32_t clip_events;       /* Counter of frames engaging safety limiter */
     float    rms_dbfs;          /* Last-frame RMS level (for VU / telemetry) */
 } audio_dsp_t;
@@ -47,6 +57,7 @@ void audio_dsp_init(audio_dsp_t *dsp, audio_dsp_profile_t profile,
                     uint32_t sample_rate, uint8_t channels);
 void audio_dsp_reset(audio_dsp_t *dsp);
 void audio_dsp_set_beamform(audio_dsp_t *dsp, int enabled);
+void audio_dsp_set_agc(audio_dsp_t *dsp, int enabled);
 
 /* In-place processing of interleaved int16 PCM (num_frames = samples per channel). */
 void audio_dsp_process_i16(audio_dsp_t *dsp, int16_t *pcm, size_t num_frames);

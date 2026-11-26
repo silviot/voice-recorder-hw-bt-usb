@@ -49,6 +49,15 @@ static uint8_t s_cfg_held;       /* the request's rec_* settings are applied; s_
 static uint8_t s_rec_ours;       /* phone mode: this run's recorder_start() succeeded (the recording is the run's) */
 static uint8_t s_user_ch, s_user_gain, s_user_dsp, s_user_vor;
 
+static void bench_gain_restore(void)
+{
+    if (s_cfg.rec_gain != BT_BENCH_REC_KEEP) {
+        recorder_enable_auto_gain();
+    } else {
+        (void)s_user_gain;
+    }
+}
+
 /* Bench SSP auto-confirm override: provided by the phone-mode confirm UI (bt_xrec_bluedroid.c). This weak no-op
  * keeps images without it linking; the run then logs that the override is unavailable. Declared here only, so a
  * header with a different integer parameter type cannot clash with it. */
@@ -690,7 +699,7 @@ static void rec_cfg_restore(void)
         return;
     }
     recorder_set_channels(s_user_ch);
-    recorder_set_gain(s_user_gain);
+    bench_gain_restore();
     recorder_set_dsp_profile((audio_dsp_profile_t)s_user_dsp);
     recorder_set_vor((int)s_user_vor);
     s_cfg_held = 0u;
@@ -796,7 +805,7 @@ void bt_bench_rec_apply(void)
 
 int bt_bench_home_bg_allowed(void)
 {
-    return s_home && s_home_rec_done && s_cfg.sync_s != 0u;
+    return s_home && s_cfg.sync_s != 0u;
 }
 
 /* mode=rec, every home-loop pass before the REC switch is read. */

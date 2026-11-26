@@ -247,32 +247,52 @@ static int send_later_try(xrec_ctx_t *ctx)
     return 0;
 }
 
-/* STAT field 10: 0 = not recording; mono: the time one XREC_PACE_WINDOW takes at the cap (the shortest interval
- * between window starts; the device paces, a client adds no pause after a window); stereo: XREC_LATER_MS (no
- * transfers until REC stops). */
+static uint32_t eff_rec_rate_bps(const xrec_ctx_t *ctx)
+{
+    uint8_t ch = rec_channels(ctx);
+    uint32_t rate = ctx->pace.rate_bps;
+    if (ch > 1u && rate > XREC_REC_STEREO_RATE_BPS) {
+        rate = XREC_REC_STEREO_RATE_BPS;
+    }
+    return rate;
+}
+
+static uint32_t eff_rec_budget_us(const xrec_ctx_t *ctx)
+{
+    uint8_t ch = rec_channels(ctx);
+    uint32_t budget = ctx->pace.budget_us;
+    if (ch > 1u && budget > XREC_REC_STEREO_BUDGET_US) {
+        budget = XREC_REC_STEREO_BUDGET_US;
+    }
+    return budget;
+}
+
+/* STAT field 10: 0 = not recording; mono/stereo: time one XREC_PACE_WINDOW takes at the effective cap. */
 static uint32_t pace_ms(const xrec_ctx_t *ctx)
 {
     uint8_t ch = rec_channels(ctx);
     if (ch == 0u) {
         return 0u;
     }
-    if (ch != 1u || ctx->pace.rate_bps == 0u) {
+    uint32_t rate = eff_rec_rate_bps(ctx);
+    if (rate == 0u) {
         return XREC_LATER_MS;
     }
-    return (uint32_t)(((uint64_t)XREC_PACE_WINDOW * 1000u + ctx->pace.rate_bps - 1u) / ctx->pace.rate_bps);
+    return (uint32_t)(((uint64_t)XREC_PACE_WINDOW * 1000u + rate - 1u) / rate);
 }
 
-/* Token bucket refill (bytes at pace.rate_bps). The bucket starts full at the first pass of a recording. */
+/* Token bucket refill (bytes at eff_rec_rate_bps). The bucket starts full at the first pass of a recording. */
 static void pace_refill(xrec_ctx_t *ctx, uint32_t now_us)
 {
-    if (!ctx->pace_live) {
+    uint32_t rate = eff_rec_rate_bps(ctx);
+    if (!ctx->pace_live || rate == 0u) {
         ctx->pace_live   = 1u;
         ctx->pace_tokens = XREC_REC_GETS_BURST;
         ctx->pace_t_us   = now_us;
         return;
     }
     uint32_t dt = now_us - ctx->pace_t_us;               /* wraps every ~71 min: fine for a delta */
-    uint64_t add = ((uint64_t)dt * ctx->pace.rate_bps) / 1000000u;
+    uint64_t add = ((uint64_t)dt * rate) / 1000000u;
     if (add == 0u) {
         return;                                          /* keep pace_t_us: the fraction is not lost */
     }
@@ -282,7 +302,7 @@ static void pace_refill(xrec_ctx_t *ctx, uint32_t now_us)
         ctx->pace_t_us   = now_us;
     } else {
         ctx->pace_tokens = (uint32_t)t;
-        ctx->pace_t_us  += (uint32_t)((add * 1000000u) / ctx->pace.rate_bps);
+        ctx->pace_t_us  += (uint32_t)((add * 1000000u) / rate);
     }
 }
 
@@ -438,6 +458,27 @@ static int ls_append(ls_ctx_t *lc, const char *line, int len)
     return 0;
 }
 
+static int clamp_active_entry(const xrec_ctx_t *ctx, exfat_entry_t *ent)
+{
+    if (!ctx->ops.file_busy || ctx->ops.file_busy(ctx->user, ent->name) == 0) {
+        return 0;
+    }
+    if (!ctx->ops.rec_flushed_size) {
+        return -1;
+    }
+    uint32_t live_sz = ctx->ops.rec_flushed_size(ctx->user);
+    if (live_sz <= 44u) {
+        return -1;
+    }
+    if (ent->size > (uint64_t)live_sz) {
+        ent->size = (uint64_t)live_sz;
+    }
+    if (ent->valid_data_len > ent->size) {
+        ent->valid_data_len = ent->size;
+    }
+    return 0;
+}
+
 /* The listing resumes at ctx->ls_pos, the first slot after the last entry that was sent (or skipped with nothing
  * unsent before it): a pass reads only the directory part not listed yet. */
 static int ls_dir_cb(const exfat_entry_t *entry, const exfat_dir_pos_t *next, void *user)
@@ -448,6 +489,13 @@ static int ls_dir_cb(const exfat_entry_t *entry, const exfat_dir_pos_t *next, vo
         char line[128];
         int pos = 0;
         uint32_t sz = (entry->size > 0xFFFFFFFFu) ? 0xFFFFFFFFu : (uint32_t)entry->size;
+        if (lc->ctx->ops.file_busy && lc->ctx->ops.file_busy(lc->ctx->user, entry->name) != 0 &&
+            lc->ctx->ops.rec_flushed_size) {
+            uint32_t live_sz = lc->ctx->ops.rec_flushed_size(lc->ctx->user);
+            if (live_sz < sz) {
+                sz = live_sz;
+            }
+        }
         append_str(line, &pos, (int)sizeof(line), "+XREC:F,");
         append_u32(line, &pos, (int)sizeof(line), sz);
         append_str(line, &pos, (int)sizeof(line), ",");
@@ -564,8 +612,9 @@ static void handle_ping(xrec_ctx_t *ctx)
     append_str(buf, &pos, (int)sizeof(buf), ",pair=");
     append_u32(buf, &pos, (int)sizeof(buf), ctx->pair_active ? 1u : 0u);
     /* capability flags (clients parse key=value and ignore unknown keys):
-     * rec=1 = PUT target REC,<stem>.cwx; sync=1 = +XREC:SYNC,<pending>[,<eta_s>] */
-    append_str(buf, &pos, (int)sizeof(buf), ",rec=1,sync=1\r\n");
+     * rec=1 = PUT target REC,<stem>.cwx; sync=1 = +XREC:SYNC,<pending>[,<eta_s>];
+     * live=1 = best-effort live GETS of active recording up to flushed disk bytes */
+    append_str(buf, &pos, (int)sizeof(buf), ",rec=1,sync=1,live=1\r\n");
     send_text(ctx, buf, pos);
 }
 
@@ -684,7 +733,10 @@ static void handle_stat(xrec_ctx_t *ctx)
         (void)exfat_stat_fs(ctx->vol, &st.free_mb, &st.total_mb);
     }
     if (rec_channels(ctx) == 0u) {
-        st.rec_idx = 0u;                         /* only a running recording is named */
+        st.rec_idx   = 0u;                       /* only a running recording is named */
+        st.rec_bytes = 0u;
+    } else if (st.rec_bytes == 0u && ctx->ops.rec_flushed_size) {
+        st.rec_bytes = ctx->ops.rec_flushed_size(ctx->user);
     }
     st.pace_ms = pace_ms(ctx);
     char buf[160];
@@ -705,11 +757,13 @@ static void handle_stat(xrec_ctx_t *ctx)
     append_u32(buf, &pos, (int)sizeof(buf), st.free_mb);
     append_str(buf, &pos, (int)sizeof(buf), ",");
     append_u32(buf, &pos, (int)sizeof(buf), st.total_mb);
-    /* fields 9 and 10 (F7): appended, numeric, so clients that read the first 8 by position are unaffected */
+    /* fields 9, 10, 11 (F7 / live streaming): rec_idx, pace_ms, rec_bytes */
     append_str(buf, &pos, (int)sizeof(buf), ",");
     append_u32(buf, &pos, (int)sizeof(buf), st.rec_idx);
     append_str(buf, &pos, (int)sizeof(buf), ",");
     append_u32(buf, &pos, (int)sizeof(buf), st.pace_ms);
+    append_str(buf, &pos, (int)sizeof(buf), ",");
+    append_u32(buf, &pos, (int)sizeof(buf), st.rec_bytes);
     append_str(buf, &pos, (int)sizeof(buf), "\r\n");
     send_text(ctx, buf, pos);
 }
@@ -803,7 +857,7 @@ static int rec_walk_yield(xrec_ctx_t *ctx, uint32_t t0)
     if (rec_ring_busy(ctx)) {
         return 1;
     }
-    if ((uint32_t)(pace_now_us(ctx) - t0) >= ctx->pace.budget_us) {
+    if ((uint32_t)(pace_now_us(ctx) - t0) >= eff_rec_budget_us(ctx)) {
         ctx->pace.budget_stops++;
         return 1;
     }
@@ -950,14 +1004,11 @@ static void handle_get_common(xrec_ctx_t *ctx, const char *args, int is_stream)
         send_err(ctx, "NAME");
         return;
     }
-    /* F7: the file being recorded grows and is rewritten (header, checkpoints): never sent, the client skips it */
-    if (ctx->ops.file_busy && ctx->ops.file_busy(ctx->user, p) != 0) {
+    /* Live active-file streaming: refuse with BUSY only when no flushed bytes exist (<= 44 B) or no flushed-size hook is wired */
+    if (ctx->ops.file_busy && ctx->ops.file_busy(ctx->user, p) != 0 &&
+        (!ctx->ops.rec_flushed_size || ctx->ops.rec_flushed_size(ctx->user) <= 44u)) {
         ctx->pace.busy++;
         send_err(ctx, "BUSY");
-        return;
-    }
-    if (rec_channels(ctx) > 1u) {
-        send_later(ctx);                         /* decision 5: no transfers during a stereo recording */
         return;
     }
 
@@ -2056,17 +2107,7 @@ void xrec_poll(xrec_ctx_t *ctx)
     if ((!ctx->gets_active && !ctx->gets_lookup) || ctx->put_active) {
         return;
     }
-    if (rec_ch > 1u) {
-        /* a stereo recording began during a stream (or its lookup): it ends here (decision 5), the client asks again
-         * later. The stream ends only once the LATER line is queued: a full TX ring (the stream filled it) retries it
-         * at the next poll, so the client never waits for a timeout. */
-        ctx->gets_staged = 0u;
-        if (send_later_try(ctx) == 0) {
-            ctx->gets_active = 0u;
-            ctx->gets_lookup = 0u;
-        }
-        return;
-    }
+    (void)send_later_try; /* kept only if deferred LATER retry is re-introduced; avoid unused warning */
     if (ctx->gets_lookup) {
         if (rec_ring_busy(ctx)) {
             return;
@@ -2080,6 +2121,11 @@ void xrec_poll(xrec_ctx_t *ctx)
         ctx->gets_lookup = 0u;
         if (rc != 0 || ctx->gets_file.is_dir) {
             send_err(ctx, "NOENT");
+            return;
+        }
+        if (clamp_active_entry(ctx, &ctx->gets_file) != 0) {
+            ctx->pace.busy++;
+            send_err(ctx, "BUSY");
             return;
         }
         gets_begin(ctx);
@@ -2104,7 +2150,7 @@ void xrec_poll(xrec_ctx_t *ctx)
                 if (rec_ring_busy(ctx)) {
                     return;
                 }
-                if ((uint32_t)(pace_now_us(ctx) - pass_t0) >= ctx->pace.budget_us) {
+                if ((uint32_t)(pace_now_us(ctx) - pass_t0) >= eff_rec_budget_us(ctx)) {
                     ctx->pace.budget_stops++;
                     return;
                 }

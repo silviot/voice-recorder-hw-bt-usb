@@ -24,7 +24,7 @@
 #include "openfw_xrec.h"
 #include "openfw_bench_meas.h"
 
-static char     g_out[16384];
+static char     g_out[65536];
 static uint32_t g_out_len;
 static int      g_send_fail;        /* the next g_send_fail sends fail (a full TX ring) */
 static uint32_t g_reads;            /* read_sectors calls */
@@ -213,11 +213,13 @@ static void fill(uint8_t *b, uint32_t n, uint8_t seed)
 /* ---- 11. Sync while recording (docs/BT_SYNC_SPEED_AND_RECORDING.md F1, F1b, F6, F7): fake recorder state ---- */
 static uint8_t  g_rec_ch;           /* 0 idle, 1 mono, 2 stereo */
 static uint32_t g_rec_pending;      /* audio blocks the recorder has not taken */
+static uint32_t g_rec_flushed;      /* checkpointed flushed bytes of active file */
 static uint32_t g_us_step;          /* added to g_now_us at every now_us() read: card reads that take time */
 static int      g_rtc_sets;
 
 static uint8_t  fake_rec_channels(void *u) { (void)u; return g_rec_ch; }
 static uint32_t fake_rec_pending(void *u) { (void)u; return g_rec_pending; }
+static uint32_t fake_rec_flushed_size(void *u) { (void)u; return g_rec_flushed; }
 static uint32_t fake_now_us(void *u)
 {
     (void)u;
@@ -235,6 +237,7 @@ static void fake_get_stat(void *u, xrec_stat_t *st)
     (void)u;
     st->media_status = g_rec_ch ? 0x21u : 0x10u;
     st->rec_idx = 9u;                /* xrec_proto reports it only while recording */
+    st->rec_bytes = g_rec_flushed;
 }
 static int fake_set_rtc(void *u, const xrec_rtc_t *rt)
 {
@@ -273,6 +276,7 @@ static void test_sync_while_recording(void)
     ops.file_busy = fake_file_busy;
     ops.rec_channels = fake_rec_channels;
     ops.rec_pending = fake_rec_pending;
+    ops.rec_flushed_size = fake_rec_flushed_size;
     ops.now_us = fake_now_us;
     xrec_init(&g_x, &g_vol, &ops, NULL);
     xrec_set_bound_key(&g_x, g_key);
@@ -284,35 +288,63 @@ static void test_sync_while_recording(void)
     make_wav("OLD_0001.wav", big, sizeof(big));
     make_wav("REC_0009.wav", big, 4096u);         /* "the file being recorded" while g_rec_ch != 0 */
 
-    /* STAT fields 9 (rec_idx) and 10 (pace_ms): 0,0 when idle; mono: 16 KiB at 48000 B/s = 342 ms; stereo: LATER */
+    /* STAT fields 9 (rec_idx), 10 (pace_ms), 11 (rec_bytes): 0,0,0 when idle; mono 342 ms; stereo 456 ms */
+    g_rec_flushed = 0u;
     const char *r = cmd("+XREC:STAT");
-    assert(strncmp(r, "+XREC:STAT,", 11) == 0 && strstr(r, ",0,0\r\n") != NULL);
+    assert(strncmp(r, "+XREC:STAT,", 11) == 0 && strstr(r, ",0,0,0\r\n") != NULL);
     g_rec_ch = 1u;
+    g_rec_flushed = 2048u;
     r = cmd("+XREC:STAT");
-    assert(strstr(r, ",9,342\r\n") != NULL);
+    assert(strstr(r, ",9,342,2048\r\n") != NULL);
     g_rec_ch = 2u;
     r = cmd("+XREC:STAT");
-    assert(strstr(r, ",9,30000\r\n") != NULL);
+    assert(strstr(r, ",9,456,2048\r\n") != NULL);
     {
-        int commas = 0;                          /* 10 numeric fields: old parsers read the first 8 */
+        int commas = 0;                          /* 11 numeric fields */
         for (const char *q = r; *q; q++) {
             commas += *q == ',';
         }
-        assert(commas == 10);
+        assert(commas == 11);
     }
 
-    /* F7: the active file is never sent (any case), in mono and stereo */
+    /* When flushed <= 44 B, active file still answers BUSY; when flushed > 44 B, GETS streams up to flushed size */
+    g_rec_flushed = 44u;
     for (uint8_t ch = 1u; ch <= 2u; ch++) {
         g_rec_ch = ch;
         assert(strcmp(cmd("+XREC:GETS,0,4096,640,REC_0009.wav"), "+XREC:ERR,BUSY\r\n") == 0);
         assert(strcmp(cmd("+XREC:GET,0,640,rec_0009.WAV"), "+XREC:ERR,BUSY\r\n") == 0);
     }
-    /* decision 5: stereo recording -> other files LATER too */
+    g_rec_flushed = 2048u;
+    for (uint8_t ch = 1u; ch <= 2u; ch++) {
+        g_rec_ch = ch;
+        g_now_us += 2000000u;                    /* refill tokens for live test */
+        assert(strstr(ls(), "+XREC:F,2048,REC_0009.wav\r\n") != NULL);
+        clear_out();
+        rx_str("+XREC:GETS,0,4096,640,REC_0009.wav\r");
+        for (int p = 0; p < 50 && (g_x.gets_lookup || g_x.gets_active); p++) {
+            g_now_us += 20000u;
+            xrec_poll(&g_x);
+        }
+        assert(!g_x.gets_lookup && !g_x.gets_active);
+        uint32_t next_live = 0u;
+        assert(frames_payload(&next_live) == 2048u);
+    }
+    /* Finished files also stream best-effort during stereo recording (at stereo cap) */
     g_rec_ch = 2u;
-    assert(strcmp(cmd("+XREC:GETS,0,4096,640,OLD_0001.wav"), "+XREC:ERR,LATER,30000\r\n") == 0);
-    assert(strcmp(cmd("+XREC:GET,0,640,OLD_0001.wav"), "+XREC:ERR,LATER,30000\r\n") == 0);
-    /* the old file is fine once REC stopped */
+    g_now_us += 2000000u;
+    clear_out();
+    rx_str("+XREC:GETS,0,1280,640,OLD_0001.wav\r");
+    for (int p = 0; p < 50 && (g_x.gets_lookup || g_x.gets_active); p++) {
+        g_now_us += 20000u;
+        xrec_poll(&g_x);
+    }
+    {
+        uint32_t next_old = 0u;
+        assert(!g_x.gets_lookup && !g_x.gets_active && frames_payload(&next_old) == 1280u);
+    }
+    /* the whole 4096-byte file is readable once REC stopped */
     g_rec_ch = 0u;
+    g_rec_flushed = 0u;
     r = cmd("+XREC:GET,0,640,REC_0009.wav");
     assert(g_out_len == 12u + 640u && memcmp(r, "XREC", 4) == 0);
 
@@ -346,7 +378,7 @@ static void test_sync_while_recording(void)
     assert(strcmp(cmd("+XREC:PUTEND"), "+XREC:OK,PUTEND,96\r\n") == 0);
     assert(strcmp(cmd("+XREC:RTC,2026,11,25,10,00,00,2"), "+XREC:OK,RTC\r\n") == 0 && g_rtc_sets == 1);
     xrec_get_pace_stats(&g_x, &ps);
-    assert(ps.later == 9u && ps.busy == 4u);   /* 2 GETS/GET + DEL + 3 PUT + PUTEND + RTC + PAIR */
+    assert(ps.later == 7u && ps.busy == 4u);   /* DEL + 3 PUT + PUTEND + RTC + PAIR; 4 active-GETS/GET(44B) */
 
     /* F1: recorder first. A command waits (bytes not consumed) while the recorder has blocks pending. */
     g_rec_ch = 1u;
@@ -413,21 +445,28 @@ static void test_sync_while_recording(void)
     xrec_poll(&g_x);
     uint32_t rest = frames_payload(&next);
     assert(next == 60000u && rest > 3u * 640u && !g_x.gets_active);
-    /* a stereo recording that starts during a stream ends it with LATER */
+    /* stereo recording: rate-capped at 36000 B/s + 2.5 ms pass budget, continues best-effort cleanly */
     g_rec_ch = 0u;
     xrec_set_rec_pace(&g_x, 48000u, 0u);
     clear_out();
     rx_str("+XREC:GETS,0,60000,640,OLD_0001.wav");
-    g_rec_ch = 1u;                                     /* mono from here: the stream is paced */
+    g_rec_ch = 2u;                                     /* stereo from here: paced at <= 36 KB/s */
     rx_str("\r");
     next = 0u;
-    (void)frames_payload(&next);
+    uint32_t st_moved = frames_payload(&next);
     assert(g_x.gets_active);
-    g_rec_ch = 2u;
+    for (int ms = 0; ms < 1000; ms++) {
+        g_now_us += 1000u;
+        clear_out();
+        xrec_poll(&g_x);
+        st_moved += frames_payload(&next);
+    }
+    assert(st_moved <= 36000u + 2048u && st_moved >= 36000u - 640u);
+    g_rec_ch = 0u;
     clear_out();
     xrec_poll(&g_x);
-    assert(strcmp(g_out, "+XREC:ERR,LATER,30000\r\n") == 0 && !g_x.gets_active);
-    g_rec_ch = 0u;
+    (void)frames_payload(&next);
+    assert(next == 60000u && !g_x.gets_active);
 
     assert(exfat_delete_file(&g_vol, "/record", "OLD_0001.wav") == 0);
     assert(exfat_delete_file(&g_vol, "/record", "REC_0009.wav") == 0);
@@ -606,19 +645,25 @@ static void test_rec_hardening(void)
         rx_str("+XREC:LS\r");
         assert(!g_x.gets_lookup);
         (void)ls_drain(5u, NULL);
-        /* a stereo recording during a lookup ends it with LATER */
+        /* switching to stereo mid-lookup tightens the pass budget (2.5 ms) cleanly without aborting */
         clear_out();
         rx_str("+XREC:GET,0,64,LS_0299.wav\r");
         assert(g_x.gets_lookup);
         g_rec_ch = 2u;
+        g_now_us += 200000u;
         clear_out();
-        xrec_poll(&g_x);
-        assert(strcmp(g_out, "+XREC:ERR,LATER,30000\r\n") == 0 && !g_x.gets_lookup);
+        for (int k = 0; k < 2000 && (g_x.gets_lookup || g_x.gets_active); k++) {
+            uint32_t r1 = g_reads;
+            xrec_poll(&g_x);
+            assert(g_reads - r1 <= 4u);
+            g_now_us += 20000u;
+        }
+        assert(!g_x.gets_lookup && !g_x.gets_active && g_out_len == 12u + 64u);
         g_rec_ch = 1u;
     }
     g_read_cost_us = 0u;
 
-    /* The stereo LATER that ends a running stream is retried while the TX ring is full: never lost */
+    /* A stream running across a 1ch -> 2ch transition continues cleanly under stereo pacing */
     {
         static uint8_t big4k[4096];
         fill(big4k, sizeof(big4k), 0x21u);
@@ -634,17 +679,17 @@ static void test_rec_hardening(void)
         }
         assert(g_x.gets_active);
         g_rec_ch = 2u;
-        g_send_fail = 2;
-        clear_out();
+        g_send_fail = 1;
+        uint32_t keep_len = g_out_len;
         xrec_poll(&g_x);
-        assert(g_out_len == 0u && g_x.gets_active);           /* not queued: the stream is not ended silently */
-        xrec_poll(&g_x);
-        assert(g_out_len == 0u && g_x.gets_active);
-        xrec_poll(&g_x);
-        assert(strcmp(g_out, "+XREC:ERR,LATER,30000\r\n") == 0 && !g_x.gets_active);
-        clear_out();
-        xrec_poll(&g_x);
-        assert(g_out_len == 0u);                              /* once */
+        assert(g_out_len == keep_len && g_x.gets_active);     /* TX full: staged frame preserved */
+        for (int k = 0; k < 400 && g_x.gets_active; k++) {
+            g_now_us += 20000u;
+            xrec_poll(&g_x);
+        }
+        assert(!g_x.gets_active);
+        uint32_t got_tot = 0u;
+        assert(frames_payload(&got_tot) == 4096u);
         g_rec_ch = 0u;
         assert(exfat_delete_file(&g_vol, "/record", "BIGL_0001.wav") == 0);
     }

@@ -490,8 +490,7 @@ static void bind_home_detail(const ui_model_t *m, unsigned page, lv_obj_t *title
                     ui_tr((m->file_count == 1) ? UI_STR_RECORDING_ONE : UI_STR_RECORDING_MANY));
         lv_snprintf(l2, sizeof(l2), ui_tr(UI_STR_SPACE_LEFT_FMT), free_s);
     } else if (page == 2u) {
-        lv_snprintf(l1, sizeof(l1), "%s %u \xC2\xB7 %s \xC2\xB7 %s",
-                    ui_tr(UI_STR_GAIN), (unsigned)m->cfg.mic_gain,
+        lv_snprintf(l1, sizeof(l1), "%s \xC2\xB7 %s",
                     (m->cfg.channels == 1u) ? "1ch" : "2ch",
                     sound_mode_name(m->cfg.sound_mode));
         lv_snprintf(l2, sizeof(l2), "%s", ui_tr(m->cfg.vor_enabled ? UI_STR_VOR_ON : UI_STR_VOR_OFF));
@@ -641,18 +640,13 @@ static void bind_rec(const ui_model_t *m, bool entering)
                         m->rec_blink ? UI_COL_TEXT : UI_COL_REC_DIM, "REC", NULL, badge, 1);
     }
 
-    char tbuf[16], gbuf[24], free_s[24], ftxt[40];
+    char tbuf[16], free_s[24], ftxt[40];
     ui_format_duration(tbuf, (int)sizeof(tbuf), m->rec_sec);
     set_changed_text(objects.rec_timer, tbuf);
     set_changed_text_color(objects.rec_timer,
                            lv_color_hex(m->rec_vor_wait ? UI_HEX_MUTE : UI_HEX_TEXT));
 
-    lv_snprintf(gbuf, sizeof(gbuf), "%s %u", ui_tr(UI_STR_GAIN), (unsigned)m->cfg.mic_gain);
-    set_changed_text(objects.rec_gain_lbl, gbuf);
-    set_changed_bg_color(objects.rec_gain_pill,
-                         lv_color_hex(m->rec_gain_bar ? UI_HEX_CYAN : UI_HEX_TILE));
-    set_changed_text_color(objects.rec_gain_lbl,
-                           lv_color_hex(m->rec_gain_bar ? UI_HEX_BLACK : UI_HEX_TEXT));
+    set_hidden(objects.rec_gain_pill, true);
 
     ui_format_free_time(free_s, (int)sizeof(free_s), m->sd_free_sec);
     lv_snprintf(ftxt, sizeof(ftxt), ui_tr(UI_STR_LEFT_FMT), free_s);
@@ -705,13 +699,6 @@ static void bind_rec(const ui_model_t *m, bool entering)
                                lv_color_hex((m->rec_warn_col == UI_COL_RED) ? UI_HEX_TEXT : UI_HEX_BLACK));
         set_changed_text_align(objects.rec_foot_left, LV_TEXT_ALIGN_CENTER);
         set_changed_width(objects.rec_foot_left, 152);
-    } else if (m->rec_gain_bar) {
-        set_changed_bg_color(objects.rec_foot_box, lv_color_hex(UI_HEX_TILE));
-        set_changed_bg_opa(objects.rec_foot_box, LV_OPA_COVER);
-        set_hidden(objects.rec_foot_left, true);
-        set_hidden(objects.rec_foot_right, true);
-        set_hidden(objects.rec_foot_bar, false);
-        set_changed_bar_value(objects.rec_foot_bar, (int32_t)m->cfg.mic_gain);
     } else if (m->rec_vor_wait) {
         set_changed_bg_opa(objects.rec_foot_box, LV_OPA_TRANSP);
         set_hidden(objects.rec_foot_bar, true);
@@ -1354,16 +1341,15 @@ static void format_setting_val(const ui_model_t *m, int idx, char *val, int vcap
     static const uint8_t brt_pct[5] = { 20u, 40u, 60u, 80u, 100u };
     *adj = 1;
     switch (idx) {
-    case 0: lv_snprintf(val, (size_t)vcap, "%u", (unsigned)m->cfg.mic_gain); break;
-    case 1: lv_snprintf(val, (size_t)vcap, "%s", sound_mode_name(m->cfg.sound_mode)); break;
-    case 2: lv_snprintf(val, (size_t)vcap, "%s", (m->cfg.channels == 1u) ? "1ch" : "2ch"); break;
-    case 3: lv_snprintf(val, (size_t)vcap, "%s", ui_tr(m->cfg.vor_enabled ? UI_STR_ON : UI_STR_OFF)); break;
-    case 4: lv_snprintf(val, (size_t)vcap, "%u%%", (unsigned)brt_pct[m->cfg.brightness_idx < 5u ? m->cfg.brightness_idx : 3u]); break;
-    case 5: lv_snprintf(val, (size_t)vcap, "%s", screen_off_name(m->cfg.screen_off_idx)); break;
-    case 6: ui_format_clock(val, vcap, m->now.hour, m->now.minute); *adj = 0; break;
-    case 7: lv_snprintf(val, (size_t)vcap, "%s", skip_mode_name(m->cfg.skip_mode)); break;
-    case 8: lv_snprintf(val, (size_t)vcap, "%s", ui_lang_native_name(m->cfg.lang)); break;
-    case 9: lv_snprintf(val, (size_t)vcap, "%s", ui_tr(m->vbus_present ? UI_STR_CONNECT : UI_STR_UNPLUGGED)); *adj = 0; break;
+    case 0: lv_snprintf(val, (size_t)vcap, "%s", sound_mode_name(m->cfg.sound_mode)); break;
+    case 1: lv_snprintf(val, (size_t)vcap, "%s", (m->cfg.channels == 1u) ? "1ch" : "2ch"); break;
+    case 2: lv_snprintf(val, (size_t)vcap, "%s", ui_tr(m->cfg.vor_enabled ? UI_STR_ON : UI_STR_OFF)); break;
+    case 3: lv_snprintf(val, (size_t)vcap, "%u%%", (unsigned)brt_pct[m->cfg.brightness_idx < 5u ? m->cfg.brightness_idx : 3u]); break;
+    case 4: lv_snprintf(val, (size_t)vcap, "%s", screen_off_name(m->cfg.screen_off_idx)); break;
+    case 5: ui_format_clock(val, vcap, m->now.hour, m->now.minute); *adj = 0; break;
+    case 6: lv_snprintf(val, (size_t)vcap, "%s", skip_mode_name(m->cfg.skip_mode)); break;
+    case 7: lv_snprintf(val, (size_t)vcap, "%s", ui_lang_native_name(m->cfg.lang)); break;
+    case 8: lv_snprintf(val, (size_t)vcap, "%s", ui_tr(m->vbus_present ? UI_STR_CONNECT : UI_STR_UNPLUGGED)); *adj = 0; break;
 #ifdef UI_SET_ROW_AOUT
     case UI_SET_ROW_AOUT:
         lv_snprintf(val, (size_t)vcap, "%s", ui_tr_bt(m->bt_out_mode == 1u ? UI_BT_STR_OUT_BT
@@ -1385,9 +1371,9 @@ static void format_setting_val(const ui_model_t *m, int idx, char *val, int vcap
 
 static void bind_settings(const ui_model_t *m)
 {
-    /* i18n labels of every row but "Audio output" (BT=1 inserts that one at UI_SET_ROW_AOUT, openfw_i18n_bt.h) */
+    /* i18n labels of every row but Audio output/Auto sync/Auto off (BT=1 inserts those at UI_SET_ROW_AOUT..UI_SET_ROW_AUTO_OFF) */
     static const ui_str_id_t label_ids[] = {
-        UI_STR_SET_MIC_GAIN, UI_STR_SET_SOUND, UI_STR_SET_MICS, UI_STR_SET_VOR,
+        UI_STR_SET_SOUND, UI_STR_SET_MICS, UI_STR_SET_VOR,
         UI_STR_SET_BRIGHTNESS, UI_STR_SET_SCREEN_OFF, UI_STR_SET_CLOCK,
         UI_STR_SET_SKIP, UI_STR_SET_LANGUAGE, UI_STR_SET_USB_DISK, UI_STR_SET_ABOUT,
         UI_STR_SET_HSPROBE
@@ -1440,7 +1426,7 @@ static void bind_settings(const ui_model_t *m)
 
         const char *val_str;
         char val_buf[32];
-        if (idx == 6 && sel && m->set_edit_clock != 0u) {
+        if (idx == 5 && sel && m->set_edit_clock != 0u) {
             lv_snprintf(val_buf, sizeof(val_buf), (m->set_edit_clock == 1u) ? "[%02u]:%02u" : "%02u:[%02u]",
                         (unsigned)m->set_edit_h, (unsigned)m->set_edit_m);
             val_str = val_buf;
@@ -1459,7 +1445,7 @@ static void bind_settings(const ui_model_t *m)
                 lv_snprintf(val_buf, sizeof(val_buf), "%s", val);
                 val_str = val_buf;
                 set_changed_text(vals[r], val_str);
-                set_changed_text_color(vals[r], lv_color_hex((idx == 9 && sel && m->vbus_present) ? UI_HEX_CYAN : UI_HEX_DIM));
+                set_changed_text_color(vals[r], lv_color_hex((idx == 8 && sel && m->vbus_present) ? UI_HEX_CYAN : UI_HEX_DIM));
             }
         }
         int32_t vw = lv_text_get_width(val_str, (uint32_t)lv_strlen(val_str), &ui_font_sm, 0) + 2;
@@ -1474,30 +1460,23 @@ static void bind_settings(const ui_model_t *m)
     }
     bind_scrollbar(objects.set_scroll_thumb, UI_SET_COUNT, m->set_scroll, 3, 50);
 
+    set_hidden(objects.set_foot_vu_box, true);
+    set_hidden(objects.set_foot_desc, false);
     if (m->set_edit_clock != 0u) {
-        set_hidden(objects.set_foot_vu_box, true);
-        set_hidden(objects.set_foot_desc, false);
         set_changed_text(objects.set_foot_desc, ui_tr(UI_STR_CLOCK_EDIT_FOOT));
-    } else if (m->set_sel == 0) {
-        set_hidden(objects.set_foot_desc, true);
-        set_hidden(objects.set_foot_vu_box, false);
-        set_changed_text(objects.set_foot_vu_lbl, ui_tr(UI_STR_INPUT));
-        set_changed_bar_value(objects.set_foot_vu_bar, (int32_t)m->set_input_vu);
     } else {
-        set_hidden(objects.set_foot_vu_box, true);
-        set_hidden(objects.set_foot_desc, false);
         const char *desc = ui_tr(UI_STR_DESC_ABOUT);
         switch (m->set_sel) {
-        case 1: desc = ui_tr((m->cfg.sound_mode == 0u) ? UI_STR_DESC_SND_RAW :
+        case 0: desc = ui_tr((m->cfg.sound_mode == 0u) ? UI_STR_DESC_SND_RAW :
                              (m->cfg.sound_mode == 1u ? UI_STR_DESC_SND_CLARITY : UI_STR_DESC_SND_BYPASS)); break;
-        case 2: desc = ui_tr((m->cfg.channels == 1u) ? UI_STR_DESC_MIC_1CH : UI_STR_DESC_MIC_2CH); break;
-        case 3: desc = ui_tr(UI_STR_DESC_VOR); break;
-        case 4: desc = ui_tr(UI_STR_DESC_BRIGHTNESS); break;
-        case 5: desc = ui_tr(UI_STR_DESC_SCREEN_OFF); break;
-        case 6: desc = ui_tr(UI_STR_DESC_CLOCK); break;
-        case 7: desc = ui_tr(UI_STR_DESC_SKIP); break;
-        case 8: desc = ui_tr(UI_STR_DESC_LANGUAGE); break;
-        case 9: desc = ui_tr(m->vbus_present ? UI_STR_DESC_USB_MOUNT : UI_STR_DESC_USB_PLUG); break;
+        case 1: desc = ui_tr((m->cfg.channels == 1u) ? UI_STR_DESC_MIC_1CH : UI_STR_DESC_MIC_2CH); break;
+        case 2: desc = ui_tr(UI_STR_DESC_VOR); break;
+        case 3: desc = ui_tr(UI_STR_DESC_BRIGHTNESS); break;
+        case 4: desc = ui_tr(UI_STR_DESC_SCREEN_OFF); break;
+        case 5: desc = ui_tr(UI_STR_DESC_CLOCK); break;
+        case 6: desc = ui_tr(UI_STR_DESC_SKIP); break;
+        case 7: desc = ui_tr(UI_STR_DESC_LANGUAGE); break;
+        case 8: desc = ui_tr(m->vbus_present ? UI_STR_DESC_USB_MOUNT : UI_STR_DESC_USB_PLUG); break;
 #ifdef UI_SET_ROW_AOUT
         case UI_SET_ROW_AOUT: desc = ui_tr_bt(UI_BT_STR_DESC_AUDIO_OUTPUT); break;
         case UI_SET_ROW_AUTO_SYNC: desc = ui_tr_bt(UI_BT_STR_DESC_AUTO_SYNC); break;

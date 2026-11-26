@@ -860,7 +860,9 @@ static void test_recorder(const char *exfat_img_path)
     assert(exfat_read_file(&vol_ckpt, &ent4, 0u, hdr4, 44u, &got4) == 0 && got4 == 44u);
     wav_info_t info4;
     assert(wav_parse_header(hdr4, &info4) == 0 && info4.data_bytes == (uint32_t)(ent4.size - 44u));
+    assert(recorder_get_flushed_wav_bytes() == (uint32_t)ent4.size);
     assert(recorder_stop() == 0);
+    assert(recorder_get_flushed_wav_bytes() == 0u);
 
     /* Snapshot clean SD image before fault-injection tests #5 & #6 */
     uint8_t *sd_clean = (uint8_t *)malloc((size_t)sz);
@@ -1072,6 +1074,19 @@ static void test_recorder(const char *exfat_img_path)
     g_openfw_log.buf[g_openfw_log.write_idx] = '\0';
     assert(strncmp(&g_openfw_log.buf[2], "BENCH rec seq=1 file=REC_0005.wav rec=0 ", 40) == 0);
 #endif
+
+    /* Recording #11: Auto mic gain clip protection steps PGA down from 20 when raw ADC hits >= 31200 */
+    assert(exfat_mount(&vol, &dev) == 0);
+    recorder_enable_auto_gain();
+    assert(recorder_get_gain() == 20u);
+    recorder_set_dsp_profile(AUDIO_DSP_ASR_RAW);
+    recorder_set_channels(1u);
+    assert(recorder_start(&vol, 1) == 0);
+    sim_dma_deliver_frame(0, 32000, NULL);
+    recorder_poll();
+    assert(recorder_get_gain() == 18u);
+    assert(((*pga >> 24) & 31u) == 18u);
+    assert(recorder_stop() == 0);
 
     /* Restore default recorder config */
     recorder_set_gain(20u);

@@ -581,7 +581,8 @@ static void dev_get_stat(void *user, xrec_stat_t *out)       /* F:1733-1752 */
     if (s_sd && s_vol != NULL) {
         (void)exfat_stat_fs(s_vol, &out->free_mb, &out->total_mb);   /* cached free count (F4): no bitmap scan */
     }
-    out->rec_idx = recorder_get_rec_index();                           /* STAT field 9 (F7) */
+    out->rec_idx   = recorder_get_rec_index();                         /* STAT field 9 (F7) */
+    out->rec_bytes = recorder_get_flushed_wav_bytes();                 /* STAT field 11 (live tail) */
 }
 
 /* Sync while recording (openfw_xrec.h, docs/BT_SYNC_SPEED_AND_RECORDING.md F1/F6/F7). */
@@ -595,6 +596,12 @@ static uint32_t dev_rec_pending(void *user)
 {
     (void)user;
     return audio_ring_pending();
+}
+
+static uint32_t dev_rec_flushed_size(void *user)
+{
+    (void)user;
+    return recorder_get_flushed_wav_bytes();
 }
 
 static uint32_t dev_now_us(void *user)
@@ -773,9 +780,10 @@ static const xrec_ops_t k_dev_ops = {
     .read_log = dev_read_log,
     .reset_log = dev_reset_log,
     .audio_cfg = dev_audio_cfg,
-    .rec_channels = dev_rec_channels,
-    .rec_pending = dev_rec_pending,
-    .now_us = dev_now_us,
+    .rec_channels     = dev_rec_channels,
+    .rec_pending      = dev_rec_pending,
+    .rec_flushed_size = dev_rec_flushed_size,
+    .now_us           = dev_now_us,
 };
 
 const xrec_ops_t *bt_xrec_plat_device_ops(void) { return &k_dev_ops; }
