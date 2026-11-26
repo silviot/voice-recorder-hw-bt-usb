@@ -452,6 +452,9 @@ every few seconds and dropped the link after 5-9 s.
 - **HW8 (session 8) path (c):** the laptop bond lost from `bt_hp_bonds.bin` fits the same mechanism if that laptop
   set the SC host bit; 0047 closes it either way.
 - Recovery on the device: one re-pairing inside the window (the phone's old key is replaced).
+- **Verified** (release image `3e60e98`, patch 0047): re-paired 09:09 inside the window (auto-accept), the app
+  reconnected at 09:11 with the stored key (no auth failure) and completed a sync (`done`, nothing new).
+  Watch over the next days: a recurrence would now show as a working reconnect instead of Key Missing.
 
 ## Exp 1 stages A and B: how to run
 
