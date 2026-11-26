@@ -123,10 +123,12 @@ typedef enum {
  * routing for the headphones mode), then About, then the Headset button test diagnostic last. Row indices are
  * UI-only: nothing persisted is indexed by them (settings.bin stores fields, bt_hp_cfg.bin the output mode). */
 #if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID && !(defined(OPENFW_HCI_PROBE) && OPENFW_HCI_PROBE)
-#define UI_SET_ROW_AOUT   10
-#define UI_SET_ROW_ABOUT  11
-#define UI_SET_HSPROBE    12
-#define UI_SET_COUNT      13
+#define UI_SET_ROW_AOUT      10
+#define UI_SET_ROW_AUTO_SYNC 11
+#define UI_SET_ROW_AUTO_OFF  12
+#define UI_SET_ROW_ABOUT     13
+#define UI_SET_HSPROBE       14
+#define UI_SET_COUNT         15
 #else
 #define UI_SET_ROW_ABOUT  10
 #define UI_SET_HSPROBE    11
@@ -316,6 +318,9 @@ typedef struct {
     uint8_t        list_val_col[UI_LIST_ROWS];   /* 0 dim, 1 cyan, 2 green, 3 amber */
     char           list_foot[64];
     uint8_t        bt_out_mode;     /* Settings "Audio output": 0 Speaker, 1 Headphones, 2 Both */
+    uint8_t        bt_auto_sync;    /* Settings "Auto sync": 0 Off, 1 On (default) */
+    uint8_t        bt_auto_off;     /* Settings "Auto off": 0 Off, 1 2m, 2 5m (default), 3 15m */
+    uint8_t        bt_bg_syncing;   /* 1 while background phone sync is active */
 #endif
 
     /* Power off */

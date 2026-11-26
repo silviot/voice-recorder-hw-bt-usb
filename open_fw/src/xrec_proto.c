@@ -563,8 +563,9 @@ static void handle_ping(xrec_ctx_t *ctx)
     append_u32(buf, &pos, (int)sizeof(buf), ctx->auth ? 1u : 0u);
     append_str(buf, &pos, (int)sizeof(buf), ",pair=");
     append_u32(buf, &pos, (int)sizeof(buf), ctx->pair_active ? 1u : 0u);
-    /* capability flags (clients parse key=value and ignore unknown keys): rec=1 = PUT target REC,<stem>.cwx */
-    append_str(buf, &pos, (int)sizeof(buf), ",rec=1\r\n");
+    /* capability flags (clients parse key=value and ignore unknown keys):
+     * rec=1 = PUT target REC,<stem>.cwx; sync=1 = +XREC:SYNC,<pending>[,<eta_s>] */
+    append_str(buf, &pos, (int)sizeof(buf), ",rec=1,sync=1\r\n");
     send_text(ctx, buf, pos);
 }
 
@@ -1209,8 +1210,18 @@ static void handle_put_complete(xrec_ctx_t *ctx)
         }
         ctx->put_stream_mode = ctx->put_target;
         copy_cstr(ctx->put_stream_name, (uint32_t)sizeof(ctx->put_stream_name), fname);
-        ctx->put_written  = 0u;
-        ctx->put_has_last = 0u;
+        ctx->put_written   = 0u;
+        ctx->put_has_last  = 0u;
+        ctx->put_cwx_state = 1u;
+        if (ctx->put_target == XREC_PUT_REC && ctx->put_len >= 16u &&
+            ctx->xfer.put_buf[0] == 'C' && ctx->xfer.put_buf[1] == 'W' &&
+            ctx->xfer.put_buf[2] == 'X' && ctx->xfer.put_buf[3] == '1') {
+            uint32_t wc = (uint32_t)ctx->xfer.put_buf[12] |
+                          ((uint32_t)ctx->xfer.put_buf[13] << 8) |
+                          ((uint32_t)ctx->xfer.put_buf[14] << 16) |
+                          ((uint32_t)ctx->xfer.put_buf[15] << 24);
+            ctx->put_cwx_state = (wc > 0u) ? 1u : 2u;
+        }
         xfer_begin(ctx, 1u, fname, 0u, 0u, 0u);
     } else if (ctx->put_stream_mode != ctx->put_target ||
                ctx->put_offset != ctx->put_written ||
@@ -1310,6 +1321,9 @@ static void handle_putend(xrec_ctx_t *ctx)
     }
     ctx->put_done_valid = 1u;
     ctx->put_done_total = total;
+    if (mode == XREC_PUT_REC && ctx->ops.on_rec_cwx) {
+        ctx->ops.on_rec_cwx(ctx->user, final_name, ctx->put_cwx_state ? ctx->put_cwx_state : 1u);
+    }
     send_putend_ok(ctx, total);
 }
 
@@ -1700,6 +1714,37 @@ static void try_start_put_header(xrec_ctx_t *ctx)
     ctx->put_got     = 0u;
 }
 
+static void handle_sync(xrec_ctx_t *ctx, const char *args)
+{
+    const char *p = args;
+    uint32_t pending = 0u;
+    uint32_t eta_sec = 0u;
+    if (parse_u32_step(&p, &pending) != 0) {
+        send_err(ctx, "ARGS");
+        return;
+    }
+    if (*p == ',') {
+        p++;
+        if (parse_u32_step(&p, &eta_sec) != 0) {
+            send_err(ctx, "ARGS");
+            return;
+        }
+    }
+    if (*p != '\0') {
+        send_err(ctx, "ARGS");
+        return;
+    }
+    if (ctx->ops.on_sync_state) {
+        ctx->ops.on_sync_state(ctx->user, pending, eta_sec);
+    }
+    char resp[48];
+    int pos = 0;
+    append_str(resp, &pos, (int)sizeof(resp), "+XREC:OK,SYNC,");
+    append_u32(resp, &pos, (int)sizeof(resp), pending);
+    append_str(resp, &pos, (int)sizeof(resp), "\r\n");
+    send_text(ctx, resp, pos);
+}
+
 static void process_line(xrec_ctx_t *ctx, const char *line)
 {
     if (!str_starts_with(line, "+XREC:")) {
@@ -1761,6 +1806,8 @@ static void process_line(xrec_ctx_t *ctx, const char *line)
         handle_ota(ctx);
     } else if (str_starts_with(cmd, "PUTEND") && cmd[6] == '\0') {
         handle_putend(ctx);
+    } else if (str_starts_with(cmd, "SYNC,")) {
+        handle_sync(ctx, cmd + 5);
     } else if (str_starts_with(cmd, "RUN") && (cmd[3] == '\0' || cmd[3] == ',')) {
         handle_run(ctx, cmd + 3);
     } else if (str_starts_with(cmd, "LOG") && (cmd[3] == '\0' || cmd[3] == ',')) {

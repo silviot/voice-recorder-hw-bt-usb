@@ -109,6 +109,9 @@ typedef struct {
     uint8_t  (*rec_channels)(void *user);
     uint32_t (*rec_pending)(void *user);
     uint32_t (*now_us)(void *user);
+    /* Cooperative background sync (+XREC:SYNC,<pending>[,<eta_s>]) and live CWX commit notification. Optional. */
+    void     (*on_sync_state)(void *user, uint32_t pending, uint32_t eta_sec);
+    void     (*on_rec_cwx)(void *user, const char *cwx_name, uint8_t tr_state);
 } xrec_ops_t;
 
 /* Pacing counters (bench +XREC:DBG,PACE; tests). */
@@ -216,6 +219,7 @@ typedef struct {
     /* last PUTEND commit, so a repeated PUTEND (lost reply) answers the same OK until the next PUT header */
     uint8_t        put_done_valid;
     uint8_t        put_rec_deleted;
+    uint8_t        put_cwx_state;      /* 1 = words > 0, 2 = 0 words ("No speech") */
     uint32_t       put_done_total;
 
     /* Transfer status (xrec_get_xfer): updated where GETS / PUT chunks move, read by the UI from the same task */

@@ -45,7 +45,7 @@ _Static_assert(BT_XREC_TX_RING >= BT_XREC_WRITE_MAX, "a coalesced write is stage
 
 /* ---- event records (BTC -> app). DATA and WRITE coalesce with the newest record of the same kind and handle. ---- */
 enum {
-    EV_DATA = 1, EV_WRITE, EV_CONG, EV_SPP_INIT, EV_SPP_START, EV_SRV_OPEN, EV_CLOSE, EV_RX_OVERFLOW,
+    EV_DATA = 1, EV_WRITE, EV_CONG, EV_SPP_INIT, EV_SPP_START, EV_SRV_OPEN, EV_CLOSE, EV_RX_OVERFLOW, EV_DISC_COMP,
     EV_CFM_REQ, EV_PIN_REQ, EV_KEY_REQ, EV_KEY_NOTIF, EV_AUTH_CMPL, EV_ACL_CONN, EV_ACL_DISC,
 };
 
@@ -155,6 +155,12 @@ static struct {
     uint32_t reboot_at;
     uint32_t last_fault;
     uint8_t  parked;          /* F8: silenced by a fault during a recording (state DEAD); hard path after REC */
+    /* background sync telemetry + outbound poke */
+    uint8_t  sync_seen, poke_busy, last_cwx_state;
+    uint16_t sync_pending, sync_eta_sec;
+    uint32_t sync_seq, cwx_seq;
+    char     last_cwx_name[32];
+    bda_slot_t last_peer;
     bt_xrec_debug_t d;          /* counters only (the rest is filled by bt_xrec_get_debug) */
 } s;
 
@@ -491,6 +497,11 @@ static void spp_cb(esp_spp_cb_event_t event, esp_spp_cb_param_t *p)
         e.type = EV_WRITE;
         e.handle = p->write.handle;
         e.val = (uint32_t)p->write.len;
+        break;
+    case ESP_SPP_DISCOVERY_COMP_EVT:
+        e.type = EV_DISC_COMP;
+        e.status = (uint8_t)p->disc_comp.status;
+        e.extra = p->disc_comp.scn_num;
         break;
     default:
         return;
@@ -869,6 +880,32 @@ static void xo_reboot(void *user) { (void)user; defer_reboot(1u); }
 static void xo_ota(void *user) { (void)user; defer_reboot(2u); }
 static void xo_dfu(void *user) { (void)user; defer_reboot(3u); }
 
+static void xo_sync_state(void *user, uint32_t pending, uint32_t eta_sec)
+{
+    (void)user;
+    s.sync_seen = 1u;
+    s.sync_pending = (uint16_t)(pending > 0xFFFFu ? 0xFFFFu : pending);
+    s.sync_eta_sec = (uint16_t)(eta_sec > 0xFFFFu ? 0xFFFFu : eta_sec);
+    s.sync_seq++;
+    bt_xrec_plat_log_u32("BT XREC sync pending", pending);
+}
+
+static void xo_rec_cwx(void *user, const char *cwx_name, uint8_t tr_state)
+{
+    (void)user;
+    if (cwx_name != NULL) {
+        size_t i = 0u;
+        while (cwx_name[i] != '\0' && i + 1u < sizeof(s.last_cwx_name)) {
+            s.last_cwx_name[i] = cwx_name[i];
+            i++;
+        }
+        s.last_cwx_name[i] = '\0';
+    }
+    s.last_cwx_state = tr_state ? tr_state : 1u;
+    s.cwx_seq++;
+    bt_xrec_plat_log_u32("BT XREC CWX committed, state", s.last_cwx_state);
+}
+
 /* ---- pairing policy ---- */
 static bool is_bonded(const uint8_t bda[6])
 {
@@ -1200,8 +1237,18 @@ static void on_gap_event(const ev_t *e)
         }
         if (e->status == ESP_BT_STATUS_SUCCESS) {
             bool mitm = e->extra == ESP_BT_LINK_KEY_AUTHED_COMB_P192 || e->extra == ESP_BT_LINK_KEY_AUTHED_COMB_P256;
-            if (mitm && slot_is(&s.cfm_ok, e->bda) && !slot_is(&s.reject, e->bda)) {
+            if (e->extra == ESP_BT_LINK_KEY_CHG_COMB) {
+                if (is_bonded(e->bda) && bt_xrec_plat_bond_mitm(e->bda) && !slot_is(&s.reject, e->bda)) {
+                    slot_set(&s.auth_ok, e->bda);
+                    slot_set(&s.last_peer, e->bda);
+                    s.d.lk_refreshed++;
+                    bt_xrec_plat_log("BT SSP link key refreshed (MITM bond kept)");
+                } else {
+                    reject_bond(e->bda, "BT SSP bond removed: key refresh without MITM bond");
+                }
+            } else if (mitm && slot_is(&s.cfm_ok, e->bda) && !slot_is(&s.reject, e->bda)) {
                 slot_set(&s.auth_ok, e->bda);
+                slot_set(&s.last_peer, e->bda);
                 bt_xrec_plat_log("BT SSP bonded (numeric comparison, MITM)");
                 if (s.ssp_window) {
                     s.ssp_window = 0u;     /* one bond per window; apply_scan_mode() drops discoverability */
@@ -1356,6 +1403,7 @@ static void on_spp_event(const ev_t *e)
         if (link_authorized(e->bda)) {
             s.conn_authorized = 1u;
             s.d.conns_authorized++;
+            slot_set(&s.last_peer, e->bda);
             bt_xrec_plat_log_u32("BT XREC SPP open, mtu", s.mtu);
             request_name(e->bda);
         } else {
@@ -1389,6 +1437,11 @@ static void on_spp_event(const ev_t *e)
         if (s.conn_open && e->handle == s.conn_handle) {
             s.cong = e->extra;
         }
+        break;
+    case EV_DISC_COMP:
+        s.poke_busy = 0u;
+        s.d.pokes_done++;
+        bt_xrec_plat_log_u32("BT XREC poke discovery done, status", e->status);
         break;
     default:
         break;
@@ -1745,6 +1798,7 @@ int bt_shutdown(void)
     s.scan_applied = 0u;
     s.scan_refused = s.scan_failsafe = s.scan_disc_sent = s.scan_want_sent = 0u;
     s.acl_links = 0u;
+    s.poke_busy = 0u;
     memset(s.links, 0, sizeof(s.links));
     s.cfm_ok.valid = s.auth_ok.valid = s.reject.valid = s.acl_peer.valid = s.name_asked.valid = 0u;
     free_session();
@@ -1858,6 +1912,8 @@ int bt_xrec_start(exfat_vol_t *vol, int sd_mounted)
     ops.on_dfu = xo_dfu;
     ops.get_mtu = xo_get_mtu;
     ops.now_ms = xo_now_ms;
+    ops.on_sync_state = xo_sync_state;
+    ops.on_rec_cwx = xo_rec_cwx;
     xrec_init(&b->xrec, sd_mounted ? vol : 0, &ops, 0);
     bt_xrec_plat_load_bound_key(&b->xrec);
 
@@ -2332,6 +2388,79 @@ void bt_xrec_set_bench_xrec_pin(const char *pin6)
     bt_xrec_plat_log(ok ? "BT XREC BENCH PIN ON: pairing windows use the bench PIN" : "BT XREC BENCH PIN off");
 }
 #endif
+
+void bt_xrec_get_sync_info(bt_xrec_sync_info_t *out)
+{
+    if (out == NULL) {
+        return;
+    }
+    memset(out, 0, sizeof(*out));
+    out->sync_seen = s.sync_seen;
+    out->sync_pending = s.sync_pending;
+    out->sync_eta_sec = s.sync_eta_sec;
+    out->sync_seq = s.sync_seq;
+    out->cwx_seq = s.cwx_seq;
+    out->last_cwx_state = s.last_cwx_state;
+    memcpy(out->last_cwx_name, s.last_cwx_name, sizeof(out->last_cwx_name));
+    out->poke_busy = s.poke_busy;
+    out->last_peer_valid = s.last_peer.valid;
+    memcpy(out->last_peer_bda, s.last_peer.bda, 6u);
+}
+
+int bt_xrec_has_mitm_bond(uint8_t out_bda[6])
+{
+    if (s.state != BT_XREC_ST_READY) {
+        return 0;
+    }
+    int n = esp_bt_gap_get_bond_device_num();
+    if (n <= 0) {
+        return 0;
+    }
+    esp_bd_addr_t list[8];
+    int cnt = (int)(sizeof(list) / sizeof(list[0]));
+    if (esp_bt_gap_get_bond_device_list(&cnt, list) != ESP_OK) {
+        return 0;
+    }
+    for (int i = 0; i < cnt && i < (int)(sizeof(list) / sizeof(list[0])); i++) {
+        if (bt_xrec_plat_bond_mitm(list[i])) {
+            if (out_bda != NULL) {
+                memcpy(out_bda, list[i], 6u);
+            }
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int bt_xrec_poke_bonded(const uint8_t hint_bda[6])
+{
+    if (s.state != BT_XREC_ST_READY || s.window_open || s.conn_open || s.acl_links != 0u || s.poke_busy) {
+        return -1;
+    }
+    uint8_t target[6];
+    bool found = false;
+    if (hint_bda != NULL && is_bonded(hint_bda) && bt_xrec_plat_bond_mitm(hint_bda)) {
+        memcpy(target, hint_bda, 6u);
+        found = true;
+    } else if (s.last_peer.valid && is_bonded(s.last_peer.bda) && bt_xrec_plat_bond_mitm(s.last_peer.bda)) {
+        memcpy(target, s.last_peer.bda, 6u);
+        found = true;
+    } else if (bt_xrec_has_mitm_bond(target)) {
+        found = true;
+    }
+    if (!found) {
+        return -1;
+    }
+    esp_err_t r = esp_spp_start_discovery(target);
+    if (r != ESP_OK) {
+        bt_xrec_plat_log_u32("BT XREC poke start_discovery failed", (uint32_t)r);
+        return -1;
+    }
+    s.poke_busy = 1u;
+    s.d.pokes_sent++;
+    bt_xrec_plat_log("BT XREC poke started (paging bonded phone)");
+    return 0;
+}
 
 /* The teardown job (bt_xrec_fw.c) waits for ESP_SPP_UNINIT_EVT before esp_bluedroid_disable(). */
 int bt_xrec_spp_uninit_seen(void)

@@ -93,6 +93,7 @@ void bt_bench_cfg_default(bt_bench_cfg_t *cfg)
     cfg->rec_vor = BT_BENCH_REC_KEEP;
     cfg->rec_secs = 0u;
     cfg->delay_s = 0u;
+    cfg->sync_s = 0u;
 }
 
 static int hexval(uint8_t c)
@@ -197,7 +198,7 @@ enum {
     K_HP_SPEECH_BP, K_HP_MONO, K_HP_TICK_MS, K_HP_PKT_PER_TICK, K_HP_TXQ, K_HP_CREDIT_TICKS, K_HP_TONE_HZ, K_HP_FILE,
     K_HP_CREDITS, K_HP_PIN,
     K_REC_FIRST,                             /* K_REC_FIRST.. are the recording keys (mode=rec, or rec=1) */
-    K_REC = K_REC_FIRST, K_REC_SECS, K_REC_CH, K_REC_GAIN, K_REC_DSP, K_REC_VOR, K_DELAY_S, K_N
+    K_REC = K_REC_FIRST, K_REC_SECS, K_REC_CH, K_REC_GAIN, K_REC_DSP, K_REC_VOR, K_DELAY_S, K_SYNC_S, K_N
 };
 static const char *const k_keys[K_N] = { "secs", "pair", "pair_every", "pair_secs", "autoconfirm", "exit", "reboot",
                                          "xrec_pin", "ui", "smp", "coalesce", "spp_wr", "spp_buf", "tx_ring",
@@ -205,7 +206,7 @@ static const char *const k_keys[K_N] = { "secs", "pair", "pair_every", "pair_sec
                                          "hp_secs", "hp_rate", "hp_bitpool", "hp_speech_bp", "hp_mono", "hp_tick_ms",
                                          "hp_pkt_per_tick", "hp_txq", "hp_credit_ticks", "hp_tone_hz", "hp_file",
                                          "hp_credits", "hp_pin", "rec", "rec_secs", "rec_ch", "rec_gain",
-                                         "rec_dsp", "rec_vor", "delay_s" };
+                                         "rec_dsp", "rec_vor", "delay_s", "sync_s" };
 _Static_assert(K_N <= 64, "seen is a 64-bit key mask");
 #define KBIT(k) (1ull << (k))
 #define SEEN(k) ((seen & KBIT(k)) != 0u)
@@ -322,6 +323,9 @@ static int rec_rules(uint64_t seen, const bt_bench_cfg_t *c)
         }
         return 0;
     }
+    if (SEEN(K_SYNC_S)) {
+        return -1;                                       /* sync_s is mode=rec only */
+    }
     if (!c->rec) {
         return (seen & rec_settings) != 0u ? -1 : 0;   /* recording settings without a recording */
     }
@@ -362,6 +366,10 @@ static int rec_num(uint32_t k, int32_t n, bt_bench_cfg_t *c)
     case K_REC_VOR:
         if (n != 0 && n != 1) return -1;
         c->rec_vor = (uint8_t)n;
+        return 0;
+    case K_SYNC_S:
+        if (n < 0 || n > (int32_t)BT_BENCH_DELAY_MAX) return -1;
+        c->sync_s = (uint16_t)n;
         return 0;
     default:                                             /* K_DELAY_S */
         if (n < 0 || n > (int32_t)BT_BENCH_DELAY_MAX) return -1;

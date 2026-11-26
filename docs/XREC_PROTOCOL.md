@@ -64,7 +64,7 @@ The earlier clean-room host (`src/bt_hci.c` + `src/bt_spp.c`) was deleted in pla
 
 | Command | Reply |
 | :--- | :--- |
-| `+XREC:PING` | `+XREC:PONG,openfw_v5,v5,bound=<0\|1>,auth=<0\|1>,pair=<0\|1>,rec=1` (`pair` = XREC PIN window open; then capability flags: `rec=1` = the `PUT ... REC,<stem>.cwx` sidecar target exists. Parse `key=value` fields and ignore unknown keys; firmware without the flag has no REC target) |
+| `+XREC:PING` | `+XREC:PONG,openfw_v5,v5,bound=<0\|1>,auth=<0\|1>,pair=<0\|1>,rec=1,sync=1` (`pair` = XREC PIN window open; then capability flags: `rec=1` = the `PUT ... REC,<stem>.cwx` sidecar target exists; `sync=1` = `+XREC:SYNC,<pending>[,<eta_s>]` cooperative background sync completion is supported. Parse `key=value` fields and ignore unknown keys; firmware without a flag lacks that feature) |
 | `+XREC:PAIR,<6 digits>,<64 hex>` | `+XREC:OK,PAIR`, or `ERR,PAIRCLOSED`, `ERR,PIN` (5 failures close the window), `ERR,BADKEY`, `ERR,SAVE` (key not written to the card; old binding kept) |
 | `+XREC:CHAL` | `+XREC:CHAL,<32 lowercase hex nonce>` (16 bytes). If the entropy pool is not ready: no reply and the link is closed |
 | `+XREC:AUTH,<64 hex>` | HMAC-SHA256(key, nonce bytes): `+XREC:OK,AUTH`, or `ERR,UNBOUND`, `ERR,NOCHAL` (one AUTH per CHAL), `ERR,AUTH` |
@@ -131,6 +131,12 @@ The earlier clean-room host (`src/bt_hci.c` + `src/bt_spp.c`) was deleted in pla
   `<stem>.wav` also deletes its transcript sidecar `<stem>.cwx` (as the on-device delete does): the recorder reuses
   the number of a deleted newest recording, and the new recording must not inherit the old transcript.
 * `+XREC:RECSTART` -> `+XREC:OK,RECSTART,<name>`; `+XREC:RECSTOP` -> `+XREC:OK,RECSTOP` | `ERR,NOTREC`.
+* `+XREC:SYNC,<pending 0..65535>[,<eta_sec 0..65535>]` -> `+XREC:OK,SYNC,<pending>` | `ERR,ARGS`. Cooperative background
+  sync status (`sync=1` in `PONG`): sent by the phone at the end of a sync pass. `pending` counts recordings still
+  awaiting download, on-phone transcription/diarization, or `.cwx` upload. When `pending == 0` and the client closes
+  SPP, a background sync session on the recorder clears its `sync_pending` flag and shuts down Bluetooth within ~1.5 s
+  (and powers off automatically if the idle auto-off timer has elapsed); when `pending > 0`, the recorder stays
+  connectable in low-power page scan so the phone can reconnect as soon as transcription finishes and push the `.cwx`.
 * `REBOOT`, `DFU`, `OTA`, `LOG`, `RUN`, `DSP` / `GAIN` / `CH` / `VOR`: maintenance and development commands, not
   needed by a sync client (see `xrec_proto.c`). Bench images only (`make BT=1 BENCH=1`): `DBG` (measurement counters)
   and `DBG,PACE[,<bytes/s>[,<budget us>]]` (read / set the GETS rate cap of 5.5 and its counters:
@@ -261,7 +267,9 @@ Reader: `open_fw/src/cwx.c`, `open_fw/include/openfw_cwx.h`. Reference encoder: 
 * **Words**: u32 start_ms, u32 end_ms, u8 speaker_idx, u8 flags (0x01 TURN_START, 0x02 LOW_CONF), u8 text_len, then
   text_len bytes of UTF-8 (the reader keeps up to 47 bytes). Words in turn order (not sorted by start). The encoder
   maps typographic quotes, dashes and ellipsis to ASCII and strips control characters; the device font covers
-  Latin-1, Latin Extended-A, Greek and Cyrillic.
+  Latin-1, Latin Extended-A, Greek and Cyrillic. A recording with no detected speech is represented by a valid `CWX1`
+  sidecar with `word_count = 0` (`speaker_count = 0`, seek entries `{0, 0}`): its presence marks the recording as
+  already transcribed (`[T]` badge, no repeat sync) and the on-device player displays `"No speech"`.
 
 ## 8. Legacy stock-firmware patch (`fw_mod`) differences
 

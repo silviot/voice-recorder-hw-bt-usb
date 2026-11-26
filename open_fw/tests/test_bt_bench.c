@@ -597,7 +597,13 @@ static void test_parse_rec(void)
     CHECK(parse("mode=rec secs=10 rec_ch=2 rec_gain=0 rec_dsp=0 rec_vor=1 delay_s=600 reboot=1 exit=auto", &c, NULL) ==
           BT_BENCH_OK && c.rec_ch == 2u && c.rec_gain == 0u && c.rec_dsp == 0u && c.rec_vor == 1u &&
           c.delay_s == 600u && c.reboot == 1u, "mode=rec range ends, reboot, exit");
-    CHECK(parse("mode=rec delay_s=0", &c, NULL) == BT_BENCH_OK && c.delay_s == 0u, "delay_s=0");
+    CHECK(parse("mode=rec delay_s=0", &c, NULL) == BT_BENCH_OK && c.delay_s == 0u && c.sync_s == 0u, "delay_s=0");
+    CHECK(parse("mode=rec secs=10 delay_s=2 sync_s=120", &c, NULL) == BT_BENCH_OK && c.sync_s == 120u,
+          "mode=rec sync_s=120");
+    CHECK(parse("mode=rec sync_s=600", &c, NULL) == BT_BENCH_OK && c.sync_s == 600u, "mode=rec sync_s max");
+    CHECK(parse("mode=rec sync_s=601", &c, NULL) == BT_BENCH_E_VALUE, "mode=rec sync_s > 600");
+    CHECK(parse("sync_s=60", &c, NULL) == BT_BENCH_E_CONFLICT, "sync_s without mode=rec");
+    CHECK(parse("rec=1 sync_s=60", &c, NULL) == BT_BENCH_E_CONFLICT, "sync_s with mode=phone rec=1");
     /* phone mode with rec=1 */
     CHECK(parse("secs=150 rec=1 rec_secs=75 delay_s=10 rec_gain=31 rec_dsp=2 rec_vor=0", &c, &at) == BT_BENCH_OK,
           "phone rec example (at %u)", at);

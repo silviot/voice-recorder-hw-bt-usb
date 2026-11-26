@@ -42,6 +42,9 @@ static exfat_vol_t *s_vol;
 static int s_sd;
 static uint8_t s_rec_run;        /* this run records */
 static uint8_t s_home;           /* mode=rec: the home loop drives the recording, not ended yet */
+static uint8_t s_home_rec_done;  /* mode=rec with sync_s: recording stopped, waiting on background sync */
+static uint8_t s_home_bg_seen;   /* mode=rec with sync_s: background sync was seen active */
+static uint32_t s_home_sync_t0;  /* mode=rec with sync_s: when the post-recording sync wait began */
 static uint8_t s_cfg_held;       /* the request's rec_* settings are applied; s_user_* restore them */
 static uint8_t s_rec_ours;       /* phone mode: this run's recorder_start() succeeded (the recording is the run's) */
 static uint8_t s_user_ch, s_user_gain, s_user_dsp, s_user_vor;
@@ -791,10 +794,35 @@ void bt_bench_rec_apply(void)
     }
 }
 
+int bt_bench_home_bg_allowed(void)
+{
+    return s_home && s_home_rec_done && s_cfg.sync_s != 0u;
+}
+
 /* mode=rec, every home-loop pass before the REC switch is read. */
-int bt_bench_home_tick(uint32_t now_ms, int saving)
+int bt_bench_home_tick(uint32_t now_ms, int saving, int bg_active)
 {
     if (!s_home) {
+        return 0;
+    }
+    if (s_home_rec_done) {
+        if (bg_active) {
+            s_home_bg_seen = 1u;
+        }
+        uint32_t el_ms = now_ms - s_home_sync_t0;
+        int done = (s_home_bg_seen && !bg_active) || el_ms >= (uint32_t)s_cfg.sync_s * 1000u ||
+                   (!s_home_bg_seen && el_ms >= 5000u);
+        if (done) {
+            lbegin("bgsync");
+            lks("st", (s_home_bg_seen && !bg_active) ? "done" : (s_home_bg_seen ? "timeout" : "not_started"));
+            lku("ms", el_ms);
+            lemit();
+            s_home = 0u;
+            s_home_rec_done = 0u;
+            drain();
+            return BT_BENCH_HOME_DONE;
+        }
+        drain();
         return 0;
     }
     uint32_t a = bt_bench_rec_tick(&s_rec, now_ms, saving);
@@ -821,8 +849,18 @@ int bt_bench_home_tick(uint32_t now_ms, int saving)
         lku("t", (now_ms - s_run.t0) / 1000u);
         lemit();
         rec_cfg_restore();
-        s_home = 0u;
-        r = BT_BENCH_HOME_DONE;
+        if (s_cfg.sync_s != 0u) {
+            s_home_rec_done = 1u;
+            s_home_bg_seen = (uint8_t)(bg_active != 0);
+            s_home_sync_t0 = now_ms;
+            lbegin("bgsync");
+            lks("st", "wait");
+            lku("sync_s", s_cfg.sync_s);
+            lemit();
+        } else {
+            s_home = 0u;
+            r = BT_BENCH_HOME_DONE;
+        }
     }
     drain();
     return r;

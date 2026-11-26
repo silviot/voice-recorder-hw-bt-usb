@@ -169,6 +169,7 @@ typedef struct {
     uint8_t  rec_ch, rec_gain, rec_dsp, rec_vor;   /* BT_BENCH_REC_KEEP = the current setting */
     uint16_t rec_secs;      /* rec=1: recording length, 0 = until the run ends */
     uint16_t delay_s;       /* pre-roll before the recording starts */
+    uint16_t sync_s;        /* mode=rec: wait up to sync_s after recording for background phone sync (0 = no BT) */
 } bt_bench_cfg_t;
 
 typedef enum {
@@ -322,7 +323,8 @@ void bt_bench_hp_finish(uint8_t out_mode);              /* tone off, the user's 
  * is over and stopped: call bt_bench_end() (BTBENCH.LOG; reboot=1), then let USB disk mode come back. */
 #define BT_BENCH_HOME_HOLD 0x1
 #define BT_BENCH_HOME_DONE 0x2
-int  bt_bench_home_tick(uint32_t now_ms, int saving);
+int  bt_bench_home_tick(uint32_t now_ms, int saving, int bg_active);
+int  bt_bench_home_bg_allowed(void);
 /* REC-switch path (mode=rec), right after apply_cfg_to_recorder(): the run's rec_* settings (no-op otherwise). */
 void bt_bench_rec_apply(void);
 /* rec_* settings applied (phone mode: skip the settings sync, they must not be saved). */

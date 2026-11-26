@@ -333,7 +333,9 @@ static int m_cfm_calls, m_cfm_accept = -1, m_pin_calls, m_pin_accept = -1, m_pas
 static uint8_t m_cfm_bda[6];
 static int m_name_calls;
 static uint8_t m_name_bda[6];
-static int m_remove_calls, m_disc_calls;
+static int m_remove_calls, m_disc_calls, m_poke_calls;
+static uint8_t m_poke_bda[6];
+static esp_err_t m_poke_ret = ESP_OK;
 static uint32_t m_disc_handle;
 static esp_err_t m_spp_init_ret = ESP_OK, m_srv_ret = ESP_OK;
 static uint8_t m_bonds[8][6];
@@ -452,6 +454,12 @@ esp_err_t esp_spp_disconnect(uint32_t handle)
     m_disc_calls++;
     m_disc_handle = handle;
     return ESP_OK;
+}
+esp_err_t esp_spp_start_discovery(esp_bd_addr_t bd_addr)
+{
+    m_poke_calls++;
+    memcpy(m_poke_bda, bd_addr, 6u);
+    return m_poke_ret;
 }
 
 /* esp_spp_write model (ESP_SPP_MODE_CB, vendored btc_spp.c): BTC copies into a ring of m_btc_cap bytes; a write that
@@ -705,9 +713,11 @@ static void mocks_reset(void)
     m_ctrl_name_ok = 0;
     m_last_log[0] = '\0';
     m_cfm_logged = 0xFFFFFFFFu;
-    m_cfm_calls = m_pin_calls = m_passkey_calls = m_remove_calls = m_disc_calls = 0;
+    m_cfm_calls = m_pin_calls = m_passkey_calls = m_remove_calls = m_disc_calls = m_poke_calls = 0;
     m_cfm_accept = m_pin_accept = m_passkey_accept = -1;
     memset(m_cfm_bda, 0, sizeof(m_cfm_bda));
+    memset(m_poke_bda, 0, sizeof(m_poke_bda));
+    m_poke_ret = ESP_OK;
     m_name_calls = 0;
     memset(m_name_bda, 0, sizeof(m_name_bda));
     m_disc_handle = 0u;
@@ -885,7 +895,8 @@ static void t_pairing_and_data(void)
     uint32_t rx0 = status().rx_acl_pkts;
     rx(H1, "+XREC:PING\r\n");
     CHECK(wire_has("+XREC:PONG,openfw_v5,v5,bound=0,auth=0,pair=1"), "PONG on the wire");
-    CHECK(wire_has("+XREC:PONG,openfw_v5,v5,bound=0,auth=0,pair=1,rec=1\r\n"), "PONG advertises the REC sidecar target");
+    CHECK(wire_has("+XREC:PONG,openfw_v5,v5,bound=0,auth=0,pair=1,rec=1,sync=1\r\n"),
+          "PONG advertises REC and SYNC capabilities");
     CHECK(status().rx_acl_pkts == rx0 + 1u && status().tx_acl_pkts >= 1u, "activity counters");
     wire_clear();
     char cmd[128];
@@ -2698,6 +2709,116 @@ static void t_coalesce(void)
 #endif
 }
 
+static void t_sync_poke_and_key_refresh(void)
+{
+    printf("[28] 0x06 link-key rotation (MITM kept, non-MITM purged), doorbell poke, +XREC:SYNC, CWX sidecar state\n");
+    mocks_reset();
+    m_vol = g_have_vol ? &g_vol : NULL;
+    add_bond(PEER);
+    bring_up();
+
+    /* 1. Outbound doorbell poke (bt_xrec_poke_bonded -> esp_spp_start_discovery + ESP_SPP_DISCOVERY_COMP_EVT) */
+    bt_xrec_sync_info_t si;
+    CHECK(bt_xrec_has_mitm_bond(NULL) == 1, "MITM bond detected");
+    CHECK(bt_xrec_poke_bonded(NULL) == 0 && m_poke_calls == 1 && memcmp(m_poke_bda, PEER, 6u) == 0,
+          "poke started for PEER");
+    bt_xrec_get_sync_info(&si);
+    CHECK(si.poke_busy == 1u && dbg().pokes_sent == 1u && dbg().pokes_done == 0u, "poke_busy while discovery runs");
+    CHECK(bt_xrec_poke_bonded(NULL) == -1 && m_poke_calls == 1, "second poke refused while busy");
+    esp_spp_cb_param_t sp;
+    memset(&sp, 0, sizeof(sp));
+    sp.disc_comp.status = ESP_SPP_SUCCESS;
+    spp_evt(ESP_SPP_DISCOVERY_COMP_EVT, &sp);
+    bt_xrec_poll();
+    bt_xrec_get_sync_info(&si);
+    CHECK(si.poke_busy == 0u && dbg().pokes_done == 1u, "poke_busy cleared on DISCOVERY_COMP");
+
+    /* Refused while pairing window is open */
+    bt_xrec_open_pairing(60000u);
+    CHECK(bt_xrec_poke_bonded(NULL) == -1 && m_poke_calls == 1, "poke refused while pairing window open");
+    m_now += 60001u;
+    bt_xrec_poll();
+
+    /* 2. Patch 0048: ESP_BT_LINK_KEY_CHG_COMB (0x06) kept on MITM bond, purged on non-MITM/unbonded peer */
+    auth_cmpl(PEER, ESP_BT_STATUS_SUCCESS, ESP_BT_LINK_KEY_CHG_COMB);
+    bt_xrec_poll();
+    CHECK(dbg().lk_refreshed == 1u && m_remove_calls == 0 && m_purges == 0,
+          "0x06 rotation on MITM bond kept (lk_refreshed %u, removes %d)", dbg().lk_refreshed, m_remove_calls);
+    auth_cmpl(PEER2, ESP_BT_STATUS_SUCCESS, ESP_BT_LINK_KEY_CHG_COMB);
+    bt_xrec_poll();
+    CHECK(m_remove_calls == 1 && m_purges == 1, "0x06 without MITM bond purged (removes %d, purges %d)",
+          m_remove_calls, m_purges);
+
+    /* 3. +XREC:SYNC,<pending>[,<eta_sec>] and 0-word vs >0-word CWX1 upload state */
+    pair_and_auth();
+    btc_drain(H1, m_btc_used, 1000u);
+    bt_xrec_poll();
+    wire_clear();
+    CHECK(bt_xrec_poke_bonded(NULL) == -1, "poke refused while SPP link is open");
+
+    rx(H1, "+XREC:SYNC,2,45\r\n");
+    CHECK(wire_has("+XREC:OK,SYNC,2\r\n"), "SYNC,2,45 acknowledged");
+    bt_xrec_get_sync_info(&si);
+    CHECK(si.sync_seen == 1u && si.sync_pending == 2u && si.sync_eta_sec == 45u && si.sync_seq == 1u,
+          "sync_info updated (seen %u pending %u eta %u seq %u)", si.sync_seen, si.sync_pending, si.sync_eta_sec,
+          (unsigned)si.sync_seq);
+    wire_clear();
+    rx(H1, "+XREC:SYNC,0\r\n");
+    CHECK(wire_has("+XREC:OK,SYNC,0\r\n"), "SYNC,0 acknowledged");
+    bt_xrec_get_sync_info(&si);
+    CHECK(si.sync_seen == 1u && si.sync_pending == 0u && si.sync_eta_sec == 0u && si.sync_seq == 2u,
+          "sync_info idle (pending %u seq %u)", si.sync_pending, (unsigned)si.sync_seq);
+
+    if (g_have_vol) {
+        uint8_t cwx[64];
+        memset(cwx, 0, sizeof(cwx));
+        memcpy(cwx, "CWX1", 4u);
+        cwx[4] = 1u;   /* version = 1 */
+        cwx[16] = 64u; /* speakers_off = 64 */
+        cwx[20] = 64u; /* seek_off = 64 */
+        cwx[28] = 64u; /* words_off = 64 */
+        /* 0-word ("No speech") CWX1: word_count = 0 -> last_cwx_state == 2 */
+        char hdr[96];
+        wire_clear();
+        snprintf(hdr, sizeof(hdr), "+XREC:PUT,0,64,%u,REC,CO.cwx:", (unsigned)openfw_crc16_ccitt_false(cwx, 64u));
+        rx_raw(H1, hdr, strlen(hdr));
+        rx_raw(H1, cwx, 64u);
+        bt_xrec_poll();
+        CHECK(wire_has("+XREC:OK,PUT,0,64\r\n"), "0-word CWX1 chunk staged");
+        wire_clear();
+        rx(H1, "+XREC:PUTEND\r\n");
+        CHECK(wire_has("+XREC:OK,PUTEND,64\r\n"), "0-word CWX1 committed");
+        bt_xrec_get_sync_info(&si);
+        CHECK(si.cwx_seq == 1u && si.last_cwx_state == 2u && strcmp(si.last_cwx_name, "CO.cwx") == 0,
+              "0-word CWX1 -> state 2 (seq %u state %u name '%s')", (unsigned)si.cwx_seq, si.last_cwx_state,
+              si.last_cwx_name);
+
+        /* >0-word CWX1: word_count = 3 -> last_cwx_state == 1 */
+        cwx[12] = 3u;
+        wire_clear();
+        snprintf(hdr, sizeof(hdr), "+XREC:PUT,0,64,%u,REC,CO.cwx:", (unsigned)openfw_crc16_ccitt_false(cwx, 64u));
+        rx_raw(H1, hdr, strlen(hdr));
+        rx_raw(H1, cwx, 64u);
+        bt_xrec_poll();
+        wire_clear();
+        rx(H1, "+XREC:PUTEND\r\n");
+        CHECK(wire_has("+XREC:OK,PUTEND,64\r\n"), ">0-word CWX1 committed");
+        bt_xrec_get_sync_info(&si);
+        CHECK(si.cwx_seq == 2u && si.last_cwx_state == 1u && strcmp(si.last_cwx_name, "CO.cwx") == 0,
+              ">0-word CWX1 -> state 1 (seq %u state %u)", (unsigned)si.cwx_seq, si.last_cwx_state);
+    }
+
+    /* Unauthenticated SYNC on a fresh session is rejected */
+    spp_close(H1);
+    bt_xrec_poll();
+    btc_drain(H1, m_btc_used, 1000u);
+    wire_clear();
+    srv_open(H2, PEER);
+    rx(H2, "+XREC:SYNC,0\r\n");
+    CHECK(wire_has("+XREC:ERR,LOCKED\r\n"), "unauthenticated SYNC rejected with ERR,LOCKED");
+    stop_ok();
+}
+
 int main(int argc, char **argv)
 {
     for (int i = 1; i < argc; i++) {
@@ -2745,6 +2866,7 @@ int main(int argc, char **argv)
 #endif
     t_coalesce();
     t_ui_sig();
+    t_sync_poke_and_key_refresh();
     bt_xrec_test_reset();
     printf("test_bt_xrec (%s build): %d checks, %d failures\n", TB_BENCH ? "bench" : "release", g_checks, g_fails);
     return g_fails == 0 ? 0 : 1;

@@ -138,6 +138,80 @@ static enum screen_sleep_state g_screen_off = SCREEN_AWAKE;
 static uint32_t         g_toast_until_ms   = 0u;
 static int              g_cpu1_booted      = 0;
 
+#if OPENFW_BT_HP
+static bt_phone_cfg_t   g_phone_cfg;
+static uint8_t          g_phone_cfg_dirty;
+static uint8_t          g_poweroff_after_sync;
+static struct {
+    uint8_t  active;
+    uint8_t  requested;
+    uint8_t  ever_connected;
+    uint8_t  was_spp_open;
+    uint8_t  pokes;
+    uint8_t  suppress_until_rec;
+    uint32_t start_ms;
+    uint32_t ready_ms;
+    uint32_t poke_ms;
+    uint32_t last_conn_ms;
+    uint32_t last_disc_ms;
+    uint32_t seen_cwx_seq;
+} g_bt_bg;
+
+static int bt_bg_busy_for_poweroff(uint32_t now_ms)
+{
+    if (!g_bt_bg.active) {
+        return 0;
+    }
+    bt_status_t st;
+    bt_xrec_sync_info_t si;
+    bt_xrec_get_status(&st);
+    bt_xrec_get_sync_info(&si);
+    if (st.spp_open || st.xfer_active || si.poke_busy) {
+        return 1;
+    }
+    if (si.sync_seen && si.sync_pending > 0u) {
+        return 1;
+    }
+    return (uint32_t)(now_ms - g_bt_bg.start_ms) < 12000u ? 1 : 0;
+}
+#endif
+
+static void perform_clean_poweroff(ui_screen_id_t screen)
+{
+    lcd_shutdown();
+#if OPENFW_BT_HP
+    g_bt_bg.active      = 0u;
+    g_bt_bg.requested   = 0u;
+    g_ui.bt_bg_syncing  = 0u;
+    if (screen == UI_SCR_PLAYER) {
+        aout_stop();                        /* the headset route too (design §3.1 R-14) */
+    }
+    (void)bt_shutdown();                    /* phone or headphones mode, whichever runs (design §6.7) */
+#endif
+    if (screen == UI_SCR_USB) {
+        usb_msc_stop();
+#if OPENFW_BT_PHONE
+    } else if (screen == UI_SCR_BT) {
+        bt_xrec_stop();
+#endif
+    } else if (screen == UI_SCR_PLAYER) {
+        audio_dac_stop();
+        /* last_file is the track being played (set before playback starts) */
+        g_ui.last_file.resume_sec = (g_ui.play_state == 2u) ? 0u : g_ui.play_pos_sec;
+    }
+    (void)recorder_stop();
+    apm_power_off((int)screen);
+    if (screen == UI_SCR_SETTINGS || screen == UI_SCR_PLAYER
+#if OPENFW_BT_HP
+        || g_phone_cfg_dirty
+#endif
+       ) {
+        save_persisted_state();
+    }
+    (void)sd_flush(&g_sd_card);
+    pmu_soft_poweroff();
+}
+
 static void clear_boot_strikes_once(void)
 {
     if (!g_boot_strikes_cleared) {
@@ -251,6 +325,8 @@ static void backlight_service(void)
     }
 }
 
+static void copy_cstr(char *dst, int cap, const char *src);
+
 int ui_poll_power_button(ui_screen_id_t screen, ui_model_t *model, uint32_t now)
 {
     /* USB and audio service loops can run many times in a millisecond.
@@ -292,31 +368,21 @@ int ui_poll_power_button(ui_screen_id_t screen, ui_model_t *model, uint32_t now)
             }
             break;
         case POWER_BUTTON_SHUTDOWN:
-            lcd_shutdown();
 #if OPENFW_BT_HP
-            if (screen == UI_SCR_PLAYER) {
-                aout_stop();                        /* the headset route too (design §3.1 R-14) */
+            if (!g_poweroff_after_sync && bt_bg_busy_for_poweroff(now)) {
+                g_poweroff_after_sync = 1u;
+                openfw_log_puts("Power-off deferred until background sync finishes (hold again to force)\n");
+                backlight_wake(now);
+                copy_cstr(model->toast_msg, (int)sizeof(model->toast_msg), ui_tr_bt(UI_BT_STR_SYNC_DEFER_OFF));
+                model->toast_col = UI_COL_CYAN;
+                g_toast_until_ms = now + 4000u;
+                g_ui_screen      = screen;
+                ui_render_screen(screen, model);
+                break;
             }
-            (void)bt_shutdown();                    /* phone or headphones mode, whichever runs (design §6.7) */
 #endif
-            if (screen == UI_SCR_USB) {
-                usb_msc_stop();
-#if OPENFW_BT_PHONE
-            } else if (screen == UI_SCR_BT) {
-                bt_xrec_stop();
-#endif
-            } else if (screen == UI_SCR_PLAYER) {
-                audio_dac_stop();
-                /* last_file is the track being played (set before playback starts) */
-                g_ui.last_file.resume_sec = (g_ui.play_state == 2u) ? 0u : g_ui.play_pos_sec;
-            }
-            (void)recorder_stop();
-            apm_power_off((int)screen);
-            if (screen == UI_SCR_SETTINGS || screen == UI_SCR_PLAYER) {
-                save_persisted_state();
-            }
-            (void)sd_flush(&g_sd_card);
-            pmu_soft_poweroff();
+            perform_clean_poweroff(screen);
+            break;
         case POWER_BUTTON_IDLE:
             break;
         }
@@ -577,6 +643,13 @@ static void save_persisted_state(void)
                           g_ui.has_last ? g_ui.last_file.filename : "",
                           g_ui.has_last ? g_ui.last_file.resume_sec : 0u,
                           g_ui.has_last);
+#if OPENFW_BT_HP
+    if (g_phone_cfg_dirty) {
+        if (bt_phone_cfg_save(&g_phone_cfg) == 0) {
+            g_phone_cfg_dirty = 0u;
+        }
+    }
+#endif
 }
 
 static rtc_datetime_t file_datetime(const exfat_entry_t *entry)
@@ -1270,7 +1343,10 @@ static int main_usb_audio_cfg_cb(int set, uint8_t cfg[4], int16_t *rms_x10, uint
 static int run_usb_msc_mode(int auto_mode)
 {
 #if OPENFW_BT_HP
-    (void)bt_shutdown();      /* headphones mode must not flush bt_hp_bonds.bin while the host owns the card (§6.7) */
+    g_bt_bg.active     = 0u;
+    g_bt_bg.requested  = 0u;
+    g_ui.bt_bg_syncing = 0u;
+    (void)bt_shutdown();      /* headphones/phone mode must not flush bonds while the host owns the card (§6.7) */
 #endif
     keys_flush_events();
     g_ui_screen        = UI_SCR_USB;
@@ -1550,6 +1626,12 @@ static uint8_t bt_xfer_pct(uint32_t done, uint32_t total)
 
 static void run_bt_xrec_mode(void)
 {
+#if OPENFW_BT_HP
+    /* Adopt an already-running background phone session seamlessly if one is up; run_bt_xrec_mode stops it on exit. */
+    g_bt_bg.active     = 0u;
+    g_bt_bg.requested  = 0u;
+    g_ui.bt_bg_syncing = 0u;
+#endif
     g_ui_screen   = UI_SCR_BT;
     g_ui.bt_state = 0u;
     g_ui.bt_xfer_name[0] = '\0';
@@ -1811,7 +1893,30 @@ static void run_bt_xrec_mode(void)
     if (recorder_is_saving()) {
         (void)recorder_stop();
     }
-    if (cfg_save_deferred) {
+#if OPENFW_BT_HP
+    {
+        bt_xrec_sync_info_t si;
+        bt_xrec_get_sync_info(&si);
+        if (si.last_peer_valid &&
+            (!g_phone_cfg.phone_valid ||
+             __builtin_memcmp(g_phone_cfg.phone_bda, si.last_peer_bda, 6u) != 0)) {
+            g_phone_cfg.phone_valid = 1u;
+            for (int i = 0; i < 6; i++) {
+                g_phone_cfg.phone_bda[i] = si.last_peer_bda[i];
+            }
+            g_phone_cfg_dirty = 1u;
+        }
+        if (si.sync_seen && si.sync_pending == 0u && g_phone_cfg.sync_pending) {
+            g_phone_cfg.sync_pending = 0u;
+            g_phone_cfg_dirty        = 1u;
+        }
+    }
+#endif
+    if (cfg_save_deferred
+#if OPENFW_BT_HP
+        || g_phone_cfg_dirty
+#endif
+       ) {
         save_persisted_state();                 /* settings an XREC command changed during the recording */
     }
     bt_xrec_stop();
@@ -2080,6 +2185,12 @@ static int hp_start_session(void)
     }
     if (bt_lowbatt_refuse_now(millis())) {
         return -1;
+    }
+    if (g_bt_bg.active) {
+        g_bt_bg.active     = 0u;
+        g_bt_bg.requested  = 0u;
+        g_ui.bt_bg_syncing = 0u;
+        bt_xrec_stop();
     }
     wdt_feed();
     (void)bt_rf_init_calibrated(0x53u, 32000000u);
@@ -2475,6 +2586,289 @@ static int hp_auto_connect_for_play(void)
 #define hp_auto_connect_for_play() 1
 #endif
 
+#if OPENFW_BT_HP
+/* ======================== Background phone sync & Smart auto-power-off (BT=1) ====================================
+ * Runs non-modally in the main loop (Home / Saved / Files / Settings) when Auto sync is On and a MITM-bonded,
+ * XREC-bound phone exists on SD. Pages the phone once READY (esp_spp_start_discovery doorbell poke), serves LS/GETS/
+ * PUT REC, applies incoming .cwx transcript badges live to g_files[], and shuts Bluetooth down automatically as soon
+ * as +XREC:SYNC,0 completes (or after a bounded idle window if the phone is out of range). */
+#define BT_BG_NO_CONN_MS    45000u
+#define BT_BG_POKE_RETRY_MS 18000u
+#define BT_BG_WAIT_MAX_MS   600000u
+#define BT_BG_SYNC0_DISC_MS 1200u
+#define BT_BG_SYNC0_OPEN_MS 4000u
+#define BT_BG_LEGACY_IDLE_MS 20000u
+
+static int has_untranscribed_recording(void)
+{
+    for (int i = 0; i < g_ui.file_count; i++) {
+        if (!g_files[i].is_dir && str_eq_ci(g_file_dirs[i], "/record") && !g_files[i].has_transcript) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void bt_bg_stop(const char *why)
+{
+    if (!g_bt_bg.active) {
+        return;
+    }
+    openfw_log_puts("BT bg sync stop: ");
+    openfw_log_puts(why);
+    openfw_log_putc('\n');
+    g_bt_bg.active     = 0u;
+    g_ui.bt_bg_syncing = 0u;
+    bt_xrec_stop();
+    if (g_phone_cfg_dirty && !recorder_is_saving()) {
+        save_persisted_state();
+    }
+}
+
+static void bt_bg_apply_cwx(const char *cwx_name, uint8_t tr_state, int *dirty)
+{
+    if (!cwx_name || cwx_name[0] == '\0') {
+        return;
+    }
+    char wav_name[32];
+    copy_cstr(wav_name, (int)sizeof(wav_name), cwx_name);
+    int len = 0;
+    while (wav_name[len] != '\0') {
+        len++;
+    }
+    if (len < 5 || wav_name[len - 4] != '.') {
+        return;
+    }
+    wav_name[len - 3] = 'w';
+    wav_name[len - 2] = 'a';
+    wav_name[len - 1] = 'v';
+    uint8_t badge = tr_state ? tr_state : 1u;
+    for (int i = 0; i < g_ui.file_count; i++) {
+        if (!g_files[i].is_dir && str_eq_ci(g_file_dirs[i], "/record") &&
+            str_eq_ci(g_files[i].filename, wav_name)) {
+            g_files[i].has_transcript = badge;
+            if (dirty) {
+                *dirty = 1;
+            }
+        }
+    }
+    if (g_ui.has_last && str_eq_ci(g_last_dir, "/record") &&
+        str_eq_ci(g_ui.last_file.filename, wav_name)) {
+        g_ui.last_file.has_transcript = badge;
+        if (dirty) {
+            *dirty = 1;
+        }
+    }
+}
+
+static void bt_bg_poll(uint32_t now_ms, int rec_active, int usb_busy, int bench_block_bt, int *dirty)
+{
+    if (rec_active || usb_busy || bench_block_bt || !g_phone_cfg.auto_sync) {
+        if (g_bt_bg.active) {
+            bt_bg_stop(rec_active ? "recording" : (usb_busy ? "usb" : "disabled"));
+        }
+        return;
+    }
+    if (!g_bt_bg.active) {
+        if (!g_bt_bg.requested || g_bt_bg.suppress_until_rec || !g_sd_mounted || now_ms < 2500u ||
+            bt_hp_active() || bt_lowbatt_poll(now_ms)) {
+            return;
+        }
+        if (!bt_phone_has_bond_files()) {
+            g_bt_bg.requested          = 0u;
+            g_bt_bg.suppress_until_rec = 1u;
+            return;
+        }
+        wdt_feed();
+        (void)bt_rf_init_calibrated(0x53u, 32000000u);
+        if (bt_xrec_start(&g_exfat_vol, g_sd_mounted) != 0) {
+            g_bt_bg.requested          = 0u;
+            g_bt_bg.suppress_until_rec = 1u;
+            return;
+        }
+        bt_xrec_sync_info_t si0;
+        bt_xrec_get_sync_info(&si0);
+        g_bt_bg.active         = 1u;
+        g_bt_bg.requested      = 0u;
+        g_bt_bg.ever_connected = 0u;
+        g_bt_bg.was_spp_open   = 0u;
+        g_bt_bg.pokes          = 0u;
+        g_bt_bg.start_ms       = now_ms;
+        g_bt_bg.ready_ms       = 0u;
+        g_bt_bg.poke_ms        = 0u;
+        g_bt_bg.last_conn_ms   = now_ms;
+        g_bt_bg.last_disc_ms   = now_ms;
+        g_bt_bg.seen_cwx_seq   = si0.cwx_seq;
+        g_ui.bt_bg_syncing     = 1u;
+        if (dirty) {
+            *dirty = 1;
+        }
+        openfw_log_puts("BT bg sync started\n");
+    }
+
+    bt_xrec_poll();
+    if (bt_lowbatt_poll(now_ms)) {
+        bt_bg_stop("low battery");
+        if (dirty) {
+            *dirty = 1;
+        }
+        return;
+    }
+
+    bt_status_t st;
+    bt_xrec_debug_t dbg;
+    bt_xrec_sync_info_t si;
+    bt_xrec_get_status(&st);
+    bt_xrec_get_debug(&dbg);
+    bt_xrec_get_sync_info(&si);
+
+    if (!st.active || dbg.state == BT_XREC_ST_FAULTED || dbg.state == BT_XREC_ST_DEAD) {
+        g_bt_bg.active             = 0u;
+        g_bt_bg.suppress_until_rec = 1u;
+        g_ui.bt_bg_syncing         = 0u;
+        if (dirty) {
+            *dirty = 1;
+        }
+        return;
+    }
+
+    if (si.last_peer_valid &&
+        (!g_phone_cfg.phone_valid ||
+         __builtin_memcmp(g_phone_cfg.phone_bda, si.last_peer_bda, 6u) != 0)) {
+        g_phone_cfg.phone_valid = 1u;
+        for (int i = 0; i < 6; i++) {
+            g_phone_cfg.phone_bda[i] = si.last_peer_bda[i];
+        }
+        g_phone_cfg_dirty = 1u;
+    }
+
+    if (si.cwx_seq != g_bt_bg.seen_cwx_seq) {
+        g_bt_bg.seen_cwx_seq = si.cwx_seq;
+        g_bt_bg.last_conn_ms = now_ms;
+        bt_bg_apply_cwx(si.last_cwx_name, si.last_cwx_state, dirty);
+    }
+
+    if (dbg.conns_authorized > 0u) {
+        g_bt_bg.ever_connected = 1u;
+    }
+    if (st.spp_open || st.xfer_active) {
+        g_bt_bg.last_conn_ms = now_ms;
+    }
+    if (g_bt_bg.was_spp_open && !st.spp_open) {
+        g_bt_bg.last_disc_ms = now_ms;
+    }
+    g_bt_bg.was_spp_open = st.spp_open;
+
+    if (dbg.state == BT_XREC_ST_READY && g_bt_bg.ready_ms == 0u) {
+        g_bt_bg.ready_ms = now_ms ? now_ms : 1u;
+        if (!bt_xrec_has_mitm_bond(0)) {
+            g_bt_bg.suppress_until_rec = 1u;
+            bt_bg_stop("no MITM bond");
+            if (dirty) {
+                *dirty = 1;
+            }
+            return;
+        }
+    }
+
+    /* Outbound doorbell poke: once shortly after READY, and one retry at +18 s if the phone has not connected yet. */
+    if (dbg.state == BT_XREC_ST_READY && !g_bt_bg.ever_connected && !st.spp_open &&
+        dbg.acl_links == 0u && !si.poke_busy) {
+        int due = (g_bt_bg.pokes == 0u && (uint32_t)(now_ms - g_bt_bg.ready_ms) >= 200u) ||
+                  (g_bt_bg.pokes == 1u && (uint32_t)(now_ms - g_bt_bg.poke_ms) >= BT_BG_POKE_RETRY_MS);
+        if (due) {
+            (void)bt_xrec_poke_bonded(g_phone_cfg.phone_valid ? g_phone_cfg.phone_bda : 0);
+            g_bt_bg.pokes++;
+            g_bt_bg.poke_ms = now_ms;
+        }
+    }
+
+    /* Completion & timeout rules */
+    if (si.sync_seen && si.sync_pending == 0u) {
+        if (g_phone_cfg.sync_pending) {
+            g_phone_cfg.sync_pending = 0u;
+            g_phone_cfg_dirty        = 1u;
+        }
+        if ((!st.spp_open && (uint32_t)(now_ms - g_bt_bg.last_disc_ms) >= BT_BG_SYNC0_DISC_MS) ||
+            (st.spp_open && !st.xfer_active && (uint32_t)(now_ms - g_bt_bg.last_conn_ms) >= BT_BG_SYNC0_OPEN_MS)) {
+            bt_bg_stop("sync complete (SYNC,0)");
+            if (dirty) {
+                *dirty = 1;
+            }
+            return;
+        }
+    } else if (!g_bt_bg.ever_connected) {
+        if (!st.spp_open && !si.poke_busy && (uint32_t)(now_ms - g_bt_bg.start_ms) >= BT_BG_NO_CONN_MS) {
+            g_bt_bg.suppress_until_rec = 1u;
+            bt_bg_stop("phone not in range (45 s)");
+            if (dirty) {
+                *dirty = 1;
+            }
+            return;
+        }
+    } else if (!st.spp_open) {
+        if (!si.sync_seen && (uint32_t)(now_ms - g_bt_bg.last_disc_ms) >= BT_BG_LEGACY_IDLE_MS) {
+            if (!has_untranscribed_recording() && g_phone_cfg.sync_pending) {
+                g_phone_cfg.sync_pending = 0u;
+                g_phone_cfg_dirty        = 1u;
+            }
+            bt_bg_stop("idle after legacy sync");
+            if (dirty) {
+                *dirty = 1;
+            }
+            return;
+        }
+        if ((uint32_t)(now_ms - g_bt_bg.last_conn_ms) >= BT_BG_WAIT_MAX_MS) {
+            g_bt_bg.suppress_until_rec = 1u;
+            bt_bg_stop("pending wait timeout (10 m)");
+            if (dirty) {
+                *dirty = 1;
+            }
+            return;
+        }
+    }
+}
+
+static void auto_poweroff_poll(ui_screen_id_t scr, uint32_t now_ms, int rec_active, int bench_active)
+{
+    if (g_poweroff_after_sync && !g_bt_bg.active && !rec_active) {
+        openfw_log_puts("Deferred power-off: background sync finished\n");
+        perform_clean_poweroff(scr);
+    }
+#if !OPENFW_UNATTENDED_DEV
+    static const uint32_t k_auto_off_ms[4] = { 0u, 120000u, 300000u, 900000u };
+    uint8_t idx = g_phone_cfg.auto_off_idx <= 3u ? g_phone_cfg.auto_off_idx : 2u;
+    uint32_t limit_ms = k_auto_off_ms[idx];
+    if (limit_ms == 0u || bench_active || rec_active || recorder_is_saving() ||
+        keys_read_rec_switch() || vbus_present_cached(now_ms) || g_bt_bg.active) {
+        return;
+    }
+    if (bt_hp_active()) {
+        bt_hp_ui_t hu;
+        bt_hp_get_ui(&hu);
+        if (hu.scanning || hu.pairing || hu.link == BT_HP_LINK_CONNECTING ||
+            hu.link == BT_HP_LINK_OPEN || hu.link == BT_HP_LINK_STARTED) {
+            return;
+        }
+    }
+    uint32_t last = g_last_activity_ms;
+    uint32_t key_ms;
+    if (keys_last_activity(&key_ms) && (int32_t)(key_ms - last) > 0) {
+        last = key_ms;
+    }
+    if ((uint32_t)(now_ms - last) >= limit_ms) {
+        openfw_log_puts("Auto power-off: idle timeout reached\n");
+        perform_clean_poweroff(scr);
+    }
+#else
+    (void)scr;
+    (void)now_ms;
+    (void)rec_active;
+    (void)bench_active;
+#endif
+}
+#endif
+
 static void play_boot_animation(void)
 {
     /*
@@ -2569,6 +2963,20 @@ static void adjust_setting(int idx, int delta, uint32_t now_ms)
         g_ui.bt_out_mode = (uint8_t)((g_ui.bt_out_mode + (delta > 0 ? 1u : 2u)) % 3u);
         bt_hp_set_out_mode(g_ui.bt_out_mode);
         aout_set_mode((aout_mode_t)g_ui.bt_out_mode);
+        break;
+    case UI_SET_ROW_AUTO_SYNC:
+        g_phone_cfg.auto_sync ^= 1u;
+        g_ui.bt_auto_sync = g_phone_cfg.auto_sync;
+        g_phone_cfg_dirty = 1u;
+        if (g_phone_cfg.auto_sync && (g_phone_cfg.sync_pending || has_untranscribed_recording())) {
+            g_bt_bg.suppress_until_rec = 0u;
+            g_bt_bg.requested          = 1u;
+        }
+        break;
+    case UI_SET_ROW_AUTO_OFF:
+        g_phone_cfg.auto_off_idx = (uint8_t)((g_phone_cfg.auto_off_idx + (delta > 0 ? 1u : 3u)) % 4u);
+        g_ui.bt_auto_off = g_phone_cfg.auto_off_idx;
+        g_phone_cfg_dirty = 1u;
         break;
 #endif
     default:
@@ -2714,6 +3122,11 @@ static void apm_power_off(int screen)
 
 static void play_file_at_index(int start_idx)
 {
+#if OPENFW_BT_HP
+    if (g_bt_bg.active) {
+        bt_bg_stop("entering player");
+    }
+#endif
     if (!hp_auto_connect_for_play()) {
         return;
     }
@@ -2813,6 +3226,11 @@ static void play_named_file(const char *dir, ui_file_entry_t *entry)
     if (!hp_auto_connect_for_play()) {
         return;
     }
+#if OPENFW_BT_HP
+    if (g_bt_bg.active) {
+        bt_bg_stop("entering player");
+    }
+#endif
     g_ui_screen        = UI_SCR_PLAYER;
     g_ui.play_file     = *entry;
     g_ui.play_has_prev = 0u;
@@ -3046,6 +3464,12 @@ int openfw_main(void)
     bt_hp_set_boot_volume(&g_exfat_vol, &g_sd_mounted);
     g_ui.bt_out_mode = bt_hp_out_mode();                   /* SD:/bt_hp_cfg.bin (not settings.bin, design §6.6) */
     aout_set_mode((aout_mode_t)g_ui.bt_out_mode);
+    (void)bt_phone_cfg_load(&g_phone_cfg);
+    g_ui.bt_auto_sync = g_phone_cfg.auto_sync;
+    g_ui.bt_auto_off  = g_phone_cfg.auto_off_idx;
+    if (g_phone_cfg.auto_sync && (g_phone_cfg.sync_pending || has_untranscribed_recording())) {
+        g_bt_bg.requested = 1u;
+    }
 #endif
     openfw_log_puts("BOOT_US LCDB=");
     openfw_log_u32(lcd_b_us);
@@ -3194,12 +3618,21 @@ int openfw_main(void)
 #if OPENFW_BT_BENCH
         if (bench_home) {
             /* BTBENCH.RUN mode=rec: the switch is held on for the run's recording (the same path as the slide) */
-            int ba = bt_bench_home_tick(now_ms, recorder_is_saving());
+            int bg_on = 0;
+#if OPENFW_BT_HP
+            bg_on = g_bt_bg.active;
+#endif
+            int ba = bt_bench_home_tick(now_ms, recorder_is_saving(), bg_on);
             if (ba & BT_BENCH_HOME_HOLD) {
                 rec_sw = 1;
             }
             if (ba & BT_BENCH_HOME_DONE) {
                 bench_home = 0;
+#if OPENFW_BT_HP
+                if (g_bt_bg.active) {
+                    bt_bg_stop("bench done");
+                }
+#endif
                 if (bt_bench_end(&g_exfat_vol, g_sd_mounted)) {
                     (void)sd_flush(&g_sd_card);
                     system_reboot();
@@ -3217,6 +3650,10 @@ int openfw_main(void)
             enter_long_fired = 0;
             if (rec_sw) {
 #if OPENFW_BT_HP
+                g_poweroff_after_sync = 0u;
+                if (g_bt_bg.active) {
+                    bt_bg_stop("recording started");
+                }
                 bt_hp_suspend();       /* design §6.9: keep the link, stop sending while recording */
 #endif
                 if (scr != UI_SCR_REC && scr != UI_SCR_SAVED) {
@@ -3293,6 +3730,12 @@ int openfw_main(void)
                     g_ui.saved_frac_pct = 100u;
                     g_ui.saved_dt       = g_files[0].dt;
                     copy_cstr(g_ui.saved_filename, (int)sizeof(g_ui.saved_filename), saved_name);
+#if OPENFW_BT_HP
+                    g_phone_cfg.sync_pending   = 1u;
+                    g_phone_cfg_dirty          = 1u;
+                    g_bt_bg.suppress_until_rec = 0u;
+                    g_bt_bg.requested          = 1u;
+#endif
                     save_persisted_state();
                     saved_start_ms = now_ms;
                     scr            = UI_SCR_SAVED;
@@ -3452,12 +3895,33 @@ int openfw_main(void)
             if (enter_usb_auto) {
                 int manual = run_usb_msc_mode(1);
                 usb_suppress_until_unpl = (manual && pmu_is_vbus_present()) ? 1 : 0;
+#if OPENFW_BT_HP
+                if (g_phone_cfg.auto_sync && (g_phone_cfg.sync_pending || has_untranscribed_recording())) {
+                    g_bt_bg.suppress_until_rec = 0u;
+                    g_bt_bg.requested          = 1u;
+                }
+#endif
                 g_ui_screen = (uint32_t)scr;
                 prev_key    = KEY_NONE;
                 dirty       = 1;
                 continue;
             }
         }
+
+#if OPENFW_BT_HP
+        {
+            int bench_block_bt = 0;
+#if OPENFW_BT_BENCH
+            bench_block_bt = bench_home && !bt_bench_home_bg_allowed();
+#endif
+            bt_bg_poll(now_ms, rec_active, usb_probing, bench_block_bt, &dirty);
+            int bench_active = 0;
+#if OPENFW_BT_BENCH
+            bench_active = bench_home;
+#endif
+            auto_poweroff_poll(scr, now_ms, rec_active, bench_active);
+        }
+#endif
 
         /* 4. Key input handling (drain queued debounced edges, then final state pass for holds) */
         for (;;) {

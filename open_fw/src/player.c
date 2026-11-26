@@ -821,8 +821,10 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
         exfat_find_path(vol, cwx_path, &cwx_ent) == 0 && !cwx_ent.is_dir &&
         cwx_ent.size <= 0xFFFFFFFFu &&
         cwx_open(&cwx, exfat_cwx_read_cb, &cwx_io, (uint32_t)cwx_ent.size) == 0) {
-        has_cwx = 1;
-        cwx_tr_pager_init(&g_tr_pager, &cwx, CWX_TR_MAX_LINE_W);
+        has_cwx = (cwx.word_count == 0u) ? 2 : 1;
+        if (has_cwx == 1) {
+            cwx_tr_pager_init(&g_tr_pager, &cwx, CWX_TR_MAX_LINE_W);
+        }
     }
 
     int hp_in = keys_read_hp_detect();
@@ -1366,7 +1368,7 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
         /* Fast zero-I/O transcript word tracking (~33 Hz from RAM pager cache) */
         int tr_populated = 0;
         uint32_t tr_pos_ms = 0u;
-        if (has_cwx && !ui_dirty && (uint32_t)(now - last_tr_poll_ms) >= 30u) {
+        if (has_cwx == 1 && !ui_dirty && (uint32_t)(now - last_tr_poll_ms) >= 30u) {
             last_tr_poll_ms = now;
             uint32_t heard = eof_reached ? played_frames : player_heard_frames(played_frames, skip_frames);
             if (scrub.speed) heard = scrub_heard(&scrub, winfo.total_samples);
@@ -1416,7 +1418,7 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
             m->play_vu_l        = (paused || eof_reached || scrub.speed) ? 0u : peak_l_pct;
             m->play_vu_r        = (paused || eof_reached || scrub.speed) ? 0u : peak_r_pct;
 
-            if (has_cwx && !tr_populated) {
+            if (has_cwx == 1 && !tr_populated) {
                 last_tr_sig     = populate_transcript_lines(m, &g_tr_pager, pos_ms, paused && !scrub.speed);
                 last_tr_poll_ms = now;
             }

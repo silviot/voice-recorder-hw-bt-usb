@@ -23,6 +23,7 @@
 #include "sl6801_regs.h"
 #include "sl6801_rom.h"
 #include "openfw.h"
+#include "openfw_crypto.h"
 #include "openfw_exp.h"
 #include "openfw_rtos.h"
 #include "esp_err.h"
@@ -1444,4 +1445,102 @@ void bt_hp_plat_attach_sink(void *tx, void *sink, const void *link, int ring_is_
 int16_t *bt_hp_plat_borrow_dac_buf(uint32_t *bytes)
 {
     return audio_dac_borrow_buf(bytes);
+}
+
+/* ============================================ phone sync & auto-off config (SD:/bt_phone_cfg.bin) ================ */
+#define PHONE_CFG_FILE "bt_phone_cfg.bin"
+#define PHONE_CFG_TMP  ".bt_phone_cfg.tmp"
+#define PHONE_CFG_BYTES 16u
+
+void bt_phone_cfg_defaults(bt_phone_cfg_t *cfg)
+{
+    if (cfg == NULL) {
+        return;
+    }
+    memset(cfg, 0, sizeof(*cfg));
+    cfg->auto_sync = 1u;      /* automatic background sync enabled by default */
+    cfg->auto_off_idx = 2u;   /* 5 minutes idle auto-power-off by default */
+}
+
+int bt_phone_cfg_load(bt_phone_cfg_t *cfg)
+{
+    bt_phone_cfg_defaults(cfg);
+    if (cfg == NULL || s_boot_vol == NULL || s_boot_sd == NULL || !*s_boot_sd) {
+        return -1;
+    }
+    exfat_entry_t ent;
+    if (exfat_find_path(s_boot_vol, "/" PHONE_CFG_FILE, &ent) != 0 || ent.is_dir || ent.size != PHONE_CFG_BYTES) {
+        return -1;
+    }
+    uint8_t b[PHONE_CFG_BYTES];
+    uint32_t nread = 0u;
+    if (exfat_read_file(s_boot_vol, &ent, 0u, b, PHONE_CFG_BYTES, &nread) != 0 || nread != PHONE_CFG_BYTES) {
+        return -1;
+    }
+    uint32_t magic = (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+    uint16_t want_crc = openfw_crc16_ccitt_false(b, PHONE_CFG_BYTES - 2u);
+    uint16_t got_crc = (uint16_t)b[PHONE_CFG_BYTES - 2u] | ((uint16_t)b[PHONE_CFG_BYTES - 1u] << 8);
+    if (magic != BT_PHONE_CFG_MAGIC || b[4] != 1u || want_crc != got_crc) {
+        return -1;
+    }
+    cfg->auto_sync = b[5] ? 1u : 0u;
+    cfg->auto_off_idx = b[6] <= 3u ? b[6] : 2u;
+    cfg->sync_pending = b[7] ? 1u : 0u;
+    cfg->phone_valid = b[8] ? 1u : 0u;
+    memcpy(cfg->phone_bda, &b[9], 6u);
+    return 0;
+}
+
+int bt_phone_cfg_save(const bt_phone_cfg_t *cfg)
+{
+    if (cfg == NULL) {
+        return -1;
+    }
+    uint8_t b[PHONE_CFG_BYTES];
+    memset(b, 0, sizeof(b));
+    b[0] = (uint8_t)(BT_PHONE_CFG_MAGIC & 0xFFu);
+    b[1] = (uint8_t)((BT_PHONE_CFG_MAGIC >> 8) & 0xFFu);
+    b[2] = (uint8_t)((BT_PHONE_CFG_MAGIC >> 16) & 0xFFu);
+    b[3] = (uint8_t)((BT_PHONE_CFG_MAGIC >> 24) & 0xFFu);
+    b[4] = 1u; /* version */
+    b[5] = cfg->auto_sync ? 1u : 0u;
+    b[6] = cfg->auto_off_idx <= 3u ? cfg->auto_off_idx : 2u;
+    b[7] = cfg->sync_pending ? 1u : 0u;
+    b[8] = cfg->phone_valid ? 1u : 0u;
+    memcpy(&b[9], cfg->phone_bda, 6u);
+    uint16_t crc = openfw_crc16_ccitt_false(b, PHONE_CFG_BYTES - 2u);
+    b[PHONE_CFG_BYTES - 2u] = (uint8_t)(crc & 0xFFu);
+    b[PHONE_CFG_BYTES - 1u] = (uint8_t)((crc >> 8) & 0xFFu);
+
+    exfat_vol_t *v = s_vol;
+    int sd = s_sd;
+    if (v == NULL) {
+        v = s_boot_vol;
+        sd = (s_boot_vol != NULL && s_boot_sd != NULL) ? *s_boot_sd : 0;
+    }
+    exfat_vol_t *keep_v = s_vol;
+    int keep_sd = s_sd;
+    s_vol = v;
+    s_sd = sd;
+    int r = save_root_file_atomic(PHONE_CFG_TMP, PHONE_CFG_FILE, b, PHONE_CFG_BYTES);
+    s_vol = keep_v;
+    s_sd = keep_sd;
+    return r;
+}
+
+int bt_phone_has_bond_files(void)
+{
+    exfat_vol_t *v = s_vol != NULL ? s_vol : s_boot_vol;
+    int sd = s_vol != NULL ? s_sd : ((s_boot_vol != NULL && s_boot_sd != NULL) ? *s_boot_sd : 0);
+    if (!sd || v == NULL) {
+        return 0;
+    }
+    exfat_entry_t ke, be;
+    if (exfat_find_path(v, "/cassini.key", &ke) != 0 || ke.is_dir || ke.size != 36u) {
+        return 0;
+    }
+    if (exfat_find_path(v, "/" BOND_FILE, &be) != 0 || be.is_dir || be.size <= 48u) {
+        return 0;
+    }
+    return 1;
 }

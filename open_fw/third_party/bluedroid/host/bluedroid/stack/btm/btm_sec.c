@@ -4934,9 +4934,21 @@ void btm_sec_link_key_notification (UINT8 *p_bda, UINT8 *p_link_key, UINT8 key_t
     } else {
         BTM_TRACE_EVENT ("Remote device does not support Secure Connection");
     }
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+    /* open_fw patch 0048: remember HCI_LKEY_TYPE_CHANGED_COMB across delayed remote-name resolution while keeping the
+     * link's original authenticated link_key_type in p_dev_rec, so btc_dm + the app distinguish key rotation on an
+     * existing MITM bond from an unconfirmed new pairing. */
+    if (key_type == BTM_LKEY_TYPE_CHANGED_COMB) {
+        p_dev_rec->link_key_changed = TRUE;
+    } else {
+        p_dev_rec->link_key_changed = FALSE;
+        p_dev_rec->link_key_type = key_type;
+    }
+#else
     if (key_type != BTM_LKEY_TYPE_CHANGED_COMB) {
         p_dev_rec->link_key_type = key_type;
     }
+#endif
 
     p_dev_rec->sec_flags |= BTM_SEC_LINK_KEY_KNOWN;
 
@@ -5046,10 +5058,19 @@ void btm_sec_link_key_notification (UINT8 *p_bda, UINT8 *p_link_key, UINT8 key_t
                 BTM_TRACE_DEBUG ("btm_sec_link_key_notification()  LTK derived LK is saved already"
                                  " (key_type = %d)\n", p_dev_rec->link_key_type);
             } else {
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+                UINT8 cb_key_type = p_dev_rec->link_key_changed ? BTM_LKEY_TYPE_CHANGED_COMB : p_dev_rec->link_key_type;
+                p_dev_rec->link_key_changed = FALSE;
+                (*btm_cb.api.p_link_key_callback) (p_bda, p_dev_rec->dev_class,
+                                                   p_dev_rec->sec_bd_name,
+                                                   p_link_key, cb_key_type,
+                                                   p_dev_rec->remote_supports_secure_connections);
+#else
                 (*btm_cb.api.p_link_key_callback) (p_bda, p_dev_rec->dev_class,
                                                    p_dev_rec->sec_bd_name,
                                                    p_link_key, p_dev_rec->link_key_type,
                                                    p_dev_rec->remote_supports_secure_connections);
+#endif
             }
         }
     }
@@ -5883,10 +5904,19 @@ static void btm_sec_collision_timeout (TIMER_LIST_ENT *p_tle)
 static void btm_send_link_key_notif (tBTM_SEC_DEV_REC *p_dev_rec)
 {
     if (btm_cb.api.p_link_key_callback) {
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+        UINT8 cb_key_type = p_dev_rec->link_key_changed ? BTM_LKEY_TYPE_CHANGED_COMB : p_dev_rec->link_key_type;
+        p_dev_rec->link_key_changed = FALSE;
+        (*btm_cb.api.p_link_key_callback) (p_dev_rec->bd_addr, p_dev_rec->dev_class,
+                                           p_dev_rec->sec_bd_name, p_dev_rec->link_key,
+                                           cb_key_type,
+                                           p_dev_rec->remote_supports_secure_connections);
+#else
         (*btm_cb.api.p_link_key_callback) (p_dev_rec->bd_addr, p_dev_rec->dev_class,
                                            p_dev_rec->sec_bd_name, p_dev_rec->link_key,
                                            p_dev_rec->link_key_type,
                                            p_dev_rec->remote_supports_secure_connections);
+#endif
 
     }
 }

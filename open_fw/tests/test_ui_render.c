@@ -370,7 +370,10 @@ static const struct { ui_bt_str_id_t id; uint8_t kind; } k_bt_kinds[] = {
     { UI_BT_STR_HP_NOT_READY, BK_TOAST },     { UI_BT_STR_NOT_IN_BUILD, BK_FOOT },
     { UI_BT_STR_HP_NOT_CONNECTED, BK_TOAST }, { UI_BT_STR_HP_PAUSED, BK_TOAST },
     { UI_BT_STR_LOWBATT_BT_OFF, BK_TOAST },   { UI_BT_STR_HP_PAIR_AGAIN, BK_FOOT },
-    { UI_BT_STR_HP_SPK_ONLY, BK_TOAST },
+    { UI_BT_STR_HP_SPK_ONLY, BK_TOAST },      { UI_BT_STR_NO_SPEECH, BK_LBL },
+    { UI_BT_STR_SYNC_DEFER_OFF, BK_TOAST },   { UI_BT_STR_AUTO_SYNC, BK_SETLBL },
+    { UI_BT_STR_DESC_AUTO_SYNC, BK_FOOT },    { UI_BT_STR_AUTO_OFF, BK_SETLBL },
+    { UI_BT_STR_DESC_AUTO_OFF, BK_FOOT },
 };
 
 static void check_bt_i18n(void)
@@ -445,6 +448,36 @@ static void check_bt_i18n(void)
                 fprintf(stderr, "Settings Audio output row lang %u: label %d px, value \"%s\" %d px\n", (unsigned)lang,
                         (int)lw, v, (int)vw);
                 bad++;
+            }
+        }
+        /* Settings "Auto sync" and "Auto off" rows with their widest values selected */
+        {
+            const char *on_s = ui_tr_lang(lang, UI_STR_ON), *off_s = ui_tr_lang(lang, UI_STR_OFF);
+            const char * sync_vals[2] = { on_s, off_s };
+            for (unsigned k = 0; k < 2u; k++) {
+                char v[40];
+                snprintf(v, sizeof(v), "- %s +", sync_vals[k]);
+                int32_t vw = px(v, &ui_font_sm) + 2;
+                int32_t lw = px(ui_tr_bt_lang(lang, UI_BT_STR_AUTO_SYNC), &ui_font_md);
+                if (vw < 54) vw = 54;
+                if (vw > 96 || lw > 146 - vw - 8) {
+                    fprintf(stderr, "Settings Auto sync row lang %u: label %d px, value \"%s\" %d px\n",
+                            (unsigned)lang, (int)lw, v, (int)vw);
+                    bad++;
+                }
+            }
+            const char *off_vals[4] = { off_s, "2m", "5m", "15m" };
+            for (unsigned k = 0; k < 4u; k++) {
+                char v[40];
+                snprintf(v, sizeof(v), "- %s +", off_vals[k]);
+                int32_t vw = px(v, &ui_font_sm) + 2;
+                int32_t lw = px(ui_tr_bt_lang(lang, UI_BT_STR_AUTO_OFF), &ui_font_md);
+                if (vw < 54) vw = 54;
+                if (vw > 96 || lw > 146 - vw - 8) {
+                    fprintf(stderr, "Settings Auto off row lang %u: label %d px, value \"%s\" %d px\n",
+                            (unsigned)lang, (int)lw, v, (int)vw);
+                    bad++;
+                }
             }
         }
     }
@@ -1121,6 +1154,25 @@ int main(int argc, char **argv)
 #if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID
     check_bt_ui(&m);
 #endif
+    /* 0-word CWX sidecar ("No speech"): player transcript view hides speaker stripes/pill and renders "No speech". */
+    {
+        ui_model_t ns = m;
+        ns.play_has_transcript = 2;
+        ns.play_dur_ms = 12000u;
+        ns.play_pos_ms = 3000u;
+        ns.play_pos_sec = 3u;
+        ns.play_file.duration_sec = 12u;
+        ui_render_screen(UI_SCR_PLAYER, &ns);
+        for (int frame = 0; frame < 14; frame++) { s_now += 16u; ui_port_task_handler(); }
+#if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID
+        assert(strcmp(lv_label_get_text(objects.ptr_line_2), ui_tr_bt(UI_BT_STR_NO_SPEECH)) == 0);
+#else
+        assert(strcmp(lv_label_get_text(objects.ptr_line_2), "No speech") == 0);
+#endif
+        assert(!lv_obj_has_flag(objects.ptr_line_2, LV_OBJ_FLAG_HIDDEN));
+        assert(lv_obj_has_flag(objects.ptr_bar_2, LV_OBJ_FLAG_HIDDEN));
+        assert(lv_obj_has_flag(objects.ptr_word_pill, LV_OBJ_FLAG_HIDDEN));
+    }
     check_toast_text(&m);
     /* Verify visible toast (including long truncated toast) is a compact bottom pill
      * (never a full-screen 160x160 default-sized circle) and produces 0 redraw pixels when unchanged */

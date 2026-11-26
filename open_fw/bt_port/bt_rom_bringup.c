@@ -408,9 +408,12 @@ void bt_rom_bringup_ld_layer(const uint8_t bd_addr[6])
     REG8(0x00802CF4u + 0x1A1u) = 1u;
     REG8(0x00802CF4u + 0x1A2u) = 2u;
 
-    /* Local LMP features (BR/EDR + SSP + eSCO) */
-    REG32(0x00802C04u + 0x00u) = 0xFACDFE7Fu;
-    REG32(0x00802C04u + 0x04u) = 0x877BFDDBu;
+    /* Local LMP features (BR/EDR + SSP + eSCO). Role switch (b5), hold (b6) and pause encryption (b42) are cleared
+     * to match BT_CTRL_OPCODE_TABLE.md §3.6: when we page a phone as master (bt_xrec_poke_bonded), advertising b5+b42
+     * caused Android to send LMP_pause_encryption_req for an encrypted role switch, wedging the ROM in LC 0x35 until
+     * the 30 s LMP response timeout (silicon 2026-11-26). */
+    REG32(0x00802C04u + 0x00u) = 0xFACDFE1Fu;
+    REG32(0x00802C04u + 0x04u) = 0x877BF9DBu;
     REG32(0x00802C0Cu) = 0u;
     REG32(0x00802C10u) = 0u;
 

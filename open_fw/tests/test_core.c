@@ -3038,7 +3038,7 @@ static void test_xrec_session(void)
         mock_xrec_exp_write, mock_xrec_exp_run, mock_xrec_read_log,
         mock_xrec_reset_log, mock_xrec_on_dfu, mock_xrec_audio_cfg,
         mock_xrec_get_mtu, mock_xrec_file_busy, NULL, NULL,
-        NULL, NULL, NULL,
+        NULL, NULL, NULL, NULL, NULL,
     };
     xrec_init(&xrec, &vol, &ops, &sp);
 

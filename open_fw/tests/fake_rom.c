@@ -677,6 +677,20 @@ void fake_peer_disconnect(uint8_t reason)
     }
 }
 
+void fake_peer_change_link_key(const uint8_t new_key[16])
+{
+    if (!fake_peer.enabled || !fake_peer.connected) {
+        return;
+    }
+    memcpy(fake_peer.key, new_key, 16u);
+    fake_peer.has_key = true;
+    uint8_t ln[23];
+    memcpy(ln, s_peer.addr, 6u);
+    memcpy(&ln[6], new_key, 16u);
+    ln[22] = 0x06u; /* HCI_LKEY_TYPE_CHANGED_COMB */
+    peer_emit(0xE466u, peer_lc_src(), ln, 23u);
+}
+
 void fake_peer_name_release(void)
 {
     if (!fake_peer.name_held) {

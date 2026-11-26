@@ -28,7 +28,7 @@ const void *const g_bt_link_roots[] = {
     ROOT(esp_bt_gap_get_bond_device_num), ROOT(esp_bt_gap_set_device_name),
     /* phone mode: SPP */
     ROOT(esp_spp_register_callback), ROOT(esp_spp_enhanced_init), ROOT(esp_spp_start_srv), ROOT(esp_spp_write),
-    ROOT(esp_spp_disconnect), ROOT(esp_spp_stop_srv), ROOT(esp_spp_deinit),
+    ROOT(esp_spp_disconnect), ROOT(esp_spp_stop_srv), ROOT(esp_spp_deinit), ROOT(esp_spp_start_discovery),
     /* headphones mode: A2DP source + AVRCP */
     ROOT(esp_a2d_register_callback), ROOT(esp_a2d_source_init), ROOT(esp_a2d_source_connect),
     ROOT(esp_a2d_media_ctrl_by_handle), ROOT(esp_a2d_source_audio_data_send), ROOT(esp_a2d_source_disconnect_by_handle),

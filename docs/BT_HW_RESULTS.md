@@ -458,6 +458,40 @@ every few seconds and dropped the link after 5-9 s.
 
 **Open (2026-11-26):** `REC_0052.wav` (stereo: 2,203,692 B = 34.4 s at 16 kHz x 2 ch; the app's import is a mono downmix) plays only in the LEFT headphone; the stereo audiobook plays on both. Code read: capture (`audio_dma.c` ch1+ch2 mux, AMIC2 PGA), DSP (`audio_dsp.c` all profiles process both channels) and the headset path (`hp_sink_pull` mono->stereo) look right. Unverified: the file's right-channel level (needs the card). Suspects: AMIC2 (second mic) silent / no bias on this board, or the player's stereo-file path to the headset. Workaround: record mono (Settings channels = 1).
 
+## Session 12 (2026-11-26): unattended background wakeup, `+XREC:SYNC,0`, and LMP `0x802C04` role-switch mask
+
+Goal: zero-babysitting end-to-end sync (`feat/bt-just-works` + Cassini `feat/recorder-sync` `15f9608f`). After a
+recording stops (or on power-on with unsynced audio), `open_fw` starts non-modal background Bluetooth (`bt_bg_poll`),
+pokes the bonded Pixel 8 (`02:CA:55:00:01:1D`) via `esp_spp_start_discovery()`, wakes Cassini with the phone screen off
+(`mWakefulness=Dozing`) via `CompanionDeviceService.onDeviceAppeared`, downloads new `.wav` files, transcribes/diarizes
+in the background, pushes `.cwx` sidecars (including 0-word `"No speech"` `CWX1` sidecars), and shuts Bluetooth down as
+soon as `+XREC:SYNC,0` arrives.
+
+- **Run 1 (`mode=rec secs=10 delay_s=2 sync_s=180`, before `0x802C04` mask):** `bt_xrec_poke_bonded()` connected ACL in
+  ~140 ms and `CompanionDeviceManager` woke Cassini while Dozing (`Background started FGS: Allowed`). Cassini's SDP +
+  auth + E0 encryption succeeded on the same ACL link in 1.4 s, then stalled for 30.0 s (`HCI_ERR_LMP_RESPONSE_TIMEOUT`,
+  ROM LC state `0x36 -> 0x35`).
+- **Root cause (static ROM disassembly + logcat):** Because we paged the phone (`0405` with `allow_rs = 0`), we were
+  Central and the Pixel 8 was Peripheral (`mConnectionRole: 1`). `bt_rom_bringup.c` wrote unmasked LMP page 0
+  (`0xFACDFE7F`, `0x877BFDDB`) to `0x00802C04`, advertising Role Switch (b5) and Pause Encryption (b42) over LMP even
+  though `bt_ctrl` masked b5/b6 in HCI `1004` (`BT_CTRL_OPCODE_TABLE.md` §3.6 open item). Right after E0 encryption
+  came up, Android initiated an encrypted role switch (`LMP_pause_encryption_req`, ext opcode `0x17` -> ROM `0x23D34` ->
+  `0x2B53C` LC `0x35`), wedging the link until the 30 s LMP timeout.
+- **Fix:** `bt_rom_bringup.c` clears b5 (role switch), b6 (hold), and b42 (pause encryption) in `0x00802C04`
+  (`0xFACDFE1F`, `0x877BF9DB`). Also guarded Bluedroid patch `0048` (`HCI_LKEY_TYPE_CHANGED_COMB` preserves MITM bond)
+  and fixed a TOCTOU in `RecorderSync` where a transcript finishing mid-upload was drained before `+XREC:SYNC,0`.
+- **Runs 2 & 3 (`mode=rec secs=10 delay_s=2 sync_s=180`, Pixel 8 Dozing, screen off, no UI open):**
+  - Run 2: recorded `REC_0054.wav`, poked Pixel 8, opened SPP (`mtu 990`) immediately (`lc=0x36 -> 0x05`, zero `0x35`),
+    uploaded 22 pending 0-word `"No speech"` `.cwx` sidecars (`state 2`, e.g. `TEST_440HZ.cwx` 136 B `words=0`) plus
+    multi-word `JWSPEECH.cwx` (`words=26`) and `REC_0053.cwx` (`words=12`), downloaded 3 WAVs at 53–56 KB/s (0 retries),
+    and stopped BT cleanly (`mallocfail 0`, `stalls 0`).
+  - Run 3 (after APK update, cold `MY_PACKAGE_REPLACED` re-arm, Dozing): recorded `REC_0055.wav`, uploaded
+    `REC_0054.cwx` (`words=5`), downloaded `REC_0055.wav` (53 KB/s) with `+XREC:SYNC,1` keeping the recorder listening,
+    transcribed in background, reconnected and pushed `REC_0055.cwx` (`words=15`) + `+XREC:SYNC,0`, and shut BT down
+    at `ms=66928` (`bt_bonds.bin` 152 B intact).
+- **Left on hardware:** clean release `BT=1` (`BENCH=0`) image (`FIRM CRC-16=0xB75A`, 858,496 B) flashed & verified on
+  SL6801; updated debug APK (`15f9608f`) installed on Pixel 8 (`mNotifyOnDeviceNearby=true`).
+
 ## Exp 1 stages A and B: how to run
 
 Probe image for plan M5 Exp 1 stage A and stage B (step 4): `bt_ctrl` (plan M1) drives the real RW-BT ROM through

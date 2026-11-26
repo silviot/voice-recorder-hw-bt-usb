@@ -60,6 +60,12 @@ typedef enum {
     UI_BT_STR_LOWBATT_BT_OFF, /* Toast: Bluetooth stopped / refused at low battery */
     UI_BT_STR_HP_PAIR_AGAIN, /* Headphones message: the remembered headset lost its key, reconnects stopped */
     UI_BT_STR_HP_SPK_ONLY, /* Player toast: output Both with no headset: the speaker plays alone */
+    UI_BT_STR_NO_SPEECH, /* Player transcript view: 0-word .cwx sidecar ("No speech") */
+    UI_BT_STR_SYNC_DEFER_OFF, /* Toast: first 2s Power hold during active background sync defers shutdown */
+    UI_BT_STR_AUTO_SYNC, /* Settings row label: automatic background phone sync */
+    UI_BT_STR_DESC_AUTO_SYNC, /* Settings description of Auto sync */
+    UI_BT_STR_AUTO_OFF, /* Settings row label: smart idle auto-power-off */
+    UI_BT_STR_DESC_AUTO_OFF, /* Settings description of Auto off */
     UI_BT_STR_COUNT
 } ui_bt_str_id_t;
 

@@ -1427,6 +1427,94 @@ static void sup_quiet(const char *what, uint32_t ms)
             b.max_ms[1], b.max_ms[2]);
 }
 
+static int fn_poke_bonded(uint32_t arg)
+{
+    (void)arg;
+    return bt_xrec_poke_bonded(NULL);
+}
+
+__attribute__((noinline)) static bool step_p9c(uint8_t lkey[16], const pbase_t *base)
+{
+    /* Patch 0048: when an already-MITM-bonded master rotates the combination link key (HCI_LKEY_TYPE_CHANGED_COMB 0x06),
+     * both delayed (first reconnect after boot while BTM's remote name request is still in flight) and immediate link-key
+     * notifications must keep LinkKeyType = 5 in /bt_bonds.bin and never purge the bond; also verify the outbound
+     * doorbell poke (bt_xrec_poke_bonded -> esp_spp_start_discovery). */
+    bth_log("[P9c] A rotates the combination link key (0x06, before & after name resolution) + doorbell poke: bond kept\n");
+    stop_session(base, "stop before P9c");
+    if (p_fail) {
+        return false;
+    }
+    rom_cmds_clear();
+    if (!wait_ready()) {
+        return false;
+    }
+    uint8_t rkey1[16], rkey2[16];
+    for (unsigned i = 0u; i < 16u; i++) {
+        rkey1[i] = (uint8_t)(lkey[i] ^ 0x3Cu);
+        rkey2[i] = (uint8_t)(lkey[i] ^ 0xA5u);
+    }
+    fake_peer_cfg_t a;
+    peer_cfg(&a, 0xA1u, 0x01u, 0x05u, 0x05u, "laptop-A");
+    peer_attach(&a, lkey);
+    bth_rom_lock();
+    fake_peer.name_hold = true;   /* hold BTM's link-setup name request so 0x06 takes btm_send_link_key_notif */
+    bth_rom_unlock();
+    if (!peer_page_and_connect()) {
+        return false;
+    }
+    peer_authenticate();
+    PCHECK(WAIT(fake_peer.authenticated && fake_peer.encrypted, 3000), "P9c auth before rotation");
+    uint32_t ref0 = S().d.lk_refreshed;
+    bth_rom_lock();
+    fake_peer_change_link_key(rkey1);
+    fake_peer_name_release();
+    bth_rom_unlock();
+    bth_ctrl_kick();
+    PCHECK(WAIT(S().d.lk_refreshed == ref0 + 1u, 3000), "delayed 0x06 key rotation not kept (lk_refreshed %u, "
+           "bonds %d)", S().d.lk_refreshed, S().bonds);
+    PCHECK(S().bonds == 1, "bond dropped on delayed 0x06 rotation (%d)", S().bonds);
+
+    /* Second rotation on the same link (BTM_SEC_NAME_KNOWN already set -> immediate callback path) */
+    bth_rom_lock();
+    fake_peer_change_link_key(rkey2);
+    bth_rom_unlock();
+    bth_ctrl_kick();
+    PCHECK(WAIT(S().d.lk_refreshed == ref0 + 2u, 3000), "immediate 0x06 key rotation not kept (%u)",
+           S().d.lk_refreshed);
+    memcpy(lkey, rkey2, 16u);
+    peer_drop(0x13u);
+    PCHECK(WAIT(!S().d.conn_open && S().d.acl_links == 0u, 3000), "P9c link not down");
+    PCHECK(WAIT(bond_file_has_key(lkey) > 0, 3000), "rotated key not saved in /bt_bonds.bin");
+
+    /* Restart and verify the rotated key still loads as MITM-authenticated (LinkKeyType = 5, not 6) + poke works */
+    stop_session(base, "stop after P9c rotation");
+    if (p_fail) {
+        return false;
+    }
+    rom_cmds_clear();
+    if (!wait_ready()) {
+        return false;
+    }
+    PCHECK(S().bonds == 1 && S().d.bonds_removed == 0u, "rotated bond purged on restart (bonds %d removed %u)",
+           S().bonds, S().d.bonds_removed);
+    peer_cfg(&a, 0xA1u, 0x01u, 0x05u, 0x05u, "laptop-A");
+    a.ignores_pages = true;   /* phone asleep/away: poke completes cleanly without stranding a link */
+    peer_attach(&a, lkey);
+    PCHECK(bthx_call_fn(fn_poke_bonded, 0u, 2000u) == 0, "bt_xrec_poke_bonded refused");
+    PCHECK(WAIT(S().d.pokes_sent == 1u && S().d.pokes_done == 1u, 8000),
+           "poke discovery did not complete (sent %u done %u)", S().d.pokes_sent, S().d.pokes_done);
+    a.ignores_pages = false;
+    peer_attach(&a, lkey);
+    if (!peer_page_and_connect()) {
+        return false;
+    }
+    peer_authenticate();
+    PCHECK(WAIT(fake_peer.authenticated && fake_peer.encrypted, 3000), "auth with rotated key after restart");
+    peer_drop(0x13u);
+    PCHECK(WAIT(!S().d.conn_open && S().d.acl_links == 0u, 3000), "P9c reconnect link not down");
+    return !p_fail;
+}
+
 int bth_phone_scenario(const char *img_path)
 {
     bth_log("[P] phone mode end to end: XREC backend + Bluedroid + bt_ctrl + fake ROM peer\n");
@@ -1788,6 +1876,11 @@ int bth_phone_scenario(const char *img_path)
         PCHECK(S().bonds == 1, "pass %d: bond dropped (%d bonds)", pass, S().bonds);
     }
     PCHECK(WAIT(bond_file_has_key(lkey) > 0, 3000), "A's key no longer in /bt_bonds.bin (%d)", bond_file_has_key(lkey));
+
+    /* ---- 9c ---- */
+    if (!step_p9c(lkey, &base)) {
+        goto out;
+    }
 
     /* ---- 10 ---- */
     bth_log("[P10] laptop B pairs with the window closed: rejected\n");

@@ -478,7 +478,14 @@ static void bind_home_detail(const ui_model_t *m, unsigned page, lv_obj_t *title
         lv_snprintf(l2, sizeof(l2), "%s", ui_tr(m->cfg.vor_enabled ? UI_STR_VOR_ON : UI_STR_VOR_OFF));
     } else {
         lv_snprintf(l1, sizeof(l1), "%s", ui_tr(UI_STR_BT_FILE_SYNC));
-        lv_snprintf(l2, sizeof(l2), ui_tr(UI_STR_DEVICE_NAME_FMT), m->bt_name[0] ? m->bt_name : "HW_76");
+#if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID
+        if (m->bt_bg_syncing) {
+            lv_snprintf(l2, sizeof(l2), "%s", ui_tr_bt(UI_BT_STR_CONNECTING));
+        } else
+#endif
+        {
+            lv_snprintf(l2, sizeof(l2), ui_tr(UI_STR_DEVICE_NAME_FMT), m->bt_name[0] ? m->bt_name : "HW_76");
+        }
     }
     set_changed_text(title, l1);
     set_changed_text_color(title, lv_color_hex(col1));
@@ -972,6 +979,32 @@ static void bind_player_tr(const ui_model_t *m, bool entering)
         objects.ptr_line_3, objects.ptr_line_4, objects.ptr_line_5,
     };
 
+    if (m->play_has_transcript == 2) {
+        for (int i = 0; i < (int)CWX_TR_VIEW_LINES; i++) {
+            set_hidden(bars[i], true);
+            if (i == 2) {
+                set_hidden(lines[i], false);
+#if defined(OPENFW_BT_BLUEDROID) && OPENFW_BT_BLUEDROID
+                set_changed_text(lines[i], ui_tr_bt(UI_BT_STR_NO_SPEECH));
+#else
+                set_changed_text(lines[i], "No speech");
+#endif
+                set_changed_text_color(lines[i], lv_color_hex(UI_HEX_MUTE));
+            } else {
+                set_hidden(lines[i], true);
+            }
+        }
+        if (objects.ptr_curr_upcoming) {
+            set_hidden(objects.ptr_curr_upcoming, true);
+        }
+        if (objects.ptr_word_pill) {
+            lv_anim_delete(objects.ptr_word_pill, NULL);
+            set_hidden(objects.ptr_word_pill, true);
+            s_tr_pill_visible = 0;
+        }
+        return;
+    }
+
     lv_color_t bg_col = lv_color_hex(UI_HEX_BG);
     int have_active_upcoming = 0;
 
@@ -1229,6 +1262,14 @@ static void format_setting_val(const ui_model_t *m, int idx, char *val, int vcap
         lv_snprintf(val, (size_t)vcap, "%s", ui_tr_bt(m->bt_out_mode == 1u ? UI_BT_STR_OUT_BT
                                                       : m->bt_out_mode == 2u ? UI_BT_STR_OUT_BOTH : UI_BT_STR_OUT_SPEAKER));
         break;
+    case UI_SET_ROW_AUTO_SYNC:
+        lv_snprintf(val, (size_t)vcap, "%s", ui_tr(m->bt_auto_sync ? UI_STR_ON : UI_STR_OFF));
+        break;
+    case UI_SET_ROW_AUTO_OFF:
+        lv_snprintf(val, (size_t)vcap, "%s", m->bt_auto_off == 0u ? ui_tr(UI_STR_OFF)
+                                             : m->bt_auto_off == 1u ? "2m"
+                                             : m->bt_auto_off == 3u ? "15m" : "5m");
+        break;
 #endif
     case UI_SET_HSPROBE: lv_snprintf(val, (size_t)vcap, "%s", "OK"); *adj = 0; break; /* TODO(i18n) */
     default: lv_snprintf(val, (size_t)vcap, "%s", BOARD_FW_VERSION_STR); *adj = 0; break;
@@ -1245,7 +1286,7 @@ static void bind_settings(const ui_model_t *m)
         UI_STR_SET_HSPROBE
     };
 #ifdef UI_SET_ROW_AOUT
-    _Static_assert(sizeof(label_ids) / sizeof(label_ids[0]) == UI_SET_COUNT - 1, "Settings label table");
+    _Static_assert(sizeof(label_ids) / sizeof(label_ids[0]) == UI_SET_COUNT - 3, "Settings label table");
 #else
     _Static_assert(sizeof(label_ids) / sizeof(label_ids[0]) == UI_SET_COUNT, "Settings label table");
 #endif
@@ -1279,8 +1320,12 @@ static void bind_settings(const ui_model_t *m)
 #ifdef UI_SET_ROW_AOUT
         if (idx == UI_SET_ROW_AOUT) {
             set_changed_text(lbls[r], ui_tr_bt(UI_BT_STR_AUDIO_OUTPUT));
+        } else if (idx == UI_SET_ROW_AUTO_SYNC) {
+            set_changed_text(lbls[r], ui_tr_bt(UI_BT_STR_AUTO_SYNC));
+        } else if (idx == UI_SET_ROW_AUTO_OFF) {
+            set_changed_text(lbls[r], ui_tr_bt(UI_BT_STR_AUTO_OFF));
         } else {
-            set_changed_text(lbls[r], ui_tr(label_ids[idx > UI_SET_ROW_AOUT ? idx - 1 : idx]));
+            set_changed_text(lbls[r], ui_tr(label_ids[idx > UI_SET_ROW_AUTO_OFF ? idx - 3 : idx]));
         }
 #else
         set_changed_text(lbls[r], ui_tr(label_ids[idx]));
@@ -1348,6 +1393,8 @@ static void bind_settings(const ui_model_t *m)
         case 9: desc = ui_tr(m->vbus_present ? UI_STR_DESC_USB_MOUNT : UI_STR_DESC_USB_PLUG); break;
 #ifdef UI_SET_ROW_AOUT
         case UI_SET_ROW_AOUT: desc = ui_tr_bt(UI_BT_STR_DESC_AUDIO_OUTPUT); break;
+        case UI_SET_ROW_AUTO_SYNC: desc = ui_tr_bt(UI_BT_STR_DESC_AUTO_SYNC); break;
+        case UI_SET_ROW_AUTO_OFF: desc = ui_tr_bt(UI_BT_STR_DESC_AUTO_OFF); break;
 #endif
         case UI_SET_HSPROBE: desc = ui_tr(UI_STR_DESC_HSPROBE); break;
         default: break;

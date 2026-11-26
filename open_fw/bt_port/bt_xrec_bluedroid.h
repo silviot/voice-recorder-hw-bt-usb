@@ -122,8 +122,50 @@ typedef struct {
     uint32_t rx_lost;            /* SPP reported an RX frame lost for lack of memory (patch 0044): link closed */
     uint32_t close_retries;      /* esp_spp_disconnect() retried after a refusal (review STEP10 C11) */
     uint8_t  parked;             /* F8: a fault during a recording silenced BT (state DEAD); hard path after REC */
+    uint32_t lk_refreshed;       /* patch 0048: ESP_BT_LINK_KEY_CHG_COMB kept on an existing MITM bond */
+    uint32_t pokes_sent;         /* bt_xrec_poke_bonded(): esp_spp_start_discovery() calls accepted */
+    uint32_t pokes_done;         /* ESP_SPP_DISCOVERY_COMP_EVT received */
 } bt_xrec_debug_t;
 void bt_xrec_get_debug(bt_xrec_debug_t *out);
+
+/* Live sync / sidecar-upload telemetry + outbound doorbell poke for background sync (src/main.c, app task only). */
+typedef struct {
+    uint8_t  sync_seen;          /* 1 once the current session received +XREC:SYNC,<pending> */
+    uint16_t sync_pending;       /* last reported pending items (downloads + transcriptions + uploads) */
+    uint16_t sync_eta_sec;       /* optional ETA hint from +XREC:SYNC */
+    uint32_t sync_seq;           /* increments on every +XREC:SYNC command */
+    uint32_t cwx_seq;            /* increments on every committed PUT REC,<stem>.cwx */
+    uint8_t  last_cwx_state;     /* 1 = words > 0, 2 = 0-word ("No speech") */
+    char     last_cwx_name[32];  /* committed "<stem>.cwx" */
+    uint8_t  poke_busy;          /* 1 while esp_spp_start_discovery() is in flight */
+    uint8_t  last_peer_valid;    /* 1 once an authorized MITM peer connected or bonded this session */
+    uint8_t  last_peer_bda[6];
+} bt_xrec_sync_info_t;
+void bt_xrec_get_sync_info(bt_xrec_sync_info_t *out);
+/* Outbound "doorbell poke": while READY with no open link and no open pairing window, page a MITM-bonded phone and
+ * query its SDP server (esp_spp_start_discovery) so Android wakes CompanionDeviceService / ACTION_ACL_CONNECTED and
+ * opens RFCOMM back to our server. Prefers hint_bda (when non-NULL and MITM-bonded), else the first MITM bond in
+ * Bluedroid's store. Returns 0 when discovery was started, -1 otherwise. App task only. */
+int  bt_xrec_poke_bonded(const uint8_t hint_bda[6]);
+/* 1 when Bluedroid's loaded bond store holds at least one MITM-authenticated bond (writes its BDA to out_bda if
+ * non-NULL). App task, stack READY. */
+int  bt_xrec_has_mitm_bond(uint8_t out_bda[6]);
+
+/* Persistent phone-sync & smart auto-power-off settings (SD:/bt_phone_cfg.bin, BT=1 only; settings.bin untouched). */
+#define BT_PHONE_CFG_MAGIC 0x31435042u /* "BPC1" LE */
+typedef struct {
+    uint8_t  auto_sync;          /* 1 = automatic background sync on (default), 0 = manual only */
+    uint8_t  auto_off_idx;       /* 0 = Off, 1 = 2m, 2 = 5m (default), 3 = 15m */
+    uint8_t  sync_pending;       /* 1 = untranscribed recording / unfinished sync awaits phone */
+    uint8_t  phone_valid;        /* 1 = phone_bda holds the most recent authorized phone */
+    uint8_t  phone_bda[6];
+} bt_phone_cfg_t;
+void bt_phone_cfg_defaults(bt_phone_cfg_t *cfg);
+int  bt_phone_cfg_load(bt_phone_cfg_t *cfg);
+int  bt_phone_cfg_save(const bt_phone_cfg_t *cfg);
+/* Cheap file-existence check on the boot volume before spinning up Bluedroid in the background: 1 iff /cassini.key
+ * (36 B) and a non-empty /bt_bonds.bin (> 48 B; an empty bt_store image is 43 B) both exist on the mounted card. */
+int  bt_phone_has_bond_files(void);
 
 /* ---- BENCH images only (make BT=1 BENCH=1; SD:/BTBENCH.RUN phone keys, docs/BT_SYNC_THROUGHPUT.md) ----
  * TX path knobs for the sync-throughput A/B runs. Defaults = the release behaviour (990, 3960, 8192, coalesce 1). Set

@@ -1,0 +1,152 @@
+diff --git a/open_fw/third_party/bluedroid/host/bluedroid/btc/core/btc_dm.c b/open_fw/third_party/bluedroid/host/bluedroid/btc/core/btc_dm.c
+index bd5e896..d4c09ac 100644
+--- a/open_fw/third_party/bluedroid/host/bluedroid/btc/core/btc_dm.c
++++ b/open_fw/third_party/bluedroid/host/bluedroid/btc/core/btc_dm.c
+@@ -428,7 +428,7 @@ static BOOLEAN openfw_lkey_authenticated(int key_type)
+     return key_type == HCI_LKEY_TYPE_AUTH_COMB || key_type == HCI_LKEY_TYPE_AUTH_COMB_P_256;
+ }
+ 
+-static BOOLEAN openfw_stored_key_authenticated(const BD_ADDR bda)
++static int openfw_stored_auth_key_type(const BD_ADDR bda)
+ {
+     bt_bdaddr_t a;
+     bdstr_t bdstr;
+@@ -436,9 +436,15 @@ static BOOLEAN openfw_stored_key_authenticated(const BD_ADDR bda)
+     bdcpy(a.address, bda);
+     bdaddr_to_string(&a, bdstr, sizeof(bdstr));
+     btc_config_lock();
++    bool have_key = btc_config_exist(bdstr, BTC_STORAGE_LINK_KEY_STR);
+     bool have = btc_config_get_int(bdstr, BTC_STORAGE_LINK_KEY_TYPE_STR, &type);
+     btc_config_unlock();
+-    return (have && openfw_lkey_authenticated(type)) ? TRUE : FALSE;
++    return (have_key && have && openfw_lkey_authenticated(type)) ? type : -1;
++}
++
++static BOOLEAN openfw_stored_key_authenticated(const BD_ADDR bda)
++{
++    return openfw_stored_auth_key_type(bda) >= 0 ? TRUE : FALSE;
+ }
+ #endif
+ 
+@@ -450,20 +456,31 @@ static void btc_dm_auth_cmpl_evt (tBTA_DM_AUTH_CMPL *p_auth_cmpl)
+ #if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+     bool key_not_stored = false; /* open_fw patch 0044 */
+     BOOLEAN openfw_downgrade = FALSE;
++    uint8_t store_key_type = p_auth_cmpl->key_type;
+ #endif
+     BTC_TRACE_DEBUG("%s: bond state success %d, present %d, type%d\n", __func__, p_auth_cmpl->success,
+               p_auth_cmpl->key_present, p_auth_cmpl->key_type);
+ 
+     bdcpy(bd_addr.address, p_auth_cmpl->bd_addr);
+ #if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+-    /* 0042: an unauthenticated key never replaces a stored authenticated (MITM) one. Just Works is refused before it
+-     * makes a key (btc_dm_sp_cfm_req_evt); this catches any other path (legacy PIN) and reports the pairing failed. */
+-    if (p_auth_cmpl->success == TRUE && p_auth_cmpl->key_present &&
+-            p_auth_cmpl->key_type != HCI_LKEY_TYPE_CHANGED_COMB && !openfw_lkey_authenticated(p_auth_cmpl->key_type) &&
+-            openfw_stored_key_authenticated(p_auth_cmpl->bd_addr)) {
+-        BTC_TRACE_WARNING("%s: unauthenticated key (type %d) not stored over an authenticated bond\n", __func__,
+-                          p_auth_cmpl->key_type);
+-        openfw_downgrade = TRUE;
++    /* 0042 + 0048: an unauthenticated key never replaces a stored authenticated (MITM) one. A rotated combination key
++     * (HCI_LKEY_TYPE_CHANGED_COMB) on an already-authenticated bond keeps the stored authenticated key type in NVS while
++     * reporting HCI_LKEY_TYPE_CHANGED_COMB to the GAP callback so the app distinguishes key rotation from an unconfirmed
++     * new pairing; without an authenticated bond, HCI_LKEY_TYPE_CHANGED_COMB is refused. */
++    if (p_auth_cmpl->success == TRUE && p_auth_cmpl->key_present) {
++        int stored_auth = openfw_stored_auth_key_type(p_auth_cmpl->bd_addr);
++        if (p_auth_cmpl->key_type == HCI_LKEY_TYPE_CHANGED_COMB) {
++            if (stored_auth >= 0) {
++                store_key_type = (uint8_t)stored_auth;
++            } else {
++                BTC_TRACE_WARNING("%s: changed combination key refused without an authenticated bond\n", __func__);
++                openfw_downgrade = TRUE;
++            }
++        } else if (!openfw_lkey_authenticated(p_auth_cmpl->key_type) && stored_auth >= 0) {
++            BTC_TRACE_WARNING("%s: unauthenticated key (type %d) not stored over an authenticated bond\n", __func__,
++                              p_auth_cmpl->key_type);
++            openfw_downgrade = TRUE;
++        }
+     }
+     if ( (p_auth_cmpl->success == TRUE) && (p_auth_cmpl->key_present) && !openfw_downgrade ) {
+ #else
+@@ -480,9 +497,15 @@ static void btc_dm_auth_cmpl_evt (tBTA_DM_AUTH_CMPL *p_auth_cmpl)
+                 bt_status_t ret __attribute__((unused));
+                 BTC_TRACE_DEBUG("%s: Storing link key. key_type=0x%x",
+                           __FUNCTION__, p_auth_cmpl->key_type);
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++                ret = btc_storage_add_bonded_device(&bd_addr,
++                                                    p_auth_cmpl->key, store_key_type,
++                                                    16, p_auth_cmpl->sc_support);
++#else
+                 ret = btc_storage_add_bonded_device(&bd_addr,
+                                                     p_auth_cmpl->key, p_auth_cmpl->key_type,
+                                                     16, p_auth_cmpl->sc_support);
++#endif
+ #if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+                 /* open_fw patch 0044: the config entries are allocated (btc_config_set_*): out of memory, upstream
+                  * asserted (reset while recording). Drop whatever part was written and report the pairing as failed:
+diff --git a/open_fw/third_party/bluedroid/host/bluedroid/stack/btm/btm_sec.c b/open_fw/third_party/bluedroid/host/bluedroid/stack/btm/btm_sec.c
+index 615385d..d621f3e 100644
+--- a/open_fw/third_party/bluedroid/host/bluedroid/stack/btm/btm_sec.c
++++ b/open_fw/third_party/bluedroid/host/bluedroid/stack/btm/btm_sec.c
+@@ -4934,9 +4934,21 @@ void btm_sec_link_key_notification (UINT8 *p_bda, UINT8 *p_link_key, UINT8 key_t
+     } else {
+         BTM_TRACE_EVENT ("Remote device does not support Secure Connection");
+     }
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++    /* open_fw patch 0048: remember HCI_LKEY_TYPE_CHANGED_COMB across delayed remote-name resolution while keeping the
++     * link's original authenticated link_key_type in p_dev_rec, so btc_dm + the app distinguish key rotation on an
++     * existing MITM bond from an unconfirmed new pairing. */
++    if (key_type == BTM_LKEY_TYPE_CHANGED_COMB) {
++        p_dev_rec->link_key_changed = TRUE;
++    } else {
++        p_dev_rec->link_key_changed = FALSE;
++        p_dev_rec->link_key_type = key_type;
++    }
++#else
+     if (key_type != BTM_LKEY_TYPE_CHANGED_COMB) {
+         p_dev_rec->link_key_type = key_type;
+     }
++#endif
+ 
+     p_dev_rec->sec_flags |= BTM_SEC_LINK_KEY_KNOWN;
+ 
+@@ -5046,10 +5058,19 @@ void btm_sec_link_key_notification (UINT8 *p_bda, UINT8 *p_link_key, UINT8 key_t
+                 BTM_TRACE_DEBUG ("btm_sec_link_key_notification()  LTK derived LK is saved already"
+                                  " (key_type = %d)\n", p_dev_rec->link_key_type);
+             } else {
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++                UINT8 cb_key_type = p_dev_rec->link_key_changed ? BTM_LKEY_TYPE_CHANGED_COMB : p_dev_rec->link_key_type;
++                p_dev_rec->link_key_changed = FALSE;
++                (*btm_cb.api.p_link_key_callback) (p_bda, p_dev_rec->dev_class,
++                                                   p_dev_rec->sec_bd_name,
++                                                   p_link_key, cb_key_type,
++                                                   p_dev_rec->remote_supports_secure_connections);
++#else
+                 (*btm_cb.api.p_link_key_callback) (p_bda, p_dev_rec->dev_class,
+                                                    p_dev_rec->sec_bd_name,
+                                                    p_link_key, p_dev_rec->link_key_type,
+                                                    p_dev_rec->remote_supports_secure_connections);
++#endif
+             }
+         }
+     }
+@@ -5883,10 +5904,19 @@ static void btm_sec_collision_timeout (TIMER_LIST_ENT *p_tle)
+ static void btm_send_link_key_notif (tBTM_SEC_DEV_REC *p_dev_rec)
+ {
+     if (btm_cb.api.p_link_key_callback) {
++#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
++        UINT8 cb_key_type = p_dev_rec->link_key_changed ? BTM_LKEY_TYPE_CHANGED_COMB : p_dev_rec->link_key_type;
++        p_dev_rec->link_key_changed = FALSE;
++        (*btm_cb.api.p_link_key_callback) (p_dev_rec->bd_addr, p_dev_rec->dev_class,
++                                           p_dev_rec->sec_bd_name, p_dev_rec->link_key,
++                                           cb_key_type,
++                                           p_dev_rec->remote_supports_secure_connections);
++#else
+         (*btm_cb.api.p_link_key_callback) (p_dev_rec->bd_addr, p_dev_rec->dev_class,
+                                            p_dev_rec->sec_bd_name, p_dev_rec->link_key,
+                                            p_dev_rec->link_key_type,
+                                            p_dev_rec->remote_supports_secure_connections);
++#endif
+ 
+     }
+ }

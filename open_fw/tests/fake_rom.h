@@ -230,6 +230,7 @@ void fake_peer_ghost_end(uint8_t status);            /* the rejected link ends: 
 void fake_peer_name_release(void);                   /* the held name request completes (E0D3 with the name) */
 void fake_peer_role_switch(uint8_t new_role);        /* the peer switches roles: E461 {0, addr, our new role} */
 void fake_peer_max_slots(uint8_t slots);             /* E468 Max Slots Change on the peer's link */
+void fake_peer_change_link_key(const uint8_t new_key[16]); /* master rotates link key: E466 {addr, key[16], type 0x06} */
 
 /* ---- headphones path: discoverable devices other than the scripted peer (inquiry results and names only; a page
  * to one of them times out like an out-of-range device) ---- */
