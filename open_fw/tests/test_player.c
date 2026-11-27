@@ -23,6 +23,7 @@ enum { FLUSH_LOG = 16 };
 static unsigned flush_at[FLUSH_LOG], flush_ms[FLUSH_LOG];
 static int16_t slot_l[AUDIO_DAC_QUEUE_SLOTS][SLOT_FRAMES], slot_r[AUDIO_DAC_QUEUE_SLOTS][SLOT_FRAMES];
 static unsigned read_last_ms;
+static unsigned fail_read_after_frames;
 static unsigned win_from, win_to, win_writes, win_reads; /* activity inside [win_from, win_to) */
 static int16_t before_win_l;     /* last left sample submitted before win_from */
 static int max_scrub_speed;
@@ -212,6 +213,10 @@ int exfat_read_file(const exfat_vol_t *vol, const exfat_entry_t *ent,
 {
     (void)vol;
     assert(offset + len <= ent->size);
+    if (fail_read_after_frames && consumed >= fail_read_after_frames) {
+        *got = 0;
+        return -1;
+    }
     if (offset > 0u) {
         if (pcm_read_idx > 0u && (offset & 511u) != 0u) {
             unaligned_reads_after_first++;
@@ -940,7 +945,7 @@ static void test_pause_zero_loss_and_ima2048(void)
     for (unsigned ch = 1; ch <= 2; ch++) {
         uint16_t ba  = 2048u;
         uint16_t spb = (ch == 1u) ? 4089u : 2041u;
-        uint32_t nblk = 2u;
+        uint32_t nblk = 10u;
         uint32_t data_bytes = nblk * ba;
         memset(recording, 0, 60u + data_bytes);
         memcpy(&recording[0], "RIFF", 4u);
@@ -977,6 +982,12 @@ static void test_pause_zero_loss_and_ima2048(void)
         assert(openfw_play_file_ui(&vol, "/record", "test.wav", &m) == 0);
         assert(ended == 1);
         assert(consumed == nblk * spb);
+
+        /* One second lands inside a block in both formats. */
+        m.play_file.resume_sec = 1u;
+        reset_run(pause_resume_then_finish);
+        assert(openfw_play_file_ui(&vol, "/record", "test.wav", &m) == 0);
+        assert(ended && consumed == nblk * spb - 16000u);
     }
 
     /* 4. Unaligned IMA-ADPCM (data_offset=60, block_align=256, spb=505, multi-read) keeps every read 512B aligned */
@@ -1212,6 +1223,21 @@ static void test_autoplay(void)
     assert(consumed == FRAMES && count == 0);
     assert(m.play_file.resume_sec == 0u);
     assert(ended == 0); /* never sat on the End screen */
+
+    /* An SD error during playback must preserve the audible position. */
+    synth_frames = 60u * 16000u;
+    file_size = 44u + synth_frames * 4u;
+    assert(!wav_build_header(recording, 16000, 2, 16, file_size - 44u));
+    reset_run(NULL);
+    m.play_file.resume_sec = 10u;
+    fail_read_after_frames = 17000u;
+    assert(openfw_play_file_ui(&vol, "/record", "test.wav", &m) == 0);
+    assert(!ended && consumed >= fail_read_after_frames);
+    assert(m.play_file.resume_sec == 10u + consumed / 16000u);
+    fail_read_after_frames = 0;
+    synth_frames = 0;
+    file_size = 44u + FRAMES * 4u;
+    assert(!wav_build_header(recording, 16000, 2, 16, file_size - 44u));
 
     /* Autoplay folder but last track: stops at the end as before. The tick
      * callback (position memory) sees the live position and the End state. */

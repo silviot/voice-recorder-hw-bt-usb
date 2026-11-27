@@ -1013,10 +1013,12 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
 
     uint32_t data_off      = 0u;
     uint32_t played_frames = 0u;
+    uint32_t skip_frames   = 0u;
     if (m->play_file.resume_sec > 0u && winfo.sample_rate > 0u) {
         uint64_t target = (uint64_t)m->play_file.resume_sec * (uint64_t)winfo.sample_rate;
         if (target < (uint64_t)winfo.total_samples) {
             player_seek_to_frame(&winfo, target, &data_off, &played_frames);
+            skip_frames = (uint32_t)target - played_frames;
         }
     }
     const int16_t *pcm_buf = (winfo.format_tag == WAV_FMT_PCM)
@@ -1024,7 +1026,6 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
                            : g_dec_pcm;
     uint32_t buf_pos       = 0u;
     uint32_t buf_frames    = 0u;
-    uint32_t skip_frames   = 0u;
     uint8_t  peak_l_pct    = 0u;
     uint8_t  peak_r_pct    = 0u;
     scrub_t  scrub         = {0};
@@ -1377,15 +1378,9 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
                     uint32_t got = 0u;
                     if (wav_read_aligned(vol, &wav_ent, (uint64_t)winfo.data_offset + data_off,
                                          g_file_buf, chunk, &got) != 0 || got < chunk) {
-                        data_off = winfo.data_bytes;
-                        if (!aout_is_busy()) {
-                            eof_reached = 1;
-                            peak_l_pct  = 0u;
-                            peak_r_pct  = 0u;
-                            PA_SET(0);
-                            ui_dirty    = 1;
-                        }
-                        break;
+                        /* Preserve the heard position on media errors. Only a
+                         * drained track should trigger autoplay and clear it. */
+                        goto playback_done;
                     }
                     data_off += chunk;
 
@@ -1555,10 +1550,14 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
         }
     }
 
+playback_done:
     if (scrub.speed) {
         uint32_t heard = scrub_heard(&scrub, winfo.total_samples);
         m->play_pos_sec = frames_to_ms(heard, winfo.sample_rate) / 1000u;
         eof_reached = heard == winfo.total_samples;
+    } else {
+        uint32_t heard = player_heard_frames(played_frames, skip_frames);
+        m->play_pos_sec = frames_to_ms(heard, winfo.sample_rate) / 1000u;
     }
     aout_stop();
     m->play_file.resume_sec = eof_reached ? 0u : m->play_pos_sec;

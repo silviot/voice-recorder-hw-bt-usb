@@ -3553,29 +3553,32 @@ static void apm_player_tick(uint32_t now_ms)
     }
 }
 
-/* Before g_files[idx] starts: pick its remembered position and focus it. */
-static void apm_begin_track(int idx)
+/* Set up the resume position and remember the track before playback starts. */
+static void apm_begin_track(const char *dir, ui_file_entry_t *file)
 {
-    g_apm.active = 0u;
-    g_ui.play_tick_cb = 0;
     apm_flush();
-    if (!dir_has_autoplay_cached(g_file_dirs[idx])) {
-        return;
+    g_apm.active = 0u;
+    if (dir_has_autoplay_cached(dir) &&
+        apmem_file_tag(&g_exfat_vol, dir, file->filename, &g_apm.tag) == 0) {
+        copy_cstr(g_apm.dir, (int)sizeof(g_apm.dir), dir);
+        copy_cstr(g_apm.name, (int)sizeof(g_apm.name), file->filename);
+        uint32_t saved = file->resume_sec;
+        (void)apmem_load_pos(&g_exfat_vol, dir, file->filename, g_apm.tag, &saved);
+        file->resume_sec = apmem_resume_pos(saved, file->duration_sec);
+        if (!g_apm.failed && !recorder_is_saving() &&
+            apmem_save_focus(&g_exfat_vol, dir, file->filename) != 0) {
+            g_apm.failed = 1u;
+        }
+        g_apm.active = 1u;
     }
-    copy_cstr(g_apm.dir, (int)sizeof(g_apm.dir), g_file_dirs[idx]);
-    copy_cstr(g_apm.name, (int)sizeof(g_apm.name), g_files[idx].filename);
-    if (apmem_file_tag(&g_exfat_vol, g_apm.dir, g_apm.name, &g_apm.tag) != 0) {
-        return;
+    g_ui.play_file = *file;
+    g_ui.last_file = *file;
+    copy_cstr(g_last_dir, (int)sizeof(g_last_dir), dir);
+    g_ui.has_last = 1;
+    if (!recorder_is_saving()) {
+        save_persisted_state();
     }
-    uint32_t saved = g_files[idx].resume_sec;
-    (void)apmem_load_pos(&g_exfat_vol, g_apm.dir, g_apm.name, g_apm.tag, &saved);
-    g_files[idx].resume_sec = apmem_resume_pos(saved, g_files[idx].duration_sec);
-    if (!g_apm.failed && !recorder_is_saving() &&
-        apmem_save_focus(&g_exfat_vol, g_apm.dir, g_apm.name) != 0) {
-        g_apm.failed = 1u;
-    }
-    g_apm.active = 1u;
-    apmem_sched_start(&g_apm.sched, millis(), g_files[idx].resume_sec);
+    apmem_sched_start(&g_apm.sched, millis(), file->resume_sec);
     g_ui.play_tick_cb = apm_player_tick;
 }
 
@@ -3671,24 +3674,10 @@ static void play_file_at_index(int start_idx)
                                                   g_ui.file_count, idx);
 
         g_ui_screen = UI_SCR_PLAYER;
-        g_ui.play_file     = g_files[idx];
         g_ui.play_has_prev = (prev_idx >= 0) ? 1u : 0u;
         g_ui.play_has_next = (next_idx < g_ui.file_count) ? 1u : 0u;
         g_ui.play_autoplay = (auto_idx >= 0 && dir_has_autoplay_cached(g_file_dirs[idx])) ? 1u : 0u;
-        /* Record the track as "last played" before it starts so a power-off
-         * mid-track (also after an automatic advance) resumes this track. */
-        apm_begin_track(idx); /* autoplay folder: remembered position + focus */
-        g_ui.play_file = g_files[idx];
-        g_ui.last_file = g_files[idx];
-        copy_cstr(g_last_dir, (int)sizeof(g_last_dir), g_file_dirs[idx]);
-        g_ui.has_last  = 1;
-        if (!g_apm.active) {
-            apmem_sched_start(&g_apm.sched, millis(), g_files[idx].resume_sec);
-            g_ui.play_tick_cb = apm_player_tick;
-            if (!recorder_is_saving()) {
-                save_persisted_state();
-            }
-        }
+        apm_begin_track(g_file_dirs[idx], &g_files[idx]);
         int rc = openfw_play_file_ui(&g_exfat_vol, g_file_dirs[idx], g_files[idx].filename, &g_ui);
         keys_ignore_held();
         hp_player_toast_keep();
@@ -3799,15 +3788,17 @@ static void play_named_file(const char *dir, ui_file_entry_t *entry)
     }
 #endif
     g_ui_screen        = UI_SCR_PLAYER;
-    g_ui.play_file     = *entry;
+    apm_begin_track(dir, entry);
     g_ui.play_has_prev = 0u;
     g_ui.play_has_next = 0u;
     g_ui.play_autoplay = 0u;
-    (void)openfw_play_file_ui(&g_exfat_vol, dir, entry->filename, &g_ui);
+    int rc = openfw_play_file_ui(&g_exfat_vol, dir, entry->filename, &g_ui);
+    apm_end_track(rc);
     keys_ignore_held();
     hp_player_toast_keep();
     backlight_note_activity(millis());
     entry->resume_sec = g_ui.play_file.resume_sec;
+    g_ui.last_file = g_ui.play_file;
     save_persisted_state();
 #if OPENFW_BT_HP
     if (bt_hp_active()) {

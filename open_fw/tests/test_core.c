@@ -1039,6 +1039,7 @@ static void test_apmem_policy(void)
     assert(apmem_resume_pos(589u, 600u) == 589u);
     assert(apmem_resume_pos(590u, 600u) == 0u);
     assert(apmem_resume_pos(700u, 600u) == 0u);
+    assert(apmem_resume_pos(UINT32_MAX, 600u) == 0u);
     assert(apmem_resume_pos(120u, 0u) == 0u);
     assert(apmem_resume_pos(5u, 12u) == 0u); /* tiny file */
     assert(apmem_store_pos(120u, 600u, 0) == 120u);

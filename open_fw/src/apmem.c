@@ -231,7 +231,7 @@ uint32_t apmem_resume_pos(uint32_t saved_sec, uint32_t dur_sec)
     if (saved_sec == 0u || dur_sec == 0u) {
         return 0u; /* unknown length: never seek blind */
     }
-    if (saved_sec + APMEM_TAIL_SEC >= dur_sec) {
+    if (saved_sec >= dur_sec || dur_sec - saved_sec <= APMEM_TAIL_SEC) {
         return 0u; /* past the end or in the closing seconds: treat as finished */
     }
     return saved_sec;
