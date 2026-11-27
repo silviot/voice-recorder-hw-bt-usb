@@ -338,7 +338,7 @@ static void backlight_service(void)
     g_fade_out_reason = SCREEN_AWAKE;
     lcd_backlight_set(0u); /* disconnect the PWM from the pad */
     ui_render_screen(UI_SCR_OFF, &g_ui);
-    cpu1_ui_sync(60u);
+    cpu1_ui_sync(300u);
     /* When hardware IPC Mailbox WFE is active, CPU1 is already halted in
      * zero-power WFE sleep; only park CPU1 in reset when WFE is unavailable. */
     if (!cpu1_ui_wfe_active()) {
@@ -4140,7 +4140,7 @@ int openfw_main(void)
 
     refresh_telemetry();
     ui_render_screen(scr, &g_ui);
-    cpu1_ui_sync(250u);
+    cpu1_ui_sync(500u);
     openfw_log_puts("UI_FIRST_US=");
     openfw_log_u32(g_ui_last_render_us);
     openfw_log_puts(" LOAD=");
@@ -5064,8 +5064,10 @@ int openfw_main(void)
         backlight_update();
 
         if (dirty && !g_screen_off) {
-            ui_render_screen(scr, &g_ui);
-            dirty = 0;
+            if (!cpu1_ui_is_busy()) {
+                ui_render_screen(scr, &g_ui);
+                dirty = 0;
+            }
         } else if (!g_screen_off) {
             /* Keep LVGL timers & animations ticking (no-op when CPU1 drives UI) */
             ui_dispatch_tick();

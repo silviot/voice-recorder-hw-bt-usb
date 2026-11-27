@@ -174,6 +174,9 @@ test-bt-hp:
 	$(BT_HP_CC) -O1 -g -Wall -Wextra -Werror -fsanitize=thread -iquote bt_port -Itests tests/test_hp_sink.c \
 		bt_port/hp_sink.c -lm -pthread -o $(BT_HP_TEST_DIR)/test_hp_sink_tsan
 	TSAN_OPTIONS="halt_on_error=1" $(BT_HP_TEST_DIR)/test_hp_sink_tsan --stress-only 3
+	$(BT_HP_CC) -O1 -g -Wall -Wextra -Werror -fsanitize=thread -DOPENFW_CPU1_IPC_HOST_ATOMIC=1 -Iinclude \
+		tests/test_cpu1_ipc.c -pthread -o $(BT_HP_TEST_DIR)/test_cpu1_ipc_tsan
+	TSAN_OPTIONS="halt_on_error=1" $(BT_HP_TEST_DIR)/test_cpu1_ipc_tsan
 	@# vendored SBC codec: shifts of negative values and wrapping fixed-point sums are its idiom (2s complement on both targets)
 	@mkdir -p $(BT_HP_TEST_DIR)/sbc
 	@for f in $(BT_HP_SBC_ENC) $(BT_HP_SBC_DEC); do \

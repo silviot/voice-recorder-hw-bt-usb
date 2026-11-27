@@ -853,6 +853,31 @@ int main(int argc, char **argv)
     ui_render_screen(UI_SCR_SAVED, &m);
     assert(g_written_pixels == before);
 
+    /* Final 5% SAVED countdown frame -> UI_SCR_HOME transition must complete hardware push
+     * AND rebind home_scroll_event even if LVGL TLSF reuses the prior home_details pointer. */
+    m.saved_frac_pct = 5;
+    ui_render_screen(UI_SCR_SAVED, &m);
+    ui_render_screen(UI_SCR_HOME, &m);
+    assert(ui_port_is_animating());
+    s_now += 200u;
+    ui_port_task_handler();
+    assert(!ui_port_is_animating());
+    assert(g_ssa == 0u);
+    assert(lv_obj_get_scrollbar_mode(objects.home_details) == LV_SCROLLBAR_MODE_OFF);
+    m.home_focus = 2;
+    ui_render_screen(UI_SCR_HOME, &m);
+    s_now += 300u;
+    ui_port_task_handler();
+    ui_port_render_now();
+    assert(lv_obj_get_x(objects.home_focus_mark) == lv_obj_get_x(objects.home_tile_2) +
+           (lv_obj_get_width(objects.home_tile_2) - lv_obj_get_width(objects.home_focus_mark)) / 2);
+    assert(lv_obj_get_scroll_x(objects.home_details) == 2 * page_width);
+    m.home_focus = 1;
+    ui_render_screen(UI_SCR_HOME, &m);
+    s_now += 300u;
+    ui_port_task_handler();
+    assert(!ui_port_is_animating());
+
     /* 4: Files list */
     ui_render_screen(UI_SCR_FILES, &m);
     capture_shot(4);

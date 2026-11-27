@@ -21,6 +21,7 @@
 
 static lv_image_dsc_t          s_spec_dsc;
 static enum ScreensEnum        s_active_eez_scr = (enum ScreensEnum)0;
+static lv_obj_t               *s_home_bound_view = NULL;
 static const ui_spectrogram_t *s_last_spec_ptr  = NULL;
 static uint32_t                s_last_spec_sig  = 0u;
 
@@ -553,7 +554,6 @@ static void bind_home(const ui_model_t *m, bool entering)
             set_changed_text_color(lbls[i], ink);
         }
 
-        static lv_obj_t *s_home_bound_view = NULL;
         lv_obj_t *view = objects.home_details;
         if (entering) {
             if (view != s_home_bound_view) {
@@ -1829,6 +1829,10 @@ void ui_render_screen_sync(ui_screen_id_t scr, const ui_model_t *m)
         if (!entering && lv_screen_active()) lv_obj_invalidate(lv_screen_active());
     } else if (entering) {
         ui_transition(nav_transition(s_active_eez_scr, target));
+    }
+    if (entering) {
+        /* loadScreen() frees the previous screen; clear cached pointers in case TLSF reuses the address. */
+        s_home_bound_view = NULL;
     }
     loadScreen(target);
     s_active_eez_scr = target;

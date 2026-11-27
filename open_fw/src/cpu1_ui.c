@@ -21,6 +21,9 @@
 #include "openfw.h"
 #include "openfw_ui.h"
 #include "ui/ui_port.h"
+#ifndef OPENFW_HOST_MMIO
+#include "openfw_cpu1_ipc.h"
+#endif
 
 #define CPU1_CMD_RENDER        1u
 #define CPU1_CMD_REC_LIVE      2u
@@ -64,25 +67,19 @@ volatile uint32_t g_ui_heap_used      = 0u;
 static uint32_t       g_cpu1_stack[CPU1_STACK_WORDS] __attribute__((aligned(8)));
 static cpu1_ui_slot_t s_slots[2] OPENFW_SRAM_HI;
 
-static volatile uint32_t s_req_word             = 0u;    /* (seq << 1) | slot_idx */
-static volatile uint32_t s_ack_seq              = 0u;
-static volatile uint32_t s_cpu1_reading_slot    = 0xFFu; /* 0, 1, or 0xFF (idle) */
+static cpu1_ipc_t        s_ipc;
 static volatile uint32_t s_cpu1_anim_period_ms  = 0u;    /* 0 = static, 4 = push, 16 = LVGL anim */
 static uint32_t          s_cpu1_last_wake_ms    = 0u;
 static volatile uint8_t  s_cpu0_in_mbox         = 0u;
 static volatile uint32_t s_cpu1_stop_req        = 0u;
-static volatile uint32_t s_cpu1_stopped      = 0u;
-static volatile uint32_t s_mbox_probe_done   = 0u;
-static volatile uint8_t  s_spec_reset_pend   = 0u;
-static volatile uint8_t  s_spec_marker_pend  = 0u;
-static ui_spectrogram_t *volatile s_spec_ptr = NULL;
-static uint8_t           s_cpu1_active       = 0u;
-static uint8_t           s_lvgl_poisoned     = 0u;
-static uint8_t           s_poison_logged     = 0u;
-static uint32_t          s_last_seq          = 0u;
-static uint32_t          s_last_slot         = 0u;
-static uint32_t          s_stall_ack_seen    = 0u;
-static uint64_t          s_stall_since_us    = 0ull;
+static volatile uint32_t s_cpu1_stopped         = 0u;
+static volatile uint32_t s_mbox_probe_done      = 0u;
+static volatile uint8_t  s_spec_reset_pend      = 0u;
+static volatile uint8_t  s_spec_marker_pend     = 0u;
+static ui_spectrogram_t *volatile s_spec_ptr    = NULL;
+static uint8_t           s_cpu1_active          = 0u;
+static uint8_t           s_lvgl_poisoned        = 0u;
+static uint8_t           s_poison_logged        = 0u;
 
 static inline int cpu1_canary_corrupt(void)
 {
@@ -190,7 +187,7 @@ static void cpu1_fault_c(const uint32_t *frame, uint32_t ipsr)
     g_cpu1_fault_pc       = pc;
     g_cpu1_fault_cfsr     = SCB_CFSR;
     s_cpu1_anim_period_ms = 0u;
-    s_cpu1_reading_slot   = 0xFFu;
+    cpu1_ipc_abort_read(&s_ipc);
     g_cpu1_faulted      = 1u;
     s_cpu1_stopped      = 1u;
     OPENFW_DSB();
@@ -223,7 +220,7 @@ void openfw_lv_assert_handler(const char *file, int line)
         g_cpu1_fault_pc       = (uint32_t)(uintptr_t)file;
         g_cpu1_fault_cfsr     = 0x4C560000u | ((uint32_t)line & 0xFFFFu);
         s_cpu1_anim_period_ms = 0u;
-        s_cpu1_reading_slot   = 0xFFu;
+        cpu1_ipc_abort_read(&s_ipc);
         g_cpu1_faulted      = 2u;
         s_cpu1_stopped      = 1u;
         OPENFW_DSB();
@@ -305,7 +302,7 @@ static void cpu1_entry_c(void)
     while (1) {
         if (s_cpu1_stop_req != 0u) {
             s_cpu1_anim_period_ms = 0u;
-            s_cpu1_reading_slot   = 0xFFu;
+            cpu1_ipc_abort_read(&s_ipc);
             s_cpu1_stopped        = 1u;
             OPENFW_DSB();
             /* Halt completely bus-silent (IRQs are masked) before CPU0 asserts reset */
@@ -314,19 +311,8 @@ static void cpu1_entry_c(void)
             }
         }
 
-        uint32_t w   = s_req_word;
-        uint32_t seq = w >> 1;
-        if (seq != s_ack_seq) {
-            uint32_t idx = w & 1u;
-            s_cpu1_reading_slot = idx;
-            OPENFW_DSB();
-            /* Verify CPU0 did not advance s_req_word before seeing s_cpu1_reading_slot */
-            if (s_req_word != w) {
-                s_cpu1_reading_slot = 0xFFu;
-                OPENFW_DSB();
-                continue;
-            }
-
+        uint32_t idx = 0u, seq = 0u;
+        if (cpu1_ipc_claim_read(&s_ipc, &idx, &seq)) {
             const cpu1_ui_slot_t *slot = &s_slots[idx];
             uint64_t t0 = us_timer_now();
             ui_spectrogram_t *sp = slot->model.spec ? slot->model.spec : s_spec_ptr;
@@ -354,7 +340,7 @@ static void cpu1_entry_c(void)
                 g_cpu1_fault_pc       = 0xDEAD57ACu;
                 g_cpu1_fault_cfsr     = 0x57AC0000u;
                 s_cpu1_anim_period_ms = 0u;
-                s_cpu1_reading_slot   = 0xFFu;
+                cpu1_ipc_abort_read(&s_ipc);
                 g_cpu1_faulted        = 3u;
                 s_cpu1_stopped        = 1u;
                 OPENFW_DSB();
@@ -375,10 +361,7 @@ static void cpu1_entry_c(void)
             }
             s_cpu1_anim_period_ms = ui_port_anim_period_ms();
 
-            OPENFW_DSB();
-            s_ack_seq           = seq;
-            s_cpu1_reading_slot = 0xFFu;
-            OPENFW_DSB();
+            cpu1_ipc_finish_read(&s_ipc, seq);
             last_tick_ms = millis();
             continue;
         }
@@ -395,7 +378,7 @@ static void cpu1_entry_c(void)
                 g_cpu1_fault_pc       = 0xDEAD57ACu;
                 g_cpu1_fault_cfsr     = 0x57AC0001u;
                 s_cpu1_anim_period_ms = 0u;
-                s_cpu1_reading_slot   = 0xFFu;
+                cpu1_ipc_abort_read(&s_ipc);
                 g_cpu1_faulted        = 3u;
                 s_cpu1_stopped        = 1u;
                 OPENFW_DSB();
@@ -411,7 +394,7 @@ static void cpu1_entry_c(void)
             /* True zero-power Cortex-M4 WFE sleep woken in <1 us by CPU0 IPC Mailbox ch0 */
             cpu1_mbox_drain_and_clear();
             OPENFW_DSB();
-            if ((s_req_word >> 1) != s_ack_seq || s_cpu1_stop_req != 0u ||
+            if (cpu1_ipc_has_pending_req(&s_ipc) || s_cpu1_stop_req != 0u ||
                 (s_cpu1_anim_period_ms != 0u &&
                  (uint32_t)(millis() - last_tick_ms) >= s_cpu1_anim_period_ms)) {
                 continue;
@@ -437,28 +420,18 @@ static void cpu1_submit_slot(uint8_t kind, ui_screen_id_t scr, const ui_model_t 
     if (s_lvgl_poisoned != 0u) {
         return;
     }
-    uint64_t now_us = us_timer_now();
-    /* Guard against a stalled/faulted CPU1: park it and mark LVGL poisoned
+    if (g_cpu1_faulted != 0u || cpu1_canary_corrupt()) {
+        cpu1_poison_and_stop(g_cpu1_faulted ? "fault" : "canary");
+        return;
+    }
+    /* Guard against a genuinely hung CPU1 (>3 s): park it and mark LVGL poisoned
      * so CPU0 never renders against partially mutated LVGL/EEZ heap state. */
-    if (s_ack_seq == s_last_seq) {
-        s_stall_since_us = 0ull;
-    } else if (s_stall_since_us == 0ull || s_ack_seq != s_stall_ack_seen) {
-        s_stall_ack_seen = s_ack_seq;
-        s_stall_since_us = now_us;
-    } else if ((now_us - s_stall_since_us) > 250000ull) {
+    if (cpu1_ipc_check_stalled(&s_ipc, us_timer_now())) {
         cpu1_poison_and_stop("stall");
         return;
     }
 
-    uint32_t next = s_last_slot ^ 1u;
-    uint64_t t0   = now_us;
-    while (s_cpu1_reading_slot == next) {
-        if (g_cpu1_faulted != 0u || cpu1_canary_corrupt() || (us_timer_now() - t0) > 100000ull) {
-            cpu1_poison_and_stop(g_cpu1_faulted ? "fault" : (cpu1_canary_corrupt() ? "canary" : "slot busy"));
-            return;
-        }
-        OPENFW_NOP();
-    }
+    uint32_t next = cpu1_ipc_begin_write(&s_ipc);
 
     cpu1_ui_slot_t *slot = &s_slots[next];
     slot->scr          = scr;
@@ -515,16 +488,7 @@ static void cpu1_submit_slot(uint8_t kind, ui_screen_id_t scr, const ui_model_t 
         }
     }
 
-    uint32_t seq = (s_last_seq + 1u) & 0x7FFFFFFFu;
-    if (seq == 0u) {
-        seq = 1u;
-    }
-    s_last_seq  = seq;
-    s_last_slot = next;
-
-    OPENFW_DSB();
-    s_req_word = (seq << 1) | next;
-    OPENFW_DSB();
+    cpu1_ipc_publish_write(&s_ipc, next);
     if (g_cpu1_wfe_ok != 0u) {
         cpu1_ring_mbox();
     }
@@ -558,24 +522,18 @@ int cpu1_ui_start(void)
     for (uint32_t i = 0u; i < CPU1_STACK_WORDS; i++) {
         g_cpu1_stack[i] = CPU1_STACK_CANARY;
     }
-    g_cpu1_alive        = 0u;
-    g_cpu1_faulted      = 0u;
-    g_cpu1_fault_pc     = 0u;
-    g_cpu1_fault_cfsr   = 0u;
-    g_cpu1_wfe_ok       = 0u;
-    s_req_word          = 0u;
-    s_ack_seq           = 0u;
-    s_cpu1_reading_slot   = 0xFFu;
+    g_cpu1_alive          = 0u;
+    g_cpu1_faulted        = 0u;
+    g_cpu1_fault_pc       = 0u;
+    g_cpu1_fault_cfsr     = 0u;
+    g_cpu1_wfe_ok         = 0u;
+    cpu1_ipc_init(&s_ipc);
     s_cpu1_anim_period_ms = 0u;
     s_cpu1_last_wake_ms   = 0u;
     s_cpu0_in_mbox        = 0u;
     s_cpu1_stop_req       = 0u;
-    s_cpu1_stopped      = 0u;
-    s_mbox_probe_done   = 0u;
-    s_last_seq          = 0u;
-    s_last_slot         = 0u;
-    s_stall_ack_seen    = 0u;
-    s_stall_since_us    = 0ull;
+    s_cpu1_stopped        = 0u;
+    s_mbox_probe_done     = 0u;
 
     CPU1_BOOT_TRAMP   = ((uint32_t)(uintptr_t)cpu1_trampoline) | 1u;
     CPU1_BOOT_SP      = (uint32_t)(uintptr_t)&g_cpu1_stack[CPU1_STACK_WORDS];
@@ -631,13 +589,20 @@ void cpu1_ui_stop(void)
             cpu1_ring_mbox();
         }
         uint64_t t0 = us_timer_now();
-        while (s_cpu1_stopped == 0u && (us_timer_now() - t0) < 50000ull) {
-            OPENFW_NOP();
+        while (s_cpu1_stopped == 0u && g_cpu1_faulted == 0u &&
+               (us_timer_now() - t0) < 500000ull) {
+            uint32_t pm = 0u;
+            __asm__ volatile ("mrs %0, primask" : "=r"(pm));
+            if ((pm & 1u) == 0u) {
+                OPENFW_TASK_WAIT();
+            } else {
+                OPENFW_NOP();
+            }
         }
         int unclean = (s_cpu1_stopped == 0u || g_cpu1_faulted != 0u || cpu1_canary_corrupt());
         s_cpu1_active         = 0u;
         s_cpu1_anim_period_ms = 0u;
-        s_cpu1_reading_slot   = 0xFFu;
+        cpu1_ipc_abort_read(&s_ipc);
         if (unclean) {
             s_lvgl_poisoned = 1u;
             cpu1_log_poison("unclean stop");
@@ -655,6 +620,14 @@ int cpu1_ui_is_active(void)
     return (int)s_cpu1_active;
 }
 
+int cpu1_ui_is_busy(void)
+{
+    if (!cpu1_ui_is_active()) {
+        return 0;
+    }
+    return cpu1_ipc_is_busy(&s_ipc);
+}
+
 int cpu1_ui_wfe_active(void)
 {
     return (cpu1_ui_is_active() && g_cpu1_wfe_ok != 0u) ? 1 : 0;
@@ -667,7 +640,7 @@ void cpu1_ui_sync(uint32_t timeout_ms)
     }
     uint64_t t0      = us_timer_now();
     uint64_t lim_us  = (uint64_t)timeout_ms * 1000ull;
-    while (s_ack_seq != (s_req_word >> 1) || s_cpu1_reading_slot != 0xFFu) {
+    while (cpu1_ipc_is_busy(&s_ipc)) {
         if (g_cpu1_faulted != 0u || cpu1_canary_corrupt()) {
             cpu1_poison_and_stop(g_cpu1_faulted ? "sync fault" : "sync canary");
             return;
@@ -748,7 +721,7 @@ void ui_rec_update_live(const ui_model_t *m)
     if (cpu1_ui_is_active()) {
         /* Only post 20 Hz live meter/spec updates when CPU1 is idle so we never
          * overwrite a pending full-screen switch. */
-        if (s_ack_seq == (s_req_word >> 1) && s_cpu1_reading_slot == 0xFFu) {
+        if (!cpu1_ipc_is_busy(&s_ipc)) {
             cpu1_submit_slot(CPU1_CMD_REC_LIVE, UI_SCR_REC, m, NULL, 0u, 0u, 0, 0);
         }
         return;
@@ -768,7 +741,7 @@ void ui_rec_push_live(const ui_model_t *m, const int16_t *pcm, uint32_t frames,
     if (cpu1_ui_is_active()) {
         if (full_render) {
             cpu1_submit_slot(CPU1_CMD_RENDER, UI_SCR_REC, m, pcm, frames, channels, vor_paused, 1);
-        } else if (s_ack_seq == (s_req_word >> 1) && s_cpu1_reading_slot == 0xFFu) {
+        } else if (!cpu1_ipc_is_busy(&s_ipc)) {
             cpu1_submit_slot(CPU1_CMD_REC_LIVE, UI_SCR_REC, m, pcm, frames, channels, vor_paused, 1);
         }
         return;
@@ -797,7 +770,7 @@ void ui_dispatch_tick(void)
 int ui_dispatch_is_animating(void)
 {
     if (cpu1_ui_is_active()) {
-        return (s_cpu1_anim_period_ms != 0u || s_ack_seq != (s_req_word >> 1)) ? 1 : 0;
+        return (s_cpu1_anim_period_ms != 0u || cpu1_ipc_is_busy(&s_ipc)) ? 1 : 0;
     }
     if (s_lvgl_poisoned != 0u) {
         return 0;
@@ -810,6 +783,7 @@ int ui_dispatch_is_animating(void)
 int cpu1_ui_start(void)                  { return 0; }
 void cpu1_ui_stop(void)                  { }
 int cpu1_ui_is_active(void)              { return 0; }
+int cpu1_ui_is_busy(void)                { return 0; }
 int cpu1_ui_wfe_active(void)             { return 0; }
 void cpu1_ui_sync(uint32_t timeout_ms)   { (void)timeout_ms; }
 void cpu1_ui_systick_tick(uint32_t now_ms) { (void)now_ms; }

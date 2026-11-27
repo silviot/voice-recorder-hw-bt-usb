@@ -58,6 +58,7 @@ extern volatile uint32_t g_ui_heap_used;
 int  cpu1_ui_start(void);
 void cpu1_ui_stop(void);
 int  cpu1_ui_is_active(void);
+int  cpu1_ui_is_busy(void);
 int  cpu1_ui_wfe_active(void);
 void cpu1_ui_sync(uint32_t timeout_ms);
 void cpu1_ui_systick_tick(uint32_t now_ms);
