@@ -205,6 +205,51 @@ int main(void)
           "!started_here timeout should cancel page without stopping session (stop=%u disc=%u)",
           M.stop_calls, M.disc_calls);
 
+    /* 6. !started_here enters READY while an expiring background rc_poll connect is already in flight:
+     * when that inherited attempt fails with CONNECT_FAIL, autoconn must issue one fresh connect_addr(last, 0)
+     * instead of immediately failing user playback. */
+    mock_reset();
+    M.ui.state   = BT_HP_ST_READY;
+    M.ui.link    = BT_HP_LINK_CONNECTING;
+    M.ui.msg     = BT_HP_MSG_RECONNECTING;
+    M.ui.msg_seq = 5u;
+    bt_hp_autoconn_init(&ac, 0, 10000u, 5u);
+    CHECK(bt_hp_autoconn_step(&ac, 10000u, 0, 0, 0, &k_ops) == BT_HP_AC_WAIT && ac.inherited_conn == 1u &&
+              M.connect_calls == 0u,
+          "should wait on in-flight background reconnect first");
+    /* Expiring background attempt fails right as the user waits */
+    M.ui.link    = BT_HP_LINK_NONE;
+    M.ui.msg     = BT_HP_MSG_CONNECT_FAIL;
+    M.ui.msg_seq = 6u;
+    CHECK(bt_hp_autoconn_step(&ac, 15000u, 0, 0, 0, &k_ops) == BT_HP_AC_WAIT && M.connect_calls == 1u &&
+              ac.tried_connect == 1u && M.stop_calls == 0u,
+          "expiring rc_poll CONNECT_FAIL should retry connect_addr once (calls=%u)", M.connect_calls);
+    /* Succeeds on the fresh attempt */
+    M.ready = 1;
+    M.ui.link = BT_HP_LINK_OPEN;
+    M.ui.msg = BT_HP_MSG_CONNECTED;
+    M.ui.msg_seq = 7u;
+    CHECK(bt_hp_autoconn_step(&ac, 16500u, 0, 0, 0, &k_ops) == BT_HP_AC_READY, "fresh retry succeeded");
+
+    /* If the fresh attempt itself fails with CONNECT_FAIL, then report BT_HP_AC_FAIL_MSG */
+    mock_reset();
+    M.ui.state   = BT_HP_ST_READY;
+    M.ui.link    = BT_HP_LINK_CONNECTING;
+    M.ui.msg_seq = 8u;
+    bt_hp_autoconn_init(&ac, 0, 20000u, 8u);
+    CHECK(bt_hp_autoconn_step(&ac, 20000u, 0, 0, 0, &k_ops) == BT_HP_AC_WAIT, "enter on inherited connect");
+    M.ui.link    = BT_HP_LINK_NONE;
+    M.ui.msg     = BT_HP_MSG_CONNECT_FAIL;
+    M.ui.msg_seq = 9u;
+    CHECK(bt_hp_autoconn_step(&ac, 21000u, 0, 0, 0, &k_ops) == BT_HP_AC_WAIT && M.connect_calls == 1u,
+          "fresh attempt launched");
+    M.ui.link    = BT_HP_LINK_NONE;
+    M.ui.msg     = BT_HP_MSG_CONNECT_FAIL;
+    M.ui.msg_seq = 10u;
+    CHECK(bt_hp_autoconn_step(&ac, 26000u, 0, 0, 0, &k_ops) == BT_HP_AC_FAIL_MSG &&
+              ac.fail_msg == BT_HP_MSG_CONNECT_FAIL,
+          "second CONNECT_FAIL after fresh attempt must fail");
+
     printf("test_bt_hp_autoconn: %d checks, %d failures\n", g_checks, g_fail);
     return g_fail != 0;
 }

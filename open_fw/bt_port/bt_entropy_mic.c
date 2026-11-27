@@ -38,7 +38,7 @@ const char *bt_entropy_mic_status_str(int st)
 
 static int adc_busy(void)
 {
-    if (recorder_is_saving() || recorder_is_vor_waiting()) {
+    if (audio_dac_is_running() || recorder_is_saving() || recorder_is_vor_waiting()) {
         return 1;
     }
     if (!recorder_has_error()) {
@@ -56,11 +56,12 @@ static int adc_busy(void)
  * cleared: AMIC1 PGA enables (audio_amic_16k_init step 5) and ANA_CTRL0's high enables (0xC0000000). ANA_CTRL0 0x22,
  * the codec clock / global enable and DAC_ANA_CFG0[9] stay: keys.c sets them at boot for the PB11 jack detect. The APLL
  * stays as after a playback (audio_dac_stop leaves it too; its power-down is not traced). The next recorder or player
- * start re-initialises all of it. */
+ * start re-initialises all of it. Never clear bit 31 (0x80000000) while the DAC is running. */
 static void mic_analog_off(void)
 {
     openfw_mmio_clr32(CODEC_AMIC01_PGA_ADDR, 0x20430000u);
-    openfw_mmio_clr32(CODEC_ANA_CTRL0_ADDR, 0xC0000000u);
+    uint32_t ana_clr = audio_dac_is_running() ? 0x40000000u : 0xC0000000u;
+    openfw_mmio_clr32(CODEC_ANA_CTRL0_ADDR, ana_clr);
 }
 
 int bt_entropy_mic_collect(void)

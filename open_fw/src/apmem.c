@@ -324,10 +324,74 @@ int apmem_file_tag(exfat_vol_t *vol, const char *dir, const char *name, uint32_t
     return 0;
 }
 
+/* Cached .autoplay.state directory entry so periodic 60 s saves avoid re-walking directories. */
+static struct {
+    const exfat_vol_t *vol;
+    const blkdev_t    *dev;
+    uint32_t           part_lba;
+    uint32_t           heap_lba;
+    uint32_t           cluster_count;
+    char               dir[96];
+    exfat_entry_t      ent;
+    uint8_t            valid;
+} g_state_cache;
+
+void apmem_invalidate_cache(void)
+{
+    g_state_cache.valid = 0u;
+}
+
 static int state_usable(const exfat_entry_t *ent)
 {
     return !ent->is_dir && ent->size == APMEM_FILE_BYTES &&
            ent->valid_data_len >= APMEM_FILE_BYTES && ent->first_cluster >= 2u;
+}
+
+static int dir_eq_ci(const char *a, const char *b)
+{
+    uint32_t i = 0u;
+    while (a[i] != '\0' && b[i] != '\0') {
+        if (lower(a[i]) != lower(b[i])) {
+            return 0;
+        }
+        i++;
+    }
+    return a[i] == '\0' && b[i] == '\0';
+}
+
+static int cache_matches(const exfat_vol_t *vol, const char *dir)
+{
+    return g_state_cache.valid &&
+           g_state_cache.vol == vol &&
+           g_state_cache.dev == vol->dev &&
+           g_state_cache.part_lba == vol->part_lba &&
+           g_state_cache.heap_lba == vol->heap_lba &&
+           g_state_cache.cluster_count == vol->cluster_count &&
+           dir_eq_ci(g_state_cache.dir, dir);
+}
+
+static void cache_store(const exfat_vol_t *vol, const char *dir, const exfat_entry_t *ent)
+{
+    if (!vol || !dir || !ent || !state_usable(ent)) {
+        return;
+    }
+    uint32_t i = 0u;
+    while (dir[i] != '\0') {
+        if (i + 1u >= (uint32_t)sizeof(g_state_cache.dir)) {
+            g_state_cache.valid = 0u;
+            return;
+        }
+        g_state_cache.dir[i] = dir[i];
+        i++;
+    }
+    g_state_cache.dir[i]        = '\0';
+    g_state_cache.vol           = vol;
+    g_state_cache.dev           = vol->dev;
+    g_state_cache.part_lba      = vol->part_lba;
+    g_state_cache.heap_lba      = vol->heap_lba;
+    g_state_cache.cluster_count = vol->cluster_count;
+    g_state_cache.ent           = *ent;
+    g_state_cache.valid         = 1u;
 }
 
 /* Find (and with create != 0, create once) the folder's state file. */
@@ -337,13 +401,19 @@ static int state_open(exfat_vol_t *vol, const char *dir, int create, exfat_entry
     if (!vol || join_path(path, (uint32_t)sizeof(path), dir, APMEM_STATE_NAME) != 0) {
         return -1;
     }
+    if (!create && cache_matches(vol, dir) && state_usable(&g_state_cache.ent)) {
+        *ent = g_state_cache.ent;
+        return 0;
+    }
     if (exfat_find_path(vol, path, ent) == 0) {
         if (state_usable(ent)) {
+            cache_store(vol, dir, ent);
             return 0;
         }
         if (!create || ent->is_dir) {
             return -1;
         }
+        apmem_invalidate_cache();
         /* Truncated by a power cut during the one-time creation: start over */
         if (exfat_delete_file(vol, dir, APMEM_STATE_NAME) != 0) {
             return -1;
@@ -352,6 +422,7 @@ static int state_open(exfat_vol_t *vol, const char *dir, int create, exfat_entry
         return -1;
     }
 
+    apmem_invalidate_cache();
     exfat_writer_t w;
     if (exfat_create_file(vol, dir, APMEM_STATE_NAME, &w) != 0) {
         return -1;
@@ -368,6 +439,7 @@ static int state_open(exfat_vol_t *vol, const char *dir, int create, exfat_entry
     if (exfat_find_path(vol, path, ent) != 0 || !state_usable(ent)) {
         return -1;
     }
+    cache_store(vol, dir, ent);
     return 0;
 }
 
@@ -376,6 +448,7 @@ static int load_pair(exfat_vol_t *vol, const exfat_entry_t *ent, uint32_t lsec, 
 {
     uint32_t got = 0u;
     if (exfat_read_file(vol, ent, (uint64_t)lsec * 1024u, g_pair, 1024u, &got) != 0 || got != 1024u) {
+        apmem_invalidate_cache();
         bzero_n(g_pair, 1024u);
         return -2;
     }
@@ -409,7 +482,11 @@ static int edit_lsec(exfat_vol_t *vol, const char *dir, uint32_t lsec, int may_c
     }
     apmem_sec_seal(work, lsec, new_seq);
     uint32_t target = (cur == 0) ? 1u : 0u; /* overwrite the older / invalid copy */
-    return exfat_overwrite_sector(vol, &ent, (uint64_t)(lsec * 2u + target) * 512u, work);
+    if (exfat_overwrite_sector(vol, &ent, (uint64_t)(lsec * 2u + target) * 512u, work) != 0) {
+        apmem_invalidate_cache();
+        return -1;
+    }
+    return 0;
 }
 
 int apmem_load_pos(exfat_vol_t *vol, const char *dir, const char *name, uint32_t size_tag,

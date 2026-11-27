@@ -41,6 +41,7 @@
 #include "bt_rom_real.h"
 #include "bt_xrec_bluedroid.h"
 #include "bt_task_sup.h"
+#include "bt_hp.h"
 /* Bluedroid's osi thread API (osi/thread.h pulls in bt_common.h, whose bt_status_t clashes with openfw.h's). */
 typedef struct osi_thread osi_thread_t;
 bool osi_thread_post(osi_thread_t *thread, void (*func)(void *context), void *context, int queue_idx,
@@ -1276,9 +1277,9 @@ uint32_t bt_xrec_plat_poll(void)
     }
     uint32_t now = millis();
     session_entropy_poll(now);
-    if (recorder_is_saving()) {
-        /* F6: no second card writer while recording. The request stays set (the store stays dirty in RAM) and the
-         * bond file is written at the first poll after REC stops (or at the session end). */
+    if (recorder_is_saving() || bt_hp_streaming() || audio_dac_is_busy()) {
+        /* F6: no second card writer while recording or streaming audio. The request stays set (the store stays dirty in
+         * RAM) and the bond file is written once playback pauses/stops or at session end. */
     } else if (s_store_flush_req) {
         s_store_flush_req = 0u;
         bonds_write();

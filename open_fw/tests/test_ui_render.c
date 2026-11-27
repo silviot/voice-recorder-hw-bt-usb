@@ -1068,21 +1068,16 @@ int main(int argc, char **argv)
     ui_render_screen(UI_SCR_PLAYER, &m);
     assert(g_written_pixels == before);
 
-    /* Advance active word on same line -> smooth horizontal pill glide animation */
+    /* Advance active word on same line -> snaps immediately with zero LVGL animations (lowers CPU1 XIP contention) */
     int32_t pill_x0 = lv_obj_get_style_x(objects.ptr_word_pill, LV_PART_MAIN);
     m.tr_spoken_len = 15u; /* "the signal from" */
     m.tr_word_start = 11u; /* "from" */
     m.tr_word_len   = 4u;
     ui_render_screen(UI_SCR_PLAYER, &m);
-    assert(ui_port_is_animating());
-    for (int f = 0; f < 10; f++) {
-        s_now += 16u;
-        ui_port_task_handler();
-    }
     assert(!ui_port_is_animating());
     assert(lv_obj_get_style_x(objects.ptr_word_pill, LV_PART_MAIN) > pill_x0 + 20);
 
-    /* Advance top_line_id by +1 -> smooth vertical upward scroll animation on ptr_track */
+    /* Advance top_line_id by +1 locally -> vertical scroll animation on ptr_track */
     m.tr_lines[0] = (cwx_tr_slot_t){ 1, 0xFC15u, 3u, 1u, "left, but just heard" };
     m.tr_lines[1] = (cwx_tr_slot_t){ 2, 0xFC15u, 3u, 0u, "the signal from the" };
     m.tr_lines[2] = (cwx_tr_slot_t){ 3, 0xFC15u, 3u, 0u, "spacecraft is gone," };
@@ -1106,6 +1101,13 @@ int main(int argc, char **argv)
         trk_y_prev = trk_y_now;
     }
     assert(!ui_port_is_animating() && trk_y_prev == -19);
+
+    /* Advance top_line_id while BT audio plays -> snaps immediately with zero LVGL animations */
+    m.play_bt_audio  = 1u;
+    m.tr_top_line_id = 3;
+    ui_render_screen(UI_SCR_PLAYER, &m);
+    assert(!ui_port_is_animating() && lv_obj_get_style_y(objects.ptr_track, LV_PART_MAIN) == -19);
+    m.play_bt_audio  = 0u;
 
     /* Exercise volume pill + scrub badge + silence pause in transcript mode */
     m.play_vol_hi = 1u;

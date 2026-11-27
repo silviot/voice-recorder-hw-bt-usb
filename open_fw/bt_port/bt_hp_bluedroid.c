@@ -136,6 +136,7 @@ typedef struct {
     uint32_t start_retry_at;
     uint8_t  start_failed;
     uint32_t start_failed_at;
+    uint8_t  start_fail_cycles;        /* consecutive START_FAILED cycles without reaching STARTED on this link */
     uint8_t  start_demand;             /* demand arrived while start_failed: START again after the cooldown */
     uint8_t  susp_retries, susp_retry_due;   /* refused SUSPENDs retried (audit r3 item 5) */
     uint32_t susp_refused_at;
@@ -144,6 +145,7 @@ typedef struct {
     uint16_t ct_hdl;                   /* the AVRCP CT connection's handle (AVCTP may open before A2DP CONNECTED) */
     uint8_t  orphan;                   /* a connect we gave up on (timeout) may still complete in Bluedroid */
     uint8_t  orphan_bda[6];
+    uint32_t orphan_since;
     uint32_t orphan_until;
     uint8_t  ssp_burned;
     uint8_t  stall_disc;
@@ -169,6 +171,9 @@ typedef struct {
 } hp_cfg_t;
 
 static hp_t *g HP_HI;
+#if !defined(OPENFW_BT_HOST_HARNESS) && !defined(BT_HP_HOST)
+static int16_t s_hp_ring[HP_RING_BYTES / sizeof(int16_t)] HP_HI;
+#endif
 static hp_cfg_t s_cfg HP_HI;
 static uint8_t s_cfg_loaded HP_HI;
 static uint8_t s_cfg_dirty HP_HI;
@@ -963,7 +968,7 @@ static void name_learned(const uint8_t bda[6], const char *name)
     if (s_cfg.last_valid && bda_eq(s_cfg.last, bda) && strncmp(s_cfg.last_name, name, BT_HP_NAME_MAX) != 0) {
         memset(s_cfg.last_name, 0, sizeof(s_cfg.last_name));
         memcpy(s_cfg.last_name, name, BT_HP_NAME_MAX - 1u);
-        cfg_save();
+        cfg_mark_dirty();
         lbegin("name saved");
         lka("peer", bda);
         lks("name", s_cfg.last_name);
@@ -1278,6 +1283,7 @@ static void on_link_down(const char *why, uint32_t pev)
     g->mc_out = g->mc_want = MC_NONE;
     g->start_failed = 0u;
     g->start_retries = 0u;
+    g->start_fail_cycles = 0u;
     g->start_demand = 0u;
     g->ct_conn = 0u;
     g->abs_vol = 0u;
@@ -1343,6 +1349,7 @@ static void on_a2d_conn(const ev_t *e)
         g->user_disc = 0u;
         g->start_failed = 0u;
         g->start_retries = 0u;
+        g->start_fail_cycles = 0u;
         g->last_real_t = bt_xrec_plat_now_ms();
         char nm[BT_HP_NAME_MAX];
         found_name(e->bda, nm);
@@ -1419,6 +1426,7 @@ static void on_a2d_audio(const ev_t *e)
         if (e->b) {
             g->link = BT_HP_LINK_STARTED;
             g->start_retries = 0u;
+            g->start_fail_cycles = 0u;
             g->susp_retries = 0u;
             g->susp_retry_due = 0u;
             g->last_real_t = bt_xrec_plat_now_ms();
@@ -1507,12 +1515,18 @@ static void start_failure(const char *why, bool final)
     g->start_failed = 1u;
     g->start_failed_at = now;
     g->start_retries = 0u;
+    g->start_fail_cycles++;
     g->start_demand = 0u;
     set_msg(BT_HP_MSG_START_FAILED);
     player_event(BT_HP_PEV_START_FAILED);
     lbegin("START failed twice: headphones not ready");
     lks("why", why);
     lend();
+    if (g->start_fail_cycles >= 2u && g->conn_hdl != ESP_A2D_INVALID_CONN_HDL) {
+        log1("START failed across two cycles: resetting wedged A2DP link");
+        g->user_disc = 0u;
+        (void)esp_a2d_source_disconnect_by_handle(g->conn_hdl);
+    }
 }
 
 static void on_auth(const ev_t *e)
@@ -2070,7 +2084,13 @@ static void config_finish(void)
         tun.speech_bp = s_tun.speech_bp;
     }
 #endif
-    /* PCM ring (design §3.3): heap first, so output mode BOTH can run the DAC too; the DAC's slot buffer otherwise */
+    /* PCM ring (design §3.3): dedicated static SRAM_HI buffer on firmware so heap fragmentation never forces
+     * DAC-buffer aliasing; host tests still exercise heap allocation + DAC-buffer fallback. */
+#if !defined(OPENFW_BT_HOST_HARNESS) && !defined(BT_HP_HOST)
+    g->ring = s_hp_ring;
+    uint32_t bytes = (uint32_t)sizeof(s_hp_ring);
+    g->ring_is_dac = 0u;
+#else
     g->ring = (int16_t *)bt_xrec_plat_alloc(HP_RING_BYTES);
     uint32_t bytes = HP_RING_BYTES;
     g->ring_is_dac = 0u;
@@ -2084,6 +2104,7 @@ static void config_finish(void)
         fault(BT_XREC_FAULT_CONFIG);
         return;
     }
+#endif
     hp_sink_init(&g->sink, g->ring, bytes);
     if (hp_tx_bd_init(&g->sink, &tun, tx_event) != 0) {
         log1("hp_tx init failed (alarm)");
@@ -2150,7 +2171,11 @@ static void free_session(void)
     g = NULL;
     bt_xrec_plat_unlock();
     if (b != NULL) {
-        if (b->ring != NULL && !b->ring_is_dac) {
+        if (b->ring != NULL && !b->ring_is_dac
+#if !defined(OPENFW_BT_HOST_HARNESS) && !defined(BT_HP_HOST)
+            && b->ring != s_hp_ring
+#endif
+        ) {
             bt_xrec_plat_free(b->ring);
         }
         memset(b, 0, sizeof(*b));
@@ -2415,9 +2440,15 @@ static void ready_poll(uint32_t now)
         g->scan_cancel = 0u;
         set_msg(BT_HP_MSG_SCAN_DONE);
     }
-    /* a pick waits for the discovery to stop (design §6.2), then for bt_ctrl's inquiry flag, at most 1 s more */
-    if (g->pick_pending && !g->scanning && !orphan_active(now)) {
-        if (!bt_ctrl_inquiry_active() || time_reached(now, g->pick_since + 1000u)) {
+    /* a pick waits for the discovery to stop (design §6.2), then for bt_ctrl's inquiry flag, at most 1 s more.
+     * For the same peer, let an explicit pick/play supersede a timed-out/cancelled connect after 1.5 s settle. */
+    if (g->pick_pending && !g->scanning) {
+        bool orphan_blk = orphan_active(now);
+        if (orphan_blk && bda_eq(g->pick_bda, g->orphan_bda) && time_reached(now, g->orphan_since + 1500u)) {
+            g->orphan = 0u;
+            orphan_blk = false;
+        }
+        if (!orphan_blk && (!bt_ctrl_inquiry_active() || time_reached(now, g->pick_since + 1000u))) {
             g->pick_pending = 0u;
             if (g->pick_pair) {
                 window_open(g->pick_bda);
@@ -2439,6 +2470,7 @@ static void ready_poll(uint32_t now)
         lend();
         g->orphan = 1u;
         memcpy(g->orphan_bda, g->target, 6u);
+        g->orphan_since = now;
         g->orphan_until = now + BT_HP_CONNECT_TO_MS;
         g->link = BT_HP_LINK_NONE;
         g->d.connect_fail++;
@@ -2760,7 +2792,9 @@ int bt_hp_disconnect(void)
     if (g->link == BT_HP_LINK_CONNECTING && g->target_valid) {
         g->orphan = 1u;               /* a late CONNECTED is closed (user_disc), no new connect until it reports */
         memcpy(g->orphan_bda, g->target, 6u);
-        g->orphan_until = bt_xrec_plat_now_ms() + BT_HP_CONNECT_TO_MS;
+        uint32_t now = bt_xrec_plat_now_ms();
+        g->orphan_since = now;
+        g->orphan_until = now + BT_HP_CONNECT_TO_MS;
         g->link = BT_HP_LINK_NONE;
     }
     lbegin("disconnect");
@@ -2885,6 +2919,11 @@ int bt_hp_abs_vol(void)
 int bt_hp_streaming(void)
 {
     return g != NULL && g->link == BT_HP_LINK_STARTED;
+}
+
+int bt_hp_user_disconnected(void)
+{
+    return g != NULL && g->user_disc != 0u;
 }
 
 int bt_hp_take_key(void)

@@ -93,7 +93,7 @@ static unsigned mid_pads(void)
 
 /* ---- fake DAC (speaker route): 4 slots, mono expansion check ---- */
 static unsigned dac_slots[AUDIO_DAC_QUEUE_SLOTS], dac_head, dac_count, dac_submitted, dac_consumed;
-static unsigned dac_level, dac_starved_ms, dac_writes, max_skew, dac_next, dac_skipped;
+static unsigned dac_level, dac_starved_ms, dac_writes, max_skew, dac_next, dac_skipped, dac_small_mid;
 static int dac_running;
 
 static int16_t sample(unsigned frame, unsigned ch) { return (int16_t)((int)(frame % 30000) * (ch ? -1 : 1)); }
@@ -143,6 +143,9 @@ int audio_dac_write_stereo(const int16_t *pcm, uint32_t frames)
         assert(pcm[2 * i + 1] == sample(at + i, channels - 1));
     }
     dac_next = at + frames;
+    if (dac_count > 0u && frames < 512u && hp_sink_queued(&sink) > 0u) {
+        dac_small_mid++;
+    }
     dac_writes++;
     dac_slots[(dac_head + dac_count) % AUDIO_DAC_QUEUE_SLOTS] = frames;
     dac_count++;
@@ -272,7 +275,7 @@ static void play(aout_mode_t mode, unsigned ch, int stall)
     last_stall_ms = 0;
     pkts = src_consumed = pkt_credit = 0;
     dac_head = dac_count = dac_submitted = dac_consumed = 0;
-    dac_level = dac_starved_ms = dac_writes = max_skew = dac_next = dac_skipped = 0;
+    dac_level = dac_starved_ms = dac_writes = max_skew = dac_next = dac_skipped = dac_small_mid = 0;
     hp_sink_init(&sink, ring, sizeof(ring));
     hp_sink_set_out_rate(&sink, CONN_RATE);
     aout_bt_attach(&fake_tx, &sink, &k_link, 0);
@@ -326,6 +329,7 @@ int main(void)
         assert(hp_sink_channels(&sink) == ch && sink.ch_mismatch == 0u);
         assert(src_consumed == FRAMES && mid_pads() == 0u);
         assert(dac_submitted == FRAMES && dac_consumed == FRAMES && dac_skipped == 0u);
+        assert(dac_small_mid == 0u);
         assert(max_skew == 0u);
         assert(dac_level == 18u);           /* one volume for both outputs: the headset's bt_vol */
         printf("[OK] Both, %s file, headset connected: speaker and headset each get every frame\n",

@@ -41,7 +41,7 @@
 #define BT_XREC_SPP_NAME       "Cassini"  /* legacy SDP ServiceName (src/bt_spp.c:352) */
 
 /* ---- deadlines (ms) ---- */
-#define BT_XREC_SHUTDOWN_DEADLINE_MS 2000u   /* plan M1 recovery ladder: one absolute 2 s deadline */
+#define BT_XREC_SHUTDOWN_DEADLINE_MS 2500u   /* plan M1 recovery ladder: one absolute deadline (>1.5 s A2DP deinit wait) */
 #define BT_XREC_UP_DEADLINE_MS       12000u  /* bt_ctrl open + HCI Reset (RF calibration) + Bluedroid enable */
 #define BT_XREC_CONFIG_DEADLINE_MS   5000u   /* SPP INIT + START events after enable */
 #define BT_XREC_REBOOT_DELAY_MS      250u    /* legacy F:1827: deferred reboot / OTA / DFU */

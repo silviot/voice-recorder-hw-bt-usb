@@ -39,6 +39,7 @@ typedef struct {
     uint8_t  started_here;
     uint8_t  ready_seen;
     uint8_t  tried_connect;
+    uint8_t  inherited_conn;
     uint8_t  phase;      /* 1 = Starting, 2 = Connecting */
     uint8_t  fail_msg;   /* BT_HP_MSG_* when BT_HP_AC_FAIL_MSG is returned */
 } bt_hp_autoconn_t;
@@ -51,6 +52,7 @@ static inline void bt_hp_autoconn_init(bt_hp_autoconn_t *ac, int started_here, u
     ac->started_here   = started_here ? 1u : 0u;
     ac->ready_seen     = 0u;
     ac->tried_connect  = 0u;
+    ac->inherited_conn = 0u;
     ac->phase          = 1u;
     ac->fail_msg       = BT_HP_MSG_NONE;
 }
@@ -95,10 +97,24 @@ static inline int bt_hp_autoconn_step(bt_hp_autoconn_t *ac, uint32_t now, int re
         return BT_HP_AC_FAIL_NOT_CONNECTED;
     }
 
-    /* Observe new session messages (e.g. rc_poll PAIR_AGAIN or CONNECT_FAIL) BEFORE issuing connect_addr. */
+    if (u.state == BT_HP_ST_READY && !ac->ready_seen) {
+        ac->ready_seen     = 1u;
+        ac->ready_deadline = now + BT_HP_AUTOCONN_READY_TO_MS;
+        if (!ac->started_here && u.link == BT_HP_LINK_CONNECTING) {
+            ac->inherited_conn = 1u;
+        }
+    }
+
+    /* Observe new session messages (e.g. rc_poll PAIR_AGAIN or CONNECT_FAIL) BEFORE issuing connect_addr.
+     * If an already-in-flight background rc_poll attempt fails before we issued our own connect_addr, retry once
+     * instead of immediately failing user playback. */
     if (u.msg_seq != ac->seen_seq) {
         ac->seen_seq = u.msg_seq;
-        if (bt_hp_autoconn_is_fail_msg(u.msg)) {
+        if (u.msg == BT_HP_MSG_CONNECT_FAIL && ac->inherited_conn && !ac->tried_connect &&
+            u.state == BT_HP_ST_READY && u.has_last) {
+            ac->inherited_conn = 0u;
+            ac->ready_deadline = now + BT_HP_AUTOCONN_READY_TO_MS;
+        } else if (bt_hp_autoconn_is_fail_msg(u.msg)) {
             ac->fail_msg = u.msg;
             bt_hp_autoconn_stop_started(ac, ops);
             return BT_HP_AC_FAIL_MSG;
@@ -106,10 +122,6 @@ static inline int bt_hp_autoconn_step(bt_hp_autoconn_t *ac, uint32_t now, int re
     }
 
     if (u.state == BT_HP_ST_READY) {
-        if (!ac->ready_seen) {
-            ac->ready_seen     = 1u;
-            ac->ready_deadline = now + BT_HP_AUTOCONN_READY_TO_MS;
-        }
         if (!u.has_last && u.link == BT_HP_LINK_NONE) {
             bt_hp_autoconn_stop_started(ac, ops);
             return BT_HP_AC_FAIL_NOT_CONNECTED;

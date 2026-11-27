@@ -129,6 +129,7 @@ static struct {
     /* Audio Codec + Codec SRAM + DMAC */
     uint32_t codec_regs[256]; /* 0x40009000..0x400093FC */
     uint32_t codec_sram[128]; /* 0x40009400..0x400095FC */
+    uint32_t codec_dac_fifo_rst_calls;
     uint32_t dmac_regs[8][16];
     void    *dmac_buf[8];
     uint32_t dmac_len[8];
@@ -338,7 +339,12 @@ void openfw_mmio_wr32(uint32_t addr, uint32_t val)
     }
 
     if (addr >= AUDIO_CODEC_BASE && addr < CODEC_SRAM_START) {
-        g_soc.codec_regs[(addr - AUDIO_CODEC_BASE) >> 2] = val;
+        uint32_t off = addr - AUDIO_CODEC_BASE;
+        if (addr == CODEC_DAC_FIFO_RST_ADDR && (val & 0x2u) != 0u) {
+            g_soc.codec_dac_fifo_rst_calls++;
+            val &= ~0x2u; /* self-clearing hardware FIFO reset bit */
+        }
+        g_soc.codec_regs[off >> 2] = val;
         return;
     }
     if (addr >= CODEC_SRAM_START && addr < CODEC_SRAM_END) {
@@ -1116,7 +1122,11 @@ static void test_audio_dac(void)
     g_soc.efuse_words[2] = (5u << 29);
     g_soc.efuse_words[3] = 0x09u | (0x2Bu << 4);
 
+    assert(audio_dac_is_running() == 0);
     assert(audio_dac_start(16000u, 20u) == 0);
+    assert(audio_dac_is_running() == 1);
+    uint32_t rst0 = g_soc.codec_dac_fifo_rst_calls;
+    assert(rst0 >= 1u);
     assert(g_dmac_ch0_cb != NULL);
     assert((g_soc.cru_apll_ctrl & (1u << 28)) != 0u);
     assert((g_soc.cru_apll_ctrl & 0x00003FE0u) == 0x3060u); /* 24.576 MHz int=3 */
@@ -1170,27 +1180,37 @@ static void test_audio_dac(void)
         g_dmac_ch0_cb();
         assert((g_soc.dmac_regs[0][3] & 0x3FFFFu) == frames * 4u);
     }
-    /* Final transfer idles cleanly. */
+    /* Final transfer idles cleanly and marks DAC FIFO for reset before next start. */
     g_soc.dmac_regs[0][9] |= 0x02u; /* Transfer complete */
     g_dmac_ch0_cb();
     assert(audio_dac_is_busy() == 0);
     assert(audio_dac_queued_frames() == 0u);
     assert((g_soc.dmac_regs[0][0] & DMAC_CTL_CH_EN) == 0u);
+    assert(g_soc.codec_dac_fifo_rst_calls == rst0); /* no extra reset while running */
 
-    /* Flush drops queued slots immediately while keeping codec & IRQ warm */
+    /* First write after underrun resets the 16-bit FIFO unpacker; flush also resets it. */
     assert(audio_dac_write_stereo(sbuf, 200u) == 200);
+    assert(g_soc.codec_dac_fifo_rst_calls == rst0 + 1u);
     assert(audio_dac_write_stereo(sbuf, 100u) == 100);
+    assert(g_soc.codec_dac_fifo_rst_calls == rst0 + 1u); /* queued while active: no reset */
     assert(audio_dac_queued_frames() == 300u);
     audio_dac_flush();
+    assert(g_soc.codec_dac_fifo_rst_calls == rst0 + 2u);
     assert(audio_dac_is_busy() == 0);
     assert(audio_dac_queued_frames() == 0u);
     assert((g_soc.dmac_regs[0][0] & DMAC_CTL_CH_EN) == 0u);
     assert((g_soc.nvic_iser[1] & (1u << 28)) != 0u);
     assert(audio_dac_write_stereo(sbuf, 64u) == 64);
+    assert(g_soc.codec_dac_fifo_rst_calls == rst0 + 2u); /* flush already reset FIFO */
     assert(audio_dac_queued_frames() == 64u);
     g_soc.dmac_regs[0][9] |= 0x02u;
     g_dmac_ch0_cb();
     assert(audio_dac_queued_frames() == 0u);
+    /* Complete after single-slot underrun also resets on next write */
+    assert(audio_dac_write_stereo(sbuf, 16u) == 16);
+    assert(g_soc.codec_dac_fifo_rst_calls == rst0 + 3u);
+    g_soc.dmac_regs[0][9] |= 0x02u;
+    g_dmac_ch0_cb();
 
     /* Volume clamp & mute */
     audio_dac_set_volume(99u, 600u);
@@ -1243,6 +1263,7 @@ static void test_audio_dac(void)
     assert(g_soc.rom_gpio_calls == pa_calls);
 
     audio_dac_stop();
+    assert(audio_dac_is_running() == 0);
     assert(g_soc.rom_gpio_last_cfg == 0x0001F000u);
     assert(g_dmac_ch0_cb == NULL);
     assert((g_soc.nvic_iser[1] & (1u << 28)) == 0u);

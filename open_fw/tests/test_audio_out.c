@@ -242,11 +242,20 @@ static void test_both_drain(void)
     CHECK(aout_start(16000, 31) == 0 && aout_route() == AOUT_ROUTE_BOTH, "both route");
     uint32_t tick = hp_tx_start(&T);
     int64_t next = g_now;
+    unsigned small_mid_writes = 0;
     for (int ms = 0; ms < 1000; ms++) {   /* 1 s of normal playback */
         g_now += 1000; dac_run_us(1000); stack_run();
         if (g_now >= next) { hp_tx_tick(&T); next += tick * 1000; }
+        uint32_t w0 = D.h, n0 = D.n;
+        (void)w0;
         write_some(2);
+        if (n0 > 0u && D.n > n0 && hp_sink_queued(&S) > 0u) {
+            for (uint32_t k = n0; k < D.n; k++) {
+                if (D.slots[(D.h + k) % 4u] < 512u) small_mid_writes++;
+            }
+        }
     }
+    CHECK(small_mid_writes == 0u, "BOTH fragmented DAC slots mid-stream (%u small writes)", small_mid_writes);
     uint32_t total = g_src_idx;
     CHECK(D.written < total, "the tap holds frames back while writing (%u of %u)", D.written, total);
     int drained_ms = -1, early = 0;

@@ -34,9 +34,7 @@ static int32_t s_tr_pill_target_y = -1;
 static int32_t s_tr_pill_target_w = -1;
 static int     s_tr_pill_visible  = 0;
 
-static void anim_set_x_cb(void *obj, int32_t v) { lv_obj_set_x((lv_obj_t *)obj, v); }
 static void anim_set_y_cb(void *obj, int32_t v) { lv_obj_set_y((lv_obj_t *)obj, v); }
-static void anim_set_w_cb(void *obj, int32_t v) { lv_obj_set_width((lv_obj_t *)obj, v); }
 
 static void start_ease_out_anim(lv_obj_t *obj, lv_anim_exec_xcb_t cb,
                                 int32_t from, int32_t to, uint32_t dur_ms)
@@ -1045,12 +1043,11 @@ static void bind_player_tr(const ui_model_t *m, bool entering)
         set_changed_y(objects.ptr_track, TR_TRACK_REST_Y);
     }
 
-    int scrolled = 0;
     if (!entering && m->tr_top_line_id != s_tr_top_line_id) {
         int32_t delta = (s_tr_top_line_id >= 0 && m->tr_top_line_id >= 0)
                       ? (m->tr_top_line_id - s_tr_top_line_id)
                       : 0;
-        if (delta == 1 || delta == -1) {
+        if (!m->play_bt_audio && (delta == 1 || delta == -1)) {
             int32_t cur_y   = lv_obj_get_style_y(objects.ptr_track, LV_PART_MAIN);
             int32_t start_y = cur_y + delta * TR_ROW_H;
             if (start_y > TR_TRACK_REST_Y + 24) start_y = TR_TRACK_REST_Y + 24;
@@ -1058,7 +1055,6 @@ static void bind_player_tr(const ui_model_t *m, bool entering)
             lv_obj_set_y(objects.ptr_track, start_y);
             start_ease_out_anim(objects.ptr_track, anim_set_y_cb,
                                 start_y, TR_TRACK_REST_Y, 190u);
-            scrolled = 1;
         } else {
             lv_anim_delete(objects.ptr_track, anim_set_y_cb);
             set_changed_y(objects.ptr_track, TR_TRACK_REST_Y);
@@ -1192,25 +1188,11 @@ static void bind_player_tr(const ui_model_t *m, bool entering)
             lv_color_t pill_col = lv_color_mix(spk_col, bg_col, 104u);
             set_changed_bg_color(objects.ptr_word_pill, pill_col);
 
-            int32_t line_diff = (s_tr_active_line >= 0) ? (asl->line_id - s_tr_active_line) : 99;
-            int snap = entering || !s_tr_pill_visible || scrolled ||
-                       (line_diff > 1 || line_diff < -1);
-            if (snap) {
-                lv_anim_delete(objects.ptr_word_pill, NULL);
-                set_changed_x(objects.ptr_word_pill, tx);
-                set_changed_y(objects.ptr_word_pill, ty);
-                set_changed_width(objects.ptr_word_pill, tw);
-            } else if (tx != s_tr_pill_target_x || ty != s_tr_pill_target_y || tw != s_tr_pill_target_w) {
-                int32_t cur_x = lv_obj_get_style_x(objects.ptr_word_pill, LV_PART_MAIN);
-                int32_t cur_y = lv_obj_get_style_y(objects.ptr_word_pill, LV_PART_MAIN);
-                int32_t cur_w = lv_obj_get_style_width(objects.ptr_word_pill, LV_PART_MAIN);
-                uint32_t dur_ms = (ty != cur_y) ? 120u : 85u;
-                start_ease_out_anim(objects.ptr_word_pill, anim_set_x_cb, cur_x, tx, dur_ms);
-                start_ease_out_anim(objects.ptr_word_pill, anim_set_w_cb, cur_w, tw, dur_ms);
-                if (ty != cur_y) {
-                    start_ease_out_anim(objects.ptr_word_pill, anim_set_y_cb, cur_y, ty, dur_ms);
-                }
-            }
+            /* Snap word highlight directly: 62.5 Hz per-word LVGL animations contend with CPU0 on XIP flash */
+            lv_anim_delete(objects.ptr_word_pill, NULL);
+            set_changed_x(objects.ptr_word_pill, tx);
+            set_changed_y(objects.ptr_word_pill, ty);
+            set_changed_width(objects.ptr_word_pill, tw);
             set_hidden(objects.ptr_word_pill, false);
             s_tr_pill_target_x = tx;
             s_tr_pill_target_y = ty;

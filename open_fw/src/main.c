@@ -1247,6 +1247,7 @@ static void probe_microsd_mount_only(int log_uart, uint32_t *out_sd_us, uint32_t
     if (out_sd_us) *out_sd_us = (uint32_t)(t1 - t0);
 
     g_sd_blkdev = sd_as_blkdev(&g_sd_card);
+    apmem_invalidate_cache();
     if (exfat_mount(&g_exfat_vol, &g_sd_blkdev) != 0) {
         if (out_mnt_us) *out_mnt_us = (uint32_t)(us_timer_now() - t1);
         if (log_uart) {
@@ -1545,6 +1546,7 @@ static int run_usb_msc_mode(int auto_mode)
     /* Remount exFAT because USB host may have written or deleted files;
      * if mount fails (e.g. card state changed), re-initialize SDIO cleanly. */
     if (g_sd_card.initialized) {
+        apmem_invalidate_cache();
         g_sd_mounted = (exfat_mount(&g_exfat_vol, &g_sd_blkdev) == 0) ? 1 : 0;
         if (!g_sd_mounted) {
             probe_microsd_internal(0);
@@ -2355,6 +2357,15 @@ static void hp_act(uint8_t kind, uint8_t arg)
             (void)hp_start_session();
         }
         break;
+    case HPR_STATUS:
+        if (bt_hp_active()) {
+            bt_hp_ui_t u;
+            bt_hp_get_ui(&u);
+            if (u.state == BT_HP_ST_READY && u.link == BT_HP_LINK_NONE && u.has_last) {
+                (void)bt_hp_connect_addr(u.last, 0);
+            }
+        }
+        break;
     case HPR_DISCONNECT:
         (void)bt_hp_disconnect();
         break;
@@ -2681,30 +2692,40 @@ static const bt_hp_autoconn_ops_t k_hp_autoconn_ops = {
 };
 
 /*
- * When "BT" (AOUT_MODE_HEADPHONES) is selected as output and no headset stream
- * is ready yet, automatically start headphones mode (if off) and connect to
- * the remembered headset before entering the player.
- * Returns 1 if playback should proceed, 0 if cancelled / failed / timed out /
- * interrupted by the REC switch.
+ * When "BT" (AOUT_MODE_HEADPHONES) or "Both" (AOUT_MODE_BOTH with a remembered
+ * headset that was not explicitly disconnected) is selected as output and no
+ * headset stream is ready yet, automatically start headphones mode (if off)
+ * and connect to the remembered headset before entering the player.
+ * Returns 1 if playback should proceed, 0 if cancelled / failed in BT-only
+ * mode / interrupted by the REC switch.
  */
 static int hp_auto_connect_for_play(void)
 {
-    if (aout_get_mode() != AOUT_MODE_HEADPHONES || bt_hp_stream_ready()) {
+    aout_mode_t mode = aout_get_mode();
+    if ((mode != AOUT_MODE_HEADPHONES && mode != AOUT_MODE_BOTH) || bt_hp_stream_ready()) {
+        return 1;
+    }
+
+    bt_hp_ui_t u;
+    bt_hp_get_ui(&u);
+    if (mode == AOUT_MODE_BOTH && (!u.has_last || bt_hp_user_disconnected())) {
         return 1;
     }
 
     int started_here = !bt_hp_active();
     if (started_here) {
         if (hp_start_session() != 0) {
+            if (mode == AOUT_MODE_BOTH) {
+                return 1;
+            }
             if (g_ui.toast_msg[0] == '\0') {
                 ui_show_toast(ui_tr_bt(UI_BT_STR_HP_NOT_CONNECTED), UI_COL_AMBER, millis(), 2000u);
             }
             return 0;
         }
+        bt_hp_get_ui(&u);
     }
 
-    bt_hp_ui_t u;
-    bt_hp_get_ui(&u);
     bt_hp_autoconn_t ac;
     bt_hp_autoconn_init(&ac, started_here, millis(), u.msg_seq);
     uint32_t last_ui = 0u;
@@ -2751,6 +2772,10 @@ static int hp_auto_connect_for_play(void)
             } else if (back_pressed) {
                 g_ui.toast_msg[0] = '\0';
                 keys_ignore_held();
+            } else if (mode == AOUT_MODE_BOTH) {
+                g_ui.toast_msg[0] = '\0';
+                keys_ignore_held();
+                return 1;
             } else if (rc == BT_HP_AC_FAIL_NOT_CONNECTED) {
                 ui_show_toast(ui_tr_bt(UI_BT_STR_HP_NOT_CONNECTED), UI_COL_AMBER, now, 2000u);
             } else if (rc == BT_HP_AC_FAIL_CONNECT) {

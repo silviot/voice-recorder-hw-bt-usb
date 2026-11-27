@@ -19,15 +19,14 @@
 
 /* Defaults (§4.3; bench-overridable through hp_tx_tun_t). */
 #define HP_TICK_MS            20u
-#define HP_MAX_BITPOOL        53u   /* advertised max (SEP caps): the A2DP high-quality value for 48 kHz joint stereo */
+#define HP_MAX_BITPOOL        35u   /* advertised max (SEP caps): high quality while fitting 12 frames/pkt on MTU 1008 */
 #define HP_TXQ_PKT_CAP        4u    /* = MAX_OUTPUT_A2DP_SRC_FRAME_QUEUE_SZ + 1 (bt_port_prefix.h, Bluedroid patch 0034) */
 #define HP_MAX_PKT_PER_TICK   2u
 #define HP_CREDIT_TICKS       4u    /* 80 ms: a BTC tick held up < 80 ms by higher-priority tasks loses no air time
                                        * (silicon 2026-11-25: with 2, 3.3 % of the stream was lost to late ticks) */
 #define HP_LAT_MS             150u  /* used until the sink sends a delay report */
 #define HP_STALL_MS           800u
-#define HP_SPEECH_BP          0u    /* per-packet bitpool for sources <= 16 kHz (0 = always max); was 24 (CPU), the
-                                       * encoder costs about the same at 53 (qemu-arm count: +14 %) */
+#define HP_SPEECH_BP          24u   /* per-packet bitpool for sources <= 16 kHz (177 kbps SBC; halves packet rate) */
 #define HP_FPP_MAX            15u   /* 4-bit frame count in the A2DP SBC media payload header */
 #define HP_DOWN_PKTS_MAX      10u   /* BTA a2d_list <= 1, L2CAP <= 5, controller <= 4 credits (rev 3) */
 #define HP_LINK_END_PKTS      4u    /* link end: the ROM reports up to 4 never-aired packets as completed (§4.4) */

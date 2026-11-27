@@ -97,5 +97,6 @@ int apmem_load_focus(exfat_vol_t *vol, const char *dir, char *out, uint32_t cap)
 int apmem_save_pos(exfat_vol_t *vol, const char *dir, const char *name, uint32_t size_tag,
                    uint32_t pos);
 int apmem_save_focus(exfat_vol_t *vol, const char *dir, const char *name);
+void apmem_invalidate_cache(void);
 
 #endif /* OPENFW_APMEM_H */

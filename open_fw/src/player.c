@@ -44,6 +44,110 @@ static uint8_t  g_file_buf[4096] __attribute__((aligned(4)));
 static int16_t  g_dec_pcm[4096]  __attribute__((aligned(4)));
 static int16_t  g_mono_tx[PLAYER_DAC_CHUNK_FRAMES * 2u] __attribute__((aligned(4)));
 
+/* 1-sector alignment cache for sequential WAV reads so unaligned data chunks (e.g. data_offset=60
+ * in IMA-ADPCM audiobooks) never trigger unaligned SD reads or duplicate tail-sector CMD17s. */
+static uint8_t  g_wav_sec_buf[512] __attribute__((aligned(4)));
+static uint64_t g_wav_sec_off   = 0ull;
+static uint32_t g_wav_sec_valid = 0u;
+
+static int wav_read_aligned(exfat_vol_t *vol, const exfat_entry_t *ent,
+                            uint64_t offset, uint8_t *dst, uint32_t len, uint32_t *out_got)
+{
+    uint32_t total = 0u;
+    if (out_got) {
+        *out_got = 0u;
+    }
+    if (!vol || !ent || (!dst && len > 0u) || offset >= ent->size) {
+        return -1;
+    }
+    if ((uint64_t)len > ent->size - offset) {
+        len = (uint32_t)(ent->size - offset);
+    }
+
+    uint32_t mis = (uint32_t)(offset & 511ull);
+    if (mis != 0u) {
+        uint64_t sec_off = offset & ~511ull;
+        if (!g_wav_sec_valid || g_wav_sec_off != sec_off) {
+            uint32_t want = (ent->size - sec_off >= 512ull) ? 512u : (uint32_t)(ent->size - sec_off);
+            uint32_t got  = 0u;
+            if (exfat_read_file(vol, ent, sec_off, g_wav_sec_buf, want, &got) != 0 || got != want) {
+                g_wav_sec_valid = 0u;
+                return -1;
+            }
+            g_wav_sec_off   = sec_off;
+            g_wav_sec_valid = got;
+        }
+        if (mis >= g_wav_sec_valid) {
+            return -1;
+        }
+        uint32_t take = g_wav_sec_valid - mis;
+        if (take > len) {
+            take = len;
+        }
+        for (uint32_t i = 0u; i < take; i++) {
+            dst[i] = g_wav_sec_buf[mis + i];
+        }
+        offset += take;
+        total  += take;
+    }
+
+    uint32_t full = (len - total) & ~511u;
+    if (full > 0u) {
+        if (((uintptr_t)(dst + total) & 3u) == 0u) {
+            uint32_t got = 0u;
+            if (exfat_read_file(vol, ent, offset, dst + total, full, &got) != 0 || got != full) {
+                g_wav_sec_valid = 0u;
+                return -1;
+            }
+            offset += full;
+            total  += full;
+        } else {
+            while (full > 0u) {
+                uint32_t got = 0u;
+                if (exfat_read_file(vol, ent, offset, g_wav_sec_buf, 512u, &got) != 0 || got != 512u) {
+                    g_wav_sec_valid = 0u;
+                    return -1;
+                }
+                g_wav_sec_off   = offset;
+                g_wav_sec_valid = 512u;
+                for (uint32_t i = 0u; i < 512u; i++) {
+                    dst[total + i] = g_wav_sec_buf[i];
+                }
+                offset += 512u;
+                total  += 512u;
+                full   -= 512u;
+            }
+        }
+    }
+
+    uint32_t tail = len - total;
+    if (tail > 0u) {
+        uint64_t sec_off = offset;
+        if (!g_wav_sec_valid || g_wav_sec_off != sec_off) {
+            uint32_t want = (ent->size - sec_off >= 512ull) ? 512u : (uint32_t)(ent->size - sec_off);
+            uint32_t got  = 0u;
+            if (exfat_read_file(vol, ent, sec_off, g_wav_sec_buf, want, &got) != 0 || got != want) {
+                g_wav_sec_valid = 0u;
+                return -1;
+            }
+            g_wav_sec_off   = sec_off;
+            g_wav_sec_valid = got;
+        }
+        if (g_wav_sec_valid < tail) {
+            return -1;
+        }
+        for (uint32_t i = 0u; i < tail; i++) {
+            dst[total + i] = g_wav_sec_buf[i];
+        }
+        total += tail;
+    }
+
+    if (out_got) {
+        *out_got = total;
+    }
+    return 0;
+}
+
 /* Retain the continuation of the previous grain for waveform matching. */
 #define SCRUB_OVERLAP_MAX 256u
 static int16_t        g_scrub_tail[2u * SCRUB_OVERLAP_MAX];
@@ -763,6 +867,7 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
 
     /* Fast path: parse standard WAV headers within the first 512 B sector.
      * Fall back to scanning up to 4096 B when LIST/bext/JUNK chunks precede data. */
+    g_wav_sec_valid = 0u;
     wav_stream_info_t winfo;
     uint32_t hdr_read = 0u;
     uint32_t hdr_want = (wav_ent.size > 512u) ? 512u : (uint32_t)wav_ent.size;
@@ -780,6 +885,14 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
             wav_parse_stream(g_file_buf, hdr_read, &winfo) != 0) {
             return 0;
         }
+    }
+    if (hdr_read >= 512u || hdr_read == wav_ent.size) {
+        uint32_t seed = (hdr_read >= 512u) ? 512u : hdr_read;
+        for (uint32_t i = 0u; i < seed; i++) {
+            g_wav_sec_buf[i] = g_file_buf[i];
+        }
+        g_wav_sec_off   = 0ull;
+        g_wav_sec_valid = seed;
     }
     if (winfo.block_align == 0u || winfo.block_align > sizeof(g_file_buf)) {
         return 0;
@@ -1246,16 +1359,6 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
                         if (chunk > sizeof(g_file_buf)) chunk = (uint32_t)sizeof(g_file_buf);
                     } else {
                         chunk = (uint32_t)sizeof(g_file_buf);
-                        /* Align the first unaligned PCM read to a 512 B file boundary so
-                         * subsequent reads take exfat_read_file()'s zero-copy aligned path. */
-                        uint32_t file_off = winfo.data_offset + data_off;
-                        uint32_t misalign = file_off & 511u;
-                        if (misalign != 0u) {
-                            uint32_t to_align = 512u - misalign;
-                            if ((to_align % (uint32_t)winfo.block_align) == 0u && to_align < chunk) {
-                                chunk = to_align;
-                            }
-                        }
                     }
                     if (chunk > rem) chunk = rem;
                     chunk -= chunk % winfo.block_align;
@@ -1272,8 +1375,8 @@ int openfw_play_file_ui(exfat_vol_t *vol, const char *dir_path, const char *wav_
                     }
 
                     uint32_t got = 0u;
-                    if (exfat_read_file(vol, &wav_ent, (uint64_t)winfo.data_offset + data_off,
-                                        g_file_buf, chunk, &got) != 0 || got < chunk) {
+                    if (wav_read_aligned(vol, &wav_ent, (uint64_t)winfo.data_offset + data_off,
+                                         g_file_buf, chunk, &got) != 0 || got < chunk) {
                         data_off = winfo.data_bytes;
                         if (!aout_is_busy()) {
                             eof_reached = 1;

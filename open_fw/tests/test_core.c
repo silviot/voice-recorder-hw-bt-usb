@@ -1107,6 +1107,13 @@ static void apmem_make_file(exfat_vol_t *vol, const char *dir, const char *name,
     assert(exfat_close_file(&w) == 0);
 }
 
+static unsigned apmem_rd_sectors;
+static int apmem_read_wrap(void *ctx, uint32_t lba, uint32_t count, void *buf)
+{
+    apmem_rd_sectors += count;
+    return fault_read_sectors(ctx, lba, count, buf);
+}
+
 static void test_apmem_storage(void)
 {
     enum { SECS = 148u }; /* 128 x 512 B clusters: each 16 KiB state file spans a 32-cluster FAT chain */
@@ -1114,8 +1121,10 @@ static void test_apmem_storage(void)
     static uint8_t snap[SECS * 512u];
     init_tiny_exfat(disk, SECS);
     put_le64(&disk[20u * 512u] + 24u, 16u); /* allocation bitmap covers 128 clusters */
+    apmem_rd_sectors = 0u;
+    apmem_invalidate_cache();
     fault_disk_t fd = { disk, SECS, -1, 0 };
-    blkdev_t dev = { fault_read_sectors, fault_write_sectors, SECS, &fd };
+    blkdev_t dev = { apmem_read_wrap, fault_write_sectors, SECS, &fd };
     exfat_vol_t vol;
     assert(exfat_mount(&vol, &dev) == 0);
     assert(exfat_mkdir(&vol, "book") == 0);
@@ -1181,6 +1190,14 @@ static void test_apmem_storage(void)
         assert(apmem_save_pos(&vol, "/book", "CH_02.wav", tag2, 100u + i) == 0);
         assert(apmem_load_pos(&vol, "/book", "CH_02.wav", tag2, &pos) == 0 && pos == 100u + i);
     }
+    unsigned r0 = apmem_rd_sectors;
+    assert(apmem_save_pos(&vol, "/book", "CH_02.wav", tag2, 151u) == 0);
+    unsigned hit_reads = apmem_rd_sectors - r0;
+    assert(hit_reads == 2u);
+    apmem_invalidate_cache();
+    r0 = apmem_rd_sectors;
+    assert(apmem_save_pos(&vol, "/book", "CH_02.wav", tag2, 150u) == 0);
+    assert((apmem_rd_sectors - r0) > hit_reads);
 
     /* Stale entries: renamed (other name) or replaced (other size) files are not matched */
     assert(apmem_load_pos(&vol, "/book", "CH_01_renamed.wav", tag1, &pos) == -1);
@@ -1232,11 +1249,13 @@ static void test_apmem_storage(void)
     assert(exfat_find_path(&vol, "/book2/" APMEM_STATE_NAME, &st) == 0 && st.size == APMEM_FILE_BYTES);
     assert(apmem_load_pos(&vol, "/book2", "A.wav", 100u, &pos) == 0 && pos == 50u);
 
-    /* Remount (power cycle) keeps everything */
+    /* Remount (power cycle) keeps everything and invalidates/bypasses prior cache */
     exfat_vol_t vol2;
     assert(exfat_mount(&vol2, &dev) == 0);
     assert(apmem_load_pos(&vol2, "/book", "CH_02.wav", tag2, &pos) == 0 && pos == 150u);
     assert(apmem_load_focus(&vol2, "/book", name, sizeof(name)) == 0 && strcmp(name, "CH_02.wav") == 0);
+    apmem_invalidate_cache();
+    assert(apmem_load_pos(&vol2, "/book", "CH_02.wav", tag2, &pos) == 0 && pos == 150u);
 
     printf("  [PASS] apmem storage (lazy create, 1 sector/save, torn write, stale, 200 files, RO card, truncated file)\n");
 }

@@ -44,13 +44,14 @@ static const uint16_t pcm_gain_q15[32] = {
 };
 
 static int16_t g_dac_buf[AUDIO_DAC_QUEUE_SLOTS][DAC_SLOT_SAMPLES] __attribute__((aligned(4)));
-static volatile uint8_t  g_dac_running   = 0u;
-static volatile uint8_t  g_tx_active     = 0u;
-static volatile uint8_t  g_active_slot   = 0u;
+static volatile uint8_t  g_dac_running    = 0u;
+static volatile uint8_t  g_tx_active      = 0u;
+static volatile uint8_t  g_dac_fifo_dirty = 0u;
+static volatile uint8_t  g_active_slot    = 0u;
 static uint8_t           g_write_slot;
 static volatile uint32_t g_slot_bytes[AUDIO_DAC_QUEUE_SLOTS];
 static uint32_t          g_pcm_gain_q15;
-static int8_t            g_pa_state      = -1;
+static int8_t            g_pa_state       = -1;
 
 static void dac_wait_mmio_mask(uint32_t addr, uint32_t mask, uint32_t expect)
 {
@@ -59,6 +60,18 @@ static void dac_wait_mmio_mask(uint32_t addr, uint32_t mask, uint32_t expect)
             return;
         }
     }
+}
+
+/* Reset the 16-bit DAC TX FIFO unpacker state before restarting DMAC CH0 after flush or underrun. */
+static void dac_fifo_reset_short(void)
+{
+    openfw_mmio_set32(CODEC_DAC_FIFO_RST_ADDR, 0x2u);
+    for (uint32_t t = 0u; t < 64u; t++) {
+        if ((openfw_mmio_rd32(CODEC_DAC_FIFO_RST_ADDR) & 0x2u) == 0u) {
+            break;
+        }
+    }
+    g_dac_fifo_dirty = 0u;
 }
 
 void audio_pa_set(int enable)
@@ -143,7 +156,8 @@ static void audio_dac_dmac_ch0_irq(void)
             OPENFW_DSB();
         } else {
             openfw_mmio_clr32(DMAC_CH_CTL_ADDR(DAC_DMA_CH), DMAC_CTL_CH_EN);
-            g_tx_active = 0u;
+            g_tx_active      = 0u;
+            g_dac_fifo_dirty = 1u;
         }
     }
 }
@@ -262,9 +276,10 @@ int audio_dac_start(uint32_t sample_rate, uint8_t ana_vol_0_31)
     audio_dac_set_volume(ana_vol_0_31, 0x1FFu);
 
     /* 4. Configure DMAC CH0 TX + NVIC IRQ 60 */
-    g_tx_active   = 0u;
-    g_active_slot = 0u;
-    g_write_slot  = 0u;
+    g_tx_active      = 0u;
+    g_dac_fifo_dirty = 0u;
+    g_active_slot    = 0u;
+    g_write_slot     = 0u;
     for (unsigned i = 0u; i < AUDIO_DAC_QUEUE_SLOTS; i++) {
         g_slot_bytes[i] = 0u;
     }
@@ -328,7 +343,16 @@ int audio_dac_write_stereo(const int16_t *interleaved_lr, uint32_t num_frames)
         }
     }
 
+    if (!g_tx_active && g_dac_fifo_dirty) {
+        dac_fifo_reset_short();
+    }
+
     OPENFW_IRQ_SAVE(primask);
+    if (g_dac_running && !g_tx_active && g_dac_fifo_dirty) {
+        OPENFW_IRQ_RESTORE(primask);
+        dac_fifo_reset_short();
+        OPENFW_IRQ_SAVE(primask);
+    }
     if (g_dac_running) {
         g_slot_bytes[slot] = frames * 4u;
         g_write_slot = (uint8_t)((slot + 1u) % AUDIO_DAC_QUEUE_SLOTS);
@@ -359,6 +383,11 @@ int16_t *audio_dac_borrow_buf(uint32_t *out_bytes)
 }
 #endif
 
+int audio_dac_is_running(void)
+{
+    return g_dac_running != 0u;
+}
+
 int audio_dac_is_busy(void)
 {
     return g_tx_active;
@@ -377,10 +406,12 @@ void audio_dac_flush(void)
     openfw_mmio_wr32(DMAC_CH_IRQ_STAT_ADDR(DAC_DMA_CH),
                      openfw_mmio_rd32(DMAC_CH_IRQ_STAT_ADDR(DAC_DMA_CH)));
     nvic_clear_pending(DMAC_IRQ_BASE + DAC_DMA_CH);
+    dac_fifo_reset_short();
 
-    g_tx_active   = 0u;
-    g_active_slot = 0u;
-    g_write_slot  = 0u;
+    g_tx_active      = 0u;
+    g_dac_fifo_dirty = 0u;
+    g_active_slot    = 0u;
+    g_write_slot     = 0u;
     for (unsigned i = 0u; i < AUDIO_DAC_QUEUE_SLOTS; i++) {
         g_slot_bytes[i] = 0u;
     }
@@ -417,9 +448,10 @@ void audio_dac_stop(void)
     OPENFW_DSB();
     AUDIO_DAC_ISB();
 
-    g_tx_active   = 0u;
-    g_active_slot = 0u;
-    g_write_slot  = 0u;
+    g_tx_active      = 0u;
+    g_dac_fifo_dirty = 0u;
+    g_active_slot    = 0u;
+    g_write_slot     = 0u;
     for (unsigned i = 0u; i < AUDIO_DAC_QUEUE_SLOTS; i++) {
         g_slot_bytes[i] = 0u;
     }

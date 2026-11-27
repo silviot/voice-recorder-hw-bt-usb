@@ -41,7 +41,7 @@
 #define BT_HP_NAME_REQ_TO_MS  10000u  /* a remote name request that never reports is given up then */
 #define BT_HP_SCAN_CANCEL_TO_MS 5000u  /* a discovery cancel not confirmed by "discovery stopped" is cleared after this */
 #define BT_HP_TICK_STOP_MS    100u     /* design §4.3: bound of the BTC-context tick stop at teardown */
-#define BT_HP_DEINIT_WAIT_MS  600u     /* design §5.5: ESP_A2D_DEINIT_SUCCESS wait inside the down job */
+#define BT_HP_DEINIT_WAIT_MS  1500u    /* design §5.5: ESP_A2D_DEINIT_SUCCESS wait inside the down job */
 #define BT_HP_VOL_DEF         64u      /* bt_vol default (0..127, AVRCP scale) */
 
 /* Session states (bt_hp_ui_t.state) */
@@ -137,6 +137,7 @@ int  bt_hp_stream_ready(void);        /* OPEN, STARTED or suspended (aout routes
 void bt_hp_suspend(void);             /* REC switch (design §6.9): suspend the stream, keep the link */
 uint16_t bt_hp_acl_handle(void);      /* the headset's ACL handle (0xFFFF = none): bench linkinfo / stats */
 int  bt_hp_streaming(void);
+int  bt_hp_user_disconnected(void);   /* 1 when the user explicitly disconnected and has not connected again */
 
 /* ---- player integration (src/player.c, BT=1) ---- */
 #define BT_HP_KEY_NONE      0

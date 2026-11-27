@@ -979,7 +979,41 @@ static void test_pause_zero_loss_and_ima2048(void)
         assert(consumed == nblk * spb);
     }
 
-    /* 4. WAV header with 1024-byte JUNK chunk before data (>512 B) parses & plays */
+    /* 4. Unaligned IMA-ADPCM (data_offset=60, block_align=256, spb=505, multi-read) keeps every read 512B aligned */
+    {
+        uint16_t ba  = 256u;
+        uint16_t spb = 505u;
+        uint32_t nblk = 20u; /* 5120 bytes -> 3 aligned multi-sector chunks of 2048/2048/1024 */
+        uint32_t data_bytes = nblk * ba;
+        memset(recording, 0, 60u + data_bytes);
+        memcpy(&recording[0], "RIFF", 4u);
+        put_le32_t(&recording[4], 52u + data_bytes);
+        memcpy(&recording[8], "WAVEfmt ", 8u);
+        put_le32_t(&recording[16], 20u);
+        put_le16_t(&recording[20], WAV_FMT_IMA_ADPCM);
+        put_le16_t(&recording[22], 1u);
+        put_le32_t(&recording[24], 16000u);
+        put_le32_t(&recording[28], 16000u * ba / spb);
+        put_le16_t(&recording[32], ba);
+        put_le16_t(&recording[34], 4u);
+        put_le16_t(&recording[36], 2u);
+        put_le16_t(&recording[38], spb);
+        memcpy(&recording[40], "fact", 4u);
+        put_le32_t(&recording[44], 4u);
+        put_le32_t(&recording[48], nblk * spb);
+        memcpy(&recording[52], "data", 4u);
+        put_le32_t(&recording[56], data_bytes);
+        file_size = 60u + data_bytes;
+        channels  = 1u;
+        memset(&m, 0, sizeof(m));
+        m.cfg.spk_vol = 18;
+        reset_run(pause_resume_then_finish);
+        assert(openfw_play_file_ui(&vol, "/record", "test.wav", &m) == 0);
+        assert(ended == 1 && consumed == nblk * spb);
+        assert(unaligned_reads_after_first == 0u);
+    }
+
+    /* 5. WAV header with 1024-byte JUNK chunk before data (>512 B) parses & plays */
     uint32_t junk_len = 1024u;
     uint32_t pcm_frames = 2048u;
     uint32_t pcm_bytes = pcm_frames * 2u;

@@ -21,16 +21,17 @@
 #ifdef AOUT_HOST_TEST
 #include <stdlib.h>
 #define aout_alloc(n) malloc(n)
-#else
-#include "FreeRTOS.h"
-#define aout_alloc(n) pvPortMalloc(n)
 #endif
 
 #define AOUT_EXPAND_FRAMES 128u   /* mono -> stereo for the DAC route, on the stack */
-#define AOUT_TAP_FRAMES    512u   /* BOTH: DAC feed chunk (heap, allocated on first use) */
+#define AOUT_TAP_FRAMES    512u   /* BOTH: DAC feed chunk */
 /* BOTH: a backlog beyond what the DAC queue takes at once (4 slots of one tap chunk), found with the DAC dry, is
  * dropped instead of played late (pump_dac) */
 #define AOUT_RESYNC_FRAMES (AUDIO_DAC_QUEUE_SLOTS * AOUT_TAP_FRAMES)
+
+#ifndef AOUT_HOST_TEST
+static int16_t s_tap_buf[AOUT_TAP_FRAMES * 2u] OPENFW_SRAM_HI;
+#endif
 
 /* Same Q15 curve as the DAC's digital gain (audio_dac.c): level 0 mutes, 1..31 span -48 dB .. 0 dB. */
 static const uint16_t s_gain_q15[32] = {
@@ -119,11 +120,15 @@ int aout_start(uint32_t src_rate, uint8_t vol)
             r = AOUT_ROUTE_BT;   /* the ring lives in the DAC's buffer: the DAC cannot run */
             g_ao.st.both_degraded++;
         } else if (g_ao.tap_buf == NULL) {
+#ifndef AOUT_HOST_TEST
+            g_ao.tap_buf = s_tap_buf;
+#else
             g_ao.tap_buf = (int16_t *)aout_alloc(AOUT_TAP_FRAMES * 2u * sizeof(int16_t));
             if (g_ao.tap_buf == NULL) {
                 r = AOUT_ROUTE_BT;
                 g_ao.st.both_degraded++;
             }
+#endif
         }
     }
     if (r == AOUT_ROUTE_DAC || r == AOUT_ROUTE_BOTH) {
@@ -174,6 +179,9 @@ static void pump_dac(void)
             hp_sink_tap_advance(s, n);
             g_ao.st.dac_resync_frames += n;
             return;
+        }
+        if (q_dac > 0u && q_ring > 0u && n < AOUT_TAP_FRAMES) {
+            return;   /* coalesce into full 512-frame chunks so the 4 DMA slots are not fragmented */
         }
         n = hp_sink_tap_peek(s, g_ao.tap_buf, n < AOUT_TAP_FRAMES ? n : AOUT_TAP_FRAMES);
         int took = audio_dac_write_stereo(g_ao.tap_buf, n);

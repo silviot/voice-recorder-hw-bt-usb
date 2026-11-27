@@ -61,6 +61,9 @@ SECTIONS
             *lv_tick.o
             *lv_timer.o
             *libbt_port.a:hp_sink.o
+            *libbt_port.a:hp_tx.o
+            *libbt_port.a:hp_sbc.o
+            *libbt_port.a:hp_tx_bd.o
             *libbluedroid.a:sbc_analysis.o
             *libbluedroid.a:sbc_dct.o
             *libbluedroid.a:sbc_enc_bit_alloc_ste.o
@@ -168,6 +171,9 @@ SECTIONS
     .bt_fast : ALIGN(8) {
         _sbt_fast = .;
         *libbt_port.a:hp_sink.o(.text .text.*)
+        *libbt_port.a:hp_tx.o(.text .text.*)
+        *libbt_port.a:hp_sbc.o(.text .text.*)
+        *libbt_port.a:hp_tx_bd.o(.text .text.*)
         *libbluedroid.a:sbc_analysis.o(.text .text.*)
         *libbluedroid.a:sbc_dct.o(.text .text.*)
         *libbluedroid.a:sbc_enc_bit_alloc_ste.o(.text .text.*)
