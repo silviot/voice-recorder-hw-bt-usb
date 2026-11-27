@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "bt_store.h"
+#include "bt_phone_cfg_codec.h"
 #include "openfw_crypto.h"
 
 static int g_fail;
@@ -249,12 +250,48 @@ static void test_hold(void)
     CHECK(!bt_store_held(), "init did not clear the hold");
 }
 
+static void test_phone_cfg(void)
+{
+    static const uint8_t k_bda[6] = { 0x08u, 0x8Bu, 0xC8u, 0x68u, 0xC7u, 0xB3u };
+    bt_phone_cfg_t in = { .auto_sync = 1u, .auto_off_idx = 3u, .sync_pending = 1u, .phone_valid = 1u };
+    memcpy(in.phone_bda, k_bda, 6u);
+    uint8_t buf[BT_PHONE_CFG_BYTES];
+    bt_phone_cfg_pack(&in, buf);
+
+    bt_phone_cfg_t out;
+    memset(&out, 0, sizeof(out));
+    CHECK(bt_phone_cfg_unpack(buf, BT_PHONE_CFG_BYTES, &out) == 0, "17-byte BPC1 unpack");
+    CHECK(out.auto_sync == 1u && out.auto_off_idx == 3u && out.sync_pending == 1u && out.phone_valid == 1u,
+          "17-byte BPC1 fields");
+    CHECK(memcmp(out.phone_bda, k_bda, 6u) == 0, "all 6 phone_bda bytes preserved (last=0x%02x)", out.phone_bda[5]);
+
+    buf[BT_PHONE_CFG_BYTES - 1u] ^= 0x01u;
+    CHECK(bt_phone_cfg_unpack(buf, BT_PHONE_CFG_BYTES, &out) == -1, "bad CRC rejected");
+    buf[BT_PHONE_CFG_BYTES - 1u] ^= 0x01u;
+    buf[0] = 'X';
+    CHECK(bt_phone_cfg_unpack(buf, BT_PHONE_CFG_BYTES, &out) == -1, "bad magic rejected");
+    CHECK(bt_phone_cfg_unpack(buf, 0u, &out) == -1, "len 0 rejected");
+    CHECK(bt_phone_cfg_unpack(buf, 15u, &out) == -1, "len 15 rejected");
+
+    static const uint8_t k_legacy[BT_PHONE_CFG_LEGACY_BYTES] = {
+        0x42u, 0x50u, 0x43u, 0x31u, 0x01u, 0x01u, 0x02u, 0x01u,
+        0x01u, 0x08u, 0x8Bu, 0xC8u, 0x68u, 0xC7u, 0xD7u, 0x54u,
+    };
+    memset(&out, 0xAA, sizeof(out));
+    CHECK(bt_phone_cfg_unpack(k_legacy, BT_PHONE_CFG_LEGACY_BYTES, &out) == 0, "16-byte legacy BPC1 unpack");
+    CHECK(out.auto_sync == 1u && out.auto_off_idx == 2u && out.sync_pending == 1u && out.phone_valid == 0u,
+          "legacy BPC1 keeps prefs and clears corrupted phone_bda");
+    static const uint8_t k_zero[6] = { 0 };
+    CHECK(memcmp(out.phone_bda, k_zero, 6u) == 0, "legacy phone_bda zeroed");
+}
+
 int main(void)
 {
     test_api();
     test_random_ops();
     test_load_fuzz();
     test_hold();
+    test_phone_cfg();
     if (g_fail) {
         printf("test_bt_store: %d FAILURE(S)\n", g_fail);
         return 1;

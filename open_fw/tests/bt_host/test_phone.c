@@ -1515,6 +1515,54 @@ __attribute__((noinline)) static bool step_p9c(uint8_t lkey[16], const pbase_t *
     return !p_fail;
 }
 
+__attribute__((noinline)) static bool step_p9d(const uint8_t lkey[16], const uint8_t xkey[32])
+{
+    /* ACL link encryption disabled mid-session (e.g. peer role-switch fails without EPR): the device must close SPP
+     * and tear down the ACL instead of keeping an unencrypted RFCOMM socket open, then accept a fresh encrypted link. */
+    bth_log("[P9d] ACL encryption disabled mid-session drops SPP + ACL; encrypted reconnect succeeds\n");
+    fake_peer_cfg_t a;
+    peer_cfg(&a, 0xA1u, 0x01u, 0x05u, 0x05u, "laptop-A");
+    peer_attach(&a, lkey);
+    if (!peer_page_and_connect()) {
+        return false;
+    }
+    peer_authenticate();
+    PCHECK(WAIT(fake_peer.authenticated && fake_peer.encrypted, 3000), "P9d auth before enc off");
+    if (!step_rfcomm_open()) {
+        return false;
+    }
+    PCHECK(xrec_auth_chal(xkey), "P9d XREC CHAL/AUTH before enc off");
+    uint32_t drops0 = S().d.enc_off_drops;
+    bth_rom_lock();
+    fake_peer_encrypt(false);
+    bth_rom_unlock();
+    bth_ctrl_kick();
+    PCHECK(WAIT(S().d.enc_off_drops == drops0 + 1u && !S().d.conn_open && S().d.acl_links == 0u, 3000),
+           "enc_off did not drop SPP+ACL (drops %u conn %u acl %u)", S().d.enc_off_drops, S().d.conn_open,
+           S().d.acl_links);
+    PCHECK(WAIT(!fake_peer.connected, 3000), "fake_peer ACL still connected after enc_off drop");
+
+    /* Fresh encrypted reconnect succeeds cleanly */
+    peer_attach(&a, lkey);
+    if (!peer_page_and_connect()) {
+        return false;
+    }
+    peer_authenticate();
+    PCHECK(WAIT(fake_peer.authenticated && fake_peer.encrypted, 3000), "P9d reconnect auth");
+    if (!step_rfcomm_open()) {
+        return false;
+    }
+    PCHECK(xrec_auth_chal(xkey), "P9d reconnect CHAL/AUTH");
+    char line[160];
+    PCHECK(x_send("+XREC:PING\r") && x_line(line, sizeof(line), 3000u) && strncmp(line, "+XREC:PONG", 10) == 0,
+           "P9d reconnect PING '%s'", line);
+    PCHECK(x_send("+XREC:SYNC,0\r") && x_line(line, sizeof(line), 3000u) && strcmp(line, "+XREC:OK,SYNC,0") == 0,
+           "P9d reconnect SYNC '%s'", line);
+    peer_drop(0x13u);
+    PCHECK(WAIT(!S().d.conn_open && S().d.acl_links == 0u, 3000), "P9d reconnect link not down");
+    return !p_fail;
+}
+
 int bth_phone_scenario(const char *img_path)
 {
     bth_log("[P] phone mode end to end: XREC backend + Bluedroid + bt_ctrl + fake ROM peer\n");
@@ -1879,6 +1927,11 @@ int bth_phone_scenario(const char *img_path)
 
     /* ---- 9c ---- */
     if (!step_p9c(lkey, &base)) {
+        goto out;
+    }
+
+    /* ---- 9d ---- */
+    if (!step_p9d(lkey, xkey)) {
         goto out;
     }
 

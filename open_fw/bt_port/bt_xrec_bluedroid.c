@@ -46,7 +46,7 @@ _Static_assert(BT_XREC_TX_RING >= BT_XREC_WRITE_MAX, "a coalesced write is stage
 /* ---- event records (BTC -> app). DATA and WRITE coalesce with the newest record of the same kind and handle. ---- */
 enum {
     EV_DATA = 1, EV_WRITE, EV_CONG, EV_SPP_INIT, EV_SPP_START, EV_SRV_OPEN, EV_CLOSE, EV_RX_OVERFLOW, EV_DISC_COMP,
-    EV_CFM_REQ, EV_PIN_REQ, EV_KEY_REQ, EV_KEY_NOTIF, EV_AUTH_CMPL, EV_ACL_CONN, EV_ACL_DISC,
+    EV_CFM_REQ, EV_PIN_REQ, EV_KEY_REQ, EV_KEY_NOTIF, EV_AUTH_CMPL, EV_ACL_CONN, EV_ACL_DISC, EV_ENC_OFF,
 };
 
 typedef struct {
@@ -156,9 +156,10 @@ static struct {
     uint32_t last_fault;
     uint8_t  parked;          /* F8: silenced by a fault during a recording (state DEAD); hard path after REC */
     /* background sync telemetry + outbound poke */
-    uint8_t  sync_seen, poke_busy, last_cwx_state;
+    uint8_t  sync_seen, poke_busy, poke_active, poke_acl_up, poke_drop_sent, last_cwx_state;
+    uint8_t  poke_bda[6];
     uint16_t sync_pending, sync_eta_sec;
-    uint32_t sync_seq, cwx_seq, fs_seq;
+    uint32_t sync_seq, cwx_seq, fs_seq, poke_acl_t0;
     char     last_cwx_name[32];
     bda_slot_t last_peer;
     bt_xrec_debug_t d;          /* counters only (the rest is filled by bt_xrec_get_debug) */
@@ -377,6 +378,17 @@ static void post(const ev_t *e)
     if (queued) {
         bt_xrec_plat_notify_app();
     }
+}
+
+void bt_xrec_on_enc_change(const uint8_t bda[6], uint8_t encr_enable)
+{
+    if (bda == NULL || encr_enable != 0u) {
+        return;
+    }
+    ev_t e = { 0 };
+    e.type = EV_ENC_OFF;
+    memcpy(e.bda, bda, 6u);
+    post(&e);
 }
 
 static void on_data_ind(uint32_t handle, const uint8_t *data, uint16_t len)
@@ -1200,6 +1212,8 @@ static void prompt_poll(uint32_t now)
     }
 }
 
+static void rx_pend_drop(void);
+
 static void on_gap_event(const ev_t *e)
 {
     esp_err_t r;
@@ -1279,6 +1293,10 @@ static void on_gap_event(const ev_t *e)
             s.acl_links++;
             link_up((uint16_t)e->handle);
             slot_set(&s.acl_peer, e->bda);
+            if (s.poke_active && bda_eq(e->bda, s.poke_bda)) {
+                s.poke_acl_up = 1u;
+                s.poke_acl_t0 = bt_xrec_plat_now_ms();
+            }
         }
         break;
     case EV_ACL_DISC:
@@ -1286,6 +1304,9 @@ static void on_gap_event(const ev_t *e)
             s.acl_links--;
         }
         link_down((uint16_t)e->handle);
+        if (s.poke_active && bda_eq(e->bda, s.poke_bda)) {
+            s.poke_active = s.poke_acl_up = s.poke_drop_sent = 0u;
+        }
         if (s.scan_refused) {
             s.scan_retry_at = bt_xrec_plat_now_ms();   /* apply_scan_mode() sends the wanted mode again this poll */
         }
@@ -1306,6 +1327,21 @@ static void on_gap_event(const ev_t *e)
             s.cfm_ok.valid = 0u;
             s.ssp_showing = 0u;
         }
+        break;
+    case EV_ENC_OFF:
+        s.d.enc_off_drops++;
+        bt_xrec_plat_log("BT XREC link encryption disabled by peer: dropping link");
+        if (slot_is(&s.auth_ok, e->bda)) {
+            s.auth_ok.valid = 0u;
+        }
+        if (s.conn_open && bda_eq(s.conn_bda, e->bda)) {
+            s.conn_authorized = 0u;
+            rx_pend_drop();
+            if (!s.conn_closing) {
+                conn_close_request("BT XREC close: link encryption disabled");
+            }
+        }
+        bt_xrec_plat_drop_acl(e->bda);
         break;
     default:
         break;
@@ -1402,6 +1438,9 @@ static void on_spp_event(const ev_t *e)
             break;
         }
         conn_reset();
+        if (s.poke_active && bda_eq(e->bda, s.poke_bda)) {
+            s.poke_active = s.poke_acl_up = s.poke_drop_sent = 0u;
+        }
         s.conn_open = 1u;
         s.conn_handle = e->handle;
         memcpy(s.conn_bda, e->bda, 6u);
@@ -1447,6 +1486,9 @@ static void on_spp_event(const ev_t *e)
     case EV_DISC_COMP:
         s.poke_busy = 0u;
         s.d.pokes_done++;
+        if (s.poke_active && !s.poke_acl_up && s.acl_links == 0u) {
+            s.poke_active = s.poke_drop_sent = 0u;
+        }
         bt_xrec_plat_log_u32("BT XREC poke discovery done, status", e->status);
         break;
     default:
@@ -1614,6 +1656,7 @@ static void config_begin(void)
         fault(BT_XREC_FAULT_CONFIG);
     } else {
         s_spp_init_posted = 1u;
+        bt_xrec_plat_enc_watch_set(1);
     }
 }
 
@@ -1768,11 +1811,13 @@ int bt_shutdown(void)
     bt_xrec_plat_lock();
     s.cb_open = 0u;
     bt_xrec_plat_unlock();
+    bt_xrec_plat_enc_watch_set(0);
     if (s.b != NULL) {
         xrec_close_pairing(&s.b->xrec);
         xrec_on_disconnect(&s.b->xrec);
     }
     conn_reset();
+    s.poke_active = s.poke_acl_up = s.poke_drop_sent = s.poke_busy = 0u;
     s.window_open = s.xrec_pin_issued = s.ssp_showing = s.ssp_window = s.ssp_deferred = 0u;
     prompt_withdraw("BT SSP prompt withdrawn: BT stopping");
     s.reboot_mode = 0u;
@@ -2092,6 +2137,15 @@ void bt_xrec_poll(void)
 
     if (s.entropy_fail && s.conn_open && !s.conn_closing) {
         conn_close_request("BT XREC close: entropy not ready");
+    }
+    if (s.poke_active && s.poke_acl_up && !s.poke_drop_sent && !s.conn_open) {
+        uint32_t hold_ms = s.poke_busy ? BT_XREC_POKE_FALLBACK_MS : BT_XREC_POKE_HOLD_MS;
+        if ((uint32_t)(now - s.poke_acl_t0) >= hold_ms) {
+            s.poke_drop_sent = 1u;
+            s.d.poke_acl_drops++;
+            bt_xrec_plat_log("BT XREC releasing idle poke ACL");
+            bt_xrec_plat_drop_acl(s.poke_bda);
+        }
     }
     close_retry_poll(now);
     if (s.state != BT_XREC_ST_CONFIG && s.state != BT_XREC_ST_READY) {
@@ -2472,6 +2526,11 @@ int bt_xrec_poke_bonded(const uint8_t hint_bda[6])
         return -1;
     }
     s.poke_busy = 1u;
+    s.poke_active = 1u;
+    s.poke_acl_up = 0u;
+    s.poke_drop_sent = 0u;
+    memcpy(s.poke_bda, target, 6u);
+    s.poke_acl_t0 = bt_xrec_plat_now_ms();
     s.d.pokes_sent++;
     bt_xrec_plat_log("BT XREC poke started (paging bonded phone)");
     return 0;

@@ -40,6 +40,7 @@
 #include "bt_ctrl_rtos.h"
 #include "bt_rom_real.h"
 #include "bt_xrec_bluedroid.h"
+#include "bt_phone_cfg_codec.h"
 #include "bt_task_sup.h"
 #include "bt_hp.h"
 /* Bluedroid's osi thread API (osi/thread.h pulls in bt_common.h, whose bt_status_t clashes with openfw.h's). */
@@ -1462,7 +1463,6 @@ int16_t *bt_hp_plat_borrow_dac_buf(uint32_t *bytes)
 /* ============================================ phone sync & auto-off config (SD:/bt_phone_cfg.bin) ================ */
 #define PHONE_CFG_FILE "bt_phone_cfg.bin"
 #define PHONE_CFG_TMP  ".bt_phone_cfg.tmp"
-#define PHONE_CFG_BYTES 16u
 
 void bt_phone_cfg_defaults(bt_phone_cfg_t *cfg)
 {
@@ -1481,26 +1481,16 @@ int bt_phone_cfg_load(bt_phone_cfg_t *cfg)
         return -1;
     }
     exfat_entry_t ent;
-    if (exfat_find_path(s_boot_vol, "/" PHONE_CFG_FILE, &ent) != 0 || ent.is_dir || ent.size != PHONE_CFG_BYTES) {
+    if (exfat_find_path(s_boot_vol, "/" PHONE_CFG_FILE, &ent) != 0 || ent.is_dir ||
+        (ent.size != BT_PHONE_CFG_BYTES && ent.size != BT_PHONE_CFG_LEGACY_BYTES)) {
         return -1;
     }
-    uint8_t b[PHONE_CFG_BYTES];
+    uint8_t b[BT_PHONE_CFG_BYTES];
     uint32_t nread = 0u;
-    if (exfat_read_file(s_boot_vol, &ent, 0u, b, PHONE_CFG_BYTES, &nread) != 0 || nread != PHONE_CFG_BYTES) {
+    if (exfat_read_file(s_boot_vol, &ent, 0u, b, (uint32_t)ent.size, &nread) != 0 || nread != (uint32_t)ent.size) {
         return -1;
     }
-    uint32_t magic = (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
-    uint16_t want_crc = openfw_crc16_ccitt_false(b, PHONE_CFG_BYTES - 2u);
-    uint16_t got_crc = (uint16_t)b[PHONE_CFG_BYTES - 2u] | ((uint16_t)b[PHONE_CFG_BYTES - 1u] << 8);
-    if (magic != BT_PHONE_CFG_MAGIC || b[4] != 1u || want_crc != got_crc) {
-        return -1;
-    }
-    cfg->auto_sync = b[5] ? 1u : 0u;
-    cfg->auto_off_idx = b[6] <= 3u ? b[6] : 2u;
-    cfg->sync_pending = b[7] ? 1u : 0u;
-    cfg->phone_valid = b[8] ? 1u : 0u;
-    memcpy(cfg->phone_bda, &b[9], 6u);
-    return 0;
+    return bt_phone_cfg_unpack(b, nread, cfg);
 }
 
 int bt_phone_cfg_save(const bt_phone_cfg_t *cfg)
@@ -1508,21 +1498,8 @@ int bt_phone_cfg_save(const bt_phone_cfg_t *cfg)
     if (cfg == NULL) {
         return -1;
     }
-    uint8_t b[PHONE_CFG_BYTES];
-    memset(b, 0, sizeof(b));
-    b[0] = (uint8_t)(BT_PHONE_CFG_MAGIC & 0xFFu);
-    b[1] = (uint8_t)((BT_PHONE_CFG_MAGIC >> 8) & 0xFFu);
-    b[2] = (uint8_t)((BT_PHONE_CFG_MAGIC >> 16) & 0xFFu);
-    b[3] = (uint8_t)((BT_PHONE_CFG_MAGIC >> 24) & 0xFFu);
-    b[4] = 1u; /* version */
-    b[5] = cfg->auto_sync ? 1u : 0u;
-    b[6] = cfg->auto_off_idx <= 3u ? cfg->auto_off_idx : 2u;
-    b[7] = cfg->sync_pending ? 1u : 0u;
-    b[8] = cfg->phone_valid ? 1u : 0u;
-    memcpy(&b[9], cfg->phone_bda, 6u);
-    uint16_t crc = openfw_crc16_ccitt_false(b, PHONE_CFG_BYTES - 2u);
-    b[PHONE_CFG_BYTES - 2u] = (uint8_t)(crc & 0xFFu);
-    b[PHONE_CFG_BYTES - 1u] = (uint8_t)((crc >> 8) & 0xFFu);
+    uint8_t b[BT_PHONE_CFG_BYTES];
+    bt_phone_cfg_pack(cfg, b);
 
     exfat_vol_t *v = s_vol;
     int sd = s_sd;
@@ -1534,7 +1511,7 @@ int bt_phone_cfg_save(const bt_phone_cfg_t *cfg)
     int keep_sd = s_sd;
     s_vol = v;
     s_sd = sd;
-    int r = save_root_file_atomic(PHONE_CFG_TMP, PHONE_CFG_FILE, b, PHONE_CFG_BYTES);
+    int r = save_root_file_atomic(PHONE_CFG_TMP, PHONE_CFG_FILE, b, BT_PHONE_CFG_BYTES);
     s_vol = keep_v;
     s_sd = keep_sd;
     return r;

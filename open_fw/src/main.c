@@ -162,6 +162,7 @@ static struct {
     uint32_t seen_cwx_seq;
     uint32_t seen_fs_seq;
 } g_bt_bg;
+static uint32_t g_hp_idle_since_ms;
 
 static int bt_bg_busy_for_poweroff(uint32_t now_ms)
 {
@@ -1974,6 +1975,15 @@ static void run_bt_xrec_mode(void)
             {
                 bt_xrec_sync_info_t si_ui;
                 bt_xrec_get_sync_info(&si_ui);
+                if (si_ui.last_peer_valid &&
+                    (!g_phone_cfg.phone_valid ||
+                     __builtin_memcmp(g_phone_cfg.phone_bda, si_ui.last_peer_bda, 6u) != 0)) {
+                    g_phone_cfg.phone_valid = 1u;
+                    for (int i = 0; i < 6; i++) {
+                        g_phone_cfg.phone_bda[i] = si_ui.last_peer_bda[i];
+                    }
+                    g_phone_cfg_dirty = 1u;
+                }
                 if (si_ui.cwx_seq != seen_cwx_seq) {
                     seen_cwx_seq = si_ui.cwx_seq;
                     bt_bg_apply_cwx(si_ui.last_cwx_name, si_ui.last_cwx_state, 0);
@@ -2103,8 +2113,8 @@ static void run_bt_xrec_mode(void)
                 g_bt_bg.start_ms       = end_ms;
                 g_bt_bg.pokes          = 0u;
                 g_bt_bg.poke_ms        = 0u;
-                g_bt_bg.ever_connected = (dbg_end.conns_authorized > 0u) ? 1u : 0u;
-            } else if (dbg_end.conns_authorized > 0u) {
+                g_bt_bg.ever_connected = (st_end.xrec_auth || si.sync_seen || si.cwx_seq > 0u) ? 1u : 0u;
+            } else if (st_end.xrec_auth || si.sync_seen || si.cwx_seq > 0u) {
                 g_bt_bg.ever_connected = 1u;
             }
             g_bt_bg.ready_ms     = end_ms ? end_ms : 1u;
@@ -2431,6 +2441,11 @@ static void hp_act(uint8_t kind, uint8_t arg)
     case HPR_POWER:
         if (bt_hp_active()) {
             (void)bt_hp_stop();
+            g_hp_idle_since_ms = 0u;
+            if (!keys_read_rec_switch()) {
+                bt_bg_rearm_if_needed();
+            }
+            bt_ui_sync_refresh(0);
         } else {
             (void)hp_start_session();
         }
@@ -2631,6 +2646,16 @@ static void run_bt_hp_screen(int bench)
         (void)bt_hp_stop();              /* the bench run ends with BT off, like phone mode */
     }
 #endif
+    if (bt_hp_active()) {
+        uint32_t t_idle = millis();
+        g_hp_idle_since_ms = t_idle ? t_idle : 1u;
+        if (!keys_read_rec_switch()) {
+            bt_bg_rearm_if_needed();
+        }
+        bt_ui_sync_refresh(0);
+    } else {
+        g_hp_idle_since_ms = 0u;
+    }
     keys_ignore_held();
     g_ui.toast_msg[0] = '\0';
     backlight_wake(millis());
@@ -3176,6 +3201,16 @@ static void bt_bg_poll(uint32_t now_ms, int rec_active, int usb_busy, int bench_
         if (!g_bt_bg.requested || g_bt_bg.suppress_until_rec || !g_sd_mounted || now_ms < 2500u) {
             return;
         }
+        if (bt_hp_active() && !bt_hp_streaming() && g_hp_idle_since_ms != 0u &&
+            (uint32_t)(now_ms - g_hp_idle_since_ms) >= 5000u) {
+            bt_hp_ui_t hu;
+            bt_hp_get_ui(&hu);
+            if (!hu.scanning && !hu.pairing) {
+                openfw_log_puts("BT bg sync: yielding idle headphones\n");
+                (void)bt_hp_stop();
+                g_hp_idle_since_ms = 0u;
+            }
+        }
         bt_bg_ensure_started(now_ms, dirty);
         if (!g_bt_bg.active) {
             return;
@@ -3233,7 +3268,7 @@ static void bt_bg_poll(uint32_t now_ms, int rec_active, int usb_busy, int bench_
 
     bt_ui_sync_refresh(dirty);
 
-    if (dbg.conns_authorized > 0u) {
+    if (st.xrec_auth || si.sync_seen) {
         g_bt_bg.ever_connected = 1u;
     }
     if (st.spp_open || st.xfer_active) {
@@ -3612,6 +3647,18 @@ static void play_file_at_index(int start_idx)
     }
 #endif
     if (!hp_auto_connect_for_play()) {
+#if OPENFW_BT_HP
+        if (bt_hp_active()) {
+            uint32_t t_idle = millis();
+            g_hp_idle_since_ms = t_idle ? t_idle : 1u;
+            if (!keys_read_rec_switch()) {
+                bt_bg_rearm_if_needed();
+            }
+            bt_ui_sync_refresh(0);
+        } else {
+            g_hp_idle_since_ms = 0u;
+        }
+#endif
         return;
     }
     int idx = start_idx;
@@ -3673,6 +3720,12 @@ static void play_file_at_index(int start_idx)
     }
     save_persisted_state();
 #if OPENFW_BT_HP
+    if (bt_hp_active()) {
+        uint32_t t_idle = millis();
+        g_hp_idle_since_ms = t_idle ? t_idle : 1u;
+    } else {
+        g_hp_idle_since_ms = 0u;
+    }
     if (!keys_read_rec_switch()) {
         bt_bg_rearm_if_needed();
     }
@@ -3726,6 +3779,18 @@ static void play_named_file(const char *dir, ui_file_entry_t *entry)
         }
     }
     if (!hp_auto_connect_for_play()) {
+#if OPENFW_BT_HP
+        if (bt_hp_active()) {
+            uint32_t t_idle = millis();
+            g_hp_idle_since_ms = t_idle ? t_idle : 1u;
+            if (!keys_read_rec_switch()) {
+                bt_bg_rearm_if_needed();
+            }
+            bt_ui_sync_refresh(0);
+        } else {
+            g_hp_idle_since_ms = 0u;
+        }
+#endif
         return;
     }
 #if OPENFW_BT_HP
@@ -3745,6 +3810,12 @@ static void play_named_file(const char *dir, ui_file_entry_t *entry)
     entry->resume_sec = g_ui.play_file.resume_sec;
     save_persisted_state();
 #if OPENFW_BT_HP
+    if (bt_hp_active()) {
+        uint32_t t_idle = millis();
+        g_hp_idle_since_ms = t_idle ? t_idle : 1u;
+    } else {
+        g_hp_idle_since_ms = 0u;
+    }
     if (!keys_read_rec_switch()) {
         bt_bg_rearm_if_needed();
     }
@@ -4229,6 +4300,11 @@ int openfw_main(void)
                     bench_block_bt = bench_home && !bt_bench_home_bg_allowed();
 #endif
                     if (!bench_block_bt && g_phone_cfg.auto_sync) {
+                        if (bt_hp_active() && bt_phone_has_bond_files()) {
+                            openfw_log_puts("BT bg sync: stopping idle headphones on rec\n");
+                            (void)bt_hp_stop();
+                            g_hp_idle_since_ms = 0u;
+                        }
                         /* Start BT/RF calibration BEFORE DMA audio capture starts so zero ring slots accumulate */
                         g_bt_bg.suppress_until_rec = 0u;
                         g_bt_bg.requested          = 1u;

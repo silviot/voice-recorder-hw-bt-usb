@@ -527,6 +527,43 @@ soon as `+XREC:SYNC,0` arrives.
 - **Left on hardware:** clean release `BT=1` (`BENCH=0`, `863,616 B`, `FIRM CRC-16=0xDA9F`) flashed & verified on
   SL6801; updated debug APK installed on Pixel 8.
 
+## Session 14 (2026-11-27): encryption-drop ACL recovery, idle poke release, idle headset yield, and 17-byte `bt_phone_cfg.bin`
+
+- **Root causes diagnosed on attached hardware (`REC_0065.wav` 1,163,308 B stuck untranscribed, Home tile stuck on `Q:1`):**
+  1. **Role-switch encryption failure on outbound pokes (`6C:EB` Jabra active):** SL6801's outbound poke
+     (`bt_xrec_poke_bonded()` -> `esp_spp_start_discovery()`) initiated the ACL as Central with role-switch/EPR masked
+     (`0x00802C04`). When Android `RecorderSync` opened RFCOMM while A2DP headphones (`6C:EB`) were active on Pixel 8,
+     Android's `BTM_SwitchRole` disabled ACL encryption (`Encryption failure 19`), leaving an unencrypted RFCOMM socket
+     stalled while `main.c` marked `ever_connected = 1` on `conns_authorized > 0` and suppressed retries.
+  2. **Idle headphones blocking background sync (`BT…` -> `Q:1`):** Exiting playback or BT Headphones left
+     `bt_hp_active() == 1`, causing `bt_bg_ensure_started()` to return early forever and leaving the Home tile on `Q:1`.
+  3. **`SD:/bt_phone_cfg.bin` truncated at 16 bytes:** `PHONE_CFG_BYTES` in `bt_xrec_fw.c` was `16u` instead of `17u`
+     (`4 + 1 + 1 + 1 + 1 + 1 + 6 + 2`), so writing the 2-byte CRC overwrote `phone_bda[5]` (`0xb3` clobbered by CRC
+     LSB `0xd7` in `425043310101020101088bc868c7d754`).
+- **Firmware fixes:**
+  - `open_fw/bt_port/bt_xrec_spp_mtu.c` + `bt_xrec_bluedroid.{h,c}`: register `btm_cb.api.p_enc_change_callback` and
+    queue `EV_ENC_OFF` when link encryption drops to `0`, immediately closing SPP and calling
+    `btm_remove_acl(bda, BT_TRANSPORT_BR_EDR)` (`enc_off_drops`).
+  - `bt_xrec_bluedroid.{h,c}`: track outbound poke ACLs and release idle poke links via `btm_remove_acl()` after
+    `BT_XREC_POKE_HOLD_MS` (`400 ms`, or `BT_XREC_POKE_FALLBACK_MS` `1200 ms` if discovery lags; disarmed if SPP opens,
+    `poke_acl_drops`); gate `main.c` `ever_connected` on `st.xrec_auth || si.sync_seen` and keep `phone_bda` refreshed.
+  - `open_fw/src/main.c`: stop idle `bt_hp` (`!bt_hp_streaming()`, not scanning/pairing) 5 s after leaving player/BT
+    Headphones (`g_hp_idle_since_ms`), and immediately stop idle `bt_hp` on `rec_sw` ON when `auto_sync` and phone bond
+    files are present.
+  - `open_fw/bt_port/bt_phone_cfg_codec.h` + `bt_xrec_fw.c`: fix `BT_PHONE_CFG_BYTES` to `17u` (decoding legacy
+    16-byte files without the clobbered 6th BDA byte), covered in `tests/test_bt_store.c` (`test_phone_cfg`), plus new
+    encryption-drop and poke-ACL tests in `tests/test_bt_xrec.c` (`t_enc_off_and_poke_acl`) and
+    `tests/bt_host/test_phone.c` (`[P9d]`).
+- **Hardware verification (SL6801 `1209:0001` + Pixel 8 `49101FDJH002K4` `08:8b:c8:68:c7:b3` with active Jabra `6C:EB`):**
+  - Unattended `BT=1 BENCH=1` `mode=rec secs=10 sync_s=90` run paged Pixel 8, dropped the idle Master poke ACL cleanly
+    (`BT XREC releasing idle poke ACL`, `reason=0x16`), accepted Pixel 8's encrypted reconnect as Central (`mtu 990`),
+    downloaded `REC_0065.wav` (1,163,308 B in 40,136 ms, 28 KB/s, 0 retries, while recording 10 s `REC_0066.wav`),
+    transcribed it on Pixel 8, committed `SD:/record/REC_0065.cwx` (698 B, `state 1`, `+XREC:SYNC,1`), and stopped with
+    `stalls 0`, `mallocfail 0`, `sd_err_tot 0`. Temporary `BTBENCH.LOG` and `REC_0066.*` removed from SD;
+    `SD:/bt_phone_cfg.bin` updated to 17 bytes (`phone_bda=08:8b:c8:68:c7:b3`, `sync_pending=0`).
+- **Left on hardware:** clean release `BT=1` (`BENCH=0`, `874,976 B`, `FIRM CRC-16=0xDD28`) flashed & verified on
+  SL6801 (`_ebss=0x0084f930`, `_ebss_hi=0x00866b30`).
+
 ## Exp 1 stages A and B: how to run
 
 Probe image for plan M5 Exp 1 stage A and stage B (step 4): `bt_ctrl` (plan M1) drives the real RW-BT ROM through

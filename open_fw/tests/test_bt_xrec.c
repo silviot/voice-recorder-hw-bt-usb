@@ -143,6 +143,16 @@ static void note_push(int kind, uint8_t arg, const char *line)
     m_notes_n++;
 }
 uint16_t bt_xrec_plat_spp_peer_mtu(uint32_t handle) { (void)handle; return m_peer_mtu; }
+static int m_enc_watch_on, m_drop_acl_calls;
+static uint8_t m_drop_acl_bda[6];
+void bt_xrec_plat_enc_watch_set(int enable) { m_enc_watch_on = enable ? 1 : 0; }
+void bt_xrec_plat_drop_acl(const uint8_t bda[6])
+{
+    m_drop_acl_calls++;
+    if (bda != NULL) {
+        memcpy(m_drop_acl_bda, bda, 6u);
+    }
+}
 /* Live session blocks and their sizes: a block must go back to the heap zeroed (no key, no PAIR line left in it). */
 static void *m_blk[8];
 static size_t m_blk_n[8];
@@ -720,6 +730,9 @@ static void mocks_reset(void)
     m_poke_ret = ESP_OK;
     m_name_calls = 0;
     memset(m_name_bda, 0, sizeof(m_name_bda));
+    m_enc_watch_on = 0;
+    m_drop_acl_calls = 0;
+    memset(m_drop_acl_bda, 0, sizeof(m_drop_acl_bda));
     m_disc_handle = 0u;
     m_spp_init_ret = m_srv_ret = ESP_OK;
     m_nbonds = m_purges = 0;
@@ -2822,6 +2835,84 @@ static void t_sync_poke_and_key_refresh(void)
     stop_ok();
 }
 
+static void t_enc_off_and_poke_acl(void)
+{
+    printf("[29] enc-change watch, ACL drop on enc=0, idle poke ACL hold/release & SPP handoff\n");
+    mocks_reset();
+    add_bond(PEER);
+    bring_up();
+    CHECK(m_enc_watch_on == 1, "enc watch armed on bring_up");
+
+    /* A: idle poke ACL released BT_XREC_POKE_HOLD_MS after link-up once discovery completes */
+    esp_spp_cb_param_t sp;
+    CHECK(bt_xrec_poke_bonded(NULL) == 0 && m_poke_calls == 1, "poke A started");
+    acl_conn_h(PEER, 0x0011u);
+    bt_xrec_poll();
+    memset(&sp, 0, sizeof(sp));
+    sp.disc_comp.status = ESP_SPP_SUCCESS;
+    spp_evt(ESP_SPP_DISCOVERY_COMP_EVT, &sp);
+    bt_xrec_poll();
+    m_now += BT_XREC_POKE_HOLD_MS - 10u;
+    bt_xrec_poll();
+    CHECK(m_drop_acl_calls == 0, "poke ACL held before hold window (%d)", m_drop_acl_calls);
+    m_now += 20u;
+    bt_xrec_poll();
+    CHECK(m_drop_acl_calls == 1 && dbg().poke_acl_drops == 1u && memcmp(m_drop_acl_bda, PEER, 6u) == 0,
+          "idle poke ACL dropped at hold deadline (calls %d drops %u)", m_drop_acl_calls, dbg().poke_acl_drops);
+    acl_disc_h(PEER, 0x0011u);
+    bt_xrec_poll();
+
+    /* B: fallback deadline releases idle poke ACL even if DISCOVERY_COMP lags */
+    CHECK(bt_xrec_poke_bonded(NULL) == 0 && m_poke_calls == 2, "poke B started");
+    acl_conn_h(PEER, 0x0012u);
+    bt_xrec_poll();
+    m_now += BT_XREC_POKE_HOLD_MS + 100u;
+    bt_xrec_poll();
+    CHECK(m_drop_acl_calls == 1, "poke B waits past short hold while discovery busy");
+    m_now += BT_XREC_POKE_FALLBACK_MS;
+    bt_xrec_poll();
+    CHECK(m_drop_acl_calls == 2 && dbg().poke_acl_drops == 2u,
+          "idle poke B released on fallback timer (calls %d drops %u)", m_drop_acl_calls, dbg().poke_acl_drops);
+    spp_evt(ESP_SPP_DISCOVERY_COMP_EVT, &sp);
+    acl_disc_h(PEER, 0x0012u);
+    bt_xrec_poll();
+
+    /* C: if phone opens SPP over the poke ACL, timer is disarmed and link stays open */
+    CHECK(bt_xrec_poke_bonded(NULL) == 0 && m_poke_calls == 3, "poke C started");
+    acl_conn_h(PEER, 0x0013u);
+    spp_evt(ESP_SPP_DISCOVERY_COMP_EVT, &sp);
+    srv_open(H1, PEER);
+    bt_xrec_poll();
+    m_now += 5000u;
+    bt_xrec_poll();
+    CHECK(m_drop_acl_calls == 2 && status().spp_open == 1u,
+          "SPP session cancels idle poke ACL drop (calls %d open %u)", m_drop_acl_calls, status().spp_open);
+
+    /* D: enc=1 is harmless; enc=0 closes SPP + drops ACL and blocks further frames */
+    bt_xrec_on_enc_change(PEER, 1u);
+    bt_xrec_poll();
+    CHECK(dbg().enc_off_drops == 0u && status().spp_open == 1u && m_drop_acl_calls == 2,
+          "enc=1 leaves SPP open");
+    wire_clear();
+    rx(H1, "+XREC:PING\r\n");
+    CHECK(wire_has("+XREC:PONG"), "PING works while encrypted");
+
+    int disc0 = m_disc_calls;
+    bt_xrec_on_enc_change(PEER, 0u);
+    bt_xrec_poll();
+    CHECK(dbg().enc_off_drops == 1u && status().spp_open == 0u && m_disc_calls == disc0 + 1 &&
+          m_drop_acl_calls == 3 && memcmp(m_drop_acl_bda, PEER, 6u) == 0,
+          "enc=0 closes SPP and drops ACL (enc_off %u spp %u disc %d->%d acl %d)",
+          dbg().enc_off_drops, status().spp_open, disc0, m_disc_calls, m_drop_acl_calls);
+    wire_clear();
+    rx(H1, "+XREC:PING\r\n");
+    CHECK(!wire_has("+XREC:PONG"), "PING rejected after enc=0 drop");
+    spp_close(H1);
+    acl_disc_h(PEER, 0x0013u);
+    stop_ok();
+    CHECK(m_enc_watch_on == 0, "enc watch cleared on stop");
+}
+
 int main(int argc, char **argv)
 {
     for (int i = 1; i < argc; i++) {
@@ -2870,6 +2961,7 @@ int main(int argc, char **argv)
     t_coalesce();
     t_ui_sig();
     t_sync_poke_and_key_refresh();
+    t_enc_off_and_poke_acl();
     bt_xrec_test_reset();
     printf("test_bt_xrec (%s build): %d checks, %d failures\n", TB_BENCH ? "bench" : "release", g_checks, g_fails);
     return g_fails == 0 ? 0 : 1;

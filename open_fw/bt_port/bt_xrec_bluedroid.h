@@ -58,6 +58,8 @@
                                               * itself just before the key, and the screen lags up to 150 ms) */
 #define BT_XREC_SCAN_RETRY_MS        3000u   /* a refused scan mode (ROM 0C1A rule: > 1 ACL link) is sent again */
 #define BT_XREC_PIN_KEEP_MS          10000u  /* re-opening a window with more than this left keeps its XREC PIN */
+#define BT_XREC_POKE_HOLD_MS         400u    /* release an idle outbound poke ACL promptly when SPP does not open */
+#define BT_XREC_POKE_FALLBACK_MS     1200u   /* fallback idle poke ACL release if DISCOVERY_COMP lags */
 #define BT_XREC_PEER_NAME_MAX        24u     /* bytes incl. NUL: remote name (UTF-8, cut at a character) or address */
 
 /* ---- BT fault reasons (logged; code of the hard-path fault record 0xB1) ---- */
@@ -125,6 +127,8 @@ typedef struct {
     uint32_t lk_refreshed;       /* patch 0048: ESP_BT_LINK_KEY_CHG_COMB kept on an existing MITM bond */
     uint32_t pokes_sent;         /* bt_xrec_poke_bonded(): esp_spp_start_discovery() calls accepted */
     uint32_t pokes_done;         /* ESP_SPP_DISCOVERY_COMP_EVT received */
+    uint32_t enc_off_drops;      /* BTM encryption disabled on open link -> SPP/ACL dropped */
+    uint32_t poke_acl_drops;     /* idle outbound poke ACL released when phone did not open SPP */
 } bt_xrec_debug_t;
 void bt_xrec_get_debug(bt_xrec_debug_t *out);
 
@@ -255,6 +259,8 @@ void     bt_xrec_plat_log(const char *msg);  /* one line, no secrets */
 void     bt_xrec_plat_log_u32(const char *msg, uint32_t v);
 /* BTC context: negotiated RFCOMM MTU of an open SPP connection (0 = unknown). */
 uint16_t bt_xrec_plat_spp_peer_mtu(uint32_t handle);
+/* BTU context (btm_sec_encrypt_change): notifies phone mode when ACL encryption changes. */
+void     bt_xrec_on_enc_change(const uint8_t bda[6], uint8_t encr_enable);
 /* App task, stack enabled (bt_xrec_bond.c, under btc_config's mutex): 1 if the stored bond of bda holds an
  * authenticated combination key (P-192 0x05 / P-256 0x08); purge drops bda's bond from the BTC config at once (the
  * next bond-file write cannot carry it), independent of BTA DM's deferred unpair. */
@@ -336,5 +342,9 @@ int      bt_xrec_plat_ctrl_note(char *line, uint16_t cap, bt_xrec_note_t *info);
 /* App task: the newest remote name a successful Remote Name Request Complete carried (bt_ctrl_peer_name), whoever
  * asked for it. 1 with bda and a NUL-terminated name, 0 when none. */
 int      bt_xrec_plat_ctrl_name(uint8_t bda[6], char *name, uint16_t cap);
+/* App task (bt_xrec_spp_mtu.c, posted to BTU_TASK via osi_thread_post): install/clear the BTM encryption-change
+ * callback, and drop a BR/EDR ACL link via btm_remove_acl(bda, BT_TRANSPORT_BR_EDR). */
+void     bt_xrec_plat_enc_watch_set(int enable);
+void     bt_xrec_plat_drop_acl(const uint8_t bda[6]);
 
 #endif /* BT_XREC_BLUEDROID_H */
