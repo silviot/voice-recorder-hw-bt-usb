@@ -76,6 +76,9 @@ XREC_SRCS := $(ROOT)/bt_port/bt_rom_real.c $(ROM_BRINGUP_SRC) $(ROOT)/bt_port/bt
 # the session objects when BENCH changes in the same BUILD_DIR.
 BENCH ?= 0
 BENCH_FLAGS := -DOPENFW_BT_BENCH_IMAGE=$(BENCH)
+ifeq ($(PROFILE_REC),1)
+BENCH_FLAGS += -DOPENFW_PROFILE_REC=1
+endif
 # KEYTEST_MISMATCH=1 (bench only, open_fw/Makefile): plan step 6b mismatched public-key test image.
 KEYTEST_MISMATCH ?= 0
 ifeq ($(KEYTEST_MISMATCH),1)

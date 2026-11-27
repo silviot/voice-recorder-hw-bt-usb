@@ -21,6 +21,9 @@
 #include "audio_dsp.h"
 #include "openfw_wav.h"
 #include "openfw_bench_meas.h"   /* F0 counters: bench images only (OPENFW_BENCH_MEAS), compiled out otherwise */
+#if OPENFW_PROFILE_REC
+#include "sl6801_regs.h"
+#endif
 #if OPENFW_BENCH_MEAS
 #if defined(OPENFW_RTOS) && OPENFW_RTOS
 #ifdef OPENFW_HOST_MMIO
@@ -83,6 +86,45 @@ static uint32_t            g_split_count     = 0u;
 static uint32_t            g_last_overruns   = 0u;
 static uint32_t            g_created_timestamp;
 static char                g_filename[16];
+
+#if OPENFW_PROFILE_REC
+/* SysTick runs at the CPU clock with a 1 ms reload. Reading the software
+ * tick on both sides of VAL retries if the tick ISR preempted this task.
+ * Unsigned differences span counter wraps; the interval includes preemption. */
+static uint32_t bm_cycle_stamp(void)
+{
+    const uint32_t period = SYSTICK_RVR + 1u;
+    uint32_t tick, down;
+    do {
+        tick = millis();
+        down = SYSTICK_CVR;
+    } while (millis() != tick);
+    return tick * period - down;
+}
+
+static uint32_t bm_frames, bm_cycles, bm_dsp_us, bm_sd_us, bm_idle_t0, bm_gets_t0;
+static uint64_t bm_wall_t0;
+
+static void bm_window_reset(void)
+{
+    bm_frames = bm_cycles = bm_dsp_us = bm_sd_us = 0u;
+    bm_wall_t0 = us_timer_now();
+    bm_idle_t0 = ulTaskGetIdleRunTimeCounter();
+    bm_gets_t0 = g_bench_meas.gets_b_total;
+}
+
+static void bm_window_report(uint64_t now)
+{
+    if (bm_frames == 0u) {
+        return;
+    }
+    uint32_t idle_us = ulTaskGetIdleRunTimeCounter() - bm_idle_t0;
+    bt_bench_log_rec_profile(bm_frames, bm_cycles, bm_dsp_us, bm_sd_us,
+                             (uint32_t)(now - bm_wall_t0), idle_us,
+                             g_bench_meas.gets_b_total - bm_gets_t0);
+    bm_window_reset();
+}
+#endif
 
 static uint32_t parse_rec_index(const char *name)
 {
@@ -366,6 +408,9 @@ static void rec_vor_emit_cb(void *user, const int16_t *pcm, size_t num_frames)
         uint32_t bm_t1 = (uint32_t)us_timer_now();
         recorder_checkpoint_if_due();
         uint32_t bm_t2 = (uint32_t)us_timer_now();
+#if OPENFW_PROFILE_REC
+        bm_sd_us += bm_t2 - bm_t0;
+#endif
         bench_meas_write(&g_bench_meas, (uint32_t)num_frames, bm_t1 - bm_t0, bm_t2 - bm_t1);
 #else
         recorder_checkpoint_if_due();
@@ -493,6 +538,9 @@ int recorder_start(exfat_vol_t *vol, int sd_mounted)
     g_last_overruns = audio_get_overruns();
     g_rec_active    = 1;
 #if OPENFW_BENCH_MEAS
+#if OPENFW_PROFILE_REC
+    bm_window_reset();
+#endif
     bench_meas_rec_start(&g_bench_meas, g_filename, g_active_channels, g_mic_gain, (uint8_t)g_dsp_profile,
                          (uint8_t)g_vor_enabled, (uint32_t)us_timer_now());
 #endif
@@ -583,10 +631,25 @@ void recorder_poll(void)
                 g_pga_quiet_blks = 0u;
             }
         }
+#if OPENFW_PROFILE_REC
+        uint64_t dsp_t0 = us_timer_now();
+        uint32_t dsp_c0 = bm_cycle_stamp();
+#endif
         audio_dsp_process_i16(&g_dsp, g_proc_buf, num_frames);
+#if OPENFW_PROFILE_REC
+        bm_cycles += bm_cycle_stamp() - dsp_c0;
+        bm_dsp_us += (uint32_t)(us_timer_now() - dsp_t0);
+        bm_frames += (uint32_t)num_frames;
+#endif
         if (g_rec_saving) {
             audio_vor_feed(&g_vor, g_proc_buf, num_frames, rec_vor_emit_cb, 0);
         }
+#if OPENFW_PROFILE_REC
+        uint64_t now = us_timer_now();
+        if (now - bm_wall_t0 >= BENCH_PROFILE_WINDOW_MS * 1000u) {
+            bm_window_report(now);
+        }
+#endif
     }
 #if OPENFW_BENCH_MEAS
     bm_dma_stamp();
@@ -638,6 +701,9 @@ int recorder_stop(void)
 #endif
     recorder_poll();
 
+#if OPENFW_PROFILE_REC
+    bm_window_report(us_timer_now());
+#endif
     int fin_rc = finalize_current_wav_file();
     g_rec_active = 0;
 #if OPENFW_BENCH_MEAS

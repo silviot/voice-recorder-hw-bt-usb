@@ -48,6 +48,9 @@ static uint8_t s_rec_run;        /* this run records */
 static uint8_t s_home;           /* mode=rec: the home loop drives the recording, not ended yet */
 static uint8_t s_home_rec_done;  /* mode=rec with sync_s: recording stopped, waiting on background sync */
 static uint8_t s_home_bg_seen;   /* mode=rec with sync_s: background sync was seen active */
+#if OPENFW_PROFILE_REC
+static uint32_t s_home_cpu_next; /* next per-task snapshot during the home-screen recording */
+#endif
 static uint32_t s_home_sync_t0;  /* mode=rec with sync_s: when the post-recording sync wait began */
 static uint8_t s_cfg_held;       /* the request's rec_* settings are applied; s_user_* restore them */
 static uint8_t s_rec_ours;       /* phone mode: this run's recorder_start() succeeded (the recording is the run's) */
@@ -155,6 +158,23 @@ static void lemit(void)
     openfw_log_puts(s_line);
     taskEXIT_CRITICAL();
 }
+
+#if OPENFW_PROFILE_REC
+void bt_bench_log_rec_profile(uint32_t frames, uint32_t cycles, uint32_t dsp_us, uint32_t sd_us,
+                              uint32_t wall_us, uint32_t idle_us, uint32_t gets_bytes)
+{
+    s_ll = 0u;
+    ls("PROFILE");
+    lku("frames", frames);
+    lku("dsp_cyc", cycles);
+    lku("dsp_us", dsp_us);
+    lku("sd_us", sd_us);
+    lku("wall_us", wall_us);
+    lku("idle_us", idle_us);
+    lku("gets_b", gets_bytes);
+    lemit();
+}
+#endif
 
 static void drain(void)
 {
@@ -840,11 +860,22 @@ int bt_bench_home_tick(uint32_t now_ms, int saving, int bg_active)
     }
     uint32_t a = bt_bench_rec_tick(&s_rec, now_ms, saving);
     if (a & BT_BENCH_REC_ACT_START) {
+#if OPENFW_PROFILE_REC
+        s_win30.prev_us = 0u;
+        log_cpu30();  /* establish the baseline before the REC switch starts capture */
+        s_home_cpu_next = now_ms + 4u * BENCH_PROFILE_WINDOW_MS;
+#endif
         lbegin("recrun start");
         lku("t", (now_ms - s_run.t0) / 1000u);
         lks("via", "rec_switch_path");
         lemit();
     }
+#if OPENFW_PROFILE_REC
+    if (saving && (int32_t)(now_ms - s_home_cpu_next) >= 0) {
+        log_cpu30();
+        s_home_cpu_next = now_ms + 4u * BENCH_PROFILE_WINDOW_MS;
+    }
+#endif
     if (a & BT_BENCH_REC_ACT_STOP) {
         lbegin("recrun stop");
         lks("why", bt_bench_rec_why_name(s_rec.why));

@@ -93,6 +93,12 @@ typedef struct {
     uint16_t cpu_win_ms;                      /* its length; 0 = no window yet */
 } bench_meas_t;
 
+#if OPENFW_PROFILE_REC
+#define BENCH_PROFILE_WINDOW_MS 8000u
+void bt_bench_log_rec_profile(uint32_t frames, uint32_t cycles, uint32_t dsp_us, uint32_t sd_us,
+                              uint32_t wall_us, uint32_t idle_us, uint32_t gets_bytes);
+#endif
+
 extern bench_meas_t g_bench_meas;            /* the firmware's instance (bench images) */
 /* src/audio_dma.c (bench images): us_timer low 32 bits taken by the DMA ISR at the latest completed block. Pair it
  * with audio_get_frames() read before and after (the ISR updates both together). */
