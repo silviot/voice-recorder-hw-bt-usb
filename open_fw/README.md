@@ -20,17 +20,20 @@ open_fw/
 │   ├── audio_dma.c           # Dual-mic AMIC1+AMIC2 DMAC CH1 ring capture
 │   ├── audio_dac.c           # Stereo DAC0/DAC1 DMAC CH0 playback, PB30 speaker PA & 32-step log volume
 │   ├── audio_dsp.c           # Clean-room Voice Clarity / ASR Raw / Bypass DSP + VOR gate
-│   ├── recorder.c            # Checkpointed WAV recording state machine
+│   ├── recorder.c            # Checkpointed WAV recording state machine (+ Auto-PGA clip protection)
 │   ├── player.c              # WAV (PCM/IMA-ADPCM) player with speed dial (-32x..32x) & CWX captions
+│   ├── audio_out.c           # BT=1 output dispatch (DAC / BT A2DP headset / Both)
 │   ├── wav.c / cwx.c         # WAV parser/writer & CWX1 timed-word transcript engine
 │   ├── sdio.c / exfat.c      # 1-bit SDIO driver (CMD18/CMD25) & crash-safe exFAT filesystem
-│   ├── persist.c             # Persistent settings (/cassini/settings.bin)
+│   ├── apmem.c / persist.c   # Per-folder playback auto-resume (.autoplay.state) & /cassini/settings.bin
 │   ├── usb_musb.c / usb_scsi.c # Mentor MUSB Full-Speed USB MSC (EP2 2 KiB FIFO) + vendor 0xE0 SCSI
-│   ├── bt_rf.c / xrec_proto.c # Classic BT RF calibration + +XREC v5 protocol (Bluetooth host: ../bt_port/, BT=1)
+│   ├── bt_rf.c / xrec_proto.c # Classic BT RF calibration + +XREC v5 protocol
+│   ├── rtos/                 # FreeRTOS V11.1.0 glue & boot self-test (RTOS=1 / BT=1)
 │   ├── keys.c / pmu.c / rtc.c / uart.c / wdt_timer.c # Platform peripherals & SRAM log ring
 │   ├── crypto.c              # SHA-256, HMAC-SHA256, CRC-16/CCITT-FALSE, constant-time compare
 │   └── exp_runner.c          # SRAM experiment execution bridge (0x00850000 arena, DEV_EXP=1)
-├── tests/                    # 6 native host test suites (core, MMIO drivers, UI, DSP, player, audio/BT)
+├── bt_port/                  # BT=1 Bluedroid host port (phone XREC, A2DP/AVRCP headphones, RW-BT glue)
+├── tests/                    # Native host MMIO/UI/DSP/FS suites + tests/bt_host/ Bluedroid harness
 ├── exp/                      # Standalone Thumb-2 SRAM hardware probes (built via tools/run_exp.py)
 ├── tools/                    # FIRM packer, LVGL font & EEZ generators, QEMU runner & patch
 └── third_party/lvgl/         # Auto-fetched pinned LVGL v9.2.2 (gitignored)
@@ -49,13 +52,13 @@ make -C open_fw all
 # The same without Bluetooth
 make -C open_fw BT=0 all
 
-# Bluetooth host tests (bt/host_tests.mk): port shims, XREC session, Bluedroid host harness
-make -C open_fw test-bt-port test-bt-xrec test-bt-host
+# Bluetooth host tests (bt/host_tests.mk): port shims, controller shim, XREC session, headphones DSP, Bluedroid harness
+make -C open_fw test-bt-port test-bt-ctrl test-bt-xrec test-bt-hp test-bt-host
 
 # Boot checks + RTOS self-test in QEMU: without BT (RTOS=1) and with BT
 make -C open_fw test-qemu-rtos test-qemu-bt
 
-# Run all 6 host unit, MMIO driver, UI render, DSP, and fsck.exfat tests
+# Run all native host unit, MMIO driver, UI render, DSP, and fsck.exfat tests
 make -C open_fw test-host
 
 # Run the same suite under ASan + UBSan
@@ -79,11 +82,13 @@ make -C open_fw DEV_EXP=1 all update-up
 
 | Region | Address | Budget / Purpose |
 | :--- | :--- | :--- |
-| `.ram_boot` | `0x00804C00` | `<= 4 KiB` Stage-1 `HLKJ` load window (bootstrap + vector table) |
-| `.text` / `.rodata` | `0x00C0F430` | Quad 48 MHz XIP NOR (~`308 KiB` used out of ~`1.9 MiB`) |
-| `.data` + `.bss` | `0x0081A380..0x0084FFFF` | Zero-wait-state SRAM fast-path (hot LVGL/LCD code, 25.6 KiB FB, audio rings, TLSF heap) |
+| `.ram_boot` | `0x00804C00` | `<= 4 KiB` Stage-1 `HLKJ` load window (`3,960 B` `BT=1`, `3,964 B` `BT=0`) |
+| `.bt_fast` + `RTOS_HEAP_LO` | `0x00805C00..0x0081A37F` | `81.9 KiB` lower SRAM (`24.1 KiB` `.bt_fast` hot BT/SBC SRAM code + optional `.bt_lo_bss` in `BENCH`/`HCI_PROBE` + `~57.8 KiB` FreeRTOS heap) |
+| `.text` / `.rodata` | `0x00C0F430` | Quad 48 MHz XIP NOR (`~395 KiB` `BT=0`, `~803 KiB` `BT=1` out of ~`1.9 MiB`) |
+| `.data` + `.bss` | `0x0081A380..0x0084FFFF` | Zero-wait-state SRAM fast-path (hot LVGL/LCD code, 25.6 KiB FB, audio rings, TLSF heap; `BT=1` `_ebss = 0x0084F928`) |
 | `.exp_arena` / `.exp_out` | `0x00850000..0x0085BFFF` | `32 KiB` SRAM probe arena + `16 KiB` capture buffer |
-| `.bss_hi` (`OPENFW_SRAM_HI`) | `0x0085C000..0x00866FFF` | `44 KiB` upper SRAM for large non-hot buffers (96-entry file browser & CPU1 UI slots), leaving `~15 KiB` below `_estack = 0x0086AC08` |
+| `.bss_hi` (`OPENFW_SRAM_HI`) | `0x0085C000..0x00866FFF` | `44 KiB` upper SRAM for large non-hot buffers (96-entry file browser & CPU1 UI slots; `BT=1` `_ebss_hi = 0x00866B30`), below `_estack = 0x0086AC08` |
+| `RTOS_HEAP` | `0x0086B000..0x0087FFFF` | `84 KiB` upper RTOS SRAM (`9.0 KiB` `.rtos_static`, `42.2 KiB` `.bt_data`/`.bt_bss` + `~32.8 KiB` FreeRTOS heap; total `~90.6 KiB` FreeRTOS heap across `RTOS_HEAP_LO` + `RTOS_HEAP`) |
 
 ## microSD Disk Layout (exFAT)
 
@@ -106,6 +111,7 @@ The recorder uses a single exFAT partition on the microSD card with the followin
 │   └── <subfolder>/            # Optional nested audio folders (also surfaced in Files root)
 ├── cassini.key                 # +XREC v5 paired host key ("CSK5" + 32 B)
 ├── bt_bonds.bin                # BT=1: phone-mode Bluedroid bonds (bt_port/bt_xrec_fw.c)
+├── bt_phone_cfg.bin            # BT=1: phone-mode auto-sync & auto-off preferences
 ├── bt_hp_bonds.bin             # BT=1: headphones-mode bonds (headsets)
 ├── bt_hp_cfg.bin               # BT=1: headphones settings (output mode, volume, last headset)
 ├── update.up                   # Optional SD OTA firmware update package (Stage-1 HLKJ)
@@ -126,6 +132,6 @@ A `bt_keys.bin` left by the legacy Bluetooth host (removed in plan step 9) is ig
   - **Storage:** one hidden fixed-size 16 KiB file per folder, created once on the first real save (one-time cost: directory entry + FAT/bitmap + data, like any small file). It holds 16 logical 512 B sectors (header with the focused name + 15 sectors × 31 slots = 465 position slots, `{name hash, size tag, seconds, stamp}`; slot sector = FNV-1a(lower-case name) mod 15, least-recently-written slot evicted when a sector is full). Each logical sector exists twice (A/B); every save reads the pair and overwrites the **older** copy with seq+1 and a CRC-16 via `exfat_overwrite_sector()` — **exactly one 512 B data-sector write, no FAT, bitmap, directory-entry or size change**. A torn write can only damage the copy being written, so the previous value survives (at most the latest position is lost) and the filesystem is never at risk. Unchanged values are not written at all.
   - **Why not `.autoplay.config/` with one small file per track, or editing the `.autoplay` marker:** each per-file update would create/replace a file (directory entries in the folder, FAT and allocation-bitmap sectors — the metadata a power cut can corrupt — plus a whole cluster, 32–128 KiB, per track), i.e. 5–8 metadata writes per save instead of one data sector. The marker is a user file, usually empty (no cluster to overwrite) and may be rewritten by the host over USB.
   - **When it writes:** pause (immediately; skips while paused coalesced to one write per 5 s), leaving a track (Back, next/prev, automatic advance, REC slide), power-off (also from the Files list: focus), Files Back out of the folder (focus), track start (focus, only when it changed), and during uninterrupted playback at most every 60 s (never while the speed dial is away from 1×: the first tick back at 1× writes the heard position if the period has elapsed) (every 15 s below 3.5 V, ahead of a brown-out). An hour of continuous listening therefore costs ~60 single-sector writes (+2 per chapter change), spread over two alternating sectors. A position whose write is triggered by the REC slide is kept in RAM and written only after the recording is closed; no position write ever runs while the recorder is saving. A write error (read-only/full card) silences the feature until the next file-list reload; playback never blocks. RAM cost: one 1 KiB static sector-pair buffer plus ~100 B of state.
-- **Safety & resume:** The track being played is recorded as "last played" before it starts, and a power-off during playback saves the live position, so resume follows automatic advances. Folder rows are protected from long-press delete; `settings.bin` resume lookup searches both loose files and discovered folders.
+- **Safety & universal resume:** The track being played is recorded as "last played" before it starts, and playback position is committed via `apmem` + `settings.bin` periodically (every 60 s at 1×, or 15 s under low battery), immediately on pause, on every track/mode switch, and on clean power-off for both `.autoplay` folders and loose tracks. Folder rows are protected from long-press delete; `settings.bin` resume lookup searches both loose files and discovered folders.
 
 For deeper technical details, see **[../docs/LVGL_ARCHITECTURE.md](../docs/LVGL_ARCHITECTURE.md)**, **[../docs/SL6801_HW76_HARDWARE.md](../docs/SL6801_HW76_HARDWARE.md)**, and **[../docs/DEVELOPMENT_WORKFLOW.md](../docs/DEVELOPMENT_WORKFLOW.md)**.

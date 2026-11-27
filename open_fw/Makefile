@@ -50,7 +50,7 @@ endif
 LVGL_INC := -I$(LVGL_DIR) -DLV_CONF_INCLUDE_SIMPLE=1
 
 CFLAGS   := --target=thumbv7em-none-eabi -mcpu=cortex-m4 -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb \
-            -Os -Wall -Wextra -ffreestanding -fno-builtin -fno-stack-protector \
+            -Os -Wall -Wextra -Werror -MMD -MP -ffreestanding -fno-builtin -fno-stack-protector \
             -ffunction-sections -fdata-sections \
             -Iinclude -Isrc/ui -Isrc/ui/eez $(LVGL_INC) $(RTOS_INC) $(RTOS_DEFS) -I$(BUILD_DIR)
 ifeq ($(DEV_EXP),1)
@@ -411,7 +411,7 @@ test-qemu-hciprobe-full:
 
 WASM_BUILD_DIR := $(BUILD_DIR)_wasm
 WASM_OUT       := ../web_emu/openfw.wasm
-WASM_CFLAGS    := --target=wasm32 -Os -Wall -Wextra -ffreestanding -fno-builtin \
+WASM_CFLAGS    := --target=wasm32 -Os -Wall -Wextra -Werror -MMD -MP -ffreestanding -fno-builtin \
                   -fno-stack-protector -DOPENFW_HOST_MMIO -DOPENFW_WASM=1 \
                   -Iinclude -Isrc/ui -Isrc/ui/eez $(LVGL_INC) -I$(BUILD_DIR)
 WASM_LVGL_CFLAGS := --target=wasm32 -O2 -ffreestanding -fno-builtin -fno-stack-protector \
@@ -425,11 +425,11 @@ $(WASM_BUILD_DIR)/lvgl/%.o: $(LVGL_DIR)/%.c include/lv_conf.h include/board_conf
 	@mkdir -p $(dir $@)
 	$(CLANG) $(WASM_LVGL_CFLAGS) -c $< -o $@
 
-$(WASM_BUILD_DIR)/src/main.o: src/main.c $(SPLASH_HDR) include/sl6801_regs.h include/openfw.h include/openfw_ui.h include/openfw_i18n.h include/openfw_exp.h include/openfw_player.h include/openfw_apmem.h include/openfw_hsprobe.h include/board_config.h src/ui/ui_port.h
+$(WASM_BUILD_DIR)/src/main.o: src/main.c $(SPLASH_HDR) $(CONFIG_STAMP) include/sl6801_regs.h include/openfw.h include/openfw_ui.h include/openfw_i18n.h include/openfw_exp.h include/openfw_player.h include/openfw_apmem.h include/openfw_hsprobe.h include/board_config.h src/ui/ui_port.h | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
 	$(CLANG) $(WASM_CFLAGS) -c $< -o $@
 
-$(WASM_BUILD_DIR)/%.o: %.c include/sl6801_regs.h include/sl6801_rom.h include/openfw.h include/openfw_ui.h include/openfw_i18n.h include/audio_dsp.h include/openfw_exp.h include/openfw_crypto.h include/openfw_wav.h include/openfw_cwx.h include/openfw_player.h include/openfw_apmem.h include/openfw_fs.h include/openfw_usb_msc.h include/openfw_xrec.h include/openfw_hsprobe.h include/board_config.h include/lv_conf.h
+$(WASM_BUILD_DIR)/%.o: %.c $(CONFIG_STAMP) include/sl6801_regs.h include/sl6801_rom.h include/openfw.h include/openfw_ui.h include/openfw_i18n.h include/audio_dsp.h include/openfw_exp.h include/openfw_crypto.h include/openfw_wav.h include/openfw_cwx.h include/openfw_player.h include/openfw_apmem.h include/openfw_fs.h include/openfw_usb_msc.h include/openfw_xrec.h include/openfw_hsprobe.h include/board_config.h include/lv_conf.h | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
 	$(CLANG) $(WASM_CFLAGS) -c $< -o $@
 
@@ -441,6 +441,8 @@ $(WASM_OUT): $(LVGL_DIR)/lvgl.h $(WASM_OBJS) $(WASM_LVGL_OBJS)
 	@ls -lh $@
 
 wasm: $(WASM_OUT)
+
+-include $(ARM_OBJS:.o=.d) $(WASM_OBJS:.o=.d)
 
 clean:
 	rm -rf $(BUILD_DIR) $(WASM_BUILD_DIR)

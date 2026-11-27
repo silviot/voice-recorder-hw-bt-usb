@@ -121,6 +121,7 @@ typedef struct {
     /* Cooperative background sync (+XREC:SYNC,<pending>[,<eta_s>]) and live CWX commit notification. Optional. */
     void     (*on_sync_state)(void *user, uint32_t pending, uint32_t eta_sec);
     void     (*on_rec_cwx)(void *user, const char *cwx_name, uint8_t tr_state);
+    void     (*on_fs_change)(void *user);
 } xrec_ops_t;
 
 /* Pacing counters (bench +XREC:DBG,PACE; tests). */

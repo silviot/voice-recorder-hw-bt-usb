@@ -269,6 +269,24 @@ class XRecRFCOMMClient:
                     files.append((parts[2], int(parts[1])))
         return files
 
+    def list_files_with_time(self) -> List[Tuple[str, int, str]]:
+        """List recordings with ISO-8601 local timestamps (+XREC:LS,T), falling back to +XREC:LS on older firmware."""
+        self._send_cmd("+XREC:LS,T")
+        files: List[Tuple[str, int, str]] = []
+        while True:
+            line = self._read_line()
+            if line == "+XREC:END":
+                break
+            if line == "+XREC:ERR,ARGS":
+                return [(name, sz, "-") for name, sz in self.list_files()]
+            if line.startswith("+XREC:ERR,"):
+                raise RuntimeError(f"Device error listing files: {line}")
+            if line.startswith("+XREC:FT,"):
+                parts = line.split(",", 3)
+                if len(parts) == 4:
+                    files.append((parts[3], int(parts[1]), parts[2]))
+        return files
+
     def delete_file(self, filename: str) -> None:
         self._send_cmd(f"+XREC:DEL,{filename}")
         line = self._read_line()
@@ -471,7 +489,7 @@ class XRecRFCOMMClient:
         # recording) and the shortest interval between GETS window starts (0 = none; the device paces itself, no pause
         # after a window); older firmware sends 8 fields: keys left out
         keys = ("battery_pct", "voltage_mv", "charge_status", "vbus", "media_status", "rec_sec", "free_mb", "total_mb",
-                "rec_idx", "pace_ms")
+                "rec_idx", "pace_ms", "rec_bytes")
         return dict(zip(keys, parts))
 
     def pace(self, rate_bps: int = 0, budget_us: int = 0) -> Dict[str, str]:
@@ -674,41 +692,45 @@ class XRecRFCOMMClient:
         offset = 0
         t0 = time.monotonic()
 
-        with open(tmp_path, "wb") as f:
-            while offset < total_size:
-                use_burst = burst_size > chunk_size
-                req = min(burst_size if use_burst else chunk_size, total_size - offset)
-                chunk = None
-                for attempt in range(3):
-                    try:
-                        if use_burst:
-                            chunk = self.get_burst(filename, offset, req, chunk_size)
-                        else:
-                            chunk = self.get_chunk(filename, offset, req)
+        try:
+            with open(tmp_path, "wb") as f:
+                while offset < total_size:
+                    use_burst = burst_size > chunk_size
+                    req = min(burst_size if use_burst else chunk_size, total_size - offset)
+                    chunk = None
+                    for attempt in range(3):
+                        try:
+                            if use_burst:
+                                chunk = self.get_burst(filename, offset, req, chunk_size)
+                            else:
+                                chunk = self.get_chunk(filename, offset, req)
+                            break
+                        except DeviceRefused:
+                            raise                    # BUSY / LATER: not a transfer error, no retry
+                        except Exception as exc:
+                            if attempt == 2:
+                                raise
+                            print(f"\n  Retry {attempt + 1} at offset {offset}: {exc}")
+                            self.rx_buf.clear()
+                    assert chunk is not None
+                    if not chunk:
                         break
-                    except DeviceRefused:
-                        f.close()
-                        tmp_path.unlink(missing_ok=True)
-                        raise                    # BUSY / LATER: not a transfer error, no retry
-                    except Exception as exc:
-                        if attempt == 2:
-                            raise
-                        print(f"\n  Retry {attempt + 1} at offset {offset}: {exc}")
-                        self.rx_buf.clear()
-                assert chunk is not None
-                if not chunk:
-                    break
-                f.write(chunk)
-                h.update(chunk)
-                offset += len(chunk)
-                elapsed = max(time.monotonic() - t0, 0.001)
-                rate_kbs = (offset / 1024.0) / elapsed
-                pct = (offset * 100.0 / total_size) if total_size else 100.0
-                print(
-                    f"\r  {filename}: {offset:,}/{total_size:,} B ({pct:5.1f}%) @ {rate_kbs:5.1f} KB/s",
-                    end="",
-                    flush=True,
-                )
+                    f.write(chunk)
+                    h.update(chunk)
+                    offset += len(chunk)
+                    elapsed = max(time.monotonic() - t0, 0.001)
+                    rate_kbs = (offset / 1024.0) / elapsed
+                    pct = (offset * 100.0 / total_size) if total_size else 100.0
+                    print(
+                        f"\r  {filename}: {offset:,}/{total_size:,} B ({pct:5.1f}%) @ {rate_kbs:5.1f} KB/s",
+                        end="",
+                        flush=True,
+                    )
+                f.flush()
+                os.fsync(f.fileno())
+        except BaseException:
+            tmp_path.unlink(missing_ok=True)
+            raise
 
         print()
         tmp_path.replace(dst_path)
@@ -738,10 +760,26 @@ class XRecRFCOMMClient:
         synced = 0
         skipped: List[str] = []
         for name, sz in files:
-            dst = safe_dest_path(dest_root, name)
+            base_dst = safe_dest_path(dest_root, name)
+            dst = base_dst
             if dst.is_file() and dst.stat().st_size == sz:
                 print(f"Skipping already synced: {name} ({sz:,} bytes)")
                 continue
+            if dst.exists():
+                suffix_idx = 2
+                found_match = False
+                while True:
+                    cand = safe_dest_path(dest_root, f"{base_dst.stem}_{suffix_idx}{base_dst.suffix}")
+                    if cand.is_file() and cand.stat().st_size == sz:
+                        print(f"Skipping already synced: {name} -> {cand.name} ({sz:,} bytes)")
+                        found_match = True
+                        break
+                    if not cand.exists():
+                        dst = cand
+                        break
+                    suffix_idx += 1
+                if found_match:
+                    continue
             if skip_all or name.lower() == rec_name:
                 print(f"Skipping {name}: " + ("stereo recording" if skip_all else "being recorded"))
                 skipped.append(name)
@@ -964,12 +1002,14 @@ def main() -> None:
             print(f"Uploaded transcript 0:\\record\\{remote} ({n:,} bytes)")
             return
 
-        files = client.list_files()
-        print(f"Found {len(files)} file(s) in 0:\\record:")
-        for name, sz in files:
-            print(f"  - {name} ({sz:,} bytes)")
+        files_t = client.list_files_with_time()
+        print(f"Found {len(files_t)} file(s) in 0:\\record:")
+        for name, sz, iso in files_t:
+            ts_note = f", {iso}" if iso != "-" else ""
+            print(f"  - {name} ({sz:,} bytes{ts_note})")
         if args.list:
             return
+        files = [(name, sz) for name, sz, _ in files_t]
 
         args.dest.mkdir(parents=True, exist_ok=True)
         dest_root = args.dest.resolve()

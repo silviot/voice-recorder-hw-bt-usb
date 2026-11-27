@@ -66,6 +66,7 @@ SECTIONS
             *libbt_port.a:hp_tx_bd.o
             *libbluedroid.a:sbc_analysis.o
             *libbluedroid.a:sbc_dct.o
+            *libbluedroid.a:sbc_enc_bit_alloc_mono.o
             *libbluedroid.a:sbc_enc_bit_alloc_ste.o
             *libbluedroid.a:sbc_encoder.o
             *libbluedroid.a:sbc_packing.o
@@ -105,7 +106,7 @@ SECTIONS
 
     .bss (NOLOAD) : ALIGN(4) {
         _sbss = .;
-        *(EXCLUDE_FILE(*libbluedroid.a:* *libbt_port.a:* *libc.a:* *libclang_rt_min.a:*) .bss .bss.* COMMON)
+        *(EXCLUDE_FILE(*libbluedroid.a:* *libbt_port.a:* *libc.a:* *libclang_rt_min.a:* *bench_meas.o) .bss .bss.* COMMON)
         /* BT=1: the RW-BT ROM heap g_bt_heap (bt_port/bt_rom_bringup.c) stays here, where the legacy bt_hci.c had it */
         *libbt_port.a:bt_rom_bringup.o(.bss .bss.* COMMON)
         . = ALIGN(4);
@@ -176,6 +177,7 @@ SECTIONS
         *libbt_port.a:hp_tx_bd.o(.text .text.*)
         *libbluedroid.a:sbc_analysis.o(.text .text.*)
         *libbluedroid.a:sbc_dct.o(.text .text.*)
+        *libbluedroid.a:sbc_enc_bit_alloc_mono.o(.text .text.*)
         *libbluedroid.a:sbc_enc_bit_alloc_ste.o(.text .text.*)
         *libbluedroid.a:sbc_encoder.o(.text .text.*)
         *libbluedroid.a:sbc_packing.o(.text .text.*)
@@ -186,6 +188,16 @@ SECTIONS
 
     _sibt_fast = LOADADDR(.bt_fast);
 
+    /* Diagnostic BENCH=1 / HCI_PROBE=1 static buffers (empty in release BT=1 / BT=0): keep .bss and .bss_hi
+     * within their bounds while leaving ~47 KiB in RTOS_HEAP_LO and preserving the >32 KiB RTOS_HEAP floor. */
+    .bt_lo_bss (NOLOAD) : ALIGN(8) {
+        _sbt_lo_bss = .;
+        *bench_meas.o(.bss .bss.* COMMON)
+        *(.bt_lo_bss .bt_lo_bss.*)
+        . = ALIGN(8);
+        _ebt_lo_bss = .;
+    } > RTOS_HEAP_LO
+
     .rtos_heap_lo (NOLOAD) : ALIGN(8) {
         _srtos_heap_lo = .;
         . = ORIGIN(RTOS_HEAP_LO) + LENGTH(RTOS_HEAP_LO);
@@ -193,6 +205,7 @@ SECTIONS
     } > RTOS_HEAP_LO
 
     ASSERT(_srtos_heap_lo >= 0x00805C00 && _ertos_heap_lo <= 0x0081A380, "RTOS_HEAP_LO outside the validated range")
+    ASSERT(_srtos_heap_lo >= _ebt_lo_bss && _sbt_lo_bss >= _ebt_fast, "RTOS_HEAP_LO static sections overlap")
 
     .rtos_heap (NOLOAD) : ALIGN(8) {
         _srtos_heap0 = .;

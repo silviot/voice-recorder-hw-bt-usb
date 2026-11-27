@@ -503,25 +503,37 @@ class PyUsbBulkTransport(BulkOnlyTransport):
             raise FileNotFoundError(f"Cassini OpenFW ({vid:04x}:{pid:04x}) not found.")
 
         self._reattach = False
-        if self.dev.is_kernel_driver_active(0):
-            self.dev.detach_kernel_driver(0)
-            self._reattach = True
-        self._usb_util.claim_interface(self.dev, 0)
+        try:
+            if self.dev.is_kernel_driver_active(0):
+                self.dev.detach_kernel_driver(0)
+                self._reattach = True
+            self._usb_util.claim_interface(self.dev, 0)
 
-        cfg = self.dev.get_active_configuration()
-        intf = cfg[(0, 0)]
-        self.ep_out = self._usb_util.find_descriptor(
-            intf,
-            custom_match=lambda e: self._usb_util.endpoint_direction(e.bEndpointAddress)
-            == self._usb_util.ENDPOINT_OUT,
-        )
-        self.ep_in = self._usb_util.find_descriptor(
-            intf,
-            custom_match=lambda e: self._usb_util.endpoint_direction(e.bEndpointAddress)
-            == self._usb_util.ENDPOINT_IN,
-        )
-        if self.ep_out is None or self.ep_in is None:
-            raise RuntimeError("Missing Bulk IN/OUT endpoints on OpenFW USB interface 0")
+            cfg = self.dev.get_active_configuration()
+            intf = cfg[(0, 0)]
+            self.ep_out = self._usb_util.find_descriptor(
+                intf,
+                custom_match=lambda e: self._usb_util.endpoint_direction(e.bEndpointAddress)
+                == self._usb_util.ENDPOINT_OUT,
+            )
+            self.ep_in = self._usb_util.find_descriptor(
+                intf,
+                custom_match=lambda e: self._usb_util.endpoint_direction(e.bEndpointAddress)
+                == self._usb_util.ENDPOINT_IN,
+            )
+            if self.ep_out is None or self.ep_in is None:
+                raise RuntimeError("Missing Bulk IN/OUT endpoints on OpenFW USB interface 0")
+        except Exception:
+            try:
+                self._usb_util.release_interface(self.dev, 0)
+            except Exception:
+                pass
+            if self._reattach:
+                try:
+                    self.dev.attach_kernel_driver(0)
+                except Exception:
+                    pass
+            raise
 
     def close(self) -> None:
         self._usb_util.release_interface(self.dev, 0)

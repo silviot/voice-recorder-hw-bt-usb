@@ -181,22 +181,37 @@ class PyUsbBootromClient(BootromFlashClient):
                 f"SL6801 BootROM ({vid:04x}:{pid:04x}) not found. Enter PC Upgrade / mask ROM DFU mode first."
             )
         self._reattach = False
-        if self.dev.is_kernel_driver_active(0):
-            self.dev.detach_kernel_driver(0)
-            self._reattach = True
-        self._usb_util.claim_interface(self.dev, 0)
-        cfg = self.dev.get_active_configuration()
-        intf = cfg[(0, 0)]
-        self.ep_out = self._usb_util.find_descriptor(
-            intf,
-            custom_match=lambda e: self._usb_util.endpoint_direction(e.bEndpointAddress)
-            == self._usb_util.ENDPOINT_OUT,
-        )
-        self.ep_in = self._usb_util.find_descriptor(
-            intf,
-            custom_match=lambda e: self._usb_util.endpoint_direction(e.bEndpointAddress)
-            == self._usb_util.ENDPOINT_IN,
-        )
+        try:
+            if self.dev.is_kernel_driver_active(0):
+                self.dev.detach_kernel_driver(0)
+                self._reattach = True
+            self._usb_util.claim_interface(self.dev, 0)
+            cfg = self.dev.get_active_configuration()
+            intf = cfg[(0, 0)]
+            self.ep_out = self._usb_util.find_descriptor(
+                intf,
+                custom_match=lambda e: self._usb_util.endpoint_direction(e.bEndpointAddress)
+                == self._usb_util.ENDPOINT_OUT,
+            )
+            self.ep_in = self._usb_util.find_descriptor(
+                intf,
+                custom_match=lambda e: self._usb_util.endpoint_direction(e.bEndpointAddress)
+                == self._usb_util.ENDPOINT_IN,
+            )
+            if self.ep_out is None or self.ep_in is None:
+                raise RuntimeError("Missing Bulk IN/OUT endpoints on SL6801 BootROM interface 0")
+        except Exception:
+            self._disconnected = False
+            try:
+                self._usb_util.release_interface(self.dev, 0)
+            except Exception:
+                pass
+            if self._reattach:
+                try:
+                    self.dev.attach_kernel_driver(0)
+                except Exception:
+                    pass
+            raise
         self._tag = 1
         self._disconnected = False
 
@@ -577,12 +592,28 @@ def execute_flash_plan(
         )
         stats["sectors_erased"] += 1
 
-    # 2. Program all payload chunks first, deferring the boot header sector
-    #    (0x00D000..0x00DFFF) to the very end ("header-last" power-safe order).
+    # 2. Program all non-header payload chunks first ("header-last" power-safe order),
+    #    then verify payload CRC/readback BEFORE writing 0x00D000 so reset falls back to
+    #    BootROM DFU (301a:2800) if payload verification fails.
     deferred_header_chunks: list[int] = []
+    payload_verify_ranges: list[tuple[int, int]] = []
+    header_verify_ranges: list[tuple[int, int]] = []
+    hdr_end = BOOT_HEADER_OFFSET + SECTOR_SIZE
     for start, length in ranges:
+        end = start + length
+        h_lo = max(start, BOOT_HEADER_OFFSET)
+        h_hi = min(end, hdr_end)
+        if h_lo < h_hi:
+            if start < h_lo:
+                payload_verify_ranges.append((start, h_lo - start))
+            header_verify_ranges.append((h_lo, h_hi - h_lo))
+            if h_hi < end:
+                payload_verify_ranges.append((h_hi, end - h_hi))
+        else:
+            payload_verify_ranges.append((start, length))
+
         for off in range(start, start + length, chunk):
-            if BOOT_HEADER_OFFSET <= off < BOOT_HEADER_OFFSET + SECTOR_SIZE:
+            if BOOT_HEADER_OFFSET <= off < hdr_end:
                 deferred_header_chunks.append(off)
                 continue
             data = expected_sector_data(image, off, chunk)
@@ -595,6 +626,44 @@ def execute_flash_plan(
             stats["chunks_written"] += 1
             stats["bytes_written"] += len(data)
 
+    def _verify_subranges(subranges: list[tuple[int, int]]) -> None:
+        if not verify:
+            return
+        for s_off, s_len in subranges:
+            exp = expected_sector_data(image, s_off, s_len)
+            exp_crc = crc16_ccitt_false(exp)
+            hw_crc = _with_retries(
+                client,
+                f"crc@0x{s_off:06X}",
+                lambda s=s_off, l=s_len: client.crc_flash(s, l),
+                retries,
+            )
+            if hw_crc != exp_crc:
+                raise RuntimeError(
+                    f"Hardware CRC-16 mismatch at 0x{s_off:06X}+0x{s_len:X}: "
+                    f"got 0x{hw_crc:04X}, expected 0x{exp_crc:04X}"
+                )
+            for off in range(s_off, s_off + s_len, chunk):
+                rlen = min(chunk, s_off + s_len - off)
+                got = _with_retries(
+                    client,
+                    f"read@0x{off:06X}",
+                    lambda o=off, n=rlen: client.read_flash(o, n),
+                    retries,
+                )
+                want = exp[off - s_off : off - s_off + rlen]
+                if got != want:
+                    for bi, (gb, wb) in enumerate(zip(got, want)):
+                        if gb != wb:
+                            raise RuntimeError(
+                                f"Readback mismatch at 0x{off + bi:06X}: "
+                                f"got 0x{gb:02X}, expected 0x{wb:02X}"
+                            )
+                    raise RuntimeError(f"Readback length mismatch at 0x{off:06X}")
+                stats["bytes_verified"] += len(got)
+
+    _verify_subranges(payload_verify_ranges)
+
     for off in deferred_header_chunks:
         data = expected_sector_data(image, off, chunk)
         _with_retries(
@@ -606,39 +675,16 @@ def execute_flash_plan(
         stats["chunks_written"] += 1
         stats["bytes_written"] += len(data)
 
-    for start, length in ranges:
-        # 3. Verify both hardware CRC-16 and exact byte readback
-        if verify:
-            exp = expected_sector_data(image, start, length)
-            exp_crc = crc16_ccitt_false(exp)
-            hw_crc = _with_retries(
-                client,
-                f"crc@0x{start:06X}",
-                lambda s=start, l=length: client.crc_flash(s, l),
-                retries,
-            )
-            if hw_crc != exp_crc:
-                raise RuntimeError(
-                    f"Hardware CRC-16 mismatch at 0x{start:06X}+0x{length:X}: "
-                    f"got 0x{hw_crc:04X}, expected 0x{exp_crc:04X}"
-                )
-            for off in range(start, start + length, chunk):
-                got = _with_retries(
-                    client,
-                    f"read@0x{off:06X}",
-                    lambda o=off: client.read_flash(o, chunk),
-                    retries,
-                )
-                want = exp[off - start : off - start + chunk]
-                if got != want:
-                    for bi, (gb, wb) in enumerate(zip(got, want)):
-                        if gb != wb:
-                            raise RuntimeError(
-                                f"Readback mismatch at 0x{off + bi:06X}: "
-                                f"got 0x{gb:02X}, expected 0x{wb:02X}"
-                            )
-                    raise RuntimeError(f"Readback length mismatch at 0x{off:06X}")
-                stats["bytes_verified"] += len(got)
+    try:
+        _verify_subranges(header_verify_ranges)
+    except Exception:
+        # Leave 0x00D000 erased so reset falls back cleanly to 301a:2800 BootROM DFU.
+        if header_verify_ranges:
+            try:
+                _with_retries(client, f"erase@0x{BOOT_HEADER_OFFSET:06X}", lambda: client.erase_4k(BOOT_HEADER_OFFSET), retries)
+            except Exception:
+                pass
+        raise
 
     elapsed = max(time.monotonic() - t0, 1e-6)
     print(
@@ -767,7 +813,53 @@ def run_self_test() -> int:
         saw_err = True
     assert saw_err, "Expected verify to reject bit-flipped readback"
 
-    # 6. BootROM WRITERAM + RUNRAM reboot stub
+    # 6. Header-last enforcement across 0x00D000..0x010000:
+    #    erase 0x00D000 first, verify 0x00E000+ before writing 0x00D000 last,
+    #    and keep 0x00D000 erased if payload verification fails.
+    full_img = bytearray([0xFF] * 0x12000)
+    full_img[0x0D000:0x0F000] = bytes((i & 0xFF) for i in range(0x2000))
+    hl_ok = _MockBootromClient(bytes([0xFF] * 0x12000), fail_every=0)
+    ops_order: list[tuple[str, int]] = []
+    orig_erase_hl = hl_ok.erase_4k
+    orig_write_hl = hl_ok.write_page
+    orig_crc_hl = hl_ok.crc_flash
+    def _track_erase(off: int) -> None:
+        ops_order.append(("erase", off))
+        orig_erase_hl(off)
+    def _track_write(off: int, data: bytes) -> None:
+        ops_order.append(("write", off))
+        orig_write_hl(off, data)
+    def _track_crc(off: int, length: int) -> int:
+        ops_order.append(("crc", off))
+        return orig_crc_hl(off, length)
+    hl_ok.erase_4k = _track_erase  # type: ignore[method-assign]
+    hl_ok.write_page = _track_write  # type: ignore[method-assign]
+    hl_ok.crc_flash = _track_crc  # type: ignore[method-assign]
+    execute_flash_plan(hl_ok, bytes(full_img), [(0x0D000, 0x3000)], chunk=2048, retries=2, verify=True, dry_run=False)
+    assert ops_order[0] == ("erase", 0x0D000), f"0x00D000 not erased first: {ops_order}"
+    write_offs = [op for op in ops_order if op[0] == "write"]
+    assert write_offs[-2:] == [("write", 0x0D000), ("write", 0x0D800)], f"0x00D000 not written last: {ops_order}"
+    first_hdr_write_idx = ops_order.index(("write", 0x0D000))
+    crc_idxs = [i for i, op in enumerate(ops_order) if op == ("crc", 0x0E000)]
+    assert crc_idxs and crc_idxs[0] < first_hdr_write_idx, f"Payload not verified before 0x00D000 write: {ops_order}"
+
+    hl_fail = _MockBootromClient(bytes([0xFF] * 0x12000), fail_every=0)
+    orig_read_hl = hl_fail.read_flash
+    def _corrupt_payload(offset: int, length: int) -> bytes:
+        res = bytearray(orig_read_hl(offset, length))
+        if offset == 0x0E000:
+            res[0] ^= 0xFF
+        return bytes(res)
+    hl_fail.read_flash = _corrupt_payload  # type: ignore[method-assign]
+    saw_payload_err = False
+    try:
+        execute_flash_plan(hl_fail, bytes(full_img), [(0x0D000, 0x3000)], chunk=2048, retries=1, verify=True, dry_run=False)
+    except RuntimeError:
+        saw_payload_err = True
+    assert saw_payload_err, "Expected payload readback mismatch at 0x00E000"
+    assert bytes(hl_fail.mem[0x0D000:0x0E000]) == b"\xFF" * SECTOR_SIZE, "0x00D000 must stay erased when payload verify fails"
+
+    # 7. BootROM WRITERAM + RUNRAM reboot stub
     reb = _MockBootromClient(bytes(old_img), fail_every=0)
     reb.reboot_chip()
     assert reb.ram.get(REBOOT_STUB_ADDR) == REBOOT_STUB_BYTES
@@ -776,7 +868,7 @@ def run_self_test() -> int:
 
     print(
         "flash_ranges.py self-test PASSED "
-        "(alignment, diff, retries, dry-run, CRC+readback verify, reboot stub)"
+        "(alignment, diff, retries, dry-run, header-last order, CRC+readback verify, reboot stub)"
     )
     return 0
 

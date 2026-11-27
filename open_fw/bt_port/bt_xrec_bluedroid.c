@@ -158,7 +158,7 @@ static struct {
     /* background sync telemetry + outbound poke */
     uint8_t  sync_seen, poke_busy, last_cwx_state;
     uint16_t sync_pending, sync_eta_sec;
-    uint32_t sync_seq, cwx_seq;
+    uint32_t sync_seq, cwx_seq, fs_seq;
     char     last_cwx_name[32];
     bda_slot_t last_peer;
     bt_xrec_debug_t d;          /* counters only (the rest is filled by bt_xrec_get_debug) */
@@ -904,6 +904,12 @@ static void xo_rec_cwx(void *user, const char *cwx_name, uint8_t tr_state)
     s.last_cwx_state = tr_state ? tr_state : 1u;
     s.cwx_seq++;
     bt_xrec_plat_log_u32("BT XREC CWX committed, state", s.last_cwx_state);
+}
+
+static void xo_fs_change(void *user)
+{
+    (void)user;
+    s.fs_seq++;
 }
 
 /* ---- pairing policy ---- */
@@ -1914,6 +1920,7 @@ int bt_xrec_start(exfat_vol_t *vol, int sd_mounted)
     ops.now_ms = xo_now_ms;
     ops.on_sync_state = xo_sync_state;
     ops.on_rec_cwx = xo_rec_cwx;
+    ops.on_fs_change = xo_fs_change;
     xrec_init(&b->xrec, sd_mounted ? vol : 0, &ops, 0);
     bt_xrec_plat_load_bound_key(&b->xrec);
 
@@ -2407,6 +2414,7 @@ void bt_xrec_get_sync_info(bt_xrec_sync_info_t *out)
     out->sync_eta_sec = s.sync_eta_sec;
     out->sync_seq = s.sync_seq;
     out->cwx_seq = s.cwx_seq;
+    out->fs_seq = s.fs_seq;
     out->last_cwx_state = s.last_cwx_state;
     memcpy(out->last_cwx_name, s.last_cwx_name, sizeof(out->last_cwx_name));
     out->poke_busy = s.poke_busy;

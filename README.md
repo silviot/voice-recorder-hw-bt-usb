@@ -12,16 +12,16 @@ Out of the box, the hardware packs dual differential microphones, 64 GB of stora
 
 ## Project Status
 
-The core recorder firmware is **working and verified on physical `HW_76` silicon**. The remaining major milestone is completing **Bluetooth connectivity**.
+The firmware and host tooling are **working and verified on physical `HW_76` silicon**, including Classic Bluetooth phone sync (`+XREC v5` with live streaming during recording) and A2DP/AVRCP wireless headphones playback.
 
 | Subsystem | Status | Notes |
 | :--- | :---: | :--- |
-| **Dual-Mic Audio Recording & DSP** | Working | Instant `PB6` slide-switch capture to exFAT WAV, `AMIC1 + AMIC2` stereo/mono, clean-room `Voice Clarity` / `ASR Raw` / `Bypass` DSP, optional VOR (200 ms pre-roll + 500 ms hangover), live 128-pt FFT Mel spectrogram + markers |
-| **Audio Playback & Transcripts** | Working | On-device WAV (PCM & IMA-ADPCM) playback with 32-step log-dB volume, automatic speaker (`PB30` PA) / 3.5 mm headphone (`PB11`) switching, a speed dial (`−32×…32×`: pitch-preserving audio up to `4×` forward and reverse, silent seeking from `8×`), and synced `.cwx` word-level captions |
+| **Dual-Mic Audio Recording & DSP** | Working | Instant `PB6` slide-switch capture to exFAT WAV, `AMIC1 + AMIC2` stereo/mono, automatic analog clip-protection PGA gain (`Auto-PGA`, starting at `20`), clean-room `Voice Clarity` / `ASR Raw` / `Bypass` DSP, optional VOR (200 ms pre-roll + 500 ms hangover), live 128-pt FFT Mel spectrogram + markers |
+| **Audio Playback & Transcripts** | Working | On-device WAV (PCM & IMA-ADPCM) playback with 32-step log-dB volume, automatic speaker (`PB30` PA) / 3.5 mm headphone (`PB11`) / Bluetooth A2DP switching, speed dial (`−32×…32×`), universal auto-resume (`apmem` + `settings.bin`), and synced `.cwx` word-level captions |
 | **Dual-Core LVGL v9.2.2 UI** | Working | Dedicated **CPU1 (96 MHz)** UI worker with IPC Mailbox `WFE` sleep, 4-bit anti-aliased Noto Sans fonts, EEZ Studio screens, hardware-scroll screen push transitions, and `289 ms` cold boot |
-| **Crash-Safe exFAT Storage** | Working | 1-bit SDIO (`CMD18`/`CMD25` bursts + fallback), periodic WAV checkpointing, atomic staged file replace, `fsck.exfat`-clean |
+| **Crash-Safe exFAT Storage** | Working | 1-bit SDIO (`CMD18`/`CMD25` bursts + fallback), periodic WAV checkpointing, atomic staged file replace, 2 GiB WAV auto-split, `fsck.exfat`-clean |
 | **USB-C Drive Mode & Telemetry** | Working | Clean-room Mentor MUSB USB Mass Storage (`1209:0001`, `~810 KB/s` via EP2 `2 KiB` FIFO, no Linux disconnect loop) + vendor SCSI `0xE0` live log, RTC sync & SRAM experiment runner |
-| **Bluetooth Connectivity (`+XREC v5`)** | **Next Milestone** | Clean-room RF/VCO/BPF calibration, `RW-BT` HCI controller glue, SPP framing, and `+XREC v5` protocol are written and unit-tested; end-to-end on-device BT pairing & sync soak is the next active work item |
+| **Bluetooth Phone Sync & Headphones (`BT=1`)** | Working | FreeRTOS V11.1.0 + Bluedroid (`+XREC v5` SPP sync, live streaming during recording + `.cwx` background upload, MITM SSP pairing, and A2DP Source / AVRCP CT+TG headphones mode with SRAM-hot SBC/resampler loops) |
 
 ---
 
@@ -67,14 +67,14 @@ flowchart LR
     subgraph BOOT["Boot Chain (Safe — Stock HLKJ & PSMP Untouched)"]
         ROM["Mask ROM (384 KiB)<br/>USB DFU 301a:2800"] --> HLKJ["Stage-1 HLKJ<br/>Flash 0x000000..0x00CFFF"]
         HLKJ --> RAMBOOT[".ram_boot (<= 4 KiB @ SRAM 0x804C00)<br/>FPU + PLL0 96 MHz + Quad 48 MHz XIP"]
-        RAMBOOT --> XIP["open_fw XIP (~272 KiB @ 0xC0F430)<br/>+ Hot LCD/LVGL in SRAM"]
+        RAMBOOT --> XIP["open_fw XIP (~395 KiB BT=0 / ~803 KiB BT=1 @ 0xC0F430)<br/>+ Hot LCD/LVGL/BT in SRAM"]
     end
 
     subgraph CPU0["CPU0 — Real-Time & Storage Core (96 MHz)"]
-        AUDIO["Audio ADC/DAC<br/>DMAC CH1/CH0 + FPU DSP/VOR"]
-        FS["1-bit SDIO + exFAT<br/>WAV / IMA-ADPCM / CWX"]
+        AUDIO["Audio ADC/DAC<br/>DMAC CH1/CH0 + FPU DSP/VOR/Auto-PGA"]
+        FS["1-bit SDIO + exFAT<br/>WAV / IMA-ADPCM / CWX / apmem"]
         USB["Mentor MUSB USB 2.0<br/>MSC (EP2 2 KiB) + 0xE0 Telemetry"]
-        BT["RW-BT RF / HCI / SPP<br/>+XREC v5 (Next Milestone)"]
+        BT["RW-BT + Bluedroid (FreeRTOS)<br/>+XREC v5 Live Sync & A2DP/AVRCP"]
         SYS["Keys (1 kHz IRQ), PMU, RTC, WDT"]
     end
 
@@ -104,7 +104,7 @@ flowchart LR
    - Dual analog mics (`AMIC1 + AMIC2`) stream through DMAC CH1 into a 4-slot ring buffer, processed in hardware floating-point (`audio_dsp.c`) with three selectable profiles: **`Voice Clarity`** (350 Hz HPF + 2.2 kHz `+9 dB` shelf + 2:1 compressor + limiter), **`ASR Raw`** (75 Hz HPF + transparent peak limiter for Parakeet/Whistle), and **`Bypass`**.
    - Playback (`player.c` + `audio_dac.c`) decodes PCM and IMA-ADPCM WAV files, supports synchronized `.cwx` word-level transcripts (`cwx.c`), and routes audio automatically between the 3.5 mm headphone jack (`PB11`) and the built-in speaker (`PB30` PA).
 4. **Host-First Testing & Zero-Wire Debugging:**
-   - Every hardware driver uses a compile-time MMIO abstraction (`OPENFW_HOST_MMIO`) so **6 native host test suites** run in seconds on Linux under **ASan + UBSan** and validate exFAT images with real `fsck.exfat -n`.
+   - Every hardware driver uses a compile-time MMIO abstraction (`OPENFW_HOST_MMIO`) so **native host test suites + Bluetooth host suites** (`test-host`, `test-bt-port`, `test-bt-ctrl`, `test-bt-xrec`, `test-bt-hp`) run in seconds on Linux under **ASan + UBSan** and validate exFAT images with real `fsck.exfat -n`.
    - On physical hardware, `open_fw` exposes a **vendor SCSI `0xE0`** command channel alongside normal USB Mass Storage (`1209:0001`), letting [`tools/dev_cycle.py`](tools/dev_cycle.py) read the 4 KiB SRAM ring log, sync the RTC, reboot into BootROM DFU, or upload/execute 2-second C hardware probes in SRAM (`0x00850000`) with zero UART wiring.
 
 ---
@@ -113,19 +113,19 @@ flowchart LR
 
 ### 1. Build & Run the Automated Test Suite (No Hardware Needed)
 
-Requires `clang`, `lld`, `llvm` (`llvm-objcopy`), `cc`, `exfatprogs`, `python3`, and `python3-pil`. LVGL v9.2.2 is fetched automatically into `open_fw/third_party/lvgl/` on the first build. The default image includes Bluetooth (`BT=1`: Bluedroid phone and headphones modes) and also needs `meson` and `ninja`, which build picolibc once (`open_fw/tools/build_picolibc.sh`); `BT=0` builds the image without Bluetooth and without picolibc:
+Requires `clang`, `lld`, `llvm` (`llvm-objcopy`), `cc`, `exfatprogs`, `python3`, `python3-pil`, and `python3-numpy`. LVGL v9.2.2 is fetched automatically into `open_fw/third_party/lvgl/` on the first build. The default image includes Bluetooth (`BT=1`: Bluedroid phone and headphones modes) and also needs `meson` and `ninja`, which build picolibc once (`open_fw/tools/build_picolibc.sh`); `BT=0` builds the image without Bluetooth and without picolibc:
 
 ```bash
-# Build the ARM Cortex-M4F firmware (BT=1) and run all 6 host unit/MMIO/UI test suites
-make -C open_fw all test-host
+# Build the ARM Cortex-M4F firmware (BT=1) and run host & Bluetooth unit/MMIO/UI test suites
+make -C open_fw all test-host test-bt-port test-bt-ctrl test-bt-xrec test-bt-hp
 
-# The same image without Bluetooth (no meson / ninja / picolibc needed; what CI builds)
+# The same image without Bluetooth (no meson / ninja / picolibc needed)
 make -C open_fw BT=0 all
 
-# Run with AddressSanitizer + UndefinedBehaviorSanitizer
+# Run host suites with AddressSanitizer + UndefinedBehaviorSanitizer
 make -C open_fw test-host-san
 
-# Run the Python host tool self-tests
+# Run the Python host tool self-tests (bootrom PID guard, exFAT/sync integrity, DSP check)
 python3 tools/test_tools.py
 ```
 

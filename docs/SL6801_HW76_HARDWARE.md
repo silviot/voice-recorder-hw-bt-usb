@@ -79,6 +79,8 @@ All 6 tactile buttons share a single analog resistor ladder on **`PD0`**:
 | **Back** | `2176 .. 2559` |
 | **Play / OK / M** | `2560 .. 2959` |
 
+> **Chord behavior (`VOL+` + `VOL-`):** Because all six buttons sit on the same `PD0` resistor ladder, pressing **VOL+** and **VOL-** simultaneously puts their pull-down legs in parallel against the upper pull-up resistor (`ADC ≈ 835`), which falls inside **Next** (`336 .. 847`) in hardware and is indistinguishable from holding **Next**.
+
 **KADC/SARADC register layout** (decoded from the stock `FIRM` KADC init at `0x00D510B8`): `+0x00` CTRL (`0x80180000` base config, **bit n = channel n enable**, n = 0..9), `+0x04` START (`0xA800` = continuous scan), `+0x0C` IE, `+0x10` per-channel 4-bit fields for ch0..7, `+0x18` for ch8..9, then a **0x10 stride per channel**: THR at `+0x20 + 0x10*n`, DATA (`[11:0]`) at `+0x24 + 0x10*n` (ch1 = `+0x30`/`+0x34`, the key ladder). Which pads feed ch0, ch2..9 is not known.
 
 ### 3.3 Headset Button Probe (Settings > Headset button test)

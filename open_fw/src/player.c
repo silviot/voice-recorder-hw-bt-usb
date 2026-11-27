@@ -626,7 +626,7 @@ static uint32_t decode_blocks(const wav_stream_info_t *w, uint32_t bytes)
         if (len > w->block_align) len = w->block_align;
         int n = wav_decode_ima_adpcm_block(g_file_buf + off, len, w->channels,
                                            g_dec_pcm + decoded * w->channels, capacity - decoded);
-        if (n <= 0) return 0;
+        if (n <= 0) break;
         decoded += (uint32_t)n;
     }
     return decoded;

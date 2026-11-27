@@ -1312,7 +1312,7 @@ int bth_headphones_scenario(const char *img_path)
         SCHECK(hp >= 0 && u.found[hp].is_audio && strcmp(u.found[hp].name, "HP-Fake") == 0,
                "headset not found / not audio / name '%s'", hp >= 0 ? u.found[hp].name : "-");
         SCHECK(audio == 2, "audio-class devices %d (want headset + speaker)", audio);
-        SCHECK(rom_count(0xE001u) == 0u || 1, "inquiry");   /* the 0401 itself is checked by test_hp_link */
+        SCHECK(rom_count(0xE000u) >= 1u, "no 0401 inquiry (%u)", rom_count(0xE000u));
     }
 
     /* ---- S3 ---- */
@@ -1442,6 +1442,37 @@ int bth_headphones_scenario(const char *img_path)
         SCHECK(d.start_fail == 2u, "S5c: start_fail %u", d.start_fail);
     }
 
+    /* S5d: START fails across two consecutive cycles -> resets wedged A2DP link and recovers on reconnect */
+    {
+        s_feed = 0;
+        SCHECK(bthx_call_fn(fn_suspend, 0u, 2000u) == 0, "S5d: bt_hp_suspend");
+        SCHECK(WAIT(UI().link == BT_HP_LINK_OPEN, 3000), "S5d: suspend not done (link %u)", UI().link);
+        bt_hp_debug_t d0, d1;
+        bt_hp_get_debug(&d0);
+        uint32_t pk0 = H.pkts;
+        H.n_start = 0u;
+        H.reject_start = 4u;                                 /* cycle 1 (2 rejects) + cycle 2 (2 rejects) */
+        s_pev = 0u;
+        s_feed = 1;
+        SCHECK(WAIT(s_pev & BT_HP_PEV_START_FAILED, 4000), "S5d: cycle 1 no START_FAILED");
+        s_feed = 0;
+        (void)WAIT(0, BT_HP_START_COOLDOWN_MS + 300u);       /* wait past START cooldown so play tries again */
+        s_pev = 0u;
+        s_feed = 1;
+        SCHECK(WAIT(s_pev & BT_HP_PEV_START_FAILED, 4000), "S5d: cycle 2 no START_FAILED");
+        SCHECK(WAIT((bt_hp_get_debug(&d1), d1.disconnects == d0.disconnects + 1u && d1.connects == d0.connects + 1u),
+                    20000),
+               "S5d: wedged link did not reset+reconnect (disc %u->%u conn %u->%u link %u)",
+               d0.disconnects, d1.disconnects, d0.connects, d1.connects, UI().link);
+        H.reject_start = 0u;
+        SCHECK(wait_link(BT_HP_LINK_STARTED, 8000) && WAIT(H.pkts > pk0 + 20u, 3000),
+               "S5d: streaming did not recover (link %u pkts %u)", UI().link, H.pkts);
+        bt_hp_get_debug(&d1);
+        SCHECK(d1.start_fail == d0.start_fail + 4u, "S5d: start_fail %u -> %u", d0.start_fail, d1.start_fail);
+        s_feed = 0;
+        (void)WAIT(0, 100);
+    }
+
     /* ---- S6 ---- */
     bth_log("[S6] AVRCP keys and absolute volume (heap seq %u)\n", (unsigned)bth_heap_seq());
     if (!H.avct.open) {
@@ -1458,7 +1489,7 @@ int bth_headphones_scenario(const char *img_path)
            "keys TOGGLE %u (PLAY/PAUSE presses) PLAY %u PAUSE %u (STOP) NEXT %u", s_keys[BT_HP_KEY_TOGGLE],
            s_keys[BT_HP_KEY_PLAY], s_keys[BT_HP_KEY_PAUSE], s_keys[BT_HP_KEY_NEXT]);
     SCHECK(s_keys[BT_HP_KEY_PLAY] == 0u, "PLAY press delivered as PLAY (dropped by a playing player)");
-    SCHECK(H.psth_acks == 0u || 1, "passthrough");
+    SCHECK(WAIT(H.psth_acks >= 8u, 1000) && H.psth_acks == 8u, "passthrough acks %u (want 8)", H.psth_acks);
     SCHECK(WAIT(H.getcaps >= 1u && H.regs >= 1u, 3000), "absolute volume: GetCapabilities %u, registrations %u",
            H.getcaps, H.regs);
     SCHECK(WAIT(UI().abs_vol, 1000), "session did not see absolute volume");

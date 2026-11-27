@@ -147,7 +147,8 @@ class FakeDevice:
 
     def _cmd(self, line):
         if line == "+XREC:PING":
-            self._reply("+XREC:PONG,openfw_v5,v5,bound=1,auth=1,pair=0")
+            caps = "" if self.old_fw else ",live=1,lst=1"
+            self._reply(f"+XREC:PONG,openfw_v5,v5,bound=1,auth=1,pair=0{caps}")
         elif line == "+XREC:PUTEND":
             if self.staged:
                 name, data = self.staged
@@ -170,6 +171,14 @@ class FakeDevice:
                 if k.startswith("/record/"):
                     self._reply(f"+XREC:F,{len(v)},{k[len('/record/'):]}")
             self._reply("+XREC:END")
+        elif line == "+XREC:LS,T":
+            if self.old_fw:
+                self._reply("+XREC:ERR,ARGS")
+                return
+            for k, v in self.files.items():
+                if k.startswith("/record/"):
+                    self._reply(f"+XREC:FT,{len(v)},2026-11-25T10:00:00,{k[len('/record/'):]}")
+            self._reply("+XREC:END")
         elif line == "+XREC:DBG,PACE" or line.startswith("+XREC:DBG,PACE,"):
             if line != "+XREC:DBG,PACE":
                 self.pace_bps = int(line.split(",")[2])
@@ -184,10 +193,11 @@ class FakeDevice:
             else:
                 self._reply("+XREC:ERR,NOENT")
         elif line == "+XREC:STAT":
-            # open_fw with sync while recording: fields 9 (rec_idx) and 10 (pace_ms); old_fw: the 8 fields
+            # open_fw with sync while recording: fields 9 (rec_idx), 10 (pace_ms), 11 (rec_bytes); old_fw: 8 fields
             pace = 30000 if self.stereo else 342
+            rec_bytes = len(self.files.get("/record/REC_0001.wav", b""))
             self._reply("+XREC:STAT,80,3900,0,0,1,12,1000,30000" + ("" if self.old_fw else
-                                                                    (f",1,{pace}" if self.recording else ",0,0")))
+                                                                    (f",1,{pace},{rec_bytes}" if self.recording else ",0,0,0")))
         elif line.startswith("+XREC:RTC,"):
             if self.recording and not self.old_fw:
                 self._reply("+XREC:OK,RTC,LATER")
@@ -253,7 +263,7 @@ def client_for(dev: FakeDevice) -> bt_sync.XRecRFCOMMClient:
 def expect_raises(fn, *needles):
     try:
         fn()
-    except (RuntimeError, ValueError) as exc:
+    except (RuntimeError, ValueError, OSError) as exc:
         for n in needles:
             assert n in str(exc), f"{n!r} not in {exc!r}"
         return str(exc)
@@ -368,7 +378,13 @@ def test_get_burst_eof(td: Path) -> None:
     dst = td / "A.wav"
     client_for(dev).download_file("A.wav", 5000, dst)
     assert dst.read_bytes() == data
-    print("[PASS] bt_sync get_burst: EOF inside a burst, short EOF first frame, MTU-clamped frames, shrunk file")
+    # download_file error unlinks orphaned .part temp file
+    c_fail = client_for(FakeDevice({"/record/FAIL.wav": data}))
+    c_fail.get_chunk = lambda *a, **kw: (_ for _ in ()).throw(bt_sync.socket.timeout("drop"))  # type: ignore[method-assign]
+    dst_fail = td / "FAIL.wav"
+    expect_raises(lambda: c_fail.download_file("FAIL.wav", 1024, dst_fail, burst_size=640, chunk_size=640), "drop")
+    assert not dst_fail.exists() and not dst_fail.with_suffix(".wav.part").exists()
+    print("[PASS] bt_sync get_burst: EOF inside a burst, short EOF first frame, MTU-clamped frames, shrunk file, .part cleanup")
 
 
 def test_bench_dbg_and_load() -> None:
@@ -390,16 +406,23 @@ def test_bench_dbg_and_load() -> None:
                                      log=lambda s: None, storm_every=0.1)
     assert res["bytes"] <= 8 * 1024 * 0.5 + 1024 + 1, res
     assert res["storms"] >= 3 and dev.dels == res["storms"] and dev.files, res   # DEL of a missing name only
-    # STAT: 10 fields from firmware with sync while recording, 8 from older firmware (keys left out)
-    dev = FakeDevice({})
+    # STAT: 11 fields from current firmware (rec_idx, pace_ms, rec_bytes), 8 from older firmware (keys left out)
+    dev = FakeDevice({"/record/REC_0001.wav": bytes(1234)})
     c = client_for(dev)
     st = c.get_stat()
-    assert st["total_mb"] == 30000 and st["rec_idx"] == 0 and st["pace_ms"] == 0, st
+    assert st["total_mb"] == 30000 and st["rec_idx"] == 0 and st["pace_ms"] == 0 and st["rec_bytes"] == 0, st
     dev.recording = True
     st = c.get_stat()
-    assert st["rec_idx"] == 1 and st["pace_ms"] == 342, st
+    assert st["rec_idx"] == 1 and st["pace_ms"] == 342 and st["rec_bytes"] == 1234, st
     st = client_for(FakeDevice({}, old_fw=True)).get_stat()
-    assert st["total_mb"] == 30000 and "rec_idx" not in st and "pace_ms" not in st, st
+    assert st["total_mb"] == 30000 and "rec_idx" not in st and "pace_ms" not in st and "rec_bytes" not in st, st
+    # +XREC:LS,T + automatic fallback to +XREC:LS on older firmware
+    assert client_for(FakeDevice({"/record/REC_0001.wav": bytes(42)})).list_files_with_time() == [
+        ("REC_0001.wav", 42, "2026-11-25T10:00:00")
+    ]
+    assert client_for(FakeDevice({"/record/REC_0001.wav": bytes(42)}, old_fw=True)).list_files_with_time() == [
+        ("REC_0001.wav", 42, "-")
+    ]
     # DBG,PACE: read / set, and bench_load(pace_bps=...) sets the cap first and logs the counters last
     assert c.pace()["rate"] == "48000"
     assert c.pace(24000)["rate"] == "24000" and dev.pace_bps == 24000
@@ -478,8 +501,24 @@ def test_sync_while_recording(td: Path) -> None:
     assert c.set_rtc(datetime(2026, 11, 25, 10, 0, 0)) is False and dev.rtc_sets == 0
     dev.recording = False
     assert c.set_rtc(datetime(2026, 11, 25, 10, 0, 0)) is True and dev.rtc_sets == 1
+    # recycled filename collision: local REC_0001.wav has different size -> saved to REC_0001_2.wav, never overwritten
+    d6 = td / "collision"
+    d6.mkdir()
+    prior_rec = b"PRIOR_ARCHIVE_900" * 50
+    (d6 / "REC_0001.wav").write_bytes(prior_rec)
+    new_rec = bytes((i * 11) & 0xFF for i in range(1500))
+    dev = FakeDevice({"/record/REC_0001.wav": new_rec})
+    c = client_for(dev)
+    synced, skipped = c.sync_files(c.list_files(), d6, burst_size=3840, chunk_size=640)
+    assert synced == 1 and skipped == []
+    assert (d6 / "REC_0001.wav").read_bytes() == prior_rec
+    assert (d6 / "REC_0001_2.wav").read_bytes() == new_rec
+    synced2, skipped2 = client_for(FakeDevice({"/record/REC_0001.wav": new_rec})).sync_files(
+        [("REC_0001.wav", len(new_rec))], d6, burst_size=3840, chunk_size=640
+    )
+    assert synced2 == 0 and skipped2 == []
     print("[PASS] bt_sync while recording: active file skipped (rec_idx / BUSY), stereo skips all (pace / LATER), "
-          "RTC OK,RTC,LATER not applied")
+          "RTC OK,RTC,LATER not applied, collision suffix")
 
 
 def main() -> int:

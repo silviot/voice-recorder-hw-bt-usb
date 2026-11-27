@@ -64,7 +64,7 @@ The earlier clean-room host (`src/bt_hci.c` + `src/bt_spp.c`) was deleted in pla
 
 | Command | Reply |
 | :--- | :--- |
-| `+XREC:PING` | `+XREC:PONG,openfw_v5,v5,bound=<0\|1>,auth=<0\|1>,pair=<0\|1>,rec=1,sync=1` (`pair` = XREC PIN window open; then capability flags: `rec=1` = the `PUT ... REC,<stem>.cwx` sidecar target exists; `sync=1` = `+XREC:SYNC,<pending>[,<eta_s>]` cooperative background sync completion is supported. Parse `key=value` fields and ignore unknown keys; firmware without a flag lacks that feature) |
+| `+XREC:PING` | `+XREC:PONG,openfw_v5,v5,bound=<0\|1>,auth=<0\|1>,pair=<0\|1>,rec=1,sync=1,live=1,lst=1` (`pair` = XREC PIN window open; capability flags: `rec=1` = `PUT ... REC,<stem>.cwx`; `sync=1` = `+XREC:SYNC,<pending>[,<eta_s>]`; `live=1` = live streaming `GETS` of active recording up to flushed disk bytes; `lst=1` = `+XREC:LS,T` timestamps. Parse `key=value` fields and ignore unknown keys; firmware without a flag lacks that feature) |
 | `+XREC:PAIR,<6 digits>,<64 hex>` | `+XREC:OK,PAIR`, or `ERR,PAIRCLOSED`, `ERR,PIN` (5 failures close the window), `ERR,BADKEY`, `ERR,SAVE` (key not written to the card; old binding kept) |
 | `+XREC:CHAL` | `+XREC:CHAL,<32 lowercase hex nonce>` (16 bytes). If the entropy pool is not ready: no reply and the link is closed |
 | `+XREC:AUTH,<64 hex>` | HMAC-SHA256(key, nonce bytes): `+XREC:OK,AUTH`, or `ERR,UNBOUND`, `ERR,NOCHAL` (one AUTH per CHAL), `ERR,AUTH` |
@@ -72,19 +72,19 @@ The earlier clean-room host (`src/bt_hci.c` + `src/bt_spp.c`) was deleted in pla
 ## 5. Authenticated commands (else `+XREC:ERR,LOCKED`)
 
 ### 5.1 STAT, RTC
-* `+XREC:STAT` -> `+XREC:STAT,<bat_pct>,<mV>,<chg 0/1/2>,<vbus 0/1>,<media>,<rec_sec>,<free_mb>,<total_mb>,<rec_idx>,<pace_ms>`.
+* `+XREC:STAT` -> `+XREC:STAT,<bat_pct>,<mV>,<chg 0/1/2>,<vbus 0/1>,<media>,<rec_sec>,<free_mb>,<total_mb>,<rec_idx>,<pace_ms>,<rec_bytes>`.
   `chg`: 0 discharging, 1 charging, 2 full. `media`: **33 (0x21) while recording**, else 16 (0x10).
   `free_mb` comes from a cache kept by the file system (one allocation-bitmap scan per mount): STAT is cheap.
-  * Fields 9 and 10 (sync while recording, section 5.5) are appended and numeric. Parse STAT by position, read the
-    first 8 fields as numbers and ignore further ones. Older open_fw sends 8 fields: then treat the recorder as one
-    that cannot sync while recording (skip every download while `media == 33`).
+  * Fields 9, 10, and 11 (sync while recording, section 5.5) are appended and numeric. Parse STAT by position and
+    read any available prefix of fields (older open_fw sends 8 fields without live sync, or 10 fields without
+    `rec_bytes`). Without field 9 (`rec_idx`), skip every download while `media == 33`.
   * `rec_idx`: the `NNNN` of the `REC_NNNN.wav` being recorded, 0 = not recording.
   * `pace_ms`: 0 = no pacing (not recording). Mono recording: the time one 16 KiB GETS window takes at the device's
     rate cap (342 ms at 48000 B/s), i.e. the shortest interval between the **starts** of two windows. The device
     paces the frames itself: send the next GETS as soon as a window is complete, **do not add a pause after it**
     (the device's burst allowance is only 2 KiB, so a pause after each window is lost and halves the rate). A client
-    that paces itself starts windows at most every `pace_ms`. Stereo recording: 30000 (no transfers until the
-    recording stops, see 5.5).
+    that paces itself starts windows at most every `pace_ms`. Stereo recording: 456 ms (or `30000` when `live=1` is not advertised / live transfers are blocked).
+  * `rec_bytes`: checkpointed WAV bytes flushed to disk for the active recording (`0` when idle or before first checkpoint). Enables live streaming `GETS` of an in-progress recording (`live=1`) up to the flushed tail.
 * `+XREC:RTC` -> `+XREC:RTC,YYYY-MM-DD HH:MM:SS,<wd 0=Mon..6=Sun>`.
 * `+XREC:RTC,y,m,d,h,mi,s,wd` -> `+XREC:OK,RTC` | `ERR,ARGS` | `ERR,RTCRNG` | `ERR,RTC`. While recording:
   `+XREC:OK,RTC,LATER`: **the clock is not changed** (set it again after the recording; an `OK` and not an `ERR`
@@ -92,9 +92,11 @@ The earlier clean-room host (`src/bt_hci.c` + `src/bt_spp.c`) was deleted in pla
 
 ### 5.2 LS
 `+XREC:LS` -> zero or more `+XREC:F,<size dec>,<name>` lines, then `+XREC:END`.
+`+XREC:LS,T` -> zero or more `+XREC:FT,<size dec>,<ISO-8601 local or ->,<name>` lines, then `+XREC:END` (`lst=1` capability; emits `-` when the timestamp is unset `0`, legacy `2000-01-01`, or cold-boot fallback `2026-01-01`; other arguments return `ERR,ARGS`).
 * Only `/record`, non-recursive, directory order. Dot-files (staging temps such as `.xrec_rec.tmp`, `.autoplay`) and
   subfolders are skipped. Every other file is listed, including `.cwx` transcript sidecars.
-* Names may contain commas: split an `F,` line with limit 2 (size, then the rest of the line is the name).
+* Names may contain commas: split an `F,` line with limit 2 (size, then name) and an `FT,` line with limit 3 (size, timestamp, then name).
+* While a recording is active and checkpointed beyond the 44-byte WAV header, the active file's reported size is its flushed byte length.
 
 ### 5.3 GETS / GET (download)
 `+XREC:GETS,<off>,<total>,<chunk 1..640>,<name>` -> binary frames until `total` bytes were sent or EOF:
@@ -125,9 +127,10 @@ The earlier clean-room host (`src/bt_hci.c` + `src/bt_spp.c`) was deleted in pla
 * `+XREC:GET,<off>,<len <= 640>,<name>` -> one frame.
 
 ### 5.4 DEL, RECSTART / RECSTOP, other
-* `+XREC:DEL,<name>` -> `+XREC:OK,DEL` | `ERR,NOSD` | `ERR,NAME` | `ERR,BUSY` (the file being recorded, or the
-  staging temp of a REC upload in progress) | `ERR,LATER,<ms>` (another file while recording, 5.5) | `ERR,DEL`
-  (missing). Only in `/record`. Deleting a recording
+* `+XREC:DEL,<name>` -> `+XREC:OK,DEL` | `ERR,NOSD` | `ERR,NAME` (unsafe path or dot-file such as `.autoplay`) |
+  `ERR,BUSY` (the file being recorded, or the staging temp `.xrec_rec.tmp` of an active REC upload) | `ERR,LATER,<ms>`
+  (another file while recording, 5.5) | `ERR,DEL` (missing). Cancels any active `GETS` stream cleanly before unlinking,
+  only operates in `/record`, and triggers a UI file-list reload (`on_fs_change`). Deleting a recording
   `<stem>.wav` also deletes its transcript sidecar `<stem>.cwx` (as the on-device delete does): the recorder reuses
   the number of a deleted newest recording, and the new recording must not inherit the old transcript.
 * `+XREC:RECSTART` -> `+XREC:OK,RECSTART,<name>`; `+XREC:RECSTOP` -> `+XREC:OK,RECSTOP` | `ERR,NOTREC`.
@@ -151,7 +154,8 @@ client sees slower replies, and some commands wait for the end of the recording.
   costs more passes, not a longer one. Replies are later, never lost.
 * **Rate cap (mono).** GETS payload is limited to about 48000 B/s (+ a 2 KiB burst); `pace_ms` says how long a 16 KiB
   window takes. Downloads of finished recordings continue at that pace.
-* **The active file** (`rec_idx`): `GETS` / `GET` answer `ERR,BUSY`, `DEL` answers `ERR,BUSY`. Skip only that file.
+* **The active file** (`rec_idx`): `GETS` / `GET` answer `ERR,BUSY` before the first 4 KiB checkpoint (`rec_bytes <= 44`),
+  then stream read-only up to `rec_bytes` (`live=1`); `DEL` always answers `ERR,BUSY`.
 * **No second card writer.** `DEL` of another file, `PUT` to `REC` / `CAS` / `OTA` (the payload is discarded
   unparsed), `PUTEND`, `OTA` and `PAIR` answer `+XREC:ERR,LATER,<ms>` (`<ms>` = 30000): nothing changed, ask again
   after that long, at the latest when `STAT` shows `media != 33`. An upload staged before the recording started is
@@ -164,8 +168,8 @@ client sees slower replies, and some commands wait for the end of the recording.
 * **Pairing needs the recorder idle.** `PAIR` answers `LATER` (no PIN attempt used) because the key is saved to the
   card; the pairing window closes after 60 s, so in practice a phone is bound only while the recorder does not
   record. Clients should say so ("stop the recording to pair") instead of reporting a generic failure.
-* **Stereo recordings: no transfers.** `GETS` / `GET` answer `ERR,LATER,<ms>`; a stream running when a stereo
-  recording starts ends with `ERR,LATER,<ms>` in place of the next frame. `LS` and `STAT` still answer.
+* **Stereo recordings (`live=1`):** `GETS` / `GET` continue best-effort at a ~36,000 B/s rate cap (`pace_ms = 456`) with a
+  2.5 ms pass budget while yielding to recorder audio blocks. (Legacy images without `live=1` returned `ERR,LATER,<ms>`.) `LS` and `STAT` still answer.
 * Older clients: extra STAT fields are ignored by position-based parsers and `BUSY` skips the file. `LATER` is an
   unknown reason, and nothing on the card is lost or changed, but it is not always confined to one file: the Cassini
   app before its S4 change (cassini-android-recorder `c1104d47`, "Sync finished recordings while the recorder

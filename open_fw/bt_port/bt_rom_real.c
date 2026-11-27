@@ -140,7 +140,7 @@ static volatile uint32_t  s_irq_t_latch;   /* US_TIMER_LO at the first latch sin
 static volatile uint32_t  s_irq_count[32];
 static volatile uint32_t  s_irq_unhandled;
 static volatile uint32_t  s_nest;          /* F:229 g_irq_nest */
-static volatile uint32_t  s_saved_primask; /* F:230 */
+static volatile uint32_t  s_saved_basepri; /* saved BASEPRI across nested ROM lock */
 static uint32_t           s_prng = 0x6D2B79F5u;   /* F:231 */
 static bt_rom_real_diag_t s_d;
 
@@ -166,13 +166,16 @@ static void zero_ram(void *dst, uint32_t n)
     }
 }
 
-/* ---- nested PRIMASK lock (F:253-272), hooked at 0x00803C1C/20 ---- */
+/* ---- nested BASEPRI lock (masks BT IRQ 0x80 + FreeRTOS, keeps priority-0x00 audio DMAC unmasked), hooked at 0x00803C1C/20 ---- */
 BT_FAST static void rr_lock(void)
 {
-    uint32_t primask;
-    __asm__ volatile ("mrs %0, primask\n cpsid i" : "=r"(primask) :: "memory");
+    uint32_t basepri;
+    __asm__ volatile ("mrs %0, basepri\n msr basepri_max, %1\n dsb\n isb"
+                      : "=&r"(basepri)
+                      : "r"((uint32_t)BT_ROM_IRQ_PRIO)
+                      : "memory");
     if (s_nest == 0u) {
-        s_saved_primask = primask;
+        s_saved_basepri = basepri;
     }
     s_nest++;
 }
@@ -182,8 +185,8 @@ BT_FAST static void rr_unlock(void)
     if (s_nest > 0u) {
         s_nest--;
         if (s_nest == 0u) {
-            uint32_t pm = s_saved_primask;
-            __asm__ volatile ("msr primask, %0" :: "r"(pm) : "memory");
+            uint32_t bp = s_saved_basepri;
+            __asm__ volatile ("msr basepri, %0\n isb" :: "r"(bp) : "memory");
         }
     }
 }
@@ -192,21 +195,24 @@ void bt_rom_real_force_unlock(void)
 {
     if (s_nest > 0u) {
         s_nest = 0u;
-        uint32_t pm = s_saved_primask;
-        __asm__ volatile ("msr primask, %0" :: "r"(pm) : "memory");
+        uint32_t bp = s_saved_basepri;
+        __asm__ volatile ("msr basepri, %0\n isb" :: "r"(bp) : "memory");
     }
 }
 
 static inline uint32_t raw_irq_save(void)
 {
-    uint32_t pm;
-    __asm__ volatile ("mrs %0, primask\n cpsid i" : "=r"(pm) :: "memory");
-    return pm;
+    uint32_t bp;
+    __asm__ volatile ("mrs %0, basepri\n msr basepri_max, %1\n dsb\n isb"
+                      : "=&r"(bp)
+                      : "r"((uint32_t)BT_ROM_IRQ_PRIO)
+                      : "memory");
+    return bp;
 }
 
-static inline void raw_irq_restore(uint32_t pm)
+static inline void raw_irq_restore(uint32_t bp)
 {
-    __asm__ volatile ("msr primask, %0" :: "r"(pm) : "memory");
+    __asm__ volatile ("msr basepri, %0\n isb" :: "r"(bp) : "memory");
 }
 
 /* ---- PRNG hook 0x00803C24 (BT_ROM_INTERFACE §2.3, bt_rom_rng.h) ----
@@ -493,7 +499,7 @@ static const struct rwip_eif_api k_eif_api = { rr_eif_read, rr_eif_write, rr_eif
 
 /* TASK_HCI default handler: every ROM reply/event (sent to src_id = TASK_HCI, BT_ROM_INTERFACE §3.2) goes to bt_ctrl.
  * Runs inside run() with the ROM lock released (§3.4). */
-static int rr_hci_default_handler(uint16_t msgid, void const *param, uint16_t dest_id, uint16_t src_id)
+BT_FAST static int rr_hci_default_handler(uint16_t msgid, void const *param, uint16_t dest_id, uint16_t src_id)
 {
     (void)dest_id;
     uint8_t *p = (uint8_t *)(uintptr_t)param;

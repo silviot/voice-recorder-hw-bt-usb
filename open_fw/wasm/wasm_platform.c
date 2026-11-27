@@ -518,12 +518,13 @@ void openfw_host_dmac_register_ptr(uint32_t ch, void *buf, uint32_t len)
 
 static uint32_t current_dac_sample_rate(void)
 {
-    uint32_t dig = g_soc.codec_regs[(CODEC_DAC_DIG_CFG_ADDR - AUDIO_CODEC_BASE) >> 2];
-    uint32_t sel = (dig >> 8) & 0xFu;
-    if (sel == 7u) return 48000u;
-    if (sel == 8u) return 44100u;
-    if (sel == 5u) return 24000u;
-    return 16000u;
+    static const uint32_t k_rates[13] = {
+        8000u, 12000u, 11025u, 16000u, 24000u, 22050u,
+        32000u, 48000u, 44100u, 96000u, 88200u, 192000u, 176400u
+    };
+    uint32_t glb = g_soc.codec_regs[(CODEC_GLB_ADDR - AUDIO_CODEC_BASE) >> 2];
+    uint32_t sel = (glb >> 8) & 0xFu;
+    return (sel < 13u) ? k_rates[sel] : 16000u;
 }
 
 static void pump_audio_dmac(void)
@@ -557,10 +558,12 @@ static void pump_audio_dmac(void)
  * ============================================================================ */
 static void sync_time_ms(uint32_t now_ms)
 {
-    if (now_ms < g_soc.last_tick_ms) {
+    int32_t diff = (int32_t)(now_ms - g_soc.last_tick_ms);
+    if (diff < 0) {
         now_ms = g_soc.last_tick_ms;
+        diff = 0;
     }
-    uint32_t delta = now_ms - g_soc.last_tick_ms;
+    uint32_t delta = (uint32_t)diff;
     if (delta > 250u) {
         /* Cap large tab-background jumps so timers don't spin millions of ticks */
         delta = 250u;
@@ -632,6 +635,7 @@ uint32_t openfw_mmio_rd32(uint32_t addr)
         uint32_t off  = (addr - GPIO_BASE) & 0x3Fu;
         if (off < 0x10u)  return g_soc.gpio_mux[port][off >> 2];
         if (off == 0x10u) return g_soc.gpio_in[port];
+        if (off == 0x14u) return g_soc.gpio_out[port];
         if (off == 0x24u) return g_soc.gpio_pad_dir[port];
     }
 
@@ -752,6 +756,8 @@ void openfw_mmio_wr32(uint32_t addr, uint32_t val)
         if (off < 0x10u)  { g_soc.gpio_mux[port][off >> 2] = val; return; }
         if (off == 0x14u) { g_soc.gpio_out[port] = val; return; }
         if (off == 0x24u) { g_soc.gpio_pad_dir[port] = val; return; }
+        if (off == 0x34u) { g_soc.gpio_out[port] |= val; return; }
+        if (off == 0x38u) { g_soc.gpio_out[port] &= ~val; return; }
     }
 
     if (addr == CRU_SARADC_CLK_ADDR) { g_soc.cru_saradc_clk = val; return; }
@@ -1617,11 +1623,11 @@ void wasm_boot(uint32_t keep_sd)
     dt.weekday = 0u;
     rtc_set(&dt);
 
-    if (!keep_sd || !g_sd_formatted) {
+    if (!keep_sd) {
         wasm_format_exfat();
         wasm_seed_demo_files();
-        g_sd_formatted = 1;
     }
+    g_sd_formatted = 1;
 
     (void)openfw_main();
 }

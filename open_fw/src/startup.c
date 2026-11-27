@@ -352,6 +352,7 @@ static uint8_t xip_enable_best(uint32_t pll_hz)
 __attribute__((noinline)) static void bt_static_init(void)
 {
     extern uint32_t _sibt_data, _sbt_data, _ebt_data, _sbt_bss, _ebt_bss, _sibt_fast, _sbt_fast, _ebt_fast;
+    extern uint32_t _sbt_lo_bss, _ebt_lo_bss;
     const volatile uint32_t *src = &_sibt_data;
     for (volatile uint32_t *dst = &_sbt_data; dst < &_ebt_data; dst++, src++) {
         *dst = *src;
@@ -361,6 +362,9 @@ __attribute__((noinline)) static void bt_static_init(void)
         *dst = *src;
     }
     for (volatile uint32_t *dst = &_sbt_bss; dst < &_ebt_bss; dst++) {
+        *dst = 0u;
+    }
+    for (volatile uint32_t *dst = &_sbt_lo_bss; dst < &_ebt_lo_bss; dst++) {
         *dst = 0u;
     }
 }

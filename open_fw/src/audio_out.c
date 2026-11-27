@@ -140,7 +140,7 @@ int aout_start(uint32_t src_rate, uint8_t vol)
     if (r == AOUT_ROUTE_BT || r == AOUT_ROUTE_BOTH) {
         hp_sink_set_format(g_ao.sink, src_rate, g_ao.next_ch);
         hp_sink_set_mute(g_ao.sink, 0);
-        hp_sink_set_gain_q15(g_ao.sink, s_gain_q15[vol & 31u]);
+        hp_sink_set_gain_q15(g_ao.sink, s_gain_q15[(vol > 31u) ? 31u : vol]);
         hp_sink_tap_enable(g_ao.sink, r == AOUT_ROUTE_BOTH);
         g_ao.link->request_start();
     }
@@ -293,7 +293,7 @@ void aout_set_volume_split(uint8_t dac_vol, uint8_t bt_vol, uint16_t dig)
         audio_dac_set_volume(dac_vol, dig);
     }
     if (g_ao.route == AOUT_ROUTE_BT || g_ao.route == AOUT_ROUTE_BOTH) {
-        hp_sink_set_gain_q15(g_ao.sink, s_gain_q15[bt_vol & 31u]);
+        hp_sink_set_gain_q15(g_ao.sink, s_gain_q15[(bt_vol > 31u) ? 31u : bt_vol]);
     }
 }
 

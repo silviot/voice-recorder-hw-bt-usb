@@ -49,6 +49,7 @@ def find_recorder_mountpoint(explicit_mount: Optional[Path] = None) -> Optional[
     except Exception:
         data = {}
 
+    did_mount = False
     for dev in data.get("blockdevices", []):
         vendor = (dev.get("vendor") or "").strip()
         model = (dev.get("model") or "").strip()
@@ -69,21 +70,49 @@ def find_recorder_mountpoint(explicit_mount: Optional[Path] = None) -> Optional[
                 part_name = child.get("name")
                 if part_name and child.get("fstype") == "exfat" and not mp:
                     try:
-                        subprocess.run(
+                        res = subprocess.run(
                             ["udisksctl", "mount", "-b", f"/dev/{part_name}"],
                             check=False,
-                            stdout=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE,
                             stderr=subprocess.DEVNULL,
+                            text=True,
                         )
+                        if res.returncode == 0:
+                            did_mount = True
                     except Exception:
                         pass
 
-    # Fallback: scan common user media directories for a volume with DBROOT + record
+    if did_mount:
+        try:
+            out2 = subprocess.check_output(
+                ["lsblk", "-J", "-o", "NAME,VENDOR,MODEL,SERIAL,FSTYPE,MOUNTPOINT"],
+                text=True,
+            )
+            for dev in json.loads(out2).get("blockdevices", []):
+                vendor = (dev.get("vendor") or "").strip()
+                model = (dev.get("model") or "").strip()
+                serial = (dev.get("serial") or "").strip()
+                if (
+                    "SMTLINK" in vendor
+                    or "CARDREADER" in model
+                    or serial == "20201111000001"
+                    or "Cassini" in vendor
+                    or "OpenFW" in model
+                    or serial == "OPENFW01"
+                ):
+                    for child in dev.get("children", [dev]):
+                        mp = child.get("mountpoint")
+                        if mp and Path(mp).is_dir():
+                            return Path(mp)
+        except Exception:
+            pass
+
+    # Fallback: scan common user media directories for OpenFW (/cassini) or stock (/DBROOT) record volumes
     for base in (Path("/run/media"), Path("/media")):
         if not base.is_dir():
             continue
         for candidate in base.glob("*/*"):
-            if (candidate / "record").is_dir() and (candidate / "DBROOT").is_dir():
+            if (candidate / "record").is_dir() and ((candidate / "cassini").is_dir() or (candidate / "DBROOT").is_dir()):
                 return candidate
     return None
 
@@ -132,11 +161,38 @@ def sync_recordings(
                         break
                     suffix_idx += 1
 
+        def _find_cwx(stem: str) -> Optional[Path]:
+            for cand_cwx in record_dir.iterdir():
+                if cand_cwx.is_file() and cand_cwx.suffix.lower() == ".cwx" and cand_cwx.stem.lower() == stem.lower():
+                    return cand_cwx
+            return None
+
+        src_cwx = _find_cwx(src.stem)
+
+        def _sync_cwx_sidecar(target_audio: Path) -> None:
+            if src_cwx is None:
+                return
+            dst_cwx = target_audio.with_suffix(".cwx")
+            cwx_hash = sha256_file(src_cwx)
+            if dst_cwx.is_file() and dst_cwx.stat().st_size == src_cwx.stat().st_size and sha256_file(dst_cwx) == cwx_hash:
+                return
+            tmp_cwx = dest_dir / f".{dst_cwx.name}.part"
+            shutil.copy2(src_cwx, tmp_cwx)
+            with open(tmp_cwx, "rb") as fc:
+                os.fsync(fc.fileno())
+            tmp_cwx.replace(dst_cwx)
+
+        def _unlink_src_and_cwx() -> None:
+            src.unlink()
+            if src_cwx is not None and src_cwx.is_file():
+                src_cwx.unlink()
+
         if already_archived is not None:
+            _sync_cwx_sidecar(already_archived)
             if delete_after_sync:
                 if os.path.samefile(src, already_archived):
                     raise ValueError(f"Refusing to delete {src}: archive match {already_archived} is the same file")
-                src.unlink()
+                _unlink_src_and_cwx()
                 print(f"  -> Already archived at {already_archived.name}; removed {src.name} from device")
             continue
 
@@ -151,6 +207,7 @@ def sync_recordings(
             raise RuntimeError(f"Checksum mismatch while copying {src.name}")
 
         tmp_dst.replace(dst)
+        _sync_cwx_sidecar(dst)
         try:
             dir_fd = os.open(dest_dir, os.O_RDONLY)
             try:
@@ -163,7 +220,7 @@ def sync_recordings(
         print(f"  -> Saved to {dst} (SHA-256: {dst_hash[:16]}...)")
 
         if delete_after_sync:
-            src.unlink()
+            _unlink_src_and_cwx()
             print(f"  -> Removed {src.name} from device")
 
     return synced_files

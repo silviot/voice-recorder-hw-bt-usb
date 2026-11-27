@@ -18,8 +18,12 @@
 #include "timers.h"
 #include <string.h>
 
-/* SRAM_HI (.bss_hi, zeroed at boot) like hci_probe.c's log copy: .bt_bss would come out of the RTOS heap region. */
-#define BENCH_HI           __attribute__((section(".bss_hi"), aligned(4)))
+/* Place bench-only scratch/capture buffers in .bt_lo_bss (RTOS_HEAP_LO) on ARM so .bss / .bss_hi keep headroom. */
+#if defined(__arm__)
+#define BENCH_HI           __attribute__((section(".bt_lo_bss"), aligned(4)))
+#else
+#define BENCH_HI
+#endif
 #define BENCH_CAP_BYTES    8192u    /* ~100 lines; beyond that the head is kept here, the tail stays in the ring */
 
 static char s_cap_buf[BENCH_CAP_BYTES] BENCH_HI;

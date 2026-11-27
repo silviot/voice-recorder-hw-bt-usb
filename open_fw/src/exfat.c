@@ -556,7 +556,7 @@ static int dir_walk(const exfat_vol_t *vol, uint32_t dir_cluster, uint8_t no_fat
                     for (uint32_t k = 0u; k < 15u && name_pos < name_len; k++) {
                         uint16_t ch = le16(d + 2u + k * 2u);
                         if (name_pos < (EXFAT_MAX_NAME - 1u)) {
-                            cur_ent.name[name_pos] = (ch > 0u && ch < 0x80u) ? (char)ch : '?';
+                            cur_ent.name[name_pos] = (ch > 0u && ch < 0x80u) ? (char)ch : '_';
                         }
                         name_pos++;
                     }

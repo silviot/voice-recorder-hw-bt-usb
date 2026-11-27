@@ -5,8 +5,8 @@
 #   test-bt-host-tsan : the same harness under ThreadSanitizer    [owner: hosttest]
 #   test-bt-port  : entropy/DRBG/store shim tests               [owner: entropy]
 #   test-bt-xrec  : phone-mode XREC session on mocked esp_spp/esp_bt_gap [owner: xrec]
-.PHONY: test-bt-ctrl test-bt-host test-bt-host-tsan test-bt-port test-bt-xrec test-bt-all
-test-bt-all: test-bt-ctrl test-bt-host test-bt-port test-bt-xrec
+.PHONY: test-bt-ctrl test-bt-host test-bt-host-tsan test-bt-port test-bt-xrec test-bt-hp test-bt-all
+test-bt-all: test-bt-ctrl test-bt-host test-bt-port test-bt-xrec test-bt-hp
 
 # ---- test-bt-port: entropy pool + HMAC_DRBG (plan M2, step 2). Host build, sanitizers on. ----
 BT_PORT_TEST_DIR ?= /tmp/sl6801_bt_port_tests
@@ -175,9 +175,11 @@ test-bt-hp:
 		bt_port/hp_sink.c -lm -pthread -o $(BT_HP_TEST_DIR)/test_hp_sink_tsan
 	TSAN_OPTIONS="halt_on_error=1" $(BT_HP_TEST_DIR)/test_hp_sink_tsan --stress-only 3
 	@# vendored SBC codec: shifts of negative values and wrapping fixed-point sums are its idiom (2s complement on both targets)
-	$(BT_HP_CC) $(BT_CTRL_TEST_CFLAGS) $(BT_CTRL_BD_DEFS) $(BT_CTRL_BD_INCS) -DSBC_DEC_INCLUDED=1 -w -fno-sanitize=shift,signed-integer-overflow \
-		-c $(BT_HP_SBC_ENC) $(BT_HP_SBC_DEC)
-	@mkdir -p $(BT_HP_TEST_DIR)/sbc && mv -f $(notdir $(BT_HP_SBC_ENC:.c=.o) $(BT_HP_SBC_DEC:.c=.o)) $(BT_HP_TEST_DIR)/sbc/
+	@mkdir -p $(BT_HP_TEST_DIR)/sbc
+	@for f in $(BT_HP_SBC_ENC) $(BT_HP_SBC_DEC); do \
+		$(BT_HP_CC) $(BT_CTRL_TEST_CFLAGS) $(BT_CTRL_BD_DEFS) $(BT_CTRL_BD_INCS) -DSBC_DEC_INCLUDED=1 -w \
+			-fno-sanitize=shift,signed-integer-overflow -c "$$f" -o "$(BT_HP_TEST_DIR)/sbc/$$(basename "$${f%.c}").o" || exit 1; \
+	done
 	$(BT_HP_CC) $(BT_CTRL_TEST_CFLAGS) $(BT_CTRL_BD_DEFS) $(BT_CTRL_BD_INCS) -DSBC_DEC_INCLUDED=1 \
 		tests/test_hp_tx.c bt_port/hp_tx.c bt_port/hp_sink.c bt_port/hp_sbc.c bt_port/hp_selftest.c \
 		$(BT_HP_TEST_DIR)/sbc/*.o -lm \

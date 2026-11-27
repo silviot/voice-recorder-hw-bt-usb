@@ -52,7 +52,7 @@ Minimal, phase-safe, non-destructive capture conditioning:
 2. **Stage 2 — Transparent Safety Peak Limiter (No Upward AGC)**
    - **Purpose:** Prevents harsh digital clipping on sudden loud speech/plosives while keeping background noise floor completely flat (no AGC "breathing/pumping" that confuses VAD and ASR).
    - **Parameters:**
-     - Analog PGA gain set conservatively (`18..22` out of `31`, leaving ~12–18 dB headroom).
+     - **Automatic Mic Gain (Auto-PGA):** Starts each recording at PGA `20` (manual override only via `+XREC:GAIN=<0..31>`); if raw ADC peaks hit `>= 31200` on active DSP profiles (`ASR_RAW` / `VOICE_CLARITY`), PGA steps down by `2` down to a floor of `8` with a 4-block (`~512 ms`) cooldown, and recovers slowly `+1` per 64 consecutive quiet blocks (`< 2000`, VOR open) back toward `20`.
      - Soft-knee ceiling starting at `-3.0 dBFS` (`0.707`), hard asymptote at `-0.5 dBFS` (`0.944`) via smooth `tanh`-like rational saturator or envelope-follower gain reduction (`attack = 1 ms`, `release = 80 ms`).
    - **Stereo linking (Phase 2):** Compute peak envelope as `max(|L|, |R|)` and apply identical gain to both channels to preserve inter-channel level/phase cues for host beamforming.
 
@@ -164,7 +164,7 @@ void audio_dsp_process_i16(audio_dsp_t *dsp, int16_t *pcm, size_t num_frames);
 - [ ] Optional: add 24-bit-in-32-bit capture mode if extra dynamic range is needed (avoids PGA tuning altogether).
 
 ### Phase 3 — Runtime Control & Host ASR Pipeline *(Complete)*
-- [x] Expose `+XREC:DSP=<0|1|2>` and `+XREC:GAIN=<0..31>`. The recorder menu saves changes from Bluetooth mode to `/cassini/settings.bin` when the SD card is mounted. Gain sets the analog PGA immediately. Profile changes apply to the next recording.
+- [x] Expose `+XREC:DSP=<0|1|2>` and optional manual `+XREC:GAIN=<0..31>` override (on-device recording defaults to automatic mic gain starting at PGA `20`). Changes persist to `/cassini/settings.bin` when mounted; DSP profile applies to the next recording.
 - [x] Add host helper script (`tools/asr_prep.py` with `--self-test`) implementing the two downstream recipes:
   - **Parakeet (`parakeet-tdt-0.6b-v2`/`v3`):** stereo-to-mono sum → clean-room / Silero VAD → 16 kHz mono WAV + JSON manifest.
   - **Whistle (Cactus 55M):** stereo-to-mono sum → `150–7000 Hz` bandpass → pause-aligned chunks `≤ 30 s` + JSON manifest + keyword list.

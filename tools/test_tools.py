@@ -25,6 +25,7 @@ sys.path.insert(0, str(TOOLS_DIR))
 
 import bt_sync  # noqa: E402
 import fix_exfat_boundary  # noqa: E402
+import usb_rtc_sync  # noqa: E402
 import usb_sync  # noqa: E402
 
 
@@ -177,7 +178,22 @@ def test_usb_sync_collisions() -> None:
                 refused = True
             assert refused, f"Expected ValueError when dest aliases record/: {bad_dest}"
             assert only_copy.exists() and only_copy.read_bytes() == b"IRREPLACEABLE"
-    print("[PASS] usb_sync.py collision, deduplication & alias-path safety")
+
+        # 6. Companion .cwx sidecar syncing, collision suffixing, and delete-after-sync cleanup + /cassini mount marker
+        (mp / "cassini").mkdir()
+        (mp / "record" / "SIDE_0001.wav").write_bytes(b"W1" * 60)
+        (mp / "record" / "SIDE_0001.cwx").write_bytes(b"CWX1sidecar_one")
+        usb_sync.sync_recordings(mp, dest, delete_after_sync=True)
+        assert (dest / "SIDE_0001.wav").read_bytes() == b"W1" * 60
+        assert (dest / "SIDE_0001.cwx").read_bytes() == b"CWX1sidecar_one"
+        assert not (mp / "record" / "SIDE_0001.wav").exists() and not (mp / "record" / "SIDE_0001.cwx").exists()
+        (mp / "record" / "SIDE_0001.wav").write_bytes(b"W2" * 80)
+        (mp / "record" / "SIDE_0001.cwx").write_bytes(b"CWX1sidecar_two")
+        usb_sync.sync_recordings(mp, dest, delete_after_sync=True)
+        assert (dest / "SIDE_0001_2.wav").read_bytes() == b"W2" * 80
+        assert (dest / "SIDE_0001_2.cwx").read_bytes() == b"CWX1sidecar_two"
+        assert not (mp / "record" / "SIDE_0001.wav").exists() and not (mp / "record" / "SIDE_0001.cwx").exists()
+    print("[PASS] usb_sync.py collision, .cwx sidecar sync/delete, deduplication & alias-path safety")
 
 
 def _make_mbr_exfat_image(td: Path, total_sec: int = 4096, p1_start: int = 64) -> tuple[Path, int]:
@@ -241,16 +257,27 @@ def test_fix_exfat_boundary() -> None:
             disk.seek(bmap_byte_off)
             disk.write(bytes([orig_b]))
 
-        # 2. Clean shrink by 1 cluster
+        # 2. dry_run=True must leave the disk image completely untouched
+        before_dry = disk_img.read_bytes()
+        assert fix_exfat_boundary.parse_args(["/dev/null", "--dry-run"]).dry_run is True
+        fix_exfat_boundary.fix_device(disk_img, dry_run=True)
+        assert disk_img.read_bytes() == before_dry
+
+        # 3. NoFatChain (flags=0x03) on 0x81 bitmap entry still resolves cleanly
+        with open(disk_img, "r+b", buffering=0) as disk:
+            bmap_clus, bmap_len, no_fat = fix_exfat_boundary.find_exfat_bitmap_info(disk, heap_lba, root_clus, spc)
+            assert bmap_clus >= 2 and bmap_len >= 63 and no_fat is False
+
+        # 4. Clean shrink by 1 cluster
         fix_exfat_boundary.fix_device(disk_img, dry_run=False)
         _, sz1 = struct.unpack_from("<II", disk_img.read_bytes()[:512], 0x1BE + 8)
         assert sz1 == p1_size - 8
 
-        # 3. Second run must be idempotent
+        # 5. Second run must be idempotent
         fix_exfat_boundary.fix_device(disk_img, dry_run=False)
         _, sz2 = struct.unpack_from("<II", disk_img.read_bytes()[:512], 0x1BE + 8)
         assert sz2 == sz1
-    print("[PASS] fix_exfat_boundary.py allocated-tail refusal, shrink, and idempotency")
+    print("[PASS] fix_exfat_boundary.py allocated-tail refusal, dry-run, shrink, and idempotency")
 
 
 def test_rf_audio_check() -> None:
@@ -265,6 +292,41 @@ def test_rf_audio_check() -> None:
     print("[PASS] rf_audio_check.py synthetic self-test")
 
 
+def test_bootrom_pid_guard_and_selftests() -> None:
+    # AGENTS.md: never send BootROM 0xC0 commands to stock card-reader PID 0x2801; BootROM must stay 0x2800 only.
+    for py_path in sorted(TOOLS_DIR.glob("*.py")):
+        if py_path.name == "test_tools.py":
+            continue
+        src = py_path.read_text(encoding="utf-8", errors="replace")
+        has_2801 = ("2801" in src)
+        has_bootrom_c0 = ("ctrl_transfer(0xC0" in src or "ctrl_transfer(0x40" in src)
+        assert not (has_2801 and has_bootrom_c0), f"{py_path.name} mixes 2801 with USB vendor control transfers"
+
+    # usb_rtc_sync.py must use OpenFW SCSI 0xE0 (1209:0001) and explicitly refuse 301a:2801
+    import datetime as _dt
+
+    rtc_src = (TOOLS_DIR / "usb_rtc_sync.py").read_text(encoding="utf-8")
+    assert "0x2801" in rtc_src and "0xC0" in rtc_src and "openfw_usb" in rtc_src
+    sample_dt = _dt.datetime(2026, 11, 25, 14, 30, 45)
+    packed = usb_rtc_sync.pack_rtc_time(sample_dt)
+    unpacked_dt, wd = usb_rtc_sync.unpack_rtc_time(packed)
+    assert len(packed) == 8 and unpacked_dt == sample_dt and wd == sample_dt.weekday()
+
+    # Execute all offline tool self-tests
+    for script, flag in (
+        ("flash_ranges.py", "--self-test"),
+        ("openfw_usb.py", "--self-test"),
+        ("dev_cycle.py", "--self-test"),
+        ("asr_prep.py", "--self-test"),
+        ("cassini_to_device.py", "--self-test"),
+        ("bt_probe_report.py", "--self-test"),
+        ("bt_entropy_unpack.py", "--self-test"),
+        ("usb_rtc_sync.py", "--dry-run"),
+    ):
+        subprocess.run([sys.executable, "-I", str(TOOLS_DIR / script), flag], check=True)
+    print("[PASS] AGENTS.md BootROM PID guard & all tool --self-test runners")
+
+
 def main() -> int:
     test_bt_sync_path_traversal()
     test_bt_sync_transport_detection()
@@ -272,6 +334,7 @@ def main() -> int:
     test_usb_sync_collisions()
     test_fix_exfat_boundary()
     test_rf_audio_check()
+    test_bootrom_pid_guard_and_selftests()
     print("ALL HOST TOOL SAFETY TESTS PASSED")
     return 0
 

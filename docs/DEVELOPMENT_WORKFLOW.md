@@ -9,9 +9,9 @@ Because the **Smartlink SL6801** has no public vendor datasheet and `DWT->CYCCNT
 Never flash untested code. Every change must pass the full zero-warning ARM build, host ASan + UBSan test suite, `fsck.exfat` filesystem check, and Python tool self-tests:
 
 ```bash
-make -C open_fw all test-host-san \
-  && python3 tools/openfw_usb.py --self-test \
-  && python3 tools/dev_cycle.py --self-test
+make -C open_fw all test-host-san test-bt-port test-bt-ctrl test-bt-xrec test-bt-hp test-bt-host \
+  && make -C open_fw wasm \
+  && python3 tools/test_tools.py
 ```
 
 *(If you also have your local `dumps/firmware_2M.bin` dump present, include `update-up` in the `make` command to pack the full 2 MiB flash image and `update_openfw.up` OTA bundle.)*

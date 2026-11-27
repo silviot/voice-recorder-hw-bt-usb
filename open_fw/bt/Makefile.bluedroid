@@ -57,7 +57,7 @@ FW_PORT_SRCS := $(ROOT)/bt_port/bt_port_fw_stubs.c $(ROOT)/bt_port/bt_port_glue.
 # pure C (-Wextra); the SBC wrapper and the Bluedroid binding include stack internals (vendored-code warning set).
 HP_PURE_SRCS := $(ROOT)/bt_port/hp_sink.c $(ROOT)/bt_port/hp_tx.c $(ROOT)/bt_port/hp_selftest.c
 FW_PORT_SRCS += $(HP_PURE_SRCS) $(ROOT)/bt_port/hp_sbc.c $(ROOT)/bt_port/hp_tx_bd.c
-$(patsubst $(ROOT)/%.c,$(BUILD_DIR)/%.o,$(HP_PURE_SRCS)): CFLAGS += -Wextra
+$(patsubst $(ROOT)/%.c,$(BUILD_DIR)/%.o,$(HP_PURE_SRCS)): CFLAGS += -Wextra -Werror
 # RW-BT ROM bring-up moved verbatim from the deleted legacy src/bt_hci.c (plan step 9): built like the firmware's own
 # sources (freestanding, no builtins: its copy loops stay loops); its .bss (g_bt_heap) stays in main SRAM (sl6801_firm.ld).
 ROM_BRINGUP_SRC := $(ROOT)/bt_port/bt_rom_bringup.c
@@ -118,7 +118,7 @@ ifeq ($(BENCH),1)
 # bench sampler's RFCOMM / L2CAP reads (Bluedroid internals: vendored-code warning set, like bt_xrec_spp_mtu.c)
 FW_PORT_SRCS += $(ROOT)/bt_port/bt_bench_probe.c
 endif
-$(XREC_OBJS): CFLAGS += -Wextra $(BENCH_FLAGS)
+$(XREC_OBJS): CFLAGS += -Wextra -Werror $(BENCH_FLAGS)
 $(XREC_OBJS): $(BENCH_STAMP)
 endif
 FW_PORT_OBJS := $(patsubst $(ROOT)/%.c,$(BUILD_DIR)/%.o,$(FW_PORT_SRCS))
@@ -149,10 +149,16 @@ HCI_PROBE_AUTORUN ?= 0
 PROBE_FLAGS := -DHCI_PROBE_WAIVE_LIVENESS=$(HCI_PROBE_WAIVE_LIVENESS) -DHCI_PROBE_AUTORUN=$(HCI_PROBE_AUTORUN)
 PROBE_STAMP := $(BUILD_DIR)/.probe_flags
 ifeq ($(HCI_PROBE),1)
-$(PROBE_OBJS): CFLAGS += -Wextra -DOPENFW_HCI_PROBE=1 $(PROBE_FLAGS)
+$(PROBE_OBJS): CFLAGS += -Wextra -Werror -DOPENFW_HCI_PROBE=1 $(PROBE_FLAGS)
 $(PROBE_OBJS): $(PROBE_STAMP)
 endif
+LOGS_STAMP := $(BUILD_DIR)/.bt_logs
+$(OBJS) $(FW_PORT_OBJS): $(LOGS_STAMP)
 .PHONY: probe-flags-force
+$(LOGS_STAMP): probe-flags-force
+	@mkdir -p $(dir $@)
+	@printf '%s\n' '$(BT_LOGS)' > $@.tmp
+	@if cmp -s $@.tmp $@ 2>/dev/null; then rm -f $@.tmp; else mv $@.tmp $@; fi
 $(BENCH_STAMP): probe-flags-force
 	@mkdir -p $(dir $@)
 	@printf '%s\n' '$(BENCH_FLAGS)' > $@.tmp

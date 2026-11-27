@@ -258,15 +258,20 @@ function renderFiles(files) {
   for (const f of files) {
     const row = document.createElement("div");
     row.className = "file-row";
-    const kb = (f.size / 1024).toFixed(1);
-    row.innerHTML = `
-      <span class="file-name">${f.name}</span>
-      <span class="file-meta">${kb} KB</span>
-      <button class="btn-mini" type="button">Download</button>
-    `;
-    row.querySelector("button").addEventListener("click", () => {
+    const nameEl = document.createElement("span");
+    nameEl.className = "file-name";
+    nameEl.textContent = f.name;
+    const metaEl = document.createElement("span");
+    metaEl.className = "file-meta";
+    metaEl.textContent = `${(f.size / 1024).toFixed(1)} KB`;
+    const btn = document.createElement("button");
+    btn.className = "btn-mini";
+    btn.type = "button";
+    btn.textContent = "Download";
+    btn.addEventListener("click", () => {
       if (worker) worker.postMessage({ type: "download", name: f.name });
     });
+    row.append(nameEl, metaEl, btn);
     filesEl.appendChild(row);
   }
 }

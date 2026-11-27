@@ -135,6 +135,7 @@ typedef struct {
     uint16_t sync_eta_sec;       /* optional ETA hint from +XREC:SYNC */
     uint32_t sync_seq;           /* increments on every +XREC:SYNC command */
     uint32_t cwx_seq;            /* increments on every committed PUT REC,<stem>.cwx */
+    uint32_t fs_seq;             /* increments on DEL, RECSTOP, or PUT REC/CAS commit */
     uint8_t  last_cwx_state;     /* 1 = words > 0, 2 = 0-word ("No speech") */
     char     last_cwx_name[32];  /* committed "<stem>.cwx" */
     uint8_t  poke_busy;          /* 1 while esp_spp_start_discovery() is in flight */

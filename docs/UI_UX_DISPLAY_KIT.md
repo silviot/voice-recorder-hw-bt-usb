@@ -18,7 +18,7 @@ This document describes the display hardware, typography, 14-color dark-mode pal
 | **Rendering core** | Dedicated **CPU1 (96 MHz)** with full-screen `25.6 KiB` RGB565 direct buffer, zero-wait-state SRAM draw loops, and `10.4 ms` full-frame parallel 8080 LCD blits |
 | **Text rendering** | **4-bit (16-level) grayscale anti-aliased** Noto Sans fonts with tabular digits (`0..9`) and crisp Unicode UI symbols |
 | **Backlight** | PWM channel 3 (`0–100%`), driven low when blanked |
-| **Flash budget** | ~`272 KiB` total `.text` out of **2 MiB Quad 48 MHz XIP NOR** |
+| **Flash budget** | ~`395 KiB` (`BT=0`) / ~`803 KiB` (`BT=1`) `.text` out of **2 MiB Quad 48 MHz XIP NOR** |
 
 > **Why 4-bit grayscale AA (not ClearType subpixel AA)?**
 > In landscape (`160×80`), the panel's R/G/B subpixel stripes are stacked vertically rather than horizontally, so horizontal RGB subpixel AA causes color fringing. 4-bit (16-level) grayscale AA gives crisp, fringe-free edges in both orientations.

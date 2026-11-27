@@ -2,6 +2,7 @@
  * SPDX-License-Identifier: MIT */
 #include "bt_ctrl_evt.h"
 #include "bt_ctrl_cmds.h"
+#include "bt_rom_if.h"
 #include <string.h>
 
 enum {
@@ -140,8 +141,8 @@ static uint16_t rd16(const uint8_t *p)
     return (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
 }
 
-uint16_t bt_ctrl_evt_pack(uint16_t id, const uint8_t *param, uint16_t param_len, uint8_t *out,
-                          bt_ctrl_evt_info_t *info)
+BT_FAST uint16_t bt_ctrl_evt_pack(uint16_t id, const uint8_t *param, uint16_t param_len, uint8_t *out,
+                                  bt_ctrl_evt_info_t *info)
 {
     memset(info, 0, sizeof(*info));
     const evt_row_t *r = find(id);
@@ -281,7 +282,7 @@ uint16_t bt_ctrl_evt_pack(uint16_t id, const uint8_t *param, uint16_t param_len,
     return (uint16_t)(3u + r->out_len);
 }
 
-uint16_t bt_ctrl_evt_pack_nocp(uint8_t *out, uint8_t n, const uint16_t *handles, const uint16_t *counts)
+BT_FAST uint16_t bt_ctrl_evt_pack_nocp(uint8_t *out, uint8_t n, const uint16_t *handles, const uint16_t *counts)
 {
     out[0] = BT_H4_EVT;
     out[1] = BT_HCI_EVT_NOCP;

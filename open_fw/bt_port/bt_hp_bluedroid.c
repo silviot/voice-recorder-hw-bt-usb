@@ -1525,6 +1525,9 @@ static void start_failure(const char *why, bool final)
     if (g->start_fail_cycles >= 2u && g->conn_hdl != ESP_A2D_INVALID_CONN_HDL) {
         log1("START failed across two cycles: resetting wedged A2DP link");
         g->user_disc = 0u;
+        g->mc_want = MC_NONE;
+        g->stall_disc = 1u;
+        g->stall_t = now;
         (void)esp_a2d_source_disconnect_by_handle(g->conn_hdl);
     }
 }
@@ -1552,6 +1555,7 @@ static void on_auth(const ev_t *e)
         if (!picked && !(s_cfg.last_valid && bda_eq(s_cfg.last, e->bda))) {
             g->d.bonds_removed++;
             log1("bond removed: not the picked headset");
+            bt_xrec_plat_bond_purge(e->bda);
             (void)esp_bt_gap_remove_bond_device((uint8_t *)e->bda);
         }
     } else {
@@ -2819,6 +2823,7 @@ int bt_hp_forget(void)
     }
     g->user_disc = 1u;
     g->rc_active = 0u;
+    bt_xrec_plat_bond_purge(bda);
     esp_err_t r = esp_bt_gap_remove_bond_device(bda);   /* also takes the link down (bta_dm_remove_device) */
     lbegin("forget");
     lka("peer", bda);

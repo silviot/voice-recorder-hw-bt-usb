@@ -293,6 +293,7 @@ int audio_dac_start(uint32_t sample_rate, uint8_t ana_vol_0_31)
     openfw_mmio_wr32(DMAC_CH_IRQ_EN_ADDR(DAC_DMA_CH), DMAC_AUDIO_IRQ_EN); /* TC_IE */
 
     openfw_exp_set_dmac_ch0_irq(audio_dac_dmac_ch0_irq);
+    nvic_set_priority(DMAC_IRQ_BASE + DAC_DMA_CH, 0x00u);
     nvic_clear_pending(DMAC_IRQ_BASE + DAC_DMA_CH);
     nvic_enable_irq(DMAC_IRQ_BASE + DAC_DMA_CH);
 

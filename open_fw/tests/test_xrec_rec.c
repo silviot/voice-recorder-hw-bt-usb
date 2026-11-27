@@ -216,10 +216,19 @@ static uint32_t g_rec_pending;      /* audio blocks the recorder has not taken *
 static uint32_t g_rec_flushed;      /* checkpointed flushed bytes of active file */
 static uint32_t g_us_step;          /* added to g_now_us at every now_us() read: card reads that take time */
 static int      g_rtc_sets;
+static uint32_t g_fs_changes;
 
 static uint8_t  fake_rec_channels(void *u) { (void)u; return g_rec_ch; }
 static uint32_t fake_rec_pending(void *u) { (void)u; return g_rec_pending; }
 static uint32_t fake_rec_flushed_size(void *u) { (void)u; return g_rec_flushed; }
+static void fake_on_fs_change(void *u) { (void)u; g_fs_changes++; }
+static int fake_rec_stop(void *u)
+{
+    (void)u;
+    g_rec_ch = 0u;
+    g_rec_flushed = 0u;
+    return 0;
+}
 static uint32_t fake_now_us(void *u)
 {
     (void)u;
@@ -278,6 +287,9 @@ static void test_sync_while_recording(void)
     ops.rec_pending = fake_rec_pending;
     ops.rec_flushed_size = fake_rec_flushed_size;
     ops.now_us = fake_now_us;
+    ops.rec_stop = fake_rec_stop;
+    ops.on_fs_change = fake_on_fs_change;
+    g_fs_changes = 0u;
     xrec_init(&g_x, &g_vol, &ops, NULL);
     xrec_set_bound_key(&g_x, g_key);
     authenticate();
@@ -319,6 +331,11 @@ static void test_sync_while_recording(void)
         g_rec_ch = ch;
         g_now_us += 2000000u;                    /* refill tokens for live test */
         assert(strstr(ls(), "+XREC:F,2048,REC_0009.wav\r\n") != NULL);
+        {
+            const char *lt = cmd("+XREC:LS,T");
+            assert(strstr(lt, "+XREC:FT,2048,-,REC_0009.wav\r\n") != NULL &&
+                   strstr(lt, "+XREC:END\r\n") != NULL);
+        }
         clear_out();
         rx_str("+XREC:GETS,0,4096,640,REC_0009.wav\r");
         for (int p = 0; p < 50 && (g_x.gets_lookup || g_x.gets_active); p++) {
@@ -375,7 +392,11 @@ static void test_sync_while_recording(void)
     /* after REC: the same upload resumes and commits, the clock can be set, DEL works */
     g_rec_ch = 0u;
     expect_put_ok(64u, "REC,REC_0007.cwx", big + 64, 32u);
-    assert(strcmp(cmd("+XREC:PUTEND"), "+XREC:OK,PUTEND,96\r\n") == 0);
+    {
+        uint32_t fsc_put = g_fs_changes;
+        assert(strcmp(cmd("+XREC:PUTEND"), "+XREC:OK,PUTEND,96\r\n") == 0);
+        assert(g_fs_changes == fsc_put + 1u);
+    }
     assert(strcmp(cmd("+XREC:RTC,2026,11,25,10,00,00,2"), "+XREC:OK,RTC\r\n") == 0 && g_rtc_sets == 1);
     xrec_get_pace_stats(&g_x, &ps);
     assert(ps.later == 7u && ps.busy == 4u);   /* DEL + 3 PUT + PUTEND + RTC + PAIR; 4 active-GETS/GET(44B) */
@@ -467,8 +488,15 @@ static void test_sync_while_recording(void)
     xrec_poll(&g_x);
     (void)frames_payload(&next);
     assert(next == 60000u && !g_x.gets_active);
+    g_rec_ch = 1u;
+    {
+        uint32_t fsc_rec = g_fs_changes;
+        assert(strcmp(cmd("+XREC:RECSTOP"), "+XREC:OK,RECSTOP\r\n") == 0);
+        assert(g_rec_ch == 0u && g_fs_changes == fsc_rec + 1u);
+        assert(strcmp(cmd("+XREC:DEL,OLD_0001.wav"), "+XREC:OK,DEL\r\n") == 0);
+        assert(g_fs_changes == fsc_rec + 2u);
+    }
 
-    assert(exfat_delete_file(&g_vol, "/record", "OLD_0001.wav") == 0);
     assert(exfat_delete_file(&g_vol, "/record", "REC_0009.wav") == 0);
     assert(exfat_delete_file(&g_vol, "/record", "REC_0007.wav") == 0);
     assert(exfat_delete_file(&g_vol, "/record", "REC_0007.cwx") == 0);

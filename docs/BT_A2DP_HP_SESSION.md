@@ -139,9 +139,7 @@ Settings > Headset button test) merged on top of the BT branch. The BT=0 image s
 `test/main-combo`'s (FIRM CRC-16 0xA3BB): every BT-side hook is a macro that folds to the old call for BT=0.
 
 - **Settings rows** (`include/openfw_ui.h`; row indices are UI-only, nothing persisted is indexed by them):
-  0..9 fixed (mic gain .. USB disk), then BT=1 release/bench: 10 Audio output, 11 About, 12 Headset button test
-  (`UI_SET_COUNT` 13); BT=0 and BT=1 `HCI_PROBE=1`: 10 About, 11 Headset button test (12). `UI_SET_ROWS` /
-  `UI_SET_ROWS_STR` are gone (`UI_SET_COUNT`, `UI_SET_ROW_ABOUT`, `UI_SET_HSPROBE`, optional `UI_SET_ROW_AOUT`).
+  originally 0..9 fixed (mic gain .. USB disk), then 10 Audio output, 11 About, 12 Headset button test (`UI_SET_COUNT` 13); **current layout** (automatic mic gain removed the manual row and added `Auto sync` / `Auto off`): `0..8` fixed (`Sound`..`USB disk`), then BT=1 release/bench: `9 Audio output`, `10 Auto sync`, `11 Auto off`, `12 About`, `13 Headset button test` (`UI_SET_COUNT` 14); BT=0 and BT=1 `HCI_PROBE=1`: `9 About`, `10 Headset button test` (`UI_SET_COUNT` 11). `UI_SET_ROWS` / `UI_SET_ROWS_STR` are gone (`UI_SET_COUNT`, `UI_SET_ROW_ABOUT`, `UI_SET_HSPROBE`, optional `UI_SET_ROW_AOUT`, `UI_SET_ROW_AUTO_SYNC`, `UI_SET_ROW_AUTO_OFF`).
 - **Player**: every speed-dial path writes, flushes, mutes and counts through `aout_*` and `PA_SET`, so Headphones
   and Both work. The silent clock (|speed| >= 8) starts once `aout_queued_frames()` is 0; on the headset route that
   includes the latency term, which drains within the delay estimate after the last real frame, so the clock starts

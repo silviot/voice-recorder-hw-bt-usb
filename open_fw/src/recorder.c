@@ -79,6 +79,7 @@ static uint32_t            g_pcm_bytes       = 0u;
 static uint32_t            g_last_ckpt_bytes = 0u;
 static uint32_t            g_flushed_wav_bytes = 0u;
 static uint32_t            g_prev_split_sec  = 0u;
+static uint32_t            g_split_count     = 0u;
 static uint32_t            g_last_overruns   = 0u;
 static uint32_t            g_created_timestamp;
 static char                g_filename[16];
@@ -335,14 +336,16 @@ static void rec_vor_emit_cb(void *user, const int16_t *pcm, size_t num_frames)
     uint32_t nbytes = (uint32_t)(num_frames * (size_t)g_active_channels * sizeof(int16_t));
 
     /* Split seamlessly before 32-bit RIFF/WAV limit */
-    if (g_pcm_bytes > REC_SPLIT_BYTES - nbytes) {
-        uint32_t bps = 32000u * (uint32_t)(g_active_channels ? g_active_channels : 1u);
-        g_prev_split_sec += g_pcm_bytes / bps;
+    if (nbytes <= REC_SPLIT_BYTES && g_pcm_bytes > REC_SPLIT_BYTES - nbytes) {
+        uint32_t bps       = 32000u * (uint32_t)(g_active_channels ? g_active_channels : 1u);
+        uint32_t split_sec = g_pcm_bytes / bps;
         if (finalize_current_wav_file() != 0 || open_next_wav_file(g_rec_vol) != 0) {
             g_rec_error  = 1;
             g_rec_saving = 0;
             return;
         }
+        g_prev_split_sec += split_sec;
+        g_split_count++;
     }
 
 #if OPENFW_BENCH_MEAS
@@ -454,6 +457,7 @@ int recorder_start(exfat_vol_t *vol, int sd_mounted)
     g_last_ckpt_bytes   = 0u;
     g_flushed_wav_bytes = 0u;
     g_prev_split_sec    = 0u;
+    g_split_count       = 0u;
     g_filename[0]       = '\0';
 
     if (!sd_mounted || !vol) {
@@ -595,7 +599,12 @@ void recorder_poll(void)
  * Pushed whole under FreeRTOS BASEPRI (no task switch or BT IRQ, priority-0 audio DMAC IRQs stay unmasked). */
 static void bm_log_rec(void)
 {
-    static char bm_line[16u + BENCH_MEAS_LINE_MAX + BENCH_MEAS_SDW_LINE_MAX];
+#if defined(__arm__)
+#define BM_LO_BSS __attribute__((section(".bt_lo_bss"), aligned(4)))
+#else
+#define BM_LO_BSS
+#endif
+    static char bm_line[16u + BENCH_MEAS_LINE_MAX + BENCH_MEAS_SDW_LINE_MAX] BM_LO_BSS;
     static const char k_tag[] = "BENCH rec ";
     uint32_t n = 0u;
     while (k_tag[n] != '\0') {
@@ -727,6 +736,11 @@ uint32_t recorder_rec_index_of(const char *name)
 uint32_t recorder_get_rec_index(void)
 {
     return g_rec_saving ? recorder_rec_index_of(g_filename) : 0u;
+}
+
+uint32_t recorder_get_split_count(void)
+{
+    return g_split_count;
 }
 
 /* XREC DEL guard (review STEP10 A1): non-zero while /record/<name> (case-insensitive, as exFAT) is being written. */

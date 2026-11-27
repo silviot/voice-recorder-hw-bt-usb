@@ -58,11 +58,7 @@ Every time you edit fonts, styles, or screen layouts in `open_fw/cassini.eez-pro
 make -C open_fw test-host
 ```
 
-This compiles and executes all 6 host test suites (`test_core`, `test_drivers_mmio`, `test_ui_render`, `test_audio_dsp`, `test_player`, and `test_audio_bt_mmio`), including `test_ui_render`, which renders **all 14 UI screens and sub-states** into a 2× zoomed contact sheet at:
-
-```text
-/tmp/sl6801_openfw/ui_all_screens.ppm
-```
+This compiles and executes all host test suites (`test_core`, `test_xrec_rec`, `test_drivers_mmio`, `test_ui_render`, `test_audio_dsp`, `test_player`, `test_audio_bt_mmio`, `test_hsprobe`, plus `test_bt_sync_xrec.py` and `rf_audio_check.py`), including `test_ui_render`, which renders UI screens and sub-states into 2× zoomed contact sheets at `/tmp/sl6801_openfw/ui_all_screens.ppm` and `/tmp/sl6801_openfw/ui_all_screens_bt.ppm`.
 
 Convert to PNG if you want to share it:
 

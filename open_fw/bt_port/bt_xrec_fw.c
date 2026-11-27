@@ -676,6 +676,9 @@ static int dev_rec_start(void *user, const char *opt_name, char *out_name, uint3
 static int dev_rec_stop(void *user)
 {
     (void)user;
+    if (keys_read_rec_switch()) {
+        return -1;
+    }
     return recorder_stop();
 }
 

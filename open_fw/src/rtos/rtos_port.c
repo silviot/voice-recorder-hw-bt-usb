@@ -76,7 +76,7 @@ void vApplicationIdleHook(void)
 /* RAM copy of the last fatal record (AON_BACKUP survives reset on silicon; the QEMU model does not keep it). */
 volatile uint32_t g_rtos_fatal[3];
 
-void openfw_rtos_fatal(uint32_t code, uint32_t a, uint32_t b)
+OPENFW_FASTFUNC void openfw_rtos_fatal(uint32_t code, uint32_t a, uint32_t b)
 {
     __asm__ volatile ("cpsid i" ::: "memory");
     g_rtos_fatal[0] = OPENFW_FAULT_MAGIC_BASE | (code & 0xFFu);
@@ -95,7 +95,7 @@ void openfw_rtos_fatal(uint32_t code, uint32_t a, uint32_t b)
     }
 }
 
-void openfw_rtos_assert_failed(const char *file, int line)
+OPENFW_FASTFUNC void openfw_rtos_assert_failed(const char *file, int line)
 {
     openfw_rtos_fatal(0xF0u, (uint32_t)line, (uint32_t)(uintptr_t)file);
 }
@@ -115,7 +115,7 @@ void vApplicationMallocFailedHook(void)
 }
 #endif
 
-void vApplicationStackOverflowHook(TaskHandle_t task, char *name)
+OPENFW_FASTFUNC void vApplicationStackOverflowHook(TaskHandle_t task, char *name)
 {
     openfw_rtos_fatal(0xF2u, (uint32_t)(uintptr_t)task, (uint32_t)(uintptr_t)name);
 }

@@ -35,10 +35,16 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            clang lld llvm exfatprogs python3 python3-pil
+            clang lld llvm exfatprogs python3 python3-pil meson ninja-build python3-numpy
 
       - name: Fetch LVGL sources
         run: make -C open_fw fetch-lvgl
+
+      - name: Cache picolibc for BT=1 ARM builds
+        uses: actions/cache@v4
+        with:
+          path: /tmp/sl6801_picolibc/pl-install
+          key: picolibc-${{ runner.os }}-${{ hashFiles('open_fw/tools/build_picolibc.sh') }}
 
       - name: Run OpenFW host unit and MMIO driver tests
         run: make -C open_fw test-host
@@ -47,15 +53,17 @@ jobs:
         run: make -C open_fw test-host-san
 
       # The default image's Bluetooth layer (BT=1) on the host: entropy/DRBG/store/probe-trigger shims, the
-      # controller shim against the fake ROM, and the phone-mode XREC session over mocked Bluedroid SPP. Host
-      # compiler + vendored Bluedroid headers only (no picolibc). test-bt-host (full Bluedroid harness) stays local.
-      - name: Run OpenFW Bluetooth host tests (BT=1 port, controller shim, XREC session)
-        run: make -C open_fw test-bt-port test-bt-ctrl test-bt-xrec
+      # controller shim against the fake ROM, the phone-mode XREC session over mocked Bluedroid SPP, and the
+      # headphones SBC/resampler/audio-out suite. test-bt-host (full Bluedroid harness) stays local.
+      - name: Run OpenFW Bluetooth host tests (BT=1 port, controller shim, XREC session, headphones DSP)
+        run: make -C open_fw test-bt-port test-bt-ctrl test-bt-xrec test-bt-hp
 
-      # BT=0 (no Bluetooth): the default BT=1 image needs picolibc (tools/build_picolibc.sh: meson + ninja), which
-      # this runner does not install. The BT=1 ARM build runs in the local gates.
-      - name: Build Cassini OpenFW ARM firmware (BT=0)
-        run: make -C open_fw BT=0 all
+      - name: Build Cassini OpenFW ARM firmware (BT=0, BT=1, BT=1 BENCH=1) and WASM emulator
+        run: |
+          make -C open_fw BT=0 BUILD_DIR=/tmp/sl6801_openfw_bt0 OUT_BIN=/tmp/sl6801_openfw_bt0/fw.bin all
+          make -C open_fw BT=1 all
+          make -C open_fw BT=1 BENCH=1 BUILD_DIR=/tmp/sl6801_openfw_bench OUT_BIN=/tmp/sl6801_openfw_bench/fw.bin all
+          make -C open_fw wasm
 
       - name: Run Python host tool self-tests and safety regressions
         run: |
@@ -65,4 +73,7 @@ jobs:
           python3 tools/dev_cycle.py --self-test
           python3 tools/asr_prep.py --self-test
           python3 tools/cassini_to_device.py --self-test
+          python3 tools/bt_probe_report.py --self-test
+          python3 tools/bt_entropy_unpack.py --self-test
+          python3 tools/rf_audio_check.py --self-test
           python3 tools/test_tools.py

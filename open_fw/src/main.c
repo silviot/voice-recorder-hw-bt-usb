@@ -93,6 +93,8 @@ static uint32_t         g_vbus_poll_ms = 0u;
 static int              g_vbus_cache_valid = 0;
 
 static void save_persisted_state(void);
+static void apm_flush(void);
+static void apm_save_focus_sel(void);
 static void apm_power_off(int screen);
 
 volatile uint32_t       g_ui_screen = UI_SCR_HOME;
@@ -158,6 +160,7 @@ static struct {
     uint32_t last_conn_ms;
     uint32_t last_disc_ms;
     uint32_t seen_cwx_seq;
+    uint32_t seen_fs_seq;
 } g_bt_bg;
 
 static int bt_bg_busy_for_poweroff(uint32_t now_ms)
@@ -212,6 +215,11 @@ static void perform_clean_poweroff(ui_screen_id_t screen)
         g_ui.last_file.resume_sec = (g_ui.play_state == 2u) ? 0u : g_ui.play_pos_sec;
     }
     (void)recorder_stop();
+    audio_capture_stop();
+    if (screen != UI_SCR_PLAYER) {
+        audio_dac_stop();
+    }
+    keys_pause_scan(0);
     apm_power_off((int)screen);
     if (screen == UI_SCR_SETTINGS || screen == UI_SCR_PLAYER
 #if OPENFW_BT_HP
@@ -618,8 +626,17 @@ static void refresh_telemetry(void)
     g_ui.hp_plugged   = keys_read_hp_detect();
     g_ui.sd_ok      = g_sd_mounted ? 1 : 0;
     g_ui.sd_total_mb = g_sd_total_mb;
-    uint32_t sec_per_mb = (g_ui.cfg.channels == 1u) ? 33u : 16u;
-    g_ui.sd_free_sec = g_sd_free_mb * sec_per_mb;
+    if (g_sd_mounted && g_exfat_vol.free_valid) {
+        uint64_t free_bytes = (uint64_t)g_exfat_vol.free_clusters *
+                              (uint64_t)g_exfat_vol.sectors_per_cluster * 512ULL;
+        uint64_t bps        = (g_ui.cfg.channels == 1u) ? 32000ULL : 64000ULL;
+        uint64_t secs       = free_bytes / bps;
+        g_sd_free_mb        = (uint32_t)(free_bytes >> 20);
+        g_ui.sd_free_sec    = (secs > 0xFFFFFFFFULL) ? 0xFFFFFFFFu : (uint32_t)secs;
+    } else {
+        uint32_t sec_per_mb = (g_ui.cfg.channels == 1u) ? 33u : 16u;
+        g_ui.sd_free_sec    = g_sd_free_mb * sec_per_mb;
+    }
 }
 
 static void apply_cfg_to_recorder(void)
@@ -1011,6 +1028,8 @@ static void format_browse_title(char *dst, int cap, const char *path)
     dst[out] = '\0';
 }
 
+static int dir_has_autoplay_cached(const char *dir);
+
 static void reload_files_and_sd_stats(void)
 {
     g_sd_free_mb  = 0u;
@@ -1025,6 +1044,8 @@ static void reload_files_and_sd_stats(void)
         g_ui.sd_ok       = 0;
         g_ui.sd_total_mb = 0u;
         g_ui.sd_free_sec = 0u;
+        g_ui.has_last    = 0;
+        g_apm.pending    = 0u;
         g_browse_dir[0]  = '\0';
 #if OPENFW_BT_HP
         g_record_unsynced_count = 0u;
@@ -1214,6 +1235,45 @@ static void reload_files_and_sd_stats(void)
     if (g_ui.file_scroll > g_ui.file_sel) {
         g_ui.file_scroll = g_ui.file_sel;
     }
+    if (g_apm.pending && !dir_has_autoplay_cached(g_apm.dir)) {
+        g_apm.pending = 0u;
+    }
+    if (g_ui.has_last && g_browse_dir[0] == '\0') {
+        int last_ok = 0;
+        for (int i = 0; i < total_count; i++) {
+            if (!g_files[i].is_dir && str_eq_ci(g_file_dirs[i], g_last_dir) &&
+                str_eq_ci(g_files[i].filename, g_ui.last_file.filename)) {
+                g_ui.last_file.has_transcript = g_files[i].has_transcript;
+                last_ok = 1;
+                break;
+            }
+        }
+        if (!last_ok) {
+            char lpath[128];
+            int lp = 0;
+            if (!(g_last_dir[0] == '/' && g_last_dir[1] == '\0')) {
+                append_str(lpath, &lp, (int)sizeof(lpath), g_last_dir);
+            }
+            append_str(lpath, &lp, (int)sizeof(lpath), "/");
+            append_str(lpath, &lp, (int)sizeof(lpath), g_ui.last_file.filename);
+            lpath[lp] = '\0';
+            exfat_entry_t lent;
+            if (exfat_find_path(&g_exfat_vol, lpath, &lent) == 0 && !lent.is_dir) {
+                last_ok = 1;
+                if (lp >= 5 && lpath[lp - 4] == '.') {
+                    lpath[lp - 3] = 'c';
+                    lpath[lp - 2] = 'w';
+                    lpath[lp - 1] = 'x';
+                    exfat_entry_t cent;
+                    g_ui.last_file.has_transcript =
+                        (exfat_find_path(&g_exfat_vol, lpath, &cent) == 0 && !cent.is_dir) ? 1u : 0u;
+                }
+            }
+        }
+        if (!last_ok) {
+            g_ui.has_last = 0;
+        }
+    }
     if (g_ui.file_count > 0 && !g_ui.has_last && g_browse_dir[0] == '\0') {
         for (int i = 0; i < g_ui.file_count; i++) {
             if (!g_files[i].is_dir) {
@@ -1274,8 +1334,20 @@ static void prepend_saved_recording_fast(const char *saved_name, uint32_t rec_s,
                                          uint8_t rec_ch, uint32_t committed_bytes)
 {
     if (g_browse_dir[0] != '\0') {
+        apm_save_focus_sel();
         g_browse_dir[0] = '\0';
+        g_ui.file_sel   = g_root_file_sel;
+        g_ui.file_scroll = g_root_file_scroll;
         reload_files_and_sd_stats();
+        for (int i = 0; i < g_ui.file_count; i++) {
+            if (!g_files[i].is_dir && str_eq_ci(g_file_dirs[i], "/record") &&
+                str_eq_ci(g_files[i].filename, saved_name)) {
+                g_ui.last_file = g_files[i];
+                copy_cstr(g_last_dir, (int)sizeof(g_last_dir), "/record");
+                g_ui.has_last  = 1;
+                break;
+            }
+        }
         return;
     }
     /* Insert right after any leading folder entries */
@@ -1373,6 +1445,10 @@ static int main_usb_audio_cfg_cb(int set, uint8_t cfg[4], int16_t *rms_x10, uint
 
 static int run_usb_msc_mode(int auto_mode)
 {
+    if (!keys_read_rec_switch() && recorder_is_saving()) {
+        (void)recorder_stop();
+    }
+    apm_flush();
 #if OPENFW_BT_HP
     g_bt_bg.active     = 0u;
     g_bt_bg.requested  = 0u;
@@ -1443,14 +1519,15 @@ static int run_usb_msc_mode(int auto_mode)
                         back_down = 1;
                         back_press_ms = kev.t_ms;
                     } else {
-                        manual_exit = back_down && (uint32_t)(kev.t_ms - back_press_ms) >= 600u;
+                        manual_exit = back_down && (int32_t)(kev.t_ms - back_press_ms) >= 600;
                         back_down = 0;
                         if (manual_exit) break;
                     }
                 }
             }
+            now = millis();
             if (keys_state(NULL) != KEY_BACK && !keys_event_pending()) back_down = 0;
-            if (manual_exit || (back_down && (uint32_t)(now - back_press_ms) >= 600u)) {
+            if (manual_exit || (back_down && (int32_t)(now - back_press_ms) >= 600)) {
                 manual_exit = 1;
                 break;
             }
@@ -2035,6 +2112,7 @@ static void run_bt_xrec_mode(void)
             g_bt_bg.last_disc_ms = end_ms;
             g_bt_bg.was_spp_open = st_end.spp_open;
             g_bt_bg.seen_cwx_seq = si.cwx_seq;
+            g_bt_bg.seen_fs_seq  = si.fs_seq;
             if (cfg_save_deferred || g_phone_cfg_dirty) {
                 save_persisted_state();
             }
@@ -2985,6 +3063,9 @@ static void bt_bg_stop(const char *why)
     openfw_log_puts("BT bg sync stop: ");
     openfw_log_puts(why);
     openfw_log_putc('\n');
+    if (!keys_read_rec_switch() && recorder_is_saving()) {
+        (void)recorder_stop();
+    }
     g_bt_bg.active     = 0u;
     bt_xrec_stop();
     bt_ui_sync_refresh(0);
@@ -3061,6 +3142,7 @@ static void bt_bg_ensure_started(uint32_t now_ms, int *dirty)
         g_bt_bg.last_conn_ms   = now_ms;
         g_bt_bg.last_disc_ms   = now_ms;
         g_bt_bg.seen_cwx_seq   = si0.cwx_seq;
+        g_bt_bg.seen_fs_seq    = si0.fs_seq;
         g_ui.bt_bg_syncing     = 1u;
         if (dirty) {
             *dirty = 1;
@@ -3140,6 +3222,13 @@ static void bt_bg_poll(uint32_t now_ms, int rec_active, int usb_busy, int bench_
         g_bt_bg.seen_cwx_seq = si.cwx_seq;
         g_bt_bg.last_conn_ms = now_ms;
         bt_bg_apply_cwx(si.last_cwx_name, si.last_cwx_state, dirty);
+    }
+    if (si.fs_seq != g_bt_bg.seen_fs_seq && !rec_active && !recorder_is_saving()) {
+        g_bt_bg.seen_fs_seq = si.fs_seq;
+        reload_files_and_sd_stats();
+        if (dirty) {
+            *dirty = 1;
+        }
     }
 
     bt_ui_sync_refresh(dirty);
@@ -3407,20 +3496,24 @@ static void apm_flush(void)
 
 static void apm_player_tick(uint32_t now_ms)
 {
-    if (!g_apm.active || g_apm.failed || recorder_is_saving()) {
+    if (recorder_is_saving() || g_ui.play_scrub_speed != 0) {
         return;
     }
-    if (g_ui.play_scrub_speed != 0) {
-        /* Speed dial away from 1x: the position is in flight. play_pos_sec is the
-         * heard position, but writing mid-seek is pointless; the first tick back
-         * at 1x (or a pause, or leaving the track) writes it instead. */
-        return;
-    }
-    if (apmem_sched_tick(&g_apm.sched, now_ms, g_ui.play_pos_sec, g_ui.play_state, g_ui.batt_mv)) {
-        uint32_t pos = apmem_store_pos(g_ui.play_pos_sec, g_ui.play_file.duration_sec, 0);
-        if (apmem_save_pos(&g_exfat_vol, g_apm.dir, g_apm.name, g_apm.tag, pos) != 0) {
-            g_apm.failed = 1u;
+    if (g_apm.active) {
+        if (g_apm.failed) {
+            return;
         }
+        if (apmem_sched_tick(&g_apm.sched, now_ms, g_ui.play_pos_sec, g_ui.play_state, g_ui.batt_mv)) {
+            uint32_t pos = apmem_store_pos(g_ui.play_pos_sec, g_ui.play_file.duration_sec, 0);
+            if (apmem_save_pos(&g_exfat_vol, g_apm.dir, g_apm.name, g_apm.tag, pos) != 0) {
+                g_apm.failed = 1u;
+            }
+            apmem_sched_saved(&g_apm.sched, now_ms, g_ui.play_pos_sec);
+        }
+    } else if (g_sd_mounted &&
+               apmem_sched_tick(&g_apm.sched, now_ms, g_ui.play_pos_sec, g_ui.play_state, g_ui.batt_mv)) {
+        g_ui.last_file.resume_sec = apmem_store_pos(g_ui.play_pos_sec, g_ui.play_file.duration_sec, 0);
+        save_persisted_state();
         apmem_sched_saved(&g_apm.sched, now_ms, g_ui.play_pos_sec);
     }
 }
@@ -3542,6 +3635,13 @@ static void play_file_at_index(int start_idx)
         g_ui.last_file = g_files[idx];
         copy_cstr(g_last_dir, (int)sizeof(g_last_dir), g_file_dirs[idx]);
         g_ui.has_last  = 1;
+        if (!g_apm.active) {
+            apmem_sched_start(&g_apm.sched, millis(), g_files[idx].resume_sec);
+            g_ui.play_tick_cb = apm_player_tick;
+            if (!recorder_is_saving()) {
+                save_persisted_state();
+            }
+        }
         int rc = openfw_play_file_ui(&g_exfat_vol, g_file_dirs[idx], g_files[idx].filename, &g_ui);
         keys_ignore_held();
         hp_player_toast_keep();
@@ -4103,6 +4203,12 @@ int openfw_main(void)
 #if OPENFW_BT_BENCH
                 bt_bench_rec_apply(); /* BTBENCH.RUN mode=rec: rec_* for this recording only (no-op otherwise) */
 #endif
+                refresh_telemetry();
+                if (g_ui.batt_mv < 3450u) {
+                    low_batt_cutoff = 1;
+                } else if (g_ui.batt_mv >= 3550u) {
+                    low_batt_cutoff = 0;
+                }
                 if (!g_sd_mounted) {
                     g_ui.sd_ok = 0;
                     rec_active = 0;
@@ -4151,15 +4257,35 @@ int openfw_main(void)
                     stop_rc    = recorder_stop();
                     rec_active = 0;
                 }
+                apm_flush();
                 uint32_t committed_bytes = recorder_get_committed_bytes();
 
                 if (was_saving && stop_rc == 0 && saved_name[0] != '\0') {
-                    /* Incremental file list & free-space update avoids full SD rescan lag */
-                    prepend_saved_recording_fast(saved_name, rec_s, rec_ch, committed_bytes);
+                    if (recorder_get_split_count() > 0u) {
+                        if (g_browse_dir[0] != '\0') {
+                            apm_save_focus_sel();
+                            g_browse_dir[0]  = '\0';
+                            g_ui.file_sel    = g_root_file_sel;
+                            g_ui.file_scroll = g_root_file_scroll;
+                        }
+                        reload_files_and_sd_stats();
+                        for (int i = 0; i < g_ui.file_count; i++) {
+                            if (!g_files[i].is_dir && str_eq_ci(g_file_dirs[i], "/record") &&
+                                str_eq_ci(g_files[i].filename, saved_name)) {
+                                g_ui.last_file = g_files[i];
+                                copy_cstr(g_last_dir, (int)sizeof(g_last_dir), "/record");
+                                g_ui.has_last  = 1;
+                                break;
+                            }
+                        }
+                    } else {
+                        /* Incremental file list & free-space update avoids full SD rescan lag */
+                        prepend_saved_recording_fast(saved_name, rec_s, rec_ch, committed_bytes);
+                    }
                     g_ui.saved_sec      = rec_s;
                     g_ui.saved_channels = rec_ch;
                     g_ui.saved_frac_pct = 100u;
-                    g_ui.saved_dt       = g_files[0].dt;
+                    g_ui.saved_dt       = g_ui.last_file.dt;
                     copy_cstr(g_ui.saved_filename, (int)sizeof(g_ui.saved_filename), saved_name);
 #if OPENFW_BT_HP
                     bt_xrec_clear_sync_done();
@@ -4202,6 +4328,7 @@ int openfw_main(void)
             recorder_poll();
             if (recorder_has_error()) {
                 (void)recorder_stop();
+                apm_flush();
                 g_ui.rec_sec     = recorder_get_seconds();
                 rec_active       = 0;
                 g_ui.rec_stopped = 1u;
@@ -4336,6 +4463,13 @@ int openfw_main(void)
 
             if (enter_usb_auto) {
                 int manual = run_usb_msc_mode(1);
+                now_ms = millis();
+                refresh_telemetry();
+                if (g_ui.batt_mv < 3450u) {
+                    low_batt_cutoff = 1;
+                } else if (g_ui.batt_mv >= 3550u) {
+                    low_batt_cutoff = 0;
+                }
                 usb_suppress_until_unpl = (manual && pmu_is_vbus_present()) ? 1 : 0;
 #if OPENFW_BT_HP
                 if (g_phone_cfg.auto_sync && (g_phone_cfg.sync_pending || has_untranscribed_recording())) {
@@ -4356,11 +4490,11 @@ int openfw_main(void)
 #if OPENFW_BT_BENCH
             bench_block_bt = bench_home && !bt_bench_home_bg_allowed();
 #endif
-            if (rec_active) {
+            if (rec_active || recorder_is_saving()) {
                 recorder_poll();
             }
             bt_bg_poll(now_ms, rec_active, usb_probing, bench_block_bt, &dirty);
-            if (rec_active) {
+            if (rec_active || recorder_is_saving()) {
                 recorder_poll();
             }
             int bench_active = 0;
@@ -4564,7 +4698,7 @@ int openfw_main(void)
                         }
                     } else if (enter_press_ms != 0u && !enter_long_fired &&
                                (key == KEY_ENTER || prev_key == KEY_ENTER) &&
-                               (uint32_t)(t - enter_press_ms) >= 600u) {
+                               (int32_t)(t - enter_press_ms) >= 600) {
                         if (g_ui.file_count > 0 && !g_files[g_ui.file_sel].is_dir) {
                             enter_long_fired = 1;
                             enter_press_ms   = 0u;
@@ -4619,8 +4753,9 @@ int openfw_main(void)
                             g_ui.del_holding = 1u;
                             dirty            = 1;
                         } else {
-                            uint32_t held = (uint32_t)(t - enter_press_ms);
-                            uint8_t  pct  = (held >= 1200u) ? 100u : (uint8_t)((held * 100u) / 1200u);
+                            int32_t  held_s = (int32_t)(t - enter_press_ms);
+                            uint32_t held   = (held_s > 0) ? (uint32_t)held_s : 0u;
+                            uint8_t  pct    = (held >= 1200u) ? 100u : (uint8_t)((held * 100u) / 1200u);
                             if (pct != g_ui.del_hold_pct) {
                                 g_ui.del_hold_pct = pct;
                                 dirty = 1;

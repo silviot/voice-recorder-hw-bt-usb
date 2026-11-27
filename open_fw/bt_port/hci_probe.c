@@ -111,9 +111,12 @@
 #define CPU_SAMPLES         10u      /* ... in 10 consecutive guard samples (GUARD_PERIOD_MS each, i.e. 1 s) */
 #define PROBE_NAME_PREFIX   "Cassini-Probe-"
 #define RTOS_STATIC __attribute__((section(".rtos_static"), aligned(8)))
-/* Probe-only diagnostic buffers go to SRAM_HI (.bss_hi, zeroed at boot, plan §4 "~19 KB left"): the RTOS region keeps
- * its heap_5 margin for what the integrated image will also have (bt_ctrl rings, task stacks). */
-#define PROBE_BSS   __attribute__((section(".bss_hi")))
+/* Probe-only diagnostic buffers go to .bt_lo_bss (RTOS_HEAP_LO) on ARM so .bss_hi stays comfortably within 44 KiB. */
+#if defined(__arm__)
+#define PROBE_BSS   __attribute__((section(".bt_lo_bss"), aligned(4)))
+#else
+#define PROBE_BSS
+#endif
 
 static StaticTask_t s_tcb RTOS_STATIC;
 static StackType_t  s_stack[PROBE_STACK_WORDS] RTOS_STATIC;

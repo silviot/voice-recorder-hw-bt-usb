@@ -22,6 +22,7 @@ Solution:
 
 SPDX-License-Identifier: MIT
 """
+import argparse
 import fcntl
 import os
 import stat
@@ -41,7 +42,7 @@ def get_disk_sectors(disk, dev_path: Path) -> int:
     return st.st_size // 512
 
 
-def find_exfat_bitmap(disk, heap_lba: int, root_cluster: int, sec_per_clus: int) -> tuple[int, int]:
+def find_exfat_bitmap_info(disk, heap_lba: int, root_cluster: int, sec_per_clus: int) -> tuple[int, int, bool]:
     """Scan the first cluster of the exFAT root directory for the 0x81 Allocation Bitmap."""
     lba = heap_lba + (root_cluster - 2) * sec_per_clus
     disk.seek(lba * 512)
@@ -51,10 +52,16 @@ def find_exfat_bitmap(disk, heap_lba: int, root_cluster: int, sec_per_clus: int)
         if etype == 0x00:
             break
         if etype == 0x81:
+            no_fat_chain = (root_data[off + 1] & 0x02) != 0
             bmap_cluster = struct.unpack_from("<I", root_data, off + 20)[0]
             bmap_len = struct.unpack_from("<Q", root_data, off + 24)[0]
-            return bmap_cluster, bmap_len
+            return bmap_cluster, bmap_len, no_fat_chain
     raise RuntimeError("exFAT 0x81 Allocation Bitmap entry not found in root directory")
+
+
+def find_exfat_bitmap(disk, heap_lba: int, root_cluster: int, sec_per_clus: int) -> tuple[int, int]:
+    bmap_cluster, bmap_len, _ = find_exfat_bitmap_info(disk, heap_lba, root_cluster, sec_per_clus)
+    return bmap_cluster, bmap_len
 
 
 def is_cluster_allocated(
@@ -65,6 +72,7 @@ def is_cluster_allocated(
     bmap_cluster: int,
     bmap_len: int,
     cluster_idx_0based: int,
+    no_fat_chain: bool = False,
 ) -> bool:
     byte_off = cluster_idx_0based // 8
     bit_mask = 1 << (cluster_idx_0based % 8)
@@ -73,14 +81,15 @@ def is_cluster_allocated(
     cluster_bytes = sec_per_clus * 512
     step_clusters = byte_off // cluster_bytes
     in_clus_off = byte_off % cluster_bytes
-    cur = bmap_cluster
-    for _ in range(step_clusters):
-        disk.seek(fat_lba * 512 + cur * 4)
-        nxt = struct.unpack("<I", disk.read(4))[0]
-        if nxt >= 0xFFFFFFF8 or nxt < 2:
-            cur = cur + 1  # Contiguous bitmap fallback
-        else:
-            cur = nxt
+    cur = bmap_cluster + step_clusters if no_fat_chain else bmap_cluster
+    if not no_fat_chain:
+        for _ in range(step_clusters):
+            disk.seek(fat_lba * 512 + cur * 4)
+            nxt = struct.unpack("<I", disk.read(4))[0]
+            if nxt >= 0xFFFFFFF8 or nxt < 2:
+                cur = cur + 1  # Contiguous bitmap fallback
+            else:
+                cur = nxt
     disk.seek((heap_lba + (cur - 2) * sec_per_clus) * 512 + in_clus_off)
     b = disk.read(1)[0]
     return (b & bit_mask) != 0
@@ -142,8 +151,10 @@ def fix_device(dev_path: Path, dry_run: bool = False) -> None:
         # Verify the tail cluster being removed is FREE in the Allocation Bitmap
         fat_lba = p1_start + fat_off
         heap_lba = p1_start + clus_off
-        bmap_cluster, bmap_len = find_exfat_bitmap(disk, heap_lba, root_clus, sec_per_clus)
-        if is_cluster_allocated(disk, fat_lba, heap_lba, sec_per_clus, bmap_cluster, bmap_len, clus_cnt - 1):
+        bmap_cluster, bmap_len, no_fat_chain = find_exfat_bitmap_info(disk, heap_lba, root_clus, sec_per_clus)
+        if is_cluster_allocated(
+            disk, fat_lba, heap_lba, sec_per_clus, bmap_cluster, bmap_len, clus_cnt - 1, no_fat_chain=no_fat_chain
+        ):
             raise RuntimeError(
                 f"Tail cluster #{clus_cnt - 1} is currently ALLOCATED in exFAT bitmap! "
                 "Refusing to shrink volume and lose data."
@@ -189,10 +200,15 @@ def fix_device(dev_path: Path, dry_run: bool = False) -> None:
         print(f"Successfully patched and synced {dev_path}.")
 
 
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    ap = argparse.ArgumentParser(
+        description="In-place MBR + exFAT tail-cluster shrink for SL6801 Linux USB stability"
+    )
+    ap.add_argument("--dry-run", action="store_true", help="Inspect geometry without modifying the device")
+    ap.add_argument("device", type=Path, help="Block device or disk image path (e.g. /dev/sdX)")
+    return ap.parse_args(argv)
+
+
 if __name__ == "__main__":
-    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
-        print(f"Usage: sudo {sys.argv[0]} [--dry-run] /dev/sdX")
-        sys.exit(1)
-    dry = "--dry-run" in sys.argv
-    target = Path(sys.argv[-1])
-    fix_device(target, dry_run=dry)
+    args = parse_args()
+    fix_device(args.device, dry_run=args.dry_run)

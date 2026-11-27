@@ -2,6 +2,7 @@
  * through bt_rom_real.c.
  * SPDX-License-Identifier: MIT */
 #include "bt_rom_rng.h"
+#include "bt_rom_if.h"
 
 #if (BT_ROM_RNG_POOL_BYTES & (BT_ROM_RNG_POOL_BYTES - 1u)) != 0u
 #error "BT_ROM_RNG_POOL_BYTES must be a power of two"
@@ -105,7 +106,7 @@ static int take(uint8_t *out, uint32_t n)
     return 0;
 }
 
-uint32_t bt_rom_rng_hook(uint32_t ret_addr, volatile uint8_t *nonce_block, uint32_t (*legacy)(void))
+BT_FAST uint32_t bt_rom_rng_hook(uint32_t ret_addr, volatile uint8_t *nonce_block, uint32_t (*legacy)(void))
 {
     uint8_t b[BT_ROM_NONCE_BLOCK_BYTES + 1u];
     uint32_t v = 0u;

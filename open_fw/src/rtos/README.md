@@ -41,8 +41,7 @@ heap_5). Design and rationale: `docs/BLUETOOTH_BLUEDROID_PLAN.md` §3. Silicon r
   `-j <section>` in the `objcopy` that builds `xip.bin`.
 - **`.ram_boot` has ~170 B of headroom.** Put new boot-time code in XIP (`bt_static_init()` runs after XIP is mapped)
   and new hot code in `.fast_ramtext`, not `.ramtext`.
-- Keep the default image byte-identical: guard every RTOS/BT change with `OPENFW_RTOS` / `OPENFW_BT_BLUEDROID` and
-  compare `FIRM CRC-16` of `make all` before committing (currently 0xC786).
+- Keep `BT=0` cleanly isolated: guard every RTOS/BT change with `OPENFW_RTOS` / `OPENFW_BT_BLUEDROID` so `make -C open_fw BT=0 all` continues to build and run bare-metal cleanly.
 - **POSIX port (host harness) V11.1.0 can hang in `vTaskDelete(other)`** (cancelled thread exits holding its event
   mutex; fixed upstream in V11.2.0). `tests/bt_host/posix_port_shim.h` makes the mutex robust at compile time; see
   `tests/bt_host/README.md` for the other host-port lessons (pre-emption inside malloc, TSan).

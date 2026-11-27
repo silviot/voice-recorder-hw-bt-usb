@@ -1081,17 +1081,79 @@ static void test_recorder(const char *exfat_img_path)
     assert(strncmp(&g_openfw_log.buf[2], "BENCH rec seq=1 file=REC_0005.wav rec=0 ", 40) == 0);
 #endif
 
-    /* Recording #11: Auto mic gain clip protection steps PGA down from 20 when raw ADC hits >= 31200 */
+    /* Recording #11: Auto mic gain clip protection, 4-block cooldown, floor at 8, 64-block quiet recovery,
+     * VOR-closed inhibition, and AUDIO_DSP_VOICE_CLARITY compatibility */
     assert(exfat_mount(&vol, &dev) == 0);
     recorder_enable_auto_gain();
     assert(recorder_get_gain() == 20u);
+    assert(recorder_get_split_count() == 0u);
     recorder_set_dsp_profile(AUDIO_DSP_ASR_RAW);
     recorder_set_channels(1u);
+    recorder_set_vor(0);
     assert(recorder_start(&vol, 1) == 0);
+    /* Block 1 at 32000 (>= 31200): steps 20 -> 18, sets 4-block cooldown */
     sim_dma_deliver_frame(0, 32000, NULL);
     recorder_poll();
     assert(recorder_get_gain() == 18u);
     assert(((*pga >> 24) & 31u) == 18u);
+    /* Next 3 clip blocks stay locked at 18 during cooldown */
+    for (int i = 0; i < 3; i++) {
+        sim_dma_deliver_frame(0, 32000, NULL);
+        recorder_poll();
+        assert(recorder_get_gain() == 18u);
+    }
+    /* Cooldown expires on 4th post-step block (4 -> 3 -> 2 -> 1 -> 0) -> drops 18 -> 16 */
+    sim_dma_deliver_frame(0, 32000, NULL);
+    recorder_poll();
+    assert(recorder_get_gain() == 16u);
+    /* Repeated clipping steps down 16 -> 14 -> 12 -> 10 -> 8 and clamps at floor 8 */
+    for (int step = 0; step < 5; step++) {
+        for (int b = 0; b < 5; b++) {
+            sim_dma_deliver_frame(0, 32000, NULL);
+            recorder_poll();
+        }
+    }
+    assert(recorder_get_gain() == 8u);
+    assert(((*pga >> 24) & 31u) == 8u);
+    /* 63 quiet blocks (< 2000) keep gain at 8; 64th steps +1 -> 9 */
+    for (int b = 0; b < 63; b++) {
+        sim_dma_deliver_frame(0, 500, NULL);
+        recorder_poll();
+        assert(recorder_get_gain() == 8u);
+    }
+    sim_dma_deliver_frame(0, 500, NULL);
+    recorder_poll();
+    assert(recorder_get_gain() == 9u);
+    assert(recorder_stop() == 0);
+
+    /* VOR-closed inhibition + AUDIO_DSP_VOICE_CLARITY + recovery cap at 20 */
+    recorder_enable_auto_gain();
+    recorder_set_dsp_profile(AUDIO_DSP_VOICE_CLARITY);
+    recorder_set_vor(1);
+    assert(recorder_start(&vol, 1) == 0);
+    sim_dma_deliver_frame(0, 32000, NULL);
+    recorder_poll();
+    assert(recorder_get_gain() == 18u);
+    for (int b = 0; b < 40 && !recorder_is_vor_waiting(); b++) {
+        sim_dma_deliver_frame(0, 0, NULL);
+        recorder_poll();
+    }
+    assert(recorder_is_vor_waiting() == 1);
+    /* >64 silent blocks while VOR gate is closed must NOT step gain up */
+    for (int b = 0; b < 70; b++) {
+        sim_dma_deliver_frame(0, 0, NULL);
+        recorder_poll();
+    }
+    assert(recorder_get_gain() == 18u);
+    /* Re-open VOR with a moderate sound, then verify recovery caps at 20 */
+    sim_dma_deliver_frame(0, 3000, NULL);
+    recorder_poll();
+    for (int b = 0; b < 200; b++) {
+        sim_dma_deliver_frame(0, 1200, NULL);
+        recorder_poll();
+    }
+    assert(recorder_get_gain() == 20u);
+    recorder_set_vor(0);
     assert(recorder_stop() == 0);
 
     /* Restore default recorder config */

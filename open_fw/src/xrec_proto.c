@@ -1149,10 +1149,18 @@ static void handle_del(xrec_ctx_t *ctx, const char *filename)
         send_err(ctx, "BUSY");
         return;
     }
+    if (filename[0] == '.') {
+        send_err(ctx, "NAME");
+        return;
+    }
     if (rec_channels(ctx) != 0u) {
         send_later(ctx);                         /* F6: no second card writer while recording */
         return;
     }
+    /* Stop any active GETS stream before deleting so freed clusters are never streamed */
+    ctx->gets_active = 0u;
+    ctx->gets_staged = 0u;
+    ctx->gets_lookup = 0u;
     if (exfat_delete_file(ctx->vol, "/record", filename) != 0) {
         send_err(ctx, "DEL");
         return;
@@ -1166,6 +1174,9 @@ static void handle_del(xrec_ctx_t *ctx, const char *filename)
             abort_staged_put(ctx);
             ctx->put_rec_deleted = 1u;
         }
+    }
+    if (ctx->ops.on_fs_change) {
+        ctx->ops.on_fs_change(ctx->user);
     }
     static const char ok[] = "+XREC:OK,DEL\r\n";
     send_text(ctx, ok, (int)(sizeof(ok) - 1u));
@@ -1205,6 +1216,9 @@ static void handle_recstop(xrec_ctx_t *ctx)
     if (ctx->ops.rec_stop(ctx->user) != 0) {
         send_err(ctx, "NOTREC");
         return;
+    }
+    if (ctx->ops.on_fs_change) {
+        ctx->ops.on_fs_change(ctx->user);
     }
     static const char ok[] = "+XREC:OK,RECSTOP\r\n";
     send_text(ctx, ok, (int)(sizeof(ok) - 1u));
@@ -1447,6 +1461,9 @@ static void handle_putend(xrec_ctx_t *ctx)
     ctx->put_done_total = total;
     if (mode == XREC_PUT_REC && ctx->ops.on_rec_cwx) {
         ctx->ops.on_rec_cwx(ctx->user, final_name, ctx->put_cwx_state ? ctx->put_cwx_state : 1u);
+    }
+    if (ctx->ops.on_fs_change) {
+        ctx->ops.on_fs_change(ctx->user);
     }
     send_putend_ok(ctx, total);
 }

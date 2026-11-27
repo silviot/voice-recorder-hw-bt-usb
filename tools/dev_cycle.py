@@ -202,7 +202,11 @@ def cmd_boot(args: argparse.Namespace) -> int:
 def cmd_flash(args: argparse.Namespace) -> int:
     if args.build or not FIRM_BIN.is_file() or not IMAGE_2M.is_file():
         print("Building open_fw + 2M image...")
-        subprocess.run(["make", "-C", str(OPENFW_DIR), "all", "update-up"], check=True)
+        make_cmd = ["make", "-C", str(OPENFW_DIR), "all", "update-up"]
+        sudo_uid = os.environ.get("SUDO_UID")
+        if os.geteuid() == 0 and sudo_uid:
+            make_cmd = ["sudo", "-u", f"#{sudo_uid}", *make_cmd]
+        subprocess.run(make_cmd, check=True)
 
     image_bytes = IMAGE_2M.read_bytes()
     # Read exact FIRM length from the partition table inside IMAGE_2M (offset 0x00D018)

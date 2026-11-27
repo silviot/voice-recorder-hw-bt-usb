@@ -1642,6 +1642,35 @@ static void test_exfat_hardening_and_batching(void)
     assert(exfat_read_file(&vol2, &f44, 0u, fb, 16u, &nr) == 0 && nr == 9u);
     assert(memcmp(fb, "F_044.TXT", 9u) == 0);
 
+    /* 7. Non-ASCII UTF-16LE characters (>= 0x80) map to '_' in exFAT directory listing */
+    assert(exfat_create_file(&vol2, "/", "cafe.wav", &w) == 0);
+    assert(exfat_close_file(&w) == 0);
+    {
+        uint32_t root_lba = vol2.heap_lba + ((vol2.root_dir_cluster - 2u) << vol2.spc_shift);
+        uint8_t rsec[512];
+        int patched_u16 = 0;
+        for (uint32_t s = 0u; s < vol2.sectors_per_cluster && !patched_u16; s++) {
+            assert(stats_read_sectors(&sd, root_lba + s, 1u, rsec) == 0);
+            for (uint32_t sl = 0u; sl + 2u < 16u; sl++) {
+                uint8_t *e = &rsec[sl * 32u];
+                if (e[0] == 0x85u && e[32u] == 0xC0u && e[64u] == 0xC1u &&
+                    e[64u + 2u] == 'c' && e[64u + 4u] == 'a' && e[64u + 6u] == 'f' && e[64u + 8u] == 'e') {
+                    e[64u + 8u] = 0xE9u; /* U+00E9 LATIN SMALL LETTER E WITH ACUTE */
+                    e[64u + 9u] = 0x00u;
+                    put_le16(e + 2u, test_entry_checksum(e, 3u));
+                    assert(stats_write_sectors(&sd, root_lba + s, 1u, rsec) == 0);
+                    patched_u16 = 1;
+                    break;
+                }
+            }
+        }
+        assert(patched_u16 == 1);
+        exfat_entry_t uent;
+        assert(exfat_find_path(&vol2, "/caf_.wav", &uent) == 0);
+        assert(exfat_delete_file(&vol2, "/", "caf_.wav") == 0);
+        assert(exfat_find_path(&vol2, "/caf_.wav", &uent) != 0);
+    }
+
     free(disk);
     printf("  [PASS] exfat hardening (MBR multi-part, ValidDataLength, batching, write-err rollback, slot-15 NoFatChain grow, cached delete)\n");
 }
@@ -2725,6 +2754,7 @@ typedef struct {
     uint8_t     mic_gain;
     uint8_t     channels;
     uint8_t     vor_enabled;
+    uint32_t    fs_changes;
 } sim_phone_t;
 
 #define SIM_LINK_CREDITS 7u      /* initial credits of the RFCOMM channel (PN k = 7) */
@@ -2919,6 +2949,12 @@ static void mock_xrec_on_dfu(void *user)
 {
     sim_phone_t *sp = (sim_phone_t *)user;
     sp->dfu_called++;
+}
+
+static void mock_xrec_on_fs_change(void *user)
+{
+    sim_phone_t *sp = (sim_phone_t *)user;
+    sp->fs_changes++;
 }
 
 static int mock_xrec_audio_cfg(void *user, int set, uint8_t *dsp_profile,
@@ -3134,6 +3170,7 @@ static void test_xrec_session(void)
         .audio_cfg    = mock_xrec_audio_cfg,
         .get_mtu      = mock_xrec_get_mtu,
         .file_busy    = mock_xrec_file_busy,
+        .on_fs_change = mock_xrec_on_fs_change,
     };
     xrec_init(&xrec, &vol, &ops, &sp);
 
@@ -3221,6 +3258,41 @@ static void test_xrec_session(void)
     sp.rx_len = 0u;
     phone_cmd(&sp, "+XREC:LS,BAD\r");
     assert(strstr(phone_text(&sp), "+XREC:ERR,ARGS") != NULL);
+
+    /* +XREC:LS,T suppresses 0x5C210000 cold-boot fallback timestamp (2026-01-01 00:00:00) */
+    exfat_set_timestamp(&vol, 0x5C210000u);
+    assert(exfat_create_file(&vol, "/record", "COLD_BOOT.wav", &w) == 0);
+    assert(exfat_write(&w, wav_file, 64u) == 0);
+    assert(exfat_close_file(&w) == 0);
+    sp.credits += 4u;
+    sp.rx_len = 0u;
+    phone_cmd(&sp, "+XREC:LS,T\r");
+    assert(strstr(phone_text(&sp), "+XREC:FT,64,-,COLD_BOOT.wav") != NULL);
+    sp.rx_len = 0u;
+    phone_cmd(&sp, "+XREC:DEL,COLD_BOOT.wav\r");
+    assert(strstr(phone_text(&sp), "+XREC:OK,DEL") != NULL);
+
+    /* +XREC:DEL refuses dot-files (.autoplay) and cancels an active stalled GETS cleanly */
+    sp.rx_len = 0u;
+    phone_cmd(&sp, "+XREC:DEL,.autoplay\r");
+    assert(strstr(phone_text(&sp), "+XREC:ERR,NAME") != NULL);
+    {
+        exfat_entry_t ap_keep;
+        assert(exfat_find_path(&vol, "/record/.AUTOPLAY", &ap_keep) == 0);
+    }
+    assert(exfat_create_file(&vol, "/record", "DELGETS.wav", &w) == 0);
+    assert(exfat_write(&w, wav_file, 256u) == 0);
+    assert(exfat_close_file(&w) == 0);
+    sp.credits = 1u;
+    sp.rx_len = 0u;
+    phone_cmd(&sp, "+XREC:GETS,0,256,64,DELGETS.wav\r");
+    assert(xrec.gets_active == 1u);
+    sp.credits += 4u;
+    sp.rx_len = 0u;
+    uint32_t fsc_before = sp.fs_changes;
+    phone_cmd(&sp, "+XREC:DEL,DELGETS.wav\r");
+    assert(strstr(phone_text(&sp), "+XREC:OK,DEL") != NULL);
+    assert(xrec.gets_active == 0u && sp.fs_changes == fsc_before + 1u);
 
     /* STEP10 A1: DEL of the file being recorded is refused and the file stays */
     sp.rx_len = 0u;
@@ -3373,9 +3445,11 @@ static void test_xrec_session(void)
     sp.rx_len = 0u;
     send_xrec_put_target(&sp, 0u, "CAS,demo.cwx", cas_data, sizeof(cas_data), cas_crc);
     const char *c_put_end = "+XREC:PUTEND\r";
+    uint32_t fsc_cas = sp.fs_changes;
     phone_cmd(&sp, c_put_end);
     assert(strstr(phone_text(&sp), "+XREC:OK,PUT,0,48") != NULL);
     assert(strstr(phone_text(&sp), "+XREC:OK,PUTEND,48") != NULL);
+    assert(sp.fs_changes == fsc_cas + 1u);
 
     sp.credits += 10u;
     sp.rx_len = 0u;
