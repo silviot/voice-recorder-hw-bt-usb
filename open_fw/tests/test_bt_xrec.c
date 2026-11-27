@@ -895,8 +895,8 @@ static void t_pairing_and_data(void)
     uint32_t rx0 = status().rx_acl_pkts;
     rx(H1, "+XREC:PING\r\n");
     CHECK(wire_has("+XREC:PONG,openfw_v5,v5,bound=0,auth=0,pair=1"), "PONG on the wire");
-    CHECK(wire_has("+XREC:PONG,openfw_v5,v5,bound=0,auth=0,pair=1,rec=1,sync=1,live=1\r\n"),
-          "PONG advertises REC, SYNC, and LIVE capabilities");
+    CHECK(wire_has("+XREC:PONG,openfw_v5,v5,bound=0,auth=0,pair=1,rec=1,sync=1,live=1,lst=1\r\n"),
+          "PONG advertises REC, SYNC, LIVE, and LST capabilities");
     CHECK(status().rx_acl_pkts == rx0 + 1u && status().tx_acl_pkts >= 1u, "activity counters");
     wire_clear();
     char cmd[128];
@@ -913,6 +913,9 @@ static void t_pairing_and_data(void)
     rx_raw(H1, "PI", 2u);
     rx(H1, "NG\r\n");
     CHECK(wire_has("+XREC:PONG,openfw_v5,v5,bound=1,auth=1,pair=0"), "split command parsed once");
+    wire_clear();
+    rx(H1, "+XREC:LS,BAD\r\n");
+    CHECK(wire_has("+XREC:ERR,ARGS\r\n"), "malformed LS suffix rejected with ERR,ARGS");
     stop_ok();
 }
 

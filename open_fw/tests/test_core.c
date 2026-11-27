@@ -3064,10 +3064,12 @@ static void test_xrec_session(void)
     for (uint32_t i = 44u; i < sizeof(exact960); i++) {
         exact960[i] = (uint8_t)((i * 59u + 13u) & 0xFFu);
     }
+    exfat_set_timestamp(&vol, 0x5D738420u); /* 2026-11-19 16:33:00 */
     assert(exfat_create_file(&vol, "/record", "EXACT960.wav", &w) == 0);
     assert(exfat_write(&w, exact960, sizeof(exact960)) == 0);
     assert(exfat_close_file(&w) == 0);
 
+    exfat_set_timestamp(&vol, 0x28210000u); /* 2000-01-01 00:00:00 (un-synced RTC) */
     for (int idx = 2; idx <= 9; idx++) {
         char fname[20];
         snprintf(fname, sizeof(fname), "REC_%04d.wav", idx);
@@ -3189,6 +3191,18 @@ static void test_xrec_session(void)
     assert(strstr(phone_text(&sp), ".autoplay") == NULL);
     assert(strstr(phone_text(&sp), "+XREC:END") != NULL);
 
+    /* +XREC:LS,T emits ISO local timestamps (and '-' for un-synced/fallback); +XREC:LS,BAD -> ERR,ARGS */
+    sp.credits += 4u;
+    sp.rx_len   = 0u;
+    phone_cmd(&sp, "+XREC:LS,T\r");
+    assert(strstr(phone_text(&sp), "+XREC:FT,1024,-,REC_0001.wav") != NULL);
+    assert(strstr(phone_text(&sp), "+XREC:FT,960,2026-11-19T16:33:00,EXACT960.wav") != NULL);
+    assert(strstr(phone_text(&sp), "+XREC:FT,64,-,REC_0002.wav") != NULL);
+    assert(strstr(phone_text(&sp), "+XREC:END") != NULL);
+    sp.rx_len = 0u;
+    phone_cmd(&sp, "+XREC:LS,BAD\r");
+    assert(strstr(phone_text(&sp), "+XREC:ERR,ARGS") != NULL);
+
     /* STEP10 A1: DEL of the file being recorded is refused and the file stays */
     sp.rx_len = 0u;
     sp.busy_name = "REC_0009.wav";
@@ -3207,6 +3221,19 @@ static void test_xrec_session(void)
     assert(strstr(phone_text(&sp), "+XREC:ERR,NAME") != NULL);
     assert(strstr(phone_text(&sp), "+XREC:OK,DEL") != NULL);
     assert(strstr(phone_text(&sp), "REC_0009.wav") == NULL);
+
+    /* +XREC:LS,T preserves commas in filenames alongside timestamps */
+    exfat_set_timestamp(&vol, 0x5D738420u);
+    assert(exfat_create_file(&vol, "/record", "a,b.wav", &w) == 0);
+    assert(exfat_write(&w, wav_file, 64u) == 0);
+    assert(exfat_close_file(&w) == 0);
+    sp.credits += 4u;
+    sp.rx_len = 0u;
+    phone_cmd(&sp, "+XREC:LS,T\r");
+    assert(strstr(phone_text(&sp), "+XREC:FT,64,2026-11-19T16:33:00,a,b.wav") != NULL);
+    sp.rx_len = 0u;
+    phone_cmd(&sp, "+XREC:DEL,a,b.wav\r");
+    assert(strstr(phone_text(&sp), "+XREC:OK,DEL") != NULL);
 
     /* 3. Single-frame +XREC:GET */
     sp.credits += 6u;

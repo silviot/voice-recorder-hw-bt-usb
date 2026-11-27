@@ -195,6 +195,7 @@ typedef struct {
     /* Resumable +XREC:LS state */
     uint8_t        ls_active;
     uint8_t        ls_has_dir;
+    uint8_t        ls_with_time;
     exfat_entry_t  ls_dir;
     exfat_dir_pos_t ls_pos;            /* the first directory slot not yet listed (entries before it were sent) */
 

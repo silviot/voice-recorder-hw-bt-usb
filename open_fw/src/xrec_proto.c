@@ -479,6 +479,40 @@ static int clamp_active_entry(const xrec_ctx_t *ctx, exfat_entry_t *ent)
     return 0;
 }
 
+/* Decode a DOS 32-bit exFAT timestamp (2-second resolution), rejecting zero, un-synced (< 2025) and cold-boot
+ * fallback timestamps (0x5C210000 = 2026-01-01 00:00:00). */
+static int dos_stamp_valid(uint32_t stamp, uint16_t *yr, uint8_t *mo, uint8_t *dy,
+                           uint8_t *hh, uint8_t *mm, uint8_t *ss)
+{
+    if (stamp == 0u || stamp == 0x5C210000u) {
+        return 0;
+    }
+    uint32_t y = 1980u + (stamp >> 25);
+    uint32_t m = (stamp >> 21) & 15u;
+    uint32_t d = (stamp >> 16) & 31u;
+    uint32_t h = (stamp >> 11) & 31u;
+    uint32_t n = (stamp >> 5) & 63u;
+    uint32_t s = (stamp & 31u) * 2u;
+    static const uint8_t month_days[12] = { 31u, 28u, 31u, 30u, 31u, 30u, 31u, 31u, 30u, 31u, 30u, 31u };
+    if (y < 2025u || y > 2099u || m < 1u || m > 12u || h > 23u || n > 59u || s > 59u) {
+        return 0;
+    }
+    uint32_t max_d = month_days[m - 1u];
+    if (m == 2u && (y % 4u == 0u) && ((y % 100u != 0u) || (y % 400u == 0u))) {
+        max_d = 29u;
+    }
+    if (d < 1u || d > max_d) {
+        return 0;
+    }
+    *yr = (uint16_t)y;
+    *mo = (uint8_t)m;
+    *dy = (uint8_t)d;
+    *hh = (uint8_t)h;
+    *mm = (uint8_t)n;
+    *ss = (uint8_t)s;
+    return 1;
+}
+
 /* The listing resumes at ctx->ls_pos, the first slot after the last entry that was sent (or skipped with nothing
  * unsent before it): a pass reads only the directory part not listed yet. */
 static int ls_dir_cb(const exfat_entry_t *entry, const exfat_dir_pos_t *next, void *user)
@@ -486,7 +520,7 @@ static int ls_dir_cb(const exfat_entry_t *entry, const exfat_dir_pos_t *next, vo
     ls_ctx_t *lc = (ls_ctx_t *)user;
     /* Hidden files (e.g. a .autoplay folder marker) are not recordings */
     if (!entry->is_dir && entry->name[0] != '.') {
-        char line[128];
+        char line[160];
         int pos = 0;
         uint32_t sz = (entry->size > 0xFFFFFFFFu) ? 0xFFFFFFFFu : (uint32_t)entry->size;
         if (lc->ctx->ops.file_busy && lc->ctx->ops.file_busy(lc->ctx->user, entry->name) != 0 &&
@@ -496,11 +530,39 @@ static int ls_dir_cb(const exfat_entry_t *entry, const exfat_dir_pos_t *next, vo
                 sz = live_sz;
             }
         }
-        append_str(line, &pos, (int)sizeof(line), "+XREC:F,");
-        append_u32(line, &pos, (int)sizeof(line), sz);
-        append_str(line, &pos, (int)sizeof(line), ",");
-        append_str(line, &pos, (int)sizeof(line), entry->name);
-        append_str(line, &pos, (int)sizeof(line), "\r\n");
+        if (lc->ctx->ls_with_time) {
+            uint16_t yr = 0u;
+            uint8_t mo = 0u, dy = 0u, hh = 0u, mm = 0u, ss = 0u;
+            int has_time = dos_stamp_valid(entry->created_timestamp, &yr, &mo, &dy, &hh, &mm, &ss) ||
+                           dos_stamp_valid(entry->modified_timestamp, &yr, &mo, &dy, &hh, &mm, &ss);
+            append_str(line, &pos, (int)sizeof(line), "+XREC:FT,");
+            append_u32(line, &pos, (int)sizeof(line), sz);
+            append_str(line, &pos, (int)sizeof(line), ",");
+            if (has_time) {
+                append_u32(line, &pos, (int)sizeof(line), yr);
+                append_str(line, &pos, (int)sizeof(line), "-");
+                append_2d(line, &pos, (int)sizeof(line), mo);
+                append_str(line, &pos, (int)sizeof(line), "-");
+                append_2d(line, &pos, (int)sizeof(line), dy);
+                append_str(line, &pos, (int)sizeof(line), "T");
+                append_2d(line, &pos, (int)sizeof(line), hh);
+                append_str(line, &pos, (int)sizeof(line), ":");
+                append_2d(line, &pos, (int)sizeof(line), mm);
+                append_str(line, &pos, (int)sizeof(line), ":");
+                append_2d(line, &pos, (int)sizeof(line), ss);
+            } else {
+                append_str(line, &pos, (int)sizeof(line), "-");
+            }
+            append_str(line, &pos, (int)sizeof(line), ",");
+            append_str(line, &pos, (int)sizeof(line), entry->name);
+            append_str(line, &pos, (int)sizeof(line), "\r\n");
+        } else {
+            append_str(line, &pos, (int)sizeof(line), "+XREC:F,");
+            append_u32(line, &pos, (int)sizeof(line), sz);
+            append_str(line, &pos, (int)sizeof(line), ",");
+            append_str(line, &pos, (int)sizeof(line), entry->name);
+            append_str(line, &pos, (int)sizeof(line), "\r\n");
+        }
         if (ls_append(lc, line, pos) != 0) {
             return 1;
         }
@@ -603,7 +665,7 @@ void xrec_get_xfer(const xrec_ctx_t *ctx, uint32_t now_ms, xrec_xfer_t *out)
 
 static void handle_ping(xrec_ctx_t *ctx)
 {
-    char buf[96];
+    char buf[128];
     int pos = 0;
     append_str(buf, &pos, (int)sizeof(buf), "+XREC:PONG,openfw_v5,v5,bound=");
     append_u32(buf, &pos, (int)sizeof(buf), ctx->bound ? 1u : 0u);
@@ -613,8 +675,9 @@ static void handle_ping(xrec_ctx_t *ctx)
     append_u32(buf, &pos, (int)sizeof(buf), ctx->pair_active ? 1u : 0u);
     /* capability flags (clients parse key=value and ignore unknown keys):
      * rec=1 = PUT target REC,<stem>.cwx; sync=1 = +XREC:SYNC,<pending>[,<eta_s>];
-     * live=1 = best-effort live GETS of active recording up to flushed disk bytes */
-    append_str(buf, &pos, (int)sizeof(buf), ",rec=1,sync=1,live=1\r\n");
+     * live=1 = best-effort live GETS of active recording up to flushed disk bytes;
+     * lst=1 = +XREC:LS,T emitting +XREC:FT,<size>,<ISO-or--> ,<name> */
+    append_str(buf, &pos, (int)sizeof(buf), ",rec=1,sync=1,live=1,lst=1\r\n");
     send_text(ctx, buf, pos);
 }
 
@@ -926,19 +989,29 @@ static void xrec_poll_ls(xrec_ctx_t *ctx)
     ctx->ls_active = 0u;
 }
 
-static void handle_ls(xrec_ctx_t *ctx)
+static void handle_ls(xrec_ctx_t *ctx, const char *args)
 {
+    uint8_t with_time = 0u;
+    if (args[0] == '\0') {
+        with_time = 0u;
+    } else if (args[0] == ',' && args[1] == 'T' && args[2] == '\0') {
+        with_time = 1u;
+    } else {
+        send_err(ctx, "ARGS");
+        return;
+    }
     if (!ctx->vol) {
         send_err(ctx, "NOSD");
         return;
     }
     /* Stop any active GETS stream so binary frames never interleave with LS text */
-    ctx->gets_active = 0u;
-    ctx->gets_staged = 0u;
-    ctx->gets_lookup = 0u;
-    ctx->ls_active   = 1u;
+    ctx->gets_active  = 0u;
+    ctx->gets_staged  = 0u;
+    ctx->gets_lookup  = 0u;
+    ctx->ls_with_time = with_time;
+    ctx->ls_active    = 1u;
     mem_zero(&ctx->ls_pos, sizeof(ctx->ls_pos));
-    ctx->ls_has_dir  = 0u;
+    ctx->ls_has_dir   = 0u;
 
     exfat_entry_t rec_dir;
     if (exfat_find_path(ctx->vol, "/record", &rec_dir) == 0 && rec_dir.is_dir) {
@@ -1829,8 +1902,8 @@ static void process_line(xrec_ctx_t *ctx, const char *line)
         handle_stat(ctx);
     } else if (str_starts_with(cmd, "RTC") && (cmd[3] == '\0' || cmd[3] == ',')) {
         handle_rtc(ctx, cmd + 3);
-    } else if (str_starts_with(cmd, "LS") && cmd[2] == '\0') {
-        handle_ls(ctx);
+    } else if (str_starts_with(cmd, "LS") && (cmd[2] == '\0' || cmd[2] == ',')) {
+        handle_ls(ctx, cmd + 2);
     } else if (str_starts_with(cmd, "GETS,")) {
         handle_get_common(ctx, cmd + 5, 1);
     } else if (str_starts_with(cmd, "GET,")) {
