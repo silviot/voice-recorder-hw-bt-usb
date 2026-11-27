@@ -3612,6 +3612,22 @@ static void test_bt_ui_pace(void)
 }
 
 /* Regression test: SysTick key edge stamped after loop-top timestamp (key_ms > now_ms) must never underflow. */
+static void test_completed_sync_idle(void)
+{
+    openfw_sync_idle_t idle = {0};
+    uint32_t start = UINT32_MAX - 2000u;
+    for (uint32_t t = 0u; t < 4000u; t += 10u) {
+        assert(!openfw_sync_idle_due(&idle, start + t, 1));
+    }
+    assert(openfw_sync_idle_due(&idle, start + 4000u, 1));
+    assert(!openfw_sync_idle_due(&idle, start + 4001u, 0));
+    assert(!openfw_sync_idle_due(&idle, start + 5000u, 1));
+    assert(!openfw_sync_idle_due(&idle, start + 8999u, 0));  /* transfer resumes */
+    assert(!openfw_sync_idle_due(&idle, start + 9010u, 1));
+    assert(!openfw_sync_idle_due(&idle, start + 13009u, 1));
+    assert(openfw_sync_idle_due(&idle, start + 13010u, 1));
+}
+
 static void test_auto_poweroff_policy(void)
 {
     printf("Testing auto power-off wrap-safe idle policy...\n");
@@ -3672,6 +3688,7 @@ int main(int argc, char **argv)
     test_xrec_session();
     test_bt_ui_pace();
     test_auto_poweroff_policy();
+    test_completed_sync_idle();
     printf("All open_fw host unit tests PASSED!\n");
     return 0;
 }

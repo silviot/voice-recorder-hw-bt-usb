@@ -131,7 +131,10 @@ static const uint8_t    k_brt_pct[5]       = { 20u, 40u, 60u, 80u, 100u };
 static const uint32_t   k_scr_off_ms[5]    = { 15000u, 30000u, 60000u, 300000u, 0u };
 #endif
 static uint8_t          g_cur_bl_pct       = 255u;
-static uint32_t         g_last_activity_ms = 0u;
+static uint32_t         g_backlight_activity_ms;
+#if OPENFW_BT_HP && !OPENFW_UNATTENDED_DEV
+static uint32_t         g_poweroff_activity_ms;
+#endif
 enum screen_sleep_state {
     SCREEN_AWAKE,
     SCREEN_IDLE_TIMEOUT,
@@ -157,6 +160,7 @@ static struct {
     uint32_t start_ms;
     uint32_t ready_ms;
     uint32_t poke_ms;
+    openfw_sync_idle_t sync_idle;
     uint32_t last_conn_ms;
     uint32_t last_disc_ms;
     uint32_t seen_cwx_seq;
@@ -281,9 +285,19 @@ static void backlight_apply(uint8_t pct)
 #define BL_FADE_IN_MS  100u
 static enum screen_sleep_state g_fade_out_reason = SCREEN_AWAKE;
 
+/* User activity restarts both clocks. Audio and USB can keep the device
+ * powered while the backlight still times out. */
+static void backlight_note_activity(uint32_t now_ms)
+{
+    g_backlight_activity_ms = now_ms;
+#if OPENFW_BT_HP && !OPENFW_UNATTENDED_DEV
+    g_poweroff_activity_ms = now_ms;
+#endif
+}
+
 static void backlight_wake(uint32_t now_ms)
 {
-    g_last_activity_ms = now_ms;
+    backlight_note_activity(now_ms);
     if (g_fade_out_reason != SCREEN_AWAKE) {
         g_fade_out_reason = SCREEN_AWAKE;
         backlight_apply(user_bl_pct()); /* cancels the ramp */
@@ -314,13 +328,6 @@ static void backlight_sleep_now(enum screen_sleep_state reason)
         g_cur_bl_pct = 0u;
     }
     g_fade_out_reason = reason; /* a manual off may upgrade an idle fade */
-}
-
-/* The player runs no screen idle timer: restart it on return to the menus so
- * they get a full timeout, without waking a screen the user switched off. */
-static void backlight_note_activity(uint32_t now_ms)
-{
-    g_last_activity_ms = now_ms;
 }
 
 static int screen_manually_off(void)
@@ -434,7 +441,7 @@ static void backlight_update(void)
      * that never call backlight_wake()/backlight_update() (the player): without
      * this, BACK out of a long playback left an idle time of the whole playback
      * and the very first backlight_update() blacked the screen out. */
-    uint32_t last = g_last_activity_ms;
+    uint32_t last = g_backlight_activity_ms;
     uint32_t key_ms;
     if (keys_last_activity(&key_ms) && (int32_t)(key_ms - last) > 0) {
         last = key_ms;
@@ -2117,6 +2124,7 @@ static void run_bt_xrec_mode(void)
             } else if (st_end.xrec_auth || si.sync_seen || si.cwx_seq > 0u) {
                 g_bt_bg.ever_connected = 1u;
             }
+            g_bt_bg.sync_idle.timing = 0u;
             g_bt_bg.ready_ms     = end_ms ? end_ms : 1u;
             g_bt_bg.last_conn_ms = end_ms;
             g_bt_bg.last_disc_ms = end_ms;
@@ -2175,7 +2183,7 @@ static int hsprobe_poll_cb(uint32_t now_ms)
     /* Key scanning is paused during the probe, so keep the idle timer fresh
      * (but never cancel a manual POWER sleep or its fade-out). */
     if (g_screen_off == SCREEN_AWAKE && g_fade_out_reason == SCREEN_AWAKE) {
-        g_last_activity_ms = now_ms;
+        backlight_note_activity(now_ms);
     }
     backlight_update();
     return show;
@@ -2925,7 +2933,6 @@ static int hp_auto_connect_for_play(void)
 #define BT_BG_POKE_RETRY_MS 18000u
 #define BT_BG_WAIT_MAX_MS   600000u
 #define BT_BG_SYNC0_DISC_MS 1200u
-#define BT_BG_SYNC0_OPEN_MS 4000u
 #define BT_BG_LEGACY_IDLE_MS 20000u
 
 typedef struct {
@@ -3141,6 +3148,7 @@ static void bt_bg_ensure_started(uint32_t now_ms, int *dirty)
     if (!g_phone_cfg.auto_sync || !g_sd_mounted || bt_hp_active() || bt_lowbatt_poll(now_ms)) {
         return;
     }
+    g_bt_bg.sync_idle.timing = 0u;
     if (!g_bt_bg.active) {
         if (!bt_phone_has_bond_files()) {
             g_bt_bg.requested          = 0u;
@@ -3254,6 +3262,7 @@ static void bt_bg_poll(uint32_t now_ms, int rec_active, int usb_busy, int bench_
     }
 
     if (si.cwx_seq != g_bt_bg.seen_cwx_seq) {
+        g_bt_bg.sync_idle.timing = 0u;
         g_bt_bg.seen_cwx_seq = si.cwx_seq;
         g_bt_bg.last_conn_ms = now_ms;
         bt_bg_apply_cwx(si.last_cwx_name, si.last_cwx_state, dirty);
@@ -3303,14 +3312,18 @@ static void bt_bg_poll(uint32_t now_ms, int rec_active, int usb_busy, int bench_
         }
     }
 
-    /* Completion & timeout rules */
-    if (!rec_active && si.sync_seen && si.sync_pending == 0u) {
+    /* The link may stay open after SYNC,0. Its presence still feeds the
+     * disconnected-peer timeout, while only actual work resets the idle grace. */
+    int complete = !rec_active && si.sync_seen && si.sync_pending == 0u;
+    int open_idle_due = openfw_sync_idle_due(&g_bt_bg.sync_idle, now_ms,
+                                             complete && st.spp_open && !st.xfer_active);
+    if (complete) {
         if (g_phone_cfg.sync_pending) {
             g_phone_cfg.sync_pending = 0u;
             g_phone_cfg_dirty        = 1u;
         }
         if ((!st.spp_open && (uint32_t)(now_ms - g_bt_bg.last_disc_ms) >= BT_BG_SYNC0_DISC_MS) ||
-            (st.spp_open && !st.xfer_active && (uint32_t)(now_ms - g_bt_bg.last_conn_ms) >= BT_BG_SYNC0_OPEN_MS)) {
+            open_idle_due) {
             bt_bg_stop("sync complete (SYNC,0)");
             if (dirty) {
                 *dirty = 1;
@@ -3372,7 +3385,7 @@ static void auto_poweroff_poll(ui_screen_id_t scr, int rec_active, int bench_act
     }
     if (inhibited) {
         /* Keep idle window fresh while on USB, recording, or active BT so unplugging/finishing starts cleanly. */
-        g_last_activity_ms = fresh_now;
+        g_poweroff_activity_ms = fresh_now;
         return;
     }
     if (limit_ms == 0u) {
@@ -3381,7 +3394,7 @@ static void auto_poweroff_poll(ui_screen_id_t scr, int rec_active, int bench_act
     uint32_t key_ms = 0u;
     int has_key = keys_last_activity(&key_ms);
     uint32_t check_now = millis();
-    if (openfw_auto_poweroff_due(limit_ms, check_now, g_last_activity_ms, has_key, key_ms)) {
+    if (openfw_auto_poweroff_due(limit_ms, check_now, g_poweroff_activity_ms, has_key, key_ms)) {
         openfw_log_puts("Auto power-off: idle timeout reached\n");
         perform_clean_poweroff(scr);
     }

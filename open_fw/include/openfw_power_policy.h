@@ -38,4 +38,23 @@ static inline int openfw_auto_poweroff_due(uint32_t limit_ms,
     return openfw_idle_elapsed_ms(now_ms, last_activity_ms, has_key_ms, key_ms) >= limit_ms;
 }
 
+/* Allow the phone four quiet seconds on an open SPP link after SYNC,0. */
+typedef struct {
+    uint32_t since_ms;
+    uint8_t timing;
+} openfw_sync_idle_t;
+
+static inline int openfw_sync_idle_due(openfw_sync_idle_t *idle, uint32_t now_ms, int completed_and_idle)
+{
+    if (!completed_and_idle) {
+        idle->timing = 0u;
+        return 0;
+    }
+    if (!idle->timing) {
+        idle->since_ms = now_ms;
+        idle->timing = 1u;
+    }
+    return (uint32_t)(now_ms - idle->since_ms) >= 4000u;
+}
+
 #endif /* OPENFW_POWER_POLICY_H */
