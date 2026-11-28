@@ -867,7 +867,14 @@ static void test_recorder(const char *exfat_img_path)
     wav_info_t info4;
     assert(wav_parse_header(hdr4, &info4) == 0 && info4.data_bytes == (uint32_t)(ent4.size - 44u));
     assert(recorder_get_flushed_wav_bytes() == (uint32_t)ent4.size);
+    exfat_entry_t live;
+    assert(!recorder_live_entry(&vol_ckpt, "REC_0004.wav", &live));
+    assert(!recorder_live_entry(&vol, "REC_0003.wav", &live));
+    assert(recorder_live_entry(&vol, "rec_0004.WAV", &live));
+    assert(strcmp(live.name, ent4.name) == 0 && live.first_cluster == ent4.first_cluster);
+    assert(live.size == ent4.size && live.valid_data_len == ent4.valid_data_len && live.no_fat_chain == ent4.no_fat_chain);
     assert(recorder_stop() == 0);
+    assert(!recorder_live_entry(&vol, "REC_0004.wav", &live));
     assert(recorder_get_flushed_wav_bytes() == 0u);
 
     /* Snapshot clean SD image before fault-injection tests #5 & #6 */

@@ -1085,7 +1085,9 @@ static void handle_get_common(xrec_ctx_t *ctx, const char *args, int is_stream)
         return;
     }
 
-    if (rec_channels(ctx) != 0u) {
+    exfat_entry_t found;
+    int live = ctx->ops.live_entry && ctx->ops.live_entry(ctx->vol, p, &found);
+    if (!live && rec_channels(ctx) != 0u) {
         /* While recording the lookup in /record (one read per 4 directory sectors) runs over the next polls within
          * the pass budget, as a GETS chunk read does (F1): a large /record never delays the recorder. The request
          * replaces any running stream / LS at once (as a found file does when idle). */
@@ -1108,16 +1110,17 @@ static void handle_get_common(xrec_ctx_t *ctx, const char *args, int is_stream)
         return;
     }
 
-    char path[96];
-    int pos = 0;
-    append_str(path, &pos, (int)sizeof(path), "/record/");
-    append_str(path, &pos, (int)sizeof(path), p);
-    path[pos] = '\0';
+    if (!live) {
+        char path[96];
+        int pos = 0;
+        append_str(path, &pos, (int)sizeof(path), "/record/");
+        append_str(path, &pos, (int)sizeof(path), p);
+        path[pos] = '\0';
 
-    exfat_entry_t found;
-    if (exfat_find_path(ctx->vol, path, &found) != 0 || found.is_dir) {
-        send_err(ctx, "NOENT");
-        return;
+        if (exfat_find_path(ctx->vol, path, &found) != 0 || found.is_dir) {
+            send_err(ctx, "NOENT");
+            return;
+        }
     }
 
     /* Stop any active LS stream so text lines never interleave with binary GETS frames */

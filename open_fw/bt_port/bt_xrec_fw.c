@@ -788,6 +788,7 @@ static const xrec_ops_t k_dev_ops = {
     .rec_channels     = dev_rec_channels,
     .rec_pending      = dev_rec_pending,
     .rec_flushed_size = dev_rec_flushed_size,
+    .live_entry = recorder_live_entry,
     .now_us           = dev_now_us,
 };
 

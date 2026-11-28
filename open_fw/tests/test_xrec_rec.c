@@ -274,6 +274,16 @@ static uint32_t frames_payload(uint32_t *next_off)
     return total;
 }
 
+static exfat_entry_t live_file;
+
+static int fake_live_entry(const exfat_vol_t *vol, const char *name, exfat_entry_t *entry)
+{
+    if (vol != &g_vol || !fake_file_busy(NULL, name) || g_rec_flushed <= 44u) return 0;
+    *entry = live_file;
+    entry->size = entry->valid_data_len = g_rec_flushed;
+    return 1;
+}
+
 static void test_sync_while_recording(void)
 {
     xrec_ops_t ops;
@@ -336,6 +346,17 @@ static void test_sync_while_recording(void)
             assert(strstr(lt, "+XREC:FT,2048,-,REC_0009.wav\r\n") != NULL &&
                    strstr(lt, "+XREC:END\r\n") != NULL);
         }
+        if (ch == 2u) {
+            assert(exfat_find_path(&g_vol, "/record/REC_0009.wav", &live_file) == 0);
+            g_x.ops.live_entry = fake_live_entry;
+        }
+        /* No payload read at the checkpoint boundary. All card reads here are lookup overhead. */
+        clear_out();
+        uint32_t reads_before = g_reads;
+        rx_str("+XREC:GETS,2048,640,640,REC_0009.wav\r");
+        while (g_x.gets_lookup || g_x.gets_active) xrec_poll(&g_x);
+        assert(g_out_len == 12u);
+        assert(ch == 2u ? g_reads == reads_before : g_reads > reads_before);
         clear_out();
         rx_str("+XREC:GETS,0,4096,640,REC_0009.wav\r");
         for (int p = 0; p < 50 && (g_x.gets_lookup || g_x.gets_active); p++) {

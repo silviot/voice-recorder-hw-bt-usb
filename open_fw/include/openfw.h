@@ -321,6 +321,7 @@ int                 recorder_is_vor_waiting(void);
 uint32_t            recorder_get_seconds(void);
 uint32_t            recorder_get_committed_bytes(void);
 uint32_t            recorder_get_flushed_wav_bytes(void);
+int                 recorder_live_entry(const exfat_vol_t *vol, const char *name, exfat_entry_t *entry);
 uint32_t            recorder_get_created_timestamp(void);
 const char         *recorder_get_filename(void);
 int                 recorder_is_recording_file(const char *name); /* /record/<name> is open for recording */

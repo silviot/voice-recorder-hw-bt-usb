@@ -117,6 +117,8 @@ typedef struct {
     uint8_t  (*rec_channels)(void *user);
     uint32_t (*rec_pending)(void *user);
     uint32_t (*rec_flushed_size)(void *user);
+    /* Optional current writer snapshot. Returns 1 only for its checkpointed /record/<name> on vol. */
+    int (*live_entry)(const exfat_vol_t *vol, const char *name, exfat_entry_t *entry);
     uint32_t (*now_us)(void *user);
     /* Cooperative background sync (+XREC:SYNC,<pending>[,<eta_s>]) and live CWX commit notification. Optional. */
     void     (*on_sync_state)(void *user, uint32_t pending, uint32_t eta_sec);
