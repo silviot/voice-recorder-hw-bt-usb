@@ -155,6 +155,7 @@ static struct {
     uint8_t  requested;
     uint8_t  ever_connected;
     uint8_t  was_spp_open;
+    uint8_t  poke_on_disc;
     uint8_t  pokes;
     uint8_t  suppress_until_rec;
     uint32_t start_ms;
@@ -2125,6 +2126,7 @@ static void run_bt_xrec_mode(void)
                 g_bt_bg.ever_connected = 1u;
             }
             g_bt_bg.sync_idle.timing = 0u;
+            g_bt_bg.poke_on_disc     = 0u;
             g_bt_bg.ready_ms     = end_ms ? end_ms : 1u;
             g_bt_bg.last_conn_ms = end_ms;
             g_bt_bg.last_disc_ms = end_ms;
@@ -3143,6 +3145,42 @@ static void bt_bg_apply_cwx(const char *cwx_name, uint8_t tr_state, int *dirty)
     refresh_record_unsynced_count();
 }
 
+static void bt_bg_arm_transition(uint32_t now_ms)
+{
+    bt_xrec_clear_sync_done();
+    g_bt_bg.requested          = 0u;
+    g_bt_bg.suppress_until_rec = 0u;
+    g_bt_bg.start_ms           = now_ms;
+    g_bt_bg.last_conn_ms       = now_ms;
+    g_bt_bg.last_disc_ms       = now_ms;
+    g_bt_bg.sync_idle.timing   = 0u;
+    bt_status_t st;
+    bt_xrec_get_status(&st);
+    if (!st.spp_open) {
+        g_bt_bg.ever_connected = 0u;
+        g_bt_bg.pokes          = 0u;
+        g_bt_bg.poke_ms        = 0u;
+        g_bt_bg.ready_ms       = now_ms ? now_ms : 1u;
+        g_bt_bg.poke_on_disc   = 0u;
+    } else {
+        g_bt_bg.poke_on_disc   = 1u;
+    }
+}
+
+static void sync_mark_saved_recording_pending(uint32_t now_ms, int allow_bg_start)
+{
+    bt_xrec_clear_sync_done();
+    g_phone_cfg.sync_pending   = 1u;
+    g_phone_cfg_dirty          = 1u;
+    g_bt_bg.suppress_until_rec = 0u;
+    if (allow_bg_start) {
+        g_bt_bg.requested = 1u;
+    }
+    if (g_bt_bg.active) {
+        bt_bg_arm_transition(now_ms);
+    }
+}
+
 static void bt_bg_ensure_started(uint32_t now_ms, int *dirty)
 {
     if (!g_phone_cfg.auto_sync || !g_sd_mounted || bt_hp_active() || bt_lowbatt_poll(now_ms)) {
@@ -3168,6 +3206,7 @@ static void bt_bg_ensure_started(uint32_t now_ms, int *dirty)
         g_bt_bg.requested      = 0u;
         g_bt_bg.ever_connected = 0u;
         g_bt_bg.was_spp_open   = 0u;
+        g_bt_bg.poke_on_disc   = 0u;
         g_bt_bg.pokes          = 0u;
         g_bt_bg.start_ms       = now_ms;
         g_bt_bg.ready_ms       = 0u;
@@ -3182,18 +3221,7 @@ static void bt_bg_ensure_started(uint32_t now_ms, int *dirty)
         }
         openfw_log_puts("BT bg sync started\n");
     } else {
-        bt_xrec_clear_sync_done();
-        g_bt_bg.requested    = 0u;
-        g_bt_bg.start_ms     = now_ms;
-        g_bt_bg.last_conn_ms = now_ms;
-        bt_status_t st;
-        bt_xrec_get_status(&st);
-        if (!st.spp_open) {
-            g_bt_bg.ever_connected = 0u;
-            g_bt_bg.pokes          = 0u;
-            g_bt_bg.poke_ms        = 0u;
-            g_bt_bg.ready_ms       = now_ms ? now_ms : 1u;
-        }
+        bt_bg_arm_transition(now_ms);
     }
 }
 
@@ -3277,7 +3305,11 @@ static void bt_bg_poll(uint32_t now_ms, int rec_active, int usb_busy, int bench_
 
     bt_ui_sync_refresh(dirty);
 
-    if (st.xrec_auth || si.sync_seen) {
+    if (si.sync_seen) {
+        g_bt_bg.poke_on_disc = 0u;
+    }
+
+    if ((st.spp_open && st.xrec_auth) || si.sync_seen) {
         g_bt_bg.ever_connected = 1u;
     }
     if (st.spp_open || st.xfer_active) {
@@ -3285,6 +3317,14 @@ static void bt_bg_poll(uint32_t now_ms, int rec_active, int usb_busy, int bench_
     }
     if (g_bt_bg.was_spp_open && !st.spp_open) {
         g_bt_bg.last_disc_ms = now_ms;
+        if (!rec_active && openfw_bt_bg_rearm_poke_on_disc(g_bt_bg.poke_on_disc, si.sync_seen)) {
+            g_bt_bg.ever_connected = 0u;
+            g_bt_bg.pokes          = 0u;
+            g_bt_bg.poke_ms        = 0u;
+            g_bt_bg.ready_ms       = now_ms ? now_ms : 1u;
+            g_bt_bg.start_ms       = now_ms;
+            g_bt_bg.poke_on_disc   = 0u;
+        }
     }
     g_bt_bg.was_spp_open = st.spp_open;
 
@@ -3340,7 +3380,8 @@ static void bt_bg_poll(uint32_t now_ms, int rec_active, int usb_busy, int bench_
             return;
         }
     } else if (!st.spp_open) {
-        if (!rec_active && !si.sync_seen && (uint32_t)(now_ms - g_bt_bg.last_disc_ms) >= BT_BG_LEGACY_IDLE_MS) {
+        if (openfw_bt_bg_legacy_idle_due(rec_active, si.sync_seen, si.sync_seq,
+                                         now_ms, g_bt_bg.last_disc_ms, BT_BG_LEGACY_IDLE_MS)) {
             if (!has_untranscribed_recording() && g_phone_cfg.sync_pending) {
                 g_phone_cfg.sync_pending = 0u;
                 g_phone_cfg_dirty        = 1u;
@@ -3403,6 +3444,12 @@ static void auto_poweroff_poll(ui_screen_id_t scr, int rec_active, int bench_act
     (void)rec_active;
     (void)bench_active;
 #endif
+}
+#else
+static inline void sync_mark_saved_recording_pending(uint32_t now_ms, int allow_bg_start)
+{
+    (void)now_ms;
+    (void)allow_bg_start;
 }
 #endif
 
@@ -4368,25 +4415,7 @@ int openfw_main(void)
                     g_ui.saved_dt       = g_ui.last_file.dt;
                     copy_cstr(g_ui.saved_filename, (int)sizeof(g_ui.saved_filename), saved_name);
 #if OPENFW_BT_HP
-                    bt_xrec_clear_sync_done();
-                    g_phone_cfg.sync_pending   = 1u;
-                    g_phone_cfg_dirty          = 1u;
-                    g_bt_bg.suppress_until_rec = 0u;
-                    g_bt_bg.requested          = 1u;
-                    if (g_bt_bg.active) {
-                        uint32_t stop_ms = millis();
-                        g_bt_bg.start_ms     = stop_ms;
-                        g_bt_bg.last_conn_ms = stop_ms;
-                        g_bt_bg.last_disc_ms = stop_ms;
-                        bt_status_t st_after;
-                        bt_xrec_get_status(&st_after);
-                        if (!st_after.spp_open) {
-                            g_bt_bg.ever_connected = 0u;
-                            g_bt_bg.pokes          = 0u;
-                            g_bt_bg.poke_ms        = 0u;
-                            g_bt_bg.ready_ms       = stop_ms ? stop_ms : 1u;
-                        }
-                    }
+                    sync_mark_saved_recording_pending(millis(), 1);
 #endif
                     save_persisted_state();
                     saved_start_ms = now_ms;
@@ -4405,13 +4434,19 @@ int openfw_main(void)
 
         /* 3. Active recording poll + 20 Hz spectrogram & peak meters */
         if (rec_active) {
+            int was_saving_before = recorder_is_saving();
             recorder_poll();
             if (recorder_has_error()) {
-                (void)recorder_stop();
+                int err_stop_rc = recorder_stop();
                 apm_flush();
                 g_ui.rec_sec     = recorder_get_seconds();
                 rec_active       = 0;
                 g_ui.rec_stopped = 1u;
+                if (was_saving_before && err_stop_rc == 0 && recorder_get_committed_bytes() > 44u) {
+                    reload_files_and_sd_stats();
+                    sync_mark_saved_recording_pending(now_ms, 1);
+                    save_persisted_state();
+                }
                 uint32_t fmb = 1u, tmb = 0u;
                 const char *reason = ui_tr(UI_STR_WRITE_ERROR);
                 if (g_sd_mounted && exfat_stat_fs(&g_exfat_vol, &fmb, &tmb) == 0 && fmb == 0u) {
@@ -4420,6 +4455,28 @@ int openfw_main(void)
                 copy_cstr(g_ui.rec_stop_reason, (int)sizeof(g_ui.rec_stop_reason), reason);
                 backlight_wake(now_ms);
                 dirty            = 1;
+            } else if (recorder_is_saving()) {
+                const char *cur_name = recorder_get_filename();
+                if (cur_name && cur_name[0] != '\0' && !str_eq_ci(g_ui.rec_filename, cur_name)) {
+                    copy_cstr(g_ui.rec_filename, (int)sizeof(g_ui.rec_filename), cur_name);
+                    dirty = 1;
+                }
+#if OPENFW_BT_HP
+                if (!was_saving_before && g_phone_cfg.auto_sync) {
+                    int bench_block_bt = 0;
+#if OPENFW_BT_BENCH
+                    bench_block_bt = bench_home && !bt_bench_home_bg_allowed();
+#endif
+                    if (!bench_block_bt) {
+                        g_bt_bg.suppress_until_rec = 0u;
+                        if (g_bt_bg.active) {
+                            bt_bg_arm_transition(now_ms);
+                        } else if (audio_ring_pending() == 0u) {
+                            g_bt_bg.requested = 1u;
+                        }
+                    }
+                }
+#endif
             }
             prev_vbus   = vbus_present_cached(now_ms);
             usb_probing = 0;
@@ -5049,9 +5106,16 @@ int openfw_main(void)
             if (g_ui.batt_mv < 3450u) {
                 low_batt_cutoff = 1;
                 if (rec_active) {
-                    (void)recorder_stop();
+                    int was_saving_lb = recorder_is_saving();
+                    int lb_stop_rc    = recorder_stop();
+                    apm_flush();
                     rec_active       = 0;
                     g_ui.rec_stopped = 1u;
+                    if (was_saving_lb && lb_stop_rc == 0 && recorder_get_committed_bytes() > 44u) {
+                        reload_files_and_sd_stats();
+                        sync_mark_saved_recording_pending(now_ms, 0);
+                        save_persisted_state();
+                    }
                     copy_cstr(g_ui.rec_stop_reason, (int)sizeof(g_ui.rec_stop_reason), ui_tr(UI_STR_LOW_BATTERY));
                     dirty = 1;
                 }

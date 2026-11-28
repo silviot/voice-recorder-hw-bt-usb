@@ -838,7 +838,8 @@ int recorder_is_recording_file(const char *name)
  * length only after the header and directory checkpoint have both reached the card. */
 int recorder_live_entry(const exfat_vol_t *vol, const char *name, exfat_entry_t *entry)
 {
-    if (!entry || g_writer.vol != vol || g_flushed_wav_bytes <= 44u || !recorder_is_recording_file(name)) {
+    if (!entry || !g_writer.active || g_writer.vol != vol || g_writer.first_cluster < 2u ||
+        g_flushed_wav_bytes <= 44u || !recorder_is_recording_file(name)) {
         return 0;
     }
     *entry = (exfat_entry_t){
@@ -846,7 +847,7 @@ int recorder_live_entry(const exfat_vol_t *vol, const char *name, exfat_entry_t 
         .size = g_flushed_wav_bytes,
         .valid_data_len = g_flushed_wav_bytes,
     };
-    for (unsigned i = 0; g_filename[i]; i++) {
+    for (unsigned i = 0u; i + 1u < sizeof(entry->name) && g_filename[i] != '\0'; i++) {
         entry->name[i] = g_filename[i];
     }
     return 1;

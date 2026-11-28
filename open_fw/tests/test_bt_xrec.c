@@ -2784,6 +2784,10 @@ static void t_sync_poke_and_key_refresh(void)
     bt_xrec_get_sync_info(&si);
     CHECK(si.sync_seen == 1u && si.sync_pending == 0u && si.sync_eta_sec == 0u && si.sync_seq == 2u,
           "sync_info idle (pending %u seq %u)", si.sync_pending, (unsigned)si.sync_seq);
+    bt_xrec_clear_sync_done();
+    bt_xrec_get_sync_info(&si);
+    CHECK(si.sync_seen == 0u && si.sync_pending == 0u && si.sync_eta_sec == 0u && si.sync_seq == 2u,
+          "clear_sync_done resets sync_seen/pending while preserving sync_seq (%u)", (unsigned)si.sync_seq);
 
     if (g_have_vol) {
         uint8_t cwx[64];

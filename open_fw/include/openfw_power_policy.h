@@ -57,4 +57,25 @@ static inline int openfw_sync_idle_due(openfw_sync_idle_t *idle, uint32_t now_ms
     return (uint32_t)(now_ms - idle->since_ms) >= 4000u;
 }
 
+/* Peers that already sent +XREC:SYNC in this session (sync_seq > 0) keep awaiting reconnect even after
+ * bt_xrec_clear_sync_done() clears sync_seen at REC transitions; only silent legacy peers use the 20 s cutoff. */
+static inline int openfw_bt_bg_legacy_idle_due(int rec_active,
+                                               uint8_t sync_seen,
+                                               uint32_t sync_seq,
+                                               uint32_t now_ms,
+                                               uint32_t last_disc_ms,
+                                               uint32_t legacy_idle_ms)
+{
+    if (rec_active || sync_seen || sync_seq != 0u) {
+        return 0;
+    }
+    return (uint32_t)(now_ms - last_disc_ms) >= legacy_idle_ms;
+}
+
+/* Re-arm the post-stop doorbell poke if an SPP link held across REC stop drops before sending +XREC:SYNC. */
+static inline int openfw_bt_bg_rearm_poke_on_disc(uint8_t poke_on_disc, uint8_t sync_seen)
+{
+    return (poke_on_disc != 0u && sync_seen == 0u) ? 1 : 0;
+}
+
 #endif /* OPENFW_POWER_POLICY_H */

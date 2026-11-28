@@ -3626,6 +3626,19 @@ static void test_completed_sync_idle(void)
     assert(!openfw_sync_idle_due(&idle, start + 9010u, 1));
     assert(!openfw_sync_idle_due(&idle, start + 13009u, 1));
     assert(openfw_sync_idle_due(&idle, start + 13010u, 1));
+
+    /* +XREC:SYNC-capable session whose sync_seen was cleared across REC must not hit the 20 s legacy cutoff */
+    assert(!openfw_bt_bg_legacy_idle_due(0, 0u, 1u, 60000u, 10000u, 20000u));
+    /* Silent legacy peer (sync_seq == 0) hits the 20 s idle cutoff once !rec_active, including millis() wrap */
+    assert(!openfw_bt_bg_legacy_idle_due(1, 0u, 0u, 40000u, 10000u, 20000u));
+    assert(!openfw_bt_bg_legacy_idle_due(0, 1u, 0u, 40000u, 10000u, 20000u));
+    assert(!openfw_bt_bg_legacy_idle_due(0, 0u, 0u, 0x00000FFFu, 0xFFFFC1E0u, 20000u)); /* 19999 ms elapsed */
+    assert(openfw_bt_bg_legacy_idle_due(0, 0u, 0u, 0x00001000u, 0xFFFFC1E0u, 20000u));  /* 20000 ms elapsed */
+
+    /* Open SPP across REC stop re-arms poke on disconnect iff no post-stop +XREC:SYNC arrived */
+    assert(openfw_bt_bg_rearm_poke_on_disc(1u, 0u) == 1);
+    assert(openfw_bt_bg_rearm_poke_on_disc(1u, 1u) == 0);
+    assert(openfw_bt_bg_rearm_poke_on_disc(0u, 0u) == 0);
 }
 
 static void test_auto_poweroff_policy(void)
