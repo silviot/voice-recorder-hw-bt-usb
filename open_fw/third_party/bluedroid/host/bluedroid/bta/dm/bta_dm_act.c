@@ -770,14 +770,33 @@ void bta_dm_disable (tBTA_DM_MSG *p_data)
 static void bta_dm_disable_timer_cback (TIMER_LIST_ENT *p_tle)
 {
     UNUSED(p_tle);
+#if !defined(OPENFW_BLUEDROID) || !OPENFW_BLUEDROID
     UINT8 i;
     tBT_TRANSPORT transport = BT_TRANSPORT_BR_EDR;
     BOOLEAN trigger_disc = FALSE;
+#endif
 
 
     APPL_TRACE_EVENT(" bta_dm_disable_timer_cback trial %d ", p_tle->param);
 
     if (BTM_GetNumAclLinks() && p_tle->param == 0) {
+#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
+        /* DM can miss a queued link notification when it deregisters during
+         * shutdown. Detach the links BTM actually counted, on the BTU task.
+         * The disconnect completes asynchronously; always arm the final pass. */
+        for (list_node_t *node = list_begin(btm_cb.p_acl_db_list); node; node = list_next(node)) {
+            tACL_CONN *acl = list_node(node);
+            if (acl->in_use) {
+                tBT_TRANSPORT transport = BT_TRANSPORT_BR_EDR;
+#if BLE_INCLUDED == TRUE
+                transport = acl->transport;
+#endif
+                btm_remove_acl(acl->remote_addr, transport);
+            }
+        }
+        bta_dm_cb.disable_timer.param = 1;
+        bta_sys_start_timer(&bta_dm_cb.disable_timer, 0, OPENFW_BTA_DM_DISABLE_DETACH_WAIT_MS);
+#else
         for (i = 0; i < bta_dm_cb.device_list.count; i++) {
 #if (BLE_INCLUDED == TRUE)
             transport = bta_dm_cb.device_list.peer_device[i].transport;
@@ -791,12 +810,9 @@ static void bta_dm_disable_timer_cback (TIMER_LIST_ENT *p_tle)
         if (trigger_disc) {
             bta_dm_cb.disable_timer.p_cback = (TIMER_CBACK *)&bta_dm_disable_timer_cback;
             bta_dm_cb.disable_timer.param = 1;
-#if defined(OPENFW_BLUEDROID) && OPENFW_BLUEDROID
-            bta_sys_start_timer(&bta_dm_cb.disable_timer, 0, OPENFW_BTA_DM_DISABLE_DETACH_WAIT_MS);   /* patch 0026 */
-#else
             bta_sys_start_timer(&bta_dm_cb.disable_timer, 0, 1500);
-#endif
         }
+#endif
     } else {
         bta_dm_cb.disabling = FALSE;
 #if (CLASSIC_BT_INCLUDED == TRUE)

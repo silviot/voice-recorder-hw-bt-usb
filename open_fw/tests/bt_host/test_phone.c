@@ -2014,6 +2014,28 @@ int bth_phone_scenario(const char *img_path)
         goto out;
     }
 
+    /* DM receives ACL changes asynchronously. Exercise shutdown with a live
+     * baseband link whose peer entry is missing from the upper-layer list. */
+    bth_log("[P12b] shutdown with a link known only to BTM\n");
+    if (!wait_ready()) {
+        goto out;
+    }
+    {
+        fake_peer_cfg_t a;
+        peer_cfg(&a, 0xA1u, 0x01u, 0x05u, 0x05u, "laptop-A");
+        peer_attach(&a, lkey);
+        if (!peer_page_and_connect()) {
+            goto out;
+        }
+        PCHECK(bth_forget_dm_peer(), "P12b setup requires one ACL and one DM peer");
+        stop_session(&base, "stop with missing DM peer");
+        PCHECK(!fake_peer.connected && fake_peer.stop_kills == 0u,
+               "P12b: controller stopped before the peer detached");
+        if (p_fail) {
+            goto out;
+        }
+    }
+
     /* ---- 13 ---- */
     /* Review finding: a Just Works key is stored (and a flush requested) before the app sees AUTH_CMPL; BTA DM removes
      * it only once the ACL is down, which never happens if BT stops first. It must still never reach the card. */

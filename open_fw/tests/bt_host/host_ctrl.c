@@ -17,6 +17,8 @@
 #include "bt_ctrl.h"
 #include "fake_rom.h"
 #include "host_env.h"
+#include "bta/bta_api.h"
+#include "bta_dm_int.h"
 
 static TaskHandle_t s_ctrl_task, s_dlv_task;
 static SemaphoreHandle_t s_rom_mutex;
@@ -30,6 +32,17 @@ _Static_assert(offsetof(esp_bluedroid_hci_driver_callbacks_t, notify_host_send_a
                offsetof(bt_ctrl_host_cb_t, notify_host_send_available), "callback table shape");
 _Static_assert(offsetof(esp_bluedroid_hci_driver_callbacks_t, notify_host_recv) ==
                offsetof(bt_ctrl_host_cb_t, notify_host_recv), "callback table shape");
+
+bool bth_forget_dm_peer(void)
+{
+    taskENTER_CRITICAL();
+    bool found = BTM_GetNumAclLinks() == 1u && bta_dm_cb.device_list.count == 1u;
+    if (found) {
+        bta_dm_cb.device_list.count = 0u;
+    }
+    taskEXIT_CRITICAL();
+    return found;
+}
 
 static void plat_enter(void) { taskENTER_CRITICAL(); }
 static void plat_exit(void) { taskEXIT_CRITICAL(); }

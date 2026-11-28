@@ -73,6 +73,7 @@ void bth_alarm_arm_drain_exit_hook(void (*fn)(void)); /* fires once right after 
 int  bth_ctrl_init(void);                   /* bt_ctrl_init + bt_ctrl / bt_dlv tasks; once */
 int  bth_ctrl_open(void);                   /* bt_ctrl_open + esp_bluedroid_attach_hci_driver */
 int  bth_ctrl_close(uint32_t timeout_ms);   /* bt_ctrl_shutdown_begin, wait for the stop status and an idle bt_dlv */
+bool bth_forget_dm_peer(void);  /* model a missing BTA DM entry for a live ACL */
 void bth_ctrl_kick(void);                   /* wake the bt_ctrl task (after fake_rom_inject*) */
 void bth_rom_lock(void);                    /* serialises fake_rom_* calls with the bt_ctrl task */
 void bth_rom_unlock(void);
